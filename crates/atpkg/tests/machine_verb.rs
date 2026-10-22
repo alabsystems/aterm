@@ -75,6 +75,14 @@ fn the_read_prints_exactly_one_parseable_record_and_exits_zero() {
     );
     let state = &records[0];
     assert!(!state.config_unreadable, "{stdout:?}");
+    // Rosetta 2 is read where it applies (Apple silicon) and nowhere else, and the read
+    // says it in words too.
+    assert_eq!(
+        state.rosetta == atpkg::machine::RosettaPosture::NotApplicable,
+        !atpkg::machine::ROSETTA_APPLIES,
+        "{stdout:?}"
+    );
+    assert!(stdout.iter().any(|l| l.contains("Rosetta 2")), "{stdout:?}");
     // And the prose above it: the verdict prefix the card quotes, on its own lines.
     assert!(
         stdout
@@ -99,8 +107,10 @@ fn the_apply_refuses_a_synthetic_home_and_writes_nothing() {
     assert!(
         !stdout
             .iter()
-            .any(|l| l.contains(atpkg::machine::UNIVERSAL_CONTROL_ENTRY)),
-        "nothing was written: {stdout:?}"
+            .any(|l| l.contains(atpkg::machine::UNIVERSAL_CONTROL_ENTRY)
+                || l.contains(atpkg::machine::ROSETTA_ENTRY)
+                || l.contains("Rosetta 2")),
+        "nothing was written or installed: {stdout:?}"
     );
 }
 

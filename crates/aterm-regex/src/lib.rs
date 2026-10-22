@@ -124,7 +124,8 @@ pub struct StepLimitExceeded {
 }
 
 impl StepLimitExceeded {
-    pub(crate) fn new(limit: u64) -> Self {
+    #[inline]
+    pub(crate) const fn new(limit: u64) -> Self {
         Self { limit }
     }
 }
@@ -169,6 +170,7 @@ impl Regex {
     }
 
     /// The pattern this was compiled from.
+    #[inline]
     #[must_use]
     pub fn as_str(&self) -> &str {
         &self.pattern
@@ -180,6 +182,7 @@ impl Regex {
     /// closed: a search that exhausts its [step budget](RegexBuilder::step_limit) reports
     /// `false` and sets [`step_limit_exceeded`](Self::step_limit_exceeded);
     /// [`try_is_match`](Self::try_is_match) reports the exhaustion instead.
+    #[inline]
     #[must_use]
     pub fn is_match(&self, text: &str) -> bool {
         self.try_is_match(text).unwrap_or(false)
@@ -190,6 +193,7 @@ impl Regex {
     /// # Errors
     /// [`StepLimitExceeded`] if the search ran out of budget before it could
     /// decide.
+    #[inline]
     pub fn try_is_match(&self, text: &str) -> Result<bool, StepLimitExceeded> {
         let mut budget = self.step_limit;
         Ok(self.search(text, 0, true, &mut budget)?.is_some())
@@ -199,6 +203,7 @@ impl Regex {
     ///
     /// Fails closed like [`is_match`](Self::is_match): an exhausted search reports `None`
     /// and sets [`step_limit_exceeded`](Self::step_limit_exceeded).
+    #[inline]
     #[must_use]
     pub fn find<'t>(&self, text: &'t str) -> Option<Match<'t>> {
         self.try_find(text).unwrap_or(None)
@@ -209,6 +214,7 @@ impl Regex {
     /// # Errors
     /// [`StepLimitExceeded`] if the search ran out of budget before it could
     /// decide; no partial span is returned.
+    #[inline]
     pub fn try_find<'t>(&self, text: &'t str) -> Result<Option<Match<'t>>, StepLimitExceeded> {
         let mut budget = self.step_limit;
         Ok(self
@@ -218,8 +224,9 @@ impl Regex {
 
     /// The work ceiling one search on this pattern may spend. See
     /// [`RegexBuilder::step_limit`].
+    #[inline]
     #[must_use]
-    pub fn step_limit(&self) -> u64 {
+    pub const fn step_limit(&self) -> u64 {
         self.step_limit
     }
 
@@ -228,6 +235,7 @@ impl Regex {
     /// Sticky and shared with every clone, so a caller scanning through an infallible
     /// helper can tell "no matches" from "gave up". Never cleared: the results the
     /// pattern produced are not exhaustive, whatever later rows cost.
+    #[inline]
     #[must_use]
     pub fn step_limit_exceeded(&self) -> bool {
         self.cut_short.load(Ordering::Relaxed)
@@ -242,8 +250,9 @@ impl Regex {
     /// The whole iteration shares one [step budget](RegexBuilder::step_limit). It fails
     /// closed: on exhaustion the iterator ends, the yielded matches are a prefix, and
     /// [`Matches::step_limit_exceeded`] and [`Regex::step_limit_exceeded`] record it.
+    #[inline]
     #[must_use]
-    pub fn find_iter<'r, 't>(&'r self, text: &'t str) -> Matches<'r, 't> {
+    pub const fn find_iter<'r, 't>(&'r self, text: &'t str) -> Matches<'r, 't> {
         self.find_iter_with_limit(text, self.step_limit)
     }
 
@@ -255,8 +264,9 @@ impl Regex {
     /// closed like `find_iter`: [`Matches::step_limit_exceeded`] says whether it reached
     /// the end, and the pattern records an exhausted search as
     /// [`step_limit_exceeded`](Self::step_limit_exceeded).
+    #[inline]
     #[must_use]
-    pub fn find_iter_with_limit<'r, 't>(
+    pub const fn find_iter_with_limit<'r, 't>(
         &'r self,
         text: &'t str,
         step_limit: u64,
@@ -342,38 +352,44 @@ pub struct Match<'t> {
 
 impl<'t> Match<'t> {
     /// Byte offset of the first code point of the match.
+    #[inline]
     #[must_use]
-    pub fn start(&self) -> usize {
+    pub const fn start(&self) -> usize {
         self.start
     }
 
     /// Byte offset just past the last code point of the match.
+    #[inline]
     #[must_use]
-    pub fn end(&self) -> usize {
+    pub const fn end(&self) -> usize {
         self.end
     }
 
     /// The matched text.
+    #[inline]
     #[must_use]
     pub fn as_str(&self) -> &'t str {
         self.text.get(self.start..self.end).unwrap_or_default()
     }
 
     /// The match as a byte range.
+    #[inline]
     #[must_use]
-    pub fn range(&self) -> std::ops::Range<usize> {
+    pub const fn range(&self) -> std::ops::Range<usize> {
         self.start..self.end
     }
 
     /// Length of the match in bytes.
+    #[inline]
     #[must_use]
-    pub fn len(&self) -> usize {
+    pub const fn len(&self) -> usize {
         self.end - self.start
     }
 
     /// Is this a zero-width match?
+    #[inline]
     #[must_use]
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.start == self.end
     }
 }
@@ -398,8 +414,9 @@ impl Matches<'_, '_> {
     /// `false` means it yielded every match in the haystack; `true` means what it yielded
     /// is a prefix. Unlike the sticky [`Regex::step_limit_exceeded`], this is per
     /// haystack, so a caller scanning many lines learns which ones it could not finish.
+    #[inline]
     #[must_use]
-    pub fn step_limit_exceeded(&self) -> bool {
+    pub const fn step_limit_exceeded(&self) -> bool {
         self.cut_short
     }
 }
@@ -407,6 +424,7 @@ impl Matches<'_, '_> {
 impl<'t> Iterator for Matches<'_, 't> {
     type Item = Match<'t>;
 
+    #[inline]
     fn next(&mut self) -> Option<Match<'t>> {
         loop {
             if self.last_end > self.text.len() {
@@ -496,8 +514,9 @@ impl RegexBuilder {
     /// Checked on every instruction emitted, so an oversized pattern fails early instead
     /// of allocating. Each instruction is charged with the slots it forces in the
     /// simulation's two thread lists.
+    #[inline]
     #[must_use]
-    pub fn size_limit(mut self, bytes: usize) -> Self {
+    pub const fn size_limit(mut self, bytes: usize) -> Self {
         self.size_limit = bytes;
         self
     }
@@ -506,8 +525,9 @@ impl RegexBuilder {
     /// ignored. This engine has no DFA, and per-search memory is already bounded by
     /// [`size_limit`](Self::size_limit). It is not repurposed as a second program cap,
     /// which would reject patterns the caller expects to compile.
+    #[inline]
     #[must_use]
-    pub fn dfa_size_limit(self, _bytes: usize) -> Self {
+    pub const fn dfa_size_limit(self, _bytes: usize) -> Self {
         self
     }
 
@@ -537,16 +557,18 @@ impl RegexBuilder {
     /// `(?:x?){2000}z` under a 1 MiB ceiling finishes a row (32.8M units) and is refused
     /// over 3 MB. Call sites that take both pattern and content from outside
     /// (`aterm-observe`, `aterm-search`) pass 2^22, about 4.8 ms per row.
+    #[inline]
     #[must_use]
-    pub fn step_limit(mut self, steps: u64) -> Self {
+    pub const fn step_limit(mut self, steps: u64) -> Self {
         self.step_limit = steps;
         self
     }
 
     /// Read back the value passed to [`step_limit`](Self::step_limit).
+    #[inline]
     #[must_use]
     #[cfg(test)]
-    pub fn get_step_limit(&self) -> u64 {
+    pub const fn get_step_limit(&self) -> u64 {
         self.step_limit
     }
 
@@ -591,18 +613,21 @@ pub fn escape(pattern: &str) -> String {
 
 impl StepLimitExceeded {
     /// Return the step budget (in work units) that was exceeded.
+    #[inline]
     #[must_use]
     pub const fn limit(self) -> u64 {
         self.limit
     }
 
     /// Return `true` iff `used <= self.limit`.
+    #[inline]
     #[must_use]
     pub const fn within_budget(self, used: u64) -> bool {
         used <= self.limit
     }
 
     /// Remaining step budget after spending `used` units, saturating at `0`.
+    #[inline]
     #[must_use]
     pub const fn remaining_budget(self, used: u64) -> u64 {
         self.limit.saturating_sub(used)
@@ -610,18 +635,21 @@ impl StepLimitExceeded {
 }
 
 /// Return the default compiled program size ceiling (`10 MiB`).
+#[inline]
 #[must_use]
 pub const fn default_size_limit() -> usize {
     DEFAULT_SIZE_LIMIT
 }
 
 /// Return the default per-search step budget (`2^26` work units).
+#[inline]
 #[must_use]
 pub const fn default_step_limit() -> u64 {
     DEFAULT_STEP_LIMIT
 }
 
 /// Clamp a requested program `size_limit` into `[min_bytes, DEFAULT_SIZE_LIMIT]`.
+#[inline]
 #[must_use]
 pub const fn clamp_size_limit(bytes: usize, min_bytes: usize) -> usize {
     let hi = if bytes > DEFAULT_SIZE_LIMIT {
@@ -637,6 +665,7 @@ pub const fn clamp_size_limit(bytes: usize, min_bytes: usize) -> usize {
 }
 
 /// Clamp a requested search `step_limit` into `[min_steps, DEFAULT_STEP_LIMIT]`.
+#[inline]
 #[must_use]
 pub const fn clamp_step_limit(steps: u64, min_steps: u64) -> u64 {
     let hi = if steps > DEFAULT_STEP_LIMIT {
@@ -653,18 +682,21 @@ pub const fn clamp_step_limit(steps: u64, min_steps: u64) -> u64 {
 
 /// Debit `cost` work units from `remaining`, returning `Some(next_remaining)`
 /// when `cost <= remaining` or `None` when the step budget is exhausted.
+#[inline]
 #[must_use]
 pub const fn debit_step_budget(remaining: u64, cost: u64) -> Option<u64> {
     remaining.checked_sub(cost)
 }
 
 /// Return `true` iff `[start, end)` is a well-ordered span within `haystack_len`.
+#[inline]
 #[must_use]
 pub const fn valid_match_span(start: usize, end: usize, haystack_len: usize) -> bool {
     start <= end && end <= haystack_len
 }
 
 /// Length of a validated match span `[start, end)`, or `0` if inverted.
+#[inline]
 #[must_use]
 pub const fn match_span_len(start: usize, end: usize) -> usize {
     end.saturating_sub(start)
@@ -672,6 +704,7 @@ pub const fn match_span_len(start: usize, end: usize) -> usize {
 
 /// Return `true` iff two match spans `[a_start, a_end)` and `[b_start, b_end)`
 /// are non-overlapping and ordered (`a_start <= a_end <= b_start <= b_end`).
+#[inline]
 #[must_use]
 pub const fn disjoint_ordered_spans(
     a_start: usize,
@@ -683,6 +716,7 @@ pub const fn disjoint_ordered_spans(
 }
 
 /// Return `true` iff ASCII byte `b` is a regex syntax metacharacter escaped by [`escape`].
+#[inline]
 #[must_use]
 pub const fn is_ascii_meta_byte(b: u8) -> bool {
     matches!(
@@ -709,6 +743,7 @@ pub const fn is_ascii_meta_byte(b: u8) -> bool {
 }
 
 /// Encode a `(start, end)` byte-offset match span into 16 little-endian bytes.
+#[inline]
 #[must_use]
 pub const fn encode_match_span_le(start: u64, end: u64) -> [u8; 16] {
     [
@@ -732,6 +767,7 @@ pub const fn encode_match_span_le(start: u64, end: u64) -> [u8; 16] {
 }
 
 /// Decode 16 little-endian bytes into a `(start, end)` byte-offset match span.
+#[inline]
 #[must_use]
 pub const fn decode_match_span_le(bytes: [u8; 16]) -> (u64, u64) {
     let start = (bytes[0] as u64)

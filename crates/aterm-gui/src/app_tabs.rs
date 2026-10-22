@@ -201,6 +201,11 @@ thread_local! {
     /// (test-only).
     static RAISED_WINDOWS: std::cell::RefCell<Vec<WindowId>> =
         const { std::cell::RefCell::new(Vec::new()) };
+    /// The activation token each of this thread's `App::raise_window` calls
+    /// would have presented (test-only, Linux).
+    #[cfg(target_os = "linux")]
+    static RAISED_ACTIVATIONS: std::cell::RefCell<Vec<Option<String>>> =
+        const { std::cell::RefCell::new(Vec::new()) };
 }
 
 /// The windows this thread's `App::raise_window` calls named, drained
@@ -208,6 +213,13 @@ thread_local! {
 #[cfg(test)]
 pub(crate) fn take_raised_windows() -> Vec<WindowId> {
     RAISED_WINDOWS.with(|raised| std::mem::take(&mut *raised.borrow_mut()))
+}
+
+/// The activation token each of this thread's `App::raise_window` calls
+/// presented, `None` where it had none, drained (test-only, Linux).
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) fn take_raised_activations() -> Vec<Option<String>> {
+    RAISED_ACTIVATIONS.with(|raised| std::mem::take(&mut *raised.borrow_mut()))
 }
 
 #[cfg(test)]
@@ -4150,19 +4162,27 @@ impl App {
 
     /// TAKE ME THERE: the ❯ menu's Go, and a click on a notice about
     /// `session` (`Wake::NoticeClicked`: aterm's own macOS notice, a Windows
-    /// balloon) — its window raised, its tab selected, its pane given the
-    /// keyboard ([`Self::focus_session_window`]), and a done its task stands
-    /// at seen. A session no window shows goes nowhere.
+    /// balloon, a Linux notification through [`Self::notice_clicked`]) — its
+    /// window raised, its tab selected, its pane given the keyboard
+    /// ([`Self::focus_session_window`]), and a done its task stands at seen. A
+    /// session no window shows goes nowhere. Returns whether a window showed it.
     #[cfg_attr(
-        all(not(target_os = "macos"), not(windows), not(test)),
+        all(
+            not(target_os = "macos"),
+            not(windows),
+            not(target_os = "linux"),
+            not(test)
+        ),
         expect(
             dead_code,
-            reason = "the menu-bar status item and a notice's click are macOS's and Windows'"
+            reason = "the menu-bar status item and a notice's click are macOS's, Windows' and \
+                      Linux's"
         )
     )]
-    pub(crate) fn go_to_session(&mut self, session: u64) {
-        self.focus_session_window(session);
+    pub(crate) fn go_to_session(&mut self, session: u64) -> bool {
+        let shown = self.focus_session_window(session);
         self.note_session_done_seen(session);
+        shown
     }
 
     /// Focus the tab displaying `session`, and the pane showing it there,
@@ -4238,18 +4258,54 @@ impl App {
     /// Go, and each Read that opens a document tab — raises through here, or
     /// the owner, in another app, sees nothing happen (§3); a "To look at"
     /// line too ([`Self::show_status_exception`]). A window with no
-    /// OS surface (headless) raises nothing. A test build records `wid`
-    /// ([`take_raised_windows`]): a test App has no OS window to ask.
+    /// OS surface (headless) raises nothing. On Linux the raise that answers a
+    /// click on a notification ([`Self::notice_clicked`]) presents the
+    /// activation token the server sent for it, which the window layer turns
+    /// into an X11 `_NET_ACTIVE_WINDOW` stamped with its `_TIME` (the launch
+    /// sequence it names ended) or a Wayland `xdg_activation_v1.activate`. A
+    /// test build records `wid` ([`take_raised_windows`]) and on Linux the
+    /// token ([`take_raised_activations`]): a test App has no OS window to ask.
     pub(crate) fn raise_window(&mut self, wid: WindowId) {
+        #[cfg(target_os = "linux")]
+        let activation = self.notice_activation.take();
         #[cfg(test)]
         RAISED_WINDOWS.with(|raised| raised.borrow_mut().push(wid));
+        #[cfg(all(test, target_os = "linux"))]
+        RAISED_ACTIVATIONS.with(|raised| raised.borrow_mut().push(activation.clone()));
         if let Some(w) = self.windows.get(&wid).and_then(|ws| ws.os_window.clone()) {
             if w.is_minimized().unwrap_or(false) {
                 self.pending_deminiaturize_focus = Some(wid);
             }
             w.set_minimized(false);
+            #[cfg(target_os = "linux")]
+            if let Some(token) = activation {
+                use aterm_window::platform::wayland::WindowExtWayland as _;
+                w.focus_window_with_activation_token(&token);
+                return;
+            }
             w.focus_window();
         }
+    }
+
+    /// A CLICK ON A LINUX NOTIFICATION about `session` (`Wake::NoticeClicked`,
+    /// heard by `notify`'s bus thread): the ❯ menu's Go
+    /// ([`Self::go_to_session`]), its window raised with `activation`, the
+    /// token the notification server sent for the click ([`Self::raise_window`]).
+    /// A server that reports a click (the notice's `default` action) does not
+    /// bring aterm forward itself, as it does for a notice without one, so a
+    /// click on a notice whose session has gone raises the window aterm was
+    /// last used in instead, with the token: what the server's own activation
+    /// of aterm did before a notice carried its action, and on X11 what ends
+    /// the launch sequence the server started for the click.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn notice_clicked(&mut self, session: u64, activation: Option<String>) {
+        self.notice_activation = activation;
+        if !self.go_to_session(session)
+            && let Some(wid) = self.frontmost_window
+        {
+            self.raise_window(wid);
+        }
+        self.notice_activation = None;
     }
 
     /// `raise <sid>` (the `Wake::RaiseSession` body): the status item's Go

@@ -35,6 +35,7 @@ pub struct TerminalBuilder {
 }
 
 impl Default for TerminalBuilder {
+    #[inline]
     fn default() -> Self {
         Self::new()
     }
@@ -43,7 +44,8 @@ impl Default for TerminalBuilder {
 impl TerminalBuilder {
     /// A builder for a 24x80 terminal with a 10,000-line ring and no tiered store.
     #[must_use]
-    pub fn new() -> Self {
+    #[inline]
+    pub const fn new() -> Self {
         Self {
             rows: 24,
             cols: 80,
@@ -54,7 +56,8 @@ impl TerminalBuilder {
 
     /// Set the terminal size (rows and cols).
     #[must_use]
-    pub fn size(mut self, rows: u16, cols: u16) -> Self {
+    #[inline]
+    pub const fn size(mut self, rows: u16, cols: u16) -> Self {
         self.rows = rows;
         self.cols = cols;
         self
@@ -62,7 +65,8 @@ impl TerminalBuilder {
 
     /// Set the in-memory ring's line cap (default 10,000).
     #[must_use]
-    pub fn ring_buffer_size(mut self, size: usize) -> Self {
+    #[inline]
+    pub const fn ring_buffer_size(mut self, size: usize) -> Self {
         self.ring_buffer_size = Some(size);
         self
     }

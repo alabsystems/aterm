@@ -340,9 +340,9 @@ pub(super) fn customize_row(
         text.spec.end_button = well_color.is_none();
         // A colour left to the theme shows the theme's hex in the quiet
         // placeholder ink: the value in force, and plainly not the
-        // person's own. The spoken value still says "Theme default". The
+        // person's own. The spoken value still says "Theme (default)". The
         // keyboard on the field keeps that hex until a key is typed, which
-        // replaces it: the field's own placeholder, "Theme default", was
+        // replaces it: the field's own placeholder, "Theme (default)", was
         // fitted to a field this narrow as "Theme…" beside the caret. (The
         // hex is no draft: one would be the person's colour to keep or
         // carry, and Return on it would pin the theme's colour as theirs.)

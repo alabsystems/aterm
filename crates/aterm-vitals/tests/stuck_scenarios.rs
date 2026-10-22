@@ -21,7 +21,7 @@ use aterm_vitals::jobs::{
     TierB, Verdict, WaitName, command_class,
 };
 use scenarios::{TICK_MS, curl, follow_fds, pipe_end, sleeper, spinner, tcp_fd};
-use world::{Proc, World, hint};
+use world::{OutFile, Proc, World, hint};
 
 /// Tick every 2 s from now until `until_ms` from now, calling `each` after
 /// each advance; the last view.
@@ -833,6 +833,124 @@ fn a_full_screen_program_waking_often_with_no_key_queued_reads_keys_not_polling(
     w.run_fg(1, 51, "./poller", p);
     let v = run_to(&mut w, 60_000, |_, _| {});
     assert_eq!(v.row("b51").map(|r| r.class), Some(Class::Polling));
+}
+
+/// A FULL-SCREEN PROGRAM AT ITS PROMPT THAT WRITES FILES (agy 1.4.0 at rest
+/// appends to its own log every 5 s while its telemetry is refused): it
+/// makes progress the terminal does not show, so it reads `running`, but it
+/// holds the foreground at the person's raw-terminal read with no key
+/// queued, so job demand parks (`Idle`: nothing more until its next
+/// terminal output, the design's "a session parked at a raw-mode prompt: 0
+/// job samples until its next PTY output"). NEGATIVE CONTROLS: the same
+/// writer in a canonical terminal, or one that drew past its mode word, is
+/// watched fast; so is a program at the raw read spinning a core with no
+/// progress.
+#[test]
+fn a_program_at_the_persons_raw_read_parks_demand_even_while_it_writes_files() {
+    let writer = || {
+        let mut p = sleeper(1000, "agy");
+        p.cpu_per_s = 18_000_000;
+        p.writes_per_s = 256 * 1024;
+        p
+    };
+    let class = |v: &JobsView| v.row("b51").map(|r| r.class);
+
+    let mut w = World::new();
+    w.run_fg(1, 51, "./agy", writer());
+    w.tty_mode(1, false, false);
+    let v = run_to(&mut w, 60_000, |_, _| {});
+    assert_eq!(class(&v), Some(Class::Running), "its writes are progress");
+    assert_eq!(v.demand, Demand::Idle, "at the person's raw read: parked");
+
+    let mut w = World::new();
+    w.run_fg(1, 51, "./agy", writer());
+    let v = run_to(&mut w, 60_000, |_, _| {});
+    assert_eq!(class(&v), Some(Class::Running));
+    assert_eq!(v.demand, Demand::Fast, "a canonical terminal names no read");
+
+    let mut w = World::new();
+    w.run_fg(1, 51, "./agy", writer());
+    w.tty_mode(1, false, false);
+    let v = run_to(&mut w, 60_000, |w, rel| {
+        if rel > 0 {
+            w.cr(1);
+        }
+    });
+    assert_eq!(class(&v), Some(Class::Running));
+    assert_eq!(
+        v.demand,
+        Demand::Fast,
+        "drawn past the word: it names nothing"
+    );
+
+    let mut w = World::new();
+    w.run_fg(1, 51, "./agy", spinner(1000, "agy"));
+    w.tty_mode(1, false, false);
+    let v = run_to(&mut w, 60_000, |_, _| {});
+    assert_eq!(class(&v), Some(Class::BusySilent));
+    assert_eq!(
+        v.demand,
+        Demand::Fast,
+        "spinning at the raw read: still watched"
+    );
+}
+
+/// A full-screen program at its prompt whose fds 1 and 2 are its own log
+/// (agy 1.4.5 in the real-Claude lab, 2026-10-21: the terminal raw, a log
+/// line every 5 s while its telemetry post is refused), playing tab `key`'s
+/// block 51 in `w`, the log growing a line a tick.
+fn logging_tui(w: &mut World, canonical: bool) {
+    let log = (1, 77_051);
+    w.files.insert(
+        log,
+        OutFile {
+            size: 0,
+            per_s: 40,
+            lf: Some(true),
+        },
+    );
+    let mut agy = sleeper(5100, "agy");
+    agy.out = Some(log);
+    w.run_fg(1, 51, "agy", agy);
+    w.tty_mode(1, canonical, canonical);
+}
+
+/// THE SAME PERSON'S READ BY THE OUTPUT-FILE CHANNEL (agy as `lsof` read it
+/// in the real-Claude lab, 2026-10-21: fds 1 and 2 on its own log, a line
+/// every 5 s): the log is the job's progress, so it reads `running`, and the
+/// person's raw read still parks job demand. NEGATIVE CONTROLS: the same log
+/// under a canonical word (a plain command with its output sent to a file)
+/// is watched fast, and so is the raw program once it printed after its
+/// word: one redraw at 2 s voids the word, and from then on only the log
+/// grows, so nothing but the stale word could park it.
+#[test]
+fn a_full_screen_program_logging_to_its_own_file_parks_demand() {
+    let mut w = World::new();
+    logging_tui(&mut w, false);
+    let v = run_to(&mut w, 30_000, |_, _| {});
+    let row = v.row("b51").expect("the program's job");
+    assert_eq!(row.class, Class::Running, "{}", row.wire());
+    assert_eq!(v.demand, Demand::Idle, "at the person's raw read: parked");
+    let mut w = World::new();
+    logging_tui(&mut w, true);
+    let v = run_to(&mut w, 30_000, |_, _| {});
+    let row = v.row("b51").expect("the command's job");
+    assert_eq!(row.class, Class::Running, "{}", row.wire());
+    assert_eq!(v.demand, Demand::Fast, "a canonical terminal names no read");
+    let mut w = World::new();
+    logging_tui(&mut w, false);
+    let v = run_to(&mut w, 30_000, |w, rel| {
+        if rel == 2_000 {
+            w.cr(1);
+        }
+    });
+    let row = v.row("b51").expect("the program's job");
+    assert_eq!(row.class, Class::Running, "{}", row.wire());
+    assert_eq!(
+        v.demand,
+        Demand::Fast,
+        "drawn past the word: it names nothing"
+    );
 }
 
 // ---------------------------------------------------------------------------

@@ -20,6 +20,7 @@ pub const ADMITTED_LICENCES: [&str; 8] = [
 ];
 
 /// Whether `spdx` is in [`ADMITTED_LICENCES`].
+#[inline]
 #[must_use]
 pub fn admitted(spdx: &str) -> bool {
     ADMITTED_LICENCES.contains(&spdx)
@@ -29,6 +30,7 @@ pub fn admitted(spdx: &str) -> bool {
 /// licence text (MIT, ISC, the BSDs, 0BSD, CC0, the Unlicense). Apache-2.0
 /// does not: a copy carries the copyright line and the short notice that
 /// points at the licence.
+#[inline]
 #[must_use]
 pub fn notice_is_whole_text(spdx: &str) -> bool {
     spdx != "Apache-2.0"

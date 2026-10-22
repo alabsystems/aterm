@@ -133,7 +133,7 @@ pub struct FxHasher {
 
 impl FxHasher {
     #[inline]
-    fn add_to_hash(&mut self, i: usize) {
+    const fn add_to_hash(&mut self, i: usize) {
         self.hash = self.hash.wrapping_add(i).wrapping_mul(K);
     }
 }
@@ -293,7 +293,7 @@ fn read_u64_le(b: &[u8]) -> u64 {
 /// bytes, where this is bit-identical to
 /// `u32::from_le_bytes(b.try_into().unwrap())`.
 #[inline]
-fn read_u32_le(b: &[u8]) -> u32 {
+const fn read_u32_le(b: &[u8]) -> u32 {
     if b.len() < 4 {
         return 0;
     }

@@ -49,6 +49,13 @@ pub struct Screen {
     /// and no gesture has been counted since. `None` for every other word, `null`, a
     /// malformed witness and a host that sends none.
     pub launch: Option<LaunchWitness>,
+    /// How many submissions the session's program had been written at the
+    /// read (`"submits"`, read after the rows): Enters over something typed
+    /// since the Enter before, whoever typed them (aterm-gui's
+    /// `submit_count`). What tells a turn asked since a point from that point
+    /// read again ([`crate::supervise::policy::turn_end::TurnEndReading::submits`]).
+    /// `None` from a host that sends none.
+    pub submits: Option<u64>,
 }
 
 /// A `person` launch witness ([`Screen::launch`]; aterm-gui's `launch_witness`).
@@ -212,6 +219,7 @@ pub fn parse_text_json(body: &str) -> Result<Screen, String> {
         cols: num(v.get("dims"), "cols").and_then(|c| u16::try_from(c).ok()),
         pane_rows: num(v.get("dims"), "rows").and_then(|r| usize::try_from(r).ok()),
         launch: v.get("launch").and_then(launch_witness),
+        submits: v.get("submits").and_then(Json::as_u64),
     })
 }
 
@@ -473,6 +481,20 @@ pub fn cell_glyph_fg(line: &str, glyph: char) -> Option<String> {
     (drawn == glyph.encode_utf8(&mut want)).then(|| style.fg.to_ascii_lowercase())
 }
 
+/// One cell's drawing from a well-formed `cell` reply
+/// ([`aterm_codec::cell::parse_style`]): `(its glyph, its style)` — the
+/// glyph percent-encoded as the server wrote it (`%20` a blank), the style
+/// its `<fg> <bg> <attrs>` with every attribute (bold among them). `None`
+/// for any other reply.
+#[must_use]
+pub fn cell_drawn(line: &str) -> Option<(String, String)> {
+    aterm_codec::cell::parse_style(line)?;
+    let mut fields = line.trim_end().strip_prefix("OK ")?.split(' ');
+    let glyph = fields.next()?.to_string();
+    let style = fields.take(3).collect::<Vec<_>>().join(" ");
+    Some((glyph, style))
+}
+
 /// The `<field>=` word of a `status` reply (`-` and absent are `None`).
 pub fn status_field<'s>(stdout: &'s str, field: &str) -> Option<&'s str> {
     let line = stdout.lines().find(|l| crate::is_ok_reply(l))?;
@@ -628,6 +650,24 @@ mod tests {
         assert_eq!(HumanInput::Unknown.quiet_since(since, now), None);
         assert_eq!(HumanInput::NeverFor(1).within(u32::MAX), Some(false));
         assert_eq!(HumanInput::NeverFor(1).ago(), None);
+    }
+
+    /// `"submits"` (aterm-gui's `submit_count`, last in the object): a count
+    /// is read; absent (an older host) and any other value are none.
+    #[test]
+    fn the_submission_count_is_read_and_its_absence_is_none() {
+        let with = |tail: &str| {
+            parse_text_json(&format!(
+                r#"{{"rows":[],"cursor":{{"row":0,"col":0}},"dims":{{"rows":2,"cols":2}},"seq":15,"gen":"2.15","human_ms":null,"unkeyed_ms":5000{tail}}}"#
+            ))
+            .expect("parses")
+            .submits
+        };
+        assert_eq!(with(r#","submits":7"#), Some(7));
+        assert_eq!(with(r#","submits":0"#), Some(0));
+        assert_eq!(with(""), None, "an older host");
+        assert_eq!(with(r#","submits":"7""#), None);
+        assert_eq!(with(r#","submits":-1"#), None);
     }
 
     /// `"launch"` (the server's launch witness, in the shape aterm-gui's

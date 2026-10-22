@@ -275,7 +275,8 @@ pub(crate) fn date_words(at_unix_ms: u64) -> String {
 
 /// Days since 1970-01-01 → proleptic-Gregorian `(year, month, day)` —
 /// Howard Hinnant's `civil_from_days`, on the non-negative half only.
-fn civil_from_days(days: u64) -> (u64, u64, u64) {
+#[inline]
+const fn civil_from_days(days: u64) -> (u64, u64, u64) {
     let z = days + 719_468;
     let era = z / 146_097;
     let doe = z - era * 146_097;
@@ -284,14 +285,15 @@ fn civil_from_days(days: u64) -> (u64, u64, u64) {
     let mp = (5 * doy + 2) / 153;
     let d = doy - (153 * mp + 2) / 5 + 1;
     let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    let y = yoe + era * 400 + u64::from(m <= 2);
+    let y = yoe + era * 400 + if m <= 2 { 1 } else { 0 };
     (y, m, d)
 }
 
 /// Proleptic-Gregorian `(year, month, day)` → days since 1970-01-01, the
 /// inverse of [`civil_from_days`] (Howard Hinnant's `days_from_civil`), on
 /// the non-negative half only.
-fn days_from_civil(year: u64, month: u64, day: u64) -> u64 {
+#[inline]
+const fn days_from_civil(year: u64, month: u64, day: u64) -> u64 {
     let y = if month <= 2 {
         year.saturating_sub(1)
     } else {

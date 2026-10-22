@@ -61,6 +61,70 @@ pub struct Spec {
     /// full. `Some` exactly when `durability` is [`Tier::Ordered`]
     /// ([`ORDERED_HORIZON_MS`] unless named).
     pub horizon_ms: Option<u64>,
+    /// Whether each world's broker RETAINS its log by aterm's default rules
+    /// (`retention=on`, what ships: `aterm_link::broker_rules::retain`, set at
+    /// every open as `aterm link broker` sets them) or keeps none
+    /// (`retention=off`: a broker from before astream's R4, the harness's
+    /// unretained open). Over an unretaining broker the bridge's `auto` mirror
+    /// stays off as well, so `retention=off` takes both away and [`Log`]
+    /// separates the two.
+    pub retention: bool,
+    /// The bridge's `--log` ([`Log`]): `auto`, what ships, or `off`.
+    pub log: Log,
+    /// How often the retaining broker's retention tick runs when no batch asks
+    /// for one sooner, in milliseconds (`retention_interval_ms=`, which the
+    /// bench hands `Broker::set_retention_interval` after the rules). `None`
+    /// keeps astream's minute, what ships. A world lives well under a minute
+    /// and the bench's bytes are far below every rule's bound, so without it
+    /// no tick lands in a measured window. Only on a retaining broker.
+    pub retention_interval_ms: Option<u64>,
+}
+
+/// The bridge's `--log` mode, as a run names it (`log=auto|off`): `auto`,
+/// what ships (session log step 6E-3, owner decision D4), mirrors the session
+/// logs' bus class onto the sessions' `ev` faces while the broker retains
+/// them; `off` mirrors nothing. The harness passes `--log off` on the bridge's
+/// `serve` line for `off`, and nothing for `auto`, the bridge's default.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Log {
+    #[default]
+    Auto,
+    Off,
+}
+
+impl Log {
+    /// The word [`parse`] reads, and the report prints.
+    #[must_use]
+    pub fn word(self) -> &'static str {
+        match self {
+            Log::Auto => "auto",
+            Log::Off => "off",
+        }
+    }
+
+    /// `auto` or `off`, and nothing else. Pure (unit-tested).
+    ///
+    /// # Errors
+    ///
+    /// Any other word, quoted.
+    pub fn parse(word: &str) -> Result<Log, String> {
+        match word {
+            "auto" => Ok(Log::Auto),
+            "off" => Ok(Log::Off),
+            _ => Err(format!("{ENV}: `log=` is `auto` or `off`, not `{word}`")),
+        }
+    }
+}
+
+/// `on` or `off`, for `retention=`. Pure (unit-tested through [`parse`]).
+fn on_off(word: &str) -> Result<bool, String> {
+    match word {
+        "on" => Ok(true),
+        "off" => Ok(false),
+        _ => Err(format!(
+            "{ENV}: `retention=` is `on` or `off`, not `{word}`"
+        )),
+    }
 }
 
 /// aterm's ordered horizon (`aterm_link::durability::ORDERED_HORIZON`, 100 ms),
@@ -154,15 +218,20 @@ impl Spec {
     pub fn words(&self) -> String {
         let attach: Vec<String> = self.attach.iter().map(usize::to_string).collect();
         let mut words = format!(
-            "samples={} warmup={} burst={} pingpong={} attach={} rounds={} durability={}",
+            "samples={} warmup={} burst={} pingpong={} attach={} rounds={} retention={} log={}",
             self.samples,
             self.warmup,
             self.burst,
             self.pingpong,
             attach.join(","),
             self.rounds,
-            self.durability.word()
+            if self.retention { "on" } else { "off" },
+            self.log.word()
         );
+        if let Some(ms) = self.retention_interval_ms {
+            words.push_str(&format!(" retention_interval_ms={ms}"));
+        }
+        words.push_str(&format!(" durability={}", self.durability.word()));
         if let Some(ms) = self.horizon_ms {
             words.push_str(&format!(" horizon_ms={ms}"));
         }
@@ -171,16 +240,17 @@ impl Spec {
 }
 
 /// Parse `out=<dir> [samples=<n>] [warmup=<n>] [burst=<n>] [pingpong=<n>]
-/// [attach=<n>,<n>,…] [rounds=<n>] [durability=strict|ordered|relaxed]
+/// [attach=<n>,<n>,…] [rounds=<n>] [retention=on|off] [log=auto|off]
+/// [retention_interval_ms=<n>] [durability=strict|ordered|relaxed]
 /// [horizon_ms=<n>]`. Pure (unit-tested).
 ///
 /// # Errors
 ///
 /// A word that is not one of those, a count that is not a positive integer
 /// (`warmup` and `horizon_ms` may be 0), a durability that is not a
-/// [`Tier`], a horizon for a tier that is not ordered, a burst past
-/// [`BURST_MAX`], an attach list that does not rise or passes [`ATTACH_MAX`],
-/// or no `out=`.
+/// [`Tier`], a horizon for a tier that is not ordered, a retention interval
+/// on a broker that does not retain, a burst past [`BURST_MAX`], an attach
+/// list that does not rise or passes [`ATTACH_MAX`], or no `out=`.
 pub fn parse(raw: &str) -> Result<Spec, String> {
     let mut out = None;
     let mut spec = Spec {
@@ -193,6 +263,9 @@ pub fn parse(raw: &str) -> Result<Spec, String> {
         rounds: DEFAULT_ROUNDS,
         durability: Tier::default(),
         horizon_ms: None,
+        retention: true,
+        log: Log::default(),
+        retention_interval_ms: None,
     };
     let count = |key: &str, v: &str, zero_ok: bool| -> Result<usize, String> {
         match v.parse::<usize>() {
@@ -215,6 +288,11 @@ pub fn parse(raw: &str) -> Result<Spec, String> {
             "pingpong" => spec.pingpong = count(key, v, false)?,
             "rounds" => spec.rounds = count(key, v, false)?,
             "durability" => spec.durability = Tier::parse(v)?,
+            "retention" => spec.retention = on_off(v)?,
+            "log" => spec.log = Log::parse(v)?,
+            "retention_interval_ms" => {
+                spec.retention_interval_ms = Some(count(key, v, false)? as u64);
+            }
             "horizon_ms" => {
                 spec.horizon_ms = Some(v.parse::<u64>().map_err(|_| {
                     format!("{ENV}: `horizon_ms=` takes a non-negative integer, not `{v}`")
@@ -239,6 +317,12 @@ pub fn parse(raw: &str) -> Result<Spec, String> {
                 tier.word()
             ));
         }
+    }
+    if spec.retention_interval_ms.is_some() && !spec.retention {
+        return Err(format!(
+            "{ENV}: retention_interval_ms= is a retaining broker's tick, and this run is \
+             retention=off"
+        ));
     }
     if spec.burst > BURST_MAX {
         return Err(format!(
@@ -286,6 +370,11 @@ mod tests {
             (Tier::Ordered, Some(ORDERED_HORIZON_MS)),
             "aterm opens its guarded broker ordered at its horizon (run.rs holds it to aterm's)"
         );
+        assert_eq!(
+            (spec.retention, spec.log, spec.retention_interval_ms),
+            (true, Log::Auto, None),
+            "what ships: the default rules at every open, the auto mirror, astream's minute"
+        );
         // The words it reports are the words that reproduce it.
         let again = parse(&format!("out=/tmp/x {}", spec.words())).expect("round trip");
         assert_eq!(again, spec);
@@ -324,6 +413,58 @@ mod tests {
             "out=",                // empty out
         ] {
             assert!(parse(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn retention_the_mirror_and_the_tick_are_named_and_reproduce() {
+        use super::*;
+
+        for (words, retention, log, every) in [
+            ("retention=on log=auto", true, Log::Auto, None),
+            ("retention=on log=off", true, Log::Off, None),
+            ("retention=off", false, Log::Auto, None),
+            ("retention=off log=off", false, Log::Off, None),
+            ("retention_interval_ms=1000", true, Log::Auto, Some(1000)),
+        ] {
+            let spec = parse(&format!("out=/o {words}")).expect(words);
+            assert_eq!(
+                (spec.retention, spec.log, spec.retention_interval_ms),
+                (retention, log, every),
+                "{words}"
+            );
+            // The report's words carry them, so an entry says which broker
+            // and which mirror it measured, and reproduces them.
+            let said = spec.words();
+            assert!(
+                said.contains(&format!(
+                    " retention={} log={}",
+                    if retention { "on" } else { "off" },
+                    log.word()
+                )),
+                "{said}"
+            );
+            assert_eq!(
+                parse(&format!("out=/o {said}")).expect("round trip"),
+                spec,
+                "{said}"
+            );
+        }
+        for bad in [
+            "retention=yes",
+            "retention=",
+            "log=turns",
+            "log=on",
+            "retention_interval_ms=0",
+            "retention_interval_ms=soon",
+            // A tick is a retaining broker's alone.
+            "retention=off retention_interval_ms=1000",
+        ] {
+            let err = parse(&format!("out=/o {bad}")).expect_err(bad);
+            assert!(
+                err.contains("retention") || err.contains("log="),
+                "{bad}: {err}"
+            );
         }
     }
 

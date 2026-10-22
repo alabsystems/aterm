@@ -23,6 +23,7 @@ use core::num::NonZeroU32;
 #[derive(Copy, Clone, Eq, PartialEq)]
 pub struct Error(NonZeroU32);
 
+#[inline]
 const fn internal_error(n: u16) -> Error {
     match NonZeroU32::new(Error::INTERNAL_START + n as u32) {
         Some(code) => Error(code),
@@ -87,6 +88,7 @@ impl Error {
     /// [`Error::ERRNO_NOT_POSITIVE`] for any other, [`Error::UNEXPECTED`] when
     /// it carries none.
     #[cfg(any(unix, windows))]
+    #[inline]
     pub(crate) fn from_io(err: &std::io::Error) -> Error {
         match err.raw_os_error() {
             Some(errno) => u32::try_from(errno)
@@ -113,11 +115,13 @@ fn os_description(errno: i32) -> Option<String> {
 
 /// Upstream has no OS text off Unix.
 #[cfg(not(unix))]
-fn os_description(_errno: i32) -> Option<String> {
+#[inline]
+const fn os_description(_errno: i32) -> Option<String> {
     None
 }
 
-fn internal_desc(error: Error) -> Option<&'static str> {
+#[inline]
+const fn internal_desc(error: Error) -> Option<&'static str> {
     match error {
         Error::UNSUPPORTED => Some("getrandom: this target is not supported"),
         Error::ERRNO_NOT_POSITIVE => Some("errno: did not return a positive value"),
@@ -173,6 +177,7 @@ impl fmt::Display for Error {
 }
 
 impl From<NonZeroU32> for Error {
+    #[inline]
     fn from(code: NonZeroU32) -> Self {
         Self(code)
     }

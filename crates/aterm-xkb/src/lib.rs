@@ -55,18 +55,21 @@ pub const INVALID: u32 = 0xffff_ffff;
 pub const NO_SYMBOL: Keysym = 0;
 
 /// Return `true` when `idx != INVALID`.
+#[inline]
 #[must_use]
 pub const fn is_valid_xkb_index(idx: u32) -> bool {
     idx != INVALID
 }
 
 /// Return `true` when `sym != NO_SYMBOL`.
+#[inline]
 #[must_use]
 pub const fn is_valid_keysym(sym: Keysym) -> bool {
     sym != NO_SYMBOL
 }
 
 /// Encode an XKB key event snapshot (`keycode`, `keysym`, `mods`, `layout`) into 16 LE bytes.
+#[inline]
 #[must_use]
 pub const fn encode_xkb_key_event_le(
     keycode: Keycode,
@@ -95,6 +98,7 @@ pub const fn encode_xkb_key_event_le(
 }
 
 /// Decode 16 LE bytes into an XKB key event snapshot (`keycode`, `keysym`, `mods`, `layout`).
+#[inline]
 #[must_use]
 pub const fn decode_xkb_key_event_le(bytes: [u8; 16]) -> (Keycode, Keysym, ModMask, LayoutIndex) {
     let kc = (bytes[0] as u32)

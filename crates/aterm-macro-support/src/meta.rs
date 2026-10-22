@@ -39,6 +39,7 @@ pub enum MetaKind {
 impl Meta {
     /// Whether the key is the single segment `name`, with no `::` before it
     /// (`::name` is another key).
+    #[inline]
     #[must_use]
     pub fn is(&self, name: &str) -> bool {
         self.leading_colon.is_none() && self.path.len() == 1 && self.path[0].to_string() == name
@@ -61,6 +62,7 @@ impl Meta {
     }
 
     /// The span of the key's first token: its leading `::` or first segment.
+    #[inline]
     #[must_use]
     pub fn first_span(&self) -> Span {
         self.leading_colon
@@ -69,6 +71,7 @@ impl Meta {
     }
 
     /// The span of the item's last token.
+    #[inline]
     #[must_use]
     pub fn last_span(&self) -> Span {
         match &self.kind {

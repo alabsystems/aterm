@@ -8,9 +8,9 @@
 //! (padded base64 of the signing key, `+`/`/` allowed, or URL-safe `-`/`_`) pins it.
 //!
 //! Every response body is bounded (`RequestBuilder::limit`, aterm-http's NET-6: an unbounded
-//! read is the client's default). One limit this module cannot set: aterm-http resolves a
-//! host name with `to_socket_addrs`, which the request's deadline does not bound, so a slow
-//! `.local` (mDNS) lookup can hold a request past `wait` until the resolver gives up.
+//! read is the client's default). aterm-http resolves a host on a helper and bounds the wait
+//! by the request's deadline. A slow `.local` (mDNS) resolver can outlive that wait: its helper
+//! is left to finish, not joined by the request.
 //!
 //! Errors name the scheme, host and path of a URL, never its query or fragment, and quote a
 //! server's refusal, or what went wrong talking to it, only as one line of at most 200

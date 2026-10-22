@@ -4381,28 +4381,22 @@ impl App {
                     birth: capture_rescan_birth(now, ws.pending_deco_birth.take(), windowless),
                     cursor: live_viewport.then_some(grid_cursor),
                 });
-        // One cat per caret: the predicate the companion emission below draws
-        // under, so a capture shows the same single cat the glass does — the
-        // flying head by its live rect, the pet by its live drawn body.
-        let companion_duty =
-            aterm_effects::companion::cursor_companion_duty(pet.on_glass, kitty_alpha, cur);
-        let companion_at = aterm_effects::companion::cursor_companion_on_glass(
-            companion_duty,
+        // One cat per caret: the companion routed before the word pass
+        // ([`crate::app_render::route_single_cursor_companion`]) and emitted
+        // after it, so a capture shows the same single cat the glass does —
+        // the flying head by its rect at its seat, the pet by its live drawn
+        // body.
+        let routed = crate::app_render::route_single_cursor_companion(
+            ws,
+            effect_geom,
             cur,
-            match companion_duty {
-                aterm_effects::companion::CompanionDuty::FlyingHead { cell } => {
-                    crate::app_render::flying_head_footprint_px(
-                        ws.fx.decos(),
-                        effect_geom,
-                        cell,
-                        cat_frame.render_look(),
-                        cat_frame.bob,
-                    )
-                }
-                _ => None,
-            },
-            pet.body_px,
+            &pet,
+            cat_frame,
+            animate_cat,
+            kitty_alpha,
+            now,
         );
+        let companion_at = routed.on_glass(cur, pet.body_px);
         // The capture tick shares the window's live effect state, so it keeps
         // app-present phase parity: the same cursor cell, selection view and
         // real focus (a capture never clobbers a focused window's armed blink
@@ -4514,15 +4508,13 @@ impl App {
         // companion nor supplies its palette/lifecycle.
         let default_bg = ws.input_scratch.default_bg;
         let cursor_color = ws.input_scratch.cursor_color;
-        let _ = crate::app_render::emit_single_cursor_companion(
+        let _ = crate::app_render::emit_routed_cursor_companion(
             ws,
             effect_geom,
-            cur,
             &pet,
             // A capture: never a spent hello (`emit_resident_pet`).
             false,
-            cat_frame,
-            animate_cat,
+            routed,
             kitty_alpha,
             now,
             !animate_cat,

@@ -76,7 +76,8 @@ pub enum MarkdownBlock {
 }
 
 impl MarkdownBlock {
-    pub fn source(&self) -> &Range<usize> {
+    #[inline]
+    pub const fn source(&self) -> &Range<usize> {
         match self {
             Self::Heading { source, .. }
             | Self::Paragraph { source, .. }
@@ -217,6 +218,7 @@ pub struct MarkdownLocation {
 }
 
 impl MarkdownLocation {
+    #[inline]
     pub const fn new(source_anchor: usize, visual_row: usize) -> Self {
         Self {
             source_anchor,
@@ -286,16 +288,19 @@ impl MarkdownHistory {
         self.entries.get(next).copied()
     }
 
+    #[inline]
     pub fn current(&self) -> Option<MarkdownLocation> {
         self.cursor
             .and_then(|cursor| self.entries.get(cursor))
             .copied()
     }
 
+    #[inline]
     pub fn can_back(&self) -> bool {
         self.cursor.is_some_and(|cursor| cursor > 0)
     }
 
+    #[inline]
     pub fn can_forward(&self) -> bool {
         self.cursor
             .is_some_and(|cursor| cursor.saturating_add(1) < self.entries.len())
@@ -646,11 +651,13 @@ pub struct InlineStyle {
 }
 
 impl InlineStyle {
-    fn is_plain(self) -> bool {
-        self == Self::default()
+    #[inline]
+    const fn is_plain(self) -> bool {
+        !self.strong && !self.emphasis && !self.strike && !self.code && !self.link
     }
 
-    fn merged(self, other: Self) -> Self {
+    #[inline]
+    const fn merged(self, other: Self) -> Self {
         Self {
             strong: self.strong || other.strong,
             emphasis: self.emphasis || other.emphasis,
@@ -694,6 +701,7 @@ pub fn inline_runs_in_range(
         .take_while(move |run| run.source.start < source.end)
 }
 
+#[inline]
 pub fn block_at_source(document: &MarkdownDocument, source_offset: usize) -> Option<usize> {
     document
         .blocks
@@ -704,6 +712,7 @@ pub fn block_at_source(document: &MarkdownDocument, source_offset: usize) -> Opt
 /// Heading owning the current source anchor. This is O(log n) and is shared by
 /// the wide outline, compact status, and command projection so they cannot
 /// disagree about the active section.
+#[inline]
 pub fn heading_at_source(document: &MarkdownDocument, source_offset: usize) -> Option<usize> {
     let next = document
         .outline
@@ -713,6 +722,7 @@ pub fn heading_at_source(document: &MarkdownDocument, source_offset: usize) -> O
 
 /// Resolve a parsed local `#anchor` without interpreting a path or touching the
 /// filesystem. Heading ids are parser-owned and deterministic.
+#[inline]
 pub fn local_anchor(document: &MarkdownDocument, destination: &str) -> Option<usize> {
     let id = destination.strip_prefix('#')?;
     if id.len() > 512 {
@@ -882,6 +892,7 @@ pub fn layout_visible_blocks(
 /// Number of reader rows in one block at the current measure. This is the
 /// canonical unit for wheel/page navigation and the typed Markdown painter's
 /// `visual_row` window.
+#[inline]
 pub fn block_visual_rows(block: &MarkdownBlock, viewport_width: f32) -> usize {
     block_visual_rows_for_height(block, estimated_block_height(block, viewport_width))
 }
@@ -889,6 +900,7 @@ pub fn block_visual_rows(block: &MarkdownBlock, viewport_width: f32) -> usize {
 /// The same row count from a height the caller has already measured. Splitting
 /// the arithmetic out keeps `estimated_block_height` — an O(block text) decode —
 /// to one call per block per layout pass; the arithmetic itself is unchanged.
+#[inline]
 fn block_visual_rows_for_height(block: &MarkdownBlock, height: f32) -> usize {
     let padding = block_visual_padding(block);
     ((height - padding).max(1.0) / block_visual_row_height(block))
@@ -896,7 +908,8 @@ fn block_visual_rows_for_height(block: &MarkdownBlock, height: f32) -> usize {
         .max(1.0) as usize
 }
 
-pub fn block_visual_row_height(block: &MarkdownBlock) -> f32 {
+#[inline]
+pub const fn block_visual_row_height(block: &MarkdownBlock) -> f32 {
     match block {
         MarkdownBlock::Heading { level, .. } => match level {
             1 => 38.0,
@@ -912,7 +925,8 @@ pub fn block_visual_row_height(block: &MarkdownBlock) -> f32 {
     }
 }
 
-fn block_visual_padding(block: &MarkdownBlock) -> f32 {
+#[inline]
+const fn block_visual_padding(block: &MarkdownBlock) -> f32 {
     match block {
         MarkdownBlock::Heading { level, .. } => {
             if *level == 1 {
@@ -1058,11 +1072,13 @@ pub fn move_block_anchor(document: &MarkdownDocument, source_anchor: usize, delt
 /// laid out nearly twice the column's width and painted past it, and its
 /// block was reserved half the rows it painted.
 #[must_use]
+#[inline]
 pub fn reader_columns(c: char) -> usize {
     aterm_grapheme::char_width(c).max(1)
 }
 
 /// [`reader_columns`] of each char of `text`, up to `limit` chars.
+#[inline]
 fn text_columns(text: &str, limit: usize) -> usize {
     text.chars().take(limit).map(reader_columns).sum()
 }
@@ -1283,12 +1299,14 @@ fn mask_source_range(masked: &mut Option<Vec<u8>>, source: &str, range: Range<us
     }
 }
 
+#[inline]
 fn find_ascii(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack
         .windows(needle.len())
         .position(|candidate| candidate == needle)
 }
 
+#[inline]
 fn ascii_run(bytes: &[u8], start: usize, marker: u8) -> usize {
     bytes[start..]
         .iter()
@@ -1296,6 +1314,7 @@ fn ascii_run(bytes: &[u8], start: usize, marker: u8) -> usize {
         .count()
 }
 
+#[inline]
 fn is_backslash_escaped(bytes: &[u8], index: usize) -> bool {
     bytes[..index]
         .iter()

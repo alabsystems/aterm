@@ -26,6 +26,7 @@ use crate::error::{Error, Result};
 /// # Errors
 /// Only from the `Serialize` impl itself — a map with a non-string key, or a
 /// type that reports its own failure.
+#[inline]
 pub fn to_vec<T: Serialize + ?Sized>(value: &T) -> Result<Vec<u8>> {
     let mut out = Vec::with_capacity(128);
     value.serialize(Serializer { out: &mut out })?;
@@ -36,6 +37,7 @@ pub fn to_vec<T: Serialize + ?Sized>(value: &T) -> Result<Vec<u8>> {
 ///
 /// # Errors
 /// As [`to_vec`].
+#[inline]
 pub fn to_string<T: Serialize + ?Sized>(value: &T) -> Result<String> {
     let bytes = to_vec(value)?;
     // Every byte the writer emits is either ASCII or a byte of a `&str` it was
@@ -79,6 +81,7 @@ pub(crate) fn write_json_string(out: &mut Vec<u8>, text: &str) {
     out.push(b'"');
 }
 
+#[inline]
 fn hex_nibble(v: u8) -> u8 {
     // `v <= 15` at every call (both arguments are masked or shifted), so the
     // lookup is in range; `get` keeps that local and the fallback is dead.
@@ -86,6 +89,7 @@ fn hex_nibble(v: u8) -> u8 {
 }
 
 /// Write an unsigned integer in decimal.
+#[inline]
 pub(crate) fn write_u128(out: &mut Vec<u8>, value: u128) {
     // u128 is at most 39 decimal digits.
     let mut buf = [0u8; 39];
@@ -107,6 +111,7 @@ pub(crate) fn write_u128(out: &mut Vec<u8>, value: u128) {
 }
 
 /// Write a signed integer in decimal.
+#[inline]
 pub(crate) fn write_i128(out: &mut Vec<u8>, value: i128) {
     if value < 0 {
         out.push(b'-');

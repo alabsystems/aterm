@@ -7,6 +7,7 @@
 
 use crate::lib::*;
 
+#[inline]
 pub fn from_bounds<I>(iter: &I) -> Option<usize>
 where
     I: Iterator,
@@ -14,20 +15,24 @@ where
     helper(iter.size_hint())
 }
 
-pub fn cautious<Element>(hint: Option<usize>) -> usize {
+#[inline]
+pub const fn cautious<Element>(hint: Option<usize>) -> usize {
     const MAX_PREALLOC_BYTES: usize = 1024 * 1024;
 
     if mem::size_of::<Element>() == 0 {
         0
     } else {
-        cmp::min(
-            hint.unwrap_or(0),
-            MAX_PREALLOC_BYTES / mem::size_of::<Element>(),
-        )
+        let h = match hint {
+            Some(v) => v,
+            None => 0,
+        };
+        let max = MAX_PREALLOC_BYTES / mem::size_of::<Element>();
+        if h < max { h } else { max }
     }
 }
 
-fn helper(bounds: (usize, Option<usize>)) -> Option<usize> {
+#[inline]
+const fn helper(bounds: (usize, Option<usize>)) -> Option<usize> {
     match bounds {
         (lower, Some(upper)) if lower == upper => Some(upper),
         _ => None,

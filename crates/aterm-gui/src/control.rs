@@ -4801,6 +4801,9 @@ fn dispatch_app_verb(
         // `card`: the harness card's constellation pin; a debug build pins
         // it, so two builds' cards can be compared pixel for pixel.
         "card" => crate::card_verb::cmd(proxy, rest),
+        // `aos`: the front window's momentum glow as an Aos task (attach, pause,
+        // repair, resume, detach, status, trace); a debug build only.
+        "aos" => crate::aos_verb::cmd(proxy, rest),
         // `security-posture`: where Settings ▸ Security's MACOS ACCESS block's
         // posture comes from; a development build's headless instance can stage
         // a named fixture.

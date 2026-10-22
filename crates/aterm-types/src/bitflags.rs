@@ -168,6 +168,7 @@ macro_rules! bitflags {
 
             // Union of all defined flag bits. Used for truncation.
             #[doc(hidden)]
+            #[inline]
             const fn __all_bits() -> $T {
                 0 $(| Self::$FLAG.bits)*
             }

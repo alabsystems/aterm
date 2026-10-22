@@ -61,9 +61,41 @@ pub(crate) fn take_for_first_window(wayland: bool) -> Option<String> {
     if wayland { tokens.wayland } else { tokens.x11 }
 }
 
+/// The startup id a program aterm opens for a person's press carries on X11: `_TIME<t>`,
+/// the newest press's server time (`aterm_window::platform::x11::user_time`). It is the id
+/// GTK calls fake: it names no launch sequence, only the time, and GTK presents a window
+/// with that time (`gtk_window_set_startup_id`). Firefox's remote hand-off passes it to the
+/// running browser. Without it a running browser presents with its own older user time,
+/// which mutter refuses; the tab opened behind aterm, marked "is ready" (the desk audit,
+/// GNOME 46 on Xorg, 2026-10-22). `None` before the first press, and off X11.
+pub(crate) fn launch_id() -> Option<String> {
+    aterm_window::platform::x11::user_time().map(|time| format!("_TIME{time}"))
+}
+
+/// `command` with [`launch_id`] in its environment as `DESKTOP_STARTUP_ID`, when there is one.
+pub(crate) fn for_a_press(mut command: aterm_uds::spawnfd::Command) -> aterm_uds::spawnfd::Command {
+    if let Some(id) = launch_id() {
+        command.env("DESKTOP_STARTUP_ID", id);
+    }
+    command
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An opener started after a press carries the press's time as its startup id.
+    /// Negative control: without [`for_a_press`]'s `env`, the variable is absent.
+    #[test]
+    fn an_opener_after_a_press_carries_its_time() {
+        aterm_window::platform::x11::note_user_time_for_test(5_678_901);
+        let opener = for_a_press(aterm_uds::spawnfd::command("xdg-open"));
+        let id = opener
+            .get_envs()
+            .find(|(key, _)| *key == "DESKTOP_STARTUP_ID")
+            .and_then(|(_, value)| value);
+        assert_eq!(id, Some(std::ffi::OsStr::new("_TIME5678901")));
+    }
 
     /// A launch token is one non-empty text value; an empty or non-UTF-8 one is none.
     #[test]

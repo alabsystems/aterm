@@ -289,6 +289,18 @@ pub struct Need {
     pub detail: Option<String>,
 }
 
+impl Need {
+    /// Whether it was OBSERVED, not claimed: raised by a record of its own
+    /// (a box, a wall, a run's failure), never by a `need` mark, which any
+    /// author can write. What `brief`'s session line names, and what a
+    /// bus reader's machine form names as the session's need (`aterm fabric
+    /// brief --json`, session log Phase 6 step 6E-6): one rule for both.
+    #[must_use]
+    pub fn observed(&self) -> bool {
+        self.src != Src::Mark && self.conf != Conf::Claim
+    }
+}
+
 /// A consumer's claim (`verdict`, `label`): attributed, never an
 /// observation.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -463,6 +475,13 @@ impl SessionState {
     #[must_use]
     pub fn top_need(&self) -> Option<&Need> {
         self.needs.iter().flatten().next()
+    }
+
+    /// The most urgent OBSERVED need ([`Need::observed`]): the one `brief`'s
+    /// session line names.
+    #[must_use]
+    pub fn top_observed_need(&self) -> Option<&Need> {
+        self.needs.iter().flatten().find(|n| n.observed())
     }
 
     /// The open run.
@@ -1746,6 +1765,45 @@ pub fn clause_of_proven(st: &SessionState, now_wall: u64) -> Option<Clause> {
     clause_with(st, now_wall, shown_proven_label)
 }
 
+/// THE NEED ROW'S WORDS (§7.3): what the clause says of a need `word` with
+/// its `detail` (a wall's reset, a failure's exit code), and its tone —
+/// `approval · bash`, `limit · 3pm`, `failed · exit 2` — or `None` for a
+/// word the clause gives no row (it reads on to the label and the open
+/// path). The clause's own need row, and what a bus reader shows of a
+/// remote session's need (the Overview's "On the fabric" group, session log
+/// Phase 6 step 6E-7): one rendering for both.
+#[must_use]
+pub fn need_words(word: &str, detail: Option<&str>) -> Option<(Words, Tone)> {
+    match word {
+        w if w.starts_with("approval:") => Some((
+            Words::fit("approval", w.trim_start_matches("approval:")),
+            Tone::Attention,
+        )),
+        "question" => Some((Words::fit("question", ""), Tone::Attention)),
+        "wall:auth" => Some((Words::fit("logged out", ""), Tone::Attention)),
+        w if w.starts_with("wall:") => {
+            let kind = WallKind::from_name(w);
+            if kind.is_some_and(WallKind::is_limit) {
+                Some((Words::fit("limit", detail.unwrap_or("")), Tone::Attention))
+            } else {
+                Some((
+                    Words::fit("wall", w.trim_start_matches("wall:")),
+                    Tone::Attention,
+                ))
+            }
+        }
+        "unresponsive" => Some((Words::fit("not responding", ""), Tone::Attention)),
+        "failure" => {
+            let words = match detail {
+                Some(code) => Words::fit("failed", &format!("exit {code}")),
+                None => Words::fit("failed", ""),
+            };
+            Some((words, Tone::Failed))
+        }
+        _ => None,
+    }
+}
+
 /// The clause policy over the label rule `label`.
 fn clause_with(
     st: &SessionState,
@@ -1770,41 +1828,10 @@ fn clause_with(
         row,
         head: Words::fit(subject, ""),
     };
-    if let Some(n) = st.top_need() {
-        let found = match n.word {
-            w if w.starts_with("approval:") => Some((
-                Words::fit("approval", w.trim_start_matches("approval:")),
-                Tone::Attention,
-            )),
-            "question" => Some((Words::fit("question", ""), Tone::Attention)),
-            "wall:auth" => Some((Words::fit("logged out", ""), Tone::Attention)),
-            w if w.starts_with("wall:") => {
-                let kind = WallKind::from_name(w);
-                if kind.is_some_and(WallKind::is_limit) {
-                    Some((
-                        Words::fit("limit", n.detail.as_deref().unwrap_or("")),
-                        Tone::Attention,
-                    ))
-                } else {
-                    Some((
-                        Words::fit("wall", w.trim_start_matches("wall:")),
-                        Tone::Attention,
-                    ))
-                }
-            }
-            "unresponsive" => Some((Words::fit("not responding", ""), Tone::Attention)),
-            "failure" => {
-                let words = match n.detail.as_deref() {
-                    Some(code) => Words::fit("failed", &format!("exit {code}")),
-                    None => Words::fit("failed", ""),
-                };
-                Some((words, Tone::Failed))
-            }
-            _ => None,
-        };
-        if let Some((words, tone)) = found {
-            return Some(mk(words, age(n.t), tone, n.by));
-        }
+    if let Some(n) = st.top_need()
+        && let Some((words, tone)) = need_words(n.word, n.detail.as_deref())
+    {
+        return Some(mk(words, age(n.t), tone, n.by));
     }
     if let Some(l) = label(st, now_wall)
         && let Some(text) = &l.text

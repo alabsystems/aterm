@@ -43,7 +43,8 @@ pub enum Op {
 impl Op {
     /// The stable wire token (e.g. for the ctl `grant <src> <op>` verb).
     #[must_use]
-    pub fn as_str(self) -> &'static str {
+    #[inline]
+    pub const fn as_str(self) -> &'static str {
         match self {
             Op::ReadScreen => "read-screen",
             Op::WriteInput => "write-input",
@@ -56,6 +57,7 @@ impl Op {
 
     /// Parse the wire token. Unknown strings return `None` (fail closed).
     #[must_use]
+    #[inline]
     pub fn parse(s: &str) -> Option<Op> {
         match s {
             "read-screen" => Some(Op::ReadScreen),
@@ -70,18 +72,21 @@ impl Op {
 
     /// Whether `self` is part of the standard human-seat vocabulary (`ReadScreen`, `WriteInput`, `Signal`).
     #[must_use]
+    #[inline]
     pub const fn is_human_seat_op(self) -> bool {
         matches!(self, Op::ReadScreen | Op::WriteInput | Op::Signal)
     }
 
     /// Whether `self` is an elevated authority never minted by [`ConnectionKind`].
     #[must_use]
+    #[inline]
     pub const fn is_elevated_op(self) -> bool {
         matches!(self, Op::ConfigWrite | Op::ClipboardWrite | Op::DeriveLoop)
     }
 
     /// Whether `self` mutates or signals the destination session (`!ReadScreen`).
     #[must_use]
+    #[inline]
     pub const fn mutates_destination(self) -> bool {
         !matches!(self, Op::ReadScreen)
     }
@@ -109,6 +114,7 @@ impl ConnectionKind {
     /// The exact ops this kind mints; [`EdgeTable::grant_connection`] draws only
     /// from these.
     #[must_use]
+    #[inline]
     pub const fn ops(&self) -> &'static [Op] {
         match self {
             ConnectionKind::Pull => &[Op::ReadScreen],
@@ -119,6 +125,7 @@ impl ConnectionKind {
 
     /// Number of [`Op`]s granted by this connection kind (`1`, `2`, or `3`).
     #[must_use]
+    #[inline]
     pub const fn op_count(self) -> usize {
         match self {
             ConnectionKind::Pull => 1,
@@ -129,18 +136,21 @@ impl ConnectionKind {
 
     /// Whether this connection kind includes read-screen (`Pull` or `Both`).
     #[must_use]
+    #[inline]
     pub const fn includes_pull(self) -> bool {
         matches!(self, ConnectionKind::Pull | ConnectionKind::Both)
     }
 
     /// Whether this connection kind includes write-input + signal (`Push` or `Both`).
     #[must_use]
+    #[inline]
     pub const fn includes_push(self) -> bool {
         matches!(self, ConnectionKind::Push | ConnectionKind::Both)
     }
 
     /// Whether this connection kind grants `op`.
     #[must_use]
+    #[inline]
     pub const fn grants_op(self, op: Op) -> bool {
         match self {
             ConnectionKind::Pull => matches!(op, Op::ReadScreen),
@@ -169,13 +179,15 @@ pub struct EdgeToken([u8; 32]);
 impl EdgeToken {
     /// Wrap raw token bytes (e.g. a token the launcher provisioned out-of-band).
     #[must_use]
-    pub fn from_bytes(b: [u8; 32]) -> Self {
+    #[inline]
+    pub const fn from_bytes(b: [u8; 32]) -> Self {
         Self(b)
     }
 
     /// The raw token bytes.
     #[must_use]
-    pub fn as_bytes(&self) -> &[u8; 32] {
+    #[inline]
+    pub const fn as_bytes(&self) -> &[u8; 32] {
         &self.0
     }
 
@@ -415,12 +427,14 @@ impl EdgeTable {
 
     /// Number of live edges.
     #[must_use]
+    #[inline]
     pub fn len(&self) -> usize {
         self.rows.len()
     }
 
     /// Whether the table holds no edges.
     #[must_use]
+    #[inline]
     pub fn is_empty(&self) -> bool {
         self.rows.is_empty()
     }
@@ -438,7 +452,8 @@ pub enum EdgeDecision {
 impl EdgeDecision {
     /// Whether the decision permits the action.
     #[must_use]
-    pub fn is_permitted(self) -> bool {
+    #[inline]
+    pub const fn is_permitted(self) -> bool {
         matches!(self, EdgeDecision::Permit)
     }
 }

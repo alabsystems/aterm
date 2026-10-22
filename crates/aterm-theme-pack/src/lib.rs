@@ -88,14 +88,16 @@ pub struct Collection {
 include!(concat!(env!("OUT_DIR"), "/pack.rs"));
 
 /// Every pack theme, sorted by id ignoring ASCII case.
+#[inline]
 #[must_use]
-pub fn themes() -> &'static [PackTheme] {
+pub const fn themes() -> &'static [PackTheme] {
     THEMES
 }
 
 /// The pack theme `id` names, ignoring ASCII case (as the catalog does):
 /// by its id, else by the name the chooser shows it under (no id or name
 /// answers for two themes; the build refuses that).
+#[inline]
 #[must_use]
 #[allow(clippy::manual_find)]
 pub fn find(id: &str) -> Option<&'static PackTheme> {
@@ -114,6 +116,7 @@ pub fn find(id: &str) -> Option<&'static PackTheme> {
 
 /// For an id a release shipped that has left the pack, the theme standing
 /// for it now (a pack id or a built-in), ignoring ASCII case.
+#[inline]
 #[must_use]
 pub fn withdrawn(id: &str) -> Option<&'static str> {
     for &(gone, theme) in WITHDRAWN {
@@ -125,6 +128,7 @@ pub fn withdrawn(id: &str) -> Option<&'static str> {
 }
 
 /// The text of the licence file `file` (`LICENSES/…`), if the pack has it.
+#[inline]
 #[must_use]
 pub fn licence_text(file: &str) -> Option<&'static str> {
     for &(name, text) in LICENCES {
@@ -136,25 +140,29 @@ pub fn licence_text(file: &str) -> Option<&'static str> {
 }
 
 /// Every licence file the pack embeds, `(path, text)`, sorted by path.
+#[inline]
 #[must_use]
-pub fn licences() -> &'static [(&'static str, &'static str)] {
+pub const fn licences() -> &'static [(&'static str, &'static str)] {
     LICENCES
 }
 
 /// Where the pack's upstream files come from.
+#[inline]
 #[must_use]
-pub fn collection() -> &'static Collection {
+pub const fn collection() -> &'static Collection {
     &COLLECTION
 }
 
 impl PackTheme {
     /// Return `true` when this theme declares a companion theme for the opposite appearance.
+    #[inline]
     #[must_use]
     pub const fn has_pair(&self) -> bool {
         self.pair.is_some()
     }
 
     /// Return the number of licence files carried by this theme.
+    #[inline]
     #[must_use]
     pub const fn licence_file_count(&self) -> usize {
         self.licence_files.len()
@@ -162,6 +170,7 @@ impl PackTheme {
 }
 
 /// Encode a theme pack entry summary (`id_hash`, `text_len`, `licence_count`) into 16 LE bytes.
+#[inline]
 #[must_use]
 pub const fn encode_theme_descriptor_le(
     id_hash: u64,
@@ -189,6 +198,7 @@ pub const fn encode_theme_descriptor_le(
 }
 
 /// Decode 16 LE bytes into a theme pack entry summary (`id_hash`, `text_len`, `licence_count`).
+#[inline]
 #[must_use]
 pub const fn decode_theme_descriptor_le(bytes: [u8; 16]) -> (u64, u32, u32) {
     let id_hash = (bytes[0] as u64)
@@ -213,6 +223,7 @@ pub const fn decode_theme_descriptor_le(bytes: [u8; 16]) -> (u64, u32, u32) {
 /// The licence file for a built-in port's source `project`: by the build's
 /// rule, `LICENSES/<spdx>-<repo>.txt`, checked to exist and embedded at build
 /// time for every built-in's source.
+#[inline]
 #[must_use]
 pub fn port_licence_file(project: &str) -> Option<&'static str> {
     for &(name, file) in PORTS {
@@ -409,6 +420,7 @@ pub enum PackState {
 }
 
 /// Where `theme` stands in the themes folder `dir`.
+#[inline]
 #[must_use]
 pub fn state_in(dir: &Path, theme: &PackTheme) -> PackState {
     standing(dir, theme).0

@@ -655,6 +655,24 @@ impl Window {
     #[inline]
     pub fn focus_window(&self) {}
 
+    /// Raise and focus the window with an activation token another client handed over (a
+    /// notification server's click): `xdg_activation_v1.activate`, which the compositor
+    /// honours for a token it issued for a recent user action. Nothing without the
+    /// activation global, as [`Self::focus_window`] does nothing.
+    pub fn focus_window_with_activation_token(&self, token: &str) {
+        let Some(xdg_activation) = self.xdg_activation.as_ref() else {
+            return;
+        };
+        // SAFETY: the live activation global and this window's live surface.
+        unsafe {
+            xdg_activation_v1::activate(
+                xdg_activation.proxy(),
+                &protocol_string(token),
+                self.surface,
+            )
+        };
+    }
+
     #[inline]
     pub fn current_monitor(&self) -> Option<MonitorHandle> {
         self.window_state.lock().unwrap().outputs.first().cloned().map(MonitorHandle::new)

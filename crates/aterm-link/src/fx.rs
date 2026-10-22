@@ -409,11 +409,15 @@ pub(crate) enum Write<'a> {
 
 impl Disk {
     /// About to make `w`. Live, `Ok`. Simulated: a dead process's write is
-    /// refused (it made none), and a kill may land here, before the write.
+    /// refused (it made none), a kill may land here, before the write, and
+    /// the device may fail it with nothing made (`crate::sim::device`'s write
+    /// errors: `EIO` or `ENOSPC` on the write, the rename, the flush or the
+    /// unlink).
     ///
     /// # Errors
     ///
-    /// The simulated refusal of a write by a process that is gone.
+    /// The simulated refusal of a write by a process that is gone, or a
+    /// simulated write error.
     pub(crate) fn before(&self, w: Write<'_>) -> io::Result<()> {
         match self {
             Disk::Os => {
@@ -425,12 +429,21 @@ impl Disk {
         }
     }
 
-    /// `w` was made, and returned `Ok`. Live, nothing. Simulated, the device
-    /// journals it, and a kill may land here, after the write.
-    pub(crate) fn after(&self, w: Write<'_>) {
+    /// `w` was made, and returned `Ok`. Live, `Ok`: nothing. Simulated, the
+    /// device journals it, and a kill may land here, after the write — or the
+    /// device says the write's LAST STEP failed after its effect was made
+    /// (`crate::sim::device`'s write errors: a durable replace whose rename
+    /// was made and whose directory flush failed, an append that wrote part
+    /// of its line), and the dir returns that error as the real call would.
+    ///
+    /// # Errors
+    ///
+    /// The simulated failure of a write's last step, after its effect.
+    pub(crate) fn after(&self, w: Write<'_>) -> io::Result<()> {
         match self {
             Disk::Os => {
                 let _ = w;
+                Ok(())
             }
             #[cfg(test)]
             Disk::Sim(p) => p.disk_after(w),

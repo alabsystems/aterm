@@ -66,7 +66,7 @@ impl<'a> Table<'a> {
 
     /// Returns the number of offsets.
     #[inline]
-    pub fn len(&self) -> u16 {
+    pub const fn len(&self) -> u16 {
         match self {
             Table::Short(array) => array.len(),
             Table::Long(array) => array.len(),
@@ -74,7 +74,8 @@ impl<'a> Table<'a> {
     }
 
     /// Checks if there are any offsets.
-    pub fn is_empty(&self) -> bool {
+    #[inline]
+    pub const fn is_empty(&self) -> bool {
         self.len() == 0
     }
 

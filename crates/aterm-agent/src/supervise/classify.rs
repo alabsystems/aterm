@@ -15,7 +15,10 @@
 //! read back from the raw words (`system(…)`, `s///w file`). A program word is judged only at
 //! a segment head: `grep -rn open src` is a read, `open src` is not. Wrappers (`xargs`,
 //! `env`, `timeout`) are seen through; `&` ends a segment like `;`; the name behind a
-//! redirect (`2>/dev/null rm x`) or zsh's `-` modifier (`- rm x`) is a head. Flags by which a
+//! redirect (`2>/dev/null rm x`) or zsh's `-` modifier (`- rm x`) is a head. A reserved word is
+//! a keyword only where a command begins: behind an assignment, a redirect, a wrapper or `time`
+//! it is a program's name (`X=1 if true` runs a program `if`, and so does `ls | time if true`,
+//! where `time` is `/usr/bin/time`; [`skip_prefixes_at`]). Flags by which a
 //! read tool runs a program or writes a file (`git -c`, `rg --pre`, `sort
 //! --compress-program`, `printf -v`, `date -s`, …) and assignments that change a later
 //! program (`PATH=`, `GIT_*=`, `HOME=`) are refused wherever they sit.
@@ -41,7 +44,9 @@
 //! zsh evaluates as arithmetic (`printf`'s arguments under a numeric format, `-t`'s operand,
 //! an `export -i`/`-E`/`-F` value, a value of one of [`ZSH_ARITHMETIC_VARS`]) must be a plain
 //! number ([`arithmetic_scan`]), and a `test`/`[` word that may brace-expand or glob into
-//! `-t` is refused.
+//! `-t` is refused. An arithmetic evaluation itself (`$((…))`, `((…))`, `$[…]`, `let`, `[[ …
+//! -eq … ]]`) is refused whole: it assigns any variable (`$((x=1,PATH=0))`) and evaluates a
+//! value's subscript in bash too ([`ARITHMETIC_RUNS`]).
 //!
 //! This judges one reading of a line. A screen-read command whose rows were joined with
 //! spaces differs from the one the shell runs, so the caller classifies both readings and
@@ -49,7 +54,9 @@
 //! zsh 5.9 and bash 3.2 read them under default options, with no alias or function. Claude
 //! Code's Bash tool replays the person's shell startup first, so the approval rule also
 //! reads that startup (`supervise::policy::shell_startup`) and, where the shell may be zsh,
-//! requires a plain line ([`plain_zsh_line`]): a positive grammar that admits no expansion.
+//! requires a plain line ([`plain_zsh_line`]): a positive grammar that admits no expansion but a
+//! plain parameter read (`$NAME`, `${NAME}`) and a command substitution over a plain line, the
+//! forms zsh expands no further than bash (MEASURED 2026-10-22).
 
 /// The verdict on one command line: `read_only`, and `reason` naming the rule
 /// (token or segment head) that decided it, so a supervisor's notes say why.
@@ -122,6 +129,17 @@ const GLOB_QUALIFIER_RUNS: &str =
 /// qualifier runs a command (`N='/(e:print -u2 X:)'; echo $~N`). Refused
 /// inside double quotes too.
 const GLOB_SUBST_RUNS: &str = "zsh's $~ flag (the value is globbed as a pattern, and a qualifier `(e:…:)` in it runs a command)";
+
+/// Why an arithmetic evaluation, `$((…))` or the `((…))` command, is no read:
+/// bash and zsh assign any variable in it, the second and later of a list too,
+/// and evaluate a variable's value as arithmetic, whose subscript runs a
+/// substitution. MEASURED, bash 3.2 with a `./0/ls`: `echo $((x=1,PATH=0));
+/// ls` and `(( x=1,PATH=0 )); ls` ran it (`PATH` is `0`), and `ls='a[$(touch
+/// M)]'; echo $((ls))` made `M`; `$((ls) )` too was arithmetic. The segment
+/// readers saw a subshell running `x=1,PATH=0` (an assignment to `x`) or `ls`.
+/// Refused whole, wherever it stands, as `$[…]`, `let` and `[[ … -eq … ]]` are.
+const ARITHMETIC_RUNS: &str = "an arithmetic evaluation ($((…)) or ((…)): it may assign any variable, PATH among \
+     them, and a value's subscript runs a substitution)";
 
 /// The python scripts run as reads when no `--allow-python` glob is given:
 /// none. A script's name is no evidence of what it does; a project names its
@@ -477,31 +495,53 @@ pub(crate) fn classify_except_rm<S: AsRef<str>>(cmd: &str, python_allow: &[S]) -
     }
 }
 
-/// `Ok` when `line` is plain: written only in the part of zsh's grammar that expands nothing,
-/// so no zsh form this module has not measured can hide in it. `approve = "safe"`'s read-only
-/// rule requires this of a line the Bash tool may run under zsh ([`classify_command_with`]
-/// refuses the forms it knows; this admits only what cannot be one).
+/// `Ok` when `line` is plain: written only in the part of zsh's grammar whose expansions behave
+/// as text or as a plain command substitution under the modelled startup (zsh 5.9 at its
+/// default options, `NO_EXTENDED_GLOB` and `NO_BARE_GLOB_QUAL` as Claude Code's Bash tool sets
+/// them, and only the options `supervise::policy::shell_startup` reads as inert), so no zsh form
+/// this module has not measured can hide in it. `approve = "safe"`'s read-only rules require this
+/// of a line the Bash tool may run under zsh ([`classify_command_with`] judges what each command
+/// does; this admits only forms zsh expands no further than bash does).
 ///
 /// A list of simple commands: no reserved word opens one ([`ZSH_RESERVED`]: `for path in …`
 /// assigns zsh's tied `path`, `repeat` evaluates arithmetic), behind a leading redirect too
-/// (`2>/dev/null for …` is the loop). Outside single quotes: no `$`, backtick, backslash,
-/// `(`, `)`, `{`, `}` or `[[`; no word opening with `=`, and no `=` in a word that is not a
-/// flag; a `~` only as `~` or `~/…`; a `<` only as a plain input redirect; a `>` only onto
-/// `/dev/null` or a descriptor; no control character. Inside double quotes: no `$`, backtick
-/// or backslash. A `#` that opens a word comments to the end of its line. `Err` names the
+/// (`2>/dev/null for …` is the loop). Outside single quotes: no backtick, backslash, `(`, `)`,
+/// `{`, `}` or `[[`; a `$` only as [`plain_dollar`] admits it (`$NAME`, `${NAME}`, or `$(…)` over
+/// a plain line); no word opening with `=`, and no `=` in a word that is not a flag; a `~` only
+/// as `~` or `~/…`; a `<` only as a plain input redirect; a `>` only onto `/dev/null` or a
+/// descriptor; no control character. Inside double quotes: no backtick or backslash, and a `$`
+/// only as outside them. A `#` that opens a word comments to the end of its line. `Err` names the
 /// first thing that is not plain.
+///
+/// MEASURED 2026-10-22 against `/bin/zsh` 5.9 run as the Bash tool runs it
+/// (`docs/measured/breaker-transcript-and-zsh-2026-10-22.md`): an unquoted `$x` or `${x}` is
+/// neither split nor globbed (bash does both), a `$(…)` is split and not globbed (bash globs too),
+/// and quoted each is one word, so each yields no more than bash's reading of it, which the
+/// classifier judges. The forms zsh evaluates further stay refused: `${(e)x}` and every `${…}`
+/// flag or operator, `$x[…]` (its subscript is arithmetic: `$x[PATH=0]` assigned `PATH`, quoted
+/// too), `$x:h` and the other modifiers, `$=x`, `$~x`, `$^x`, `$((…))`, `=cmd`.
 pub(crate) fn plain_zsh_line(line: &str) -> Result<(), String> {
+    let chars: Vec<char> = line.chars().collect();
+    plain_zsh(&chars, 0)
+}
+
+/// How deep [`plain_dollar`] follows a `$(…)` inside a `$(…)`.
+const PLAIN_NEST: u8 = 8;
+
+/// [`plain_zsh_line`] over `chars`, `depth` command substitutions in: inside one (`depth > 0`) a
+/// newline and a comment are refused too, so its `)` is the one zsh closes it with (a `#` opens a
+/// comment inside `$(…)` that can hide a `)` from this reader).
+fn plain_zsh(chars: &[char], depth: u8) -> Result<(), String> {
     #[derive(PartialEq)]
     enum Quote {
         None,
         Single,
         Double,
     }
-    let chars: Vec<char> = line.chars().collect();
     let boundary = |c: Option<&char>| c.is_none_or(|c| " \t\n;|&".contains(*c));
     let mut quote = Quote::None;
-    // The current word's unquoted text, whether a quote has opened in it,
-    // whether it is a `<` redirect's target, and whether it stands where a
+    // The current word's unquoted text (a `$` for each expansion in it), whether a quote has
+    // opened in it, whether it is a `<` redirect's target, and whether it stands where a
     // command's first word does.
     let mut word = String::new();
     let mut quoted = false;
@@ -529,6 +569,9 @@ pub(crate) fn plain_zsh_line(line: &str) -> Result<(), String> {
         if c.is_control() && c != '\t' && c != '\n' {
             return Err(format!("the control character `{}`", c.escape_default()));
         }
+        if depth > 0 && c == '\n' && quote == Quote::None {
+            return Err("a newline inside `$(…)`".into());
+        }
         match quote {
             Quote::Single => {
                 if c == '\'' {
@@ -537,7 +580,11 @@ pub(crate) fn plain_zsh_line(line: &str) -> Result<(), String> {
             }
             Quote::Double => match c {
                 '"' => quote = Quote::None,
-                '$' | '`' | '\\' => return Err(format!("`{c}` inside double quotes")),
+                '$' => {
+                    i = plain_dollar(chars, i, depth)?;
+                    continue;
+                }
+                '`' | '\\' => return Err(format!("`{c}` inside double quotes")),
                 _ => {}
             },
             Quote::None => match c {
@@ -546,12 +593,20 @@ pub(crate) fn plain_zsh_line(line: &str) -> Result<(), String> {
                 ' ' | '\t' => end_word(&mut word, &mut quoted, &mut target, false)?,
                 '\n' | ';' | '|' | '&' => end_word(&mut word, &mut quoted, &mut target, true)?,
                 '#' if at_start => {
+                    if depth > 0 {
+                        return Err("a comment inside `$(…)`".into());
+                    }
                     while i < chars.len() && chars[i] != '\n' {
                         i += 1;
                     }
                     continue;
                 }
-                '$' | '`' | '\\' | '(' | ')' | '{' | '}' => return Err(format!("`{c}`")),
+                '$' => {
+                    i = plain_dollar(chars, i, depth)?;
+                    word.push('$');
+                    continue;
+                }
+                '`' | '\\' | '(' | ')' | '{' | '}' => return Err(format!("`{c}`")),
                 '[' if at_start && chars.get(i + 1) == Some(&'[') => return Err("`[[`".into()),
                 '=' if at_start => return Err("a word opening with `=`".into()),
                 '=' if !word.starts_with('-') => return Err(format!("the assignment `{word}=`")),
@@ -605,6 +660,84 @@ pub(crate) fn plain_zsh_line(line: &str) -> Result<(), String> {
         return Err("an unterminated quote".into());
     }
     end_word(&mut word, &mut quoted, &mut target, true)
+}
+
+/// The index past the `$` form at `chars[at]` (a `$`) where zsh expands it plainly, quoted or
+/// not: a parameter read `$NAME` or `${NAME}` (an ASCII name, a letter or `_` first), or a
+/// command substitution `$(…)` whose text is itself plain ([`plain_zsh`], one level deeper:
+/// what it runs is the classifier's to judge). After either, no `[` (a subscript, arithmetic
+/// under zsh), `:` (a modifier), `(` (a qualifier) or `{`, and no character outside ASCII (zsh
+/// may read it as more of the name). Every other form is refused: `$((…))`, a special
+/// parameter (`$1`, `$#`, `$$`, `$?`, `$@` …), a flag (`$=x`, `$~x`, `$^x`, `${(e)x}`), any other
+/// `${…}`, `$'…'` and `$"…"`.
+fn plain_dollar(chars: &[char], at: usize, depth: u8) -> Result<usize, String> {
+    let name_from = |from: usize| -> Option<usize> {
+        let first = chars.get(from)?;
+        if !(first.is_ascii_alphabetic() || *first == '_') {
+            return None;
+        }
+        Some(
+            (from..chars.len())
+                .find(|&k| !(chars[k].is_ascii_alphanumeric() || chars[k] == '_'))
+                .unwrap_or(chars.len()),
+        )
+    };
+    let end = match chars.get(at + 1) {
+        Some('(') if chars.get(at + 2) == Some(&'(') => {
+            return Err("an arithmetic `$((`".into());
+        }
+        Some('(') => {
+            if depth >= PLAIN_NEST {
+                return Err("command substitutions nested too deep".into());
+            }
+            let close = substitution_close(chars, at + 2, 0)?;
+            plain_zsh(&chars[at + 2..close], depth + 1)
+                .map_err(|why| format!("inside `$(…)`: {why}"))?;
+            close + 1
+        }
+        Some('{') => match name_from(at + 2) {
+            Some(end) if chars.get(end) == Some(&'}') => end + 1,
+            _ => return Err("a `${…}` other than `${NAME}`".into()),
+        },
+        _ => name_from(at + 1)
+            .ok_or_else(|| "a `$` other than `$NAME`, `${NAME}` or `$(…)`".to_string())?,
+    };
+    match chars.get(end) {
+        Some(c) if !c.is_ascii() || "[:({".contains(*c) => Err(format!(
+            "`{c}` right after an expansion (a subscript, a modifier or a qualifier under zsh)"
+        )),
+        _ => Ok(end),
+    }
+}
+
+/// The index of the `)` that closes the `$(` whose text starts at `from`: the first `)` outside
+/// quotes and outside any `$(…)` within, `nested` deep. A backtick, a backslash or a `$((`
+/// anywhere in it, or no `)`, is refused (each also fails [`plain_zsh`] on the text).
+fn substitution_close(chars: &[char], from: usize, nested: u8) -> Result<usize, String> {
+    if nested >= PLAIN_NEST {
+        return Err("command substitutions nested too deep".into());
+    }
+    let mut quote: Option<char> = None;
+    let mut k = from;
+    while k < chars.len() {
+        let c = chars[k];
+        match (quote, c) {
+            (Some('\''), '\'') | (Some('"'), '"') => quote = None,
+            (Some('\''), _) => {}
+            (_, '`' | '\\') => return Err(format!("`{c}` inside `$(…)`")),
+            (_, '$') if chars.get(k + 1) == Some(&'(') => {
+                if chars.get(k + 2) == Some(&'(') {
+                    return Err("an arithmetic `$((`".into());
+                }
+                k = substitution_close(chars, k + 2, nested + 1)?;
+            }
+            (None, '\'' | '"') => quote = Some(c),
+            (None, ')') => return Ok(k),
+            _ => {}
+        }
+        k += 1;
+    }
+    Err("a `$(` with no `)`".into())
 }
 
 /// zsh 5.9's reserved words (`reswords`, `{`, `}` and `[[` aside, which a
@@ -808,6 +941,9 @@ impl Prelex {
                     self.double_quoted()?;
                 }
                 '$' if self.peek(1) == Some('{') => self.braced_parameter()?,
+                '$' if self.peek(1) == Some('(') && self.peek(2) == Some('(') => {
+                    return Err(ARITHMETIC_RUNS.to_string());
+                }
                 '$' if self.peek(1) == Some('(') => {
                     self.out.push_str("$(");
                     self.i += 2;
@@ -827,6 +963,9 @@ impl Prelex {
                 }
                 '(' if self.glued_paren() => {
                     return Err(GLOB_QUALIFIER_RUNS.to_string());
+                }
+                '(' if self.peek(1) == Some('(') => {
+                    return Err(ARITHMETIC_RUNS.to_string());
                 }
                 '(' => {
                     depth += 1;
@@ -906,6 +1045,9 @@ impl Prelex {
                     self.out.push(d);
                     self.i += 1;
                     return Ok(());
+                }
+                '$' if self.peek(1) == Some('(') && self.peek(2) == Some('(') => {
+                    return Err(ARITHMETIC_RUNS.to_string());
                 }
                 '$' if self.peek(1) == Some('(') => {
                     self.out.push_str("$(");
@@ -2252,7 +2394,7 @@ const XARGS_VALUE_FLAGS: &[&str] = &[
 /// The positive filter on one segment: `None` when its head is a read-only
 /// program (with the git / tmutil / python refinements), else the reason.
 fn segment_head<S: AsRef<str>>(seg: &[String], python_allow: &[S]) -> Option<String> {
-    head_from(seg, 0, python_allow)
+    head_from(seg, 0, true, python_allow)
 }
 
 /// How many tokens a redirect in command-name position spans: 1 with its target
@@ -2272,14 +2414,46 @@ fn redirect_span(tok: &str) -> usize {
 
 /// Where `seg`'s command starts from word `j`: past `VAR=value` assignments,
 /// redirects (`2>/dev/null rm x`), zsh's `-` modifier, `timeout [flags] N` or
-/// `time [-p]`, and keyword prefixes (`do`, `then`, `if`), in any order.
-fn skip_prefixes(seg: &[String], mut j: usize) -> usize {
+/// `time [-p]`, and keyword prefixes (`do`, `then`, `if`), in any order — a
+/// keyword only where the shell reads one ([`skip_prefixes_at`]).
+fn skip_prefixes(seg: &[String], j: usize) -> usize {
+    skip_prefixes_at(seg, j, true).0
+}
+
+/// [`skip_prefixes`] from word `j`, where `keyword` says whether a reserved
+/// word at `j` is read as one: at a segment's start it is, as the word a
+/// wrapper runs (`env if`, `xargs for`) it is not. Returns where the command
+/// starts and whether a reserved word there is read as one. bash reads a
+/// reserved word only where a command may begin, so behind an assignment, a
+/// redirect, zsh's `-` or `timeout` it is the command's name: `X=1 if true`
+/// and `2>/dev/null if true` run a program named `if` (MEASURED, bash 3.2,
+/// with an `if` on `PATH`). A keyword prefix there is not skipped; it is the
+/// head, which [`head_from`] refuses ([`SHELL_RESERVED`]). After `time` a
+/// reserved word is never read as one: `time` is bash's keyword only where a
+/// pipeline begins, and a segment does not say whether it does. Behind a
+/// pipe it is `/usr/bin/time`, which runs a program named by the next word
+/// (MEASURED, bash 3.2, with an `if` and a `time` first on `PATH`: `echo x |
+/// time if true` ran the `time` program with `if true`), as it is behind an
+/// assignment (`X=1 time if …`). So `time if …` and `time for …` are refused
+/// even where they are the keyword's forms; `time ls` stays a read. For the
+/// same reason an option after `time [-p]` is `/usr/bin/time`'s own, not a
+/// fragment: `ls | time -o out.txt ls` and `X=1 time -o out.txt ls` write
+/// `out.txt` (MEASURED, bash 3.2), so the command there is `time` itself,
+/// which no list clears.
+fn skip_prefixes_at(seg: &[String], mut j: usize, mut keyword: bool) -> (usize, bool) {
     loop {
         let start = j;
         while let Some(t) = seg.get(j).map(String::as_str) {
-            if is_assignment(t) || KEYWORD_PREFIX.contains(&t) || t == "-" {
+            if KEYWORD_PREFIX.contains(&t) {
+                if !keyword {
+                    return (j, false);
+                }
+                j += 1;
+            } else if is_assignment(t) || t == "-" {
+                keyword = false;
                 j += 1;
             } else if redirect_span(t) > 0 {
+                keyword = false;
                 j += redirect_span(t);
             } else {
                 break;
@@ -2291,12 +2465,21 @@ fn skip_prefixes(seg: &[String], mut j: usize) -> usize {
                 while j < seg.len() && (seg[j].starts_with('-') || is_duration(&seg[j])) {
                     j += 1;
                 }
+                keyword = false;
             }
             Some("time") => {
+                let at = j;
                 j += 1;
                 while seg.get(j).map(String::as_str) == Some("-p") {
                     j += 1;
                 }
+                if seg.get(j).is_some_and(|t| t.starts_with('-')) {
+                    // `/usr/bin/time`'s own options (`-o FILE` writes FILE,
+                    // `-a` appends): the program is `time` itself, which no
+                    // list clears, not a fragment the head check passes.
+                    return (at, false);
+                }
+                keyword = false;
             }
             _ => {}
         }
@@ -2304,8 +2487,18 @@ fn skip_prefixes(seg: &[String], mut j: usize) -> usize {
             break;
         }
     }
-    j
+    (j, keyword)
 }
+
+/// bash 3.2's reserved words (`time` aside, which [`skip_prefixes_at`] reads
+/// through as a wrapper wherever it stands): where the shell reads a command's
+/// name instead of a keyword, each is the name of a program the line does not
+/// show ([`head_from`]), though [`READ_ONLY`] and [`KEYWORD_PREFIX`] list some
+/// of them as the keywords they are at a command's start.
+const SHELL_RESERVED: &[&str] = &[
+    "!", "case", "coproc", "do", "done", "elif", "else", "esac", "fi", "for", "function", "if",
+    "in", "select", "then", "until", "while", "{", "}", "[[", "]]",
+];
 
 /// What the wrapper at `seg[j]` (`xargs`, `env`, by name or from a system
 /// directory) runs. `None`: no wrapper. `Some(Ok(None))`: it runs no word of the
@@ -2434,10 +2627,11 @@ pub(crate) struct Runs<'s> {
 /// `supervise::policy::git_config` so neither misses a wrapper.
 pub(crate) fn runs(seg: &[String]) -> Result<Option<Runs<'_>>, String> {
     let mut j = 0;
+    let mut keyword = true;
     let mut chdir = Vec::new();
     let mut fed = false;
     loop {
-        j = skip_prefixes(seg, j);
+        j = skip_prefixes_at(seg, j, keyword).0;
         if j >= seg.len() {
             return Ok(None);
         }
@@ -2449,6 +2643,7 @@ pub(crate) fn runs(seg: &[String]) -> Result<Option<Runs<'_>>, String> {
                 fed |= program(&seg[j]) == "xargs";
                 chdir.extend(dirs);
                 j = k;
+                keyword = false;
             }
         }
     }
@@ -2464,9 +2659,22 @@ pub(crate) fn command_words(line: &str) -> Result<Vec<Vec<String>>, String> {
 /// The head check from token `j`, re-entered for a wrapper's command (`xargs
 /// <cmd>`, `env [VAR=v] <cmd>`, `timeout N <cmd>`), so a listed wrapper cannot
 /// launder what it runs: `ls | xargs touch` is `touch`.
-fn head_from<S: AsRef<str>>(seg: &[String], j: usize, python_allow: &[S]) -> Option<String> {
-    let j = skip_prefixes(seg, j);
+fn head_from<S: AsRef<str>>(
+    seg: &[String],
+    j: usize,
+    keyword: bool,
+    python_allow: &[S],
+) -> Option<String> {
+    let (j, keyword) = skip_prefixes_at(seg, j, keyword);
     let head_tok = seg.get(j)?;
+    if !keyword && SHELL_RESERVED.contains(&head_tok.as_str()) {
+        // `X=1 if true`, `2>/dev/null for …`, `env if true`, `ls | time if
+        // true`: bash runs a program by that name, which no list here names.
+        return Some(format!(
+            "`{head_tok}` where the shell reads a command's name (behind an assignment, a \
+             redirect, a wrapper or `time` it is no keyword: a program named `{head_tok}` runs)"
+        ));
+    }
     if is_fragment(head_tok) {
         return None;
     }
@@ -2505,7 +2713,7 @@ fn head_from<S: AsRef<str>>(seg: &[String], j: usize, python_allow: &[S]) -> Opt
             // The command the wrapper runs is the head that counts; a bare
             // `xargs` runs echo, a bare `env` prints the environment.
             Some(Err(reason)) => Some(reason),
-            Some(Ok(Some((k, _)))) => head_from(seg, k, python_allow),
+            Some(Ok(Some((k, _)))) => head_from(seg, k, false, python_allow),
             _ => None,
         },
         "git" => {

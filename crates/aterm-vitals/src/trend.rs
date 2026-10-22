@@ -39,8 +39,9 @@ pub struct TrendView {
 
 impl TrendView {
     /// A view of a quantity that has read only `v`.
+    #[inline]
     #[must_use]
-    pub fn flat(v: f32) -> Self {
+    pub const fn flat(v: f32) -> Self {
         Self {
             raw: v,
             level: v,
@@ -50,14 +51,16 @@ impl TrendView {
     }
 
     /// Momentum: the fast average less the slow one.
+    #[inline]
     #[must_use]
-    pub fn momentum(&self) -> f32 {
+    pub const fn momentum(&self) -> f32 {
         self.level - self.slow
     }
 
     /// Which way the quantity is moving, past a noise gate. The gate is the
     /// larger of `floor` (in the quantity's own units) and half the variance,
     /// so a jittery series has to move further before it reads as rising.
+    #[inline]
     #[must_use]
     pub fn motion(&self, floor: f32) -> Motion {
         let gate = floor.max(self.mad * 0.5);
@@ -74,6 +77,7 @@ impl TrendView {
     /// The rise glow's step past the same gate as [`Self::motion`]: 0 (none)
     /// while not rising, then 1, 2 or 3 as momentum passes 1×, 2.5× and 5× the
     /// gate. Never for a falling quantity.
+    #[inline]
     #[must_use]
     pub fn glow_step(&self, floor: f32) -> u8 {
         let gate = floor.max(self.mad * 0.5);
@@ -107,8 +111,9 @@ pub enum Motion {
 impl Motion {
     /// The word the sentences print after a figure: `rising`, `easing`, or
     /// nothing while steady.
+    #[inline]
     #[must_use]
-    pub fn word(self) -> Option<&'static str> {
+    pub const fn word(self) -> Option<&'static str> {
         match self {
             Self::Rising => Some("rising"),
             Self::Falling => Some("easing"),
@@ -117,8 +122,9 @@ impl Motion {
     }
 
     /// The glyph the compact figures carry: `▴`, `▾`, or nothing.
+    #[inline]
     #[must_use]
-    pub fn glyph(self) -> Option<char> {
+    pub const fn glyph(self) -> Option<char> {
         match self {
             Self::Rising => Some('\u{25B4}'),
             Self::Falling => Some('\u{25BE}'),
@@ -141,14 +147,16 @@ pub struct Trend {
 
 impl Trend {
     /// A trend that has read nothing.
+    #[inline]
     #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
     /// Whether it has read at least one sample.
+    #[inline]
     #[must_use]
-    pub fn primed(&self) -> bool {
+    pub const fn primed(&self) -> bool {
         self.primed
     }
 
@@ -317,12 +325,14 @@ impl History {
     }
 
     /// How many samples (gaps included) it holds.
+    #[inline]
     #[must_use]
     pub fn len(&self) -> usize {
         self.values.len()
     }
 
     /// Whether it holds nothing.
+    #[inline]
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.values.is_empty()

@@ -83,30 +83,35 @@ impl Contention {
 
     /// Construct [`Contention`] directly from `per_cpu_milli` (`load / cpus * 1000`).
     #[must_use]
+    #[inline]
     pub const fn from_per_cpu_milli(per_cpu_milli: u32) -> Self {
         Self { per_cpu_milli }
     }
 
     /// Runnable threads per CPU, times 1000 (for a status or a log line).
     #[must_use]
+    #[inline]
     pub const fn per_cpu_milli(self) -> u32 {
         self.per_cpu_milli
     }
 
     /// Whether runnable load exceeds 1.0 thread per CPU (`per_cpu_milli > 1000`).
     #[must_use]
+    #[inline]
     pub const fn is_oversubscribed(self) -> bool {
         self.per_cpu_milli > 1000
     }
 
     /// Whether runnable load reaches or exceeds [`Self::MAX_STRETCH`].
     #[must_use]
+    #[inline]
     pub const fn is_at_max_stretch(self) -> bool {
         self.per_cpu_milli >= Self::MAX_STRETCH.saturating_mul(1000)
     }
 
     /// The stretch factor, times 1000: `min(max(1, load/cpu), MAX_STRETCH)`.
     #[must_use]
+    #[inline]
     pub const fn factor_milli(self) -> u32 {
         let max_milli = Self::MAX_STRETCH.saturating_mul(1000);
         if self.per_cpu_milli < 1000 {
@@ -121,12 +126,14 @@ impl Contention {
     /// `base`, stretched by the runnable load per CPU when that exceeds one:
     /// `base × min(max(1, load/cpu), MAX_STRETCH)`. Never shorter than `base`.
     #[must_use]
+    #[inline]
     pub fn stretch(self, base: Duration) -> Duration {
         base.saturating_mul(self.factor_milli()) / 1000
     }
 
     /// Stretch a millisecond threshold by [`Self::factor_milli`], saturating on overflow.
     #[must_use]
+    #[inline]
     pub const fn stretch_millis(self, base_ms: u64) -> u64 {
         let scaled = (base_ms as u128).saturating_mul(self.factor_milli() as u128) / 1000;
         if scaled > (u64::MAX as u128) {
@@ -142,6 +149,7 @@ impl Contention {
     /// spinning when it burned at least half of this, so a frozen program
     /// spinning on a saturated machine is not taken for a sleeper.
     #[must_use]
+    #[inline]
     pub const fn fair_share_ns(self, wall_ns: u64) -> u64 {
         let factor = self.factor_milli() as u128;
         let denom = if factor == 0 { 1000 } else { factor };
@@ -157,18 +165,21 @@ impl Contention {
 /// Oldest unread byte offset in a FIFO queue where `accepted` bytes have been written
 /// and `unread` bytes remain in the kernel buffer (`accepted.saturating_sub(unread)`).
 #[must_use]
+#[inline]
 pub const fn oldest_unread_offset(accepted: u64, unread: u64) -> u64 {
     accepted.saturating_sub(unread)
 }
 
 /// Return `true` iff `unread <= accepted` (no external writer injected unrecorded bytes).
 #[must_use]
+#[inline]
 pub const fn unread_within_accepted(accepted: u64, unread: u64) -> bool {
     unread <= accepted
 }
 
 /// Encode `(accepted, unread)` input-backlog watermarks into 16 little-endian bytes.
 #[must_use]
+#[inline]
 pub const fn encode_backlog_watermarks_le(accepted: u64, unread: u64) -> [u8; 16] {
     [
         (accepted & 0xFF) as u8,
@@ -192,6 +203,7 @@ pub const fn encode_backlog_watermarks_le(accepted: u64, unread: u64) -> [u8; 16
 
 /// Decode 16 little-endian bytes into `(accepted, unread)` input-backlog watermarks.
 #[must_use]
+#[inline]
 pub const fn decode_backlog_watermarks_le(bytes: [u8; 16]) -> (u64, u64) {
     let accepted = (bytes[0] as u64)
         | ((bytes[1] as u64) << 8)
@@ -480,8 +492,12 @@ impl InputBacklog {
     /// Every input byte the program has not read: the kernel's queue plus
     /// the spill queued behind it.
     #[must_use]
-    pub fn unread(&self) -> usize {
-        self.queued.saturating_add(self.spilled.unwrap_or(0))
+    #[inline]
+    pub const fn unread(&self) -> usize {
+        self.queued.saturating_add(match self.spilled {
+            Some(s) => s,
+            None => 0,
+        })
     }
 
     /// Whether writing exactly `bytes` now becomes a signal rather than input: one byte
@@ -497,6 +513,7 @@ impl InputBacklog {
     /// program is the remedy. Raw mode, a busy or non-empty spill, or a full
     /// queue answer `false`.
     #[must_use]
+    #[inline]
     pub fn signals_on_write(&self, bytes: &[u8]) -> bool {
         let [byte] = bytes else {
             return false;
@@ -535,6 +552,7 @@ pub enum InputWord {
 impl InputWord {
     /// The wire word.
     #[must_use]
+    #[inline]
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Unmeasured => "-",
@@ -640,6 +658,7 @@ pub enum Gate {
 /// against a screen the program never drew. A merely slow program gets the key,
 /// and the driver gets the warning.
 #[must_use]
+#[inline]
 pub fn gate(b: &InputBacklog, stopped: bool, stall_published: bool) -> Gate {
     if b.queued == 0 {
         return Gate::Open;
@@ -657,6 +676,7 @@ pub fn gate(b: &InputBacklog, stopped: bool, stall_published: bool) -> Gate {
 /// warning's condition, and what a restart hold reads as "not reading what was
 /// sent since".
 #[must_use]
+#[inline]
 pub fn lagging(b: &InputBacklog) -> bool {
     b.queued > 0 && !b.canonical && b.wait >= WARN_AFTER
 }

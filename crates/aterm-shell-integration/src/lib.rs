@@ -86,6 +86,7 @@ pub mod scripts {
     /// the start of its [`BODY_BEGIN`] line through the end of its [`BODY_END`]
     /// line, or `None` if absent.
     #[must_use]
+    #[inline]
     pub fn body(script: &str) -> Option<&str> {
         let begin = script.find(BODY_BEGIN)?;
         let end = begin + script[begin..].find(BODY_END)?;
@@ -124,13 +125,15 @@ pub const CWD_REPORT_KEY: &str = "AtermCwd";
 
 /// Whether `shell` has a loader that supports live body reloading via [`BODY_POINTER_VAR`].
 #[must_use]
+#[inline]
 pub const fn has_body_loader(shell: ShellType) -> bool {
     matches!(shell, ShellType::Zsh | ShellType::Bash | ShellType::Fish)
 }
 
 /// Whether `rev` is a valid script folder address (16 lowercase hex digits, [`script_set_address`]).
 #[must_use]
-pub fn is_integration_rev(rev: &str) -> bool {
+#[inline]
+pub const fn is_integration_rev(rev: &str) -> bool {
     is_address(rev)
 }
 
@@ -161,6 +164,7 @@ impl ShellType {
     ///
     /// Matching is case-insensitive and ignores a trailing `.exe`.
     #[must_use]
+    #[inline]
     pub fn detect(shell_path: &str) -> Self {
         // Split on both `/` and `\` regardless of host OS so Windows paths in
         // configs, handoffs, or test fixtures parse on Unix too.
@@ -181,6 +185,7 @@ impl ShellType {
     /// Detect the default interactive shell aterm will launch (`$SHELL` on Unix,
     /// `PowerShell` on Windows).
     #[must_use]
+    #[inline]
     pub fn detect_current() -> Self {
         #[cfg(not(windows))]
         {
@@ -197,6 +202,7 @@ impl ShellType {
 
     /// Return the canonical lowercase name of this shell type.
     #[must_use]
+    #[inline]
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Zsh => "zsh",
@@ -211,18 +217,21 @@ impl ShellType {
 
     /// Return `true` when this shell has a supported integration strategy (`!Unknown`).
     #[must_use]
+    #[inline]
     pub const fn is_known(self) -> bool {
         !matches!(self, Self::Unknown)
     }
 
     /// Return `true` when this shell is a POSIX/Unix shell (`Zsh`, `Bash`, or `Fish`).
     #[must_use]
+    #[inline]
     pub const fn is_posix_shell(self) -> bool {
         matches!(self, Self::Zsh | Self::Bash | Self::Fish)
     }
 
     /// Return `true` when this shell is a Windows host shell (`PowerShell`, `Wsl`, or `Cmd`).
     #[must_use]
+    #[inline]
     pub const fn is_windows_shell(self) -> bool {
         matches!(self, Self::PowerShell | Self::Wsl | Self::Cmd)
     }
@@ -230,6 +239,7 @@ impl ShellType {
 
 /// Encode a shell integration revision record (`rev_hash`, `shell_kind`, `nonce_prefix`) into 16 LE bytes.
 #[must_use]
+#[inline]
 pub const fn encode_integration_rev_le(
     rev_hash: u64,
     shell_kind: u32,
@@ -257,6 +267,7 @@ pub const fn encode_integration_rev_le(
 
 /// Decode 16 LE bytes into a shell integration revision record (`rev_hash`, `shell_kind`, `nonce_prefix`).
 #[must_use]
+#[inline]
 pub const fn decode_integration_rev_le(bytes: [u8; 16]) -> (u64, u32, u32) {
     let rev_hash = (bytes[0] as u64)
         | ((bytes[1] as u64) << 8)
@@ -311,14 +322,16 @@ impl ShellNonce {
     /// 64-char lowercase hex encoding to set as `ATERM_SHELL_NONCE` in the
     /// child shell environment.
     #[must_use]
-    pub fn hex(&self) -> &str {
-        &self.hex
+    #[inline]
+    pub const fn hex(&self) -> &str {
+        self.hex.as_str()
     }
 
     /// Consume the nonce and return both halves: the raw bytes authorize the
     /// terminal (`Terminal::authorize_shell_integration`), the hex is injected
     /// into the child environment.
     #[must_use]
+    #[inline]
     pub fn into_parts(self) -> ([u8; SHELL_NONCE_BYTES], String) {
         (self.raw, self.hex)
     }
@@ -363,6 +376,7 @@ pub fn hex_encode(bytes: &[u8; SHELL_NONCE_BYTES]) -> String {
     out
 }
 
+#[inline]
 const fn nibble_to_hex(n: u8) -> char {
     match n {
         0..=9 => (b'0' + n) as char,
@@ -399,6 +413,7 @@ pub const DEBUG_TRAP_SUFFIX: &str = ".trap";
 
 /// Whether `shell` carries the re-key hook (`__aterm_rekey_check`).
 #[must_use]
+#[inline]
 pub const fn has_rekey_hook(shell: ShellType) -> bool {
     matches!(shell, ShellType::Zsh | ShellType::Bash | ShellType::Fish)
 }
@@ -425,6 +440,7 @@ pub const START_ROOTS_KEY: &str = "AtermStartRoots";
 
 /// Whether `shell` supports a warm-spare hold at its first prompt (macOS and Linux).
 #[must_use]
+#[inline]
 pub const fn has_spare_hold(shell: ShellType) -> bool {
     cfg!(any(target_os = "macos", target_os = "linux"))
         && matches!(shell, ShellType::Zsh | ShellType::Bash | ShellType::Fish)
@@ -433,6 +449,7 @@ pub const fn has_spare_hold(shell: ShellType) -> bool {
 /// Whether `shell`'s wrapper supports a parked hold before user startup files
 /// (zsh `.zshenv` and bash `--rcfile`).
 #[must_use]
+#[inline]
 pub const fn has_parked_hold(shell: ShellType) -> bool {
     has_spare_hold(shell) && matches!(shell, ShellType::Zsh | ShellType::Bash)
 }
@@ -440,6 +457,7 @@ pub const fn has_parked_hold(shell: ShellType) -> bool {
 /// System startup files `shell` reads before aterm's parked hold (`/etc/zshenv`
 /// and `/etc/zsh/zshenv` for zsh; `/etc/bash.bashrc` for bash on Linux).
 #[must_use]
+#[inline]
 pub const fn pre_hold_files(shell: ShellType) -> &'static [&'static str] {
     match shell {
         ShellType::Zsh => &["/etc/zshenv", "/etc/zsh/zshenv"],
@@ -514,12 +532,14 @@ static SCRIPTS_WRITTEN: Mutex<Option<PathBuf>> = Mutex::new(None);
 /// ([`script_set_address`], write-once via temp dir + rename so concurrent builds
 /// never overwrite each other's scripts) and returns the child environment
 /// modifications. Returns `None` for [`ShellType::Unknown`].
+#[inline]
 pub fn prepare(shell: ShellType) -> Result<Option<InjectionEnv>, std::io::Error> {
     prepare_cached(shell, cache_dir(), &SCRIPTS_WRITTEN)
 }
 
 /// Ensure this build's content-addressed script directory (`<cache>/<address>/`)
 /// is installed and return its path.
+#[inline]
 pub fn ensure_script_set() -> Result<PathBuf, std::io::Error> {
     ensure_cached(cache_dir(), &SCRIPTS_WRITTEN)
 }
@@ -792,8 +812,20 @@ pub const GC_KEEP_NEWEST: usize = 5;
 const GC_SCRATCH_AGE: std::time::Duration = std::time::Duration::from_secs(60 * 60);
 
 /// Whether `name` is a 16-character lowercase hex content address.
-fn is_address(name: &str) -> bool {
-    name.len() == 16 && name.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+#[inline]
+const fn is_address(name: &str) -> bool {
+    let bytes = name.as_bytes();
+    if bytes.len() != 16 {
+        return false;
+    }
+    let mut i = 0;
+    while i < 16 {
+        if !matches!(bytes[i], b'0'..=b'9' | b'a'..=b'f') {
+            return false;
+        }
+        i += 1;
+    }
+    true
 }
 
 /// Remove other builds' script folders under `root` older than [`GC_MIN_AGE`]
@@ -903,6 +935,7 @@ fn write_script(path: &Path, contents: &str) -> Result<(), std::io::Error> {
 
 /// Normalize CRLF to LF for POSIX shell scripts (borrowing when no `\r` is present)
 /// in case the build checkout had `core.autocrlf=true`.
+#[inline]
 fn lf_only(contents: &str) -> std::borrow::Cow<'_, str> {
     if contents.contains('\r') {
         std::borrow::Cow::Owned(contents.replace("\r\n", "\n"))
@@ -1311,6 +1344,7 @@ fn merge_wslenv(existing: &str) -> String {
 /// Build the `ATERM_WSL_CWD` env pair when `shell` is [`ShellType::Wsl`] and
 /// `cwd` is a non-UNC POSIX-absolute path (`/home/...`).
 #[must_use]
+#[inline]
 pub fn wsl_cwd_env(shell: ShellType, cwd: Option<&str>) -> Option<(String, String)> {
     if shell != ShellType::Wsl {
         return None;

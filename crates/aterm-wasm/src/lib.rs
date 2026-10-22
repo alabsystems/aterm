@@ -123,6 +123,7 @@ pub fn register_font(bytes: &[u8]) -> u32 {
     })
 }
 
+#[inline]
 fn registered_font(handle: u32) -> Result<std::sync::Arc<Vec<u8>>, String> {
     REGISTERED_FONTS.with(|cell| {
         cell.borrow()
@@ -272,6 +273,7 @@ struct DisplayRowCache {
 /// [`Terminal::rebase_colors`], so a program's OSC 10/11/12/17 colours survive
 /// a host theme change, as they survive a native reload; the palette and the
 /// selection foreground keep their current baseline.
+#[inline]
 fn apply_terminal_theme_colors(term: &mut Terminal, fg: u32, bg: u32, cursor: u32, selection: u32) {
     let mut base = term.color_baseline();
     base.foreground = theme_api::unpack(fg);
@@ -292,6 +294,7 @@ impl AtermTerminal {
     /// `EffectsPipeline::apply` closes a damage session only when one is still open, so
     /// it does not re-take this one: a second `take_damage` would bump the extraction
     /// generation and force the full arm every frame with sparkle words or rain on.
+    #[inline]
     fn refill_frame_scratch(&mut self) {
         let refill =
             self.term
@@ -342,7 +345,8 @@ impl AtermTerminal {
 /// aterm-gpu-web) calls on whichever crate compiles it.
 impl AtermTerminal {
     /// The CPU face this terminal renders with.
-    pub(crate) fn render_face(&self) -> &Renderer {
+    #[inline]
+    pub(crate) const fn render_face(&self) -> &Renderer {
         &self.renderer
     }
 
@@ -370,6 +374,7 @@ impl AtermTerminal {
     }
 
     /// The renderer half of `set_selection_fg` (the engine half is the caller's).
+    #[inline]
     pub(crate) fn install_renderer_selection_fg(&mut self, fg: Option<u32>) {
         self.force_full_repaint = true;
         self.renderer.set_selection_fg(fg);
@@ -827,6 +832,7 @@ impl AtermTerminal {
 
     /// Safety net #1 (see `REFLOW_PUMP_GRACE_RENDERS`): called by `render`. After the
     /// grace window, one budgeted step per frame, never the whole job at once.
+    #[inline]
     fn pump_reflow_on_render_tick(&mut self) {
         if self.pending_reflow.is_none() {
             return;
@@ -841,6 +847,7 @@ impl AtermTerminal {
     /// Safety net #2 (see `REFLOW_BACKLOG_MAX_LINES`): called by `process`/
     /// `process_str` after feeding; one budgeted step per call while the staged
     /// output is past the cap.
+    #[inline]
     fn pump_reflow_on_output(&mut self) {
         if self.pending_reflow.is_some() && self.term.lazy_backlog_len() > REFLOW_BACKLOG_MAX_LINES
         {
@@ -999,11 +1006,13 @@ impl AtermTerminal {
     /// Record a visual change the damage epoch cannot see (renderer-held or presentation
     /// state), reopening the frame gate for one frame. Value shadows (blink, hollow)
     /// de-dup before calling; unconditional callers buy one render, never a stale skip.
+    #[inline]
     pub(crate) fn note_host_visual_change(&mut self) {
         self.host_visual_gen = self.host_visual_gen.wrapping_add(1);
     }
 
     /// Band host hook (`messages_api`): the CPU face's cell, pad and grid-top metrics.
+    #[inline]
     pub(crate) fn band_metrics(&self) -> messages_api::BandMetrics {
         let (cell_w, cell_h) = self.renderer.cell_size();
         messages_api::BandMetrics {
@@ -1016,6 +1025,7 @@ impl AtermTerminal {
 
     /// The band's gutters for the frame being composed, handed to the
     /// rasterizer.
+    #[inline]
     pub(crate) fn set_band_bleed(&mut self, bleed: Option<aterm_render::ChromeBleed>) {
         self.renderer.set_chrome_bleed(bleed);
     }
@@ -1023,6 +1033,7 @@ impl AtermTerminal {
     /// The band changed: reopen the frame gate for one frame. The CPU frame
     /// is sized from the rows it composes, so a moved row count needs
     /// nothing more here.
+    #[inline]
     pub(crate) fn note_band_change(&mut self, _rows_moved: bool) {
         self.note_host_visual_change();
     }

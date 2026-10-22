@@ -64,6 +64,7 @@ pub const PAPER_MASTER_PUBKEYS: &[&str] = &[
 /// Whether the paper-master roster tier is armed for this build. An unpinned master
 /// authorizes nothing, so callers skip the tier rather than read an absent roster as
 /// permission.
+#[inline]
 #[must_use]
 pub const fn roster_tier_armed() -> bool {
     !PAPER_MASTER_PUBKEYS.is_empty()
@@ -151,6 +152,7 @@ pub const WINDOWS_SIGNING_PUBLISHER: &str = "";
 
 /// Whether an anchor is active, i.e. non-empty. No environment variable or other ambient
 /// state can turn one off.
+#[inline]
 #[must_use]
 pub const fn anchor_active(anchor: &str) -> bool {
     !anchor.is_empty()

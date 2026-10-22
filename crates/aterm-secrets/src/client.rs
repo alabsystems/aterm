@@ -1223,18 +1223,23 @@ fn pause_after(source: &Source, outcome: &SyncOutcome, failing: &mut Duration) -
 /// and a file the manifest says the vault wrote no longer holds it (deleted or edited by hand,
 /// or, for an ` if-absent` entry, rewritten by a program, which the apply then leaves the
 /// machine's own), so [`materialization_ready`] says not ready until an apply. Once per
-/// version (`repaired`), so a program that keeps rewriting a file is not fought on every pass.
-fn repair_due(paths: &Paths, repaired: &mut Option<u64>) -> bool {
+/// source and version (`repaired`), so a program that keeps rewriting a file is not fought
+/// on every pass, and a different vault at the same sequence still gets its repair.
+fn repair_due(paths: &Paths, repaired: &mut Option<([u8; 32], u64)>) -> bool {
     let Ok(state) = load_state(paths) else {
         return false;
     };
+    let Some(source) = state.source_identity else {
+        return false;
+    };
+    let version = (source, state.seq);
     let due = state.membership == Stored::In
         && !state.failed
         && state.pending.is_empty()
-        && *repaired != Some(state.seq)
+        && *repaired != Some(version)
         && !files_intact(paths, &state);
     if due {
-        *repaired = Some(state.seq);
+        *repaired = Some(version);
     }
     due
 }
@@ -1359,42 +1364,120 @@ impl Approval {
     }
 }
 
-/// What this machine's subscriber approves, when it opens the admin locker of the envelope it
-/// last verified and that vault has a join password or is open. Local files only.
-fn admin_here_approving(paths: &Paths) -> Option<Approval> {
-    let identity = read_identity(paths).ok()??;
-    let cached = fsx::read_private(&paths.cache_file(), envelope::MAX_ENVELOPE).ok()??;
-    let envelope = envelope::parse(cached.as_slice()).ok()?;
-    let locker = envelope.admin_locker()?;
-    let plain = age::decrypt(std::slice::from_ref(&identity), locker.armored.as_bytes()).ok()?;
-    parse_admin(&plain)
-        .ok()
-        .and_then(|opened| Approval::of(&opened.doc))
+/// Decode policy only from the configured authority's cached envelope at the recorded
+/// sequence and digest. Materialization can be incomplete while that admin locker is valid.
+fn admin_here_approving(
+    paths: &Paths,
+    config: &Config,
+    state: &State,
+) -> crate::Result<Option<Approval>> {
+    let Some(pin) = config.signer else {
+        return Ok(None);
+    };
+    let cached = fsx::read_private(&paths.cache_file(), envelope::MAX_ENVELOPE)?
+        .ok_or_else(|| Error::new("no cached vault to check approval"))?;
+    let (envelope, _, _) = envelope::verify_for_reader(
+        cached.as_slice(),
+        &config.name,
+        &pin,
+        &config.followed,
+        None,
+    )?;
+    if envelope.seq != state.seq || Some(envelope.digest()) != state.digest {
+        return Err(Error::new("the cached vault is not the recorded version"));
+    }
+    let Some(identity) = read_identity(paths)? else {
+        return Ok(None);
+    };
+    let Some(locker) = envelope.admin_locker() else {
+        return Ok(None);
+    };
+    let plain = match age::decrypt(std::slice::from_ref(&identity), locker.armored.as_bytes()) {
+        Ok(plain) => plain,
+        Err(age::AgeError::NoMatch) => return Ok(None),
+        Err(error) => return Err(Error::new(format!("admin locker: {error}"))),
+    };
+    Ok(Approval::of(&parse_admin(&plain)?.doc))
+}
+
+struct ApprovalCheck {
+    version: ([u8; 32], u64),
+    digest: Option<[u8; 32]>,
+    at: Instant,
+    approval: Option<Approval>,
+}
+
+/// Read one coherent local source/version, retaining its decoded policy for at most five
+/// minutes. A join can change the source without changing the sequence.
+fn approval_here(
+    paths: &Paths,
+    checked: &mut Option<ApprovalCheck>,
+) -> crate::Result<Option<(Config, u64, Approval)>> {
+    let Some(_lock) = StateLock::observe(paths)? else {
+        if config(paths)?.is_none() {
+            return Ok(None);
+        }
+        return Err(Error::new(
+            "vault state is being changed; check approval again",
+        ));
+    };
+    let Some(config) = config(paths)? else {
+        return Ok(None);
+    };
+    let state = load_state(paths)?;
+    let seq = state.seq;
+    let version = (source_identity(&config), seq);
+    if state
+        .source_identity
+        .is_some_and(|source| source != version.0)
+    {
+        *checked = None;
+        return Err(Error::new("the recorded vault belongs to another source"));
+    }
+    if checked.as_ref().is_none_or(|held| {
+        held.version != version
+            || held.digest != state.digest
+            || held.at.elapsed() >= Duration::from_secs(300)
+    }) {
+        // A transient mismatch must not become a retained negative policy: a completed
+        // sync of this version can repair its cache without changing the sequence.
+        *checked = None;
+        let approval = admin_here_approving(paths, &config, &state)?;
+        *checked = Some(ApprovalCheck {
+            version,
+            digest: state.digest,
+            at: Instant::now(),
+            approval,
+        });
+    }
+    Ok(checked
+        .as_ref()
+        .and_then(|held| held.approval)
+        .map(|approval| (config, seq, approval)))
 }
 
 /// The approver half of an admin's subscriber: while this machine is an admin of a vault with
 /// a join password or an open one, read the join queue every 2 s and approve what proves the
 /// password, or (open) what comes from a machine not in the vault. What [`auto_approve`]
-/// judged stays [`Settled`] until the vault's version changes, so a queue that holds only
+/// judged stays [`Settled`] until the source or version changes, so a queue that holds only
 /// requests already judged (refused, left to a person, or approved and still queued for days)
 /// costs one GET a pass, never another admin open, key derivation or publish.
 fn approver_loop(paths: &Paths, log: &(dyn Fn(&str) + Sync), stop: &AtomicBool) {
     let mut settled = Settled::default();
-    let mut checked: Option<(u64, Instant)> = None;
-    let mut approval = None;
+    let mut checked = None;
     while !stop.load(Ordering::Relaxed) {
-        let seq = load_state(paths).map(|state| state.seq).unwrap_or(0);
-        if checked
-            .is_none_or(|(at_seq, at)| at_seq != seq || at.elapsed() >= Duration::from_secs(300))
-        {
-            approval = admin_here_approving(paths);
-            checked = Some((seq, Instant::now()));
-        }
-        let Some(approval) = approval else {
-            nap(stop, Duration::from_secs(30));
-            continue;
+        let (config, seq, approval) = match approval_here(paths, &mut checked) {
+            Ok(Some(held)) => held,
+            Ok(None) => {
+                nap(stop, Duration::from_secs(30));
+                continue;
+            }
+            Err(_) => {
+                nap(stop, Duration::from_secs(2));
+                continue;
+            }
         };
-        let pending = match requests(paths, None) {
+        let pending = match requests_for(&config, None) {
             Ok(pending) => pending,
             Err(_) => {
                 nap(stop, Duration::from_secs(10));
@@ -1405,8 +1488,14 @@ fn approver_loop(paths: &Paths, log: &(dyn Fn(&str) + Sync), stop: &AtomicBool) 
             Approval::Password => "by the join password",
             Approval::Open => "as the vault is open",
         };
-        if settled.due(seq, &pending, approval) {
-            match auto_approve(paths) {
+        if settled.due(&config, seq, &pending, approval) {
+            let done = admin_open(paths).and_then(|admin| {
+                if admin.config != config || admin.seq != seq {
+                    return Err(Error::new("the vault changed while checking approval"));
+                }
+                auto_approve_opened(paths, &admin)
+            });
+            match done {
                 Ok(done) => {
                     if !done.approved.is_empty() {
                         log(&format!("approved {} {by}", done.approved.join(", ")));
@@ -1450,20 +1539,27 @@ impl Judged {
 /// [`approver_loop`] pass.
 #[derive(Debug, Default)]
 pub struct Settled {
-    seq: u64,
+    version: Option<([u8; 32], u64)>,
     judged: std::collections::BTreeSet<Judged>,
 }
 
 impl Settled {
     /// Whether a pass that holds vault version `seq`, whose vault approves by `approval`, and
     /// lists `listed` runs [`auto_approve`]: some listed request the approver reads (one with
-    /// a proof; on an open vault, any) was not judged at that version. A new version forgets
-    /// every judgment, since it may carry a new password, open or close the vault, or have
-    /// let a machine go.
-    pub fn due(&mut self, seq: u64, listed: &[Request], approval: Approval) -> bool {
-        if seq != self.seq {
+    /// a proof; on an open vault, any) was not judged at that source/version. A different
+    /// source or new version forgets every judgment, since it may carry a new password,
+    /// open or close the vault, or have let a machine go.
+    pub fn due(
+        &mut self,
+        config: &Config,
+        seq: u64,
+        listed: &[Request],
+        approval: Approval,
+    ) -> bool {
+        let version = (source_identity(config), seq);
+        if self.version != Some(version) {
             self.judged.clear();
-            self.seq = seq;
+            self.version = Some(version);
         }
         listed
             .iter()
@@ -1501,6 +1597,10 @@ pub struct AutoApproved {
 /// Nothing happens on a vault with neither.
 pub fn auto_approve(paths: &Paths) -> crate::Result<AutoApproved> {
     let admin = admin_open(paths)?;
+    auto_approve_opened(paths, &admin)
+}
+
+fn auto_approve_opened(paths: &Paths, admin: &Admin) -> crate::Result<AutoApproved> {
     let mut done = AutoApproved::default();
     let Some(approval) = Approval::of(&admin.doc) else {
         return Ok(done);
@@ -1521,7 +1621,7 @@ pub fn auto_approve(paths: &Paths) -> crate::Result<AutoApproved> {
     let mut doc = admin.doc.clone();
     // Members' requests are read too: an approved request stays queued for days, and the
     // approver settles it only once it is judged.
-    for request in requests(paths, None)? {
+    for request in requests_for(&admin.config, None)? {
         if !approval.reads(&request) {
             continue;
         }
@@ -1551,7 +1651,7 @@ pub fn auto_approve(paths: &Paths) -> crate::Result<AutoApproved> {
         done.judged.push(judged);
     }
     if !done.approved.is_empty() {
-        done.seq = Some(admin_publish(paths, &admin, &doc)?.seq);
+        done.seq = Some(admin_publish(paths, admin, &doc)?.seq);
     }
     Ok(done)
 }
@@ -2090,10 +2190,12 @@ pub fn admin_open(paths: &Paths) -> crate::Result<Admin> {
             "the admin locker's key does not match the envelope's signer",
         ));
     }
-    match put_back {
-        Some(Some(over)) => transport::replace(&config.source, &bytes, &over)?,
-        Some(None) => transport::publish(&config.source, &bytes)?,
-        None => {}
+    if let Some(over) = put_back {
+        let _lock = configured_admin(paths, &config)?;
+        match over {
+            Some(over) => transport::replace(&config.source, &bytes, &over)?,
+            None => transport::publish(&config.source, &bytes)?,
+        }
     }
     Ok(Admin {
         doc: opened.doc.clone(),
@@ -2289,7 +2391,7 @@ fn publish_as(
     let renewed = renew_join_password(&admin.doc, doc)?;
     let password_renewed = renewed.is_some();
     let doc = renewed.as_ref().unwrap_or(doc);
-    let (recorded, kept_out, held) = code_only_for(paths, &admin.doc, doc)?;
+    let (recorded, kept_out, held) = code_only_for(&admin.config, &admin.doc, doc)?;
     let doc = recorded.as_ref().unwrap_or(doc);
     let (bytes, release, pairs) = if rotate {
         // The old key's endorsement of the new one joins the chain; every link before it
@@ -2311,7 +2413,10 @@ fn publish_as(
         let bytes = seal(&admin.config.name, seq, &admin.seed, doc, &admin.handoff)?;
         (bytes, None, admin.handoff.len())
     };
-    transport::publish(&admin.config.source, &bytes)?;
+    {
+        let _lock = configured_admin(paths, &admin.config)?;
+        transport::publish(&admin.config.source, &bytes)?;
+    }
     let local = sync(paths, None).err().map(|error| error.to_string());
     Ok(Published {
         seq,
@@ -2323,6 +2428,19 @@ fn publish_as(
         held,
         local,
     })
+}
+
+/// Keep a local source change from passing an admin publication admitted for the source it
+/// left. Hold the same state-writer lock through the source effect, then release it before
+/// syncing the published version locally.
+fn configured_admin(paths: &Paths, expected: &Config) -> crate::Result<StateLock> {
+    let lock = StateLock::take(paths)?;
+    if config(paths)?.as_ref() != Some(expected) {
+        return Err(Error::new(
+            "the configured vault changed while it was open; open it again before publishing",
+        ));
+    }
+    Ok(lock)
 }
 
 /// The keys of `old`'s machines that `doc` lets go: their lines deleted, or their keys
@@ -2346,7 +2464,7 @@ fn let_go(old: &Document, doc: &Document) -> Vec<String> {
 /// leaves closed, so a fleet that never opens one keeps a text every aterm reads. Returns the
 /// text, when it changes; whether it let a machine go; and the waiting requests it held.
 fn code_only_for(
-    paths: &Paths,
+    config: &Config,
     old: &Document,
     doc: &Document,
 ) -> crate::Result<(Option<Document>, bool, Vec<Request>)> {
@@ -2361,7 +2479,7 @@ fn code_only_for(
     let waiting: Vec<Request> = if old.open() {
         Vec::new()
     } else {
-        requests(paths, Some(doc))?
+        requests_for(config, Some(doc))?
             .into_iter()
             .filter(|request| {
                 !named.contains(&request.recipient) && !gone.contains(&request.recipient)
@@ -2540,6 +2658,10 @@ pub struct Request {
 /// when `doc` is given. Each code is recomputed from the key, never taken from the wire.
 pub fn requests(paths: &Paths, doc: Option<&Document>) -> crate::Result<Vec<Request>> {
     let config = config(paths)?.ok_or_else(|| Error::new("no vault configured"))?;
+    requests_for(&config, doc)
+}
+
+fn requests_for(config: &Config, doc: Option<&Document>) -> crate::Result<Vec<Request>> {
     let Source::Url(url) = &config.source else {
         return Ok(Vec::new());
     };
@@ -3162,6 +3284,32 @@ mod tests {
             b"[tool]\nhelper = local\n",
             "the rewritten if-absent file is the machine's own"
         );
+
+        // This same subscriber moves to another signed source at the same sequence. Its
+        // first repair must not inherit the first vault's once-per-version suppression.
+        let first = load_state(&admin).unwrap();
+        let other = root.path().join("other.vault");
+        create(&admin, other.to_str().unwrap(), None, Some("admin")).unwrap();
+        let opened = admin_open(&admin).unwrap();
+        let mut doc = opened.doc.clone();
+        doc.set_entry(&Audience::Everyone, "token", b"inert-other")
+            .unwrap();
+        admin_publish(&admin, &opened, &doc).unwrap();
+        let second = load_state(&admin).unwrap();
+        assert_eq!(first.seq, 2);
+        assert_eq!(second.seq, first.seq);
+        assert_ne!(second.source_identity, first.source_identity);
+        assert!(materialization_ready(&admin).unwrap());
+        assert!(!repair_due(&admin, &mut repaired));
+        std::fs::remove_file(&token).unwrap();
+        assert!(repair_due(&admin, &mut repaired));
+        assert!(
+            !repair_due(&admin, &mut repaired),
+            "once for this source too"
+        );
+        sync(&admin, None).unwrap();
+        assert!(materialization_ready(&admin).unwrap());
+        assert_eq!(std::fs::read(&token).unwrap(), b"inert-other");
 
         // A newer version may be repaired again.
         std::fs::remove_file(&token).unwrap();
@@ -3944,6 +4092,170 @@ mod tests {
             load_state(&reader).expect("state").proof.as_deref(),
             Some("its-proof")
         );
+
+        // An open admin's approval pass must keep reading that vault's queue even when a
+        // join changes its local source, and cannot publish after the source change.
+        struct Stop(Option<crate::server::Running>);
+        impl Drop for Stop {
+            fn drop(&mut self) {
+                if let Some(server) = self.0.take() {
+                    server.stop();
+                }
+            }
+        }
+        let server = Stop(Some(serve(&root.path().join("store"), "127.0.0.1:0")));
+        let addr = server.0.as_ref().expect("running").addr;
+        let admin = Paths::for_home(&root.path().join("admin"));
+        let mut sources = Vec::new();
+        for (name, value) in [("first", b"inert-first"), ("second", b"inert-other")] {
+            let url = format!("http://{addr}/v1/{name}");
+            let created = create(&admin, &url, None, Some("admin")).expect("create");
+            let opened = admin_open(&admin).expect("open");
+            let mut doc = opened.doc.clone();
+            if name == "first" {
+                doc.set_open(true).expect("open first vault");
+            }
+            doc.set_entry(&Audience::Everyone, "token", value)
+                .expect("set token");
+            admin_publish(&admin, &opened, &doc).expect("publish open vault");
+            sources.push(format!("{url}#{}", created.signer));
+        }
+        let second_config = pinned(&admin);
+        let from_a = Paths::for_home(&root.path().join("from-a"));
+        let from_b = Paths::for_home(&root.path().join("from-b"));
+        join_pinned(&from_a, &sources[0], "from-a");
+        join_pinned(&from_b, &sources[1], "from-b");
+        join_pinned(&admin, &sources[0], "admin");
+        let opened = admin_open(&admin).expect("capture first vault");
+        let mut checked = None;
+        let (_, first_seq, first_approval) = approval_here(&admin, &mut checked)
+            .expect("first policy")
+            .expect("first approves");
+        assert_eq!(first_approval, Approval::Open);
+        // The durable boundary in a different-source join: state is reset and invalidated,
+        // then config is published, before its first sync replaces the old cached locker.
+        {
+            let _lock = StateLock::take(&admin).expect("join writer");
+            let mut state = load_state(&admin).expect("first state");
+            state.seq = 0;
+            state.digest = None;
+            state.membership = Stored::None;
+            prepare_materialization(&admin, &mut state).expect("invalidate first source");
+            save_config(&admin, &second_config).expect("publish second source");
+        }
+        assert!(approval_here(&admin, &mut checked).is_err());
+        assert!(
+            checked.is_none(),
+            "an incomplete cache is not retained policy"
+        );
+        sync(&admin, None).expect("finish second-source join");
+        let current = pinned(&admin);
+        let (_, second_seq, second_approval) = approval_here(&admin, &mut checked)
+            .expect("second policy")
+            .expect("second approves");
+        assert_eq!(second_seq, first_seq);
+        assert_eq!(second_approval, Approval::Password);
+
+        // An unrelated materialized file can fail while the current verified admin locker
+        // remains usable. Approval is not gated by whole-machine materialization readiness.
+        let token = materialize::target_path(&admin.home, "token").unwrap();
+        std::fs::remove_file(&token).expect("remove owned token");
+        std::fs::create_dir(&token).expect("block only the owned entry");
+        let SyncOutcome::Applied { report, .. } = sync(&admin, None).expect("partial apply") else {
+            panic!("the blocked entry must be retried");
+        };
+        assert!(!report.failed.is_empty());
+        let partial = load_state(&admin).expect("failed materialization state");
+        assert!(partial.failed && partial.source_identity.is_none());
+        let mut cold = None;
+        let (_, seq, approval) = approval_here(&admin, &mut cold)
+            .expect("verified cache despite failed file")
+            .expect("still an admin");
+        assert_eq!((seq, approval), (second_seq, Approval::Password));
+        std::fs::remove_dir(&token).expect("remove only the empty owned blocker");
+        sync(&admin, None).expect("repair materialization");
+        let queued = |config: &Config| {
+            requests_for(config, None)
+                .expect("queue")
+                .into_iter()
+                .map(|request| request.host)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(queued(&opened.config), ["from-a"]);
+        assert_eq!(queued(&current), ["from-b"]);
+        let mut closed = opened.doc.clone();
+        closed.set_open(false).expect("close clone");
+        let (_, _, held) = code_only_for(&opened.config, &closed, &opened.doc)
+            .expect("hold only the opened vault's waiting keys");
+        assert_eq!(
+            held.iter()
+                .map(|request| request.host.as_str())
+                .collect::<Vec<_>>(),
+            ["from-a"]
+        );
+        let body = |source: &Source| match transport::fetch(source, None, Duration::from_secs(30))
+            .expect("fetch")
+        {
+            Fetched::Body(bytes) => bytes,
+            other => panic!("expected a vault, got {other:?}"),
+        };
+        let before_a = body(&opened.config.source);
+        let before_b = body(&current.source);
+        let state = std::fs::read(admin.state_file()).expect("current state");
+        assert!(auto_approve_opened(&admin, &opened).is_err());
+        assert_eq!(body(&opened.config.source), before_a);
+        assert_eq!(body(&current.source), before_b);
+        assert_eq!(std::fs::read(admin.state_file()).unwrap(), state);
+        for machine in [&from_a, &from_b] {
+            assert_eq!(
+                sync(machine, None).expect("not admitted"),
+                SyncOutcome::NotIn
+            );
+            assert!(
+                !materialize::target_path(&machine.home, "token")
+                    .unwrap()
+                    .exists()
+            );
+        }
+
+        // A fresh pass on the same source admits only its own request and value.
+        join_pinned(&admin, &sources[0], "admin");
+        assert_eq!(
+            auto_approve(&admin).expect("approve first").approved,
+            ["from-a"]
+        );
+        sync(&from_a, None).expect("first machine syncs");
+        assert_eq!(
+            std::fs::read(materialize::target_path(&from_a.home, "token").unwrap()).unwrap(),
+            b"inert-first"
+        );
+        assert_eq!(
+            sync(&from_b, None).expect("still pending"),
+            SyncOutcome::NotIn
+        );
+        assert!(
+            !materialize::target_path(&from_b.home, "token")
+                .unwrap()
+                .exists()
+        );
+        assert_eq!(body(&current.source), before_b);
+
+        // Only A's already-member request is judged: fetching B's unadmitted request here
+        // would try to publish and fail the source guard instead of resting successfully.
+        let fresh = admin_open(&admin).expect("capture admitted first vault");
+        join_pinned(&admin, &sources[1], "admin");
+        let rested = auto_approve_opened(&admin, &fresh).expect("no publication needed");
+        assert!(rested.approved.is_empty());
+        assert_eq!(rested.seq, None);
+        assert_eq!(
+            rested
+                .judged
+                .iter()
+                .map(|request| request.host.as_str())
+                .collect::<Vec<_>>(),
+            ["from-a"]
+        );
+        assert_eq!(body(&current.source), before_b);
     }
 
     /// A path checks no signature, so a version of the vault's name there that the admin does

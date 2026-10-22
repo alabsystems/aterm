@@ -1638,6 +1638,9 @@ pub const MUSE_ANCHORS: &[Anchor] = &[
     lit("muse.tool.ran", "Ran ", "1.4.10-R6427.1"),
     lit("muse.tool.wrote", "Wrote ", "1.4.10-R6427.1"),
     lit("muse.tool.edited", "Edited ", "1.4.10-R6427.1"),
+    // Its read row, two columns in with no `◆` (`  Read README.md`; the
+    // captures `box-network-digit-approved`, `lab-end-of-turn-read-row`).
+    lit("muse.tool.read", "Read ", "1.4.10-R6427.1"),
     // The walls: the key refused (measured) and its two siblings in the
     // binary; the usage wall's pieces (its URL and its time put between
     // them); a model call that failed, and its status.
@@ -1865,6 +1868,26 @@ pub const GEMINI_ANCHORS: &[Anchor] = &[
     lit(
         "gemini.fallback.demand",
         "We are currently experiencing high demand.",
+        "0.46.0",
+    ),
+    // The notices about the folder's trust drawn when a session starts or
+    // its trust level changes, under a resumed reply: chrome, not the
+    // turn's end (`gemini::trust_notices_above`). The first is the head of
+    // two literals (`… because a parent folder is trusted.`, `… because the
+    // connected IDE workspace is trusted.`).
+    lit(
+        "gemini.notice.still_trusted",
+        "Note: This folder is still trusted because",
+        "0.46.0",
+    ),
+    lit(
+        "gemini.notice.untrusted",
+        "This folder is untrusted, project settings, hooks, MCPs, and GEMINI.md files will not be applied for this folder.",
+        "0.46.0",
+    ),
+    lit(
+        "gemini.notice.agents_skipped",
+        "Skipping project agents due to untrusted folder.",
         "0.46.0",
     ),
     // The folder-trust dialog: its options name the folder after these.

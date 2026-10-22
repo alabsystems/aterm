@@ -32,6 +32,7 @@ mod imp {
     }
 
     /// Arm `name` so the next [`triggered`] at that point returns `true`.
+    #[inline]
     pub fn arm(name: &'static str) {
         ARMED.with(|a| {
             a.borrow_mut().insert(name);
@@ -39,6 +40,7 @@ mod imp {
     }
 
     /// Disarm `name` (tests should disarm after exercising the path).
+    #[inline]
     pub fn disarm(name: &'static str) {
         ARMED.with(|a| {
             a.borrow_mut().remove(name);
@@ -47,12 +49,14 @@ mod imp {
 
     /// Whether the fault point `name` is currently armed.
     #[must_use]
+    #[inline]
     pub fn triggered(name: &'static str) -> bool {
         ARMED.with(|a| a.borrow().contains(name))
     }
 
     /// Run `f` with `name` armed, disarming afterwards even on unwind. Keeps a
     /// test's fault scoped so it cannot leak into later tests on the same thread.
+    #[inline]
     pub fn with_armed<T>(name: &'static str, f: impl FnOnce() -> T) -> T {
         struct Guard(&'static str);
         impl Drop for Guard {
@@ -71,7 +75,7 @@ mod imp {
     /// Production: no fault is ever armed; folded to `false` and inlined away.
     #[inline]
     #[must_use]
-    pub fn triggered(_name: &'static str) -> bool {
+    pub const fn triggered(_name: &'static str) -> bool {
         false
     }
 }

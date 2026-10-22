@@ -193,6 +193,11 @@ only inside aterm (`TERM_PROGRAM=aterm`, `ATERM_CHILD=1`), where `aterm help`
 prints the agent brief with the caller's session ID filled in. Keep your own
 rules outside its markers. `aterm agents` shows status, `aterm agents remove`
 uninstalls, and `agents_auto_prime = false` stops the window reinstalling it.
+Each window start also sets six Claude Code defaults in `~/.claude/settings.json`,
+each only where its key is unset: the top-effort mode, `xhigh` effort, the
+session-quality survey and every rating survey off, the drafted-feedback card
+quiet, and autocompaction at 400k tokens. A value you set is kept, and
+`agents_auto_prime = false` turns these off too.
 
 - **Env hygiene.** Every spawned shell has `CLAUDE*`, `ANTHROPIC_*`,
   `COPILOT_*`, `CODEX_*`, `ANTIGRAVITY_*`, `GEMINI_*`, `CURSOR_*`, `AI_*` and
@@ -485,9 +490,12 @@ runs it once in the background so it refreshes your account's model list.
 
 On macOS aterm turns Universal Control off for this Mac by default;
 `[machine] universal_control = "leave"` in `aterm.toml` (Settings ▸ Security)
-stops that, and `aterm pkg machine` prints the line that turns it back on. Once
-a day that same pass also removes the Rust build-cache folders under
-`~/Library/Caches/aterm/cargo-build.noindex` that nothing builds into any more.
+stops that, and `aterm pkg machine` prints the line that turns it back on. On
+Apple silicon the same daily apply installs Rosetta 2 when it is missing, as you
+and with no password (`softwareupdate --install-rosetta`); `[machine] rosetta =
+false` stops that. Once a day that same pass also removes the Rust build-cache
+folders under `~/Library/Caches/aterm/cargo-build.noindex` that nothing builds
+into any more.
 
 On macOS, builds and tests can stall while macOS checks each new program aterm
 starts before its first run. `aterm doctor`'s `devtools:` row says whether that

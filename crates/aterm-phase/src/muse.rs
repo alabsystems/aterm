@@ -834,6 +834,10 @@ enum Turn {
     /// away, its rows from `.0` down to `.1`, all indented, the last thing
     /// drawn.
     Tail(usize, usize),
+    /// The turn ended on Muse Code's own read rows ([`read_rows`]), from
+    /// `.0` down to `.1`, with no reply under them: it is over, and said no
+    /// words.
+    Tool(usize, usize),
     /// THE TURN'S END SCROLLED AWAY UNDER CARDS (`/usage`, `/status`): no
     /// message, banner, reply or status row in sight above the open
     /// composer, only cards (measured on 1.4.10, the lab of 2026-10-21:
@@ -887,10 +891,17 @@ fn turn(rows: &[String], top: usize) -> Turn {
     // turn's end.
     let mut last = last;
     loop {
-        match (from..=last)
+        let head = (from..=last)
             .rev()
-            .find(|&i| leading_spaces(&rows[i]) == 0 && !blank(&rows[i]))
+            .find(|&i| leading_spaces(&rows[i]) == 0 && !blank(&rows[i]));
+        // No head under the message: the turn may have ended on Muse
+        // Code's own read rows, with no reply under them.
+        if head.is_none()
+            && let Some(first) = user.and_then(|u| read_rows(rows, u, last, drawn))
         {
+            return Turn::Tool(first, last);
+        }
+        match head {
             Some(head) if is_own_row_head(&rows[head]) => {
                 let Some(above) = (from..head).rev().find(|&i| drawn(i)) else {
                     return Turn::Unknown;
@@ -910,6 +921,37 @@ fn turn(rows: &[String], top: usize) -> Turn {
             _ => return Turn::Unknown,
         }
     }
+}
+
+/// MUSE CODE'S READ ROWS A TURN ENDED ON, no reply under them: the first of
+/// them, where every row drawn (`drawn`) under the person's message on row
+/// `user` (past the rows it wrapped onto, up to a blank row) down to `last`
+/// is a read row ([`read_row`]). Measured on 1.4.10 (2026-10-21, the lab's
+/// `tool-end` chain, [`fixtures::END_OF_TURN_READ_ROW`]): a turn whose one
+/// `read_file` call came back and whose reply held no words ends on `  Read
+/// README.md` above the composer. `None` where the message runs down to the
+/// rows with no blank between, and where any row there is another.
+fn read_rows(
+    rows: &[String],
+    user: usize,
+    last: usize,
+    drawn: impl Fn(usize) -> bool,
+) -> Option<usize> {
+    let gap = (user + 1..=last).find(|&i| blank(&rows[i]))?;
+    let mut read = (gap..=last).filter(|&i| drawn(i)).peekable();
+    let first = *read.peek()?;
+    read.all(|i| read_row(&rows[i])).then_some(first)
+}
+
+/// Muse Code's READ ROW (measured on 1.4.10: `  Read /etc/hosts`, `  Read
+/// README.md`): two columns in, no `◆`, `Read ` and a path
+/// ([`names_a_path`]) — a sentence two columns in that opens with `Read `
+/// is a row of a reply.
+fn read_row(row: &str) -> bool {
+    leading_spaces(row) == 2
+        && crate::text::trim(row)
+            .strip_prefix(const { anchor_text("muse.tool.read") })
+            .is_some_and(names_a_path)
 }
 
 /// One of Muse Code's OWN rows under a turn's end (measured on 1.4.10): the
@@ -1081,16 +1123,17 @@ pub fn background_wait(rows: &[String]) -> Option<&'static str> {
 /// approval box, the question, the review of its answers and a drawer are a
 /// prompt; the status row is busy; a reply as the last thing drawn above the
 /// composer (a card under it or not; its rows in sight, of one taller than
-/// the screen) is idle — a question when its last words end in `?`, limited
+/// the screen), or the turn's own read rows with no reply under them
+/// ([`read_rows`]), is idle — a question when its last words end in `?`, limited
 /// on a rate limit or a usage wall — and so is a session with no turn yet
 /// (its banner, or cards alone whose newest `/status` card says `IDLE`),
 /// and cards alone over the composer, the turn's end scrolled away under
 /// them, where the newest card says how the run ended ([`Turn::Carded`]: no
 /// words read); the sign-in wall is idle on its wall. A message with
-/// nothing under it,
-/// and a turn's end whose footer still says `interrupting run`, are busy NOT
-/// authoritatively; a turn stopped on a fault only a person can fix
-/// ([`faulted`]), and any other screen, are `idle` NOT authoritatively. No
+/// nothing under it, and a turn's end whose footer still says `interrupting
+/// run`, are busy NOT authoritatively; a turn stopped on a fault only a
+/// person can fix ([`faulted`]), and any other screen, are `idle` NOT
+/// authoritatively. No
 /// screen with a box on it reads idle. An ended turn that would read idle,
 /// with no wall, while the panel says the agent's own background work runs
 /// ([`background_wait`]) is BUSY as evidence, as Claude Code's reader reads
@@ -1131,14 +1174,16 @@ fn turn_phase(rows: &[String]) -> (Phase, bool) {
         Turn::Sent => (Phase::Busy, false),
         Turn::Fresh => (Phase::Idle, true),
         Turn::Unknown => (Phase::Idle, false),
-        Turn::Ended(..) | Turn::Tail(..) | Turn::Carded(_) if interrupting(rows, f) => {
+        Turn::Ended(..) | Turn::Tail(..) | Turn::Tool(..) | Turn::Carded(_)
+            if interrupting(rows, f) =>
+        {
             (Phase::Busy, false)
         }
         // At rest under its cards, its last words out of sight: idle as
         // evidence, with none read (no wall, no question, no fault).
         Turn::Carded(_) => (Phase::Idle, true),
         Turn::Ended(..) | Turn::Tail(..) if faulted(rows) => (Phase::Idle, false),
-        Turn::Ended(..) | Turn::Tail(..) => {
+        Turn::Ended(..) | Turn::Tail(..) | Turn::Tool(..) => {
             if let Some(w) = wall(rows).filter(|w| w.kind.reads_limited()) {
                 return (
                     Phase::Limited {
@@ -2966,6 +3011,12 @@ pub mod fixtures {
     /// Which do you prefer (1 or 2)?`.
     pub const REPLY_WRAPPED_50_1_4_10: &str =
         include_str!("fixtures/muse-1.4.10-R6427.1-lab-reply-wrapped-50col.txt");
+    /// A first turn ended on Muse Code's own read row, `  Read README.md`
+    /// (two columns in, no `◆`), no words after it: the stub answered with
+    /// one `read_file` call and then a reply holding none (the lab's
+    /// `forever --mode resid` chain `tool-end`, 2026-10-21).
+    pub const END_OF_TURN_READ_ROW: &str =
+        include_str!("fixtures/muse-1.4.10-R6427.1-lab-end-of-turn-read-row.txt");
     /// A slow turn 3 s in: the status row over the open composer.
     pub const BUSY_1_4_10: &str = include_str!("fixtures/muse-1.4.10-R6427.1-busy-thinking.txt");
     /// Esc in that turn, 2 s later: the text received so far, `◆

@@ -78,6 +78,7 @@ pub enum Mode {
 impl Mode {
     /// Parse the config word, in any case: the config analyzer accepts `"OFF"`,
     /// so a parse that refused it would read an opt-out as a word it cannot read.
+    #[inline]
     #[must_use]
     pub fn parse(word: &str) -> Option<Self> {
         [Self::Off, Self::Log, Self::On]
@@ -87,6 +88,7 @@ impl Mode {
 
     /// The config word.
     #[must_use]
+    #[inline]
     pub const fn word(self) -> &'static str {
         match self {
             Self::Off => "off",
@@ -114,6 +116,7 @@ pub enum Phase {
 impl Phase {
     /// The wire word (`resizes` `nudge=`).
     #[must_use]
+    #[inline]
     pub const fn wire(self) -> &'static str {
         match self {
             Self::Idle => "idle",
@@ -138,6 +141,7 @@ pub enum Reason {
 impl Reason {
     /// The log word.
     #[must_use]
+    #[inline]
     pub const fn word(self) -> &'static str {
         match self {
             Self::Debt => "debt",
@@ -158,6 +162,7 @@ pub enum Gate {
 }
 
 impl Gate {
+    #[inline]
     const fn slot(self) -> usize {
         match self {
             Self::Lease => 0,
@@ -168,6 +173,7 @@ impl Gate {
 
     /// The log word.
     #[must_use]
+    #[inline]
     pub const fn word(self) -> &'static str {
         match self {
             Self::Lease => "lease",
@@ -192,6 +198,7 @@ pub enum GiveUp {
 
 impl GiveUp {
     /// The log word.
+    #[inline]
     #[must_use]
     pub fn word(self) -> String {
         match self {
@@ -311,6 +318,7 @@ pub struct Facts {
 impl Facts {
     /// Facts of a quiet, healthy, eligible session at `size` (a test and rig
     /// starting point; the host builds its own).
+    #[inline]
     #[must_use]
     pub const fn eligible(mode: Mode, size: (u16, u16)) -> Self {
         Self {
@@ -339,6 +347,7 @@ impl Facts {
 /// The person gate's input: milliseconds since a person's last gesture on the session, or,
 /// when none reached it in this process (the stamp is process-local, so a session adopted
 /// across an update has none), since it attached. "Never" is unknown, not quiet.
+#[inline]
 #[must_use]
 pub const fn person_quiet_ms(since_gesture_ms: Option<u64>, since_attach_ms: u64) -> u64 {
     match since_gesture_ms {
@@ -379,6 +388,7 @@ pub struct RepaintNudge {
 }
 
 impl Default for RepaintNudge {
+    #[inline]
     fn default() -> Self {
         Self::new()
     }
@@ -386,6 +396,7 @@ impl Default for RepaintNudge {
 
 impl RepaintNudge {
     /// A machine at rest with no history.
+    #[inline]
     #[must_use]
     pub const fn new() -> Self {
         Self {
@@ -410,48 +421,56 @@ impl RepaintNudge {
     }
 
     /// Where the machine is.
+    #[inline]
     #[must_use]
     pub const fn phase(&self) -> Phase {
         self.phase
     }
 
     /// Why the current or last attempt was armed.
+    #[inline]
     #[must_use]
     pub const fn reason(&self) -> Reason {
         self.reason
     }
 
     /// The epoch of the current or last attempt.
+    #[inline]
     #[must_use]
     pub const fn epoch(&self) -> u64 {
         self.epoch
     }
 
     /// How many attempts have actually held a PTY (`nudged=`).
+    #[inline]
     #[must_use]
     pub const fn nudged(&self) -> u32 {
         self.nudged
     }
 
     /// Milliseconds from the hold to the first answer, once seen.
+    #[inline]
     #[must_use]
     pub const fn first_answer_ms(&self) -> Option<u64> {
         self.first_answer_ms
     }
 
     /// Milliseconds from the release to the second answer, once seen.
+    #[inline]
     #[must_use]
     pub const fn second_answer_ms(&self) -> Option<u64> {
         self.second_answer_ms
     }
 
     /// When the hold began (host ms); meaningful while [`Phase::Short`].
+    #[inline]
     #[must_use]
     pub const fn hold_started_ms(&self) -> u64 {
         self.hold_ms
     }
 
     /// The engine size the hold was taken against.
+    #[inline]
     #[must_use]
     pub const fn hold_engine(&self) -> (u16, u16) {
         self.hold_engine
@@ -690,13 +709,15 @@ impl RepaintNudge {
         }
     }
 
-    fn finish(&mut self, act: Act) -> Act {
+    #[inline]
+    const fn finish(&mut self, act: Act) -> Act {
         self.phase = Phase::Rest;
         self.last_epoch = Some(self.epoch);
         act
     }
 
-    fn drop_with(&mut self, why: Dropped) -> Act {
+    #[inline]
+    const fn drop_with(&mut self, why: Dropped) -> Act {
         // A drop about the world (not the program) leaves the epoch untried: a later,
         // eligible moment may arm it again.
         self.phase = Phase::Rest;

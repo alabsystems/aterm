@@ -697,6 +697,7 @@ const STARTER_CONFIG: &str = concat!(
 # Apply Now when there is something to apply. macOS only.
 # [machine]
 # universal_control = \"off\"        # \"off\" (default: disable it for this host) | \"leave\"
+# rosetta = true                   # Apple silicon: install Rosetta 2 when missing, as you (no password) | false
 
 # --- system awareness: the stats bars (Global, aterm, Tab): every core as a
 # tile, the GPU, memory and swap, the disk the tab is in. Read live; ⌘I opens

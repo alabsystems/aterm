@@ -1317,6 +1317,13 @@ fn the_row_to_sign_in_next_is_the_first_other_one_not_signed_in() {
     let mut s = state();
     limited(&mut s, "work-2", NOW + HOUR);
     assert_eq!(sign_in_next(&r, &s, &all(&r), Some("main"), NOW), None);
+    // NEGATIVE CONTROL: a not-enrolled or signed-out row that already has a
+    // standing limit is skipped in favor of the next non-limited row.
+    note_auth(&mut s, "work-2", Auth::SignedOut, NOW);
+    assert_eq!(
+        sign_in_next(&r, &s, &here, Some("main"), NOW),
+        Some(("pool-a".to_string(), true))
+    );
 }
 
 #[test]

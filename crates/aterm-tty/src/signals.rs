@@ -30,16 +30,19 @@ impl Signals {
     /// was stopped.
     pub const CONT: Self = Self(1 << 2);
 
+    #[inline]
     #[must_use]
     pub const fn contains(self, other: Self) -> bool {
         self.0 & other.0 == other.0
     }
 
+    #[inline]
     #[must_use]
     pub const fn is_empty(self) -> bool {
         self.0 == 0
     }
 
+    #[inline]
     #[must_use]
     pub const fn union(self, other: Self) -> Self {
         Self(self.0 | other.0)
@@ -209,24 +212,28 @@ mod unix {
 
         /// The descriptor a `poll` watches beside the terminal: readable when a signal
         /// arrived.
+        #[inline]
         #[must_use]
-        pub fn fd(&self) -> RawFd {
+        pub const fn fd(&self) -> RawFd {
             self.rd
         }
 
         /// The signals caught and not yet taken.
+        #[inline]
         #[must_use]
         pub fn pending(&self) -> Signals {
             Signals(PENDING.load(Ordering::Acquire))
         }
 
         /// Empty the wake pipe.
+        #[inline]
         pub fn drain(&self) {
             drain(self.rd);
         }
 
         /// The signals caught since the last take. The pipe is emptied first, so a
         /// signal caught meanwhile is either taken now or wakes the next `poll`.
+        #[inline]
         pub fn take(&self) -> Signals {
             drain(self.rd);
             Signals(PENDING.swap(0, Ordering::AcqRel))

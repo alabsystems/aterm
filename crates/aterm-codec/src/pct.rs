@@ -15,6 +15,7 @@
 /// Percent-encode `s` into one space-free token: every byte that is not
 /// ASCII-graphic, and `%`, becomes `%XX`. Empty -> "".
 #[must_use]
+#[inline]
 pub fn encode(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     encode_into(&mut out, s);
@@ -23,6 +24,7 @@ pub fn encode(s: &str) -> String {
 
 /// [`encode`] appending into a caller-owned buffer, with no allocation of its
 /// own (`blocks` and `history` encode many records under the terminal lock).
+#[inline]
 pub fn encode_into(out: &mut String, s: &str) {
     // Uppercase nibble table, equal to `{:02X}` without `core::fmt`.
     const HEX: &[u8; 16] = b"0123456789ABCDEF";
@@ -80,6 +82,7 @@ pub fn join_words<S: AsRef<str>>(words: &[S]) -> String {
 /// [`decode`]d. A line of plain words — no `%` in any — is its own whitespace
 /// split.
 #[must_use]
+#[inline]
 pub fn split_words(line: &str) -> Vec<String> {
     line.split_whitespace().map(decode).collect()
 }

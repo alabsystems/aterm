@@ -452,6 +452,11 @@ WHAT IT IS
   It writes no hooks, and removes any hook an older aterm wrote into
   ~/.claude/settings.json (so does every window start), keeping every other entry and
   the previous file as `settings.json.bak-<unix>`.
+  Every window start also adds six Claude Code defaults to ~/.claude/settings.json,
+  each only where its key is unset: the top-effort mode on, `effortLevel` xhigh,
+  `feedbackSurveyRate` 0 and the `env` switch CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY=1
+  (the rating surveys off), `feedbackDrafts` quiet, and `autoCompactWindow` 400000. A
+  value you set is kept, and `agents_auto_prime = false` adds none of them.
 
 KEY USAGE
   aterm agents               status: each agent, its context file + skills
@@ -838,6 +843,7 @@ CONFIGURATION — [ai] in aterm.toml (Settings ▸ Harness ▸ AI CLIs)
   aterm init --plan                 read and show changes without applying them
   aterm init --check                read only; nonzero if anything needs attention
   aterm init --json                 include per-setting results and available undo commands
+  aterm init --only base.clt        install Apple's Command Line Tools (one sudo prompt)
 
 Run as yourself, without sudo. It first restores what aterm lays for this
 account, as bare `aterm doctor` does: the installed commands and their
@@ -846,6 +852,11 @@ stays as you left it), the reroute stubs, the rustup link and exec roots. That
 part runs over SSH too; the settings below need this Mac's console, and over
 SSH or with another login at the console each is reported blocked. Exit 75 means
 only what an install pass's store lock held back is left; run it again.
+`--only` runs just the base items it names (an id such as base.shell.rc, a
+family such as shell, or base) and reads no setting of this login. Missing
+Command Line Tools are base.clt: in a terminal it runs `sudo aterm machines
+here apply` with a one-table baseline, the one password prompt; without one it
+is reported blocked.
 Caps Lock becomes Control now and persists across logins. Natural scrolling is turned off through the
 native System Settings setter and saved for future logins; `--check` verifies
 the saved value, while each apply also refreshes the current session.
@@ -3685,8 +3696,10 @@ WHAT IT IS
 KEY USAGE (spelled as you type them — daily verbs first)
   aterm pkg install --default-set
                              the whole ALab toolset in one step — the documented
-                             consent act, and the usual first command on a CLI-only
-                             box (the app's first launch runs it unattended)
+                             consent act. The first launch runs `aterm pkg seed`
+                             then `aterm pkg update`, which honour [packages]
+                             consent; on a machine with no window, run this, which
+                             also lifts a recorded decline
   aterm pkg list             what you have: each program's live build, plus builds
                              kept for rollback — local, no network. Human table on
                              a terminal; pipe it (or pass --porcelain) for the
@@ -3718,7 +3731,10 @@ KEY USAGE (spelled as you type them — daily verbs first)
                              installs on macOS alone), never through the ALab
                              index. atpkg never elevates and installs nothing
                              through the OS's own installers or package managers;
-                             an index row naming one is refused
+                             an index row naming one is refused. The one exception
+                             is a [machine] step, never an index row: Rosetta 2 on
+                             Apple silicon (`aterm pkg machine apply`, below), as
+                             you and with no password
   aterm pkg verify [program] re-attest installed bytes against the signed root (no
                              network) — doctor reads health, verify re-proves bytes
   aterm pkg which <tool>     one line: which copy of a tool runs and why — managed
@@ -3738,8 +3754,9 @@ KEY USAGE (spelled as you type them — daily verbs first)
                              answered as on the managed name (SELF-UPDATE VERBS,
                              below)
   aterm pkg seed             the first-launch bootstrap the app runs each launch:
-                             records that this machine wants the toolset and puts
-                             a stub on PATH for each default-set tool; it installs
+                             records that this machine wants the toolset, puts a
+                             stub on PATH for each default-set tool and lays the
+                             shell integration (the rc block below); it installs
                              nothing (the update pass after it does). Offline
                              unless the store is empty, when it asks the signed
                              index whether this machine is served.
@@ -3768,13 +3785,20 @@ OCCASIONAL (recovery and preference)
   aterm pkg gc               reclaim superseded builds and interrupted downloads; it
                              says what it swept and why
   aterm pkg machine          the [machine] settings as the doctor reads them: Universal
-                             Control (the cursor roaming to other Macs and iPads)
+                             Control (the cursor roaming to other Macs and iPads) and,
+                             on Apple silicon, Rosetta 2 (Apple's x86_64 translator)
   aterm pkg machine apply    apply them NOW — what aterm runs once a day at the first
                              window or interactive session (a package pass runs it
                              only after an edit to [machine], or after an apply whose
-                             write failed). Universal Control is disabled for this host
-                             (both per-host keys; `aterm pkg machine` prints the revert
-                             line). Exit 0 either way; it says what changed, why nothing
+                             change did not land). Universal Control is disabled for
+                             this host (both per-host keys; `aterm pkg machine` prints
+                             the revert line). On Apple silicon a missing Rosetta 2 is
+                             installed (`softwareupdate --install-rosetta
+                             --agree-to-license`, run as you: no admin password, no
+                             sudo; macOS keeps it). [machine] universal_control =
+                             "leave" and rosetta = false turn each off; on an Intel Mac
+                             or off macOS rosetta does nothing (`aterm pkg machine` says
+                             so). Exit 0 either way; it says what changed, why nothing
                              changed (already applied, switched off in [machine], or a
                              change that did not land), or that nothing was applied and
                              why (a HOME that is not this account's)
@@ -3799,8 +3823,9 @@ PLUMBING (producer / operator / dev — a first hour never needs these)
   aterm pkg shell-setup [--path] [--completions] [--man <dir> | --own-man] [--desktop]
                              [--dry-run]
                              what install.sh asks of the binary it placed: ONE
-                             marker-fenced PATH block in the shell's profile (the toolset
-                             hook, and the bin dir PATH lacks), this binary's completions
+                             marker-fenced PATH block in the login shell's profile (the
+                             account record's shell, never $SHELL; the toolset hook, and
+                             the bin dir PATH lacks), this binary's completions
                              where each shell loads them, the man pages (a checkout's, or
                              this binary's own), the Linux desktop entry and its icons.
                              Bare: --path --completions; --dry-run says which file it
@@ -3854,15 +3879,18 @@ WHEN TO REACH FOR IT
   integration through the same code the install pass runs.
   Never rebuild a toolchain from source to answer that message.
   (`doctor` reports — `--verbose` is its one flag — and `repair` acts.)
-  When a foreign shell needs the tools: every install/update pass writes a marker-bounded
-  block (`# >>> atpkg shell integration >>>`) into an EXISTING ~/.zshrc, ~/.bashrc,
-  ~/.bash_profile (what a login bash reads on macOS — Terminal.app, ssh) and
+  When a foreign shell needs the tools: the seed and every install/update pass write a
+  marker-bounded block (`# >>> atpkg shell integration >>>`) into an EXISTING ~/.zshrc,
+  ~/.bashrc, ~/.bash_profile (what a login bash reads on macOS — Terminal.app, ssh) and
   ~/.config/fish/config.fish that sources ~/.aterm/shell.d/00-atpkg.*,
   so Terminal.app, ssh and an agent's shell get the tools too (a shell opened before the
   install picks them up in place with `. ~/.aterm/shell.d/00-atpkg.<shell>` — fish:
   `source …fish` — never a new tab, and never `exec $SHELL`, which inside an aterm tab
-  drops the tab's shell integration). It never CREATES an rc file, and it SKIPS an rc
-  that resolves under a folder macOS guards
+  drops the tab's shell integration). It CREATES one rc file only: your login shell's
+  (the account record's shell, never $SHELL: ~/.zshrc for zsh, ~/.bash_profile for bash
+  on macOS, config.fish for fish), when it is absent — a new Mac has no ~/.zshrc —
+  holding only the block; delete the file or the block to opt out. No other shell gains
+  a file. It SKIPS an rc that resolves under a folder macOS guards
   with a consent dialog (your home's Documents, Desktop, Downloads, Pictures, Movies or
   Music folder, iCloud Drive, a cloud-sync provider's folder, a network or removable
   volume): opening it would raise that dialog on an unattended pass, so the rc is left
@@ -5403,14 +5431,17 @@ WHAT THIS OS MEASURES (Linux)
   CPU per core (/proc/stat), grouped by performance level where the kernel
   names one (cpu_core/cpu_atom PMUs, cpu_capacity); memory classes, swap and the
   commit charge (/proc/meminfo); pressure from PSI where it is enabled; the GPU's
-  busy percent where its driver says (amdgpu, i915; a sleeping card reads idle
-  without being woken); thermal throttling from trip points and throttle
+  busy percent where its driver says (amdgpu's sysfs file, NVIDIA's NVML; a
+  sleeping card reads idle without being woken, and a laptop's runtime-managed
+  dGPU is not read); thermal throttling from trip points and throttle
   counters; processes from /proc; each volume's free space (statvfs); each job
   in your tabs (`sys jobs`), from /proc's wait channels and fdinfo.
 
 WHAT IT CANNOT MEASURE HERE
   - the classes do not partition RAM: `sys mem` names the rest "no class", and
     the commit limit is advisory under overcommit.
+  - an Intel GPU's busy percent (i915, xe): only with CAP_PERFMON, which aterm
+    never asks for, so it reads unavailable(needs_privilege:cap_perfmon).
   - paging rates, a process's time waiting to run, its peak footprint and the
     bytes it wrote: unavailable(not_sampled) or absent.
   - which core a process runs on: `sys cores` shows each scope's SHARE.

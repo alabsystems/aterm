@@ -623,6 +623,68 @@ fn an_answered_box_ends_the_turn_on_the_reply() {
     assert_eq!(said_tail(&tool_row_last), None, "the control");
 }
 
+/// A TURN ENDED ON MUSE CODE'S READ ROW IS OVER, WITH NO WORDS (1.4.10,
+/// measured live 2026-10-21, `docs/measured/forever-lab-2026-10-20.md`
+/// "Residuals, live"): the turn's `read_file` call drawn as `  Read
+/// README.md`, two columns in and no `◆`, under a blank row, with no reply
+/// under it. FAILS WITHOUT THE FIX: no `◆` head under the message, so the
+/// grammar read nothing it knew (idle NOT as evidence) and the supervisor
+/// never judged the turn — the session waited for ever. It is idle as
+/// evidence with no last words, as a turn ended on `◆ Ran command · …` is;
+/// a message wrapped onto a second row over the blank changes nothing; a
+/// recap under the read row is Muse Code's own; and the same read row over
+/// a reply (the measured `Read /etc/hosts` over `◆ Tool call done. …`)
+/// leaves the reply the last words. NEGATIVE CONTROLS: the read row under a
+/// status row is busy; a row two columns in that opens with `Read ` but
+/// names no path is no read row, and neither is the read row with the
+/// message's own wrapped row directly over it (no blank between): nothing
+/// measured, idle NOT as evidence, as before.
+#[test]
+fn a_turn_ended_on_its_read_row_is_over_with_no_words() {
+    const READ: &str = "  Read README.md";
+    let rows = screen(END_OF_TURN_READ_ROW);
+    let at = rows.iter().position(|r| r == READ).expect("the read row");
+    assert!(message_drawn(&rows));
+    assert_eq!(phase(&rows), (Phase::Idle, true));
+    assert_eq!(said_tail(&rows), None);
+    let r = muse(END_OF_TURN_READ_ROW);
+    assert_eq!(
+        (r.phase.clone(), r.phase_authoritative, r.prompt.clone()),
+        (Phase::Idle, true, None)
+    );
+    assert_eq!((r.wall.clone(), r.said_tail.clone()), (None, None));
+    let with = |edits: &[(usize, &str)]| {
+        let mut out = rows.clone();
+        for &(i, row) in edits {
+            out.insert(i, row.to_string());
+        }
+        out
+    };
+    let wrapped = {
+        let mut out = rows.clone();
+        out.insert(at - 1, "  and every test it needs".to_string());
+        out
+    };
+    assert_eq!(phase(&wrapped), (Phase::Idle, true), "{wrapped:#?}");
+    let recap = with(&[(at + 1, ""), (at + 2, "◆ Recap: the parser is next")]);
+    assert_eq!(phase(&recap), (Phase::Idle, true));
+    assert_eq!(said_tail(&recap), None);
+    const REPLY: &str = "Tool call done. Result: Read text file README.md.";
+    let replied = with(&[(at + 1, ""), (at + 2, &format!("◆ {REPLY}"))]);
+    assert_eq!(phase(&replied), (Phase::Idle, true));
+    assert_eq!(said_tail(&replied).as_deref(), Some(REPLY));
+    // NEGATIVE CONTROLS.
+    let running = with(&[(at + 1, ""), (at + 2, "◇ Thinking (3s · esc to interrupt)")]);
+    assert_eq!(phase(&running), (Phase::Busy, true));
+    let mut sentence = rows.clone();
+    sentence[at] = "  Read the docs before you start".to_string();
+    assert_eq!(phase(&sentence), (Phase::Idle, false));
+    let mut glued = rows.clone();
+    glued[at - 1] = "  and every test it needs".to_string();
+    assert_eq!(phase(&glued), (Phase::Idle, false));
+    assert_eq!(said_tail(&glued), None);
+}
+
 /// THE AGENT'S OWN SENTENCE THAT OPENS LIKE A TOOL ROW IS ITS WORDS
 /// (`docs/measured/forever-lab-2026-10-20.md` P2): a reply `Wrote the parser
 /// module and its unit tests in this turn.` (or `Edited the config …`) is the

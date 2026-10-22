@@ -20,12 +20,14 @@ pub struct StrLit {
 /// Reads a literal token as a string literal.
 ///
 /// `None` for any other literal (a byte string, a C string, a char, a number).
+#[inline]
 #[must_use]
 pub fn str_lit(lit: &Literal) -> Option<StrLit> {
     parse_str_source(&lit.to_string())
 }
 
 /// A string literal token with value `value` at `span`.
+#[inline]
 #[must_use]
 pub fn str_literal(value: &str, span: Span) -> Literal {
     let mut lit = Literal::string(value);
@@ -158,6 +160,7 @@ impl IntLit {
     /// # Errors
     /// The value does not fit; the message is std's ("number too large to
     /// fit in target type").
+    #[inline]
     pub fn to_i64(&self) -> Result<i64, String> {
         self.digits.parse::<i64>().map_err(|e| e.to_string())
     }
@@ -166,6 +169,7 @@ impl IntLit {
 /// Reads a literal token as an integer literal.
 ///
 /// `None` for any other literal, a float (`1.0`, `1e3`) included.
+#[inline]
 #[must_use]
 pub fn int_lit(lit: &Literal) -> Option<IntLit> {
     // The compiler has already validated this token's suffix as a Rust
@@ -184,6 +188,7 @@ pub fn int_lit(lit: &Literal) -> Option<IntLit> {
 /// token, including Unicode XID continuation marks.
 ///
 /// `None` when `src` is not one: a float, a digit outside the base, no digit.
+#[inline]
 #[must_use]
 pub fn parse_int_source(src: &str) -> Option<IntLit> {
     read_int_source(src).filter(|int| valid_suffix(&int.suffix))
@@ -348,10 +353,12 @@ fn is_expr_path(tokens: &[TokenTree]) -> bool {
     }
 }
 
+#[inline]
 fn is_punct_at(tokens: &[TokenTree], i: usize, ch: char) -> bool {
     matches!(tokens.get(i), Some(TokenTree::Punct(p)) if p.as_char() == ch)
 }
 
+#[inline]
 fn is_colon2_at(tokens: &[TokenTree], i: usize) -> bool {
     matches!(tokens.get(i), Some(TokenTree::Punct(p)) if p.as_char() == ':' && p.spacing() == Spacing::Joint)
         && is_punct_at(tokens, i + 1, ':')

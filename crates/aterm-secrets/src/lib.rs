@@ -78,6 +78,7 @@ pub struct Error(pub String);
 
 impl Error {
     /// An error with this message.
+    #[inline]
     pub fn new(message: impl Into<String>) -> Self {
         Error(message.into())
     }

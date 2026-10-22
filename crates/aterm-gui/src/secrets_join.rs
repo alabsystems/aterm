@@ -1671,16 +1671,19 @@ impl App {
     fn answer_secrets_sheet(&mut self, id: u64, choice: Choice) {
         #[cfg(target_os = "macos")]
         let typed = self.take_secrets_sheet_with_source(id, choice == Choice::Join);
-        #[cfg(not(target_os = "macos"))]
-        let typed: Option<(String, Option<SecretBytes>)> = None;
         let Some(choice) = self.secrets_join.answered(id, choice) else {
             return;
         };
         aterm_log::info!("secrets vault: the ask was answered: {}", choice.as_str());
         match choice {
             Choice::Join => {
+                // Off macOS the sheet has no fields: the default source, no password.
+                #[cfg(target_os = "macos")]
                 let (source, password) =
                     typed.unwrap_or_else(|| (aterm_secrets::ALAB_DEFAULT_URL.to_owned(), None));
+                #[cfg(not(target_os = "macos"))]
+                let (source, password): (String, Option<SecretBytes>) =
+                    (aterm_secrets::ALAB_DEFAULT_URL.to_owned(), None);
                 self.start_secrets_join(source, password);
             }
             Choice::NotNow => {}

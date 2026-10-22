@@ -1416,3 +1416,149 @@ fn a_leap_bed_is_one_tube_across_a_short_gap() {
         "control: across six cells of air the bed still lays a tube"
     );
 }
+
+/// A COMET COMPLETION LAYS THE PATH `LENGTH` CUTS UNDER THE LETTERS IT
+/// CROSSES (audit r14 PV7): on a dark ground the comet's swept runs are its
+/// bed under the text, and every one-row run used to be redrawn as the
+/// fixed 3.5-cell typing wedge, so a Tab completion over letters looked the
+/// same at every Trail length (only the beam over air was cut by it). A
+/// jump's samples keep their own path in the bed: typing ten keys and then
+/// completing six cells at once, Length 2 and Length 24 lay different beds
+/// over the completed letters. NEGATIVE CONTROL: before the completion,
+/// typing alone, the two lengths lay the same bed, the wedge behind the
+/// caret.
+#[test]
+fn a_comet_completion_lays_the_path_length_cuts_under_its_letters() {
+    use crate::cursor_fx::{GlowKnobs, GlowSpelling, resolve_glow_config};
+    let g = tall_geom();
+    let line: Vec<char> = LINE.chars().collect();
+    let typed = 10_usize;
+    let jump = 6_usize;
+    let cfg_at = |length: usize| {
+        let glow = resolve_glow_config(
+            GlowKnobs {
+                enabled: true,
+                color: None,
+                accent: None,
+                duration_ms: 260,
+                length,
+                intensity: crate::cursor_fx::default_trail_intensity(Some(GlowStyle::Comet), false),
+                radius: 0.6,
+                ring: true,
+            },
+            GlowSpelling {
+                style: Some(GlowStyle::Comet),
+                beam: true,
+                ribbon_tall: true,
+                ribbon_flat: false,
+                classic_mono: false,
+            },
+            CURSOR,
+            true,
+            FG,
+            BG,
+            0.5,
+        );
+        let trail = TrailConfig {
+            enabled: !crate::cursor_fx::comet_tail_is_its_streak(&glow),
+            duration: Duration::from_millis(260),
+            max_len: length,
+            color: glow.color,
+            intensity: 0.0,
+            warmth: 0.0,
+        };
+        (glow, trail)
+    };
+    // The bed under each column of the row, before the completion and
+    // right after it.
+    let beds = |length: usize| -> (Vec<u8>, Vec<u8>) {
+        let (glow_cfg, trail_cfg) = cfg_at(length);
+        let mut fx = CursorFx::default();
+        let t0 = Instant::now();
+        let input = |now: Instant, col: u16| CursorFxInput {
+            now,
+            cur: Some((ROW, col)),
+            live_viewport: true,
+            cursor_style: CursorStyle::SteadyBlock,
+            blink_phase: true,
+            live_cursor: CURSOR,
+            cursor_color_pinned: false,
+            default_bg: BG,
+            cursor_cell_bg: None,
+            geom: g,
+            focused: true,
+            shed_envelope: 1.0,
+            trail_brightness: 1.0,
+            body_allowed: true,
+            momentum_glow: true,
+            user_tinted: false,
+        };
+        let blank = vec![' '; g.cols];
+        let row_with = |shown: usize| {
+            let mut cols = vec![' '; g.cols];
+            cols[0] = '$';
+            for (i, ch) in line.iter().take(shown).enumerate() {
+                cols[usize::from(START) + i] = *ch;
+            }
+            cols
+        };
+        let bed_row = |fx: &CursorFx| -> Vec<u8> {
+            (0..g.cols as u16)
+                .map(|col| bed_alpha_at(fx.glow.under_quads(), g.cell_center(ROW, col).0 as u16))
+                .collect()
+        };
+        let mut t = t0;
+        for k in 0..=typed {
+            if k > 0 {
+                t += Duration::from_millis(60);
+                fx.glow.note_synthetic_typed(t, 1);
+                fx.cadence.on_keystroke(t);
+                fx.momentum.on_key(t, MOMENTUM_GLOW_TAU_S);
+            }
+            let caret = START + k as u16;
+            fx.begin(true, true);
+            fx.glow.observe_row(ROW, caret, &row_with(k), t);
+            fx.glow.observe_neighbor_rows(Some(&blank), Some(&blank));
+            fx.tick(&input(t, caret), &glow_cfg, trail_cfg);
+        }
+        let before = bed_row(&fx);
+        // The completion: six cells land at once, licensed as a real Tab.
+        t += Duration::from_millis(60);
+        fx.cadence.on_keystroke(t);
+        fx.glow.note_user_gesture(t);
+        fx.trail.note_user_gesture(t);
+        let caret = START + (typed + jump) as u16;
+        fx.begin(true, true);
+        fx.glow.observe_row(ROW, caret, &row_with(typed + jump), t);
+        fx.glow.observe_neighbor_rows(Some(&blank), Some(&blank));
+        fx.tick(&input(t, caret), &glow_cfg, trail_cfg);
+        t += Duration::from_millis(16);
+        fx.begin(true, true);
+        fx.glow.observe_row(ROW, caret, &row_with(typed + jump), t);
+        fx.glow.observe_neighbor_rows(Some(&blank), Some(&blank));
+        fx.tick(&input(t, caret), &glow_cfg, trail_cfg);
+        (before, bed_row(&fx))
+    };
+    let (short_before, short_after) = beds(2);
+    let (long_before, long_after) = beds(24);
+    assert_eq!(
+        short_before, long_before,
+        "control: typing alone lays one bed at every length"
+    );
+    // The completed letters, up to the caret.
+    let path = usize::from(START) + typed..usize::from(START) + typed + jump;
+    let apart: u32 = path
+        .clone()
+        .map(|col| u32::from(long_after[col].abs_diff(short_after[col])))
+        .sum();
+    let longer = path
+        .clone()
+        .filter(|&col| long_after[col] > short_after[col] + 40)
+        .count();
+    assert!(
+        longer >= 1 && apart > 60,
+        "Length cuts the completion's bed: {:?} at 24 against {:?} at 2",
+        &long_after[path.clone()],
+        &short_after[path]
+    );
+}

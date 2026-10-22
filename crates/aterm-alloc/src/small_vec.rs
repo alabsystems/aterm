@@ -27,6 +27,7 @@ enum SmallVecData<T, const N: usize> {
 
 impl<T, const N: usize> SmallVec<T, N> {
     /// Create a new, empty `SmallVec`.
+    #[inline]
     #[must_use]
     pub const fn new() -> Self {
         Self {
@@ -61,8 +62,9 @@ impl<T, const N: usize> SmallVec<T, N> {
     }
 
     /// The number of elements.
+    #[inline]
     #[must_use]
-    pub fn len(&self) -> usize {
+    pub const fn len(&self) -> usize {
         match &self.data {
             SmallVecData::Inline { len, .. } => *len,
             SmallVecData::Heap(vec) => vec.len(),
@@ -70,14 +72,16 @@ impl<T, const N: usize> SmallVec<T, N> {
     }
 
     /// Whether the collection is empty.
+    #[inline]
     #[must_use]
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.len() == 0
     }
 
     /// The current capacity (inline or heap).
+    #[inline]
     #[must_use]
-    pub fn capacity(&self) -> usize {
+    pub const fn capacity(&self) -> usize {
         match &self.data {
             SmallVecData::Inline { .. } => N,
             SmallVecData::Heap(vec) => vec.capacity(),
@@ -85,8 +89,9 @@ impl<T, const N: usize> SmallVec<T, N> {
     }
 
     /// Whether the data is currently stored inline.
+    #[inline]
     #[must_use]
-    pub fn is_inline(&self) -> bool {
+    pub const fn is_inline(&self) -> bool {
         matches!(&self.data, SmallVecData::Inline { .. })
     }
 
@@ -94,12 +99,14 @@ impl<T, const N: usize> SmallVec<T, N> {
     ///
     /// This is the inverse of [`is_inline`](Self::is_inline).
     /// Provided for API compatibility with `smallvec::SmallVec::spilled()`.
+    #[inline]
     #[must_use]
-    pub fn spilled(&self) -> bool {
+    pub const fn spilled(&self) -> bool {
         !self.is_inline()
     }
 
     /// Push an element. Spills to heap if inline capacity is exceeded.
+    #[inline]
     pub fn push(&mut self, value: T) {
         match &mut self.data {
             SmallVecData::Inline { buf, len } => {
@@ -123,6 +130,7 @@ impl<T, const N: usize> SmallVec<T, N> {
     /// Pop the last element.
     // Skip: the inline arm's `assume_init_read` is in ArrayVec::pop's
     // init-tracking class; `len` counts exactly the initialized prefix.
+    #[inline]
     #[cfg_attr(trust_verify, trust::skip)]
     pub fn pop(&mut self) -> Option<T> {
         match &mut self.data {
@@ -198,6 +206,7 @@ impl<T, const N: usize> SmallVec<T, N> {
     }
 
     /// View as a slice.
+    #[inline]
     #[must_use]
     // Skip: the raw-parts reconstruction joins ArrayVec::as_slice's
     // init/provenance classification (memory-model producer lane).
@@ -223,6 +232,7 @@ impl<T, const N: usize> SmallVec<T, N> {
     /// View as a mutable slice.
     // Skip: the raw-parts reconstruction joins ArrayVec::as_slice's
     // init/provenance classification (memory-model producer lane).
+    #[inline]
     #[cfg_attr(trust_verify, trust::skip)]
     pub fn as_mut_slice(&mut self) -> &mut [T] {
         match &mut self.data {
@@ -327,6 +337,7 @@ impl<T, const N: usize> SmallVec<T, N> {
 // ── Trait impls ─────────────────────────────────────────────────────────────
 
 impl<T, const N: usize> Default for SmallVec<T, N> {
+    #[inline]
     fn default() -> Self {
         Self::new()
     }
@@ -335,12 +346,14 @@ impl<T, const N: usize> Default for SmallVec<T, N> {
 impl<T, const N: usize> Deref for SmallVec<T, N> {
     type Target = [T];
 
+    #[inline]
     fn deref(&self) -> &[T] {
         self.as_slice()
     }
 }
 
 impl<T, const N: usize> DerefMut for SmallVec<T, N> {
+    #[inline]
     fn deref_mut(&mut self) -> &mut [T] {
         self.as_mut_slice()
     }

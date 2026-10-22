@@ -1,0 +1,18 @@
+# claude-code 2.1.308 · MEASURED 2026-10-21, `aterm ctl text` of a private headless aterm (144x50, aterm 0.110.0) running the real Claude Code, launched by path with a scratch `CLAUDE_CONFIG_DIR`, a fake `apiKeyHelper` key and `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>` (a local stub of the API, crates/aterm-lab) · the folder trust dialog at the first launch in the lab's project (no LAB_TRUST), harness approve=none · the lab's random project dir is spelled /private/tmp/at.lab0 here
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+ Accessing workspace:
+
+ /private/tmp/at.lab0/proj
+
+ Quick safety check: Is this a project you created or one you trust? (Like your own code, a well-known open source project, or work from your
+ team). If not, take a moment to review what's in this folder first.
+
+ Claude Code'll be able to read, edit, and execute files here.
+
+ Security guide
+
+ ❯ No, exit
+   Yes, I trust this folder
+
+ Enter to confirm · Esc to cancel

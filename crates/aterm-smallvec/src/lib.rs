@@ -363,6 +363,7 @@ impl<A: Array> SmallVec<A> {
 
     /// Keeps the first `len` items and drops the rest, last first. Does not
     /// reallocate.
+    #[inline]
     pub fn truncate(&mut self, len: usize) {
         while self.len() > len {
             drop(self.store.pop());
@@ -393,6 +394,7 @@ impl<A: Array> SmallVec<A> {
     }
 
     /// The same as [`retain`](Self::retain), as upstream has it.
+    #[inline]
     pub fn retain_mut<F: FnMut(&mut A::Item) -> bool>(&mut self, f: F) {
         self.retain(f);
     }
@@ -759,6 +761,7 @@ where
     A::Item: Hash,
 {
     /// The slice's hash, as upstream.
+    #[inline]
     fn hash<H: Hasher>(&self, state: &mut H) {
         (**self).hash(state);
     }

@@ -43,16 +43,18 @@ impl Endian {
     };
 
     /// The header's first byte.
+    #[inline]
     #[must_use]
-    pub fn tag(self) -> u8 {
+    pub const fn tag(self) -> u8 {
         match self {
             Self::Little => b'l',
             Self::Big => b'B',
         }
     }
 
+    #[inline]
     #[must_use]
-    pub fn from_tag(tag: u8) -> Option<Self> {
+    pub const fn from_tag(tag: u8) -> Option<Self> {
         match tag {
             b'l' => Some(Self::Little),
             b'B' => Some(Self::Big),
@@ -70,6 +72,7 @@ impl Endian {
 #[cfg_attr(trust_verify, trust::requires(align == 1 || align == 2 || align == 4 || align == 8))]
 #[cfg_attr(trust_verify, trust::requires(pos <= 4294967296))]
 #[cfg_attr(trust_verify, trust::ensures(result >= pos && result - pos < align && result % align == 0))]
+#[inline]
 #[must_use]
 pub fn pad_to(pos: usize, align: usize) -> usize {
     let rem = pos % align;
@@ -156,6 +159,7 @@ pub(crate) struct Writer {
 }
 
 impl Writer {
+    #[inline]
     pub(crate) fn new(endian: Endian, base: usize) -> Self {
         Self {
             buf: Vec::new(),
@@ -165,16 +169,19 @@ impl Writer {
         }
     }
 
+    #[inline]
     fn pos(&self) -> usize {
         self.base.saturating_add(self.buf.len())
     }
 
+    #[inline]
     pub(crate) fn align(&mut self, align: usize) {
         let pos = self.pos();
         let pad = pad_to(pos, align).saturating_sub(pos);
         self.buf.resize(self.buf.len().saturating_add(pad), 0);
     }
 
+    #[inline]
     fn u16(&mut self, v: u16) {
         self.align(2);
         match self.endian {
@@ -183,6 +190,7 @@ impl Writer {
         }
     }
 
+    #[inline]
     pub(crate) fn u32(&mut self, v: u32) {
         self.align(4);
         match self.endian {
@@ -191,6 +199,7 @@ impl Writer {
         }
     }
 
+    #[inline]
     fn u64(&mut self, v: u64) {
         self.align(8);
         match self.endian {
@@ -200,6 +209,7 @@ impl Writer {
     }
 
     /// Overwrites the `u32` at buffer index `at` (an array's length slot).
+    #[inline]
     pub(crate) fn patch_u32(&mut self, at: usize, v: u32) {
         let bytes = match self.endian {
             Endian::Little => v.to_le_bytes(),
@@ -230,6 +240,7 @@ impl Writer {
         Ok(())
     }
 
+    #[inline]
     fn enter(&mut self) -> Result<()> {
         if self.depth >= MAX_DEPTH {
             return Err(Error::Invalid("containers nested deeper than 64"));
@@ -238,6 +249,7 @@ impl Writer {
         Ok(())
     }
 
+    #[inline]
     fn leave(&mut self) {
         self.depth = self.depth.saturating_sub(1);
     }
@@ -330,7 +342,8 @@ pub(crate) struct Reader<'a> {
 }
 
 impl<'a> Reader<'a> {
-    pub(crate) fn new(buf: &'a [u8], endian: Endian, base: usize) -> Self {
+    #[inline]
+    pub(crate) const fn new(buf: &'a [u8], endian: Endian, base: usize) -> Self {
         Self {
             buf,
             pos: 0,
@@ -341,10 +354,12 @@ impl<'a> Reader<'a> {
     }
 
     /// The message offset of the next byte.
-    pub(crate) fn at(&self) -> usize {
+    #[inline]
+    pub(crate) const fn at(&self) -> usize {
         self.base.saturating_add(self.pos)
     }
 
+    #[inline]
     fn take(&mut self, n: usize) -> Result<&'a [u8]> {
         let at = self.at();
         let end = self
@@ -359,6 +374,7 @@ impl<'a> Reader<'a> {
         Ok(bytes)
     }
 
+    #[inline]
     pub(crate) fn align(&mut self, align: usize) -> Result<()> {
         let at = self.at();
         // No value of a message starts past its end, and the bound is the
@@ -373,11 +389,13 @@ impl<'a> Reader<'a> {
         Ok(())
     }
 
+    #[inline]
     pub(crate) fn u8(&mut self) -> Result<u8> {
         let b = self.take(1)?;
         Ok(b.first().copied().unwrap_or(0))
     }
 
+    #[inline]
     fn fixed<const N: usize>(&mut self) -> Result<[u8; N]> {
         self.align(N)?;
         let mut out = [0u8; N];
@@ -388,14 +406,17 @@ impl<'a> Reader<'a> {
         Ok(out)
     }
 
+    #[inline]
     fn u16(&mut self) -> Result<u16> {
         self.fixed::<2>().map(u16::from_le_bytes)
     }
 
+    #[inline]
     pub(crate) fn u32(&mut self) -> Result<u32> {
         self.fixed::<4>().map(u32::from_le_bytes)
     }
 
+    #[inline]
     fn u64(&mut self) -> Result<u64> {
         self.fixed::<8>().map(u64::from_le_bytes)
     }
@@ -424,6 +445,7 @@ impl<'a> Reader<'a> {
         Ok(bytes)
     }
 
+    #[inline]
     fn enter(&mut self) -> Result<()> {
         if self.depth >= MAX_DEPTH {
             return Err(Error::malformed(
@@ -435,6 +457,7 @@ impl<'a> Reader<'a> {
         Ok(())
     }
 
+    #[inline]
     fn leave(&mut self) {
         self.depth = self.depth.saturating_sub(1);
     }

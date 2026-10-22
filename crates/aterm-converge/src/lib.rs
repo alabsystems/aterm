@@ -28,7 +28,7 @@ pub use model::{
     Report, ReportMode, Requires, SCHEMA, StoodAside,
 };
 pub use scope::{
-    NOT_AT_CONSOLE, Scope, held_back, not_own_account, select, selects, standing_aside,
+    NOT_AT_CONSOLE, Scope, held_back, left_as_is, not_own_account, select, selects, standing_aside,
 };
 
 /// One setting the engine probes, plans, applies and verifies.

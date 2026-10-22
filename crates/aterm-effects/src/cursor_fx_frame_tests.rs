@@ -283,6 +283,7 @@ fn the_knob_law_is_what_the_frame_reads() {
                             bar,
                             ring,
                             classic_tinted: false,
+                            over_text: false,
                         };
                         let law = style.reads_knob(knob, ctx);
                         if shows != law {

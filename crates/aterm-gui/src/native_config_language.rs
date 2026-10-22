@@ -1974,6 +1974,13 @@ const MANUAL_SCHEMA: &[ManualSchemaEntry] = &[
         &["atpkg", "mouse", "keyboard", "sharing"],
         true,
     ),
+    manual(
+        "machine.rosetta",
+        "Install Rosetta 2 on Apple silicon",
+        ConfigSchemaKind::Scalar(EditKind::Bool),
+        &["atpkg", "rosetta", "intel", "x86_64", "translation", "mac"],
+        true,
+    ),
     // The `[privacy]` table (`app_config::PrivacyConfig`, the macOS consent
     // lane): kept off the Settings pages on purpose — the Security page's
     // "macOS access" block is its surface — but
@@ -2608,6 +2615,7 @@ pub(crate) fn config_schema_entry(key: &str) -> Option<&'static ConfigSchemaEntr
 pub(crate) fn config_schema_match_score(
     entry: &ConfigSchemaEntry,
     query: &str,
+    reach: MatchReach,
     scratch: &mut String,
 ) -> Option<SearchRank> {
     if query.is_empty() {
@@ -2623,22 +2631,23 @@ pub(crate) fn config_schema_match_score(
     query_match_rank(
         [scratch.as_str(), entry.key]
             .into_iter()
-            .chain(crate::prefs::own_name_of(entry.key)),
+            .chain(crate::prefs::own_names_of(entry.key).into_iter().flatten()),
         entry.keywords.iter().copied(),
         query,
+        reach,
     )
 }
 
 /// WHERE A SEARCH HIT LANDS, as both Settings search and Manual completion
 /// order it: the ladder's rung first ([`candidate_match_score`]); on the
 /// same rung, a hit on what the row is called — its label, its key, a name
-/// of its own (`prefs::own_name_of`) — before one only a word it lists as a
+/// of its own (`prefs::own_names_of`) — before one only a word it lists as a
 /// synonym reached. A row's visible name is what a person reads; a synonym
 /// is a hidden alias, so "codex" finds Watch codex-alab sessions before the
 /// packages switch that lists "codex" among its words. Lower is better.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) struct SearchRank {
-    /// The ladder's rung: 0 exact prefix … [`ACRONYM_RUNG`] acronym.
+    /// The ladder's rung: [`WHOLE_AT_START`] … [`INSIDE_WORD_RUNG`].
     pub(crate) rung: u8,
     /// Only a synonym (a listed keyword, a value) reached the rung.
     pub(crate) synonym: bool,
@@ -2646,7 +2655,7 @@ pub(crate) struct SearchRank {
 
 impl SearchRank {
     /// An empty query: everything at once, in its own order.
-    pub(crate) const EVERY: Self = Self::own(0);
+    pub(crate) const EVERY: Self = Self::own(WHOLE_AT_START);
 
     /// A hit on a name of the row's own, at `rung`.
     pub(crate) const fn own(rung: u8) -> Self {
@@ -2675,11 +2684,12 @@ pub(crate) fn query_match_rank<'a>(
     own: impl Iterator<Item = &'a str> + Clone,
     synonyms: impl Iterator<Item = &'a str> + Clone,
     query: &str,
+    reach: MatchReach,
 ) -> Option<SearchRank> {
-    let rung = query_match_score(own.clone().chain(synonyms), query)?;
+    let rung = query_match_score(own.clone().chain(synonyms), query, reach)?;
     Some(SearchRank {
         rung,
-        synonym: query_match_score(own, query) != Some(rung),
+        synonym: query_match_score(own, query, reach) != Some(rung),
     })
 }
 
@@ -2694,32 +2704,35 @@ const QUERY_FILLER_WORDS: [&str; 12] = [
 /// authority use. One word ranks by [`candidate_match_score`]. Several rank as
 /// the phrase typed, or as every word matching somewhere in the set, by the
 /// worst of them: "dark mode" finds the setting whose keywords are "dark" and
-/// "mode". Filler words ("for", "the") need not match. A word that matches
-/// nothing as typed may match in its other number ("kitty" finds "kitties").
+/// "mode". Filler words ("for", "the") need not match. A word also finds its
+/// other number, as a whole word ("kitty" finds "kitties", "titles" finds
+/// "title"). `reach` is the search's ([`MatchReach`]), for every word alike.
 ///
 /// Same precondition as the ladder: `query` is lowercase, and so is every
 /// candidate.
 pub(crate) fn query_match_score<'a>(
     candidates: impl Iterator<Item = &'a str> + Clone,
     query: &str,
+    reach: MatchReach,
 ) -> Option<u8> {
     let best = |needle: &str| {
         candidates
             .clone()
-            .filter_map(|candidate| candidate_match_score(candidate, needle))
+            .filter_map(|candidate| candidate_match_score(candidate, needle, reach))
             .min()
     };
     let word = |word: &str| {
-        best(word).or_else(|| {
-            // The other number is a whole-word idea, so its stem must start
-            // a word: an acronym of it is an accident.
-            let stem = word_stem(word)?;
+        // The other number is a whole-word idea: its stem with an ending of
+        // either number ("kitt" + "ies"), never the start of a longer word,
+        // an acronym or the inside of a word.
+        let other = word_stem(word).and_then(|stem| {
             candidates
                 .clone()
-                .filter_map(|candidate| candidate_match_score(candidate, stem))
-                .filter(|score| *score < ACRONYM_RUNG)
+                .filter_map(|candidate| word_start_rung(candidate, stem, &STEM_TAILS))
+                .filter(|rung| *rung <= WHOLE_AT_WORD)
                 .min()
-        })
+        });
+        best(word).into_iter().chain(other).min()
     };
     let mut words = query.split_whitespace();
     let first = words.next()?;
@@ -2746,6 +2759,19 @@ pub(crate) fn query_match_score<'a>(
     }
 }
 
+/// The fewest letters that mean anything alone: a stem shorter than this is
+/// no word ([`word_stem`]), a query shorter than this takes no plural ending
+/// ("bu" is not whole in "bus") and is found inside no word
+/// ([`INSIDE_WORD_RUNG`]).
+const WORD_PIECE_FLOOR: usize = 3;
+
+/// The endings after which a query is still the whole word: its plural
+/// ("tab" is the word "Tabs").
+const PLURAL_TAILS: [&str; 2] = ["s", "es"];
+
+/// The endings a stem takes back ([`word_stem`]): either number of a word.
+const STEM_TAILS: [&str; 4] = ["s", "es", "ies", "y"];
+
 /// `word` less a plural or "-y" ending, so either number of a word finds the
 /// other: "kitties" and "kitty" share "kitt", "titles" finds "title". `None`
 /// when no ending comes off or too little is left to mean anything.
@@ -2754,7 +2780,63 @@ fn word_stem(word: &str) -> Option<&str> {
         .strip_suffix("ies")
         .or_else(|| word.strip_suffix('s').filter(|stem| !stem.ends_with('s')))
         .or_else(|| word.strip_suffix('y'))?;
-    (stem.len() >= 3).then_some(stem)
+    (stem.len() >= WORD_PIECE_FLOOR).then_some(stem)
+}
+
+/// The ladder's rungs ([`candidate_match_score`]), best first. A word hit:
+/// the query is a whole word that starts the candidate ("font" in "font
+/// size", "tab" in "Tabs") …
+pub(crate) const WHOLE_AT_START: u8 = 0;
+/// … a whole word later in it ("code" in "supervise claude code sessions") …
+pub(crate) const WHOLE_AT_WORD: u8 = 1;
+/// … the start of the candidate's first word ("code" in "codex") …
+pub(crate) const PREFIX_AT_START: u8 = 2;
+/// … the start of a later word ("cur" in "enable_cursor_trail").
+pub(crate) const PREFIX_AT_WORD: u8 = 3;
+/// A loose hit ([`MatchReach::Loose`]): initials only …
+pub(crate) const ACRONYM_RUNG: u8 = 4;
+/// … or the inside of a word ("board" in "keyboard").
+pub(crate) const INSIDE_WORD_RUNG: u8 = 5;
+
+/// `rung` as a hit inside a row's name rather than at its start: a value the
+/// row holds (a theme's name on the Theme row) is never what the row is
+/// called first, so its start ranks as a later word's.
+pub(crate) const fn past_the_start(rung: u8) -> u8 {
+    match rung {
+        WHOLE_AT_START => WHOLE_AT_WORD,
+        PREFIX_AT_START => PREFIX_AT_WORD,
+        rung => rung,
+    }
+}
+
+/// HOW FAR A SEARCH REACHES — one answer for a whole search, never per row.
+/// A word hit (the query starts a word: [`WHOLE_AT_START`] …
+/// [`PREFIX_AT_WORD`]) is a result. A loose hit ([`ACRONYM_RUNG`],
+/// [`INSIDE_WORD_RUNG`]) is an accident wherever a word hit exists — "cat" in
+/// notifiCATions, or the initials of "Continue A Turn", beside the settings
+/// that list the word cat — and the only answer where none does: "board" is
+/// a word of no setting, and Keyboard & Input holds it. So a search reaches
+/// [`Self::Words`] where anything it can list is a word hit, and
+/// [`Self::Loose`] only where nothing is: every list, count and preview of
+/// the search takes the same reach, so they agree.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum MatchReach {
+    /// Word hits only.
+    Words,
+    /// Loose hits too: nothing the search lists starts a word with it.
+    Loose,
+}
+
+impl MatchReach {
+    /// The reach of a search whose result set under [`Self::Words`] is
+    /// `any_word_hit` or not.
+    pub(crate) const fn of(any_word_hit: bool) -> Self {
+        if any_word_hit {
+            Self::Words
+        } else {
+            Self::Loose
+        }
+    }
 }
 
 /// THE search-rank ladder, shared by the config-schema authority above and by
@@ -2762,17 +2844,25 @@ fn word_stem(word: &str) -> Option<&str> {
 /// (`native_settings::field_match_score_in`, its page and Manual results), the
 /// theme picker's filter and the theme gallery's cards.
 ///
-/// EVERY HIT STARTS A WORD. The rungs are 0, the candidate starts with the
-/// query; 1, the query occurs where a word of the candidate starts
-/// ([`starts_a_word`]: a word, a phrase such as "bell sound", or a key fragment
-/// such as "trail_style"); 2, a short acronym — the query's letters are the
-/// initials of consecutive words ("lh" for "line height", "cts" for
-/// `cursor_trail_style`). There is no rung for a match inside a word: "cat"
-/// in "notifiCATions", "line" in "feLINE" and "top" in "deskTOP" are
-/// accidents, and the curated keywords already carry the words people mean.
-/// A query that starts with a separator ("_style", ".enabled") brings its own
-/// boundary, so it matches wherever it occurs. Lower is better; the caller
-/// takes the `min` over a candidate set ([`query_match_score`]).
+/// A WORD HIT STARTS A WORD of the candidate ([`word_start_rung`]: a word, a
+/// phrase such as "bell sound", or a key fragment such as "trail_style"; a
+/// query that starts with a separator, "_style" or ".enabled", brings its
+/// own boundary, so it matches wherever it occurs). Its rung says, best
+/// first, whether the query is that word WHOLE — it ends where the word
+/// ends, or where only a plural ending is left ("tab" in "Tabs") — and
+/// whether the word is the candidate's FIRST: [`WHOLE_AT_START`],
+/// [`WHOLE_AT_WORD`], [`PREFIX_AT_START`], [`PREFIX_AT_WORD`]. Whole outranks
+/// first: "code" is the whole word in "Supervise Claude Code sessions" and
+/// only the start of "codex", so the switch whose name holds the word comes
+/// before Watch codex-alab sessions.
+///
+/// A LOOSE HIT, under [`MatchReach::Loose`] only: [`ACRONYM_RUNG`], the
+/// query's two or three letters are the initials of consecutive words ("lh"
+/// for "line height", "cts" for `cursor_trail_style`); then
+/// [`INSIDE_WORD_RUNG`], a query of [`WORD_PIECE_FLOOR`] letters or more
+/// occurs inside a word ("board" in "keyboard", "paper" in "wallpaper").
+/// Under [`MatchReach::Words`] a loose hit is `None`. Lower is better; the
+/// caller takes the `min` over a candidate set ([`query_match_score`]).
 ///
 /// The surfaces are supposed to rank IDENTICALLY — a key that sorts first in
 /// Settings should sort first in Manual completion — and before this was shared
@@ -2784,27 +2874,23 @@ fn word_stem(word: &str) -> Option<&str> {
 /// `config_schema_keys_and_keywords_are_lowercase` /
 /// `editable_field_keys_are_unique_and_lowercase`. Every rung compares bytes
 /// exactly, which is why every caller can share one ladder.
-pub(crate) fn candidate_match_score(candidate: &str, query: &str) -> Option<u8> {
-    if candidate.starts_with(query) {
-        Some(0)
-    } else if starts_a_word(candidate, query) {
-        Some(1)
-    } else if is_acronym(query, candidate) {
-        Some(ACRONYM_RUNG)
+pub(crate) fn candidate_match_score(candidate: &str, query: &str, reach: MatchReach) -> Option<u8> {
+    let tails: &[&str] = if query.len() >= WORD_PIECE_FLOOR {
+        &PLURAL_TAILS
     } else {
-        None
-    }
+        &[]
+    };
+    word_start_rung(candidate, query, tails).or_else(|| match reach {
+        MatchReach::Words => None,
+        MatchReach::Loose if is_acronym(query, candidate) => Some(ACRONYM_RUNG),
+        MatchReach::Loose => inside_a_word(candidate, query).then_some(INSIDE_WORD_RUNG),
+    })
 }
-
-/// The ladder's last rung ([`candidate_match_score`]): a hit by initials only.
-/// A caller that wants a query to name something, not abbreviate it, admits
-/// rungs below this one.
-pub(crate) const ACRONYM_RUNG: u8 = 2;
 
 /// Whether `query` is the initials of consecutive words of `candidate` —
 /// `cts` in `cursor_trail_style`, `lh` in "line height". Words are runs of
-/// ASCII alphanumerics, as [`starts_a_word`] reads them. An acronym is two or
-/// three letters: one letter is a prefix, and a longer run of initials, or
+/// ASCII alphanumerics, as [`word_start_rung`] reads them. An acronym is two
+/// or three letters: one letter is a prefix, and a longer run of initials, or
 /// initials scattered with words skipped between them, is mostly an accident
 /// ("cat" spanning "Claude's working time And Tokens"). A `query` with any
 /// character that is not an ASCII alphanumeric is no acronym.
@@ -2836,33 +2922,70 @@ fn is_acronym(query: &str, candidate: &str) -> bool {
     false
 }
 
-/// Whether `query` occurs in `candidate` starting where a word starts — a word
-/// is a run of ASCII alphanumerics. An alphanumeric-led `query` (a word, a
-/// phrase such as "bell sound", a key fragment such as "trail_style") matches
-/// at byte `i` when `i` is 0 or the byte before `i` is not an ASCII
-/// alphanumeric (an ASCII separator, or the last byte of a multi-byte
-/// character, which is a separator whole) — a byte that is then a character
-/// boundary, since it equals the query's first, ASCII, byte. A `query` that
-/// starts with anything else ("_style", ".enabled", a non-ASCII letter) brings
-/// its own boundary, so it matches wherever it occurs. The empty query matches.
-/// Settings global search scores every schema entry's candidates per render,
-/// so this reads bytes rather than splitting.
-fn starts_a_word(candidate: &str, query: &str) -> bool {
+/// Whether an alphanumeric-led `query` of [`WORD_PIECE_FLOOR`] bytes or more
+/// occurs in `candidate` at all — inside a word, where [`word_start_rung`]
+/// found it nowhere. (A separator-led query matches wherever it occurs as a
+/// word hit already.)
+fn inside_a_word(candidate: &str, query: &str) -> bool {
+    query.len() >= WORD_PIECE_FLOOR
+        && query
+            .as_bytes()
+            .first()
+            .is_some_and(u8::is_ascii_alphanumeric)
+        && candidate.contains(query)
+}
+
+/// The best word-hit rung of `query` in `candidate`, over every place it
+/// starts a word — a word is a run of ASCII alphanumerics. An
+/// alphanumeric-led `query` (a word, a phrase such as "bell sound", a key
+/// fragment such as "trail_style") starts a word at byte `i` when `i` is 0 or
+/// the byte before `i` is not an ASCII alphanumeric (an ASCII separator, or
+/// the last byte of a multi-byte character, which is a separator whole) — a
+/// byte that is then a character boundary, since it equals the query's first,
+/// ASCII, byte. A `query` that starts with anything else ("_style",
+/// ".enabled", a non-ASCII letter) brings its own boundary, so it matches
+/// wherever it occurs. There it is WHOLE when it ends where the word does:
+/// its last byte is no ASCII alphanumeric, or the next byte is none, or the
+/// letters left of that word are one of `tails` ("s" for "tab" in "tabs").
+/// The empty query is [`WHOLE_AT_START`]. Settings global search scores
+/// every schema entry's candidates per render, so this reads bytes rather
+/// than splitting.
+fn word_start_rung(candidate: &str, query: &str, tails: &[&str]) -> Option<u8> {
     let (bytes, wanted) = (candidate.as_bytes(), query.as_bytes());
-    let Some(first) = wanted.first() else {
-        return true;
+    let (Some(first), Some(last)) = (wanted.first(), wanted.last()) else {
+        return Some(WHOLE_AT_START);
     };
-    if !first.is_ascii_alphanumeric() {
-        return candidate.contains(query);
-    }
+    let own_boundary = !first.is_ascii_alphanumeric();
+    let ends_a_word = !last.is_ascii_alphanumeric();
+    let mut best: Option<u8> = None;
     let mut word_start = true;
     for (i, byte) in bytes.iter().enumerate() {
-        if word_start && bytes[i..].starts_with(wanted) {
-            return true;
+        if (word_start || own_boundary) && bytes[i..].starts_with(wanted) {
+            let end = i + wanted.len();
+            let left = bytes[end..]
+                .iter()
+                .take_while(|byte| byte.is_ascii_alphanumeric())
+                .count();
+            let whole = ends_a_word
+                || left == 0
+                || tails
+                    .iter()
+                    .any(|tail| tail.as_bytes() == &bytes[end..end + left]);
+            let rung = match (whole, i == 0) {
+                (true, true) => WHOLE_AT_START,
+                (true, false) => WHOLE_AT_WORD,
+                (false, true) => PREFIX_AT_START,
+                (false, false) => PREFIX_AT_WORD,
+            };
+            best = Some(best.map_or(rung, |best| best.min(rung)));
+            // No later place starts the candidate, so none beats a whole word.
+            if rung <= WHOLE_AT_WORD {
+                break;
+            }
         }
         word_start = !byte.is_ascii_alphanumeric();
     }
-    false
+    best
 }
 
 /// `haystack.to_ascii_lowercase().contains(needle)` without the per-call
@@ -3563,6 +3686,9 @@ fn validate_machine_types(
             "machine" if item.as_table_like().is_none() => Some("machine must be a table"),
             "machine.universal_control" if item.as_str().is_none() => {
                 Some("machine.universal_control must be a string (off or leave)")
+            }
+            "machine.rosetta" if item.as_bool().is_none() => {
+                Some("machine.rosetta must be true or false")
             }
             _ => None,
         };
@@ -6167,9 +6293,9 @@ fn setting_help(setting: &ConfigSchemaEntry) -> String {
     };
     // A number's unit is the one every Settings reading states
     // ([`crate::prefs::numeric_unit`]), never its label's.
-    let unit = crate::prefs::numeric_unit(setting.key).unwrap_or_default();
+    let unit = crate::prefs::numeric_unit(setting.key);
     let range = semantic_numeric_bounds(setting.key)
-        .map(|(min, max)| format!(" · range {min}–{max}{unit}"));
+        .map(|(min, max)| format!(" · range {min}–{max}{}", unit.map_or("", |unit| unit.many)));
     let placeholder = setting
         .placeholder
         .trim()
@@ -6183,8 +6309,11 @@ fn setting_help(setting: &ConfigSchemaEntry) -> String {
         .any(|word| word.eq_ignore_ascii_case("default"))
     {
         format!(" · {placeholder}")
-    } else if placeholder.parse::<f64>().is_ok() {
-        format!(" · default {placeholder}{unit}")
+    } else if let Ok(value) = placeholder.parse::<f64>() {
+        format!(
+            " · default {placeholder}{}",
+            unit.map_or("", |unit| unit.after(value))
+        )
     } else {
         format!(" · default {placeholder}")
     };
@@ -7068,73 +7197,114 @@ pub(crate) mod tests {
     /// rung and only a user would have noticed the ordering change.
     #[test]
     fn candidate_match_score_ranks_each_rung() {
-        // 0 exact prefix, 1 at a word start, 2 short acronym, None.
-        assert_eq!(candidate_match_score("cursor_trail", "cur"), Some(0));
-        assert_eq!(candidate_match_score("enable_cursor_trail", "cur"), Some(1));
-        assert_eq!(candidate_match_score("colour_under_rail", "cur"), Some(2));
-        assert_eq!(candidate_match_score("line height", "lh"), Some(2));
-        assert_eq!(candidate_match_score("nothing_here", "cur"), None);
-        // NO HIT INSIDE A WORD: "cat" in notifiCATions or indiCATor is an
-        // accident, at any query length.
-        assert_eq!(candidate_match_score("thecursorthing", "cur"), None);
-        assert_eq!(
-            candidate_match_score("allow programs to show desktop notifications", "cat"),
-            None
+        use MatchReach::{Loose, Words};
+        let words = |candidate: &str, query: &str| candidate_match_score(candidate, query, Words);
+        let loose = |candidate: &str, query: &str| candidate_match_score(candidate, query, Loose);
+        // A whole word first, the candidate's first word first.
+        assert_eq!(words("font size", "font"), Some(WHOLE_AT_START));
+        assert_eq!(words("display font", "font"), Some(WHOLE_AT_WORD));
+        assert_eq!(words("cursor_trail", "cur"), Some(PREFIX_AT_START));
+        assert_eq!(words("enable_cursor_trail", "cur"), Some(PREFIX_AT_WORD));
+        assert_eq!(words("nothing_here", "cur"), None);
+        // WHOLE OUTRANKS FIRST: "code" is the whole word in the Claude Code
+        // switch's name and only the start of "codex".
+        assert!(
+            words("supervise claude code sessions", "code") < words("codex", "code"),
+            "a whole word mid-name before a prefix at the start"
         );
-        assert_eq!(candidate_match_score("indicator", "cat"), None);
-        assert_eq!(candidate_match_score("feline", "line"), None);
+        assert!(words("codex", "code") < words("watch codex-alab sessions", "code"));
+        // The best place counts, not the first: "codex code" holds "code" whole.
+        assert_eq!(words("codex code", "code"), Some(WHOLE_AT_WORD));
+        // A plural ending leaves the word whole ("tab" is "Tabs"), from three
+        // letters on; any other ending is a longer word.
+        assert_eq!(words("tabs", "tab"), Some(WHOLE_AT_START));
+        assert_eq!(words("text boxes", "box"), Some(WHOLE_AT_WORD));
+        assert_eq!(words("tables", "tab"), Some(PREFIX_AT_START));
+        assert_eq!(words("bus", "bu"), Some(PREFIX_AT_START));
         // A phrase or key fragment counts where it starts a word, and one
         // that starts with a separator brings its own boundary.
         assert_eq!(
-            candidate_match_score("terminal bell sound", "bell sound"),
-            Some(1)
+            words("terminal bell sound", "bell sound"),
+            Some(WHOLE_AT_WORD)
         );
         assert_eq!(
-            candidate_match_score("cursor_trail_style", "trail_style"),
-            Some(1)
+            words("cursor_trail_style", "trail_style"),
+            Some(WHOLE_AT_WORD)
         );
+        assert_eq!(words("cursor_trail_style", "_style"), Some(WHOLE_AT_WORD));
+        assert_eq!(words("cursor_trail_style", "ail_style"), None);
+        // NO LOOSE HIT UNDER WORDS: "cat" in notifiCATions or indiCATor, and
+        // the initials of "Color And Theme", are accidents beside a word hit.
+        assert_eq!(words("thecursorthing", "cur"), None);
         assert_eq!(
-            candidate_match_score("cursor_trail_style", "_style"),
-            Some(1)
-        );
-        assert_eq!(
-            candidate_match_score("cursor_trail_style", "ail_style"),
+            words("allow programs to show desktop notifications", "cat"),
             None
         );
-        // The acronym rung takes the initials of CONSECUTIVE words: letters
-        // scattered through words, or initials with words skipped between
-        // them, are an accident ("cat" across Claude's … And Tokens).
-        assert_eq!(candidate_match_score("clear_tab", "cat"), None);
-        assert_eq!(candidate_match_score("color and theme", "cat"), Some(2));
+        assert_eq!(words("indicator", "cat"), None);
+        assert_eq!(words("feline", "line"), None);
+        assert_eq!(words("line height", "lh"), None);
+        assert_eq!(words("color and theme", "cat"), None);
+        // UNDER LOOSE, initials, then the inside of a word.
+        assert_eq!(loose("colour_under_rail", "cur"), Some(ACRONYM_RUNG));
+        assert_eq!(loose("line height", "lh"), Some(ACRONYM_RUNG));
+        assert_eq!(loose("color and theme", "cat"), Some(ACRONYM_RUNG));
+        assert_eq!(loose("a a b", "aab"), Some(ACRONYM_RUNG));
+        assert_eq!(loose("keyboard & input", "board"), Some(INSIDE_WORD_RUNG));
+        assert_eq!(loose("wallpaper", "paper"), Some(INSIDE_WORD_RUNG));
+        assert_eq!(loose("feline", "line"), Some(INSIDE_WORD_RUNG));
+        // A word hit is still a word hit under Loose.
+        assert_eq!(loose("enable_cursor_trail", "cur"), Some(PREFIX_AT_WORD));
+        // The acronym takes the initials of CONSECUTIVE words, two or three
+        // of them: letters scattered through words, initials with words
+        // skipped between them, or a longer run, are no acronym.
+        assert_eq!(loose("clear_tab", "cat"), None);
         assert_eq!(
-            candidate_match_score("show claude's working time and tokens (σ)", "cat"),
+            loose("show claude's working time and tokens (σ)", "cat"),
             None
         );
-        assert_eq!(candidate_match_score("a a b", "aab"), Some(2));
-        // It is two or three letters: a longer acronym is mostly accidental,
-        // so it must NOT rank rather than rank last.
-        assert_eq!(
-            candidate_match_score("colour_under_rail_link", "curl"),
-            None
-        );
+        assert_eq!(loose("colour_under_rail_link", "curl"), None);
+        // Two letters are too few to be found inside a word.
+        assert_eq!(loose("keyboard", "yb"), None);
+        assert_eq!(loose("nothing_here", "zzz"), None);
         // Lower wins, so a caller's `min` over a candidate set picks the best rung.
-        assert!(candidate_match_score("cursor", "cur") < candidate_match_score("my_cursor", "cur"));
-        // The word rung reads bytes; it is the occurrence-at-a-word-start
+        assert!(words("cursor", "cur") < words("my_cursor", "cur"));
+        // The word rungs read bytes; they are the occurrence-at-a-word-start
         // model, on separators, digits, non-ASCII letters and queries that
-        // hold them.
-        let at_a_word_start = |candidate: &str, query: &str| {
-            query.is_empty()
-                || candidate.match_indices(query).any(|(i, _)| {
-                    !query.as_bytes()[0].is_ascii_alphanumeric()
-                        || i == 0
-                        || !candidate.as_bytes()[i - 1].is_ascii_alphanumeric()
+        // hold them: some place starts a word, and the rung is the best of
+        // those places by (whole, first).
+        let model = |candidate: &str, query: &str| -> Option<u8> {
+            if query.is_empty() {
+                return Some(WHOLE_AT_START);
+            }
+            let bytes = candidate.as_bytes();
+            let alnum = |byte: &u8| byte.is_ascii_alphanumeric();
+            candidate
+                .match_indices(query)
+                .filter(|(i, _)| !alnum(&query.as_bytes()[0]) || *i == 0 || !alnum(&bytes[i - 1]))
+                .map(|(i, _)| {
+                    let end = i + query.len();
+                    let rest: String = candidate[end..]
+                        .chars()
+                        .take_while(char::is_ascii_alphanumeric)
+                        .collect();
+                    let whole = !alnum(query.as_bytes().last().unwrap_or(&b'_'))
+                        || rest.is_empty()
+                        || (query.len() >= 3 && (rest == "s" || rest == "es"));
+                    match (whole, i == 0) {
+                        (true, true) => WHOLE_AT_START,
+                        (true, false) => WHOLE_AT_WORD,
+                        (false, true) => PREFIX_AT_START,
+                        (false, false) => PREFIX_AT_WORD,
+                    }
                 })
+                .min()
         };
         let candidates = [
             "",
             "_",
             "a",
             "cursor",
+            "cursors",
             "enable_cursor_trail",
             "x-cur",
             "é_cur",
@@ -7147,6 +7317,7 @@ pub(crate) mod tests {
             "a  b",
             "trail__cur9",
             "terminal bell sound",
+            "cur curl cur",
         ];
         let queries = [
             "",
@@ -7165,6 +7336,7 @@ pub(crate) mod tests {
             " b",
             "bell sound",
             "l sound",
+            "cursor",
         ];
         for candidate in candidates.into_iter().chain(
             config_schema()
@@ -7173,8 +7345,8 @@ pub(crate) mod tests {
         ) {
             for query in queries {
                 assert_eq!(
-                    starts_a_word(candidate, query),
-                    at_a_word_start(candidate, query),
+                    words(candidate, query),
+                    model(candidate, query),
                     "{candidate:?} / {query:?}"
                 );
             }
@@ -7187,7 +7359,12 @@ pub(crate) mod tests {
     #[test]
     fn an_own_name_hit_ranks_before_a_synonym_hit_on_the_same_rung() {
         let rank = |own: &[&str], synonyms: &[&str], query: &str| {
-            query_match_rank(own.iter().copied(), synonyms.iter().copied(), query)
+            query_match_rank(
+                own.iter().copied(),
+                synonyms.iter().copied(),
+                query,
+                MatchReach::Words,
+            )
         };
         let named = rank(&["supervise codex sessions", "codex"], &["agent"], "codex");
         let listed = rank(
@@ -7195,20 +7372,31 @@ pub(crate) mod tests {
             &["codex", "claude"],
             "codex",
         );
-        assert_eq!(named, Some(SearchRank::own(0)));
-        assert_eq!(listed, Some(SearchRank::synonym(0)));
+        assert_eq!(named, Some(SearchRank::own(WHOLE_AT_START)));
+        assert_eq!(listed, Some(SearchRank::synonym(WHOLE_AT_START)));
         assert!(named < listed);
-        // A rung beats the tie: a synonym's exact prefix before a name's
-        // word start.
+        // A rung beats the tie: a synonym's whole word at the start before a
+        // name's whole word later on.
         assert!(
             rank(&["x"], &["codex"], "codex") < rank(&["supervise codex sessions"], &[], "codex")
         );
         // A query that needs a synonym for one of its words is a synonym hit.
         assert_eq!(
             rank(&["dark sky"], &["mode"], "dark mode"),
-            Some(SearchRank::synonym(0))
+            Some(SearchRank::synonym(WHOLE_AT_START))
         );
         assert_eq!(rank(&["dark sky"], &["mode"], "sun"), None);
+        // A name's whole words beat synonyms that only start the query's
+        // words: "claude code" is the Claude Code switch's, not the packages
+        // switch's whose words are "claude" and "codex".
+        assert!(
+            rank(&["supervise claude code sessions"], &[], "claude code")
+                < rank(
+                    &["keep alab tools up to date"],
+                    &["claude", "codex"],
+                    "claude code"
+                )
+        );
     }
 
     /// A query of several words ranks as its phrase or as every word matching
@@ -7217,28 +7405,46 @@ pub(crate) mod tests {
     #[test]
     fn query_match_score_takes_every_word() {
         let set = ["window appearance", "window_theme", "dark", "light", "mode"];
-        let score = |query: &str| query_match_score(set.iter().copied(), query);
-        assert_eq!(score("dark mode"), Some(0));
-        assert_eq!(score("mode dark"), Some(0), "word order does not matter");
-        assert_eq!(score("dark sky"), None, "every word must match");
-        assert_eq!(score("the dark mode"), Some(0), "filler words need not");
-        assert_eq!(score("appearance of the window"), Some(1));
-        // The worst word ranks the set, and every word must start a word.
-        assert_eq!(score("dark appear"), Some(1));
-        assert_eq!(score("dark ppear"), None);
-        // A phrase that matches whole ranks by itself.
-        assert_eq!(score("window app"), Some(0));
-        let kitties = ["keyword kitties", "sparkle_words.feline.enabled"];
-        assert_eq!(query_match_score(kitties.iter().copied(), "kitty"), Some(1));
-        let titles = ["smart title"];
-        assert_eq!(query_match_score(titles.iter().copied(), "titles"), Some(1));
-        // The other number must start a word: never an acronym, never the
-        // inside of a word.
+        let score = |query: &str| query_match_score(set.iter().copied(), query, MatchReach::Words);
+        assert_eq!(score("dark mode"), Some(WHOLE_AT_START));
         assert_eq!(
-            query_match_score(["copy and trim"].into_iter(), "cats"),
+            score("mode dark"),
+            Some(WHOLE_AT_START),
+            "word order does not matter"
+        );
+        assert_eq!(score("dark sky"), None, "every word must match");
+        assert_eq!(
+            score("the dark mode"),
+            Some(WHOLE_AT_START),
+            "filler words need not"
+        );
+        assert_eq!(score("appearance of the window"), Some(WHOLE_AT_WORD));
+        // The worst word ranks the set, and every word must start a word.
+        assert_eq!(score("dark appear"), Some(PREFIX_AT_WORD));
+        assert_eq!(score("dark ppear"), None);
+        // A phrase that matches ranks by itself.
+        assert_eq!(score("window app"), Some(PREFIX_AT_START));
+        let words = |set: &[&str], query: &str| {
+            query_match_score(set.iter().copied(), query, MatchReach::Words)
+        };
+        // The other number, as a whole word.
+        let kitties = ["keyword kitties", "sparkle_words.feline.enabled"];
+        assert_eq!(words(&kitties, "kitty"), Some(WHOLE_AT_WORD));
+        assert_eq!(words(&["smart title"], "titles"), Some(WHOLE_AT_WORD));
+        // The other number must be a whole word: never an acronym, never the
+        // start of a longer word, never the inside of one.
+        assert_eq!(words(&["copy and trim"], "cats"), None);
+        assert_eq!(words(&["user"], "series"), None);
+        assert_eq!(words(&["serial port"], "series"), None);
+        // Under Loose, each word may be a loose hit.
+        assert_eq!(
+            query_match_score(["keyboard & input"].into_iter(), "board", MatchReach::Loose),
+            Some(INSIDE_WORD_RUNG)
+        );
+        assert_eq!(
+            query_match_score(["keyboard & input"].into_iter(), "board", MatchReach::Words),
             None
         );
-        assert_eq!(query_match_score(["user"].into_iter(), "series"), None);
     }
 
     fn highlighted<'a>(
@@ -7884,6 +8090,20 @@ intensity = 0.25
         );
         assert!(analyze("machine = false\n").has_errors());
         assert!(!ignored_key_warnings("machine = false\n").is_empty());
+        // `rosetta` is atpkg's boolean: either value is a known key, anything else an error
+        // (atpkg then reads the whole table as inert, and installs nothing).
+        for value in ["true", "false"] {
+            let source = format!("[machine]\nrosetta = {value}\n");
+            assert!(analyze(&source).diagnostics.is_empty(), "{value}");
+            assert!(ignored_key_warnings(&source).is_empty(), "{value}");
+            assert_eq!(
+                atpkg::config::parse_machine(&source).rosetta(),
+                value == "true"
+            );
+        }
+        let source = "[machine]\nrosetta = \"yes\"\n";
+        assert!(analyze(source).has_errors(), "{source:?}");
+        assert!(!atpkg::config::parse_machine(source).rosetta());
     }
 
     /// TF.2b: `font_hinting = "native"` loads, renders as `light`, is told so

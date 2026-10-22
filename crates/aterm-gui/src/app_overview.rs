@@ -46,7 +46,7 @@ pub(crate) enum OverviewAt {
 
 /// How often an open card's coarse ages are read again at paint time
 /// ([`App::overview_prepaint`]): the finest unit [`coarse_age`] prints.
-const OVERVIEW_AGE_STEP: std::time::Duration = std::time::Duration::from_secs(60);
+pub(crate) const OVERVIEW_AGE_STEP: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// A coarse age, so a card left open does not repaint every second: `just
 /// now`, `4m`, `2h`, `3d`.
@@ -428,12 +428,16 @@ impl App {
         Ok(())
     }
 
-    /// [`Self::open_overview`] on `wid`, which comes forward with it.
+    /// [`Self::open_overview`] on `wid`, which comes forward with it. Where
+    /// this aterm's fabric is configured, the card lists what the last read
+    /// of the fabric's log said ("On the fabric", step 6E-7) and kicks the
+    /// next read ([`Self::kick_fabric_read`]), whose landing re-renders it.
     fn open_overview_on(&mut self, wid: WindowId) -> Result<(), String> {
         let (groups, manages) = self.overview_parts();
         self.agents.overview_read_at = Some(std::time::Instant::now());
         let mut state = OverviewState::new(wid, groups, manages);
         let _ = state.set_elsewhere(self.sessions_elsewhere());
+        let _ = state.set_fabric(self.overview_fabric_group());
         if self.install_overlay_card(
             wid,
             crate::overlay::Overlay::Overview(state),
@@ -441,6 +445,7 @@ impl App {
             Self::overview_claims_pointer,
             Self::overview_pointer_motion,
         ) {
+            self.kick_fabric_read();
             Ok(())
         } else {
             Err("the front window is gone".to_string())
@@ -469,11 +474,14 @@ impl App {
         }
         let (groups, manages) = self.overview_parts();
         let elsewhere = self.sessions_elsewhere();
+        let fabric = self.overview_fabric_group();
         self.agents.overview_read_at = Some(std::time::Instant::now());
         let mut moved = false;
         for wid in open {
             if let Some(card) = self.windows.get_mut(&wid).and_then(|ws| ws.overview_mut())
-                && (card.retarget(groups.clone(), manages.clone()) | card.set_elsewhere(elsewhere))
+                && (card.retarget(groups.clone(), manages.clone())
+                    | card.set_elsewhere(elsewhere)
+                    | card.set_fabric(fabric.clone()))
             {
                 moved = true;
                 if let Some(w) = self.windows.get(&wid).and_then(|ws| ws.os_window.as_ref()) {
@@ -511,9 +519,11 @@ impl App {
         self.agents.overview_read_at = Some(now);
         let (groups, manages) = self.overview_parts();
         let elsewhere = self.sessions_elsewhere();
+        let fabric = self.overview_fabric_group();
         if let Some(card) = self.windows.get_mut(&wid).and_then(|ws| ws.overview_mut()) {
             let _ = card.retarget(groups, manages);
             let _ = card.set_elsewhere(elsewhere);
+            let _ = card.set_fabric(fabric);
         }
     }
 

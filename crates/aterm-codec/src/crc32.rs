@@ -17,6 +17,7 @@ use astream_wire::hash::crc32_ieee_update;
 pub struct Crc32(u32);
 
 impl Default for Crc32 {
+    #[inline]
     fn default() -> Self {
         Self::new()
     }
@@ -25,23 +26,27 @@ impl Default for Crc32 {
 impl Crc32 {
     /// A fresh state: the CRC of no bytes, `0`.
     #[must_use]
+    #[inline]
     pub const fn new() -> Self {
         Self(0)
     }
 
     /// Fold `data` into the running checksum.
+    #[inline]
     pub fn update(&mut self, data: &[u8]) {
         self.0 = crc32_ieee_update(self.0, data);
     }
 
     /// The finished checksum of everything folded so far.
     #[must_use]
+    #[inline]
     pub const fn finish(self) -> u32 {
         self.0
     }
 
     /// One-shot CRC-32 of `data`.
     #[must_use]
+    #[inline]
     pub const fn of(data: &[u8]) -> u32 {
         crc32_ieee_update(0, data)
     }

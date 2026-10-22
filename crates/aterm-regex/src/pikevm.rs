@@ -59,6 +59,7 @@ struct ThreadList {
 }
 
 impl ThreadList {
+    #[inline]
     fn resize(&mut self, n: usize) {
         if self.visited.len() != n {
             self.visited.clear();
@@ -69,6 +70,7 @@ impl ThreadList {
     }
 
     /// Start a fresh position: everything marked so far becomes unmarked.
+    #[inline]
     fn begin(&mut self) {
         self.dense.clear();
         match self.generation.checked_add(1) {
@@ -81,6 +83,7 @@ impl ThreadList {
     }
 
     /// Mark `pc` visited, reporting whether it already was.
+    #[inline]
     fn mark(&mut self, pc: usize) -> bool {
         match self.visited.get_mut(pc) {
             Some(slot) if *slot == self.generation => true,
@@ -102,6 +105,7 @@ pub(crate) struct Cache {
 }
 
 impl Cache {
+    #[inline]
     pub(crate) fn new() -> Self {
         Self::default()
     }
@@ -119,6 +123,7 @@ impl Cache {
 /// `budget` is the work this search may still charge (see the module docs) and is left
 /// holding what remains, so the searches of one `find_iter` share it. Exhausting it
 /// returns `Err(Exhausted)`, never a span.
+#[inline]
 pub(crate) fn search(
     prog: &Program,
     cache: &mut Cache,
@@ -271,6 +276,7 @@ fn class_matches(prog: &Program, class: usize, c: char) -> bool {
 /// thread could match, and [`Prefilter`] is a superset of what it survives its first step
 /// on. The scan steps by byte; continuation bytes are never marked, so it may pass through
 /// a multi-byte code point but stops only on a boundary.
+#[inline]
 fn skip_to_candidate(prog: &Program, first: &Prefilter, text: &str, mut pos: usize) -> usize {
     let bytes = text.as_bytes();
     while let Some(&b) = bytes.get(pos) {
@@ -330,6 +336,7 @@ fn skip_to_candidate(prog: &Program, first: &Prefilter, text: &str, mut pos: usi
 ///
 /// Returns the number of instructions entered, for the step budget: that is where an
 /// amplifier such as `(?:x?){2000}z` spends itself, ~4,000 at every position.
+#[inline]
 fn add(
     list: &mut ThreadList,
     stack: &mut Vec<usize>,
@@ -370,6 +377,7 @@ fn add(
 }
 
 /// Evaluate a zero-width assertion at byte offset `at` of `text`.
+#[inline]
 fn satisfied(kind: Assertion, text: &str, at: usize) -> bool {
     let before = || text.get(..at).and_then(|s| s.chars().next_back());
     let after = || text.get(at..).and_then(|s| s.chars().next());

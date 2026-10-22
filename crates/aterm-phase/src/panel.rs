@@ -567,8 +567,8 @@ mod tests {
         assert_eq!(last(&fx::screen(fx::USAGE_SHORT)).trim(), "↓");
     }
 
-    /// THE 2.1.301 AND 2.1.307 TABS MEASURED IN THE LAB (crates/aterm-lab,
-    /// 2026-10-15 and 2026-10-21), on both renderers: the tab that drew the
+    /// THE 2.1.301, 2.1.307 AND 2.1.308 TABS MEASURED IN THE LAB
+    /// (crates/aterm-lab, 2026-10-15 and 2026-10-21), on both renderers: the tab that drew the
     /// stub's header readings and the enrich error is a panel, a Usage tab
     /// and NOT SETTLED, and its last row (`r to retry · Esc to cancel`) is no
     /// tail; the session block alone (no read made) is settled and ends on
@@ -614,6 +614,20 @@ mod tests {
                 true,
                 false,
             ),
+            (
+                "2.1.308 header readings, inline",
+                fx::USAGE_HEADER_READINGS_INLINE_2_1_308,
+                PanelRenderer::Inline,
+                true,
+                false,
+            ),
+            (
+                "2.1.308 header readings, fullscreen",
+                fx::USAGE_HEADER_READINGS_FULLSCREEN_2_1_308,
+                PanelRenderer::Fullscreen,
+                true,
+                false,
+            ),
         ] {
             let screen = fx::screen(text);
             let panel = settings_panel(&screen).unwrap_or_else(|| panic!("{what}: a panel"));
@@ -652,6 +666,19 @@ mod tests {
             (
                 "2.1.307 dismissed, fullscreen",
                 fx::USAGE_DISMISSED_FULLSCREEN_2_1_307,
+            ),
+            ("2.1.308 menu, inline", fx::USAGE_MENU_INLINE_2_1_308),
+            (
+                "2.1.308 menu, fullscreen",
+                fx::USAGE_MENU_FULLSCREEN_2_1_308,
+            ),
+            (
+                "2.1.308 dismissed, inline",
+                fx::USAGE_DISMISSED_INLINE_2_1_308,
+            ),
+            (
+                "2.1.308 dismissed, fullscreen",
+                fx::USAGE_DISMISSED_FULLSCREEN_2_1_308,
             ),
         ] {
             assert_eq!(settings_panel(&fx::screen(text)), None, "{what}");

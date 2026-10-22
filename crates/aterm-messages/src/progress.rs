@@ -24,11 +24,13 @@ use crate::{
 const PROJECTION_MAX: Duration = Duration::from_hours(48);
 
 /// Milliseconds of `d`, saturating.
+#[inline]
 fn ms(d: Duration) -> u64 {
     u64::try_from(d.as_millis()).unwrap_or(u64::MAX)
 }
 
 /// `a − b` in milliseconds, 0 when `b` is later.
+#[inline]
 fn ms_between(a: Instant, b: Instant) -> u64 {
     ms(a.saturating_duration_since(b))
 }
@@ -358,8 +360,9 @@ impl ProgressTrack {
     }
 
     /// The series this track follows.
+    #[inline]
     #[must_use]
-    pub(crate) fn series(&self) -> Option<u64> {
+    pub(crate) const fn series(&self) -> Option<u64> {
         self.series
     }
 
@@ -379,6 +382,7 @@ impl ProgressTrack {
 }
 
 /// Whole seconds of `d`, rounded up.
+#[inline]
 fn secs_up(d: Duration) -> u64 {
     ms(d).div_ceil(1000)
 }
@@ -579,12 +583,14 @@ impl Waiter {
     /// the glass): a person's always, since they asked; nobody's only while it
     /// is very heavy system use that needs explaining, and otherwise it is
     /// silent and its end a record.
+    #[inline]
     #[must_use]
     pub const fn takes_row(self, very_heavy: bool) -> bool {
         matches!(self, Self::Person) || very_heavy
     }
 
     /// [`Waiter::Person`] when `person` is true.
+    #[inline]
     #[must_use]
     pub const fn of(person: bool) -> Self {
         if person { Self::Person } else { Self::Nobody }

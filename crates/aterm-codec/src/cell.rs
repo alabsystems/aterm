@@ -37,6 +37,7 @@ pub enum Attribute {
 impl Attribute {
     /// The producer's token.
     #[must_use]
+    #[inline]
     pub const fn word(self) -> &'static str {
         match self {
             Self::Bold => "bold",
@@ -54,6 +55,7 @@ impl Attribute {
 
     /// A token of this wire, never an inferred unknown attribute.
     #[must_use]
+    #[inline]
     pub fn parse(word: &str) -> Option<Self> {
         [
             Self::Bold,

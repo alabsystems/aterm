@@ -112,6 +112,7 @@ struct Pt {
 }
 
 impl Pt {
+    #[inline]
     const fn new(x: f64, y: f64) -> Self {
         Self { x, y }
     }
@@ -119,6 +120,7 @@ impl Pt {
 
 /// Whether the point is ink. Each shape is a signed distance (negative inside); a union is
 /// the minimum, a cut the maximum with the negated cutter.
+#[inline]
 fn ink(lit: bool, p: Pt) -> bool {
     let body = body(p);
     let handle = ring(p, HANDLE).max(-body);
@@ -133,6 +135,7 @@ fn ink(lit: bool, p: Pt) -> bool {
 }
 
 /// The body's signed distance.
+#[inline]
 fn body(p: Pt) -> f64 {
     let [rim, base] = BODY_RADII;
     round_rect(p, BODY, [rim, rim, base, base])
@@ -141,6 +144,7 @@ fn body(p: Pt) -> f64 {
 /// The double-storey "a": a bar along the top that turns down into a stem on the right, and
 /// a bowl below the bar whose right side is the stem. Rows of the 1x letter: the bar, the
 /// stem alone, the bowl's top, its counter, its foot.
+#[inline]
 fn letter_a(p: Pt) -> f64 {
     let [left, top, width, height, stroke] = LETTER;
     let half = stroke / 2.0;
@@ -210,6 +214,7 @@ fn wisp(p: Pt, cx: f64) -> f64 {
 }
 
 /// Distance to the upper right quarter of the circle of radius `r` about `c`.
+#[inline]
 fn quarter_arc(p: Pt, c: Pt, r: f64) -> f64 {
     let (dx, dy) = (p.x - c.x, p.y - c.y);
     if dx >= 0.0 && dy <= 0.0 {
@@ -223,6 +228,7 @@ fn quarter_arc(p: Pt, c: Pt, r: f64) -> f64 {
 
 /// Signed distance to the rectangle `[left, top, right, bottom]` whose corners are rounded by
 /// `[top left, top right, bottom right, bottom left]` (each at most half the shorter side).
+#[inline]
 fn round_rect(p: Pt, [x0, y0, x1, y1]: [f64; 4], radii: [f64; 4]) -> f64 {
     let (cx, cy) = (f64::midpoint(x0, x1), f64::midpoint(y0, y1));
     let r = match (p.x >= cx, p.y >= cy) {
@@ -237,12 +243,14 @@ fn round_rect(p: Pt, [x0, y0, x1, y1]: [f64; 4], radii: [f64; 4]) -> f64 {
 }
 
 /// Signed distance to the ring between radii `ri` and `ro` about (`cx`, `cy`).
+#[inline]
 fn ring(p: Pt, [cx, cy, ro, ri]: [f64; 4]) -> f64 {
     let r = (p.x - cx).hypot(p.y - cy);
     (r - ro).max(ri - r)
 }
 
 /// Distance to the segment from `a` to `b`.
+#[inline]
 fn segment(p: Pt, a: Pt, b: Pt) -> f64 {
     let (dx, dy) = (b.x - a.x, b.y - a.y);
     let len2 = dx * dx + dy * dy;

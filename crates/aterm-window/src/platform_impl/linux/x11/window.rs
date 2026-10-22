@@ -10,7 +10,8 @@
 // supported: docs/AUDIT-third-party-2026-10-15.md, LW.7. No request's failure panics, where
 // upstream unwrapped or `expect`ed them: a display that has gone fails every request, and the
 // methods a caller makes between two of the event loop's looks at the connection must return,
-// so the loop can end the run with the loss: `XConnection::report`, X11-GONE.)
+// so the loop can end the run with the loss: `XConnection::report`, X11-GONE. Where the server
+// has SYNC, the window offers its window manager EWMH's resize sync counter: `sync_request.rs`.)
 
 use std::ffi::CString;
 use std::mem::replace;
@@ -18,6 +19,7 @@ use std::os::raw::*;
 use std::path::Path;
 use std::ptr::NonNull;
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::Instant;
 use std::{cmp, env};
 
 use aterm_types::native_window::NativeWindow;
@@ -40,6 +42,7 @@ use crate::platform_impl::{
 };
 use crate::window::{ImePurpose, ResizeDirection, Theme, UserAttentionType, WindowAttributes};
 
+use super::sync_request::SyncCounter;
 use super::util;
 use super::{
     ffi, ActiveEventLoop, CookieResultExt, IgnoreError as _, ImeRequest, ImeSender, ReportExt,
@@ -65,6 +68,15 @@ pub struct SharedState {
     pub resize_increments: Option<Size>,
     pub visibility: Visibility,
     pub has_focus: bool,
+    /// Whether this client set the window's urgency hint (`request_user_attention`), which it
+    /// clears when the window gains focus.
+    pub urgent: bool,
+    /// What hides the window, and what `WindowEvent::Occluded` last said of it.
+    pub occlusion: Occlusion,
+    /// Whether the server asked for the window to be drawn again since its last
+    /// `RedrawRequested` (`Expose`): it holds nothing of what the window drew there, so that
+    /// redraw is dispatched as an exposure (`platform::x11::redraw_is_exposure`).
+    pub exposed: bool,
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -73,6 +85,37 @@ pub enum Visibility {
     Yes,
     // Waiting for VisibilityNotify
     YesWait,
+}
+
+/// LOCAL PATCH (aterm), 2026-10-22: what keeps a window from being seen, each part as the X
+/// server or the window manager last reported it; the window is occluded while any part holds.
+/// Upstream reported `WindowEvent::Occluded` from VisibilityNotify alone, which a compositing
+/// window manager (mutter, GNOME 46 on Xorg) makes useless: it redirects every top-level, so the
+/// server reports a window unobscured at its map and never fully obscured after, and a window
+/// minimized or on another workspace is known only by the window manager's unmap and
+/// `_NET_WM_STATE_HIDDEN`. A window covered by another stays unoccluded there: nothing in the
+/// protocol says so.
+#[derive(Copy, Clone, Debug, Default, Eq, PartialEq)]
+pub struct Occlusion {
+    /// Unmapped since it was last mapped: the window manager iconified it or moved it off the
+    /// current workspace (mutter unmaps both), or the application hid it (`set_visible`).
+    pub unmapped: bool,
+    /// Its `_NET_WM_STATE` holds `_NET_WM_STATE_HIDDEN`.
+    pub hidden: bool,
+    /// The last VisibilityNotify said `VisibilityFullyObscured`.
+    pub obscured: bool,
+    /// What the last `WindowEvent::Occluded` said; `false` before the first.
+    reported: bool,
+}
+
+impl Occlusion {
+    /// Applies `change`, and returns whether the window is occluded now when that is not what
+    /// it last reported: the `WindowEvent::Occluded` to send.
+    pub fn change(&mut self, change: impl FnOnce(&mut Self)) -> Option<bool> {
+        change(self);
+        let occluded = self.unmapped || self.hidden || self.obscured;
+        (replace(&mut self.reported, occluded) != occluded).then_some(occluded)
+    }
 }
 
 impl SharedState {
@@ -97,6 +140,9 @@ impl SharedState {
             min_inner_size: None,
             resize_increments: None,
             has_focus: false,
+            urgent: false,
+            occlusion: Occlusion::default(),
+            exposed: false,
         })
     }
 }
@@ -120,6 +166,8 @@ pub struct UnownedWindow {
     /// The launch's startup id until the window first maps, when its sequence ends
     /// (`end_startup_sequence`).
     startup_id: Mutex<Option<String>>,
+    /// The resize sync counter the window offers its window manager, where the server has SYNC.
+    sync: Option<SyncCounter>, // never changes once the window is made
 }
 
 macro_rules! leap {
@@ -129,6 +177,43 @@ macro_rules! leap {
             Err(err) => return Err(os_error!(OsError::XError(X11Error::from(err).into()))),
         }
     };
+}
+
+/// `NorthWestGravity` (X11 protocol): a resize keeps the window's contents at its top-left.
+const NORTH_WEST_GRAVITY: u32 = 1;
+
+/// `rgb` (`0x00RRGGBB`) as a pixel of `visual`, one of `screen`'s visuals, whose class must
+/// be `TrueColor` or `DirectColor` (a pixel of any other class is a colormap entry the
+/// window would have to allocate). Each channel is scaled to its mask's width.
+pub(super) fn background_pixel(
+    screen: &xproto::Screen,
+    visual: xproto::Visualid,
+    rgb: u32,
+) -> Option<u32> {
+    /// `TrueColor` and `DirectColor` (X11 protocol).
+    const DECOMPOSED: [u8; 2] = [4, 5];
+    let visual = screen
+        .allowed_depths
+        .iter()
+        .flat_map(|depth| &depth.visuals)
+        .find(|v| v.visual_id == visual)?;
+    if !DECOMPOSED.contains(&visual.class) {
+        return None;
+    }
+    let channel = |value: u32, mask: u32| {
+        if mask == 0 {
+            return 0;
+        }
+        let shift = mask.trailing_zeros();
+        let max = u64::from(mask >> shift);
+        let scaled = (u64::from(value & 0xff) * max + 127) / 255;
+        (u32::try_from(scaled).unwrap_or(u32::MAX) << shift) & mask
+    };
+    Some(
+        channel(rgb >> 16, visual.red_mask)
+            | channel(rgb >> 8, visual.green_mask)
+            | channel(rgb, visual.blue_mask),
+    )
 }
 
 impl UnownedWindow {
@@ -209,10 +294,22 @@ impl UnownedWindow {
                 | event_mask::POINTER_MOTION
                 | event_mask::PROPERTY_CHANGE;
 
-            ValueList::new()
+            let values = ValueList::new()
                 .set(cw::EVENT_MASK, event_mask)
                 .set(cw::BORDER_PIXEL, 0)
-                .set(cw::COLORMAP, 0)
+                .set(cw::COLORMAP, 0);
+            // The parent's visual is the screen's root visual.
+            let screen = xconn.default_root();
+            match window_attrs
+                .platform_specific
+                .x11_background
+                .and_then(|rgb| background_pixel(screen, screen.root_visual, rgb))
+            {
+                Some(pixel) => {
+                    values.set(cw::BACK_PIXEL, pixel).set(cw::BIT_GRAVITY, NORTH_WEST_GRAVITY)
+                },
+                None => values,
+            }
         };
 
         // finally creating the window
@@ -256,6 +353,7 @@ impl UnownedWindow {
             shared_state: SharedState::new(guessed_monitor, &window_attrs),
             redraw_sender: event_loop.redraw_sender.clone(),
             startup_id: Mutex::new(window_attrs.platform_specific.activation_token.clone()),
+            sync: None,
         };
 
         // Title must be set before mapping. Some tiling window managers (i.e. i3) use the window
@@ -358,13 +456,18 @@ impl UnownedWindow {
                 leap!(window.set_icon_inner(icon.inner)).ignore_error();
             }
 
-            // Opt into handling window close
+            // Opt into handling window close, and into the resize sync protocol where the
+            // server has SYNC (`sync_request.rs`).
+            window.sync = SyncCounter::offer(xconn, window.xwindow);
+            let protocols =
+                [atoms[WM_DELETE_WINDOW], atoms[_NET_WM_PING], atoms[_NET_WM_SYNC_REQUEST]];
+            let offered = if window.sync.is_some() { 3 } else { 2 };
             let result = xconn.send_void(xproto::change_property32(
                 PropMode::Replace,
                 window.xwindow,
                 atoms[WM_PROTOCOLS],
                 atom::ATOM,
-                &[atoms[WM_DELETE_WINDOW], atoms[_NET_WM_PING]],
+                &protocols[..offered],
             ));
             leap!(result).ignore_error();
 
@@ -423,6 +526,43 @@ impl UnownedWindow {
         self.shared_state.lock().unwrap()
     }
 
+    /// The window manager sent a `_NET_WM_SYNC_REQUEST` for `value` (`sync_request.rs`, step 1).
+    pub(super) fn sync_requested(&self, value: i64) {
+        if let Some(sync) = &self.sync {
+            sync.requested(value);
+        }
+    }
+
+    /// A `ConfigureNotify` came, which changed the window's size or (`resized` false) did not
+    /// (`sync_request.rs`, step 2).
+    pub(super) fn sync_configured(&self, resized: bool) {
+        if let Some(sync) = &self.sync {
+            sync.configured(&self.xconn, resized);
+        }
+    }
+
+    /// The application presented a frame of the window (`WindowExtX11::x11_frame_presented`,
+    /// `sync_request.rs`, step 3).
+    pub fn frame_presented(&self) {
+        if let Some(sync) = &self.sync {
+            sync.presented(&self.xconn);
+        }
+    }
+
+    /// An event-loop turn ended at `now`, or the loop woke for [`Self::sync_deadline`];
+    /// `redraw_queued` says whether a redraw is queued (`sync_request.rs`, steps 4 and 5).
+    pub(super) fn sync_turn_ended(&self, now: Instant, redraw_queued: impl FnOnce() -> bool) {
+        if let Some(sync) = &self.sync {
+            sync.turn_ended(&self.xconn, now, redraw_queued);
+        }
+    }
+
+    /// When the event loop must wake to answer the window manager's pending sync request
+    /// (`sync_request.rs`, step 5).
+    pub(super) fn sync_deadline(&self) -> Option<Instant> {
+        self.sync.as_ref().and_then(SyncCounter::deadline)
+    }
+
     fn set_pid(&self) -> Result<Option<VoidCookie<'_>>, X11Error> {
         let atoms = self.xconn.atoms();
         let pid_atom = atoms[_NET_WM_PID];
@@ -465,6 +605,22 @@ impl UnownedWindow {
             xproto::PropMode::Replace,
             variant.as_bytes(),
         )
+    }
+
+    /// The background the X server paints the window's exposed areas (see
+    /// `platform::x11::WindowExtX11::set_x11_background`).
+    pub fn set_background(&self, rgb: u32) {
+        let Some(pixel) = background_pixel(self.xconn.default_root(), self.visual, rgb) else {
+            return;
+        };
+        let what = "Failed to change window background";
+        self.xconn
+            .send_void(xproto::change_window_attributes(
+                self.xwindow,
+                &ValueList::new().set(cw::BACK_PIXEL, pixel),
+            ))
+            .ignore_error_or_report(&self.xconn, what);
+        self.xconn.flush_requests().or_report(&self.xconn, what);
     }
 
     #[inline]
@@ -952,9 +1108,19 @@ impl UnownedWindow {
             .ignore_error_or_report(&self.xconn, "Failed to call `XMoveWindow`");
     }
 
+    /// A window not yet mapped also says so in its normal hints (ICCCM USPosition): a window
+    /// manager places a new window itself unless they carry a position, and mutter (GNOME 46 on
+    /// Xorg) maps one moved while unmapped at its own spot, so a restored window appeared there
+    /// and jumped to its place a frame later. The hint's flag is what counts; window managers
+    /// take the window's own position, as ICCCM tells them to.
     #[inline]
     pub fn set_outer_position(&self, position: Position) {
         let (x, y) = position.to_physical::<i32>(self.scale_factor()).into();
+        let mapped = matches!(self.shared_state_lock().visibility, Visibility::Yes);
+        if !mapped {
+            self.update_normal_hints(|hints| hints.position = Some((Specified::User, x, y)))
+                .or_report(&self.xconn, "Failed to call `XSetWMNormalHints`");
+        }
         self.set_position_physical(x, y);
     }
 
@@ -1008,7 +1174,7 @@ impl UnownedWindow {
     pub fn request_inner_size(&self, size: Size) -> Option<PhysicalSize<u32>> {
         let scale_factor = self.scale_factor();
         let size: (u32, u32) = size.to_physical::<u32>(scale_factor).into();
-        self.request_inner_size_physical(size.0 as u32, size.1 as u32);
+        self.request_inner_size_physical(size.0, size.1);
 
         None
     }
@@ -1099,6 +1265,13 @@ impl UnownedWindow {
         }
     }
 
+    /// Set the window's cursor again, loaded anew: the cursor theme or size changed
+    /// (`XConnection::follow_cursor_settings`).
+    pub(crate) fn reload_cursor(&self) {
+        let icon = *self.selected_cursor.lock().unwrap();
+        self.xconn.set_cursor_icon(self.xwindow, icon);
+    }
+
     #[inline]
     pub fn scale_factor(&self) -> f64 {
         self.shared_state_lock().last_monitor.scale_factor
@@ -1173,8 +1346,9 @@ impl UnownedWindow {
     }
 
     #[inline]
-    pub fn set_ime_cursor_area(&self, spot: Position, _size: Size) {
-        let (x, y) = spot.to_physical::<i32>(self.scale_factor()).into();
+    pub fn set_ime_cursor_area(&self, spot: Position, size: Size) {
+        let scale = self.scale_factor();
+        let (x, y) = xim_spot(spot.to_physical(scale), size.to_physical(scale));
         let _ = self.ime_sender.lock().unwrap().send(ImeRequest::Position(
             self.xwindow as ffi::Window,
             x,
@@ -1196,6 +1370,28 @@ impl UnownedWindow {
 
     #[inline]
     pub fn focus_window(&self) {
+        self.focus_window_at(CURRENT_TIME);
+    }
+
+    /// [`Self::focus_window`] for an activation another client handed over with
+    /// `startup_id` (a notification server's click): the `_NET_ACTIVE_WINDOW` request
+    /// carries the id's `_TIME` stamp, the user action the window manager weighs it
+    /// against, and the launch sequence the id names is ended, as the launchee of a
+    /// launch ends it, so the launcher's busy cursor stops.
+    pub fn focus_window_with_activation_token(&self, startup_id: &str) {
+        self.focus_window_at(
+            super::startup_notify::startup_time(startup_id).unwrap_or(CURRENT_TIME),
+        );
+        // Best-effort: an unsent `remove` leaves the launcher's spinner to its timeout.
+        if let Err(_err) = self.xconn.end_startup_sequence(self.xwindow, startup_id) {
+            warn!("Failed to end the startup sequence {startup_id:?}: {_err}");
+        }
+    }
+
+    /// Ask the window manager to raise and focus the window (`_NET_ACTIVE_WINDOW`, as an
+    /// application) for the user action at `time` (`CURRENT_TIME` when none is known).
+    /// Nothing while the window is minimized or not shown.
+    fn focus_window_at(&self, time: u32) {
         let atoms = self.xconn.atoms();
         let state_atom = atoms[WM_STATE];
         let state_type_atom = atoms[CARD32];
@@ -1221,7 +1417,7 @@ impl UnownedWindow {
                         xproto::event_mask::SUBSTRUCTURE_REDIRECT
                             | xproto::event_mask::SUBSTRUCTURE_NOTIFY,
                     ),
-                    [1, CURRENT_TIME, 0, 0, 0],
+                    [1, time, 0, 0, 0],
                 )
                 .ignore_error_or_report(&self.xconn, "Failed to send client message");
             if let Err(_e) = self.xconn.flush_requests() {
@@ -1233,14 +1429,33 @@ impl UnownedWindow {
         }
     }
 
+    /// Set or clear the urgency hint. A request while the window has focus does nothing, as the
+    /// API promises, and the hint is cleared when the window gains focus ([`Self::focused`]): an
+    /// X11 window manager leaves the hint to its client, and mutter announces only its change from
+    /// unset to set, so a hint left set (upstream's) let a window's first bell be its last banner.
     #[inline]
     pub fn request_user_attention(&self, request_type: Option<UserAttentionType>) {
+        if request_type.is_some() && self.has_focus() {
+            return;
+        }
+        self.set_urgent(request_type.is_some());
+    }
+
+    /// The window gained focus: clear the urgency hint a request for attention set.
+    pub(crate) fn focused(&self) {
+        if self.shared_state_lock().urgent {
+            self.set_urgent(false);
+        }
+    }
+
+    fn set_urgent(&self, urgent: bool) {
         let mut wm_hints = self.xconn.get_wm_hints(self.xwindow).ok().flatten().unwrap_or_default();
 
-        wm_hints.urgent = request_type.is_some();
+        wm_hints.urgent = urgent;
         self.xconn
             .send_void(wm_hints.set(self.xwindow))
             .ignore_error_or_report(&self.xconn, "Failed to set WM hints");
+        self.shared_state_lock().urgent = urgent;
     }
 
     #[inline]
@@ -1251,6 +1466,12 @@ impl UnownedWindow {
     #[inline]
     pub fn request_redraw(&self) {
         self.redraw_sender.send(WindowId(self.xwindow as _)).unwrap();
+    }
+
+    /// Whether the server asked for the window to be drawn again since the last look
+    /// ([`SharedState::exposed`]), which this clears.
+    pub(crate) fn take_exposed(&self) -> bool {
+        std::mem::take(&mut self.shared_state_lock().exposed)
     }
 
     #[inline]
@@ -1281,6 +1502,19 @@ fn cast_size_to_hint(size: Size, scale_factor: f64) -> (i32, i32) {
         Size::Physical(size) => cast_physical_size_to_hint(size),
         Size::Logical(size) => size.to_physical::<i32>(scale_factor).into(),
     }
+}
+
+/// The XIM spot location (`XNSpotLocation`) of a caret box at `position`, `size` big, in window
+/// pixels: the box's bottom-left. Xlib's spot is where the next character would go, its y "the
+/// position of the baseline used by the current text line" (Xlib, XNSpotLocation); xterm and
+/// urxvt give the caret row's baseline. ibus-x11 takes the spot for the caret's place, whatever
+/// the input style, and opens its candidate popup there: upstream's top-left of the box put the
+/// popup over the line being typed (the desk audit, GNOME 46 on Xorg, 2026-10-22). The box's
+/// bottom is the nearest point to the baseline it gives, and the popup opens just below the
+/// line. Each coordinate is clamped to the protocol's 16 bits.
+pub(super) fn xim_spot(position: PhysicalPosition<i32>, size: PhysicalSize<u32>) -> (i16, i16) {
+    let clamp = |v: i64| v.clamp(i16::MIN.into(), i16::MAX.into()) as i16;
+    (clamp(position.x.into()), clamp(i64::from(position.y) + i64::from(size.height)))
 }
 
 /// ConfigureWindow's values that raise a window to the top of the stack.

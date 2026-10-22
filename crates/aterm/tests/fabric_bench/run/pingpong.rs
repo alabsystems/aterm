@@ -53,7 +53,7 @@
 //!    bridge wrote and divides their difference by the window.
 //!
 //! EVERY TIER ARM RUNS IT, on aterm's own options for the arm's tier, as the
-//! latency, burst and attach worlds do ([`super::opts_for`]): so the arm says
+//! latency, burst and attach worlds do ([`super::boot_world`]): so the arm says
 //! what a request and its reply cost on a strict broker, an ordered one at
 //! each horizon, and the relaxed ceiling. Each pong's post is timed to its
 //! record ACKED and, apart, to its record DURABLE ([`crate::clock`]: on strict
@@ -95,9 +95,10 @@ use aterm_link::ctl::Ctl;
 use aterm_link::wait_tally::{self, Tally};
 
 use super::{
-    DEADLINE, FLEET, Row, Ruler, World, await_durable, await_note, calibrate, flushes_between,
-    flushes_json, fmt_x, list_since, ms, ms_opt, newest_id, opts_for, per_unit, post, sampled,
-    served_line, stop_and_read, wait_live, yardstick, yardstick_json, yardstick_rows,
+    DEADLINE, FLEET, Row, Ruler, Ticks, World, await_durable, await_note, boot_world, calibrate,
+    flushes_between, flushes_json, fmt_x, list_since, ms, ms_opt, newest_id, per_unit, post,
+    sampled, served_line, stop_and_read, ticks, ticks_between, ticks_json, ticks_line, wait_live,
+    yardstick, yardstick_json, yardstick_rows,
 };
 use crate::census;
 use crate::clock::Clock;
@@ -138,6 +139,8 @@ struct Raw {
     /// ([`Broker::flush_counts`], read right after each: between two round
     /// trips, never inside one).
     flushes: FlushCounts,
+    /// The broker's retention ticks between the same two tallies ([`Ticks`]).
+    ticks: Ticks,
 }
 
 /// The tally in `text` (the file's contents, if it could be read) when it is
@@ -218,6 +221,7 @@ fn rounds(w: &World, broker: &Broker, spec: &Spec, clock: Clock, a: &str, b: &st
         (
             await_tally(&path, pid, 0, "ping-pong, before the first round"),
             broker.flush_counts(),
+            ticks(broker),
         )
     });
     let mut measured = Vec::with_capacity(spec.pingpong);
@@ -244,6 +248,7 @@ fn rounds(w: &World, broker: &Broker, spec: &Spec, clock: Clock, a: &str, b: &st
             start = Some((
                 await_tally(&path, pid, round.pong_off, "ping-pong, after the warm-up"),
                 broker.flush_counts(),
+                ticks(broker),
             ));
         }
         if i >= spec.warmup {
@@ -253,12 +258,14 @@ fn rounds(w: &World, broker: &Broker, spec: &Spec, clock: Clock, a: &str, b: &st
     let last = measured.last().expect("at least one measured round");
     let end = await_tally(&path, pid, last.pong_off, "ping-pong, after the last round");
     let flushes_end = broker.flush_counts();
-    let (start, flushes_start) = start.expect("taken before the first measured round");
+    let ticks_end = ticks(broker);
+    let (start, flushes_start, ticks_start) = start.expect("taken before the first measured round");
     Raw {
         rounds: measured,
         start,
         end,
         flushes: flushes_between(flushes_start, flushes_end),
+        ticks: ticks_between(ticks_start, ticks_end),
     }
 }
 
@@ -500,12 +507,12 @@ fn flushes_rt_json(f: FlushCounts, n: usize) -> Value {
 }
 
 /// The ping-pong world: boot with the tally on, on aterm's options for the
-/// arm's tier ([`opts_for`]), measure, read the log.
+/// arm's tier ([`boot_world`]), measure, read the log.
 pub(super) fn measure(spec: &Spec, clock: Clock) -> (Value, Vec<String>) {
     eprintln!("fabric bench: booting the ping-pong world");
-    let mut w = World::boot_opts_with("fbench-pp", opts_for(spec), &[(wait_tally::SEAM, "1")]);
+    let mut w = boot_world("fbench-pp", spec, &[(wait_tally::SEAM, "1")]);
     w.wait_ready();
-    let served = served_line(&w);
+    let served = served_line(&w, spec);
     let (a, b) = w.two_sessions();
     wait_live(
         &w,
@@ -640,6 +647,7 @@ pub(super) fn measure(spec: &Spec, clock: Clock) -> (Value, Vec<String>) {
         "pong_acked_to_visible_ms": stats::to_json(&pong_acked_to_visible),
         "pong_post_to_durable_head_ms": stats::to_json(&pong_to_durable),
         "flushes": flushes_rt_json(raw.flushes, n),
+        "retention_ticks": ticks_json(raw.ticks),
         "behind_commit_ms": {
             "what": "a message's wait for the inbox commit of the delivery it answers: from its post OK to that commit acked, 0 when the commit landed first; only messages the log holds after that commit (one recorded before it was published ahead of it, and did not wait on it)",
             "pong_answering_ping": stats::to_json(&pongs.waits),
@@ -745,6 +753,8 @@ pub(super) fn measure(spec: &Spec, clock: Clock) -> (Value, Vec<String>) {
         "The broker's flushes over the same window, read at its two tallies:\n".to_string(),
     ]);
     md.extend(flushes_rows(raw.flushes, n));
+    md.push(String::new());
+    md.push(ticks_line(raw.ticks));
     md.extend([
         String::new(),
         format!(

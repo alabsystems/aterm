@@ -194,6 +194,7 @@ impl EventLoop<()> {
 impl<T> EventLoop<T> {
     /// Start building a new event loop, with the given type as the user event
     /// type.
+    #[inline]
     pub fn with_user_event() -> EventLoopBuilder<T> {
         EventLoopBuilder { platform_specific: Default::default(), _p: PhantomData }
     }
@@ -210,6 +211,7 @@ impl<T> EventLoop<T> {
 
     /// Creates an [`EventLoopProxy`] that can be used to dispatch user events
     /// to the main event loop, possibly from another thread.
+    #[inline]
     pub fn create_proxy(&self) -> EventLoopProxy<T> {
         EventLoopProxy { event_loop_proxy: self.event_loop.create_proxy() }
     }
@@ -218,6 +220,7 @@ impl<T> EventLoop<T> {
     ///
     /// See the [`OwnedDisplayHandle`] type for more information.
     #[cfg(windows_platform)]
+    #[inline]
     pub fn owned_display_handle(&self) -> OwnedDisplayHandle {
         OwnedDisplayHandle { platform: self.event_loop.window_target().p.owned_display_handle() }
     }
@@ -228,6 +231,7 @@ impl<T> EventLoop<T> {
     ///
     /// [`DeviceEvent`]: crate::event::DeviceEvent
     #[cfg(windows_platform)]
+    #[inline]
     pub fn listen_device_events(&self, allowed: DeviceEvents) {
         let _span = tracing::debug_span!(
             "aterm_window::EventLoop::listen_device_events",
@@ -239,12 +243,14 @@ impl<T> EventLoop<T> {
     }
 
     /// Sets the [`ControlFlow`].
+    #[inline]
     pub fn set_control_flow(&self, control_flow: ControlFlow) {
         self.event_loop.window_target().p.set_control_flow(control_flow)
     }
 
     /// Create custom cursor.
     #[cfg(windows_platform)]
+    #[inline]
     pub fn create_custom_cursor(&self, custom_cursor: CustomCursorSource) -> CustomCursor {
         self.event_loop.window_target().p.create_custom_cursor(custom_cursor)
     }
@@ -349,17 +355,20 @@ impl ActiveEventLoop {
     /// - **X11, Wayland:** not built (WC.8: no aterm crate asks there, and the answer was
     ///   always `None`).
     #[cfg(any(macos_platform, windows_platform))]
+    #[inline]
     pub fn system_theme(&self) -> Option<Theme> {
         self.p.system_theme()
     }
 
     /// Sets the [`ControlFlow`].
+    #[inline]
     pub fn set_control_flow(&self, control_flow: ControlFlow) {
         self.p.set_control_flow(control_flow)
     }
 
     /// Gets the current [`ControlFlow`].
     #[cfg(windows_platform)]
+    #[inline]
     pub fn control_flow(&self) -> ControlFlow {
         self.p.control_flow()
     }
@@ -367,6 +376,7 @@ impl ActiveEventLoop {
     /// This exits the event loop.
     ///
     /// See [`LoopExiting`][Event::LoopExiting].
+    #[inline]
     pub fn exit(&self) {
         let _span = tracing::debug_span!("aterm_window::ActiveEventLoop::exit",).entered();
 
@@ -376,6 +386,7 @@ impl ActiveEventLoop {
     /// Returns if the [`EventLoop`] is about to stop.
     ///
     /// See [`exit()`][Self::exit].
+    #[inline]
     pub fn exiting(&self) -> bool {
         self.p.exiting()
     }
@@ -384,6 +395,7 @@ impl ActiveEventLoop {
     ///
     /// See the [`OwnedDisplayHandle`] type for more information.
     #[cfg(windows_platform)]
+    #[inline]
     pub fn owned_display_handle(&self) -> OwnedDisplayHandle {
         OwnedDisplayHandle { platform: self.p.owned_display_handle() }
     }
@@ -444,6 +456,7 @@ pub struct EventLoopProxy<T: 'static> {
 }
 
 impl<T: 'static> Clone for EventLoopProxy<T> {
+    #[inline]
     fn clone(&self) -> Self {
         Self { event_loop_proxy: self.event_loop_proxy.clone() }
     }
@@ -457,6 +470,7 @@ impl<T: 'static> EventLoopProxy<T> {
     /// Returns an `Err` if the associated [`EventLoop`] no longer exists.
     ///
     /// [`UserEvent(event)`]: Event::UserEvent
+    #[inline]
     pub fn send_event(&self, event: T) -> Result<(), EventLoopClosed<T>> {
         let _span = tracing::debug_span!("aterm_window::EventLoopProxy::send_event",).entered();
 

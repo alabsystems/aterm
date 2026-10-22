@@ -73,7 +73,8 @@ pub fn fd_peer_state(fd: std::os::fd::RawFd) -> PeerState {
 /// What one peek of a peer [`fd_peer_closed`] found still there means. `WouldBlock`, or an
 /// `Interrupted` that saw nothing, is nothing queued yet.
 #[cfg(unix)]
-fn still_there(peek: Result<usize, std::io::ErrorKind>) -> PeerState {
+#[inline]
+const fn still_there(peek: Result<usize, std::io::ErrorKind>) -> PeerState {
     match peek {
         Ok(0) => PeerState::HalfClosed,
         Err(std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted) => PeerState::Idle,

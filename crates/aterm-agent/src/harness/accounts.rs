@@ -3733,11 +3733,12 @@ pub fn signed_out(
 /// THE ROW WHOSE SIGN-IN BY NAME WOULD GIVE A SESSION ON `me` AN ACCOUNT TO
 /// MOVE ONTO: the first other row, in ROSTER order, that is not signed in on
 /// this machine — never enrolled (`accounts sync` writes such a row for every
-/// account but the default) or signed out — with whether it signs in through
-/// `accounts renew` (a row with an email, which `login` refuses) or `accounts
-/// login`. What a session at a multi-day limit on a roster row is told to
-/// run, never `/login` in its tab (the review's acct-1, acct-4). `None`: every
-/// other row is signed in. PURE.
+/// account but the default) or signed out — and has no standing limit at `now`,
+/// with whether it signs in through `accounts renew` (a row with an email,
+/// which `login` refuses) or `accounts login`. What a session at a multi-day
+/// limit on a roster row is told to run, never `/login` in its tab (the
+/// review's acct-1, acct-4). `None`: every other row is signed in or limited.
+/// PURE.
 #[must_use]
 pub fn sign_in_next(
     roster: &Roster,
@@ -3754,7 +3755,10 @@ pub fn sign_in_next(
             matches!(
                 condition(row, state, is_enrolled(row, enrolled), now),
                 Condition::NotEnrolled | Condition::SignedOut
-            )
+            ) && !state
+                .accounts
+                .get(&row.label)
+                .is_some_and(|a| a.limited_until(now).is_some())
         })
         .map(|row| (row.label.clone(), row.email.is_some()))
 }

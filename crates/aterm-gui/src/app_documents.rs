@@ -90,7 +90,7 @@ enum AbsentKeyAdded {
 /// the key's absence does ([`crate::prefs::unset_literal`] for a Settings
 /// row, the schema's documented default otherwise), checked to change
 /// nothing; else with no value, the caret where it goes. Never the words a
-/// Settings row shows for an unset value ("platform default", "Built-in
+/// Settings row shows for an unset value ("Platform (default)", "Built-in
 /// sprite"), never an example someone did not choose. Formatting elsewhere
 /// is kept: the edit is the smallest span the two texts differ in. A table
 /// or a map comes in as its empty `[key]` table. `None` for a list of

@@ -138,6 +138,7 @@ impl TypeDesc {
     pub const CAP: usize = 96;
 
     /// A scalar (or `()`, `str`, `String`): its tag alone.
+    #[inline]
     #[must_use]
     pub const fn tag(tag: u8) -> Self {
         let mut bytes = [0; Self::CAP];
@@ -146,12 +147,14 @@ impl TypeDesc {
     }
 
     /// `tag` followed by `inner` (`Option`, `[T]`, `Vec`).
+    #[inline]
     #[must_use]
     pub const fn wrap(tag: u8, inner: TypeDesc) -> Self {
         Self::pair(tag, inner, Self::empty())
     }
 
     /// `tag` followed by `a` then `b` (`Result`).
+    #[inline]
     #[must_use]
     pub const fn pair(tag: u8, a: TypeDesc, b: TypeDesc) -> Self {
         let total = 1 + a.len as usize + b.len as usize;
@@ -178,18 +181,21 @@ impl TypeDesc {
     }
 
     /// An exported class named `name`.
+    #[inline]
     #[must_use]
     pub const fn class(name: &str) -> Self {
         Self::named(tag::CLASS, name)
     }
 
     /// A JS object whose TypeScript type is `ts` ([`crate::js`]).
+    #[inline]
     #[must_use]
     pub const fn js_object(ts: &str) -> Self {
         Self::named(tag::JS_OBJECT, ts)
     }
 
     /// `tag` followed by the length of `name`, then `name`.
+    #[inline]
     const fn named(tag: u8, name: &str) -> Self {
         let name = name.as_bytes();
         assert!(
@@ -210,6 +216,7 @@ impl TypeDesc {
         }
     }
 
+    #[inline]
     const fn empty() -> Self {
         Self {
             len: 0,
@@ -218,6 +225,7 @@ impl TypeDesc {
     }
 
     /// The encoded description.
+    #[inline]
     #[must_use]
     pub const fn as_bytes(&self) -> &[u8] {
         self.bytes.split_at(self.len as usize).0
@@ -244,6 +252,7 @@ pub enum Part {
 }
 
 impl Part {
+    #[inline]
     const fn bytes(&self) -> &[u8] {
         match self {
             Part::Bytes(b) => b,
@@ -254,6 +263,7 @@ impl Part {
 
 /// The length of the record [`record`] assembles from `parts`, header
 /// included: the static's array length.
+#[inline]
 #[must_use]
 pub const fn record_len(parts: &[Part]) -> usize {
     let mut n = HEADER_LEN;
@@ -267,6 +277,7 @@ pub const fn record_len(parts: &[Part]) -> usize {
 
 /// The record for `parts`: [`MAGIC`], [`VERSION`], the body length, then
 /// each part's bytes. `N` must be [`record_len`]`(parts)`.
+#[inline]
 #[must_use]
 pub const fn record<const N: usize>(parts: &[Part]) -> [u8; N] {
     assert!(N == record_len(parts), "aterm-wasm-abi: record length");

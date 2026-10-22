@@ -617,6 +617,8 @@ impl From<&aterm_types::scheme::ColorScheme> for Theme {
 
 #[cfg(test)]
 mod cell_geometry_memo_tests;
+#[cfg(test)]
+mod color_chain_tests;
 #[cfg(all(test, feature = "embedded-font"))]
 mod combining_script_tests;
 #[cfg(test)]
@@ -879,6 +881,41 @@ impl GlyphKey {
         }
     }
 
+    /// [`Self::rgba_char`] of [`FaceId::ColorEmoji`] drawn by colour-chain face `face`
+    /// ([`COLOUR_FACE_SHIFT`]). Face `0`, the chain's head, is exactly `rgba_char`.
+    #[inline]
+    pub const fn rgba_char_in(face: u8, ch: char, px_q: u32) -> GlyphKey {
+        let key = Self::rgba_char(FaceId::ColorEmoji, ch, px_q);
+        GlyphKey {
+            ch_or_id: key.ch_or_id | ((face as u32) << COLOUR_FACE_SHIFT),
+            ..key
+        }
+    }
+
+    /// [`Self::rgba_gid`] of [`FaceId::ColorEmoji`] for a glyph id of colour-chain face
+    /// `face` ([`COLOUR_FACE_SHIFT`]): two faces' glyph `gid` are different images, so they
+    /// are different keys. Face `0` is exactly `rgba_gid`.
+    #[inline]
+    pub const fn rgba_gid_in(face: u8, gid: u16, px_q: u32) -> GlyphKey {
+        let key = Self::rgba_gid(FaceId::ColorEmoji, gid, px_q);
+        GlyphKey {
+            ch_or_id: key.ch_or_id | ((face as u32) << COLOUR_FACE_SHIFT),
+            ..key
+        }
+    }
+
+    /// The colour-chain face an [`GlyphClass::Rgba`] or [`GlyphClass::RgbaGid`] key draws
+    /// from ([`COLOUR_FACE_SHIFT`]); `0` for every other key.
+    #[inline]
+    #[must_use]
+    pub const fn colour_face(&self) -> u8 {
+        if matches!(self.glyph_class, GlyphClass::Rgba | GlyphClass::RgbaGid) {
+            (self.ch_or_id >> COLOUR_FACE_SHIFT) as u8
+        } else {
+            0
+        }
+    }
+
     /// Key for the colour composite of cluster run `run` ([`GlyphClass::RgbaCluster`]).
     #[inline]
     pub const fn rgba_cluster(run: u32, px_q: u32) -> GlyphKey {
@@ -929,15 +966,22 @@ impl GlyphKey {
     /// ([`GlyphClass::RgbaCluster`]), or a phase-carrying procedural shade key.
     #[inline]
     pub const fn chr(&self) -> Option<char> {
-        if matches!(
-            self.glyph_class,
-            GlyphClass::RgbaGid | GlyphClass::RgbaCluster | GlyphClass::MonoGid
-        ) {
-            return None;
+        match self.glyph_class {
+            GlyphClass::RgbaGid | GlyphClass::RgbaCluster | GlyphClass::MonoGid => None,
+            // Below the colour face's byte ([`COLOUR_FACE_SHIFT`]).
+            GlyphClass::Rgba => char::from_u32(self.ch_or_id & ((1 << COLOUR_FACE_SHIFT) - 1)),
+            GlyphClass::Mono => char::from_u32(self.ch_or_id),
         }
-        char::from_u32(self.ch_or_id)
     }
 }
+
+/// Where a colour key ([`GlyphClass::Rgba`], [`GlyphClass::RgbaGid`]) carries the index of
+/// the colour-chain face that draws it ([`Renderer::color_pick`]) in [`GlyphKey::ch_or_id`]:
+/// the top byte, above the code point (21 bits) or glyph id (16). Two faces' glyph `n` are
+/// different images, so the byte keeps them apart in the glyph cache and both atlases. A
+/// colour key never carries a script bit, so [`SUB_NUDGE_SHIFT`]'s byte is free there. The
+/// head face is `0`: its keys are exactly the single-face keys.
+pub const COLOUR_FACE_SHIFT: u32 = 24;
 
 /// Stamp an explicit text-presentation request into a mono raster identity.
 ///
@@ -1417,11 +1461,12 @@ pub struct AdmittedFontSources {
     styled: [Option<AdmittedFaceSource>; 3],
     fallback: Vec<AdmittedFaceSource>,
     symbol: Vec<AdmittedFaceSource>,
-    emoji: Option<AdmittedFaceSource>,
+    /// The colour-emoji chain, head first.
+    emoji: Vec<AdmittedFaceSource>,
 }
 
 impl AdmittedFontSources {
-    /// How this generation's discovered faces (fallback chain, symbol slot, colour emoji)
+    /// How this generation's discovered faces (fallback chain, symbol slot, colour chain)
     /// are resident: `(mapped_bytes, copied_bytes)`. A face compiled into the binary
     /// ([`crate::font::FaceBytes::Static`]) counts as mapped. Primary and styled faces are
     /// not counted. `tests/seal_maps_discovered_faces.rs` asserts `copied_bytes == 0` on a
@@ -1983,12 +2028,19 @@ pub struct Renderer {
     curl_scratch: Vec<(usize, usize, usize, usize, usize, usize, u32)>,
     /// Reused per-row break-column scratch for [`ligature_break_cols_into`] (it clears it).
     ligature_break_scratch: Vec<usize>,
-    /// Apple Color Emoji font bytes, loaded LAZILY on the first emoji miss (a
-    /// large `sbix` font; sessions without emoji never pay it). Stored as raw
-    /// bytes because a `aterm_font::Face` borrows them — a fresh Face is parsed
-    /// per emoji rasterization, which is rare and off the hot path.
-    color_font: Option<crate::font::FaceBytes>,
-    /// Candidate colour-emoji font paths, tried on first emoji; emptied once consumed.
+    /// The colour-emoji fallback chain, in precedence order: an injected face
+    /// ([`Self::set_color_font_bytes`]) first, then the discovered faces
+    /// ([`color_emoji_candidate_paths`]: config `emoji_font`, the per-user font dirs, the
+    /// built-ins). A code point goes to the first face that draws it in colour
+    /// ([`Self::color_pick`]). Faces load LAZILY, one at a time, only while every loaded face
+    /// misses (Apple Color Emoji is a large `sbix` font; a session without emoji never pays
+    /// for it, and one whose emoji the head draws never reads the rest). Stored as raw bytes
+    /// because a `aterm_font::Face` borrows them: a fresh Face is parsed per emoji
+    /// rasterization, which is rare and off the hot path.
+    color_chain: Vec<ColorFace>,
+    /// The colour-emoji candidate paths not yet tried, in chain order behind `color_chain`:
+    /// the next one loads when every loaded face misses a code point
+    /// ([`Self::load_next_color_face`]).
     color_font_paths: Vec<String>,
     /// Runtime per-codepoint fallback: for a code point every configured face misses,
     /// [`Renderer::glyph_key`] asks this for a covering system font (CoreText on macOS, a
@@ -3796,10 +3848,11 @@ fn embedded_symbols_own_text_point(ch: char) -> bool {
 }
 
 /// Colour-emoji faces (bitmap strikes), most-preferred first, behind the config
-/// `emoji_font`. Apple Color Emoji is `sbix`; Noto Color Emoji is `CBDT/CBLC`
-/// — both are PNG bitmap strikes read uniformly through aterm-font's
-/// `glyph_raster_image` ([`Renderer::color_font_has`]), so the Linux entry renders
-/// colour emoji exactly as the macOS one does. The first path that EXISTS wins.
+/// `emoji_font` and the per-user font dirs ([`color_emoji_discovery_paths`]). Apple Color
+/// Emoji is `sbix`; Noto Color Emoji is `CBDT/CBLC` — both are PNG bitmap strikes read
+/// uniformly through aterm-font's `glyph_raster_image` ([`Renderer::color_font_has`]), so
+/// the Linux entry renders colour emoji exactly as the macOS one does. Every path that
+/// exists joins the colour chain in this order ([`Renderer::color_pick`]).
 const COLOR_EMOJI_CANDIDATES: &[&str] = &[
     "/System/Library/Fonts/Apple Color Emoji.ttc",
     "/usr/share/fonts/truetype/noto/NotoColorEmoji.ttf",
@@ -4060,7 +4113,9 @@ fn color_emoji_discovery_paths() -> Vec<String> {
     // renders ALL emoji — including ZWJ family/couple sequences — in colour, where a
     // stock CBDT Noto renders those (Unicode-deprecated) sequences as monochrome
     // silhouettes. Scan the per-user font dirs for any *emoji* face so dropping one
-    // into ~/.local/share/fonts is enough; sorted for a deterministic choice.
+    // into ~/.local/share/fonts is enough; sorted for a deterministic order. The
+    // built-ins stay behind it in the chain, for the emoji it lacks (Twemoji Mozilla
+    // has no Emoji 15).
     for dir in user_font_dirs() {
         let Ok(rd) = std::fs::read_dir(dir) else {
             continue;
@@ -4090,6 +4145,27 @@ fn color_emoji_discovery_paths() -> Vec<String> {
 /// misses both mono faces.
 fn color_emoji_candidate_paths(config: &[String]) -> Vec<String> {
     fallback_chain_order(config, &color_emoji_discovery_paths())
+}
+
+/// One face of the colour-emoji chain ([`Renderer::color_pick`]).
+#[derive(Clone)]
+struct ColorFace {
+    bytes: crate::font::FaceBytes,
+    /// Host-injected ([`Renderer::set_color_font_bytes`]) rather than discovered: a later
+    /// injection replaces it, and the discovered faces stay behind the new one.
+    injected: bool,
+}
+
+/// The most faces the colour chain holds: a colour key carries its face's index in one byte
+/// ([`COLOUR_FACE_SHIFT`]).
+const MAX_COLOR_FACES: usize = 1 << (u32::BITS - COLOUR_FACE_SHIFT);
+
+/// Whether colour face `bytes` draws `ch` in colour ([`colour_drawable`]).
+fn color_face_draws(bytes: &[u8], ch: char) -> bool {
+    aterm_font::Face::parse(bytes, 0).ok().is_some_and(|face| {
+        face.glyph_index(ch)
+            .is_some_and(|gid| colour_drawable(&face, gid))
+    })
 }
 
 /// W8: the per-face NORMALIZATION FACTS a fallback face's rasterization scale
@@ -9352,7 +9428,7 @@ impl Renderer {
             keep_spans_scratch: Vec::new(),
             curl_scratch: Vec::new(),
             ligature_break_scratch: Vec::new(),
-            color_font: None,
+            color_chain: Vec::new(),
             color_font_paths: Vec::new(),
             runtime_fallback: RuntimeFallback::default(),
             px,
@@ -9522,12 +9598,14 @@ impl Renderer {
         Ok(())
     }
 
-    /// Install the colour-emoji (sbix) font from explicit bytes (eagerly).
-    /// Mirrors how [`ensure_color_font`] populates `color_font`, so the existing
-    /// ColorEmoji colour path renders the injected emoji face. Clearing the
-    /// candidate paths stops the lazy system scan from later overwriting it. Bytes
-    /// are validated as a parseable face (a `aterm_font::Face` borrows them per
-    /// rasterization), so a bad blob fails loudly instead of yielding tofu later.
+    /// Install a colour-emoji face from explicit bytes (eagerly) at the HEAD of the colour
+    /// chain ([`Self::color_pick`]), replacing an earlier injected face. The renderer's
+    /// discovered faces, loaded or still pending, stay behind it and draw what it lacks: a
+    /// host that injects the configured `emoji_font` (the GUI's font worker) keeps the
+    /// system face for newer emoji, and a renderer with no discovery (`from_bytes`, every
+    /// wasm host) draws from this face alone. Bytes are validated as a parseable face (a
+    /// `aterm_font::Face` borrows them per rasterization), so a bad blob fails loudly
+    /// instead of yielding tofu later.
     pub fn set_color_font_bytes(&mut self, bytes: Vec<u8>) -> Result<(), String> {
         aterm_font::Face::parse(&bytes, 0).map_err(|e| e.to_string())?;
         self.install_color_font(crate::font::FaceBytes::Vec(intern_font_bytes(bytes)));
@@ -9544,18 +9622,33 @@ impl Renderer {
     }
 
     fn install_color_font(&mut self, bytes: crate::font::FaceBytes) {
-        self.color_font = Some(bytes);
-        self.color_font_paths.clear();
-        // Emoji drawn from the old colour face survive in `self.glyphs`, addressed by
-        // `emoji_keys` and, for shaped ZWJ/skin-tone/keycap clusters, `cluster_shapes`, which
-        // memoizes the old font's gid (a wrong glyph, not just a stale bitmap). Drop all
-        // three.
+        // A discovered copy of the same bytes would only repeat it.
+        self.color_chain
+            .retain(|face| !face.injected && !face.bytes.same_bytes(&bytes));
+        self.color_chain.insert(
+            0,
+            ColorFace {
+                bytes,
+                injected: true,
+            },
+        );
+        self.color_chain.truncate(MAX_COLOR_FACES);
+        self.forget_color_routing();
+    }
+
+    /// Drop everything resolved against the colour chain, after its faces changed or moved.
+    /// Emoji drawn from an old face survive in `self.glyphs`, addressed by `emoji_keys` and,
+    /// for shaped ZWJ/skin-tone/keycap clusters, `cluster_shapes`, which memoizes that face's
+    /// gid (a wrong glyph, not just a stale bitmap). A colour key also names its face by
+    /// chain index ([`COLOUR_FACE_SHIFT`]), which now may be another face. `keys` and
+    /// `styled_keys` go too: `select_face` consulted colour coverage, so an emoji resolved
+    /// through the text path before a face arrived is memoized as `.notdef` there.
+    fn forget_color_routing(&mut self) {
         self.clear_glyph_images();
         self.emoji_keys.clear();
         self.cluster_shapes.clear();
-        // `keys` too: `select_face` consulted colour coverage, so an emoji resolved through
-        // the text path before this face arrived is memoized as `.notdef` there.
         self.keys.clear();
+        self.styled_keys.clear();
     }
 
     /// Install a real bold weight of the primary family from explicit bytes, so SGR-bold
@@ -9735,17 +9828,11 @@ impl Renderer {
         }
         self.cfg_emoji_font = path.map(str::to_string);
         let config: Vec<String> = path.map(str::to_string).into_iter().collect();
-        self.color_font = None;
+        self.color_chain.clear();
         self.color_font_paths = color_emoji_candidate_paths(&config);
         self.admitted_sources_sealed = false;
         self.drawn_faces = None;
-        // Same three memos `set_color_font_bytes` documents: keys (select_face
-        // consulted colour coverage), per-char emoji keys, shaped-cluster gids —
-        // plus the rasterized bitmaps.
-        self.keys.clear();
-        self.emoji_keys.clear();
-        self.cluster_shapes.clear();
-        self.clear_glyph_images();
+        self.forget_color_routing();
         true
     }
 
@@ -10815,7 +10902,11 @@ impl Renderer {
                 .iter()
                 .map(|face| vec(&face.bytes, face.index))
                 .collect(),
-            emoji: self.color_font.as_ref().map(|bytes| vec(bytes, 0)),
+            emoji: self
+                .color_chain
+                .iter()
+                .map(|face| vec(&face.bytes, 0))
+                .collect(),
         }
     }
 
@@ -10844,12 +10935,14 @@ impl Renderer {
         self.ensure_symbol_fallback();
         self.ensure_styled_faces();
         // The colour-emoji admission is eager because this is the last moment it can happen:
-        // the clear below empties `color_font_paths`, and `ensure_color_font` early-returns on
-        // an empty list (`tests/sealed_keeps_embedded_backstop.rs` fails if this line goes).
-        // It is the largest read here (Apple Color Emoji, 183 MiB), but
-        // `font_file::admit_font_file` maps a file on the system font volume, faulted in per
-        // glyph (`tests/seal_maps_discovered_faces.rs`), and it overlaps the two parses above.
-        self.ensure_color_font();
+        // the clear below empties `color_font_paths`, and nothing loads a colour face from a
+        // path after it (`tests/sealed_keeps_embedded_backstop.rs` fails if this line goes).
+        // So the WHOLE chain is admitted: a face behind the head is the only one that draws
+        // what the head lacks (Emoji 15 behind a user's Twemoji). It is the largest read here
+        // (Apple Color Emoji, 183 MiB), but `font_file::admit_font_file` maps a file on the
+        // system font volume, faulted in per glyph (`tests/seal_maps_discovered_faces.rs`),
+        // and it overlaps the two parses above.
+        self.ensure_color_chain();
         self.block_on_lazy_fallbacks();
 
         // `ensure_*` consumes these already, but clear explicitly so this method
@@ -10963,9 +11056,9 @@ impl Renderer {
                 .first()
                 .and_then(|face| face_family_name(&face.bytes, face.index)),
             emoji: self
-                .color_font
-                .as_deref()
-                .and_then(|bytes| face_family_name(bytes, 0)),
+                .color_chain
+                .first()
+                .and_then(|face| face_family_name(&face.bytes, 0)),
         }
     }
 
@@ -11007,7 +11100,7 @@ impl Renderer {
         rebuilt.symbol_fallback_paths.clear();
         rebuilt.symbol_user_prefix = 0;
         rebuilt.cfg_symbol_font.clone_from(&self.cfg_symbol_font);
-        rebuilt.color_font = self.color_font.clone();
+        rebuilt.color_chain = self.color_chain.clone();
         rebuilt.color_font_paths.clear();
         rebuilt.cfg_emoji_font.clone_from(&self.cfg_emoji_font);
         rebuilt.fallback_parse_rx = None;
@@ -11165,12 +11258,14 @@ impl Renderer {
         } else {
             (Vec::new(), 0)
         };
-        fork.color_font = self.color_font.clone();
+        fork.color_chain = self.color_chain.clone();
         fork.cfg_emoji_font = self.cfg_emoji_font.clone();
-        fork.color_font_paths = if fork.color_font.is_none() {
+        // The rest of the chain, as this renderer would load it: faces not yet loaded stay
+        // pending, so the fork still reads none it does not need.
+        fork.color_font_paths = if fork.color_chain.is_empty() {
             color_emoji_candidate_paths(fork.cfg_emoji_font.as_slice())
         } else {
-            Vec::new()
+            self.color_font_paths.clone()
         };
         fork.runtime_fallback = self.runtime_fallback.clone();
         fork.runtime_discovery = self.runtime_discovery;
@@ -12105,47 +12200,92 @@ impl Renderer {
         )
     }
 
-    /// Lazily admit the colour-emoji font bytes the first time one is needed.
-    /// After this runs once, `color_font_paths` is empty so we never re-try.
-    /// Only the bytes are kept (a `aterm_font::Face` borrows them); a Face is
-    /// parsed per emoji rasterization.
+    /// Admit the next pending colour-emoji candidate ([`Self::color_font_paths`]) onto the
+    /// end of the colour chain: the first that admits, parses, and is not already in the
+    /// chain (a configured `emoji_font` that discovery also lists). Returns whether a face
+    /// joined; `false` once the candidates are exhausted. Only the bytes are kept (a
+    /// `aterm_font::Face` borrows them); a Face is parsed per emoji rasterization.
     ///
     /// `font_file::admit_font_file` maps a built-in candidate (on the system font volume)
     /// read-only, so the 192 MB Apple Color Emoji costs a table-directory page here and a
     /// strike per emoji drawn. The handle goes into the process-global discovery store, so a
     /// later generation admitting the same file reuses the mapping.
-    fn ensure_color_font(&mut self) {
-        if self.color_font.is_some() || self.color_font_paths.is_empty() {
-            return;
-        }
-        let paths = std::mem::take(&mut self.color_font_paths);
-        // Only the built-in tail (`COLOR_EMOJI_CANDIDATES`) relocates: a configured
-        // `emoji_font` names exactly the file the user meant.
-        let builtin_from = paths.len().saturating_sub(COLOR_EMOJI_CANDIDATES.len());
-        let relocated = relocate_missing_builtin_fonts(&paths, builtin_from);
-        for (p, moved) in paths.iter().zip(relocated) {
-            let p = moved.as_deref().unwrap_or(p);
-            if let Ok(bytes) = font_file::admit_font_file(std::path::Path::new(p)) {
-                // Validate it parses as a colour (sbix) face before keeping it.
-                if aterm_font::Face::parse(&bytes, 0).is_ok() {
-                    self.color_font = Some(intern_discovered_font_bytes(&bytes));
-                    return;
-                }
+    fn load_next_color_face(&mut self) -> bool {
+        while !self.color_font_paths.is_empty() {
+            if self.color_chain.len() >= MAX_COLOR_FACES {
+                self.color_font_paths.clear();
+                return false;
             }
+            // Only the built-in tail (`COLOR_EMOJI_CANDIDATES`) relocates: a configured
+            // `emoji_font` or a face in the user's font dir names exactly the file meant.
+            let builtin = self.color_font_paths.len() <= COLOR_EMOJI_CANDIDATES.len();
+            let path = self.color_font_paths.remove(0);
+            let relocated =
+                relocate_missing_builtin_fonts(std::slice::from_ref(&path), usize::from(!builtin))
+                    .pop()
+                    .flatten();
+            let load = relocated.as_deref().unwrap_or(&path);
+            let Ok(bytes) = font_file::admit_font_file(std::path::Path::new(load)) else {
+                continue;
+            };
+            // Validate it parses as a face before keeping it.
+            if aterm_font::Face::parse(&bytes, 0).is_err() {
+                continue;
+            }
+            let bytes = intern_discovered_font_bytes(&bytes);
+            if self.color_chain.iter().any(|f| f.bytes.same_bytes(&bytes)) {
+                continue;
+            }
+            self.color_chain.push(ColorFace {
+                bytes,
+                injected: false,
+            });
+            return true;
+        }
+        false
+    }
+
+    /// Load the chain's head if no colour face is loaded yet.
+    fn ensure_color_font(&mut self) {
+        if self.color_chain.is_empty() {
+            self.load_next_color_face();
         }
     }
 
-    /// Whether the colour-emoji face has a glyph for `ch` (loads it lazily).
+    /// Load every pending colour face (the seal's last chance at font I/O).
+    fn ensure_color_chain(&mut self) {
+        while self.load_next_color_face() {}
+    }
+
+    /// The colour-chain face that draws `ch` in colour: the first loaded face that does,
+    /// else the next pending candidate that does, loaded now. A face behind the head loads
+    /// only when every face ahead of it misses a code point, so a session whose emoji the
+    /// head draws never reads the rest. Loads only append, so the pick for a code point
+    /// never changes once made: it is a pure function of `ch` and the chain, and the
+    /// rasterizer can trust the face a key names ([`GlyphKey::colour_face`]).
+    fn color_pick(&mut self, ch: char) -> Option<u8> {
+        let mut i = 0;
+        loop {
+            if i == self.color_chain.len() && !self.load_next_color_face() {
+                return None;
+            }
+            if color_face_draws(&self.color_chain[i].bytes, ch) {
+                return u8::try_from(i).ok();
+            }
+            i += 1;
+        }
+    }
+
+    /// Whether some colour-chain face draws `ch` in colour ([`Self::color_pick`]).
     fn color_font_has(&mut self, ch: char) -> bool {
-        self.ensure_color_font();
-        let Some(bytes) = self.color_font.as_deref() else {
-            return false;
-        };
-        let Ok(face) = aterm_font::Face::parse(bytes, 0) else {
-            return false;
-        };
-        face.glyph_index(ch)
-            .is_some_and(|gid| colour_drawable(&face, gid))
+        self.color_pick(ch).is_some()
+    }
+
+    /// The bytes of colour-chain face `face`.
+    fn color_face_bytes(&self, face: u8) -> Option<&crate::font::FaceBytes> {
+        self.color_chain
+            .get(usize::from(face))
+            .map(|face| &face.bytes)
     }
 
     #[inline]
@@ -13954,7 +14094,10 @@ impl Renderer {
             // The colour face carries a 32-bit RGBA sbix bitmap (🚀 😀); every other outcome,
             // including the monochromatized colour silhouette (`ColorEmojiMono`) and the
             // runtime-discovered fallback, is a foreground-tinted Mono coverage mask.
-            FaceId::ColorEmoji => GlyphKey::rgba_char(FaceId::ColorEmoji, ch, self.px_q),
+            // The chain face the colour tier found it in (the pick is settled: no load).
+            FaceId::ColorEmoji => {
+                GlyphKey::rgba_char_in(self.color_pick(ch).unwrap_or(0), ch, self.px_q)
+            }
             // Primary glyph: addressed by its Unicode-resolved id so the rasterizer
             // (`rasterize_indexed`) bypasses the by-char lookup. The give-up `.notdef`
             // (`primary_gid == None`) falls through to `mono_char`.
@@ -14131,8 +14274,8 @@ impl Renderer {
         if let Some(&key) = self.emoji_keys.get(&ch) {
             return key;
         }
-        let key = if self.color_font_has(ch) {
-            GlyphKey::rgba_char(FaceId::ColorEmoji, ch, self.px_q)
+        let key = if let Some(face) = self.color_pick(ch) {
+            GlyphKey::rgba_char_in(face, ch, self.px_q)
         } else {
             // No colour glyph for this char: the ordinary text dispatch. A provisional
             // resolution (fallback parse in flight) is not memoized; it re-resolves once the
@@ -14148,10 +14291,11 @@ impl Renderer {
     }
 
     /// Shape an emoji grapheme cluster (ZWJ / skin-tone / keycap / flag) on the
-    /// colour face, cached. One colour glyph is [`ClusterShape::Glyph`];
-    /// several, which the face did not ligate, are a composited
-    /// [`ClusterShape::Run`] ([`emoji_cluster`]). A non-emoji or unsupported
-    /// cluster declines (the caller falls back to the base codepoint).
+    /// colour chain, cached: the first face that draws it in colour shapes it, as
+    /// [`Self::color_pick`] picks a code point's face. One colour glyph is
+    /// [`ClusterShape::Glyph`]; several, which the face did not ligate, are a
+    /// composited [`ClusterShape::Run`] ([`emoji_cluster`]). A non-emoji or
+    /// unsupported cluster declines (the caller falls back to the base codepoint).
     ///
     /// On macOS the cluster is shaped by CoreText: Apple Color Emoji forms its
     /// sequences in `morx`, which only an AAT shaper runs (TF.6 of
@@ -14173,13 +14317,27 @@ impl Renderer {
     }
 
     fn shape_cluster_uncached(&mut self, cluster: &str) -> Option<ClusterShape> {
-        self.ensure_color_font();
-        let bytes = self.color_font.as_ref()?;
-        let glyphs = shape_colour_cluster(bytes, cluster)?;
-        let tt = aterm_font::Face::parse(bytes, 0).ok()?;
-        match colour_cluster_decision(&tt, cluster, &glyphs)? {
-            ColourCluster::Glyph(gid) => Some(ClusterShape::Glyph(gid)),
-            ColourCluster::Run(run) => self.cluster_shapes.add_run(run).map(ClusterShape::Run),
+        let mut i = 0;
+        let (face, decision) = loop {
+            if i == self.color_chain.len() && !self.load_next_color_face() {
+                return None;
+            }
+            let bytes = &self.color_chain[i].bytes;
+            let decision = shape_colour_cluster(bytes, cluster).and_then(|glyphs| {
+                let tt = aterm_font::Face::parse(bytes, 0).ok()?;
+                colour_cluster_decision(&tt, cluster, &glyphs)
+            });
+            if let Some(decision) = decision {
+                break (u8::try_from(i).ok()?, decision);
+            }
+            i += 1;
+        };
+        match decision {
+            ColourCluster::Glyph(gid) => Some(ClusterShape::Glyph { face, gid }),
+            ColourCluster::Run(run) => self
+                .cluster_shapes
+                .add_run(emoji_cluster::ClusterRun { face, ..run })
+                .map(ClusterShape::Run),
         }
     }
 
@@ -14188,7 +14346,7 @@ impl Renderer {
     /// ([`GlyphClass::RgbaCluster`]) — or `None` if it is not a colour cluster.
     pub fn glyph_key_cluster(&mut self, cluster: &str) -> Option<GlyphKey> {
         Some(match self.shape_cluster(cluster)? {
-            ClusterShape::Glyph(gid) => GlyphKey::rgba_gid(FaceId::ColorEmoji, gid, self.px_q),
+            ClusterShape::Glyph { face, gid } => GlyphKey::rgba_gid_in(face, gid, self.px_q),
             ClusterShape::Run(run) => GlyphKey::rgba_cluster(run, self.px_q),
         })
     }
@@ -15420,12 +15578,14 @@ impl Renderer {
                 let ch = key.chr().unwrap_or(char::REPLACEMENT_CHARACTER);
                 // Empty image on any failure (missing/undecodable bitmap): the
                 // blit treats a 0-sized Rgba glyph as a no-op, same as a space.
-                self.rasterize_color_emoji(ch).unwrap_or_else(empty_rgba)
+                self.rasterize_color_emoji(key.colour_face(), ch)
+                    .unwrap_or_else(empty_rgba)
             }
             GlyphClass::RgbaGid => {
-                // `ch_or_id` is a shaped colour-font glyph id (a cluster).
+                // `ch_or_id` is a shaped colour-font glyph id (a cluster) in its low 16 bits,
+                // its face's chain index above ([`COLOUR_FACE_SHIFT`]).
                 let gid = aterm_font::GlyphId(key.ch_or_id as u16);
-                self.rasterize_color_emoji_gid(gid)
+                self.rasterize_color_emoji_gid(key.colour_face(), gid)
                     .unwrap_or_else(empty_rgba)
             }
             GlyphClass::RgbaCluster => self
@@ -15743,8 +15903,9 @@ impl Renderer {
     /// `None` (→ `.notdef`) if the face, glyph or bitmap is missing. Cached by its
     /// [`GlyphKey`] like any mono glyph, so the GPU atlas gets the same bytes.
     fn rasterize_color_emoji_mono(&mut self, ch: char) -> Option<GlyphImage> {
-        self.ensure_color_font();
-        let bytes = self.color_font.as_deref()?;
+        // A char key: the face is the chain's settled pick for `ch`.
+        let pick = self.color_pick(ch)?;
+        let bytes = self.color_face_bytes(pick)?;
         let face = aterm_font::Face::parse(bytes, 0).ok()?;
         let gid = face.glyph_index(ch)?;
         // Fit the (square) glyph into one cell, preserving aspect, centred.
@@ -15778,21 +15939,23 @@ impl Renderer {
     }
 
     /// Rasterize a single-codepoint colour emoji: map `ch` to its glyph id in
-    /// the colour face, then pull + scale the bitmap. `None` if the face/glyph
-    /// is missing.
-    fn rasterize_color_emoji(&mut self, ch: char) -> Option<GlyphImage> {
-        self.ensure_color_font();
-        let bytes = self.color_font.as_deref()?;
+    /// colour-chain face `face`, then pull + scale the bitmap. `None` if the
+    /// face/glyph is missing.
+    fn rasterize_color_emoji(&mut self, face: u8, ch: char) -> Option<GlyphImage> {
+        let bytes = self.color_face_bytes(face)?;
         let gid = aterm_font::Face::parse(bytes, 0).ok()?.glyph_index(ch)?;
-        self.rasterize_color_emoji_gid(gid)
+        self.rasterize_color_emoji_gid(face, gid)
     }
 
-    /// Rasterize a colour-emoji glyph BY glyph id (a cluster already shaped to
-    /// one glyph), fitted (preserving aspect) into a 2-cell-wide box — emoji are
-    /// full-width. Returns `None` if the face cannot draw it.
-    fn rasterize_color_emoji_gid(&mut self, gid: aterm_font::GlyphId) -> Option<GlyphImage> {
-        self.ensure_color_font();
-        let bytes = self.color_font.as_deref()?;
+    /// Rasterize a glyph of colour-chain face `face` BY glyph id (a cluster already
+    /// shaped to one glyph), fitted (preserving aspect) into a 2-cell-wide box —
+    /// emoji are full-width. Returns `None` if the face cannot draw it.
+    fn rasterize_color_emoji_gid(
+        &mut self,
+        face: u8,
+        gid: aterm_font::GlyphId,
+    ) -> Option<GlyphImage> {
+        let bytes = self.color_face_bytes(face)?;
         let face = aterm_font::Face::parse(bytes, 0).ok()?;
         let (box_w, box_h) = self.color_emoji_box();
         let (rgba, w, h) = fit_color_glyph(&face, gid, box_w, box_h)?;
@@ -15803,9 +15966,8 @@ impl Renderer {
     /// composited side by side, as the shaper placed them, into the same 2-cell
     /// box one emoji fills. `None` if the run is gone or nothing drew.
     fn rasterize_color_emoji_run(&mut self, id: u32) -> Option<GlyphImage> {
-        self.ensure_color_font();
         let run = self.cluster_shapes.run(id)?;
-        let bytes = self.color_font.as_deref()?;
+        let bytes = self.color_face_bytes(run.face)?;
         let face = aterm_font::Face::parse(bytes, 0).ok()?;
         let (box_w, box_h) = self.color_emoji_box();
         // A run the face paints in COLR alone is drawn in ONE canvas at the
@@ -30236,8 +30398,10 @@ mod tests {
         seed_glyph(&mut r, FaceId::ColorEmoji, '🚀');
         r.emoji_keys
             .insert('🚀', GlyphKey::rgba_char(FaceId::ColorEmoji, '🚀', r.px_q));
-        r.cluster_shapes
-            .insert("👩\u{200d}🚀", Some(ClusterShape::Glyph(42)));
+        r.cluster_shapes.insert(
+            "👩\u{200d}🚀",
+            Some(ClusterShape::Glyph { face: 0, gid: 42 }),
+        );
         r.set_color_font_bytes(bytes.clone())
             .expect("valid font installs");
         assert!(
@@ -33903,7 +34067,14 @@ mod tests {
         // glyph leaves fully transparent compare as transparent). A COLR face
         // (Segoe UI Emoji) paints the run in one canvas at the shaper's pen
         // positions instead: there, each half holds a member's ink.
-        let bytes_font = r.color_font.as_deref().unwrap();
+        let face_index = r
+            .cluster_shapes
+            .run(key.ch_or_id)
+            .expect("the resolved composite retains its run")
+            .face;
+        let bytes_font = r
+            .color_face_bytes(face_index)
+            .expect("the resolved face stays resident");
         let face = aterm_font::Face::parse(bytes_font, 0).unwrap();
         let visible = |px: &[u8; 4]| if px[3] == 0 { [0; 4] } else { *px };
         let slot = width / 2;
@@ -33977,7 +34148,28 @@ mod tests {
             r.color_font_has('\u{1F44D}'),
             "the host's colour face maps 👍"
         );
-        let bytes = r.color_font.clone().unwrap();
+        let mut term = Terminal::new(1, 4);
+        term.process(NO_FLAG.as_bytes());
+        let input = term.cell_frame(1, 4);
+        assert_eq!(input.cluster_at(0, 0), Some(NO_FLAG));
+        let cell = &input.cells[0][0];
+        let key = r.resolve_cell_key(Some(NO_FLAG), cell);
+        // A tail face can draw the cluster the head lacks. Bind the independent
+        // shaping oracle to that resident face; the mono negative keeps the head.
+        let face_index = match key.glyph_class {
+            GlyphClass::Rgba | GlyphClass::RgbaGid => key.colour_face(),
+            GlyphClass::RgbaCluster => {
+                r.cluster_shapes
+                    .run(key.ch_or_id)
+                    .expect("the resolved composite retains its run")
+                    .face
+            }
+            _ => 0,
+        };
+        let bytes = r
+            .color_face_bytes(face_index)
+            .expect("the resolved face stays resident")
+            .clone();
         // The renderer's own shaping of the cluster (CoreText on macOS).
         let shaped = shape_colour_cluster(&bytes, NO_FLAG).expect("the colour face shapes");
         let face = aterm_font::Face::parse(&bytes, 0).unwrap();
@@ -33985,24 +34177,11 @@ mod tests {
             .iter()
             .map(|&(gid, ..)| colour_drawable(&face, aterm_font::GlyphId(gid as u16)))
             .collect();
-        #[cfg(target_os = "macos")]
-        assert_eq!(
-            letters,
-            [false, false],
-            "Apple Color Emoji has no glyph for the pair, and its letters are not colour"
-        );
-
-        let mut term = Terminal::new(1, 4);
-        term.process(NO_FLAG.as_bytes());
-        let input = term.cell_frame(1, 4);
-        assert_eq!(input.cluster_at(0, 0), Some(NO_FLAG));
-        let cell = &input.cells[0][0];
-        let key = r.resolve_cell_key(Some(NO_FLAG), cell);
         if let [(gid, ..)] = shaped[..] {
             assert!(letters[0], "the face's glyph for the pair is colour");
             assert_eq!(
                 key,
-                GlyphKey::rgba_gid(FaceId::ColorEmoji, gid as u16, r.px_q),
+                GlyphKey::rgba_gid_in(face_index, gid as u16, r.px_q),
                 "the face's glyph for the pair draws"
             );
             return;
@@ -34048,6 +34227,29 @@ mod tests {
         );
     }
 
+    /// Isolate the face whose Windows contracts these cases exercise. A user's
+    /// valid colour chain may also contain Noto or Twemoji, with different flags
+    /// and ligatures. Keep the host's primary face for the text comparisons.
+    #[cfg(windows)]
+    fn segoe_emoji_fixture(mut r: Renderer) -> Renderer {
+        r.ensure_color_chain();
+        let Some(face) = r
+            .color_chain
+            .iter()
+            .find(|face| face_family_name(&face.bytes, 0).as_deref() == Some("Segoe UI Emoji"))
+        else {
+            aterm_spec::host::could_not_run(
+                "no Segoe UI Emoji for its Windows rendering contracts",
+            );
+        };
+        let bytes = face.bytes.clone();
+        r.color_chain.clear();
+        r.color_font_paths.clear();
+        r.install_color_font(bytes);
+        r.set_runtime_font_discovery(false);
+        r
+    }
+
     /// WINDOWS' FLAGS ARE THEIR LETTERS. Segoe UI Emoji has no country flags,
     /// so 🇯🇵 draws `JP` — the primary's own `J` in the lead cell and `P` in
     /// the next, exactly as typed letters draw there, the cell's foreground
@@ -34057,8 +34259,7 @@ mod tests {
     #[cfg(windows)]
     fn a_windows_flag_draws_as_its_two_letters_in_the_primary_face() {
         const JP: &str = "\u{1F1EF}\u{1F1F5}";
-        require_host_colour_emoji();
-        let mut r = renderer();
+        let mut r = segoe_emoji_fixture(renderer());
         r.debug_block_on_lazy_fallbacks();
         assert_eq!(r.glyph_key_cluster(JP), None, "Segoe UI Emoji has no 🇯🇵");
         let mut term = Terminal::new(1, 4);
@@ -34095,8 +34296,8 @@ mod tests {
     #[test]
     #[cfg(windows)]
     fn windows_emoji_draw_in_colour_inside_their_two_cells() {
-        require_host_colour_emoji();
-        let mut r = Renderer::from_system(17.0, Theme::default()).expect(NO_FONT);
+        let mut r =
+            segoe_emoji_fixture(Renderer::from_system(17.0, Theme::default()).expect(NO_FONT));
         r.set_line_height(1.1);
         r.seal_admitted_font_sources();
         r.debug_block_on_lazy_fallbacks();
@@ -34185,8 +34386,7 @@ mod tests {
     #[cfg(windows)]
     fn a_windows_zwj_family_draws_all_its_members() {
         const FAMILY: &str = "\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}";
-        require_host_colour_emoji();
-        let mut r = renderer();
+        let mut r = segoe_emoji_fixture(renderer());
         r.debug_block_on_lazy_fallbacks();
         let key = r
             .glyph_key_cluster(FAMILY)
@@ -37931,7 +38131,13 @@ mod tests {
         assert!(before.styled.iter().all(Option::is_some));
         assert_eq!(before.fallback.len(), 1);
         assert_eq!(before.symbol.len(), 1);
-        assert!(before.emoji.is_some());
+        // The injected colour face heads the chain; the host's discovered faces follow it.
+        assert!(
+            before
+                .emoji
+                .first()
+                .is_some_and(|head| head.bytes.bytes() == embedded_font())
+        );
 
         std::fs::remove_dir_all(&dir).expect("remove every source pathname");
         let rebuilt = renderer

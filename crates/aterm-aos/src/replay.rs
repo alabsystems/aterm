@@ -1,0 +1,230 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Andrew Yates
+
+//! Deterministic replay of a task's code over recorded inputs, and the first point where
+//! two runs differ.
+//!
+//! # The law
+//!
+//! [`replay`] folds `code.step` over the inputs from a start state, in order, and stops at
+//! the first [`StepRefusal`]: a refused input left the state untouched, and nothing after it
+//! runs. Because a step is a pure function of `(state, input)` and the effects it is handed
+//! back, the same code, start state, inputs and effect recording give the same [`Run`] —
+//! state, state digest, observations and observation chain — every time.
+//!
+//! The observation chain commits to every observation and where it happened:
+//! `chain₀ = Digest::of(b"aterm-aos-obs-v1\0", [])` and
+//! `chain' = Digest::of(b"aterm-aos-obs-v1\0", [chain, cursor (u64 LE), encoded observation])`.
+//!
+//! A replay never draws anything: it returns values. Whether its effects match the
+//! recording is the port's business ([`crate::effects::ShadowPort`]); a replay run under a
+//! shadow submits nothing live.
+
+use core::fmt;
+
+use crate::effects::EffectPort;
+use crate::ident::Digest;
+use crate::task::{Code, Schema, StepRefusal, state_digest};
+use crate::wire::Enc;
+
+/// The domain of the observation chain.
+pub const OBSERVATION_DOMAIN: &[u8] = b"aterm-aos-obs-v1\0";
+
+/// What one replay produced.
+pub struct Run<S: Schema> {
+    /// The state after the last step that ran.
+    pub state: S::State,
+    /// Its digest.
+    pub state_digest: Digest,
+    /// Each step's observation, with its input's cursor.
+    pub observations: Vec<(u64, S::Observation)>,
+    /// The fold of every observation and its cursor.
+    pub observation_chain: Digest,
+    /// The first refusal, with its input's cursor; nothing after it ran.
+    pub refused: Option<(u64, StepRefusal)>,
+}
+
+impl<S: Schema> Clone for Run<S> {
+    fn clone(&self) -> Self {
+        Run {
+            state: self.state.clone(),
+            state_digest: self.state_digest,
+            observations: self.observations.clone(),
+            observation_chain: self.observation_chain,
+            refused: self.refused.clone(),
+        }
+    }
+}
+
+impl<S: Schema> fmt::Debug for Run<S> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Run")
+            .field("state_digest", &self.state_digest)
+            .field("observations", &self.observations)
+            .field("observation_chain", &self.observation_chain)
+            .field("refused", &self.refused)
+            .finish_non_exhaustive()
+    }
+}
+
+/// The empty observation chain.
+#[inline]
+#[must_use]
+pub fn empty_chain() -> Digest {
+    Digest::of(OBSERVATION_DOMAIN, &[])
+}
+
+/// One link of the observation chain.
+#[inline]
+#[must_use]
+pub fn chain_link(chain: &Digest, cursor: u64, encoded_observation: &[u8]) -> Digest {
+    Digest::of(
+        OBSERVATION_DOMAIN,
+        &[&chain.0, &cursor.to_le_bytes(), encoded_observation],
+    )
+}
+
+/// The law name of a replay stopped because its cursors left the `u64` range.
+pub const CURSOR_EXHAUSTED: &str = "aos.cursor-exhausted";
+
+/// Runs `code` from `start` over `inputs` (whose first cursor is `first_cursor`), stopping at
+/// the first StepRefusal. `observation_chain` folds each encoded observation:
+/// chain' = Digest::of(b"aterm-aos-obs-v1\0", [chain, cursor, encoded observation]).
+///
+/// An input whose cursor would leave the `u64` range is not run: the replay stops there with
+/// a refusal under [`CURSOR_EXHAUSTED`].
+pub fn replay<S: Schema, C: Code<S>>(
+    schema: &S,
+    code: &C,
+    start: S::State,
+    inputs: &[S::Input],
+    first_cursor: u64,
+    port: &mut dyn EffectPort,
+) -> Run<S> {
+    let mut state = start;
+    let mut observations = Vec::with_capacity(inputs.len());
+    let mut chain = empty_chain();
+    let mut refused = None;
+    let mut cursor = Some(first_cursor);
+    let mut e = Enc::new();
+    for input in inputs {
+        let Some(at) = cursor else {
+            refused = Some((
+                u64::MAX,
+                StepRefusal {
+                    law: CURSOR_EXHAUSTED,
+                    detail: format!("an input follows cursor {}", u64::MAX),
+                },
+            ));
+            break;
+        };
+        match code.step(schema, &mut state, input, port) {
+            Ok(obs) => {
+                schema.encode_observation(&obs, &mut e);
+                chain = chain_link(&chain, at, e.as_bytes());
+                e = Enc::with_capacity(e.len());
+                observations.push((at, obs));
+            }
+            Err(r) => {
+                refused = Some((at, r));
+                break;
+            }
+        }
+        cursor = at.checked_add(1);
+    }
+    let state_digest = state_digest(schema, &state);
+    Run {
+        state,
+        state_digest,
+        observations,
+        observation_chain: chain,
+        refused,
+    }
+}
+
+/// Where two runs first differ.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Divergence {
+    /// Same observations, different end states.
+    State {
+        /// The first run's state digest.
+        a: Digest,
+        /// The second run's state digest.
+        b: Digest,
+    },
+    /// The observation at `cursor` differs (or sits at another cursor).
+    Observation {
+        /// The cursor of the first differing observation.
+        cursor: u64,
+    },
+    /// One run made more observations than the other, neither refused.
+    Length {
+        /// The first run's observation count.
+        a: usize,
+        /// The second run's observation count.
+        b: usize,
+    },
+    /// One run refused at `cursor` where the other did not (or refused otherwise).
+    Refused {
+        /// The cursor of the earlier refusal.
+        cursor: u64,
+    },
+}
+
+impl fmt::Display for Divergence {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Divergence::State { a, b } => write!(
+                f,
+                "the runs end in different states ({} against {})",
+                a.short(),
+                b.short()
+            ),
+            Divergence::Observation { cursor } => {
+                write!(f, "the runs observe differently at cursor {cursor}")
+            }
+            Divergence::Length { a, b } => {
+                write!(f, "one run made {a} observations and the other {b}")
+            }
+            Divergence::Refused { cursor } => {
+                write!(f, "the runs differ in what they refused at cursor {cursor}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for Divergence {}
+
+/// The first point where `a` and `b` differ, in run order: an observation, then a refusal,
+/// then the observation count, then the end state. `None` when the runs are the same.
+#[must_use]
+pub fn first_divergence<S: Schema>(a: &Run<S>, b: &Run<S>) -> Option<Divergence> {
+    for ((ca, oa), (cb, ob)) in a.observations.iter().zip(&b.observations) {
+        if ca != cb || oa != ob {
+            return Some(Divergence::Observation {
+                cursor: (*ca).min(*cb),
+            });
+        }
+    }
+    if a.refused != b.refused {
+        let cursor = match (&a.refused, &b.refused) {
+            (Some((x, _)), Some((y, _))) => (*x).min(*y),
+            (Some((x, _)), None) | (None, Some((x, _))) => *x,
+            (None, None) => 0,
+        };
+        return Some(Divergence::Refused { cursor });
+    }
+    if a.observations.len() != b.observations.len() {
+        return Some(Divergence::Length {
+            a: a.observations.len(),
+            b: b.observations.len(),
+        });
+    }
+    if a.state_digest != b.state_digest {
+        return Some(Divergence::State {
+            a: a.state_digest,
+            b: b.state_digest,
+        });
+    }
+    None
+}

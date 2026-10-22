@@ -32,6 +32,7 @@ thread_local! {
 /// A half-closed client (request sent, write side shut) is still waiting and
 /// not hung up, nor is one with a request queued. `false` off a serving lane.
 #[must_use]
+#[inline]
 pub fn caller_hung_up() -> bool {
     #[cfg(unix)]
     {
@@ -49,6 +50,7 @@ pub fn caller_hung_up() -> bool {
 /// `None` off a serving lane: what reads the connection's kernel peer reads.
 #[cfg(unix)]
 #[must_use]
+#[inline]
 pub fn serving_fd() -> Option<std::os::fd::RawFd> {
     SERVING_FD.with(std::cell::Cell::get)
 }
@@ -56,6 +58,7 @@ pub fn serving_fd() -> Option<std::os::fd::RawFd> {
 /// Cap one park of a blocking verb at [`HANGUP_POLL`] while serving a
 /// connection; with no connection it parks as asked.
 #[must_use]
+#[inline]
 pub fn hangup_park(park: std::time::Duration) -> std::time::Duration {
     #[cfg(unix)]
     {

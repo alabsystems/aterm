@@ -241,18 +241,21 @@ pub struct TtyEcho {
 impl TtyEcho {
     /// The press reaches the program but never the screen (canonical no-echo, iTerm2's
     /// password mode). A raw-mode program echoes for itself, so it is `false`.
+    #[inline]
     #[must_use]
     pub const fn swallows_input(self) -> bool {
         !self.echo && self.canonical
     }
 
     /// Whether the line discipline is in full raw mode (`!ECHO && !ICANON && ISIG` off).
+    #[inline]
     #[must_use]
     pub const fn is_raw_mode(self) -> bool {
         !self.echo && !self.canonical && self.signals.is_none()
     }
 
     /// Whether the line discipline is in standard cooked echo mode (`ECHO && ICANON`).
+    #[inline]
     #[must_use]
     pub const fn is_cooked_echo(self) -> bool {
         self.echo && self.canonical
@@ -260,6 +263,7 @@ impl TtyEcho {
 
     /// Whether writing `byte` into this line discipline triggers a terminal signal
     /// (`ISIG` enabled and `byte` matches `VINTR`, `VQUIT`, or `VSUSP`).
+    #[inline]
     #[must_use]
     pub const fn intercepts_signal_byte(self, byte: u8) -> bool {
         match self.signals {
@@ -287,6 +291,7 @@ pub struct TtySignals {
 
 impl TtySignals {
     /// Standard POSIX default control characters (`^C` = `0x03`, `^\` = `0x1c`, `^Z` = `0x1a`).
+    #[inline]
     #[must_use]
     pub const fn posix_defaults() -> Self {
         Self {
@@ -297,6 +302,7 @@ impl TtySignals {
     }
 
     /// All three signal characters disabled (`_POSIX_VDISABLE`).
+    #[inline]
     #[must_use]
     pub const fn disabled() -> Self {
         Self {
@@ -307,18 +313,21 @@ impl TtySignals {
     }
 
     /// Whether `byte` matches `VINTR`.
+    #[inline]
     #[must_use]
     pub const fn is_intr(self, byte: u8) -> bool {
         matches!(self.intr, Some(b) if b == byte)
     }
 
     /// Whether `byte` matches `VQUIT`.
+    #[inline]
     #[must_use]
     pub const fn is_quit(self, byte: u8) -> bool {
         matches!(self.quit, Some(b) if b == byte)
     }
 
     /// Whether `byte` matches `VSUSP`.
+    #[inline]
     #[must_use]
     pub const fn is_susp(self, byte: u8) -> bool {
         matches!(self.susp, Some(b) if b == byte)
@@ -326,6 +335,7 @@ impl TtySignals {
 
     /// Whether `byte`, written into the PTY, is turned into a signal rather
     /// than queued.
+    #[inline]
     #[must_use]
     pub const fn signals(self, byte: u8) -> bool {
         self.is_intr(byte) || self.is_quit(byte) || self.is_susp(byte)
@@ -363,6 +373,7 @@ pub struct ShellIdentity {
 impl ShellIdentity {
     /// An identity from recorded parts (production records through
     /// [`record_spawned_shell`] / [`record_adopted_shell`]).
+    #[inline]
     #[must_use]
     pub const fn from_parts(pid: i32, birth: Option<u64>, own_child: bool) -> Self {
         Self {
@@ -375,24 +386,28 @@ impl ShellIdentity {
     /// Nothing recorded, nothing ever proven: [`Self::verify`] is `false` for
     /// every pid, so teardown never signals by pid. Stub sessions (pid `-1`)
     /// carry this.
+    #[inline]
     #[must_use]
     pub const fn unproven(pid: i32) -> Self {
         Self::from_parts(pid, None, false)
     }
 
     /// Whether the recorded pid is a positive OS process identifier (`> 0`).
+    #[inline]
     #[must_use]
     pub const fn has_positive_pid(self) -> bool {
         self.pid > 0
     }
 
     /// Whether a process birth timestamp was recorded when the session took the shell.
+    #[inline]
     #[must_use]
     pub const fn has_birth_record(self) -> bool {
         self.birth.is_some()
     }
 
     /// Pure birth-timestamp comparison against a kernel-reported `(pid, birth)`.
+    #[inline]
     #[must_use]
     pub const fn matches_kernel_birth(self, kernel_pid: i32, kernel_birth: u64) -> bool {
         self.pid > 0 && self.pid == kernel_pid && matches!(self.birth, Some(b) if b == kernel_birth)
@@ -414,6 +429,7 @@ pub enum ShellHangup {
 
 impl ShellHangup {
     /// Return the process-group id that received `SIGHUP`, if any.
+    #[inline]
     #[must_use]
     pub const fn signalled_pgid(self) -> Option<i32> {
         match self {
@@ -423,6 +439,7 @@ impl ShellHangup {
     }
 
     /// Whether any process group was signalled.
+    #[inline]
     #[must_use]
     pub const fn did_signal(self) -> bool {
         !matches!(self, Self::Nothing)
@@ -444,12 +461,14 @@ pub enum ChildExit {
 
 impl ChildExit {
     /// Whether the child exited normally with code `0`.
+    #[inline]
     #[must_use]
     pub const fn is_success(self) -> bool {
         matches!(self, Self::Code(0))
     }
 
     /// Return the normal exit code if the child was not killed by a signal.
+    #[inline]
     #[must_use]
     pub const fn exit_code(self) -> Option<i32> {
         match self {
@@ -459,6 +478,7 @@ impl ChildExit {
     }
 
     /// Return the signal number if the child was terminated by a signal.
+    #[inline]
     #[must_use]
     pub const fn signal_number(self) -> Option<u8> {
         match self {
@@ -468,6 +488,7 @@ impl ChildExit {
     }
 
     /// Conventional POSIX shell `$?` encoding (`code` for normal exit, `128 + sig` for signals).
+    #[inline]
     #[must_use]
     pub const fn shell_status_code(self) -> i32 {
         match self {
@@ -479,6 +500,7 @@ impl ChildExit {
 
 impl SpawnedShell {
     /// Whether both the master descriptor/key (`>= 0`) and child pid (`> 0`) are valid.
+    #[inline]
     #[must_use]
     pub const fn has_valid_handles(self) -> bool {
         self.master >= 0 && self.pid > 0
@@ -487,6 +509,7 @@ impl SpawnedShell {
 
 /// Clamp a requested PTY window dimension (`cols` or `rows`) to at least `1` cell,
 /// substituting `fallback` (or `1` if `fallback == 0`) when `cells == 0`.
+#[inline]
 #[must_use]
 pub const fn clamp_winsize_cells(cells: u16, fallback: u16) -> u16 {
     if cells > 0 {
@@ -499,6 +522,7 @@ pub const fn clamp_winsize_cells(cells: u16, fallback: u16) -> u16 {
 }
 
 /// Encode a 4-field PTY window size `(cols, rows, xpixel, ypixel)` into 8 little-endian bytes.
+#[inline]
 #[must_use]
 pub const fn encode_winsize_le(cols: u16, rows: u16, xpixel: u16, ypixel: u16) -> [u8; 8] {
     [
@@ -514,6 +538,7 @@ pub const fn encode_winsize_le(cols: u16, rows: u16, xpixel: u16, ypixel: u16) -
 }
 
 /// Decode 8 little-endian bytes into a 4-field PTY window size `(cols, rows, xpixel, ypixel)`.
+#[inline]
 #[must_use]
 pub const fn decode_winsize_le(bytes: [u8; 8]) -> (u16, u16, u16, u16) {
     let cols = (bytes[0] as u16) | ((bytes[1] as u16) << 8);

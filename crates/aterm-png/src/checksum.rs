@@ -23,21 +23,25 @@ pub(crate) struct Crc32(u32);
 
 impl Crc32 {
     /// A fresh CRC: the CRC of no bytes, `0`.
-    pub(crate) fn new() -> Self {
+    #[inline]
+    pub(crate) const fn new() -> Self {
         Self(0)
     }
 
     /// Fold `bytes` into the running CRC (astream-wire's slicing-by-8 fold).
+    #[inline]
     pub(crate) fn update(&mut self, bytes: &[u8]) {
         self.0 = crc32_ieee_update(self.0, bytes);
     }
 
     /// The finished CRC of everything folded so far.
-    pub(crate) fn finish(self) -> u32 {
+    #[inline]
+    pub(crate) const fn finish(self) -> u32 {
         self.0
     }
 
     /// CRC of `parts` folded in order.
+    #[inline]
     pub(crate) fn of(parts: &[&[u8]]) -> u32 {
         let mut crc = Self::new();
         for part in parts {
@@ -66,11 +70,13 @@ const BASE: u32 = 65521;
 
 impl Adler32 {
     /// The checksum of no bytes (`1`, not `0`).
-    pub(crate) fn new() -> Self {
+    #[inline]
+    pub(crate) const fn new() -> Self {
         Self { a: 1, b: 0 }
     }
 
     /// Fold `data` into the running sums.
+    #[inline]
     pub(crate) fn update(&mut self, data: &[u8]) {
         let (mut a, mut b) = (self.a, self.b);
         for chunk in data.chunks(NMAX) {
@@ -85,7 +91,8 @@ impl Adler32 {
     }
 
     /// The checksum of every byte folded so far.
-    pub(crate) fn finish(&self) -> u32 {
+    #[inline]
+    pub(crate) const fn finish(&self) -> u32 {
         (self.b << 16) | self.a
     }
 }

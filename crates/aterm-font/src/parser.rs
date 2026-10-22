@@ -131,13 +131,13 @@ pub struct F2DOT14(pub i16);
 impl F2DOT14 {
     /// Converts i16 to f32.
     #[inline]
-    pub fn to_f32(self) -> f32 {
-        f32::from(self.0) / 16384.0
+    pub const fn to_f32(self) -> f32 {
+        self.0 as f32 / 16384.0
     }
 
     /// The value with a variation delta (in F2DOT14 units) applied.
     #[inline]
-    pub fn apply_float_delta(&self, delta: f32) -> f32 {
+    pub const fn apply_float_delta(&self, delta: f32) -> f32 {
         self.to_f32() + (delta as f64 * (1.0 / 16384.0)) as f32
     }
 }
@@ -158,7 +158,7 @@ pub struct Fixed(pub f32);
 impl Fixed {
     /// The value with a variation delta (in 16.16 units) applied.
     #[inline]
-    pub(crate) fn apply_float_delta(&self, delta: f32) -> f32 {
+    pub(crate) const fn apply_float_delta(&self, delta: f32) -> f32 {
         self.0 + (delta as f64 * (1.0 / 65536.0)) as f32
     }
 }
@@ -279,7 +279,7 @@ impl<T> Default for LazyArray16<'_, T> {
 impl<'a, T: FromData> LazyArray16<'a, T> {
     /// Creates a new `LazyArray`.
     #[inline]
-    pub fn new(data: &'a [u8]) -> Self {
+    pub const fn new(data: &'a [u8]) -> Self {
         LazyArray16 {
             data,
             data_type: core::marker::PhantomData,
@@ -321,13 +321,13 @@ impl<'a, T: FromData> LazyArray16<'a, T> {
 
     /// Returns array's length.
     #[inline]
-    pub fn len(&self) -> u16 {
+    pub const fn len(&self) -> u16 {
         (self.data.len() / T::SIZE) as u16
     }
 
     /// Checks if array is empty.
     #[inline]
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.len() == 0
     }
 
@@ -454,7 +454,7 @@ impl<T> Default for LazyArray32<'_, T> {
 impl<'a, T: FromData> LazyArray32<'a, T> {
     /// Creates a new `LazyArray`.
     #[inline]
-    pub fn new(data: &'a [u8]) -> Self {
+    pub const fn new(data: &'a [u8]) -> Self {
         LazyArray32 {
             data,
             data_type: core::marker::PhantomData,
@@ -475,12 +475,13 @@ impl<'a, T: FromData> LazyArray32<'a, T> {
 
     /// Returns array's length.
     #[inline]
-    pub fn len(&self) -> u32 {
+    pub const fn len(&self) -> u32 {
         (self.data.len() / T::SIZE) as u32
     }
 
     /// Checks if the array is empty.
-    pub fn is_empty(&self) -> bool {
+    #[inline]
+    pub const fn is_empty(&self) -> bool {
         self.len() == 0
     }
 
@@ -590,8 +591,9 @@ pub struct LazyOffsetArray16<'a, T: FromSlice<'a>> {
 
 impl<'a, T: FromSlice<'a>> LazyOffsetArray16<'a, T> {
     /// Creates a new `LazyOffsetArray16`.
+    #[inline]
     #[allow(dead_code)]
-    pub fn new(data: &'a [u8], offsets: LazyArray16<'a, Option<Offset16>>) -> Self {
+    pub const fn new(data: &'a [u8], offsets: LazyArray16<'a, Option<Offset16>>) -> Self {
         Self {
             data,
             offsets,
@@ -600,6 +602,7 @@ impl<'a, T: FromSlice<'a>> LazyOffsetArray16<'a, T> {
     }
 
     /// Parses `LazyOffsetArray16` from raw data.
+    #[inline]
     #[allow(dead_code)]
     pub fn parse(data: &'a [u8]) -> Option<Self> {
         let mut s = Stream::new(data);
@@ -621,14 +624,14 @@ impl<'a, T: FromSlice<'a>> LazyOffsetArray16<'a, T> {
 
     /// Returns array's length.
     #[inline]
-    pub fn len(&self) -> u16 {
+    pub const fn len(&self) -> u16 {
         self.offsets.len()
     }
 
     /// Checks if array is empty.
     #[inline]
     #[allow(dead_code)]
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.len() == 0
     }
 }
@@ -663,6 +666,7 @@ impl<'a, T: FromSlice<'a>> IntoIterator for LazyOffsetArray16<'a, T> {
 impl<'a, T: FromSlice<'a>> Iterator for LazyOffsetArrayIter16<'a, T> {
     type Item = T;
 
+    #[inline]
     fn next(&mut self) -> Option<Self::Item> {
         if self.index < self.array.len() {
             let item = self.array.get(self.index);
@@ -690,7 +694,7 @@ pub struct Stream<'a> {
 impl<'a> Stream<'a> {
     /// Creates a new `Stream` parser.
     #[inline]
-    pub fn new(data: &'a [u8]) -> Self {
+    pub const fn new(data: &'a [u8]) -> Self {
         Stream { data, offset: 0 }
     }
 
@@ -698,7 +702,7 @@ impl<'a> Stream<'a> {
     ///
     /// Returns `None` when `offset` is out of bounds.
     #[inline]
-    pub fn new_at(data: &'a [u8], offset: usize) -> Option<Self> {
+    pub const fn new_at(data: &'a [u8], offset: usize) -> Option<Self> {
         if offset <= data.len() {
             Some(Stream { data, offset })
         } else {
@@ -708,7 +712,7 @@ impl<'a> Stream<'a> {
 
     /// Checks that stream reached the end of the data.
     #[inline]
-    pub fn at_end(&self) -> bool {
+    pub const fn at_end(&self) -> bool {
         self.offset >= self.data.len()
     }
 
@@ -716,13 +720,13 @@ impl<'a> Stream<'a> {
     ///
     /// Useful to indicate that we parsed all the data.
     #[inline]
-    pub fn jump_to_end(&mut self) {
+    pub const fn jump_to_end(&mut self) {
         self.offset = self.data.len();
     }
 
     /// Returns the current offset.
     #[inline]
-    pub fn offset(&self) -> usize {
+    pub const fn offset(&self) -> usize {
         self.offset
     }
 
@@ -738,7 +742,7 @@ impl<'a> Stream<'a> {
     ///
     /// Doesn't check bounds.
     #[inline]
-    pub fn skip<T: FromData>(&mut self) {
+    pub const fn skip<T: FromData>(&mut self) {
         self.advance(T::SIZE);
     }
 
@@ -746,15 +750,18 @@ impl<'a> Stream<'a> {
     ///
     /// Doesn't check bounds.
     #[inline]
-    pub fn advance(&mut self, len: usize) {
+    pub const fn advance(&mut self, len: usize) {
         // Saturating: past the end every read fails, as it would at end + len.
         self.offset = self.offset.saturating_add(len);
     }
 
     /// Advances by the specified `len` and checks for bounds.
     #[inline]
-    pub fn advance_checked(&mut self, len: usize) -> Option<()> {
-        if self.offset.checked_add(len)? <= self.data.len() {
+    pub const fn advance_checked(&mut self, len: usize) -> Option<()> {
+        let Some(end) = self.offset.checked_add(len) else {
+            return None;
+        };
+        if end <= self.data.len() {
             self.advance(len);
             Some(())
         } else {
@@ -926,13 +933,13 @@ impl FromData for Option<Offset32> {
 #[inline]
 #[cfg_attr(trust_verify, trust::requires(min <= max))]
 #[cfg_attr(trust_verify, trust::ensures(min <= result && result <= max))]
-pub fn i16_bound(min: i16, val: i16, max: i16) -> i16 {
+pub const fn i16_bound(min: i16, val: i16, max: i16) -> i16 {
     let upper = if val < max { val } else { max };
     if upper > min { upper } else { min }
 }
 
 #[inline]
-pub fn f32_bound(min: f32, val: f32, max: f32) -> f32 {
+pub const fn f32_bound(min: f32, val: f32, max: f32) -> f32 {
     // Upstream debug-asserted finite inputs; a caller's NaN or infinity is
     // input like any other here. NaN compares false both ways and passes
     // through, and every caller maps it to a finite value.

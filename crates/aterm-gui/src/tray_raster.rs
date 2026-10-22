@@ -86,20 +86,66 @@ impl SemanticFontResolution {
 /// [`SemanticFontResolution::Fallback`] status names as unresolved, so the
 /// specimen's status names the font that failed rather than the row that
 /// has focus.
-pub(crate) fn first_unresolved_slot(status: &str) -> Option<&str> {
-    let rest = status.split_once("unresolved ")?.1;
-    let slot = rest.split_once(" \"")?.0;
-    [
+/// Every slot a semantic font status names unresolved, with the family it
+/// asked for (`candidate fallback active: unresolved regular "Menlo X",
+/// bold "Y"; requested …`), in the order the status names them.
+pub(crate) fn unresolved_slots(status: &str) -> Vec<(&'static str, String)> {
+    const SLOTS: [&str; 7] = [
         "regular",
+        "bold italic",
         "bold",
         "italic",
-        "bold italic",
         "fallback",
         "symbol",
         "emoji",
-    ]
-    .contains(&slot)
-    .then_some(slot)
+    ];
+    let Some(rest) = status.split_once("unresolved ").map(|(_, rest)| rest) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    let mut rest = rest;
+    while let Some(slot) = SLOTS
+        .iter()
+        .find(|slot| rest.starts_with(&format!("{slot} \"")))
+    {
+        rest = &rest[slot.len() + 2..];
+        // The family as `{:?}` wrote it: up to the first unescaped quote.
+        let mut family = String::new();
+        let mut chars = rest.char_indices();
+        let mut end = None;
+        while let Some((at, ch)) = chars.next() {
+            match ch {
+                '\\' => {
+                    if let Some((_, escaped)) = chars.next() {
+                        family.push(escaped);
+                    }
+                }
+                '"' => {
+                    end = Some(at + 1);
+                    break;
+                }
+                _ => family.push(ch),
+            }
+        }
+        let Some(end) = end else {
+            break;
+        };
+        out.push((*slot, family));
+        // The next slot after this one's reason, before what was requested.
+        let tail = &rest[end..];
+        let tail = tail
+            .split_once("; requested")
+            .map_or(tail, |(head, _)| head);
+        let Some(next) = SLOTS
+            .iter()
+            .filter_map(|slot| tail.find(&format!(", {slot} \"")))
+            .min()
+        else {
+            break;
+        };
+        rest = &tail[next + 2..];
+    }
+    out
 }
 
 #[derive(Clone)]
@@ -1218,10 +1264,13 @@ pub(crate) fn kept_lines(
 
 // TEST-ONLY WORK CENSUS: how many strings THIS thread has measured glyph by
 // glyph (a width walk or a wrap's advance table), memoized ones not counted:
-// what a re-laid page's text work is ([`MeasureMemo`]).
+// what a re-laid page's text work is ([`MeasureMemo`]); and how many of them
+// the UI face mapped every char of, the strings the memo can keep (the rest
+// reach a fallback face, and are measured afresh every time by design).
 #[cfg(test)]
 thread_local! {
     static MEASURE_WALKS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static WHOLE_WALKS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 /// The strings this thread has measured glyph by glyph so far (test-only).
@@ -1230,9 +1279,24 @@ pub(crate) fn measure_walks() -> u64 {
     MEASURE_WALKS.with(std::cell::Cell::get)
 }
 
+/// Of [`measure_walks`], the strings the UI face mapped every char of: the
+/// ones [`MeasureMemo`] can keep, so a layout that finds them kept walks
+/// none of them again (test-only).
+#[cfg(test)]
+pub(crate) fn measure_walks_whole() -> u64 {
+    WHOLE_WALKS.with(std::cell::Cell::get)
+}
+
 fn note_measure_walk() {
     #[cfg(test)]
     MEASURE_WALKS.with(|walks| walks.set(walks.get() + 1));
+}
+
+/// The string just walked ([`note_measure_walk`]) is one the UI face mapped
+/// whole.
+fn note_whole_walk() {
+    #[cfg(test)]
+    WHOLE_WALKS.with(|walks| walks.set(walks.get() + 1));
 }
 
 fn default_chrome_fonts() -> ChromeFonts {
@@ -3288,6 +3352,9 @@ fn ui_text_wrap_walk(
     let whole_font = font
         .clone()
         .filter(|_| advances.values().all(|(_, ui_covers)| *ui_covers));
+    if whole_font.is_some() {
+        note_whole_walk();
+    }
     let charged = |character: char| -> (f32, bool) {
         match ascii_slot(character) {
             Some(slot) => ascii[slot],
@@ -3538,6 +3605,9 @@ fn ui_text_width_walk(
     for ch in s.chars() {
         bounded &= pen.push(fonts, &f, face, ch, px, &fits);
     }
+    if pen.whole {
+        note_whole_walk();
+    }
     (pen.w, bounded, pen.whole)
 }
 
@@ -3781,9 +3851,48 @@ struct Canvas {
     /// (`NaN` = not yet computed). A run of text sits on one fill, so the pair
     /// rarely changes and each byte costs its `powf` once per raster.
     glyph_remap: (u32, u32, [f32; 256]),
-    /// Device-px fade stack, `(top, bottom, from, to)`, the innermost last
-    /// ([`DrawPrim::FadePush`]): `blend` scales coverage by it.
-    fade: Vec<(f32, f32, f32, f32)>,
+    /// The open fade layers, the innermost last ([`DrawPrim::FadePush`]):
+    /// what is drawn inside one is drawn whole, and its pop fades it as one
+    /// picture ([`Self::pop_fade`]).
+    fade: Vec<FadeLayer>,
+}
+
+/// One open fade ([`DrawPrim::FadePush`]): its band in device px and the
+/// pixels of the region it may change as they were when it opened, so its pop
+/// can fade everything drawn inside it AS ONE LAYER — a panel, the text on it
+/// and an opaque terminal frame over the panel fade together, with no prim
+/// fading over another faded prim (and so reading more opaque where it lies
+/// on top) and no prim left unfaded.
+struct FadeLayer {
+    /// The band's top and bottom (device px) and the opacity at each.
+    top: f32,
+    bottom: f32,
+    from: f32,
+    to: f32,
+    /// The device rect the layer may change: the canvas, under the clip the
+    /// layer opened in, from the band's first faded row down. Empty where
+    /// nothing is drawn (a replay that only tracks the stacks).
+    region: DeviceRect,
+    /// `region`'s pixels as they were when the layer opened, row by row.
+    under: Vec<u8>,
+}
+
+impl FadeLayer {
+    /// How opaque the layer leaves device row `y` (1: untouched): eased out
+    /// from `from` at the band's top to `to` at its bottom, so it starts with
+    /// no step and falls fastest where it starts.
+    fn opacity_at(&self, y: i32) -> f32 {
+        let at = y as f32 + 0.5;
+        if at < self.top {
+            return 1.0;
+        }
+        let t = if self.bottom > self.top {
+            ((at - self.top) / (self.bottom - self.top)).clamp(0.0, 1.0)
+        } else {
+            1.0
+        };
+        self.to + (self.from - self.to) * (1.0 - t) * (1.0 - t)
+    }
 }
 
 impl Canvas {
@@ -3919,23 +4028,112 @@ impl Canvas {
         self.clip.pop();
     }
 
-    /// How opaque the innermost fade leaves device row `y` (1: untouched):
-    /// eased out from `from` at the band's top to `to` at its bottom, so it
-    /// starts with no step and falls fastest where it starts.
-    fn fade_at(&self, y: i32) -> f32 {
-        let Some(&(top, bottom, from, to)) = self.fade.last() else {
-            return 1.0;
+    /// Open a fade layer over the band `top..bottom` (device px), `from` to
+    /// `to` opaque. Where `draw` is false (a replay that only tracks the
+    /// stacks) the layer holds nothing and its pop changes nothing.
+    fn push_fade(&mut self, top: f32, bottom: f32, from: f32, to: f32, draw: bool) {
+        let mut layer = FadeLayer {
+            top,
+            bottom,
+            from,
+            to,
+            region: (0, 0, 0, 0),
+            under: Vec::new(),
         };
-        let at = y as f32 + 0.5;
-        if at < top {
-            return 1.0;
+        if draw {
+            // The first row the band dims: its centre at or under `top`.
+            let first = (top - 0.5).ceil();
+            let first = if first.is_finite() {
+                first.clamp(i32::MIN as f32, i32::MAX as f32) as i32
+            } else {
+                i32::MAX
+            };
+            let (x0, _, x1, y1) = self.device_bounds();
+            let (x0, y0, x1, y1) = self.clipped_bounds(x0, first.max(self.origin_y), x1, y1);
+            if x0 < x1 && y0 < y1 {
+                let stride = self.w as usize * 4;
+                let (local_x0, local_x1) =
+                    ((x0 - self.origin_x) as usize, (x1 - self.origin_x) as usize);
+                let mut under = Vec::with_capacity((x1 - x0) as usize * (y1 - y0) as usize * 4);
+                for y in y0..y1 {
+                    let row = (y - self.origin_y) as usize * stride;
+                    under.extend_from_slice(&self.px[row + local_x0 * 4..row + local_x1 * 4]);
+                }
+                layer.region = (x0, y0, x1, y1);
+                layer.under = under;
+            }
         }
-        let t = if bottom > top {
-            ((at - top) / (bottom - top)).clamp(0.0, 1.0)
-        } else {
-            1.0
+        self.fade.push(layer);
+    }
+
+    /// Close the innermost fade layer: every pixel of its region drawn inside
+    /// it is mixed back toward what was under it by the band's opacity at
+    /// its row, in premultiplied linear light — exactly drawing the layer
+    /// whole at that opacity over what it covered (`(o·L) over U` is
+    /// `U + o·((L over U) − U)`). A pixel nothing changed costs a compare; a
+    /// run of equal changes along a row composites once. An unbalanced pop is
+    /// a harmless no-op.
+    fn pop_fade(&mut self) {
+        let Some(layer) = self.fade.pop() else {
+            return;
         };
-        to + (from - to) * (1.0 - t) * (1.0 - t)
+        let (x0, y0, x1, y1) = layer.region;
+        if x0 >= x1 || y0 >= y1 {
+            return;
+        }
+        let lut = srgb_to_linear_lut();
+        let stride = self.w as usize * 4;
+        let width = (x1 - x0) as usize * 4;
+        let local_x0 = (x0 - self.origin_x) as usize * 4;
+        for y in y0..y1 {
+            let opacity = layer.opacity_at(y).clamp(0.0, 1.0);
+            if opacity >= 1.0 {
+                continue;
+            }
+            let start = (y - self.origin_y) as usize * stride + local_x0;
+            let under = &layer.under[(y - y0) as usize * width..][..width];
+            let target = &mut self.px[start..start + width];
+            if opacity <= 0.0 {
+                target.copy_from_slice(under);
+                continue;
+            }
+            let mut last: Option<([u8; 4], [u8; 4], [u8; 4])> = None;
+            for (out, was) in target
+                .as_chunks_mut::<4>()
+                .0
+                .iter_mut()
+                .zip(under.as_chunks::<4>().0)
+            {
+                if out == was {
+                    continue;
+                }
+                if let Some((drawn, ground, became)) = last
+                    && drawn == *out
+                    && ground == *was
+                {
+                    *out = became;
+                    continue;
+                }
+                let drawn = *out;
+                let (ua, da) = (f32::from(was[3]) / 255.0, f32::from(drawn[3]) / 255.0);
+                let (wu, wd) = (ua * (1.0 - opacity), da * opacity);
+                let out_a = wu + wd;
+                let became = if out_a > 0.0 {
+                    let mut mixed = [0, 0, 0, (out_a * 255.0).round().clamp(0.0, 255.0) as u8];
+                    for k in 0..3 {
+                        let lin = lut[usize::from(was[k])]
+                            .mul_add(wu, lut[usize::from(drawn[k])] * wd)
+                            / out_a;
+                        mixed[k] = linear_to_srgb_u8(lin);
+                    }
+                    mixed
+                } else {
+                    [0, 0, 0, 0]
+                };
+                *out = became;
+                last = Some((drawn, *was, became));
+            }
+        }
     }
 
     fn active_clip_intersects_tile(&self) -> bool {
@@ -3960,7 +4158,7 @@ impl Canvas {
         {
             return;
         }
-        let cov = cov.clamp(0.0, 1.0) * self.fade_at(y);
+        let cov = cov.clamp(0.0, 1.0);
         let a = (f32::from(c[3]) / 255.0) * cov;
         if a <= 0.0 {
             return;
@@ -3978,11 +4176,10 @@ impl Canvas {
     /// and three quarters of that raster was this interior: every card, row and
     /// field is a panel, translucent over the panel under it, and each of its
     /// pixels paid a linear-light source-over (three EOTF lookups and three
-    /// OETF quantizations) for the same answer as its neighbour. The fade is a
-    /// function of the row and the result one of the pixel under it alone, so
-    /// a run of equal pixels under the panel (a flat fill — the common case)
-    /// costs one composite and copies, and an opaque full-strength panel is a
-    /// plain fill.
+    /// OETF quantizations) for the same answer as its neighbour. The result is
+    /// a function of the pixel under it alone, so a run of equal pixels under
+    /// the panel (a flat fill — the common case) costs one composite and
+    /// copies, and an opaque full-strength panel is a plain fill.
     fn blend_span(&mut self, x0: i32, x1: i32, y: i32, c: [u8; 4], cov: f32, memo: &mut RimMemo) {
         let (canvas_x0, canvas_y0, canvas_x1, canvas_y1) = self.device_bounds();
         let (mut x0, mut x1) = (x0.max(canvas_x0), x1.min(canvas_x1));
@@ -4000,7 +4197,7 @@ impl Canvas {
         }
         let local_y = y - self.origin_y;
         let (local_x0, local_x1) = (x0 - self.origin_x, x1 - self.origin_x);
-        let cov = cov.clamp(0.0, 1.0) * self.fade_at(y);
+        let cov = cov.clamp(0.0, 1.0);
         let a = (f32::from(c[3]) / 255.0) * cov;
         if a <= 0.0 {
             return;
@@ -4056,7 +4253,7 @@ impl Canvas {
         {
             return;
         }
-        let cov = cov.clamp(0.0, 1.0) * self.fade_at(y);
+        let cov = cov.clamp(0.0, 1.0);
         let a = (f32::from(c[3]) / 255.0) * cov;
         if a <= 0.0 {
             return;
@@ -4902,6 +5099,8 @@ impl Canvas {
     /// Every frame pixel is opaque, so it REPLACES what is under it (what
     /// `blend` does for an opaque, fully covered source): one clipped span
     /// per row is written straight into the canvas, never a per-pixel blend.
+    /// Inside a fade the frame is part of its layer, faded with the panel
+    /// under it when the layer pops ([`Self::pop_fade`]).
     fn blit_terminal_frame(&mut self, frame: &aterm_render::Frame, x: i32, y: i32) {
         if frame.width == 0 {
             return;
@@ -5244,8 +5443,10 @@ fn rasterize_tray_on_canvas(prims: &[DrawPrim], scale: f32, mut cv: Canvas) -> V
                     &frames,
                     &mut skipped,
                 );
+                while cv.fade.len() > fades {
+                    cv.pop_fade();
+                }
                 cv.clip.truncate(clips);
-                cv.fade.truncate(fades);
             }
             let mut skipped = 0;
             replay_tray(
@@ -5282,6 +5483,10 @@ fn rasterize_tray_on_canvas(prims: &[DrawPrim], scale: f32, mut cv: Canvas) -> V
                 &mut skipped,
             );
         }
+    }
+    // A fade never popped still fades everything after its push.
+    while !cv.fade.is_empty() {
+        cv.pop_fade();
     }
     cv.px
 }
@@ -5467,11 +5672,11 @@ fn replay_tray(
             }
             _ if skipped_clip_depth > 0 => continue,
             DrawPrim::FadePush { y, h, from, to } => {
-                cv.fade.push((y * s, (y + h) * s, *from, *to));
+                cv.push_fade(y * s, (y + h) * s, *from, *to, draw);
                 continue;
             }
             DrawPrim::FadePop => {
-                cv.fade.pop();
+                cv.pop_fade();
                 continue;
             }
             _ => {}
@@ -5670,46 +5875,41 @@ mod tests {
         ];
         let (w, h) = (64_u32, 6_u32);
         for origin in [(0, 0), (-5, -2), (17, 3)] {
-            for fade in [None, Some((2.0_f32, 5.0_f32, 0.3_f32, 1.0_f32))] {
-                for clip in [
-                    None,
-                    Some((origin.0 + 9, origin.1 + 1, origin.0 + 50, origin.1 + 5)),
-                ] {
-                    for (c, coverage) in colours
-                        .into_iter()
-                        .flat_map(|c| [1.0_f32, 0.999, 0.4, 0.0].map(|coverage| (c, coverage)))
-                    {
-                        for (x0, x1) in [(0, 64), (-10, 30), (12, 13), (40, 90), (30, 30)] {
-                            let fresh = || {
-                                let mut cv = Canvas::with_origin(origin.0, origin.1, w, h, [0; 4]);
-                                cv.px = ground(w, h);
-                                if let Some(fade) = fade {
-                                    cv.fade.push(fade);
-                                }
-                                if let Some(clip) = clip {
-                                    cv.clip.push(clip);
-                                }
-                                cv
-                            };
-                            let (mut span, mut each) = (fresh(), fresh());
-                            for y in origin.1 - 1..origin.1 + h as i32 + 1 {
-                                span.blend_span(
-                                    origin.0 + x0,
-                                    origin.0 + x1,
-                                    y,
-                                    c,
-                                    coverage,
-                                    &mut RimMemo::default(),
-                                );
-                                for x in origin.0 + x0..origin.0 + x1 {
-                                    each.blend(x, y, c, coverage);
-                                }
+            for clip in [
+                None,
+                Some((origin.0 + 9, origin.1 + 1, origin.0 + 50, origin.1 + 5)),
+            ] {
+                for (c, coverage) in colours
+                    .into_iter()
+                    .flat_map(|c| [1.0_f32, 0.999, 0.4, 0.0].map(|coverage| (c, coverage)))
+                {
+                    for (x0, x1) in [(0, 64), (-10, 30), (12, 13), (40, 90), (30, 30)] {
+                        let fresh = || {
+                            let mut cv = Canvas::with_origin(origin.0, origin.1, w, h, [0; 4]);
+                            cv.px = ground(w, h);
+                            if let Some(clip) = clip {
+                                cv.clip.push(clip);
                             }
-                            assert!(
-                                span.px == each.px,
-                                "origin {origin:?} fade {fade:?} clip {clip:?} colour {c:?} at {coverage} span {x0}..{x1}"
+                            cv
+                        };
+                        let (mut span, mut each) = (fresh(), fresh());
+                        for y in origin.1 - 1..origin.1 + h as i32 + 1 {
+                            span.blend_span(
+                                origin.0 + x0,
+                                origin.0 + x1,
+                                y,
+                                c,
+                                coverage,
+                                &mut RimMemo::default(),
                             );
+                            for x in origin.0 + x0..origin.0 + x1 {
+                                each.blend(x, y, c, coverage);
+                            }
                         }
+                        assert!(
+                            span.px == each.px,
+                            "origin {origin:?} clip {clip:?} colour {c:?} at {coverage} span {x0}..{x1}"
+                        );
                     }
                 }
             }
@@ -5801,33 +6001,28 @@ mod tests {
         ];
         let colours = [[250, 250, 250, 153], [12, 14, 16, 255], [90, 160, 255, 30]];
         for origin in [(0, 0), (-6, 4), (11, -3)] {
-            for fade in [None, Some((5.0_f32, 40.0_f32, 0.2_f32, 1.0_f32))] {
-                for clip in [
-                    None,
-                    Some((origin.0 + 7, origin.1 + 5, origin.0 + 70, origin.1 + 52)),
-                ] {
-                    for &(x, y, bw, bh, r) in &boxes {
-                        for c in colours {
-                            let fresh = || {
-                                let mut cv = ground(origin);
-                                if let Some(fade) = fade {
-                                    cv.fade.push(fade);
-                                }
-                                if let Some(clip) = clip {
-                                    cv.clip.push(clip);
-                                }
-                                cv
-                            };
-                            let (mut fast, mut slow) = (fresh(), fresh());
-                            let (x, y) = (x + origin.0 as f32, y + origin.1 as f32);
-                            fast.round_rect(x, y, bw, bh, r, c);
-                            reference(&mut slow, x, y, bw, bh, r, c);
-                            assert!(
-                                fast.px == slow.px,
-                                "origin {origin:?} fade {fade:?} clip {clip:?} box {:?} colour {c:?}",
-                                (x, y, bw, bh, r)
-                            );
-                        }
+            for clip in [
+                None,
+                Some((origin.0 + 7, origin.1 + 5, origin.0 + 70, origin.1 + 52)),
+            ] {
+                for &(x, y, bw, bh, r) in &boxes {
+                    for c in colours {
+                        let fresh = || {
+                            let mut cv = ground(origin);
+                            if let Some(clip) = clip {
+                                cv.clip.push(clip);
+                            }
+                            cv
+                        };
+                        let (mut fast, mut slow) = (fresh(), fresh());
+                        let (x, y) = (x + origin.0 as f32, y + origin.1 as f32);
+                        fast.round_rect(x, y, bw, bh, r, c);
+                        reference(&mut slow, x, y, bw, bh, r, c);
+                        assert!(
+                            fast.px == slow.px,
+                            "origin {origin:?} clip {clip:?} box {:?} colour {c:?}",
+                            (x, y, bw, bh, r)
+                        );
                     }
                 }
             }
@@ -8735,6 +8930,80 @@ mod tests {
         );
         assert!(green(1, 31) <= 2, "nothing at and past the band's end");
         assert_eq!(green(9, 31), 255, "what follows the pop is whole");
+    }
+
+    /// Every unresolved slot a semantic font status names is read, each with
+    /// its family, past each one's reason and before what was requested.
+    #[test]
+    fn every_unresolved_slot_is_read_off_a_font_status() {
+        let status = "candidate fallback active: unresolved regular \"No Such\": \"No Such\" \
+                      does not resolve to a font file, bold italic \"Q \\\"x\\\"\": missing; \
+                      requested regular \"No Such\", emoji \"E\"";
+        assert_eq!(
+            unresolved_slots(status),
+            vec![
+                ("regular", "No Such".to_string()),
+                ("bold italic", "Q \"x\"".to_string())
+            ]
+        );
+        assert!(unresolved_slots("candidate renderer ready: regular \"A\"").is_empty());
+    }
+
+    /// A FADE FADES WHAT IT HOLDS AS ONE PICTURE. A preview in a list's fading
+    /// strip is a terminal panel with the terminal's opaque frame over it, the
+    /// frame the panel's colour where no glyph is: under a fade the two must
+    /// read as one surface, never as the frame standing out of the panel (a
+    /// notch at the frame's right edge and a step under its last row). Over a
+    /// contrasting ground, a wide panel and a narrower one of the same colour
+    /// over it, and an opaque frame over both, inside one fade: on every row
+    /// of the band the frame, the inner panel and the outer panel read the
+    /// same bytes. CONTROL: with no fade the frame is blitted byte for byte,
+    /// and above the band it is untouched.
+    #[test]
+    fn a_fade_fades_what_it_holds_as_one_picture() {
+        let ground = [40, 29, 78, 255];
+        let surface = [17, 19, 24, 255];
+        let frame = aterm_render::Frame {
+            width: 6,
+            height: 30,
+            pixels: vec![0x0011_1318; 180],
+        };
+        let raster = |fade: bool| {
+            let mut cv = Canvas::new(24, 40, ground);
+            cv.push_clip(0.0, 0.0, 24.0, 36.0);
+            if fade {
+                cv.push_fade(10.0, 36.0, 1.0, 0.0, true);
+            }
+            cv.round_rect(0.0, 0.0, 20.0, 36.0, 0.0, surface);
+            cv.round_rect(1.0, 0.0, 12.0, 33.0, 0.0, surface);
+            cv.blit_terminal_frame(&frame, 2, 0);
+            if fade {
+                cv.pop_fade();
+            }
+            cv.pop_clip();
+            cv.px
+        };
+        let at = |px: &[u8], x: usize, y: usize| {
+            let i = (y * 24 + x) * 4;
+            [px[i], px[i + 1], px[i + 2], px[i + 3]]
+        };
+        let whole = raster(false);
+        assert_eq!(at(&whole, 4, 20), surface, "CONTROL: the frame blits whole");
+        let faded = raster(true);
+        assert_eq!(at(&faded, 4, 5), surface, "above the band, untouched");
+        let mut dimmed = 0;
+        for y in 10..36 {
+            let (frame_px, inner, outer) = (at(&faded, 4, y), at(&faded, 10, y), at(&faded, 16, y));
+            assert_eq!(frame_px, outer, "row {y}: the frame is the panel past it");
+            assert_eq!(inner, outer, "row {y}: a panel over a panel is one panel");
+            dimmed += usize::from(outer != surface);
+        }
+        assert!(dimmed > 20, "the band fades: {dimmed} rows dimmed");
+        assert_eq!(
+            at(&faded, 4, 35)[..3],
+            at(&faded, 22, 35)[..3],
+            "gone at the band's end"
+        );
     }
 
     /// The HsvDisk raster: the centre (saturation 0) is the grey axis at

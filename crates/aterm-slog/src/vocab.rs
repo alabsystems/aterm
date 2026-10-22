@@ -33,6 +33,7 @@ impl Op {
     pub const ALL: [Op; 6] = [Op::Open, Op::Close, Op::Mark, Op::Amend, Op::Gap, Op::Snap];
 
     /// The wire word.
+    #[inline]
     #[must_use]
     pub const fn word(self) -> &'static str {
         match self {
@@ -103,6 +104,7 @@ impl Node {
     };
 
     /// A numbered node of `lvl`.
+    #[inline]
     #[must_use]
     pub const fn new(lvl: Lvl, n: u32) -> Node {
         Node { lvl, n }
@@ -266,6 +268,7 @@ impl Kind {
 
     /// The level a node of this kind lives at, for a node kind; `None` for
     /// a mark, gap or snap kind.
+    #[inline]
     #[must_use]
     pub const fn node_level(self) -> Option<Lvl> {
         match self {
@@ -287,6 +290,7 @@ impl Kind {
 
     /// A mark's kind (§3.3's mark list). `agent` and `start` are node kinds
     /// too.
+    #[inline]
     #[must_use]
     pub const fn is_mark(self) -> bool {
         matches!(
@@ -399,6 +403,7 @@ impl Src {
     ];
 
     /// The wire word.
+    #[inline]
     #[must_use]
     pub const fn word(self) -> &'static str {
         match self {
@@ -450,6 +455,7 @@ impl Conf {
     pub const ALL: [Conf; 4] = [Conf::Exact, Conf::Strong, Conf::Heuristic, Conf::Claim];
 
     /// The wire word.
+    #[inline]
     #[must_use]
     pub const fn word(self) -> &'static str {
         match self {
@@ -472,6 +478,7 @@ impl Conf {
 
     /// The order the confidence law compares by: unknown < claim <
     /// heuristic < strong < exact.
+    #[inline]
     #[must_use]
     pub const fn rank(self) -> u8 {
         match self {
@@ -485,6 +492,7 @@ impl Conf {
 
     /// The reliability suffix `brief` prints (§7.4): `!` exact, `+` strong,
     /// `~` heuristic, `?` claim (and unknown).
+    #[inline]
     #[must_use]
     pub const fn suffix(self) -> char {
         match self {
@@ -642,6 +650,7 @@ impl Actor {
     /// The owner class: the person at the window and an Owner client
     /// (`ctl`). Which of them may lift another author's need is
     /// [`Actor::overrides`].
+    #[inline]
     #[must_use]
     pub const fn is_owner(&self) -> bool {
         matches!(self, Actor::Human | Actor::Ctl)
@@ -651,6 +660,7 @@ impl Actor {
     /// harness or the owner class. Their newest verdict and label are kept
     /// beside the newest of any author, so no other author displaces them,
     /// and a label reaches `brief` and the clause only from one of them.
+    #[inline]
     #[must_use]
     pub const fn is_trusted(&self) -> bool {
         matches!(self, Actor::Harness | Actor::Human | Actor::Ctl)
@@ -664,6 +674,7 @@ impl Actor {
     /// verdict and label are kept in a slot of their own, which no `ctl`
     /// claim displaces, and only a proven author or the person lifts a need
     /// one raised ([`Actor::overrides`]).
+    #[inline]
     #[must_use]
     pub const fn is_proven(&self) -> bool {
         matches!(self, Actor::Harness | Actor::Human)
@@ -674,8 +685,9 @@ impl Actor {
     /// the person lifts any; an Owner client (`ctl`) lifts any but a proven
     /// author's ([`Actor::is_proven`]), so the agent a harness supervises
     /// cannot lift the harness's need; no other author lifts another's.
+    #[inline]
     #[must_use]
-    pub fn overrides(&self, raiser: &Actor) -> bool {
+    pub const fn overrides(&self, raiser: &Actor) -> bool {
         match self {
             Actor::Human => true,
             Actor::Ctl => !raiser.is_proven(),

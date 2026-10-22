@@ -48,6 +48,7 @@ pub struct Geometry {
 impl Geometry {
     /// Unit cells and no gutters: the fill maps onto the columns alone. The
     /// geometry of a caller that has no window (painter tests).
+    #[inline]
     #[must_use]
     pub const fn cells_only(cols: usize) -> Self {
         Self {
@@ -61,9 +62,11 @@ impl Geometry {
     /// host's hit test). A pixel left of column 0 (the leading gutter) is column 0, a zero
     /// cell width counts as one pixel, and a pixel past the last column is not clamped:
     /// the row's layout knows its width.
+    #[inline]
     #[must_use]
-    pub fn cell_at(self, x: usize) -> usize {
-        x.saturating_sub(self.cells_x) / self.cell_w.max(1)
+    pub const fn cell_at(self, x: usize) -> usize {
+        let cw = if self.cell_w > 1 { self.cell_w } else { 1 };
+        x.saturating_sub(self.cells_x) / cw
     }
 }
 
@@ -83,6 +86,7 @@ pub struct MeterSpan {
 
 impl MeterSpan {
     /// Column `x`'s window-pixel span `[x0, x1)` (see the type doc).
+    #[inline]
     #[must_use]
     pub(crate) fn px(self, x: usize) -> (u64, u64) {
         let g = self.geom;
@@ -97,6 +101,7 @@ impl MeterSpan {
     }
 
     /// The window's width the fractions are mapped onto.
+    #[inline]
     #[must_use]
     pub(crate) fn win_w(self) -> u64 {
         let g = self.geom;
@@ -114,6 +119,7 @@ impl MeterSpan {
 
     /// Column `x`'s tone on `surface` to 1/256 of a step: what a host mixes from, rounding
     /// each cell's colour once.
+    #[inline]
     #[must_use]
     pub fn fine(self, surface: &Surface, x: usize) -> FineTone {
         let (x0, x1) = self.px(x);
@@ -124,9 +130,11 @@ impl MeterSpan {
 /// The width of a pastel fill's darker edge line on a window whose cells are `cell_w`
 /// pixels wide: about an eighth of a cell (one pixel on a 1x cell, two on a Retina one),
 /// never under one.
+#[inline]
 #[must_use]
-pub(crate) fn edge_line_px(cell_w: usize) -> usize {
-    ((cell_w + 4) / 8).max(1)
+pub(crate) const fn edge_line_px(cell_w: usize) -> usize {
+    let w = (cell_w + 4) / 8;
+    if w > 1 { w } else { 1 }
 }
 
 /// What the pointer is on within one band row.
@@ -235,6 +243,7 @@ pub enum Icon {
 impl Icon {
     /// The icon that stands in for `ch`, the band's glyph; `None` for any
     /// character outside the band's closed set (it keeps its font glyph).
+    #[inline]
     #[must_use]
     pub const fn for_char(ch: char) -> Option<Self> {
         Some(match ch {

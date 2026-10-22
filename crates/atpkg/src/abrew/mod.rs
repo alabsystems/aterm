@@ -422,6 +422,8 @@ fn native_args(
                 "--ignore-dependencies",
                 "--dry-run",
                 "-n",
+                "--force",
+                "-f",
             ],
             1,
             usize::MAX,
@@ -488,7 +490,8 @@ fn native_args(
         "missing" => (&[], 0, usize::MAX, true),
         "cleanup" => (&["--dry-run", "-n", "-s", "--scrub"], 0, usize::MAX, true),
         "autoremove" => (&["--dry-run", "-n"], 0, 1, true),
-        "pin" | "unpin" | "link" | "ln" | "unlink" => (&[], 1, 1, true),
+        "pin" | "unpin" => (&[], 1, 1, true),
+        "link" | "ln" | "unlink" => (&["--dry-run", "-n"], 1, 1, true),
         "switch" => (&[], 2, 2, true),
         "list" | "ls" => (
             &[
@@ -629,14 +632,9 @@ fn native_args(
     if matches!(cmd, "list" | "ls") && !ops.is_empty() && has_flag(rest, "--pinned", "") {
         return Err(unsupported());
     }
-    // Multi-name list is native only in the versions spellings;
     // --multiple conflicts with --cask/--pinned in brew, and brew's
     // --full-name branch would swallow it, so those delegate.
     if matches!(cmd, "list" | "ls") {
-        let versions = has_flag(rest, "--versions", "") || has_flag(rest, "--multiple", "");
-        if ops.len() > 1 && !versions {
-            return Err(unsupported());
-        }
         if has_flag(rest, "--multiple", "")
             && (has_flag(rest, "--cask", "")
                 || has_flag(rest, "--pinned", "")
@@ -1466,9 +1464,7 @@ mod admission_tests {
             ("missing", vec!["--hide="]),
             ("missing", vec!["--hide=../outside"]),
             ("list", vec!["--pinned", "wget"]),
-            // Multi-name file listing and brew's --multiple
-            // conflicts delegate whole.
-            ("list", vec!["wget", "curl"]),
+            // Brew's --multiple conflicts delegate whole.
             ("list", vec!["--multiple", "--cask"]),
             ("list", vec!["--multiple", "--pinned"]),
             ("list", vec!["--multiple", "--full-name"]),
@@ -1560,6 +1556,12 @@ mod admission_tests {
             ("fetch", vec!["--cask", "homebrew/cask/firefox"]),
             ("--cellar", vec!["wget"]),
             ("--cellar", vec!["homebrew/core/wget"]),
+            ("uninstall", vec!["--force", "wget"]),
+            ("uninstall", vec!["-f", "wget"]),
+            ("link", vec!["--dry-run", "wget"]),
+            ("link", vec!["-n", "wget"]),
+            ("unlink", vec!["--dry-run", "wget"]),
+            ("list", vec!["wget", "curl"]),
             ("list", vec!["--versions", "wget"]),
             ("list", vec!["--versions", "wget", "curl"]),
             ("list", vec!["--multiple"]),

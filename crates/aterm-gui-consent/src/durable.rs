@@ -18,6 +18,7 @@ use std::fs::File;
 /// [`aterm_durable::durable`], which on Apple targets is `fcntl(F_FULLFSYNC)`, a
 /// drive-cache flush.
 #[cfg(not(all(any(test, debug_assertions), target_vendor = "apple")))]
+#[inline]
 pub fn sync_all(file: &File) -> std::io::Result<()> {
     aterm_durable::durable(file)
 }
@@ -41,6 +42,7 @@ pub fn sync_all(file: &File) -> std::io::Result<()> {
 /// targets `sync_all` already is `fsync(2)`, so the arm above stays. Every release
 /// build — every shipped one — compiles the `F_FULLFSYNC` arm.
 #[cfg(all(any(test, debug_assertions), target_vendor = "apple"))]
+#[inline]
 pub fn sync_all(file: &File) -> std::io::Result<()> {
     aterm_durable::seam::durable_fsync(file)
 }
@@ -50,6 +52,7 @@ pub fn sync_all(file: &File) -> std::io::Result<()> {
 ///
 /// # Errors
 /// The flush's own error.
+#[inline]
 pub fn finish(file: &File, flush: Flush) -> std::io::Result<()> {
     match flush {
         Flush::Durable => sync_all(file),
@@ -72,6 +75,7 @@ pub fn finish(file: &File, flush: Flush) -> std::io::Result<()> {
 /// flushes cost 0.7 µs each and its 6,516 file flushes 23 µs; beside other binaries
 /// its replays wait on their creates and renames.
 #[cfg(unix)]
+#[inline]
 pub fn fsync(file: &File) -> std::io::Result<()> {
     use std::os::fd::AsRawFd as _;
     // SAFETY: `fsync` on a descriptor this `File` owns for the call.

@@ -57,11 +57,13 @@ pub struct Fixed(pub i32);
 
 impl Fixed {
     /// The nearest fixed value to `v` (saturating).
+    #[inline]
     pub fn from_f64(v: f64) -> Fixed {
         Fixed((v * 256.0).round() as i32)
     }
 
     /// The value.
+    #[inline]
     pub fn to_f64(self) -> f64 {
         f64::from(self.0) / 256.0
     }
@@ -96,17 +98,20 @@ impl Display {
     /// For each private queue, dispatch must be serialized with the use
     /// and destruction of its proxies and listeners; destroying a proxy
     /// does not wait for a callback already running on another thread.
-    pub unsafe fn from_ptr(raw: NonNull<c_void>) -> Display {
+    #[inline]
+    pub const unsafe fn from_ptr(raw: NonNull<c_void>) -> Display {
         Display(raw)
     }
 
     /// The raw pointer.
-    pub fn as_ptr(self) -> *mut c_void {
+    #[inline]
+    pub const fn as_ptr(self) -> *mut c_void {
         self.0.as_ptr()
     }
 
     /// The display as a proxy (object 1, `wl_display`).
-    pub fn proxy(self) -> Proxy {
+    #[inline]
+    pub const fn proxy(self) -> Proxy {
         Proxy(self.0)
     }
 
@@ -203,7 +208,8 @@ impl OwnedDisplay {
     /// For each private queue, dispatch must be serialized with the use
     /// and destruction of its proxies and listeners; destroying a proxy
     /// does not wait for a callback already running on another thread.
-    pub unsafe fn display(&self) -> Display {
+    #[inline]
+    pub const unsafe fn display(&self) -> Display {
         self.0
     }
 }
@@ -240,7 +246,8 @@ impl Queue {
     }
 
     /// The raw pointer.
-    pub fn as_ptr(&self) -> *mut c_void {
+    #[inline]
+    pub const fn as_ptr(&self) -> *mut c_void {
         self.raw.as_ptr()
     }
 
@@ -356,7 +363,8 @@ pub struct Wrapper(Proxy);
 
 impl Wrapper {
     /// The wrapper as a proxy, for requests.
-    pub fn proxy(&self) -> Proxy {
+    #[inline]
+    pub const fn proxy(&self) -> Proxy {
         self.0
     }
 }
@@ -386,19 +394,23 @@ unsafe impl Sync for Proxy {}
 pub struct Arg(WlArgument);
 
 impl Arg {
-    pub fn int(v: i32) -> Arg {
+    #[inline]
+    pub const fn int(v: i32) -> Arg {
         Arg(WlArgument { i: v })
     }
 
-    pub fn uint(v: u32) -> Arg {
+    #[inline]
+    pub const fn uint(v: u32) -> Arg {
         Arg(WlArgument { u: v })
     }
 
-    pub fn fixed(v: Fixed) -> Arg {
+    #[inline]
+    pub const fn fixed(v: Fixed) -> Arg {
         Arg(WlArgument { f: v.0 })
     }
 
     /// A string (null when `None`), borrowed for the call.
+    #[inline]
     pub fn string(v: Option<&CStr>) -> Arg {
         Arg(WlArgument {
             s: v.map_or(std::ptr::null(), CStr::as_ptr),
@@ -406,6 +418,7 @@ impl Arg {
     }
 
     /// An object (null when `None`).
+    #[inline]
     pub fn object(v: Option<Proxy>) -> Arg {
         Arg(WlArgument {
             o: v.map_or(std::ptr::null_mut(), |p| p.0.as_ptr()),
@@ -413,24 +426,28 @@ impl Arg {
     }
 
     /// The placeholder for the object a request creates.
-    pub fn new_id() -> Arg {
+    #[inline]
+    pub const fn new_id() -> Arg {
         Arg(WlArgument { n: 0 })
     }
 
     /// An array, borrowed for the call.
-    pub fn array(v: &mut WlArray) -> Arg {
+    #[inline]
+    pub const fn array(v: &mut WlArray) -> Arg {
         Arg(WlArgument { a: v })
     }
 
     /// A descriptor, duplicated by libwayland for the send; the caller
     /// keeps (and closes) its own.
-    pub fn fd(v: c_int) -> Arg {
+    #[inline]
+    pub const fn fd(v: c_int) -> Arg {
         Arg(WlArgument { h: v })
     }
 }
 
 /// A `wl_array` over borrowed bytes, for a request.
-pub fn borrowed_array(bytes: &[u8]) -> WlArray {
+#[inline]
+pub const fn borrowed_array(bytes: &[u8]) -> WlArray {
     WlArray {
         size: bytes.len(),
         alloc: bytes.len(),
@@ -456,7 +473,8 @@ pub enum EventArg<'a> {
 
 impl EventArg<'_> {
     /// The argument as an unsigned integer, if it is one.
-    pub fn uint(&self) -> Option<u32> {
+    #[inline]
+    pub const fn uint(&self) -> Option<u32> {
         match *self {
             EventArg::Uint(v) => Some(v),
             _ => None,
@@ -464,7 +482,8 @@ impl EventArg<'_> {
     }
 
     /// The argument as a signed integer, if it is one.
-    pub fn int(&self) -> Option<i32> {
+    #[inline]
+    pub const fn int(&self) -> Option<i32> {
         match *self {
             EventArg::Int(v) => Some(v),
             _ => None,
@@ -501,12 +520,14 @@ impl Proxy {
     ///
     /// # Safety
     /// `raw` is a live `wl_proxy *` for as long as the value is used.
-    pub unsafe fn from_ptr(raw: NonNull<c_void>) -> Proxy {
+    #[inline]
+    pub const unsafe fn from_ptr(raw: NonNull<c_void>) -> Proxy {
         Proxy(raw)
     }
 
     /// The raw pointer.
-    pub fn as_ptr(self) -> *mut c_void {
+    #[inline]
+    pub const fn as_ptr(self) -> *mut c_void {
         self.0.as_ptr()
     }
 

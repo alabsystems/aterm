@@ -140,6 +140,7 @@ impl TerminalHandler<'_> {
             project = "aterm_core::terminal::project_altscreen"
         )
     )]
+    #[inline]
     pub(super) fn write_char(&mut self, c: char) {
         // Output that overwrites cells under a live highlight without any erase
         // (`\rProgress: 90%`) damages the selection; an append replaces nothing
@@ -646,6 +647,7 @@ impl TerminalHandler<'_> {
     /// the `a`; Unicode §3 D57 allows presenting a base-less mark as a base.
     /// Folding a visible character (ZWJ continuation, skin tone, RI pair,
     /// VS16/VS15) still asks [`Self::preceding_cell`].
+    #[inline]
     fn combining_target_cell(&self) -> (u16, u16) {
         self.preceding_cell()
             .unwrap_or((self.grid.cursor_row(), self.grid.cursor_col()))
@@ -1034,14 +1036,14 @@ impl TerminalHandler<'_> {
 /// Whether a character is a regional indicator (U+1F1E6-U+1F1FF). A local
 /// copy of `aterm_grapheme::is_regional_indicator`, which is test-only there.
 #[inline]
-fn is_regional_indicator(c: char) -> bool {
-    (0x1F1E6..=0x1F1FF).contains(&(c as u32))
+const fn is_regional_indicator(c: char) -> bool {
+    matches!(c as u32, 0x1F1E6..=0x1F1FF)
 }
 
 /// Whether a character is an emoji skin tone modifier (U+1F3FB-U+1F3FF, UTS #51).
 #[inline]
-fn is_emoji_skin_tone_modifier(c: char) -> bool {
-    (0x1F3FB..=0x1F3FF).contains(&(c as u32))
+const fn is_emoji_skin_tone_modifier(c: char) -> bool {
+    matches!(c as u32, 0x1F3FB..=0x1F3FF)
 }
 
 /// Whether a character is eligible for VS16 emoji presentation widening.

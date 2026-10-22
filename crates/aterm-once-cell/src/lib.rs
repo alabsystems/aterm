@@ -94,6 +94,7 @@ pub mod unsync {
     impl<T: RefUnwindSafe + UnwindSafe> RefUnwindSafe for OnceCell<T> {}
 
     impl<T> Default for OnceCell<T> {
+        #[inline]
         fn default() -> Self {
             Self::new()
         }
@@ -133,6 +134,7 @@ pub mod unsync {
     impl<T: Eq> Eq for OnceCell<T> {}
 
     impl<T> From<T> for OnceCell<T> {
+        #[inline]
         fn from(value: T) -> Self {
             OnceCell::with_value(value)
         }
@@ -140,6 +142,7 @@ pub mod unsync {
 
     impl<T> OnceCell<T> {
         /// Creates a new empty cell.
+        #[inline]
         pub const fn new() -> OnceCell<T> {
             OnceCell(CoreOnceCell::new())
         }
@@ -148,6 +151,7 @@ pub mod unsync {
         ///
         /// NOT `const`, where upstream's is — see divergence 3 in the crate
         /// documentation.
+        #[inline]
         pub fn with_value(value: T) -> OnceCell<T> {
             let cell = CoreOnceCell::new();
             // The cell was just created empty, so this cannot fail.
@@ -170,6 +174,7 @@ pub mod unsync {
         /// Sets the contents of this cell.
         ///
         /// Returns `Ok(())` if the cell was empty and `Err(value)` if it was full.
+        #[inline]
         pub fn set(&self, value: T) -> Result<(), T> {
             match self.try_insert(value) {
                 Ok(_) => Ok(()),
@@ -193,6 +198,7 @@ pub mod unsync {
         }
 
         /// Gets the contents, initialising them with `f` if the cell was empty.
+        #[inline]
         pub fn get_or_init<F>(&self, f: F) -> &T
         where
             F: FnOnce() -> T,
@@ -228,11 +234,13 @@ pub mod unsync {
         }
 
         /// Takes the value out, leaving the cell empty.
+        #[inline]
         pub fn take(&mut self) -> Option<T> {
             self.0.take()
         }
 
         /// Consumes the cell, returning the wrapped value.
+        #[inline]
         pub fn into_inner(self) -> Option<T> {
             self.0.into_inner()
         }
@@ -263,6 +271,7 @@ pub mod unsync {
 
     impl<T, F> Lazy<T, F> {
         /// Creates a new lazy value with the given initialising function.
+        #[inline]
         pub const fn new(init: F) -> Lazy<T, F> {
             Lazy {
                 cell: OnceCell::new(),
@@ -309,11 +318,13 @@ pub mod unsync {
         }
 
         /// Gets the reference to the result, or `None` if not yet forced.
+        #[inline]
         pub fn get(this: &Lazy<T, F>) -> Option<&T> {
             this.cell.get()
         }
 
         /// Gets a mutable reference to the result, or `None` if not yet forced.
+        #[inline]
         pub fn get_mut(this: &mut Lazy<T, F>) -> Option<&mut T> {
             this.cell.get_mut()
         }
@@ -321,12 +332,14 @@ pub mod unsync {
 
     impl<T, F: FnOnce() -> T> Deref for Lazy<T, F> {
         type Target = T;
+        #[inline]
         fn deref(&self) -> &T {
             Lazy::force(self)
         }
     }
 
     impl<T, F: FnOnce() -> T> DerefMut for Lazy<T, F> {
+        #[inline]
         fn deref_mut(&mut self) -> &mut T {
             Lazy::force_mut(self)
         }
@@ -334,6 +347,7 @@ pub mod unsync {
 
     impl<T: Default> Default for Lazy<T> {
         /// Creates a new lazy value using `Default` as the initialising function.
+        #[inline]
         fn default() -> Lazy<T> {
             Lazy::new(T::default)
         }
@@ -365,6 +379,7 @@ pub mod sync {
     }
 
     impl<T> Default for OnceCell<T> {
+        #[inline]
         fn default() -> OnceCell<T> {
             OnceCell::new()
         }
@@ -396,6 +411,7 @@ pub mod sync {
     }
 
     impl<T> From<T> for OnceCell<T> {
+        #[inline]
         fn from(value: T) -> Self {
             Self::with_value(value)
         }
@@ -411,6 +427,7 @@ pub mod sync {
 
     impl<T> OnceCell<T> {
         /// Creates a new empty cell.
+        #[inline]
         pub const fn new() -> OnceCell<T> {
             OnceCell {
                 inner: OnceLock::new(),
@@ -422,6 +439,7 @@ pub mod sync {
         ///
         /// NOT `const`, where upstream's is — see divergence 3 in the crate
         /// documentation.
+        #[inline]
         pub fn with_value(value: T) -> OnceCell<T> {
             let cell = OnceCell::new();
             // Just created, so nothing can have filled it.
@@ -450,6 +468,7 @@ pub mod sync {
         /// full. Like upstream, this runs through the same initialisation path
         /// as [`get_or_init`](Self::get_or_init), so it blocks while another
         /// thread is initialising rather than racing past it.
+        #[inline]
         pub fn set(&self, value: T) -> Result<(), T> {
             match self.try_insert(value) {
                 Ok(_) => Ok(()),
@@ -476,6 +495,7 @@ pub mod sync {
         ///
         /// `f` is called at most once per cell, even under contention: a second
         /// thread blocks until the first finishes and then observes its value.
+        #[inline]
         pub fn get_or_init<F>(&self, f: F) -> &T
         where
             F: FnOnce() -> T,
@@ -521,11 +541,13 @@ pub mod sync {
         }
 
         /// Takes the value out, leaving the cell empty.
+        #[inline]
         pub fn take(&mut self) -> Option<T> {
             self.inner.take()
         }
 
         /// Consumes the cell, returning the wrapped value.
+        #[inline]
         pub fn into_inner(self) -> Option<T> {
             self.inner.into_inner()
         }
@@ -552,6 +574,7 @@ pub mod sync {
 
     impl<T, F> Lazy<T, F> {
         /// Creates a new lazy value with the given initialising function.
+        #[inline]
         pub const fn new(f: F) -> Lazy<T, F> {
             Lazy {
                 cell: OnceCell::new(),
@@ -611,11 +634,13 @@ pub mod sync {
         }
 
         /// Gets the reference to the result, or `None` if not yet forced.
+        #[inline]
         pub fn get(this: &Lazy<T, F>) -> Option<&T> {
             this.cell.get()
         }
 
         /// Gets a mutable reference to the result, or `None` if not yet forced.
+        #[inline]
         pub fn get_mut(this: &mut Lazy<T, F>) -> Option<&mut T> {
             this.cell.get_mut()
         }
@@ -623,12 +648,14 @@ pub mod sync {
 
     impl<T, F: FnOnce() -> T> Deref for Lazy<T, F> {
         type Target = T;
+        #[inline]
         fn deref(&self) -> &T {
             Lazy::force(self)
         }
     }
 
     impl<T, F: FnOnce() -> T> DerefMut for Lazy<T, F> {
+        #[inline]
         fn deref_mut(&mut self) -> &mut T {
             Lazy::force_mut(self)
         }
@@ -636,6 +663,7 @@ pub mod sync {
 
     impl<T: Default> Default for Lazy<T> {
         /// Creates a new lazy value using `Default` as the initialising function.
+        #[inline]
         fn default() -> Lazy<T> {
             Lazy::new(T::default)
         }
@@ -664,6 +692,7 @@ pub mod race {
     }
 
     impl<T> Default for OnceBox<T> {
+        #[inline]
         fn default() -> Self {
             Self::new()
         }
@@ -680,16 +709,19 @@ pub mod race {
 
     impl<T> OnceBox<T> {
         /// Creates a new empty cell.
+        #[inline]
         pub const fn new() -> Self {
             OnceBox(crate::sync::OnceCell::new())
         }
 
         /// Creates a new cell with the given value.
+        #[inline]
         pub fn with_value(value: Box<T>) -> Self {
             OnceBox(crate::sync::OnceCell::with_value(value))
         }
 
         /// Gets a reference to the underlying value, or `None` if empty.
+        #[inline]
         pub fn get(&self) -> Option<&T> {
             self.0.get().map(|b| &**b)
         }
@@ -698,6 +730,7 @@ pub mod race {
         ///
         /// Returns `Ok(())` if the cell was empty and `Err(value)` if it was
         /// full.
+        #[inline]
         pub fn set(&self, value: Box<T>) -> Result<(), Box<T>> {
             self.0.set(value)
         }
@@ -705,6 +738,7 @@ pub mod race {
         /// Gets the contents, initialising them with `f` if the cell was empty.
         ///
         /// `f` runs at most once, where upstream allows several (divergence 2).
+        #[inline]
         pub fn get_or_init<F>(&self, f: F) -> &T
         where
             F: FnOnce() -> Box<T>,
@@ -715,6 +749,7 @@ pub mod race {
         /// Gets the contents, initialising them with `f` if the cell was empty.
         ///
         /// If `f` fails, the cell stays empty and the error is returned.
+        #[inline]
         pub fn get_or_try_init<F, E>(&self, f: F) -> Result<&T, E>
         where
             F: FnOnce() -> Result<Box<T>, E>,

@@ -56,9 +56,9 @@ fn fingerprint(r: &mut Renderer, ch: char) -> (FaceId, usize, usize, usize) {
 const EMOJI: char = '\u{1F680}';
 
 /// Conservation for the colour-emoji face, the costliest path-admitted source.
-/// The seal admits the colour-emoji candidate eagerly because that is its last
-/// chance: the seal then clears `color_font_paths`, and `ensure_color_font`
-/// early-returns on an empty list, so a deferred read would lose emoji for the
+/// The seal admits the colour-emoji chain eagerly because that is its last
+/// chance: the seal then clears `color_font_paths`, and nothing loads a colour
+/// face from a path after it, so a deferred read would lose emoji for the
 /// process's life with no diagnostic. Admission maps the file, so it is cheap
 /// (`seal_maps_discovered_faces.rs`).
 ///

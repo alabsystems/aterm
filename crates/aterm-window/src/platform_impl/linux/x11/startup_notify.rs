@@ -17,6 +17,10 @@
 //! `DESKTOP_STARTUP_ID`. The program names that id on its window (`_NET_STARTUP_ID`,
 //! which the window manager reads at map for the launch's timestamp and workspace)
 //! and ends the sequence with a `remove` message once the window is shown.
+//!
+//! A running window activated by another client with such an id (GNOME Shell's
+//! `ActivationToken` for a click on a notification) ends that sequence the same way, and
+//! stamps its raise with the id's `_TIME` ([`startup_time`]).
 
 use aterm_x11::proto::event::ClientMessage;
 use aterm_x11::proto::xproto;
@@ -71,6 +75,16 @@ impl XConnection {
     }
 }
 
+/// The X server time of the user action behind `startup_id`: the decimal stamp after its
+/// last `_TIME`, which a launcher appends (libstartup-notification's
+/// `<launcher>/<launchee>/<pid>-<seq>-<host>_TIME<time>`) and GTK reads the same way.
+/// `None` for an id with no stamp, or one past the server's 32-bit clock.
+pub(crate) fn startup_time(startup_id: &str) -> Option<u32> {
+    let (_, after) = startup_id.rsplit_once("_TIME")?;
+    let digits = after.find(|c: char| !c.is_ascii_digit()).unwrap_or(after.len());
+    after[..digits].parse().ok()
+}
+
 /// The `remove` message for `startup_id`, NUL-terminated as the spec frames it.
 fn remove_message(startup_id: &str) -> Vec<u8> {
     let mut message = b"remove: ID=".to_vec();
@@ -106,5 +120,20 @@ mod tests {
             b"remove: ID=\"gnome-shell/aterm/4242-0-host_TIME5678\"\0"
         );
         assert_eq!(remove_message("a\"b\\c d"), b"remove: ID=\"a\\\"b\\\\c d\"\0");
+    }
+
+    /// The stamp a raise is made for: the digits after the id's last `_TIME`, as GNOME
+    /// Shell's activation token for a notification click carries them. An id with no stamp,
+    /// an empty one, or one past 32 bits has none, and the raise asks with `CURRENT_TIME`.
+    #[test]
+    fn a_startup_id_s_time_is_the_stamp_after_its_last_time() {
+        assert_eq!(startup_time("gnome-shell/aterm/4242-0-host_TIME5678"), Some(5678));
+        assert_eq!(startup_time("a_TIME1-b_TIME42"), Some(42));
+        assert_eq!(startup_time("x_TIME77+junk"), Some(77));
+        assert_eq!(startup_time("x_TIME4294967295"), Some(u32::MAX));
+        for none in ["", "gnome-shell/aterm/4242-0-host", "x_TIME", "x_TIMEz9", "x_TIME4294967296"]
+        {
+            assert_eq!(startup_time(none), None, "{none:?}");
+        }
     }
 }

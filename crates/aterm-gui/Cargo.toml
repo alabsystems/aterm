@@ -7,7 +7,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "aterm — a native windowed terminal: winit presenting the aterm-render framebuffer over a real PTY shell (first-party CPU presenters on macOS and Linux, softbuffer on Windows)."
+description = "aterm — a native windowed terminal: winit presenting the aterm-render framebuffer over a real PTY shell (first-party CPU presenters: CoreGraphics on macOS, MIT-SHM and wl_shm on Linux, GDI on Windows)."
 
 [[bin]]
 name = "aterm-gui"
@@ -194,6 +194,9 @@ aterm-lexicon = { workspace = true }
 # The cursor aurora/comet-trail + sparkle-words state machines (extracted so the
 # web embedders share them); re-exported at the crate root as `crate::<module>`.
 aterm-effects = { workspace = true }
+# The `aos` verb's refusals, witness and trace decode (the momentum glow's Aos
+# boundary). Not a new edge in the BUILD graph: `aterm-effects` above links it.
+aterm-aos = { workspace = true }
 # The mosh-style predictive-echo state machine (extracted so the web embedders
 # share it); aliased at the crate root so `crate::predict::*` reads unchanged.
 aterm-predict = { workspace = true }
@@ -440,25 +443,11 @@ aterm-keeper = { workspace = true }
 # hdr_win.rs.
 aterm-win32 = { workspace = true }
 
-# THE ROW, softbuffer half: Windows only. The CPU present path is first-party
-# on macOS (`present/mac.rs`, CoreGraphics + CoreAnimation) and, since LW.6 of
-# docs/AUDIT-third-party-2026-10-15.md, on Linux (`present/x11.rs` over
-# aterm-x11's MIT-SHM, `present/wayland.rs` over aterm-wayland's wl_shm), so
-# softbuffer is compiled for Windows alone, behind the same seam
-# (`present/softbuffer_surface.rs`), until LW.3's GDI presenter. It stays in
-# Cargo.lock with every target arm it declares (the objc2 0.6 family of its
-# Apple arm, its Linux and Android arms) until it leaves the workspace then.
-#
-# The macOS move, MEASURED with `cargo forge survey --cell mac-arm`: 91 -> 89
-# packages (softbuffer 0.4.8 and objc2-core-graphics 0.3.2), -27,628 lines;
-# docs/measured/wgpu-metal-decision-2026-08-30.md §2.
-# The Linux move (LW.6): softbuffer, tiny-xlib and ctor left both Linux cells
-# (`forge survey`, the LW.6 commit says what moved).
-#
-# DEFAULT FEATURES OFF: softbuffer's default set is [kms, x11, x11-dlopen,
-# wayland, wayland-dlopen], all of them arms of its Linux backend, which no
-# cell compiles now; the Win32 backend needs none.
-softbuffer = { version = "0.4", default-features = false }
+# softbuffer left at LW.3 of docs/AUDIT-third-party-2026-10-15.md: the CPU
+# present path is first-party on every cell, macOS (`present/mac.rs`,
+# CoreGraphics + CoreAnimation), Linux since LW.6 (`present/x11.rs` over
+# aterm-x11's MIT-SHM, `present/wayland.rs` over aterm-wayland's wl_shm) and
+# Windows since LW.3 (`present/win32.rs`, GDI over aterm-win32 above).
 
 [target.'cfg(unix)'.dependencies]
 # `video frames` and the confined artifact store (`pinned_dir.rs`) open every
@@ -503,8 +492,8 @@ aterm-dbus = { workspace = true }
 
 [target.'cfg(not(any(target_os = "macos", target_os = "linux")))'.dependencies]
 # aterm-window's raw-window-handle traits, for the presenters that take a window
-# through them here: wgpu's surface (`aterm_gpu::WindowTarget`), softbuffer's
-# CPU presenter and the Win32 HWND reads. `rwh_06` is not an aterm-window default: on
+# through them here: wgpu's surface (`aterm_gpu::WindowTarget`), the GDI CPU
+# presenter's HWND (`present/win32.rs`) and the other Win32 HWND reads. `rwh_06` is not an aterm-window default: on
 # macOS the Metal presenter and the AppKit chrome take the content view through
 # first-party `aterm_objc::HasNsView`, and on Linux the GL arm and the X11 and
 # Wayland CPU presenters take the window's handles through first-party

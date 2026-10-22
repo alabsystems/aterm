@@ -63,14 +63,15 @@ impl TmuxPassthrough {
     /// through it.
     #[inline]
     #[must_use]
-    pub fn is_open(self) -> bool {
+    pub const fn is_open(self) -> bool {
         matches!(self, Self::Open | Self::Escape)
     }
 
     /// A stable name for a wire (`""` for [`Self::Off`]); [`Self::from_name`]
     /// reads it back.
+    #[inline]
     #[must_use]
-    pub fn name(self) -> &'static str {
+    pub const fn name(self) -> &'static str {
         match self {
             Self::Off => "",
             Self::Head(1) => "head1",

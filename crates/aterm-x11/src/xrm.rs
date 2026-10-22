@@ -69,21 +69,25 @@ pub struct Database {
     entries: Vec<Entry>,
 }
 
-fn quark_byte(c: u8) -> bool {
+#[inline]
+const fn quark_byte(c: u8) -> bool {
     c.is_ascii_alphanumeric() || c == b'-' || c == b'_'
 }
 
+#[inline]
 fn span(data: &[u8], keep: impl Fn(u8) -> bool) -> (&[u8], &[u8]) {
     let end = data.iter().position(|&c| !keep(c)).unwrap_or(data.len());
     data.split_at(end)
 }
 
+#[inline]
 fn skip_to_eol(data: &[u8]) -> &[u8] {
     span(data, |c| c != b'\n').1
 }
 
-fn is_octal(c: u8) -> bool {
-    (b'0'..=b'7').contains(&c)
+#[inline]
+const fn is_octal(c: u8) -> bool {
+    c >= b'0' && c <= b'7'
 }
 
 /// What a resource file's `#include` reads: the file at a path, given the
@@ -144,6 +148,7 @@ impl Database {
     }
 
     /// [`Database::get`] as UTF-8.
+    #[inline]
     pub fn get_string(&self, name: &str, class: &str) -> Option<&str> {
         std::str::from_utf8(self.get(name, class)?).ok()
     }
@@ -247,6 +252,7 @@ pub fn read_regular_file(path: &Path, limit: u64) -> Option<Vec<u8>> {
 
 /// The directory a resource file at `path` includes from: its parent.
 #[must_use]
+#[inline]
 pub fn include_dir(path: &Path) -> PathBuf {
     path.parent()
         .map_or_else(|| PathBuf::from("."), Path::to_path_buf)

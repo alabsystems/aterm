@@ -51,6 +51,7 @@ pub struct OutputInfo {
 
 impl OutputInfo {
     /// The mode flagged current, if any.
+    #[inline]
     pub fn current_mode(&self) -> Option<Mode> {
         self.modes
             .iter()
@@ -234,13 +235,15 @@ pub struct Output {
 
 impl Output {
     /// The registry's name for the global: how outputs are told apart.
-    pub fn global(&self) -> u32 {
+    #[inline]
+    pub const fn global(&self) -> u32 {
         self.global
     }
 
     /// The `wl_output`, live while [`Outputs`] holds it bound (a surface's
     /// `enter` names it; `xdg_toplevel.set_fullscreen` takes it).
-    pub fn proxy(&self) -> Proxy {
+    #[inline]
+    pub const fn proxy(&self) -> Proxy {
         self.proxy
     }
 

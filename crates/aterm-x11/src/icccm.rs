@@ -117,10 +117,12 @@ pub struct WmSizeHints {
     pub win_gravity: Option<u32>,
 }
 
+#[inline]
 fn pair(r: &mut Reader<'_>) -> Result<(i32, i32), ParseError> {
     Ok((r.i32()?, r.i32()?))
 }
 
+#[inline]
 fn flagged<T>(flags: u32, bit: u32, value: T) -> Option<T> {
     (flags & bit != 0).then_some(value)
 }

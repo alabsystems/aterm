@@ -107,7 +107,8 @@ where
 
 impl<E> U32Deserializer<E> {
     #[allow(missing_docs)]
-    pub fn new(value: u32) -> Self {
+    #[inline]
+    pub const fn new(value: u32) -> Self {
         U32Deserializer {
             value,
             marker: PhantomData,
@@ -207,7 +208,8 @@ where
 
 impl<'a, E> StrDeserializer<'a, E> {
     #[allow(missing_docs)]
-    pub fn new(value: &'a str) -> Self {
+    #[inline]
+    pub const fn new(value: &'a str) -> Self {
         StrDeserializer {
             value,
             marker: PhantomData,
@@ -292,7 +294,8 @@ pub struct SeqAccessDeserializer<A> {
 
 impl<A> SeqAccessDeserializer<A> {
     /// Construct a new `SeqAccessDeserializer<A>`.
-    pub fn new(seq: A) -> Self {
+    #[inline]
+    pub const fn new(seq: A) -> Self {
         SeqAccessDeserializer { seq }
     }
 }
@@ -338,7 +341,8 @@ pub struct MapAccessDeserializer<A> {
 
 impl<A> MapAccessDeserializer<A> {
     /// Construct a new `MapAccessDeserializer<A>`.
-    pub fn new(map: A) -> Self {
+    #[inline]
+    pub const fn new(map: A) -> Self {
         MapAccessDeserializer { map }
     }
 }

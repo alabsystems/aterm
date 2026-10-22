@@ -50,7 +50,8 @@ enum BlockSide {
 
 impl BlockSide {
     /// The word the log line names the side by.
-    fn word(self) -> &'static str {
+    #[inline]
+    const fn word(self) -> &'static str {
         match self {
             Self::Command => "command",
             Self::Output => "output",
@@ -61,12 +62,14 @@ impl BlockSide {
 impl BlockText {
     /// True iff the block's content was evicted from scrollback.
     #[must_use]
-    pub fn is_evicted(&self) -> bool {
+    #[inline]
+    pub const fn is_evicted(&self) -> bool {
         matches!(self, BlockText::Evicted)
     }
 
     /// Consume into the owned `String` if fully readable.
     #[must_use]
+    #[inline]
     pub fn into_text(self) -> Option<String> {
         match self {
             BlockText::Text(s) => Some(s),
@@ -80,7 +83,8 @@ impl Terminal {
     /// `PromptOnly` to `Complete`; a `Complete` one stays current until the
     /// next prompt (OSC 133 A) archives it.
     #[must_use]
-    pub fn current_block(&self) -> Option<&OutputBlock> {
+    #[inline]
+    pub const fn current_block(&self) -> Option<&OutputBlock> {
         self.shell.current_block.as_ref()
     }
 
@@ -89,6 +93,7 @@ impl Terminal {
     /// Double-ended: ids strictly increase front to back, so a watermarked
     /// consumer (the subscribe `events` digest) walks backwards and stops at
     /// `id <= watermark` instead of scanning the retained history.
+    #[inline]
     pub fn all_blocks(&self) -> impl DoubleEndedIterator<Item = &OutputBlock> {
         self.shell
             .output_blocks
@@ -101,12 +106,14 @@ impl Terminal {
     /// round trip, so a reader's cursor at or past it names blocks of some
     /// other engine (one that did not cross, say, an engine started blank).
     #[must_use]
-    pub fn next_block_id(&self) -> u64 {
+    #[inline]
+    pub const fn next_block_id(&self) -> u64 {
         self.shell.next_block_id
     }
 
     /// The block with this ID (unique per session, assigned sequentially).
     #[must_use]
+    #[inline]
     pub fn block_by_id(&self, id: u64) -> Option<&OutputBlock> {
         self.shell
             .output_blocks
@@ -132,6 +139,7 @@ impl Terminal {
         )
     )]
     #[must_use]
+    #[inline]
     pub fn last_completed_block(&self) -> Option<&OutputBlock> {
         self.shell.output_blocks.back()
     }
@@ -146,6 +154,7 @@ impl Terminal {
     /// the unsealed current block: it reads only `id`/`exit_code`/`state`, which
     /// are final at D.
     #[must_use]
+    #[inline]
     pub fn newest_completed_block(&self) -> Option<&OutputBlock> {
         if let Some(block) = &self.shell.current_block
             && block.is_complete()
@@ -168,7 +177,8 @@ impl Terminal {
     /// block, and after a seamless update (never checkpointed). Kept across
     /// `reset`.
     #[must_use]
-    pub fn last_finished_block(&self) -> Option<&OutputBlock> {
+    #[inline]
+    pub const fn last_finished_block(&self) -> Option<&OutputBlock> {
         self.shell.last_finished.as_ref()
     }
 
@@ -346,6 +356,7 @@ impl Terminal {
     /// [`block_command_text`](Self::block_command_text) as an `Option`: `None` when
     /// not available or evicted (an eviction is still logged and counted).
     #[must_use]
+    #[inline]
     pub fn block_command(&self, block: &OutputBlock) -> Option<String> {
         self.block_command_text(block).into_text()
     }
@@ -353,6 +364,7 @@ impl Terminal {
     /// [`block_output_text`](Self::block_output_text) as an `Option`: `None` when not
     /// available or evicted (an eviction is still logged and counted).
     #[must_use]
+    #[inline]
     pub fn block_output(&self, block: &OutputBlock) -> Option<String> {
         self.block_output_text(block).into_text()
     }

@@ -55,6 +55,7 @@ use crate::window::Window;
 /// main thread inside `applicationShouldTerminate:`, so it may show a modal. Only the
 /// first registration takes effect; without one, termination always proceeds — the
 /// default, so stock winit behavior is unchanged.
+#[inline]
 pub fn set_application_should_terminate_handler(handler: fn() -> bool) {
     crate::platform_impl::set_quit_confirm_hook(handler);
 }
@@ -70,6 +71,7 @@ pub fn set_application_should_terminate_handler(handler: fn() -> bool) {
 ///
 /// LOCAL PATCH (aterm), 2026-10-20 (ATERM-KI-1015-9). Reads the layout with `UCKeyTranslate`
 /// (up to 257 lookups, only for an Option chord whose character is ASCII); on the main thread.
+#[inline]
 pub fn option_only_character(key: crate::keyboard::PhysicalKey, shift: bool) -> Option<char> {
     crate::platform_impl::option_only_character(key, shift)
 }

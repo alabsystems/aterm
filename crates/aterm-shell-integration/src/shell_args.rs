@@ -47,6 +47,7 @@ pub enum ArgsMerge {
 /// spawn hands them `shell_args` itself; WSL: the Windows seam splices them in as
 /// `wsl.exe` options), and so is any shell when `args` is empty: [`ArgsMerge::Integrated`],
 /// `injection` untouched.
+#[inline]
 pub fn merge_shell_args(
     shell: ShellType,
     injection: &mut InjectionEnv,
@@ -59,6 +60,7 @@ pub fn merge_shell_args(
 /// decided without preparing anything: a config check's answer. `None` when the
 /// shell is integrated with them.
 #[must_use]
+#[inline]
 pub fn shell_args_bypass(shell: ShellType, args: &[String]) -> Option<String> {
     let mut probe = crate::injection_for(shell, std::path::Path::new("/"))?;
     match merge_shell_args_in(shell, &mut probe, args, &|_| None) {

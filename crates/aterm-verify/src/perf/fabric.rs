@@ -42,6 +42,17 @@
 //! and reproducing line ([`Arm::shipped`]): ordered at 100 ms since the
 //! 2026-10-20 re-gate, strict in every bare entry before it.
 //!
+//! WHAT SHIPS, AND ITS PARTS. Every world's broker retains its log by aterm's
+//! default rules, set at every open as `aterm link broker` sets them, and the
+//! bridge runs its bus mirror at `--log auto` (on over a retaining broker):
+//! what ships. `--retention off` opens every world's broker with no rules (a
+//! broker from before astream's R4, which also keeps the auto mirror off),
+//! `--log off` takes the mirror away and keeps retention, so one pair of runs
+//! separates the two; `--retention-interval-ms N` runs the retaining broker's
+//! tick every N ms instead of astream's minute, which no world outlives. Each
+//! reaches the bench's words, and the entry's reproducing line, only when
+//! given.
+//!
 //! WHY NO FLOOR. Every message costs Strict appends, and a Strict append is an
 //! fsync — `F_FULLFSYNC` on macOS — whose price is the disk's: an absolute
 //! bound would fail a correct build on a slower machine and pass a regression
@@ -172,6 +183,16 @@ pub(crate) struct Args {
     pub json_out: Option<PathBuf>,
     /// The arm measured (`--profile`), dev unless named.
     pub profile: Profile,
+    /// `--retention on|off`: whether each world's broker retains its log by
+    /// aterm's default rules; `None` leaves the bench's default, on (what
+    /// ships).
+    pub retention: Option<bool>,
+    /// `--log auto|off`: the bridge's bus mirror; `None` leaves the bench's
+    /// default, auto (what ships).
+    pub log: Option<bench_spec::Log>,
+    /// `--retention-interval-ms N`: the retaining broker's tick interval;
+    /// `None` leaves astream's minute (what ships).
+    pub retention_interval_ms: Option<u64>,
 }
 
 fn positive(flag: &str, raw: &str) -> Result<u32, String> {
@@ -241,6 +262,24 @@ impl Args {
                 }
                 "--json-out" => a.json_out = Some(PathBuf::from(raw)),
                 "--profile" => a.profile = Profile::parse(raw)?,
+                "--retention" => {
+                    a.retention = Some(match raw.as_str() {
+                        "on" => true,
+                        "off" => false,
+                        _ => {
+                            return Err(format!("`--retention` takes on or off, not `{raw}`"));
+                        }
+                    });
+                }
+                "--log" => {
+                    a.log = Some(
+                        bench_spec::Log::parse(raw)
+                            .map_err(|_| format!("`--log` takes auto or off, not `{raw}`"))?,
+                    );
+                }
+                "--retention-interval-ms" => {
+                    a.retention_interval_ms = Some(u64::from(positive(flag, raw)?));
+                }
                 // The run's switch, which `super::main` reads; it names every
                 // lane, so every lane's parser is handed it.
                 "--no-windows" => {}
@@ -328,6 +367,15 @@ impl Args {
         if let Some(n) = self.rounds {
             words.push(format!("rounds={n}"));
         }
+        if let Some(on) = self.retention {
+            words.push(format!("retention={}", if on { "on" } else { "off" }));
+        }
+        if let Some(log) = self.log {
+            words.push(format!("log={}", log.word()));
+        }
+        if let Some(ms) = self.retention_interval_ms {
+            words.push(format!("retention_interval_ms={ms}"));
+        }
         words.extend(arm.words());
         words.join(" ")
     }
@@ -356,6 +404,15 @@ impl Args {
         }
         if let Some(n) = self.rounds {
             line.push_str(&format!(" --attach-rounds {n}"));
+        }
+        if let Some(on) = self.retention {
+            line.push_str(&format!(" --retention {}", if on { "on" } else { "off" }));
+        }
+        if let Some(log) = self.log {
+            line.push_str(&format!(" --log {}", log.word()));
+        }
+        if let Some(ms) = self.retention_interval_ms {
+            line.push_str(&format!(" --retention-interval-ms {ms}"));
         }
         line.push_str(&arm.flags());
         line
@@ -1113,6 +1170,57 @@ mod tests {
         let mut o = BTreeMap::new();
         o.insert("--warmup", "3".to_string());
         assert!(Args::from_options(&o).is_err());
+    }
+
+    /// WHAT SHIPS, NAMED APART: `--retention`, `--log` and
+    /// `--retention-interval-ms` reach the bench's words and every entry's
+    /// reproducing line only when given (the bench's defaults are what
+    /// ships, and its report names them either way), and the bench's own
+    /// grammar refuses a tick interval on a broker that retains nothing.
+    #[test]
+    fn retention_the_mirror_and_the_tick_reach_the_bench_and_the_ledger() {
+        let shipped = Arm::shipped();
+        let mut o = BTreeMap::new();
+        o.insert("--retention", "on".to_string());
+        o.insert("--log", "off".to_string());
+        let a = Args::from_options(&o).expect("parses");
+        assert_eq!(
+            (a.retention, a.log),
+            (Some(true), Some(bench_spec::Log::Off))
+        );
+        assert_eq!(
+            a.bench_words(Path::new("/s"), shipped),
+            "out=/s retention=on log=off durability=ordered horizon_ms=100"
+        );
+        assert_eq!(
+            a.command_line(shipped),
+            "targo --unverified verify perf fabric --retention on --log off --durability ordered \
+             --horizon-ms 100"
+        );
+        let mut o = BTreeMap::new();
+        o.insert("--retention-interval-ms", "1000".to_string());
+        let a = Args::from_options(&o).expect("parses");
+        assert_eq!(
+            a.bench_words(Path::new("/s"), shipped),
+            "out=/s retention_interval_ms=1000 durability=ordered horizon_ms=100"
+        );
+        assert!(
+            a.command_line(shipped)
+                .contains(" --retention-interval-ms 1000 "),
+            "{}",
+            a.command_line(shipped)
+        );
+        for pairs in [
+            &[("--retention", "yes")][..],
+            &[("--log", "turns")],
+            &[("--log", "")],
+            &[("--retention-interval-ms", "0")],
+            &[("--retention", "off"), ("--retention-interval-ms", "1000")],
+        ] {
+            let o: BTreeMap<&'static str, String> =
+                pairs.iter().map(|(k, v)| (*k, (*v).to_string())).collect();
+            assert!(Args::from_options(&o).is_err(), "{pairs:?}");
+        }
     }
 
     /// THE SAME-DAY ARMS IN ONE INVOCATION: `--durability` names the tiers in

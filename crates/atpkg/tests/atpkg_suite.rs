@@ -32,6 +32,7 @@ mod one_operand_verbs;
 mod reroute_names_what_runs;
 mod run_is_the_managed_name;
 mod seed_disabled;
+mod seed_login_rc;
 mod selfupdate_intercept;
 mod settings_action_completion;
 mod shell_integration_hook_pin;

@@ -180,6 +180,7 @@ impl Describe for () {
 
 impl IntoAbi for () {
     type Ret = ();
+    #[inline]
     fn into_abi(self) -> Result<((), u32), Thrown> {
         Ok(((), 0))
     }
@@ -199,12 +200,14 @@ macro_rules! scalars {
         impl FromAbi for $t {
             type W0 = $w;
             type W1 = u32;
+            #[inline]
             unsafe fn from_abi($f: $w, _: u32) -> Result<Self, Thrown> {
                 $from
             }
         }
         impl IntoAbi for $t {
             type Ret = $w;
+            #[inline]
             fn into_abi(self) -> Result<($w, u32), Thrown> {
                 let $v = self;
                 Ok(($into, 0))
@@ -213,12 +216,14 @@ macro_rules! scalars {
         impl OptFromAbi for $t {
             type W0 = u32;
             type W1 = $w;
+            #[inline]
             unsafe fn opt_from_abi(w0: u32, $f: $w) -> Result<Option<Self>, Thrown> {
                 if w0 == 0 { Ok(None) } else { ($from).map(Some) }
             }
         }
         impl OptIntoAbi for $t {
             type Ret = $w;
+            #[inline]
             fn opt_into_abi(v: Option<Self>) -> Result<($w, u32), Thrown> {
                 Ok(match v {
                     Some($v) => ($into, 1),
@@ -257,6 +262,7 @@ elems!(u8, u16, u32, u64, i8, i16, i32, i64, f32, f64);
 ///
 /// # Safety
 /// `FromAbi::from_abi`'s contract for a buffer of `T`.
+#[inline]
 unsafe fn take_vec<T>(ptr: usize, len: usize) -> Vec<T> {
     if len == 0 {
         // Nothing was allocated; `ptr` is the alignment.
@@ -269,6 +275,7 @@ unsafe fn take_vec<T>(ptr: usize, len: usize) -> Vec<T> {
 
 /// Hand a buffer to the glue: its pointer and element count. The glue frees
 /// it with `len * size_of::<T>()` bytes at `align_of::<T>()`.
+#[inline]
 fn give_vec<T>(v: Vec<T>) -> (usize, u32) {
     let b = v.into_boxed_slice();
     let len = b.len();
@@ -291,6 +298,7 @@ fn give_vec<T>(v: Vec<T>) -> (usize, u32) {
 ///
 /// # Safety
 /// `bytes` is UTF-8 ([`FromAbi::from_abi`]'s contract for a string).
+#[inline]
 unsafe fn utf8(bytes: Vec<u8>) -> Result<String, Thrown> {
     if cfg!(debug_assertions) {
         return String::from_utf8(bytes)

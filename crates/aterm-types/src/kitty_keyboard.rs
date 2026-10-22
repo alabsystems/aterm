@@ -91,6 +91,7 @@ impl KittyKeyboardFlags {
     /// - 1 (default): Set specified bits, clear unspecified
     /// - 2: Set specified bits, leave others unchanged (OR)
     /// - 3: Clear specified bits, leave others unchanged (AND NOT)
+    #[inline]
     pub fn apply(&mut self, bits: u8, mode: u8) {
         let bits = bits & 0b1_1111; // Mask to valid flags
         match mode {
@@ -116,13 +117,13 @@ impl KittyKeyboardStackEntry {
 
     /// Create a valid entry with the given flags.
     #[inline]
-    fn new(flags: KittyKeyboardFlags) -> Self {
+    const fn new(flags: KittyKeyboardFlags) -> Self {
         Self(flags.bits() | Self::VALID_BIT)
     }
 
     /// Get the flags from this entry.
     #[inline]
-    fn flags(self) -> KittyKeyboardFlags {
+    const fn flags(self) -> KittyKeyboardFlags {
         KittyKeyboardFlags::from_bits(self.0 & !Self::VALID_BIT)
     }
 }
@@ -183,6 +184,7 @@ pub struct KittyKeyboardStateSnapshot {
 }
 
 impl From<bool> for ScreenBuffer {
+    #[inline]
     fn from(is_alternate: bool) -> Self {
         if is_alternate {
             Self::Alternate
@@ -193,6 +195,7 @@ impl From<bool> for ScreenBuffer {
 }
 
 impl Default for KittyKeyboardState {
+    #[inline]
     fn default() -> Self {
         Self::new()
     }
@@ -200,13 +203,15 @@ impl Default for KittyKeyboardState {
 
 impl KittyKeyboardState {
     /// Create new keyboard state with no enhancements.
-    pub fn new() -> Self {
+    #[inline]
+    #[must_use]
+    pub const fn new() -> Self {
         Self {
             flags: KittyKeyboardFlags::none(),
             main_saved_flags: None,
             alt_saved_flags: None,
-            main_stack: [KittyKeyboardStackEntry::default(); 8],
-            alt_stack: [KittyKeyboardStackEntry::default(); 8],
+            main_stack: [KittyKeyboardStackEntry(0); 8],
+            alt_stack: [KittyKeyboardStackEntry(0); 8],
             main_sp: 0,
             alt_sp: 0,
         }
@@ -215,18 +220,19 @@ impl KittyKeyboardState {
     /// Get current keyboard flags.
     #[must_use]
     #[inline]
-    pub fn flags(&self) -> KittyKeyboardFlags {
+    pub const fn flags(&self) -> KittyKeyboardFlags {
         self.flags
     }
 
     /// Query current flags (for CSI ? u response).
     #[must_use]
     #[inline]
-    pub fn query_flags(&self) -> u8 {
+    pub const fn query_flags(&self) -> u8 {
         self.flags.bits()
     }
 
     /// Set flags directly (CSI = flags u or CSI = flags ; mode u).
+    #[inline]
     pub fn set_flags(&mut self, bits: u8, mode: u8) {
         self.flags.apply(bits, mode);
     }

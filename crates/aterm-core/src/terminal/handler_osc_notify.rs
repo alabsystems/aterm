@@ -225,6 +225,7 @@ fn parse_conemu_taskbar_progress(message: &str) -> Option<TaskbarProgress> {
 /// Append one OSC 99 chunk's sanitized text to a title/body field, keeping the
 /// field within [`MAX_NOTIFICATION_FIELD_BYTES`] (cut at a UTF-8 boundary). Empty
 /// text leaves the field untouched.
+#[inline]
 fn append_notification_field(field: &mut Option<String>, text: &str) {
     if text.is_empty() {
         return;
@@ -236,6 +237,7 @@ fn append_notification_field(field: &mut Option<String>, text: &str) {
 
 /// Rejoin OSC params from `start..` with `;` (the parser splits a payload's
 /// literal semicolons); `None` if there is no param at `start`.
+#[inline]
 fn join_params(params: &[&[u8]], start: usize) -> Option<String> {
     if params.len() <= start {
         return None;
@@ -247,6 +249,7 @@ fn join_params(params: &[&[u8]], start: usize) -> Option<String> {
 /// [`super::handler_osc::sanitize_title`] does (notification surfaces, like title
 /// bars, render outside the grid's BiDi filter), then truncate to
 /// [`MAX_NOTIFICATION_FIELD_BYTES`] at a UTF-8 boundary.
+#[inline]
 fn sanitize_notification(text: &str) -> String {
     let filtered = super::handler_osc::sanitize_title(text);
     if filtered.len() <= MAX_NOTIFICATION_FIELD_BYTES {

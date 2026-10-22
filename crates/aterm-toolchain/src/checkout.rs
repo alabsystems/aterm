@@ -102,6 +102,7 @@ pub const HOME_SKIP: &[&str] = &["AppData", "OneDrive*"];
 /// default; on Windows blind to case as NTFS folds it (the one fold of
 /// `aterm_sysprobe::paths`), an entry ending in `*` matching every name it
 /// begins; exact elsewhere.
+#[inline]
 #[must_use]
 pub fn home_skip(name: &std::ffi::OsStr) -> Option<&'static str> {
     HOME_SKIP.iter().copied().find(|s| same_name(name, s))
@@ -133,6 +134,7 @@ pub const VOLUME_ROOTS: &[&str] = &[];
 ///
 /// Why the checkout is not called gone: it is there, it was not looked at,
 /// or what was looked at could not be read.
+#[inline]
 pub fn gone(checkout: &Path, home: Option<&Path>) -> Result<String, String> {
     gone_placed(checkout, home, None)
 }

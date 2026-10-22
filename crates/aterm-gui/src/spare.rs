@@ -3683,6 +3683,7 @@ impl Wake {
             | Wake::ControlTextScale { .. }
             | Wake::LoginNotice { .. }
             | Wake::CardSeed { .. }
+            | Wake::Aos { .. }
             | Wake::PersonStandIn { .. }
             | Wake::ControlSecurityPosture { .. }
             | Wake::UpdateHealth { .. }
@@ -3730,6 +3731,7 @@ impl Wake {
             | Wake::AnswerCloseConfirm { .. }
             | Wake::SiblingScan(..)
             | Wake::FleetRead
+            | Wake::FabricRead
             | Wake::PillAct { .. }
             | Wake::CreateWindow
             | Wake::DetachActiveTab
@@ -3771,6 +3773,7 @@ impl Wake {
             | Wake::PkgManagedCurrent(..)
             | Wake::PkgMachineSettings(..)
             | Wake::PkgForeign(..)
+            | Wake::PkgCToolchain(..)
             | Wake::PkgMachineState(..)
             | Wake::PkgMachineRecordMissing
             | Wake::PkgGroupAborted { .. }
@@ -3833,7 +3836,7 @@ impl Wake {
             Wake::SiblingRaised { .. } => None,
             #[cfg(target_os = "macos")]
             Wake::NoticeVoice => None,
-            #[cfg(any(target_os = "macos", windows))]
+            #[cfg(any(target_os = "macos", windows, target_os = "linux"))]
             Wake::NoticeClicked { .. } => None,
             #[cfg(target_os = "macos")]
             Wake::NativeTerminateRequested { .. } => None,

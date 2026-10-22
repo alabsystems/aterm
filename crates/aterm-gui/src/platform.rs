@@ -68,7 +68,9 @@ pub(crate) enum RenameEditorEdit {
 pub(crate) trait AppRt {
     /// Paint the OS window background the terminal's theme background colour
     /// (`bg`, as `0x00RRGGBB`) so the transparent titlebar / bare compact bar reads
-    /// as a seamless extension of the terminal body. No-op off macOS.
+    /// as a seamless extension of the terminal body (Windows: the class brush the
+    /// client area erases to; X11: the background the server paints until a frame
+    /// covers it). No-op on Wayland.
     fn window_set_background_color(&self, window: &Window, bg: u32);
 
     /// Apply the window-CHROME appearance: match the NSWindow colour space to
@@ -178,6 +180,13 @@ pub(crate) trait AppRt {
     /// `None` where there is no such layer (off macOS, CPU backend, no window).
     /// Read-only: it must never be the thing that establishes the state it reports.
     fn window_surface_presentation(&self, window: &Window) -> Option<(String, f64, bool)>;
+
+    /// A frame of `window` was just presented (its swap or its image put
+    /// returned). On X11 this answers a window manager's pending resize sync
+    /// request (EWMH `_NET_WM_SYNC_REQUEST`, which mutter holds a resize's
+    /// picture on until the window has drawn its new size). Default no-op: the
+    /// other platforms' compositors pace a resize themselves.
+    fn window_frame_presented(&self, _window: &Window) {}
 
     /// M5 TRUE VIBRANCY: install / update / remove the window-level
     /// `NSVisualEffectView` blurred backdrop and flip the window + CAMetalLayer to
@@ -2097,6 +2106,21 @@ pub(crate) fn current_event_queue_age_ns() -> Option<u64> {
     None
 }
 
+/// Whether the `RedrawRequested` being handled is one the X server asked for
+/// with an `Expose` (`aterm_window::platform::x11::redraw_is_exposure`): the
+/// server lost what the window showed, and the whole frame is owed
+/// (`App::note_owed_repaint`). `false` for a redraw aterm asked for, on
+/// Wayland, and off Linux.
+#[cfg(target_os = "linux")]
+pub(crate) fn redraw_is_exposure() -> bool {
+    aterm_window::platform::x11::redraw_is_exposure()
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn redraw_is_exposure() -> bool {
+    false
+}
+
 /// Linux/BSD application-runtime using the **pure-winit** surface (NO new system
 /// libraries — see [`AppRt::window_set_background_color`] and `toolbar.rs` for the
 /// deferred GTK4 work): the appearance method drives `aterm_window::Window::set_theme` so
@@ -2114,14 +2138,28 @@ pub(crate) struct AppRtLinux {
 
 #[cfg(all(not(target_os = "macos"), not(windows)))]
 impl AppRt for AppRtLinux {
-    /// INTENTIONAL no-op: winit exposes NO per-window background-COLOUR setter (only
-    /// `set_transparent` / `set_blur`, which toggle the surface's transparency, not a
-    /// fill colour). The terminal-body background colour is already painted by the
-    /// renderer's own surface clear (softbuffer/wgpu), so there is nothing window-
-    /// level to set here without a native toolkit. A full GTK4 header bar would paint
-    /// its own background to match `bg` — deferred with the rest of the header bar
-    /// (see `toolbar.rs`). Documented rather than silently empty.
-    fn window_set_background_color(&self, _window: &Window, _bg: u32) {}
+    /// On X11, the window's background: what the X server paints where the window
+    /// shows no frame yet (an area a resize just added), so it reads as the
+    /// terminal's body rather than stale pixels. The window is created with it
+    /// (`with_x11_background`, at attach); this follows a theme change. Wayland
+    /// has no window background: a surface shows only what was posted to it.
+    fn window_set_background_color(&self, window: &Window, bg: u32) {
+        #[cfg(target_os = "linux")]
+        aterm_window::platform::x11::WindowExtX11::set_x11_background(window, bg);
+        #[cfg(not(target_os = "linux"))]
+        let _ = (window, bg);
+    }
+
+    /// On X11, the window's word to its window manager that a frame is on it:
+    /// a resize sync request that a size change left waiting for one is
+    /// answered (`aterm-window`'s `sync_request.rs`). A no-op on Wayland and
+    /// while no request waits.
+    fn window_frame_presented(&self, window: &Window) {
+        #[cfg(target_os = "linux")]
+        aterm_window::platform::x11::WindowExtX11::x11_frame_presented(window);
+        #[cfg(not(target_os = "linux"))]
+        let _ = window;
+    }
 
     /// Apply the window-chrome appearance by overriding winit's window theme: map
     /// config [`WindowTheme`] → [`aterm_window::window::Theme`] via [`window_theme_to_winit`]

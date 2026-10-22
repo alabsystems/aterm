@@ -1554,6 +1554,7 @@ impl<Str> PartialEq<Key<Str>> for NativeKey {
 impl Key<SmolStr> {
     /// Convert `Key::Character(SmolStr)` to `Key::Character(&str)` so you can more easily match on
     /// `Key`. All other variants remain unchanged.
+    #[inline]
     pub fn as_ref(&self) -> Key<&str> {
         match self {
             Key::Named(a) => Key::Named(*a),
@@ -1575,7 +1576,8 @@ impl NamedKey {
     /// assert_eq!(NamedKey::Enter.to_text(), Some("\r"));
     /// assert_eq!(NamedKey::F20.to_text(), None);
     /// ```
-    pub fn to_text(&self) -> Option<&str> {
+    #[inline]
+    pub const fn to_text(&self) -> Option<&'static str> {
         match self {
             NamedKey::Enter => Some("\r"),
             NamedKey::Backspace => Some("\x08"),
@@ -1599,6 +1601,7 @@ impl Key {
     /// assert_eq!(Key::Named(NamedKey::Enter).to_text(), Some("\r"));
     /// assert_eq!(Key::Named(NamedKey::F20).to_text(), None);
     /// ```
+    #[inline]
     pub fn to_text(&self) -> Option<&str> {
         match self {
             Key::Named(action) => action.to_text(),
@@ -1705,22 +1708,26 @@ aterm_types::bitflags! {
 
 impl ModifiersState {
     /// Returns `true` if the shift key is pressed.
-    pub fn shift_key(&self) -> bool {
+    #[inline]
+    pub const fn shift_key(&self) -> bool {
         self.intersects(Self::SHIFT)
     }
 
     /// Returns `true` if the control key is pressed.
-    pub fn control_key(&self) -> bool {
+    #[inline]
+    pub const fn control_key(&self) -> bool {
         self.intersects(Self::CONTROL)
     }
 
     /// Returns `true` if the alt key is pressed.
-    pub fn alt_key(&self) -> bool {
+    #[inline]
+    pub const fn alt_key(&self) -> bool {
         self.intersects(Self::ALT)
     }
 
     /// Returns `true` if the super key is pressed.
-    pub fn super_key(&self) -> bool {
+    #[inline]
+    pub const fn super_key(&self) -> bool {
         self.intersects(Self::SUPER)
     }
 }

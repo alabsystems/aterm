@@ -112,8 +112,8 @@ use crate::storage::Dir;
 #[cfg(doc)]
 use crate::store::Committed;
 use crate::store::{
-    is_hidden_subject, AntiRollbackMode, Boot, Durability, Mutation, OpenOptions, Prepared,
-    Storage, Volume,
+    is_hidden_subject, AntiRollbackMode, Boot, Durability, InjectedFaults, Mutation, OpenOptions,
+    Prepared, Storage, Volume,
 };
 use crate::{BrokerLog, Escalate, Escalation, LogIdentity};
 
@@ -2404,6 +2404,265 @@ fn a_cut_that_died_after_phase_1_is_made_again_under_the_same_verdict() {
             }
         }
         assert!(crashed > 1, "{arm}: open #1 wrote phase 1, then cut");
+    }
+}
+
+/// THE OUTCOME-UNKNOWN RESEND LANDS EXACTLY ONCE, whatever the device kept
+/// (`broker.poisoned-refusal`): the cure an embedder relies on after a FAILED full flush
+/// poisoned the open. The batch held an escalated publish and an ordinary one behind it;
+/// both ops were answered "outcome unknown", the embedder reopens the log, and the
+/// producer resends both under the same pinned `(producer_id, producer_seq)`s, in order.
+/// Two branches, one law, for each op:
+///
+/// - KEPT: the supervisor's reopen in the same boot (the broker exits on the poison: a
+///   process exit, which loses nothing the kernel holds), and every power-loss image that
+///   kept the record. The resend DEDUPS to the recovered record — its offset, `deduped`,
+///   acked at once — and nothing is written for it. Here the open's flush covers the
+///   record, because the injected fault fails the flush before it touches the device and
+///   leaves the record's blocks dirty for the open to write. A real device is not bound
+///   to that: a failed flush can leave the pages clean but unwritten (Linux's
+///   `fdatasync` after EIO; on Apple, a drive-cache reset after the barrier), and the
+///   open's flush then has nothing to rewrite — the HONEST BOUNDARY
+///   `BrokerLog::flush_failed_lossy` states. The same-boot dedup then acks a record that
+///   may be on no media; a later power loss that takes it is REFUSED at the next open
+///   (damage below the floor) and `asb repair` cuts it: loud, never silent, but the op
+///   acked has then landed zero times. This simulation cannot reach that case.
+/// - CUT: a power-loss image in which the device dropped the record — on Relaxed its
+///   blocks still volatile after the `Lossy` sidecar, whose flush leaves the log's page
+///   cache alone; on Ordered issued in the batch's barrier epoch before the sidecar
+///   drained it — or tore the batch it was in. Recovery cuts it as a torn tail, the dedup
+///   map it rebuilds holds no entry for its key, and the resend appends it FRESH at the
+///   cut point (the recovered head, the ops in order), once; the escalated one owes and
+///   takes its full flush.
+///
+/// EVERY power-loss image of every device state from the one before the batch's write
+/// through the poison is recovered in the next boot: every subset of each epoch prefix's
+/// blocks, with and without its size change (`images` says it enumerated them all, and
+/// the test asserts it did). On each, and on the same-boot reopen, the generation has
+/// moved under the same id (the run was recorded `Lossy`, or it served a weak tier and
+/// did not stop cleanly in another boot) — or, on an image that kept no record at all,
+/// the log took a fresh id — and the log ends holding exactly one record under each key,
+/// the one its resend was answered with. The REVERSE holds on every one too: `deduped` is
+/// answered exactly when the recovered log holds the key, at that record's own offset —
+/// never for a record the recovered log lacks, such as one whose frame survived intact in
+/// a batch the recovery cut. Not vacuous, counted over the images of a state after the
+/// batch's write (one before it dropped nothing): each tier reaches both branches, the
+/// cut one with the record before the batch kept and with the escalated body still on
+/// the image (a torn batch the recovery cut, where an open that rebuilt dedup before its
+/// cut would answer `deduped`); Relaxed also keeps the escalated record and cuts the one
+/// behind it.
+#[test]
+fn the_outcome_unknown_resend_after_a_poison_lands_exactly_once() {
+    // The held batch: an escalated publish (the op whose flush failed), then an ordinary
+    // one the held head kept back behind it.
+    const OPS: [(u64, &str, &[u8]); 2] = [
+        (2, "/e/a", b"a person's word"),
+        (3, "/o/b", b"machine chatter after it"),
+    ];
+    let c = Controls::default();
+    // Room for every image of every epoch prefix: 2^13 subsets of Relaxed's 13 volatile
+    // blocks, each with and without the size change, is 2^14.
+    const IMAGES: usize = 1 << 15;
+    let mut rng = Rng(0x0D0B_1E5E);
+    for tier in [ORDERED, Durability::Relaxed] {
+        let sim = Sim::with(Device::new(16));
+        let mut log = open(&sim, tier, BOOT_A, &c).expect("the first open");
+        log.stage_publish(1, 1, "/o/a".into(), b"before".to_vec())
+            .expect("staged");
+        log.commit_batch().expect("committed");
+        let told = log.identity();
+        sim.trace_on();
+        for (seq, subject, body) in OPS {
+            log.stage_publish(1, seq, subject.into(), body.to_vec())
+                .expect("staged");
+        }
+        let committed = log.commit_batch().expect("committed");
+        assert_eq!(committed.visible_now, Offset(1), "{tier:?}: both held");
+        assert_eq!(
+            committed.owe_full,
+            Some(Offset(3)),
+            "{tier:?}: owes a flush"
+        );
+        log.inject_faults(InjectedFaults {
+            sync: true,
+            truncate: false,
+        });
+        let err = log.flush_handle().full().expect_err("the injected fault");
+        log.full_flush_failed(&err);
+        assert!(log.poisoned().is_some(), "{tier:?}: the open is poisoned");
+        // The broker exits on the poison: no clean close.
+        drop(log);
+        let trace = sim.take_trace();
+        // The trace starts at the state before the batch's write, which grows the file:
+        // an image of a state at that size never held the batch, so nothing was dropped.
+        let unwritten = trace[0].logical.len();
+        let poisoned = sim.device();
+        assert!(
+            poisoned.logical.len() > unwritten,
+            "{tier:?}: the batch's write grew the file"
+        );
+        // The escalated body as the batch wrote it: an image the recovery cut the record
+        // from that still holds it held a torn batch, not merely a dropped one.
+        let body = OPS[0].2;
+        let mut recoveries = vec![(
+            Sim::with(poisoned),
+            BOOT_A,
+            true,
+            "the supervisor's reopen in the same boot".to_string(),
+        )];
+        let mut enumerated = 0;
+        for (state, dev) in trace.iter().enumerate() {
+            let (imgs, every) = images(dev, IMAGES, &mut rng);
+            assert!(
+                every,
+                "{tier:?}: every power-loss image of state {state}, not a sample"
+            );
+            let written = dev.logical.len() > unwritten;
+            enumerated += imgs.len();
+            for (i, img) in imgs.into_iter().enumerate() {
+                recoveries.push((
+                    Sim::with(img),
+                    BOOT_B,
+                    written,
+                    format!("a power loss at state {state}, image {i}"),
+                ));
+            }
+        }
+        // Recoveries that kept both records; that kept the escalated record but cut the
+        // one behind it; that cut the escalated record after the batch was written — of
+        // those, the ones that kept the record before the batch, and the ones whose image
+        // still held the escalated body (a torn batch the recovery cut) — and those of a
+        // state before the batch's write, which dropped nothing.
+        let (mut kept, mut split, mut cut, mut cut_after_before, mut cut_torn, mut unwritten) =
+            (0, 0, 0, 0, 0, 0);
+        for (image, boot, written, what) in recoveries {
+            let torn = written
+                && image
+                    .device()
+                    .logical
+                    .windows(body.len())
+                    .any(|w| w == body);
+            let mut rec = open(&image, tier, boot, &c)
+                .unwrap_or_else(|e| panic!("{tier:?}, {what}: the open refused: {e}"));
+            let recovered = records_of(&rec);
+            let identity = rec.identity();
+            if recovered.is_empty() {
+                // A log that holds no record takes a fresh id: no offset names anything.
+                assert_ne!(
+                    identity.id, told.id,
+                    "{tier:?}, {what}: an empty log takes a fresh id ({identity}, was {told})"
+                );
+            } else {
+                assert!(
+                    identity.id == told.id && identity.generation > told.generation,
+                    "{tier:?}, {what}: the generation moved ({identity}, was {told})"
+                );
+            }
+            let head = rec.head().0;
+            let at = |seq: u64| {
+                recovered
+                    .iter()
+                    .find(|r| (r.producer_id, r.producer_seq) == (1, seq))
+                    .map(|r| r.seq.0)
+            };
+            let mut answers = Vec::new();
+            let mut fresh = head;
+            for (seq, subject, body) in OPS {
+                let (off, deduped) = rec
+                    .stage_publish(1, seq, subject.into(), body.to_vec())
+                    .unwrap_or_else(|e| panic!("{tier:?}, {what}: resending {seq}: {e:?}"));
+                assert_eq!(
+                    deduped,
+                    at(seq).is_some(),
+                    "{tier:?}, {what}: {seq} deduped exactly when the recovered log holds it"
+                );
+                let want = at(seq).unwrap_or_else(|| {
+                    fresh += 1;
+                    fresh - 1
+                });
+                assert_eq!(
+                    off.0, want,
+                    "{tier:?}, {what}: {seq} answered with its record's offset, or the cut point"
+                );
+                answers.push((seq, off, deduped));
+            }
+            let committed = rec.commit_batch().expect("the resends' batch commits");
+            let escalated_fresh = at(2).is_none();
+            assert_eq!(
+                committed.owe_full.is_some(),
+                escalated_fresh,
+                "{tier:?}, {what}: a flush is owed exactly for a fresh escalated record"
+            );
+            for &(_, off, deduped) in &answers {
+                if deduped {
+                    assert!(
+                        committed.acks_now(off.0, true),
+                        "{tier:?}, {what}: a covered original is acked at once"
+                    );
+                }
+            }
+            if let Some(target) = committed.owe_full {
+                full_flush(&mut rec, target.0, false);
+            }
+            assert_eq!(
+                (rec.head().0, rec.visible_head().0),
+                (fresh, fresh),
+                "{tier:?}, {what}: only the cut records were written, and all are shown"
+            );
+            let after = records_of(&rec);
+            assert_eq!(
+                after[..recovered.len()],
+                recovered[..],
+                "{tier:?}, {what}: nothing recovered is rewritten"
+            );
+            for ((seq, subject, body), &(_, off, _)) in OPS.iter().zip(&answers) {
+                let copies: Vec<&BrokerRecord> = after
+                    .iter()
+                    .filter(|r| (r.producer_id, r.producer_seq) == (1, *seq))
+                    .collect();
+                assert_eq!(copies.len(), 1, "{tier:?}, {what}: {seq} exactly once");
+                assert_eq!(
+                    (
+                        copies[0].seq,
+                        copies[0].subject.as_str(),
+                        copies[0].body.as_slice()
+                    ),
+                    (off, *subject, *body),
+                    "{tier:?}, {what}: {seq} is the record its resend was answered with"
+                );
+            }
+            match (at(2).is_some(), at(3).is_some()) {
+                (true, true) => kept += 1,
+                (true, false) => split += 1,
+                (false, _) if !written => unwritten += 1,
+                (false, _) => {
+                    cut += 1;
+                    cut_after_before += usize::from(head == 1);
+                    cut_torn += usize::from(torn);
+                }
+            }
+        }
+        eprintln!(
+            "{tier:?}: {enumerated} power-loss images (every one of {} states) and the \
+             same-boot reopen: {kept} kept both records (the resends dedup); {split} kept the \
+             escalated one and cut the one behind it; {cut} written and then cut the escalated \
+             one (its resend appends; {cut_after_before} with the record before the batch \
+             kept, {cut_torn} with its body still on the image); {unwritten} of a state \
+             before the batch's write",
+            trace.len()
+        );
+        assert!(
+            kept > 0 && cut > 0 && cut_after_before > 0 && cut_torn > 0,
+            "{tier:?}: both branches reached ({kept} kept; {cut} written and cut, \
+             {cut_after_before} right after the record before the batch, {cut_torn} with the \
+             escalated body on the image)"
+        );
+        if matches!(tier, Durability::Relaxed) {
+            assert!(
+                split > 0,
+                "{tier:?}: an image keeps the escalated record and cuts the one behind it"
+            );
+        }
     }
 }
 

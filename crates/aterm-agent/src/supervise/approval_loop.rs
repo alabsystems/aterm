@@ -275,6 +275,7 @@ use super::super::policy::approval::{
     keeps_trying_its_limit, limit_no_reset_reason, proof_would_lift, unvoiced_tools,
 };
 use super::super::policy::box_call;
+use super::super::policy::box_command::{self, BoxCommand};
 use super::super::policy::box_facts::{BoxFacts, QuestionFacts};
 use super::super::policy::login::PickerGate;
 use super::super::policy::question::{begun, fall_back_to, is_question_rule};
@@ -1288,6 +1289,76 @@ impl<C: Ctl> Session<'_, C> {
         Some(call.tool)
     }
 
+    /// THE COMMAND OF THE RM BREAKER'S TOO-MANY BOX, from the host's
+    /// transcript ([`box_command`]): its one pending Bash call
+    /// ([`box_command::pending_bash`], no call spent on an earlier box), read
+    /// again while it names none ([`box_call::LAG_TRIES`]: the box draws
+    /// before its call's row reaches the file), and SETTLED: a read
+    /// [`box_command::SETTLE_STEPS`] steps or more after this box's mount
+    /// first found it must find the same call with the same command, still
+    /// alone and waiting. The settle runs from that first sighting
+    /// ([`Self::box_seen`]): at the sighting the loop waits it out and
+    /// reads again; a decision on the same mount after it (the press was
+    /// skipped because a ticking countdown moved the screen past the judged
+    /// read, which the 1 s settle always outlasts) needs one read that finds
+    /// the same call, and waits nothing, so its press is fenced on a read
+    /// as fresh as any box's. The call taken is remembered
+    /// ([`Self::box_proved`]) and spent where its box leaves (a press under
+    /// `breaker-read-only` waits for that, and a box that stays goes to a
+    /// person: [`Self::box_left`]) or a new mount begins, so it answers no
+    /// later box drawn alike. `None`: no host reads a transcript. The policy
+    /// judges the command only where it draws as the box's rows
+    /// ([`box_command::drawn_as`]), so nothing here is a proof by itself.
+    fn box_command(&mut self, opts: &SuperviseOpts) -> Option<Result<BoxCommand, String>> {
+        let host = opts.idle_host.as_deref()?;
+        let Some(tail) = host.transcript_tail() else {
+            return Some(Err("no transcript of the agent's to read".to_string()));
+        };
+        let mut found = box_command::pending_bash(&tail, &self.calls_spent);
+        for _ in 0..box_call::LAG_TRIES {
+            if found.is_ok() {
+                break;
+            }
+            self.fx.sleep(self.setup.box_call_step);
+            let Some(tail) = host.transcript_tail_again() else {
+                break;
+            };
+            found = box_command::pending_bash(&tail, &self.calls_spent);
+        }
+        let call = match found {
+            Ok(call) => call,
+            Err(why) => return Some(Err(why)),
+        };
+        let settle = self.setup.box_call_step * box_command::SETTLE_STEPS;
+        let (first, sighted_now) = match &self.box_seen {
+            Some((seen, at)) if *seen == call => (*at, false),
+            _ => {
+                let now = self.fx.mono();
+                self.box_seen = Some((call.clone(), now));
+                (now, true)
+            }
+        };
+        let since = self.fx.since(first);
+        if !sighted_now && since >= settle {
+            // Seen alone and waiting a settle ago on this mount, and now.
+            self.box_proved = Some(call.id.clone());
+            return Some(Ok(call));
+        }
+        self.fx.sleep(settle.saturating_sub(since));
+        let again = host
+            .transcript_tail_again()
+            .map(|tail| box_command::pending_bash(&tail, &self.calls_spent));
+        Some(match again {
+            Some(Ok(again)) if again == call => {
+                self.box_proved = Some(call.id.clone());
+                Ok(call)
+            }
+            Some(Ok(_)) => Err("the waiting call changed within the settle".to_string()),
+            Some(Err(why)) => Err(format!("within the settle, {why}")),
+            None => Err("the transcript could not be read again".to_string()),
+        })
+    }
+
     /// The box on the screen has left: the next one mounts afresh
     /// ([`Self::box_young`]), and any remembered transcript candidate is spent
     /// ([`Self::box_call`]).
@@ -1310,8 +1381,11 @@ impl<C: Ctl> Session<'_, C> {
         }
     }
 
-    /// Spend the remembered transcript candidate, without asserting its mount.
+    /// Spend the remembered transcript candidate, without asserting its mount,
+    /// and forget the too-many box's first sighting of a call
+    /// ([`Self::box_command`]): the mount it was seen on has ended.
     fn spend_proved(&mut self) {
+        self.box_seen = None;
         if let Some(id) = self.box_proved.take() {
             self.calls_spent.push(id);
             let over = self.calls_spent.len().saturating_sub(SPENT_CALLS);
@@ -1633,6 +1707,19 @@ impl<C: Ctl> Session<'_, C> {
             && proof_would_lift(&reading, rows, &ctx)
         {
             facts.box_call = self.box_call(p, opts, ctx.home.as_deref());
+            ctx = self.approval_ctx(&facts, opts, allow);
+        }
+        // The rm breaker's too-many box over barred rows, which the screen's
+        // readings alone do not prove a read: its command as the transcript
+        // holds it ([`Self::box_command`]), for the policy to judge where it
+        // draws as the box ([`box_command::drawn_as`]), read only where
+        // [`box_command::wanted`] says so.
+        if let Some(p) = reading.prompt.as_ref()
+            && box_command::wanted(reading.program, p, || {
+                matches!(decide(&reading, rows, &ctx), Decision::Escalate { .. })
+            })
+        {
+            facts.box_command = self.box_command(opts);
             ctx = self.approval_ctx(&facts, opts, allow);
         }
         let decide_here = |ctx: &ApprovalCtx| {
@@ -4106,7 +4193,7 @@ mod act_tests {
         ),
         ("decline@v1", Outcome::Declined, "rm -rf /"),
         (RULE_LOGIN, Outcome::Typed, "/login"),
-        ("read-only@classify-v3", Outcome::Skipped, "ls"),
+        ("read-only@classify-v4", Outcome::Skipped, "ls"),
         ("-", Outcome::Escalated, ""),
         ("wall-wait@v1", Outcome::Waiting, ""),
     ];

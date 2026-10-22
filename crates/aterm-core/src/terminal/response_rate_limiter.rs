@@ -71,13 +71,15 @@ pub(crate) struct ResponseRateLimiter {
 
 impl ResponseRateLimiter {
     /// Create a rate limiter with the default capacity and refill rate.
-    pub(crate) fn new() -> Self {
+    #[inline]
+    pub(crate) const fn new() -> Self {
         Self::with_limits(DEFAULT_REFILL_BYTES_PER_SEC, DEFAULT_BURST_BYTES)
     }
 
     /// A rate limiter with custom limits. `refill_bytes_per_sec = 0` never replenishes the
     /// initial capacity.
-    pub(crate) fn with_limits(refill_bytes_per_sec: u64, capacity_bytes: u64) -> Self {
+    #[inline]
+    pub(crate) const fn with_limits(refill_bytes_per_sec: u64, capacity_bytes: u64) -> Self {
         Self {
             #[allow(
                 clippy::cast_precision_loss,
@@ -93,6 +95,7 @@ impl ResponseRateLimiter {
     /// Deduct `bytes` tokens: `true` if the response may go, `false` if it is dropped.
     /// `f64` tokens let sub-millisecond refill intervals accumulate (a burst of tiny DSR
     /// replies back to back).
+    #[inline]
     pub(crate) fn try_consume<T: TimeSource>(&mut self, bytes: usize, clock: &T) -> bool {
         // Larger than capacity can never fit: drop without deducting, so one pathological
         // call does not drain the bucket.
@@ -117,6 +120,7 @@ impl ResponseRateLimiter {
     }
 
     /// Refill tokens based on elapsed time since last refill.
+    #[inline]
     fn refill(&mut self, now: Instant) {
         let Some(last) = self.last_refill else {
             // First call: seed the clock; the bucket already starts full.
@@ -146,6 +150,7 @@ impl ResponseRateLimiter {
 }
 
 impl Default for ResponseRateLimiter {
+    #[inline]
     fn default() -> Self {
         Self::new()
     }

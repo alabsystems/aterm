@@ -85,7 +85,8 @@ fn notification_json(n: &Notification) -> String {
     )
 }
 
-fn urgency_label(urgency: NotificationUrgency) -> &'static str {
+#[inline]
+const fn urgency_label(urgency: NotificationUrgency) -> &'static str {
     match urgency {
         NotificationUrgency::Low => "low",
         NotificationUrgency::Critical => "critical",

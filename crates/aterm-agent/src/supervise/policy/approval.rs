@@ -38,8 +38,10 @@
 //! * [`Approve::None`] escalates ordinary permission boxes; it does not turn
 //!   off the separately configured dialog policies above.
 //! * [`Approve::Safe`] uses [`decide_safe`]: Claude Code command reads
-//!   ([`bash`]), bounded scratch removals ([`super::rm_breaker`]), allowed
-//!   non-secret reads ([`read_box`]) and cwd/trust-root grants ([`trust_dialog`]).
+//!   ([`bash`]), the rm breaker's too-many box over a proven read that names no
+//!   rm ([`breaker_read_only`]), bounded scratch removals ([`super::rm_breaker`]),
+//!   allowed non-secret reads ([`read_box`]) and cwd/trust-root grants
+//!   ([`trust_dialog`]).
 //!   Command ambiguity, shell startup and effective git configuration are
 //!   checked, not inferred from an apparently read-only command. An enabled
 //!   [`rm_breaker_warn`] can still approve a removal with an unproven warning.
@@ -86,6 +88,7 @@ use aterm_phase::{Phase, Program, Reading, anchor};
 
 use super::super::config::{Approve, SupervisorConfig};
 use super::a_or_an;
+use super::box_command::{self, BoxCommand};
 use super::claude_settings::{AskKind, OwnerAsk};
 use super::git_config::{GitView, WorkerEnv, git_reads, hazard};
 use super::guard::row_guard;
@@ -98,10 +101,22 @@ use crate::supervise::classify::{
     classify_command_with, classify_except_rm, glob_match, plain_zsh_line,
 };
 
-/// The read-only Bash rule's id (the classifier generation it trusts).
-pub const RULE_READ_ONLY: &str = "read-only@classify-v3";
+/// The read-only Bash rule's id (the classifier generation it trusts, and the
+/// zsh grammar it requires: v4 refuses arithmetic, an option or a keyword after
+/// `time`, and admits a plain `$NAME`, `${NAME}` and `$(…)` under zsh).
+pub const RULE_READ_ONLY: &str = "read-only@classify-v4";
 /// The rm circuit-breaker rule's id.
 pub const RULE_RM_BREAKER: &str = "rm-breaker@v3";
+/// The rm circuit breaker's too-many box ([`RmBreakerKind::TooManySubstitutions`])
+/// over a command that names no rm, which every reading of proves a read by
+/// the read-only rule's own checks ([`breaker_read_only`]). Claude Code 2.1.307
+/// draws that box over any command with more than 64 command substitutions,
+/// rm or none, in a bypass session too (MEASURED,
+/// `docs/measured/claude-code-2.1.307-2026-10-21.md`). v2 judges the box's
+/// command as the agent's transcript holds it where it draws as the box's rows
+/// exactly ([`super::box_command`]), and admits a plain `$NAME`, `${NAME}` and
+/// `$(…)` under zsh (`docs/measured/breaker-transcript-and-zsh-2026-10-22.md`).
+pub const RULE_BREAKER_READ_ONLY: &str = "breaker-read-only@v2";
 /// The rm circuit breaker the safe rules could not prove, approved with a
 /// warning under `approve = "safe"` ([`rm_breaker_warn`]): the one-shot allow
 /// pressed, the failed proof kept as `unproven` and said as one `WARN` line
@@ -730,6 +745,14 @@ pub struct ApprovalCtx {
     /// and screen rows do not close that gap. This never removes a possible
     /// tool's owner hold ([`settings_ask`]).
     pub box_call: Option<String>,
+    /// The agent transcript's one pending Bash call, read twice a settle apart
+    /// ([`super::box_command::pending_bash`]), or why none was taken; `None`:
+    /// not read. Read by the loop only for the rm breaker's too-many box over
+    /// barred rows ([`super::box_command::may_prove`]) that the screen's
+    /// readings alone do not prove. [`breaker_read_only`] judges its command
+    /// only where it draws as the box's rows exactly
+    /// ([`super::box_command::drawn_as`]); never on the transcript alone.
+    pub box_command: Option<Result<BoxCommand, String>>,
 }
 
 impl ApprovalCtx {
@@ -812,6 +835,7 @@ impl ApprovalCtx {
             owner_asks: asks_unread(),
             probe,
             box_call: None,
+            box_command: None,
         };
         ctx.set_trust_roots(&defaults.trust_roots, uid);
         ctx
@@ -2085,6 +2109,9 @@ fn bash(prompt: &PromptV2, rows: &[String], ctx: &ApprovalCtx) -> Decision {
         return Decision::escalate(why);
     }
     let breaker = prompt.rm_breaker();
+    if let Some(b) = breaker.as_ref().filter(|b| breaker_not_ruled_out(b)) {
+        return breaker_read_only(prompt, rows, b, &rows[first_row], ctx);
+    }
     if let Some(Err(why)) = breaker.as_ref().map(resolvable_breaker) {
         return Decision::escalate(why);
     }
@@ -2248,8 +2275,9 @@ fn reading_name(line: &str) -> &'static str {
 /// `Ok` unless the Bash tool may run the line under zsh
 /// ([`ShellStartup::may_run_zsh`]) and a reading of it is not plain
 /// ([`plain_zsh_line`]): under zsh the read-only rule proves only a line
-/// written where the shell expands nothing. A startup not read is
-/// [`shell_models_hold`]'s refusal, made before this.
+/// whose expansions zsh takes no further than bash (a plain `$NAME`,
+/// `${NAME}` or `$(…)`, MEASURED 2026-10-22), which the classifier judges. A
+/// startup not read is [`shell_models_hold`]'s refusal, made before this.
 fn plain_under_zsh(readings: &[String], ctx: &ApprovalCtx) -> Result<(), String> {
     if !ctx.shell.as_ref().is_ok_and(ShellStartup::may_run_zsh) {
         return Ok(());
@@ -2281,6 +2309,133 @@ pub(crate) fn read_only_every_reading(
         }
     }
     Ok(())
+}
+
+/// Why no rule approves the nested breaker ([`RmBreakerKind::NestedUnanalyzed`]),
+/// read from 2.1.307's bundle and MEASURED: the vendor draws it only for a line
+/// whose parse put a shell keyword right after an assignment or a redirect
+/// (`X=1 if …`), when the `${ …; }` function substitutions in it overrun its
+/// budget of 16 or one does not parse. bash reads such a keyword as a program's
+/// name, and the classifier reads no `${ …; }` form, so no reading of such a
+/// line is ever proven a read.
+const NESTED_UNPROVEN: &str = "the vendor draws this only over a shell keyword right after an \
+                               assignment or a redirect (bash runs a program by that name) with \
+                               `${ …; }` function substitutions, neither of which aterm's \
+                               classifier proves a read";
+
+/// [`RULE_BREAKER_READ_ONLY`]: a breaker by which the vendor could not rule a
+/// removal out ([`breaker_not_ruled_out`]), which 2.1.307 draws over commands
+/// that name no rm. It is approved only where aterm's own reading proves the
+/// whole command a read, by the checks [`bash`]'s read-only rule trusts and
+/// with nothing narrowed. The command judged is the agent transcript's one
+/// pending Bash call ([`ApprovalCtx::box_command`]) where it draws as the
+/// box's rows exactly ([`box_command::drawn_as`]); otherwise every reading of
+/// the box's command ([`PromptV2::readings`]; a barred box's rows
+/// newline-joined too, since the screen cannot tell a wrap from a newline),
+/// and a refusal then says why the transcript's call was not taken. Each
+/// command judged classifies read-only, so every
+/// simple command in every substitution is a known read, no redirect writes,
+/// no word the line computes is a command's name and nothing evaluates text
+/// again (`eval`); the shell's startup is the modelled one, aliases and
+/// functions included ([`shell_models_hold`]); a line the Bash tool may run
+/// under zsh is plain ([`plain_under_zsh`]: no expansion zsh takes further
+/// than bash); its git
+/// reads load no configuration that runs a program ([`git_reads_clear`]). The
+/// command must name no `rm` or `rmdir` anywhere, in any letter case
+/// ([`names_a_removal`]), and the box must be the breaker's own `Yes`/`No`
+/// ([`yes_no_to_proceed`]). Only the too-many kind: the nested kind is
+/// [`NESTED_UNPROVEN`]. Every refusal escalates, its reason led by the
+/// breaker's label ([`rm_breaker_label`]).
+fn breaker_read_only(
+    prompt: &PromptV2,
+    rows: &[String],
+    b: &RmBreaker,
+    guard_row: &str,
+    ctx: &ApprovalCtx,
+) -> Decision {
+    let label = rm_breaker_label(b);
+    let refused = |why: String| Decision::escalate(format!("{label}: {why}"));
+    if b.kind != RmBreakerKind::TooManySubstitutions {
+        return refused(NESTED_UNPROVEN.to_string());
+    }
+    if let Err(why) = yes_no_to_proceed(prompt, rows) {
+        return refused(why);
+    }
+    // The transcript's call where it draws as the box exactly; else the
+    // screen's readings, and why the call was not taken.
+    let screen = || command_readings(prompt, rows, false);
+    let (readings, subject, from_transcript, not_taken) = match &ctx.box_command {
+        Some(Ok(call)) => match box_command::drawn_as(prompt, rows, &call.command) {
+            Ok(()) => (vec![call.command.clone()], call.command.clone(), true, None),
+            Err(why) => {
+                let (r, s) = screen();
+                let why = format!("the transcript's waiting Bash call is not the box's: {why}");
+                (r, s, false, Some(why))
+            }
+        },
+        Some(Err(why)) => {
+            let (r, s) = screen();
+            (
+                r,
+                s,
+                false,
+                Some(format!("no transcript call taken: {why}")),
+            )
+        }
+        None => {
+            let (r, s) = screen();
+            (r, s, false, None)
+        }
+    };
+    let refused = |why: String| {
+        refused(match (&not_taken, from_transcript) {
+            (_, true) => format!("{why} (judged on the transcript's command, drawn as the box)"),
+            (Some(not), false) => format!("{why}; {not}"),
+            (None, false) => why,
+        })
+    };
+    if let Some(line) = readings.iter().find(|l| names_a_removal(l)) {
+        return refused(format!(
+            "the command names rm or rmdir ({}), the removal the breaker could not rule out",
+            reading_name(line)
+        ));
+    }
+    let runs_on = prompt.runs_on();
+    let proven = read_only_every_reading(&readings, &ctx.python_allow)
+        .and_then(|()| shell_models_hold(&readings, runs_on.as_deref(), ctx))
+        .and_then(|()| plain_under_zsh(&readings, ctx))
+        .and_then(|()| git_reads_clear(&readings, runs_on.as_deref(), ctx));
+    if let Err(why) = proven {
+        return refused(why);
+    }
+    match once_choice(prompt) {
+        Ok(choice) => Decision::Approve {
+            rule_id: RULE_BREAKER_READ_ONLY,
+            choice,
+            guard: row_guard(guard_row),
+            subject,
+            unproven: None,
+        },
+        Err(why) => refused(why),
+    }
+}
+
+/// Whether `line` names `rm` or `rmdir` as a word anywhere, in any letter case
+/// (the vendor's own test, `/\brm(?:dir)?\b/`, made case-blind: a
+/// case-insensitive file system runs `RM` as `rm`). A word here is a run of
+/// ASCII letters, digits and `_`.
+fn names_a_removal(line: &str) -> bool {
+    let lower = line.to_ascii_lowercase();
+    let bytes = lower.as_bytes();
+    let word = |c: u8| c.is_ascii_alphanumeric() || c == b'_';
+    lower.match_indices("rm").any(|(at, _)| {
+        let mut end = at + 2;
+        if lower[end..].starts_with("dir") {
+            end += 3;
+        }
+        let before = at == 0 || !word(bytes[at - 1]);
+        before && bytes.get(end).is_none_or(|c| !word(*c))
+    })
 }
 
 /// `Ok` when [`RULE_RM_BREAKER`]'s resolver may judge this breaker: an `rm` on a

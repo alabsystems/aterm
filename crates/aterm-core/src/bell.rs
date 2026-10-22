@@ -26,18 +26,23 @@ pub struct BellFlash {
 
 impl BellFlash {
     /// A new, inactive flash (no deadline, nothing to paint).
-    pub fn new() -> Self {
-        Self::default()
+    #[must_use]
+    #[inline]
+    pub const fn new() -> Self {
+        Self { deadline: None }
     }
 
     /// A bell rang at `now`: (re)start the flash window. Ringing during an
     /// active flash extends it, so a bell flood reads as one continuous
     /// flash rather than strobing.
+    #[inline]
     pub fn ring(&mut self, now: Instant) {
         self.deadline = Some(now + FLASH_DURATION);
     }
 
     /// Whether the frame should be drawn flashed at `now`.
+    #[must_use]
+    #[inline]
     pub fn is_active(&self, now: Instant) -> bool {
         self.deadline.is_some_and(|d| now < d)
     }
@@ -47,13 +52,16 @@ impl BellFlash {
     /// Stays `Some` until [`expire`](Self::expire) observes the deadline
     /// passing, so a host that missed the exact instant still wakes up and
     /// repaints rather than presenting a stuck-inverted frame.
-    pub fn deadline(&self) -> Option<Instant> {
+    #[must_use]
+    #[inline]
+    pub const fn deadline(&self) -> Option<Instant> {
         self.deadline
     }
 
     /// Retire a finished flash: when the deadline has passed, clear it and
     /// return `true` (the host must repaint the normal frame). A still
     /// running or idle flash is left untouched and returns `false`.
+    #[inline]
     pub fn expire(&mut self, now: Instant) -> bool {
         match self.deadline {
             Some(d) if now >= d => {
@@ -76,7 +84,9 @@ pub struct BellRateLimiter {
 
 impl BellRateLimiter {
     /// A gate that allows at most one firing per `interval`.
-    pub fn new(interval: Duration) -> Self {
+    #[must_use]
+    #[inline]
+    pub const fn new(interval: Duration) -> Self {
         Self {
             interval,
             last: None,
@@ -85,6 +95,7 @@ impl BellRateLimiter {
 
     /// Whether a beep may fire at `now`; records the firing when allowed.
     /// The first call always fires.
+    #[inline]
     pub fn try_fire(&mut self, now: Instant) -> bool {
         if self
             .last

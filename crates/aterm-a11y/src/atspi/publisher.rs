@@ -180,6 +180,13 @@ pub trait Buses: Send + 'static {
     fn write_timeout(&self) -> Option<Duration> {
         Some(WRITE)
     }
+
+    /// The wait before the first attempt to join the accessibility bus again
+    /// ([`REJOIN_FIRST`]); each failure doubles it, up to [`REJOIN_MAX`]. A test's
+    /// may be short.
+    fn rejoin_first(&self) -> Duration {
+        REJOIN_FIRST
+    }
 }
 
 /// The desktop's buses: the session bus from `DBUS_SESSION_BUS_ADDRESS`, and
@@ -390,10 +397,10 @@ pub(super) struct Rejoin {
 }
 
 impl Rejoin {
-    /// The attempt after `last`'s: [`REJOIN_FIRST`] from now, or twice
-    /// `last`'s wait, at most [`REJOIN_MAX`].
-    pub(super) fn next(last: Option<Rejoin>, now: Instant) -> Option<Rejoin> {
-        let after = last.map_or(REJOIN_FIRST, |r| r.after.saturating_mul(2).min(REJOIN_MAX));
+    /// The attempt after `last`'s: `first` ([`Buses::rejoin_first`]) from now, or
+    /// twice `last`'s wait, at most [`REJOIN_MAX`].
+    pub(super) fn next(last: Option<Rejoin>, now: Instant, first: Duration) -> Option<Rejoin> {
+        let after = last.map_or(first, |r| r.after.saturating_mul(2).min(REJOIN_MAX));
         now.checked_add(after).map(|at| Rejoin { at, after })
     }
 }
@@ -502,7 +509,7 @@ impl Worker {
                 aterm_log::debug!(
                     "accessibility: org.a11y.Status.IsEnabled: {e}; trying again later"
                 );
-                self.rejoin = Rejoin::next(self.rejoin, Instant::now());
+                self.rejoin = Rejoin::next(self.rejoin, Instant::now(), self.buses.rejoin_first());
                 return Ok(());
             }
             Err(e) => {
@@ -538,7 +545,7 @@ impl Worker {
         let conn = match joined {
             Ok(conn) => conn,
             Err(e) => {
-                let rejoin = Rejoin::next(self.rejoin, Instant::now());
+                let rejoin = Rejoin::next(self.rejoin, Instant::now(), self.buses.rejoin_first());
                 let again = rejoin.map_or_else(
                     || "when at-spi2-core's status changes".to_string(),
                     |r| {

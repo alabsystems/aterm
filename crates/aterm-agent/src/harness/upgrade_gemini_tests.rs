@@ -976,3 +976,62 @@ fn the_line_carries_the_homes_and_the_person_is_told_where_to_run_it() {
     );
     assert_eq!(package_version(r#"{"name":"other","version":"1"}"#), None);
 }
+
+/// A SESSION FILE GEMINI CLI WROTE BEFORE ITS FOLDER-TRUST DIALOG WAS
+/// ANSWERED — MEASURED in the lab (0.46.0, 2026-10-21, a launch under
+/// `--session-id` and no first prompt in a folder it did not trust; the
+/// lab's scratch home path elided to `/lab/gemini-home`): its header and the
+/// CLI's own `<session_context>`, nothing else. Its `Trust folder` restarted
+/// it onto this file and the restart was refused (`42`).
+const TURNLESS_SESSION: &str = concat!(
+    r##"{"sessionId":"22222222-3333-4444-8555-666666666666","projectHash":"db63f153cf1f3aa6fe8af943ea8677baf866f81f77f020c6f1fce682f46d9db2","startTime":"2026-10-22T05:07:59.626Z","lastUpdated":"2026-10-22T05:07:59.626Z","kind":"main"}"##,
+    "\n",
+    r##"{"$set":{"messages":[{"id":"d04923d38bb0f6017037e74183378ef4","timestamp":"2026-10-22T05:07:59.626Z","type":"user","content":[{"text":"<session_context>\nThis is the Gemini CLI. We are setting up the context for our chat.\nToday's date is Wednesday, October 21, 2026 (formatted according to the user's locale).\nMy operating system is: darwin\nThe project's temporary directory is: /lab/gemini-home/.gemini/tmp/proj\n- **Workspace Directories:**\n  - /private/tmp/at.LZsG/proj\n- **Directory Structure:**\n\nShowing up to 200 items (files + folders).\n\n/private/tmp/at.LZsG/proj/\n\n\n\n</session_context>"}]}],"lastUpdated":"2026-10-22T05:07:59.626Z"}}"##,
+    "\n"
+);
+
+/// WHAT A RESTART BEFORE THE FIRST TURN LEAVES, AND WHETHER ITS LAUNCH
+/// CARRIED A FIRST PROMPT: the measured session file of a folder-trust
+/// restart holds no turn ([`Precheck::NoTurns`]: its `<session_context>` is
+/// the CLI's, no person's message), and [`carries_first_prompt`] reads the
+/// launch's `-i`/`--prompt-interactive` (either spelling), a positional and
+/// words after `--`. NEGATIVE CONTROLS: the same file with a turn after it is
+/// SAFE; a launch of flags alone (its `--session-id`, `--model`, a
+/// `--resume`, a switch's `false`, a bare `--`) carries none, and an argv
+/// the table cannot read is held to carry one.
+#[test]
+fn a_restart_before_the_first_turn_leaves_no_turn_and_its_prompt_is_read() {
+    let id = "22222222-3333-4444-8555-666666666666";
+    let name = format!("session-2026-10-22T05-07-{}.jsonl", &id[..8]);
+    assert_eq!(
+        precheck(&[file(&name, TURNLESS_SESSION)], id),
+        Precheck::NoTurns
+    );
+    let with_turn = format!(
+        "{TURNLESS_SESSION}{}\n",
+        turn("2026-10-22T05:08:49.728Z", "u1", "g1")
+    );
+    assert!(matches!(
+        precheck(&[file(&name, &with_turn)], id),
+        Precheck::Safe { turns: 2, .. }
+    ));
+    for prompted in [
+        launch(&["--session-id", id, "--prompt-interactive=fix it"]),
+        launch(&["--session-id", id, "--prompt-interactive", "fix it"]),
+        launch(&["--session-id", id, "-i", "fix it"]),
+        launch(&["--session-id", id, "fix it"]),
+        launch(&["--session-id", id, "--", "fix", "it"]),
+    ] {
+        assert!(carries_first_prompt(&prompted), "{prompted:?}");
+    }
+    for bare in [
+        launch(&["--session-id", id]),
+        launch(&["--model", "gemini-3.5-flash", "--session-id", id]),
+        launch(&["--resume", id]),
+        launch(&["--sandbox", "false", "--session-id", id]),
+        launch(&["--session-id", id, "--"]),
+    ] {
+        assert!(!carries_first_prompt(&bare), "{bare:?}");
+    }
+    assert!(carries_first_prompt(&launch(&["--no-such-flag"])));
+}

@@ -117,3 +117,31 @@ mod windows_console_image;
 mod worker_held_live_headless;
 #[cfg(unix)]
 mod worker_spawn_live_headless;
+
+/// TWICE AS MANY TESTS AT ONCE AS CORES, unless the run names its own count
+/// (`RUST_TEST_THREADS`, or `--test-threads`, which libtest reads over it). The live tests here
+/// spend their time waiting on the instances they boot, not computing (a supervisor answers a
+/// question every 1.8 s, its settles), so at libtest's one test per core the binary was
+/// idle-bound: 24.9-25.9 s at 18 threads against 17.5-17.6 s at 36, at loads of 22 to 54, every
+/// run green (2026-10-22). Set at load time because a test binary has no other say in its
+/// thread count: libtest reads the variable after `main` starts.
+#[cfg(unix)]
+extern "C" fn widen_test_threads() {
+    if std::env::var_os("RUST_TEST_THREADS").is_none() {
+        let n = std::thread::available_parallelism().map_or(2, |n| n.get().saturating_mul(2));
+        // SAFETY: load time, before `main`: no other thread exists to read the environment.
+        unsafe { std::env::set_var("RUST_TEST_THREADS", n.to_string()) };
+    }
+}
+
+#[cfg(unix)]
+#[used]
+#[cfg_attr(
+    target_vendor = "apple",
+    unsafe(link_section = "__DATA,__mod_init_func,mod_init_funcs")
+)]
+#[cfg_attr(
+    any(target_os = "linux", target_os = "android"),
+    unsafe(link_section = ".init_array")
+)]
+static WIDEN_TEST_THREADS: extern "C" fn() = widen_test_threads;

@@ -188,19 +188,23 @@ impl CarriedFrame {
     }
 }
 
-/// Where a restored window goes before it is first shown (Windows): the outer
-/// position its layout row persisted, validated against the live monitors when
-/// the attach applies it, and whether it was maximized. Staged on the window
-/// ([`App::stage_restore_placement`]) and taken by its first
+/// Where a restored window goes before it is first shown (Windows, and X11's
+/// position): the outer position its layout row persisted, validated against the
+/// live monitors when the attach applies it, and whether it was maximized. Staged
+/// on the window ([`App::stage_restore_placement`]) and taken by its first
 /// [`App::attach_os_window`], which places the window while it is still hidden.
-#[cfg(windows)]
+/// An X11 window manager places a window it maps itself unless its position was
+/// set first (aterm-window marks a hidden window's position USPosition), and acts
+/// on a maximize only once the window is mapped: Linux takes the position here and
+/// maximizes after the reveal, as before.
+#[cfg(any(windows, target_os = "linux"))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct RestorePlacement {
     pub(crate) outer: Option<(i32, i32)>,
     pub(crate) maximized: bool,
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 impl App {
     /// Stage window `wid`'s persisted place (`outer`, and `maximized` when
     /// `Some(true)`; `None` never forces a change) for its first attach, which
@@ -752,9 +756,9 @@ impl App {
         if let Some(ws) = self.windows.get_mut(&wid) {
             ws.take_carried_frame(carried_inner_px);
         }
-        #[cfg(windows)]
+        #[cfg(any(windows, target_os = "linux"))]
         self.stage_restore_placement(wid, placement.0, placement.1);
-        #[cfg(not(windows))]
+        #[cfg(not(any(windows, target_os = "linux")))]
         let _ = placement;
         if !self.headless && !self.attach_os_window(el, wid) {
             // GPU surface failed: roll back the just-created window + its fresh
@@ -1218,11 +1222,16 @@ impl App {
         // window icon, and its compositor takes the icon from the desktop entry the
         // app_id names. The first window presents the launcher's startup token
         // (`startup_token`), which ends the launch's busy cursor or spinner.
+        //
+        // An X11 window's background is the colour its first frame paints
+        // (`early_reveal_backdrop`): the X server shows it from the map until that
+        // frame, and in any area a resize adds until the frame of the new size.
         #[cfg(target_os = "linux")]
         let attrs = {
             use aterm_window::platform::wayland::{
                 ActiveEventLoopExtWayland as _, WindowAttributesExtWayland,
             };
+            use aterm_window::platform::x11::WindowAttributesExtX11 as _;
             let wayland = el.is_wayland();
             let attrs = attrs
                 .with_name("aterm", "aterm")
@@ -1230,7 +1239,9 @@ impl App {
             let attrs = if wayland {
                 attrs
             } else {
-                attrs.with_window_icon(crate::desktop_files::window_icon())
+                attrs
+                    .with_window_icon(crate::desktop_files::window_icon())
+                    .with_x11_background(self.early_reveal_backdrop())
             };
             match crate::startup_token::take_for_first_window(wayland) {
                 Some(token) => attrs.with_activation_token(token),
@@ -1248,7 +1259,20 @@ impl App {
         // created visible appears at the OS default spot with the OS's own
         // caption (a light one on a light desktop) and is then resized,
         // cascaded and re-tinted on glass.
-        let reveal_after_chrome = pending_join || cfg!(windows);
+        //
+        // An X11 window restored to a place is created hidden too, and shown once it
+        // stands there (`RestorePlacement`): mutter maps a window at a spot of its own
+        // unless its position was set before the map, and it would then hop.
+        #[cfg(target_os = "linux")]
+        let placed_before_reveal =
+            !aterm_window::platform::wayland::ActiveEventLoopExtWayland::is_wayland(el)
+                && self
+                    .windows
+                    .get(&wid)
+                    .is_some_and(|ws| ws.restore_placement.is_some());
+        #[cfg(not(target_os = "linux"))]
+        let placed_before_reveal = false;
+        let reveal_after_chrome = pending_join || cfg!(windows) || placed_before_reveal;
         let attrs = if reveal_after_chrome || defer_reveal {
             attrs.with_visible(false)
         } else {
@@ -1690,8 +1714,9 @@ impl App {
         #[cfg(windows)]
         crate::platform_win::note_caption_surface(&window, self.caption_surface_tone(wid));
         // Paint the window background the theme background so the transparent
-        // titlebar reads as part of the terminal body. Before the GPU/CPU split,
-        // since the GPU arm returns. No-op off macOS.
+        // titlebar reads as part of the terminal body (on X11: the background the
+        // server paints until a frame covers it). Before the GPU/CPU split,
+        // since the GPU arm returns. No-op on Wayland.
         self.apprt
             .window_set_background_color(&window, self.theme.bg);
         // Apply the configured chrome appearance (`window_theme`) at attach, before
@@ -1708,7 +1733,9 @@ impl App {
         // was, instead of at the cascade or the OS default and then hopping and
         // playing the maximize animation on glass. An early-revealed window
         // already took its position before the join (and is never maximized).
-        #[cfg(windows)]
+        // X11 takes the position here and maximizes after the reveal (the restore's
+        // own step), since a window manager acts on a maximize only for a mapped window.
+        #[cfg(any(windows, target_os = "linux"))]
         if let Some(placement) = self
             .windows
             .get_mut(&wid)
@@ -1720,6 +1747,7 @@ impl App {
             {
                 window.set_outer_position(aterm_window::dpi::PhysicalPosition::new(x, y));
             }
+            #[cfg(windows)]
             if placement.maximized {
                 window.set_maximized(true);
             }
@@ -1929,7 +1957,7 @@ impl App {
             }
         }
         // CPU present path (CoreGraphics on macOS, MIT-SHM / wl_shm on Linux,
-        // `softbuffer` on Windows; see `crate::present`). A surface failure drops the window and returns false
+        // GDI on Windows; see `crate::present`). A surface failure drops the window and returns false
         // so only this window is declined.
         let surface = match crate::present::CpuSurface::new(window.clone()) {
             Ok(s) => s,

@@ -5,14 +5,15 @@
 # THE DIRECTORY AND THE PACKAGE NAME DIFFER ON PURPOSE, as with
 # crates/aterm-windows-sys-052: `[patch.crates-io]` matches on PACKAGE name,
 # so this must be called `windows-sys` to take the `windows-sys = "0.61"`
-# edges of winit (crates/aterm-window) and softbuffer, and the directory
+# edge of winit (crates/aterm-window), and the directory
 # keeps the `aterm-` prefix so it reads as ours
 # (docs/AUDIT-third-party-2026-10-15.md, windows-bindings step 3).
 # aterm-http and aterm-net, which asked `^0.61` here, name aterm-win32
-# directly since WB.2 (the audit's section 5.5).
+# directly since WB.2 (the audit's section 5.5); softbuffer, which asked it
+# too, left at linux-windowing LW.3.
 name = "windows-sys"
 # NOT `version.workspace = true`: a SEMVER CONTRACT with the consumers, not an
-# aterm release number. winit and softbuffer ask `^0.61.2`, and no lock-only
+# aterm release number. winit asks `^0.61.2`, and no lock-only
 # parent is left (async-io, async-signal, errno, polling, rustix 1.x,
 # tempfile, uds_windows and zbus have all left the lock; rustix, errno and
 # polling at linux-windowing LW.7); 0.61.2 is what the lock held, so the

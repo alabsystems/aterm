@@ -203,7 +203,8 @@ pub enum Approve {
     /// would rewrite the agent's own settings). The default.
     All,
     /// Only a box [`super::policy::approval::decide`] proves safe: a read-only
-    /// command, a trust dialog under [`SupervisorConfig::trust_roots`], a read
+    /// command (under the rm breaker's too-many box too, when it names no rm), a
+    /// trust dialog under [`SupervisorConfig::trust_roots`], a read
     /// under an allowed root and outside the secrets list
     /// ([`super::policy::ApprovalCtx::read_roots`]), an rm under a scratch root.
     Safe,

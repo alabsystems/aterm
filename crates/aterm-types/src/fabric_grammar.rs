@@ -31,6 +31,7 @@ pub const TOPIC_MAX: usize = PRINCIPAL_NAME_MAX;
 /// Whether `p` is a well-formed bare principal: a class prefix and `[a-z0-9-]{1,32}` (§3.2).
 /// Bare means no `<owner>@<node>` endpoint address; a subject segment and a `via=` hop are
 /// always bare.
+#[inline]
 #[must_use]
 pub fn is_principal(p: &str) -> bool {
     let Some(name) = PRINCIPAL_CLASSES.iter().find_map(|c| p.strip_prefix(c)) else {
@@ -46,6 +47,7 @@ pub fn is_principal(p: &str) -> bool {
 /// last segment of a subject and a `topic=` token on a `deliver` line and a `msg` row, so it
 /// refuses `/` (a new segment), whitespace (a new field) and `*` (a wildcard), and opens
 /// alphanumeric so it never reads as a flag or relative path.
+#[inline]
 #[must_use]
 pub fn is_topic(t: &str) -> bool {
     let mut cs = t.chars();
@@ -72,6 +74,7 @@ pub const KINDS: [&str; 9] = [
 ];
 
 /// Whether `k` is one of [`KINDS`].
+#[inline]
 #[must_use]
 pub fn is_kind(k: &str) -> bool {
     KINDS.contains(&k)
@@ -87,6 +90,7 @@ pub const ANSWER_KINDS: [&str; 3] = ["answer", "report", "ack"];
 pub const VERDICTS: [&str; 3] = ["handled", "refused", "deferred"];
 
 /// Whether `v` is one of [`VERDICTS`].
+#[inline]
 #[must_use]
 pub fn is_verdict(v: &str) -> bool {
     VERDICTS.contains(&v)
@@ -105,6 +109,7 @@ pub const VIA_MAX_BYTES: usize = VIA_MAX_HOPS * (PRINCIPAL_MAX + 1);
 /// Whether a `via=` chain may be accepted (`deliver`) or sent (`post`): one to
 /// [`VIA_MAX_HOPS`] comma-separated bare principals in at most [`VIA_MAX_BYTES`]. An empty
 /// chain is refused: a relay claim naming no relay still demotes the record's kind.
+#[inline]
 #[must_use]
 pub fn via_ok(via: &str) -> bool {
     !via.is_empty()
@@ -141,6 +146,7 @@ pub enum Bye {
 
 impl Bye {
     /// The wire word: `quit` or `handoff`.
+    #[inline]
     #[must_use]
     pub const fn word(self) -> &'static str {
         match self {
@@ -150,6 +156,7 @@ impl Bye {
     }
 
     /// The word back, or `None` for anything else.
+    #[inline]
     #[must_use]
     pub fn parse(word: &str) -> Option<Self> {
         match word {

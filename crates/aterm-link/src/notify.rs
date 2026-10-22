@@ -3146,8 +3146,9 @@ mod tests {
 
     /// A broker opened as aterm opens an ordered one, but with NO HORIZON, so
     /// its durable head moves only for an escalated record or a
-    /// `flush_durable` — what this file's ordered tests depend on, and
-    /// nothing else. `None` where astream serves ordered strict (off macOS):
+    /// `flush_durable` — what the `--once` test below depends on, and nothing
+    /// else (the follow-mode one keeps aterm's horizon, which is what it
+    /// proves). `None` where astream serves ordered strict (off macOS):
     /// there every record is durable when visible, and the tests say so.
     fn ordered_broker(log: &Path) -> Option<astream_broker::Broker> {
         let mut opts = crate::durability::Durability::Ordered.options();
@@ -3261,6 +3262,150 @@ mod tests {
                 );
             }
             drop(conn);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    /// Take a follow-mode reader's notices into `n` until `done` holds, under
+    /// a one-minute hang detector (`what` names what never happened). Returns
+    /// the kind of the last notice taken: the one that made `done` hold, when
+    /// only taking a notice can.
+    fn pump(
+        n: &mut Notifier,
+        rx: &mpsc::Receiver<Notice>,
+        what: &str,
+        done: impl Fn(&Notifier) -> bool,
+    ) -> &'static str {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let mut last = "none";
+        while !done(n) {
+            assert!(Instant::now() < deadline, "{what}: never happened");
+            match rx.recv_timeout(Duration::from_millis(10)) {
+                Ok(notice) => {
+                    last = match notice {
+                        Notice::Record(..) => "record",
+                        Notice::Checkpoint(..) => "checkpoint",
+                        Notice::Log(..) => "log",
+                        Notice::Durable(..) => "durable",
+                    };
+                    n.take(notice).expect("take");
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => panic!("{what}: the reader ended"),
+            }
+        }
+        last
+    }
+
+    /// **IN FOLLOW MODE, ON A BROKER OPENED AS ATERM OPENS AN ORDERED ONE, THE
+    /// HORIZON ALONE PAGES AN ATTENTION ROW.** The broker takes
+    /// `Durability::Ordered.options()` unchanged — aterm's 100 ms horizon and
+    /// escalation table, not [`ordered_broker`]'s no horizon — and a
+    /// follow-mode reader subscribes. One attention row is raised (a presence
+    /// record: not escalated), and then nothing: nobody calls `flush_durable`
+    /// and nothing else is published. The broker's writer flushes in full on
+    /// its own timer (astream's `the_horizon_flushes_an_idle_broker_on_its_timer`,
+    /// `broker.ordered-tier`), the subscription is sent a durable mark past the
+    /// row, and that mark is what pages it: once, for one full flush. The writer
+    /// may notice the due horizon after the batch or on its timed wake; both
+    /// paths are valid regardless of when the OS schedules it. Every wait is a
+    /// one-minute hang detector, never a latency budget.
+    ///
+    /// NEGATIVE CONTROLS: the notifier before the wait (its dev seam's field
+    /// off) pages the row as it reads it, not on a durable mark. A premature
+    /// full flush after every batch is rejected separately by astream's
+    /// `a_long_horizon_flushes_nothing_early`.
+    #[cfg(unix)]
+    #[test]
+    fn in_follow_mode_the_horizon_alone_pages_an_attention_row() {
+        for wait in [true, false] {
+            let dir = scratch(&format!("horizon-{wait}"));
+            let base = PathBuf::from(&dir);
+            std::fs::create_dir_all(&base).expect("scratch");
+            let log = base.join("h.log");
+            let sock = base.join("h.sock");
+            let broker = astream_broker::Broker::open_opts(
+                &log,
+                crate::durability::Durability::Ordered.options(),
+                || Ok(astream_broker::Prepared::Nothing),
+            )
+            .expect("open");
+            let served = broker.served_durability();
+            if served.served != astream_broker::Tier::Ordered {
+                eprintln!("ordered is served strict here: nothing waits, nothing to prove");
+                let _ = std::fs::remove_dir_all(&dir);
+                return;
+            }
+            assert_eq!(served.horizon_ms, Some(100), "aterm's own horizon");
+            let mut server = broker.serve(&sock).unwrap();
+            let fired = base.join("fired");
+            let mut c = cfg(&dir);
+            c.broker = sock.to_string_lossy().into_owned();
+            c.since = Since::Start;
+            c.once = false;
+            c.limit = 10;
+            c.exec = format!(
+                "printf '%s\\n' \"$ATERM_NOTIFY_OFFSET\" >> {}",
+                fired.display()
+            );
+            let mut n = Notifier::new(c.clone()).expect("open");
+            n.wait_durable = wait;
+            let (tx, rx) = notice_handoff();
+            let follower = {
+                let root = n.store.root.clone();
+                std::thread::spawn(move || reader(0, &Sel::Attention, &c, &root, &tx))
+            };
+            // Caught up and subscribed: the reader's tail parks on the broker.
+            pump(&mut n, &rx, "the reader's subscription", |_| {
+                broker.stats().parked_tails == 1
+            });
+            let start = broker.flush_counts().full;
+            let (mut conn, _) = transport::connect(&sock.to_string_lossy(), ACK_DEADLINE).unwrap();
+            let raised = conn
+                .publish(
+                    7,
+                    1,
+                    "/f/f1/pub/n-a/s-x/presence",
+                    b"v=1 t=1 attention=needs%20a%20key",
+                )
+                .unwrap()
+                .0;
+            let by = pump(&mut n, &rx, "the page", |_| {
+                !fired_offsets(&fired).is_empty()
+            });
+            assert_eq!(fired_offsets(&fired), [raised], "{wait}: paged once");
+            if wait {
+                assert_eq!(by, "durable", "the durable mark is what paged it");
+                assert!(broker.durable_head() > raised);
+                assert_eq!(
+                    broker.flush_counts().full,
+                    start + 1,
+                    "one full flush, the horizon's"
+                );
+                assert_eq!(n.held_bytes, 0);
+                assert_eq!(n.log_store.cursor(&Sel::Attention.key()), Some(raised + 1));
+            } else {
+                assert_eq!(by, "record", "NEGATIVE CONTROL: paged as it was read");
+            }
+            // The executor gone, the reader ends at its next notice: another row.
+            drop(rx);
+            conn.publish(
+                7,
+                2,
+                "/f/f1/pub/n-a/s-y/presence",
+                b"v=1 t=1 attention=disk",
+            )
+            .unwrap();
+            let deadline = Instant::now() + Duration::from_secs(60);
+            while !follower.is_finished() {
+                assert!(Instant::now() < deadline, "the reader never ended");
+                std::thread::yield_now();
+            }
+            follower.join().expect("the reader");
+            drop(conn);
+            // Stopped cleanly before its directory goes.
+            server.shutdown();
+            drop(broker);
             let _ = std::fs::remove_dir_all(&dir);
         }
     }

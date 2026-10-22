@@ -101,6 +101,7 @@ pub(crate) enum ReaderMotion {
 /// that scrolled into history since (`counter`): a reader off the live bottom
 /// rides up with the content they were reading; a reader at the live bottom
 /// stays there.
+#[inline]
 fn grown_from_live(rows: usize, at_counter: u64, counter: u64) -> usize {
     if rows == 0 {
         return 0;
@@ -113,6 +114,7 @@ impl DetachedReaderAim {
     /// is back with the row counter at `counter`, given `restored` (where the
     /// re-attach's own rule would put the reader). An aim above the attached
     /// rows lands at least as far up as asked and never below `restored`.
+    #[inline]
     fn resolve(self, counter: u64, sb: usize, restored: usize) -> usize {
         match self {
             DetachedReaderAim::Above { rows, at_counter } => {
@@ -333,14 +335,16 @@ const _: fn() = || {
 impl PendingScrollbackReflow {
     /// The width this history will be rewrapped to.
     #[must_use]
+    #[inline]
     #[cfg(test)]
-    pub fn new_cols(&self) -> u16 {
+    pub const fn new_cols(&self) -> u16 {
         self.new_cols
     }
 
     /// Input lines read so far, of [`Self::lines_total`]: monotone, and equal to
     /// the total on the step that returns `Done`.
     #[must_use]
+    #[inline]
     pub fn lines_done(&self) -> usize {
         self.lines_read.min(self.lines_total)
     }
@@ -349,13 +353,15 @@ impl PendingScrollbackReflow {
     /// [`Self::line_count`], which moves as the stream consumes input and
     /// re-fills the store with output).
     #[must_use]
-    pub fn lines_total(&self) -> usize {
+    #[inline]
+    pub const fn lines_total(&self) -> usize {
         self.lines_total
     }
 
     /// The history lines the job holds now, input and output (tiered + lazy +
     /// ring), for logging.
     #[must_use]
+    #[inline]
     pub fn line_count(&self) -> usize {
         self.store.line_count() + self.lazy_lines.len() + self.ring_lines.len()
     }
@@ -588,14 +594,16 @@ fn carve_completed_runs(
 impl ReflowedScrollback {
     /// The width this history was rewrapped to.
     #[must_use]
+    #[inline]
     #[cfg(test)]
-    pub fn new_cols(&self) -> u16 {
+    pub const fn new_cols(&self) -> u16 {
         self.new_cols
     }
 
     /// The number of rewrapped history lines ready to re-attach (store +
     /// ring history).
     #[must_use]
+    #[inline]
     pub fn line_count(&self) -> usize {
         self.store.line_count() + self.ring_out.len()
     }

@@ -186,7 +186,7 @@ pub const USAGE: &str = "\
 usage: aterm fabric [status] [--json]
        aterm fabric tail [--bodies] [--from <offset>] [--filter <subject-filter>]
        aterm fabric brief [@<sid>[@<node>]] [--window <records>] [--budget <tokens>]
-                          [--cap-file <path>]
+                          [--cap-file <path>] [--json]
        aterm fabric on  [--dry-run] [--fleet <F>] [--service launchd|systemd|none]
                         [--durability strict|ordered|relaxed]
        aterm fabric off [--dry-run] [--service launchd|systemd|none]
@@ -241,7 +241,10 @@ control sockets (fabric.toml) is read when the file has no command.
                    GUARDED broker whose grants do not cover /f/<F>/> (every one
                    `on` runs) every read is made over the faces the cap files
                    grant, and BROKER says which
-  --json           status only: the same data as one JSON object
+  --json           status and brief: the same data as one JSON object (brief's
+                   holds one object per session, ids, closed words and counts:
+                   node, sid, this, ep, need, detail, open, mail_in, mail_out,
+                   last_seq, age_s, partial)
   tail             follow the bus live, one line per record, until Ctrl-C
   --from <offset>  tail only: replay from that bus offset first (default: new
                    records only)
@@ -4790,8 +4793,9 @@ fn push_kvs(out: &mut String, kvs: &[(&str, String)]) {
 
 /// A JSON value, rendered by hand: this crate carries no JSON writer and the
 /// shape is small. Strings go through `glance`'s escaper, so a value that came
-/// off the bus can never close its string or carry a control byte.
-enum J {
+/// off the bus can never close its string or carry a control byte. `status
+/// --json`'s and `brief --json`'s ([`crate::fabric_brief`]) one writer.
+pub(crate) enum J {
     Null,
     Bool(bool),
     Num(u64),
@@ -4801,16 +4805,16 @@ enum J {
 }
 
 impl J {
-    fn s(v: &str) -> J {
+    pub(crate) fn s(v: &str) -> J {
         J::Str(v.to_string())
     }
-    fn opt_s(v: Option<&str>) -> J {
+    pub(crate) fn opt_s(v: Option<&str>) -> J {
         v.map_or(J::Null, J::s)
     }
-    fn opt_n(v: Option<u64>) -> J {
+    pub(crate) fn opt_n(v: Option<u64>) -> J {
         v.map_or(J::Null, J::Num)
     }
-    fn render(&self, out: &mut String) {
+    pub(crate) fn render(&self, out: &mut String) {
         match self {
             J::Null => out.push_str("null"),
             J::Bool(b) => out.push_str(if *b { "true" } else { "false" }),

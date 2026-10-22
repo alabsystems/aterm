@@ -80,30 +80,35 @@ impl Errno {
     pub const NOSYS: Self = Self(libc::ENOSYS);
 
     /// The raw `errno` value.
+    #[inline]
     #[must_use]
     pub const fn raw_os_error(self) -> i32 {
         self.0
     }
 
     /// Return `true` when this errno is `ENOENT`.
+    #[inline]
     #[must_use]
     pub const fn is_noent(self) -> bool {
         self.0 == libc::ENOENT
     }
 
     /// Return `true` when this errno is `EINVAL`.
+    #[inline]
     #[must_use]
     pub const fn is_inval(self) -> bool {
         self.0 == libc::EINVAL
     }
 
     /// The current thread's `errno`, read immediately after a failed call.
+    #[inline]
     fn last() -> Self {
         Self(std::io::Error::last_os_error().raw_os_error().unwrap_or(0))
     }
 }
 
 /// Encode a directory-relative inode identity (`dev`, `ino`) into 16 little-endian bytes.
+#[inline]
 #[must_use]
 pub const fn encode_inode_identity_le(dev: u64, ino: u64) -> [u8; 16] {
     [
@@ -127,6 +132,7 @@ pub const fn encode_inode_identity_le(dev: u64, ino: u64) -> [u8; 16] {
 }
 
 /// Decode 16 little-endian bytes into a directory-relative inode identity (`dev`, `ino`).
+#[inline]
 #[must_use]
 pub const fn decode_inode_identity_le(bytes: [u8; 16]) -> (u64, u64) {
     let dev = (bytes[0] as u64)
@@ -301,12 +307,14 @@ impl RenameFlags {
     pub const NOREPLACE: Self = Self(1);
 
     /// No flags — equivalent to a plain [`renameat`].
+    #[inline]
     #[must_use]
     pub const fn empty() -> Self {
         Self(0)
     }
 
     /// Whether every bit of `other` is set here.
+    #[inline]
     #[must_use]
     pub const fn contains(self, other: Self) -> bool {
         self.0 & other.0 == other.0
@@ -315,6 +323,7 @@ impl RenameFlags {
 
 impl std::ops::BitOr for RenameFlags {
     type Output = Self;
+    #[inline]
     fn bitor(self, rhs: Self) -> Self {
         Self(self.0 | rhs.0)
     }
@@ -366,18 +375,21 @@ pub struct FileType(u32);
 )]
 impl FileType {
     /// Extract the type from a raw `st_mode`.
+    #[inline]
     #[must_use]
     pub const fn from_raw_mode(mode: u32) -> Self {
         Self(mode & libc::S_IFMT as u32)
     }
 
     /// A directory.
+    #[inline]
     #[must_use]
     pub const fn is_dir(self) -> bool {
         self.0 == libc::S_IFDIR as u32
     }
 
     /// A regular file.
+    #[inline]
     #[must_use]
     pub const fn is_file(self) -> bool {
         self.0 == libc::S_IFREG as u32
@@ -616,6 +628,7 @@ pub struct DirEntry {
 impl DirEntry {
     /// The entry's name. `.` and `..` are returned, as `readdir` returns them;
     /// callers filter.
+    #[inline]
     #[must_use]
     pub fn file_name(&self) -> &CStr {
         &self.name

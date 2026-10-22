@@ -108,7 +108,8 @@ pub fn activate_build(layout: &Layout, build_dir: &Path) -> io::Result<()> {
 
 /// Install `bin/` shims for the manifest's raw `exposes` list, each forwarding to the tool's
 /// executable in `<build_dir>/bin/`. A name that fails [`crate::store::shim_allowed`] never
-/// becomes a [`ToolName`] and is skipped; returns the refused raw names for `status.toml`.
+/// becomes a [`ToolName`] and is skipped; returns the refused raw names, for the caller to
+/// say (a landing records them, [`crate::status::record_refused_shims`]).
 pub fn install_shims(
     layout: &Layout,
     build_dir: &Path,
@@ -806,6 +807,66 @@ pub(crate) fn reassert_shim_env(layout: &Layout, builds: &[(&Path, &[ToolName])]
     }
 }
 
+/// The store build a `bin/` entry named `name` (a file name, `pwsh.cmd` on Windows) at
+/// `shim` forwards into, when it is a shim under a name no shim may carry now
+/// ([`ToolName::from_shim_file`] refuses it: a shell, another command a shim must never
+/// intercept, a name that is not plain ASCII) and its target lies in this prefix's store
+/// ([`crate::ops::store_build_of`]). Only an older atpkg laid such a shim, before its name
+/// joined the deny-list (design S13); nothing this build writes is one, and an entry that
+/// forwards anywhere else (a link a person made, a tombstone) is never one.
+pub(crate) fn refused_name_shim(layout: &Layout, name: &str, shim: &Path) -> Option<(String, u64)> {
+    if ToolName::from_shim_file(name).is_some() {
+        return None;
+    }
+    crate::platform::resolve_shim(shim)
+        .and_then(|target| crate::ops::store_build_of(&layout.prefix, &target))
+}
+
+/// The `bin/` shims [`refused_name_shim`] names (`program`: only those into that program's
+/// store), as (file name, path), by name.
+fn refused_name_entries(layout: &Layout, program: Option<&str>) -> Vec<(String, PathBuf)> {
+    let Ok(entries) = crate::ops::read_bin_dir(layout) else {
+        return Vec::new();
+    };
+    let mut found: Vec<(String, PathBuf)> = entries
+        .flatten()
+        .filter(|entry| !crate::lay::in_flight_here(&entry.file_name()))
+        .filter_map(|entry| {
+            let name = entry.file_name().to_str()?.to_string();
+            let (owner, _) = refused_name_shim(layout, &name, &entry.path())?;
+            program
+                .is_none_or(|want| owner == want)
+                .then(|| (name, entry.path()))
+        })
+        .collect();
+    found.sort();
+    found
+}
+
+/// The file names of the `bin/` shims [`refused_name_shim`] names, by name: what
+/// [`remove_refused_name_shims`] would remove.
+pub(crate) fn refused_name_shims(layout: &Layout) -> Vec<String> {
+    refused_name_entries(layout, None)
+        .into_iter()
+        .map(|(name, _)| name)
+        .collect()
+}
+
+/// Remove every `bin/` shim [`refused_name_shim`] names (`program`: only those into that
+/// program's store), and return the file names removed. The sweep `aterm pkg repair`, every
+/// pass's base relay and a revocation run, so a shim an older atpkg laid under a name now
+/// refused never outlives the upgrade, and never keeps a revoked build running.
+pub(crate) fn remove_refused_name_shims(layout: &Layout, program: Option<&str>) -> Vec<String> {
+    let _publication = crate::lay::PUBLICATION_TURN
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    refused_name_entries(layout, program)
+        .into_iter()
+        .filter(|(_, path)| std::fs::remove_file(path).is_ok())
+        .map(|(name, _)| name)
+        .collect()
+}
+
 /// Remove `bin/` shims this program owns that point at a different build (tools a newer
 /// build dropped from `exposes`), and every alias of this program's no longer wanted
 /// (`aliases` is [`Aliases::Off`], or its base is neither in `installed` nor another tool of
@@ -832,9 +893,14 @@ fn prune_stale_shims(layout: &Layout, build_dir: &Path, installed: &[ToolName], 
         }
         let Some(name) = name.to_str() else { continue };
         // `bin/` entries are file names (`ay.cmd` on Windows); `installed` holds logical
-        // names, so compare through `from_shim_file`. Its `None` (nothing we could have
-        // written) skips: fail closed in the one predicate that deletes.
+        // names, so compare through `from_shim_file`. Its `None` skips, fail closed in the
+        // one predicate that deletes, except for a shim into this program's store under a
+        // name no shim may carry now ([`refused_name_shim`]): an older atpkg laid it, at
+        // whatever build, and no lay re-points it, so it goes.
         let Some(tool) = crate::store::ToolName::from_shim_file(name) else {
+            if refused_name_shim(layout, name, &entry.path()).is_some_and(|(p, _)| p == program) {
+                let _ = std::fs::remove_file(entry.path());
+            }
             continue;
         };
         // Never remove a name the new build still exposes — that shim was just written —

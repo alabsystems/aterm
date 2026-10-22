@@ -230,6 +230,9 @@ pub(crate) struct EpState {
     /// How many times a bridge said its mirror stopped for its pin (`link
     /// mirror stopped reason=pin`), whichever bridge, in whichever boot.
     pub(crate) pin_stops: u64,
+    /// How many of aterm's last words a bridge acknowledged (`link bye
+    /// <word>`), for the quit the world waits on.
+    pub(crate) byes_acked: u64,
     /// Every alias key a take named (`log-take … key=<hex>`; empty: none),
     /// across the node's whole life: ruling Q6 says one.
     pub(crate) take_keys: std::collections::BTreeSet<String>,
@@ -482,6 +485,16 @@ impl Endpoint {
             "hold" => s.hold(words),
             "link" => match words.next() {
                 Some("log") => s.link_log(words),
+                // The bridge's ack of aterm's last word (`link bye quit`),
+                // which the quitting instance waits for before it closes the
+                // lanes ([`super::world`]'s quit).
+                Some("bye") => match (words.next(), words.next()) {
+                    (Some("quit" | "handoff"), None) => {
+                        s.byes_acked += 1;
+                        "OK\n".to_string()
+                    }
+                    _ => "ERR usage\n".to_string(),
+                },
                 // The torn state files the bridge set aside after a power
                 // cut, counted for the oracle (lane 4: a lower lane refuses
                 // it, as its real endpoint does).

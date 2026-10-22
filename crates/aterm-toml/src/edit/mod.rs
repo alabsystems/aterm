@@ -37,6 +37,7 @@ pub struct RawString(String);
 
 impl RawString {
     /// The text as written.
+    #[inline]
     #[must_use]
     pub fn as_str(&self) -> &str {
         &self.0
@@ -88,28 +89,33 @@ impl Decor {
     }
 
     /// The raw text before the node, if it was parsed or explicitly set.
+    #[inline]
     #[must_use]
-    pub fn prefix(&self) -> Option<&RawString> {
+    pub const fn prefix(&self) -> Option<&RawString> {
         self.prefix.as_ref()
     }
 
     /// The raw text after the node, if it was parsed or explicitly set.
+    #[inline]
     #[must_use]
-    pub fn suffix(&self) -> Option<&RawString> {
+    pub const fn suffix(&self) -> Option<&RawString> {
         self.suffix.as_ref()
     }
 
     /// Replace the leading text.
+    #[inline]
     pub fn set_prefix(&mut self, prefix: impl Into<RawString>) {
         self.prefix = Some(prefix.into());
     }
 
     /// Replace the trailing text.
+    #[inline]
     pub fn set_suffix(&mut self, suffix: impl Into<RawString>) {
         self.suffix = Some(suffix.into());
     }
 
     /// Forget both sides, returning the node to canonical spacing.
+    #[inline]
     pub fn clear(&mut self) {
         self.prefix = None;
         self.suffix = None;
@@ -179,7 +185,8 @@ impl<T: ValueRepr> Formatted<T> {
     }
 
     /// The parsed value.
-    pub fn value(&self) -> &T {
+    #[inline]
+    pub const fn value(&self) -> &T {
         &self.value
     }
 
@@ -191,16 +198,19 @@ impl<T: ValueRepr> Formatted<T> {
     }
 
     /// Formatting around the scalar.
-    pub fn decor(&self) -> &Decor {
+    #[inline]
+    pub const fn decor(&self) -> &Decor {
         &self.decor
     }
 
     /// Mutable formatting around the scalar.
-    pub fn decor_mut(&mut self) -> &mut Decor {
+    #[inline]
+    pub const fn decor_mut(&mut self) -> &mut Decor {
         &mut self.decor
     }
 
     /// Byte range of the scalar token in the document it was parsed from.
+    #[inline]
     pub fn span(&self) -> Option<Range<usize>> {
         self.span.clone()
     }
@@ -306,6 +316,7 @@ impl Key {
     }
 
     /// The decoded name.
+    #[inline]
     #[must_use]
     pub fn get(&self) -> &str {
         &self.key
@@ -320,11 +331,13 @@ impl Key {
     }
 
     /// Mutable formatting around the key.
-    pub fn decor_mut(&mut self) -> &mut Decor {
+    #[inline]
+    pub const fn decor_mut(&mut self) -> &mut Decor {
         &mut self.decor
     }
 
     /// Byte range of the key token in the document it was parsed from.
+    #[inline]
     #[must_use]
     pub fn span(&self) -> Option<Range<usize>> {
         self.span.clone()

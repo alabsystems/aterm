@@ -67,8 +67,9 @@ impl DailyMax {
 
     /// Whether at least `min_s` seconds have been read
     /// ([`NET_LEARN_S`], [`TOKENS_LEARN_S`]).
+    #[inline]
     #[must_use]
-    pub fn learned(&self, min_s: u32) -> bool {
+    pub const fn learned(&self, min_s: u32) -> bool {
         self.read_s >= min_s
     }
 

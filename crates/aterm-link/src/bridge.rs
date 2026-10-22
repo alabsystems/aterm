@@ -2445,6 +2445,17 @@ pub struct Bridge {
     /// before the wait did ([`Bridge::run_names_this_boot`]). Tests only.
     #[cfg(test)]
     attach_past_an_earlier_boots_run: bool,
+    /// THE NEGATIVE CONTROL of the route's pin settle (sim item S7): a post
+    /// routes on a TOFU pin as it reads, whether or not this open's write of
+    /// it reached the media ([`Bridge::pinned_node_for`]). Tests only.
+    #[cfg(test)]
+    route_on_a_pin_that_reads: bool,
+    /// THE NEGATIVE CONTROL of the replay's hold (sim item S7), as
+    /// `Mutant::DeliverBeforeTheDrain` is the simulation's: an entry the
+    /// attach published again is settled as it lands, its record delivered
+    /// with its post still queued ([`Bridge::land_replayed`]). Tests only.
+    #[cfg(test)]
+    deliver_replay_at_once: bool,
     /// What this process's start set aside ([`Bridge::tell_set_aside`]), for the
     /// negative control that tells it in place of what the quarantine holds
     /// (`Mutant::TellMovedNotHeld`). Tests only.
@@ -2463,6 +2474,25 @@ pub struct Bridge {
     /// for an offset the set already holds — rather than joining a fragment
     /// to a number.
     acked_appendable: bool,
+    /// OWN RECORDS LANDED AND NOT SETTLED (sim item S7): `offset -> the
+    /// sequence of its in-flight entry`, for each record of ours whose ack
+    /// came and whose entry still stands — `acked` or the entry's unlink
+    /// could not be written ([`Bridge::settle_landed`]). Not delivered while
+    /// it is here: an in-flight entry never outlives its record's delivery
+    /// (`StateDir::forget_log_offsets`), or a move that took the record has the
+    /// next attach publish it again, a second copy in the recipient's inbox.
+    unsettled: BTreeMap<u64, u64>,
+    /// ENTRIES THE ATTACH REPLAYED, LANDED, NOT YET RETIRED (sim item S7):
+    /// `sequence -> (offset, ours)` of each in-flight entry
+    /// [`Bridge::settle_in_flight`] published again and the broker answered.
+    /// The entry stands and its record is not delivered
+    /// ([`Bridge::unsettled`]) until the drain retires the post or receipt
+    /// it carries — the drain's own landing clears it
+    /// ([`Bridge::settle_landed`]) — or a whole drain lists no queued one
+    /// pinned to it ([`Bridge::release_replays`]). A replayed record
+    /// delivered while its post was still queued was published again by the
+    /// drain after a move took it: a second row.
+    awaiting_drain: BTreeMap<u64, (u64, bool)>,
     /// The sequence [`Bridge::next_seq`] last reserved, until it is first put
     /// on the wire ([`Bridge::publish_at`]). A deduped answer to THAT send is
     /// a collision, never a retry: next_seq persists every number before it is
@@ -2572,6 +2602,13 @@ pub struct Bridge {
     /// ([`Bridge::reconcile_logpin_state`]): the stop the pin then causes names
     /// it, rather than read the damage as a bug's.
     pin_unreconciled: Option<String>,
+    /// THE RECOVERY AN UNCLEAN STOP IN AN EARLIER BOOT OWES is not complete
+    /// ([`Bridge::recover`], sim item S7): a write error a clean disk heals
+    /// (a full disk, `EIO`) stopped the sweep, the retirement or the pin's
+    /// reconcile. While it is, `run` is not written, no attach goes on, and
+    /// the mirror judges no pin; each attach tries it again
+    /// ([`Bridge::run_names_this_boot`]).
+    recovery_owed: bool,
     mailbox: Arc<Mailbox>,
     /// THE DOORS ([`crate::fx`]): every clock this bridge reads, its park on
     /// the mailbox, its broker dials and readers, its verb lane and its
@@ -2959,6 +2996,8 @@ impl Bridge {
             self_acked: newest(acked.offsets, SELF_ACK_KEEP),
             acked_entries: acked.entries,
             acked_appendable: acked.appendable,
+            unsettled: BTreeMap::new(),
+            awaiting_drain: BTreeMap::new(),
             unsent: None,
             held_senders: BTreeSet::new(),
             collided: None,
@@ -3025,6 +3064,10 @@ impl Bridge {
             #[cfg(test)]
             attach_past_an_earlier_boots_run: false,
             #[cfg(test)]
+            route_on_a_pin_that_reads: false,
+            #[cfg(test)]
+            deliver_replay_at_once: false,
+            #[cfg(test)]
             moved_at_start: 0,
             closers: Vec::new(),
             link: LinkReport::new(),
@@ -3037,6 +3080,7 @@ impl Bridge {
             quarantine_said: None,
             quarantine_unread: false,
             pin_unreconciled: None,
+            recovery_owed: false,
             mailbox: Arc::new(Mailbox::default()),
             cfg,
             fx,
@@ -4746,6 +4790,13 @@ impl Bridge {
                     Delivery::Unaccounted => return false,
                     Delivery::Owed => return true,
                 }
+                // A DELIVERY THAT DROPPED THE CONNECTION left its record to be
+                // offered again (an own record whose in-flight entry stands, one
+                // whose self-lane answer was lost): nothing after it in the page
+                // goes ahead of it, and the attach refills the session again.
+                if self.conn.is_none() {
+                    return false;
+                }
                 // A page is up to 256 `deliver` round trips: a halt queued
                 // during them is applied between two of them, not after the
                 // last ([`Bridge::service_urgent`]).
@@ -5464,6 +5515,24 @@ impl Bridge {
                 return Delivery::Accounted;
             }
             self.record_undeliverable(off, Some(&addr.sid.clone()), Reject::ForgedSelf);
+            return Delivery::Accounted;
+        }
+        // NOT WHILE ITS IN-FLIGHT ENTRY STANDS (sim item S7): one of ours whose
+        // `acked` write or entry unlink failed is settled first
+        // ([`Bridge::settled_before_delivery`]); where the state dir still
+        // refuses it, the record is not delivered now. The connection is
+        // dropped, as for a record whose roster is unreadable: nothing commits
+        // past it, and the reconnect's attach replays the entry before the
+        // group offers the record again.
+        if addr.src == self.node && !self.settled_before_delivery(off) {
+            if self.link.down_wants_report("error") {
+                eprintln!(
+                    "aterm-link: @{off} is not delivered while its in-flight entry stands (the \
+                     state dir refused a write); reconnecting to offer it again"
+                );
+            }
+            self.link_down("error");
+            self.conn = None;
             return Delivery::Accounted;
         }
         let (body, _raw_tail) = Body::decode(raw);
@@ -6687,9 +6756,10 @@ impl Bridge {
                 let ours = actual
                     .as_ref()
                     .map_or(journaled, |identity| self.on_own_lane(&identity.subject));
-                let remembered = !ours || self.remember_self_ack(*off).is_ok();
-                if journaled && remembered {
-                    self.state.clear_in_flight(pin.seq);
+                if journaled {
+                    self.settle_landed(pin.seq, *off, ours);
+                } else if ours {
+                    let _ = self.remember_self_ack(*off);
                 }
             }
             // NOT PUBLISHED, FOR GOOD: what the caller does next — a retire
@@ -6837,6 +6907,17 @@ impl Bridge {
     /// entry back, nothing tells that from a kill, and it is published again
     /// here — not covered ([`StateDir::retire_in_flight_of_an_earlier_boot`]).
     fn settle_in_flight(&mut self) -> bool {
+        let settled = self.replay_in_flight();
+        // WHAT THE REPLAY LANDED THAT NOTHING QUEUED CARRIES is settled now,
+        // whether or not the replay finished (sim item S7,
+        // [`Bridge::land_replayed`]).
+        self.release_replays_by_a_peek();
+        settled
+    }
+
+    /// [`Bridge::settle_in_flight`]'s replay, every entry in turn: `false` where
+    /// the attach must stop.
+    fn replay_in_flight(&mut self) -> bool {
         let entries = match self.state.in_flight() {
             Ok(entries) => entries,
             Err(e) => {
@@ -6876,10 +6957,7 @@ impl Bridge {
                     let ours = actual
                         .as_ref()
                         .is_none_or(|identity| self.on_own_lane(&identity.subject));
-                    if ours && self.remember_self_ack(off).is_err() {
-                        continue;
-                    }
-                    self.state.clear_in_flight(seq);
+                    self.land_replayed(seq, off, ours);
                 }
                 Err(e) if self.fate_unknown(&e) => {
                     eprintln!(
@@ -7196,6 +7274,170 @@ impl Bridge {
         }
     }
 
+    /// AN OWN-LANE RECORD WITH AN IN-FLIGHT ENTRY LANDED AT `off`, its entry at
+    /// `seq`: its offset is recorded as ours — `ours`: on this node's lanes
+    /// ([`Bridge::remember_self_ack`]) — and only then the entry is cleared.
+    ///
+    /// WHAT A WRITE ERROR LEAVES (sim item S7): either write failing keeps
+    /// the entry, which the next attach replays — the broker's dedup hands
+    /// the offset back to be recorded again — and the record UNSETTLED
+    /// ([`Bridge::unsettled`]), not delivered until both are done
+    /// ([`Bridge::settled_before_delivery`]). The entry must not outlive the
+    /// delivery: a move that takes the record ([`StateDir::forget_log_offsets`]
+    /// keeps an entry without `re=` to publish it on the new log) would land
+    /// a second copy of a message its recipient already holds.
+    fn settle_landed(&mut self, seq: u64, off: u64, ours: bool) {
+        let remembered = !ours || self.remember_self_ack(off).is_ok();
+        let cleared = remembered
+            && match self.state.clear_in_flight(seq) {
+                Ok(()) => true,
+                Err(e) => {
+                    eprintln!(
+                        "aterm-link: the in-flight entry at sequence {seq} (@{off}) could not be \
+                         cleared: {e}; the record is delivered once it is"
+                    );
+                    false
+                }
+            };
+        if cleared {
+            self.unsettled.retain(|_, s| *s != seq);
+            self.awaiting_drain.remove(&seq);
+        } else {
+            self.unsettled.insert(off, seq);
+        }
+    }
+
+    /// AN ENTRY THE ATTACH REPLAYED LANDED AT `off` ([`Bridge::settle_in_flight`],
+    /// sim item S7): its offset recorded as ours — `ours`: on this node's
+    /// lanes — and the entry KEPT, its record not delivered
+    /// ([`Bridge::unsettled`]), until the drain retires the post or receipt
+    /// it carries ([`Bridge::awaiting_drain`]). The replay lands the record
+    /// and leaves its post queued; the drain retires the post when its
+    /// pinned sequence is deduped to this record. Delivered before that, a
+    /// move that takes the record has the drain publish the post again, at a
+    /// new offset: a second row. Held, the record the move takes was never
+    /// delivered, and the one the drain lands is delivered once.
+    fn land_replayed(&mut self, seq: u64, off: u64, ours: bool) {
+        // NEGATIVE CONTROL (`crate::sim`): the entry cleared at once, as
+        // before sim item S7. And an observer drains nothing and delivers
+        // nothing: what it replays is settled as it lands.
+        #[cfg(test)]
+        let at_once = self.deliver_replay_at_once
+            || self
+                .fx
+                .mutant(crate::sim::world::Mutant::DeliverBeforeTheDrain);
+        #[cfg(not(test))]
+        let at_once = false;
+        if at_once || self.attachment == Attachment::Observer {
+            self.settle_landed(seq, off, ours);
+            return;
+        }
+        if ours {
+            // A failed write is the drain's landing's to make again.
+            let _ = self.remember_self_ack(off);
+        }
+        self.unsettled.insert(off, seq);
+        self.awaiting_drain.insert(seq, (off, ours));
+    }
+
+    /// THE ENDPOINT'S QUEUE, PEEKED, FOR WHAT THE REPLAY LANDED
+    /// ([`Bridge::settle_in_flight`]): the `outbox` listing the drain reads —
+    /// a peek, which retires nothing — and every replayed entry no listed
+    /// item is pinned to settled now ([`Bridge::release_replays`]). A refused
+    /// listing releases every one (no drain reads that queue); one that
+    /// fails releases nothing, and the drain's own tries again.
+    fn release_replays_by_a_peek(&mut self) {
+        if self.awaiting_drain.is_empty() {
+            return;
+        }
+        const LEGACY_OUTBOX_USAGE: &str = "ERR usage: outbox [<max>] | outbox sent <sid> <post-id> off=<n|-> [dup=1] [reason=<word>]";
+        let reply = match self.ctl_request("outbox earlier-receipts=1") {
+            Ok(reply) if reply.header() == LEGACY_OUTBOX_USAGE => self.ctl_request("outbox"),
+            answer => answer,
+        };
+        match reply {
+            Ok(reply) if reply.ok() => {
+                let drain = parse_drain(reply.body());
+                self.release_replays(&drain);
+            }
+            // REFUSED: no drain of this process reads that queue, so none
+            // publishes a post again, and a hold would only keep the
+            // records from their recipients. Everything replayed is settled.
+            Ok(_) => self.release_replays(&Drain::default()),
+            // A lane that failed is lost: this process delivers nothing more.
+            Err(_) => {}
+        }
+    }
+
+    /// A WHOLE DRAIN LISTED THE ENDPOINT'S QUEUE ([`Bridge::drain_outbox`]):
+    /// every replayed entry no listed post or receipt is pinned to carries
+    /// nothing queued — a reply, a notice, an item already retired — and is
+    /// settled now ([`Bridge::settle_landed`]); one a listed item is pinned
+    /// to waits for that item's landing. A pin that does not read releases
+    /// nothing.
+    fn release_replays(&mut self, drain: &Drain) {
+        if self.awaiting_drain.is_empty() || drain.more {
+            return;
+        }
+        let pinned = (|| -> io::Result<BTreeSet<u64>> {
+            let mut pinned = BTreeSet::new();
+            for post in &drain.posts {
+                if let Some(pin) = self.state.post_pin(&post.sid, post.id)? {
+                    pinned.insert(pin.seq);
+                }
+                if let Some(key) = post.key.as_deref() {
+                    if let Some(pin) = self.state.key_pin(&post.sid, key)? {
+                        pinned.insert(pin.seq);
+                    }
+                }
+            }
+            for r in &drain.receipts {
+                if let Some(pin) = self.state.receipt_pin(&r.sid, r.rid)? {
+                    pinned.insert(pin.seq);
+                }
+            }
+            Ok(pinned)
+        })();
+        let Ok(pinned) = pinned else {
+            return;
+        };
+        let free: Vec<(u64, u64, bool)> = self
+            .awaiting_drain
+            .iter()
+            .filter(|(seq, _)| !pinned.contains(seq))
+            .map(|(&seq, &(off, ours))| (seq, off, ours))
+            .collect();
+        for (seq, off, ours) in free {
+            self.awaiting_drain.remove(&seq);
+            self.settle_landed(seq, off, ours);
+        }
+    }
+
+    /// WHETHER THE OWN RECORD AT `off` MAY BE DELIVERED: settled, or settled
+    /// now — its offset recorded and its in-flight entry cleared, written again
+    /// here ([`Bridge::settle_landed`]) where a write error left either undone.
+    fn settled_before_delivery(&mut self, off: u64) -> bool {
+        // NEGATIVE CONTROL (`crate::sim`): delivered with its entry standing,
+        // as before sim item S7.
+        #[cfg(test)]
+        if self
+            .fx
+            .mutant(crate::sim::world::Mutant::DeliverPastAStandingEntry)
+        {
+            return true;
+        }
+        let Some(&seq) = self.unsettled.get(&off) else {
+            return true;
+        };
+        // A REPLAYED ONE WAITS FOR THE DRAIN that retires its post
+        // ([`Bridge::land_replayed`]): nothing written here settles it.
+        if self.awaiting_drain.contains_key(&seq) {
+            return false;
+        }
+        self.settle_landed(seq, off, true);
+        !self.unsettled.contains_key(&off)
+    }
+
     /// Record one offset as ours, in memory and in the state dir, keeping both
     /// halves the SAME window ([`SELF_ACK_KEEP`]): a longer in-memory set
     /// would, after a restart reloads the short one on disk, answer "forged"
@@ -7234,6 +7476,25 @@ impl Bridge {
     /// in-flight entry until this answers `Ok`. The next write is the whole
     /// set.
     fn remember_self_ack(&mut self, off: u64) -> io::Result<()> {
+        // BELOW THE WINDOW THERE IS NOTHING TO ADD (sim item S7). The window
+        // holds EVERY offset of ours from its oldest on, and fails open below
+        // it ([`forged_self`]): an offset under its oldest is already one it
+        // cannot call forged. Added, it would move the oldest down past
+        // records of ours the set does not hold — every one between the two
+        // would then be judged forged. That is what an attach after a move
+        // did: the move leaves the window at the new log's last offset
+        // ([`StateDir::forget_log_offsets`]), and the replay of an in-flight
+        // entry a failed `acked` write kept answered the entry's older
+        // offset, deduped. The entry it answers is settled either way.
+        #[cfg(test)]
+        let below_too = self
+            .fx
+            .mutant(crate::sim::world::Mutant::RememberBelowTheWindow);
+        #[cfg(not(test))]
+        let below_too = false;
+        if !below_too && self.self_acked.first().is_some_and(|oldest| off < *oldest) {
+            return Ok(());
+        }
         if !self.self_acked.insert(off) && self.acked_appendable {
             return Ok(());
         }
@@ -8190,6 +8451,12 @@ impl Bridge {
                  another log; it is not published on this one"
             );
         }
+        // An unsettled record at or above the fork is gone with the move, and
+        // its entry is published on the new log by this attach, its new offset
+        // settled there ([`Bridge::settle_landed`]); one below it still names
+        // its record here.
+        self.unsettled.retain(|off, _| kept(*off));
+        self.awaiting_drain.retain(|_, (off, _)| kept(*off));
         let before = self.deadlines.len();
         let acked = self.state.self_acked_log();
         self.self_acked = newest(acked.offsets, SELF_ACK_KEEP);
@@ -8246,6 +8513,21 @@ impl Bridge {
             self.inbox_pending_records = 0;
         }
         Ok((open, dropped.len()))
+    }
+
+    /// Whether an attach goes on with its re-base's witness unwritten: never,
+    /// but for the simulation's NEGATIVE CONTROL (`crate::sim`), the attach as
+    /// it was before sim item S7.
+    fn attaches_past_an_unwritten_witness(&self) -> bool {
+        #[cfg(test)]
+        {
+            self.fx
+                .mutant(crate::sim::world::Mutant::AttachPastAnUnwrittenWitness)
+        }
+        #[cfg(not(test))]
+        {
+            false
+        }
     }
 
     /// Persist what this process knows of the log as the state dir's
@@ -9475,6 +9757,9 @@ impl Bridge {
             }
         };
         let drain = parse_drain(&drained);
+        // THE REPLAYS NOTHING QUEUED CARRIES are settled before the posts
+        // are tried (sim item S7, [`Bridge::release_replays`]).
+        self.release_replays(&drain);
         // THE FETCHES FIRST: each is a session parked in `inbox get @<off>`
         // with a bounded wait, and answering one is a single bounded read.
         // A fetch resolves no address — it reads the parked session's OWN lane
@@ -10037,8 +10322,8 @@ impl Bridge {
         let record = self.group_record.take();
         let next = match outcome {
             Ok(off) => {
-                if journaled && self.remember_self_ack(off).is_ok() {
-                    self.state.clear_in_flight(pin.seq);
+                if journaled {
+                    self.settle_landed(pin.seq, off, true);
                 }
                 let identity = pin.identity.clone();
                 self.post_landed(&post, &subject, &pin, off, false, identity)
@@ -10546,6 +10831,18 @@ impl Bridge {
     /// asks again.
     fn pinned_node_for(&mut self, sid: &str) -> io::Result<Result<String, Route>> {
         let pinned = self.state.pins().get(sid).cloned();
+        // A PIN READ IS ON THE MEDIA BEFORE A POST ROUTES ON IT (sim item S7):
+        // one whose first sight this open wrote with the directory flush
+        // failed is written again first ([`StateDir::settle_pins`]), or a
+        // power cut takes it back and the sid's next first sight is open to
+        // a second claimant. Its error is no verdict: the post waits.
+        #[cfg(test)]
+        let settle = pinned.is_some() && !self.route_on_a_pin_that_reads;
+        #[cfg(not(test))]
+        let settle = pinned.is_some();
+        if settle {
+            self.state.settle_pins()?;
+        }
         if let Some(node) = self.route_from_view(sid, pinned.as_deref())? {
             return match pinned {
                 Some(_) => Ok(Ok(node)),
@@ -11415,6 +11712,32 @@ impl Bridge {
             // Keep the old refusal until the new log has a durable witness.
             self.conn = None;
             return false;
+        } else if self.bus_log.is_some()
+            && self.log_witness.id != self.bus_log
+            && !self.attaches_past_an_unwritten_witness()
+        {
+            // NOR IS ANYTHING DELIVERED ON A LOG THE STATE DIR'S WITNESS DOES
+            // NOT NAME (sim item S7): a re-base whose witness could not be
+            // written, or a first witness — none on the dir, or one a power
+            // cut tore — that could not. The endpoint was told this log; the
+            // state dir names an older one, or none. A record delivered now,
+            // and then a kill or a later move of the log, has the next attach
+            // tell the endpoint the move from that older witness — the fork
+            // lowest over the chain, at or below every offset delivered here
+            // — or, with none, a bare identity, and the endpoint forgets them:
+            // each one delivered again, a second row. Not attaching keeps a
+            // re-base owed ([`Bridge::log_replaced`]), and the next attach
+            // finishes it.
+            if self.link.down_wants_report("error") {
+                eprintln!(
+                    "aterm-link: the bus log's witness could not be written; not attaching \
+                     until it is (a record delivered on this log meanwhile would be offered \
+                     again as new)"
+                );
+            }
+            self.link_down("error");
+            self.conn = None;
+            return false;
         }
         // THE FLEET FACE, ON ITS OWN CONNECTION — opened before anything below
         // walks the bus, so a halt published during the refill reaches the
@@ -11451,6 +11774,17 @@ impl Bridge {
         if !self.settle_in_flight() {
             self.conn = None;
             return false;
+        }
+        // AND WHAT THE REPLAY LANDED IS RETIRED FIRST (sim item S7): the drain
+        // retires each post or receipt whose entry it published again, before
+        // the refill can deliver its record ([`Bridge::land_replayed`]). A
+        // drain that cannot leaves the record held, and the refill that meets
+        // it ends this attach for the next.
+        if !self.awaiting_drain.is_empty() {
+            self.drain_outbox();
+            if self.conn.is_none() {
+                return false;
+            }
         }
         if !self.refill_pending_admissions(false) {
             return false;
@@ -11921,9 +12255,14 @@ impl Bridge {
     /// if they were lost, which the state dir's table says costs nothing a later
     /// boot reads: they served sessions the reboot ended. Said on stderr with
     /// where each went, and kept for aterm ([`Bridge::set_aside`]): a fact for
-    /// the owner's later look, never a refusal. A sweep that fails is said and
-    /// survived: what it did not move, its reader refuses as before.
-    fn set_aside_torn_state(&mut self) {
+    /// the owner's later look, never a refusal. A sweep that fails is said.
+    /// Where a clean disk heals its error (a full disk, an I/O error,
+    /// [`crate::state::a_clean_disk_heals`]) it answers `false`: the recovery
+    /// is owed, and no attach goes on until it completes ([`Bridge::recover`],
+    /// sim item S7). Any other (a damaged file, a link planted where the
+    /// quarantine goes) meets every try the same, so it is survived, as
+    /// before: what is left is refused where it is read.
+    fn set_aside_torn_state(&mut self) -> bool {
         // NEGATIVE CONTROL (`crate::sim`): the old refusal — a torn file is
         // refused at every attach of every later boot.
         #[cfg(test)]
@@ -11931,7 +12270,7 @@ impl Bridge {
             .fx
             .mutant(crate::sim::world::Mutant::RefuseTornAfterPowerCut)
         {
-            return;
+            return true;
         }
         // NEGATIVE CONTROL (`crate::sim`): finding F1's first fix — a file is
         // whole when its reader takes it, so a cut that still reads stays.
@@ -11958,11 +12297,23 @@ impl Bridge {
                     );
                 }
                 self.set_aside += moved.len() as u64;
+                true
             }
-            Err(e) => eprintln!(
-                "aterm-link: the files a power cut may have torn could not all be set aside: \
-                 {e}; what is left is refused where it is read"
-            ),
+            Err(e) if crate::state::a_clean_disk_heals(&e) => {
+                eprintln!(
+                    "aterm-link: the files a power cut may have torn could not all be set \
+                     aside: {e}; tried again before the run record is written"
+                );
+                false
+            }
+            Err(e) => {
+                eprintln!(
+                    "aterm-link: the files a power cut may have torn could not all be set \
+                     aside: {e}; what is left is refused where it is read, until a person \
+                     repairs the state dir"
+                );
+                true
+            }
         }
     }
 
@@ -11974,9 +12325,11 @@ impl Bridge {
     /// republish ([`Bridge::settle_in_flight`]) landed it behind them. The
     /// sessions an entry serves ended with that boot, so nothing needs it. Said
     /// on stderr with where each went; a fact for nobody now running, so aterm
-    /// is not told. A failure is said and survived: what was not moved is
-    /// published again by the attach, as before.
-    fn retire_in_flight_state(&mut self) {
+    /// is not told. A failure is said; where a clean disk heals its error it
+    /// answers `false`: the recovery is owed, and no attach goes on until it
+    /// completes ([`Bridge::recover`], sim item S7). Any other is survived, as
+    /// before: what was not moved is published again by the attach.
+    fn retire_in_flight_state(&mut self) -> bool {
         // NEGATIVE CONTROL (`crate::sim`): the old republish — an entry a power
         // cut brought back is published again at its sequence.
         #[cfg(test)]
@@ -11984,7 +12337,7 @@ impl Bridge {
             .fx
             .mutant(crate::sim::world::Mutant::RepublishInFlightOfAnEarlierBoot)
         {
-            return;
+            return true;
         }
         match self.state.retire_in_flight_of_an_earlier_boot() {
             Ok(retired) => {
@@ -11997,11 +12350,22 @@ impl Bridge {
                         m.from, m.to
                     );
                 }
+                true
             }
-            Err(e) => eprintln!(
-                "aterm-link: the in-flight entries of an earlier boot could not all be \
-                 retired: {e}; what is left is published again at the attach"
-            ),
+            Err(e) if crate::state::a_clean_disk_heals(&e) => {
+                eprintln!(
+                    "aterm-link: the in-flight entries of an earlier boot could not all be \
+                     retired: {e}; tried again before the run record is written"
+                );
+                false
+            }
+            Err(e) => {
+                eprintln!(
+                    "aterm-link: the in-flight entries of an earlier boot could not all be \
+                     retired: {e}; what is left is published again at the attach"
+                );
+                true
+            }
         }
     }
 
@@ -12014,10 +12378,14 @@ impl Bridge {
     /// has its total raised to the floor, since nothing tells it from an older
     /// one a cut brought back. Whatever `[fabric] log` says: a mirror turned
     /// on later in this boot must find it reconciled, and no later start can
-    /// tell the cut. A failure is said and survived, and kept for the stop it
-    /// leads to ([`Bridge::pin_unreconciled`]): a pin that does not read stops
-    /// the mirror, as before.
-    fn reconcile_logpin_state(&mut self) {
+    /// tell the cut. A failure is said, and kept for the remedy a stop names
+    /// ([`Bridge::pin_unreconciled`]). Where a clean disk heals its error it
+    /// answers `false`: no attach goes on, and the mirror judges no pin,
+    /// until it completes ([`Bridge::recover`], sim item S7). Any other — a
+    /// copy that does not read, a planted quarantine — meets every try the
+    /// same: it is survived, and the pin that does not read stops the mirror
+    /// with the remedy that names the file to repair, as before.
+    fn reconcile_logpin_state(&mut self) -> bool {
         // NEGATIVE CONTROLS (`crate::sim`): a torn pin kept where it is, as
         // before (the mirror stops on it); one set aside with no key on the
         // media (as before `logkey`, whose world writes none); a whole one's
@@ -12038,6 +12406,10 @@ impl Bridge {
         };
         #[cfg(not(test))]
         let done = self.state.reconcile_logpin();
+        let owed = done.as_ref().is_err_and(crate::state::a_clean_disk_heals);
+        if done.is_ok() {
+            self.pin_unreconciled = None;
+        }
         match done {
             Ok(crate::state::Reconciled::Kept) => {}
             Ok(crate::state::Reconciled::Raised { from, to }) => eprintln!(
@@ -12064,13 +12436,86 @@ impl Bridge {
                  key, its total at the floor"
             ),
             Err(e) => {
+                let then = if owed {
+                    "tried again before the run record is written; the mirror judges no pin \
+                     until it is"
+                } else {
+                    "a pin that does not read stops the mirror, as before, and the stop names \
+                     the file to repair"
+                };
                 eprintln!(
                     "aterm-link: the mirror's pin could not be reconciled after an unclean stop: \
-                     {e}; a pin that does not read stops the mirror, as before"
+                     {e}; {then}"
                 );
                 self.pin_unreconciled = Some(e.to_string());
             }
         }
+        !owed
+    }
+
+    /// THE RECOVERY AN UNCLEAN STOP IN AN EARLIER BOOT OWES, ALL OF IT BEFORE
+    /// `run` SAYS A BRIDGE RUNS IN THIS ONE (sim item S7): the torn files set
+    /// aside ([`Bridge::set_aside_torn_state`]), the whole in-flight entries of
+    /// that boot retired ([`Bridge::retire_in_flight_state`], finding F2), the
+    /// mirror's pin reconciled ([`Bridge::reconcile_logpin_state`]).
+    ///
+    /// All three act on one verdict, `run`'s
+    /// ([`StateDir::torn_files_possible`]), and [`StateDir::begin_run`] ends
+    /// it: once `run` names this boot, no later bridge of the boot sweeps,
+    /// retires or reconciles anything. So a step a write error stopped (a
+    /// full disk, an I/O error) is done again BEFORE that record is written,
+    /// or never — and never cost the boot every attach: a torn in-flight entry
+    /// left where it is was refused at each one, a wedge no clean disk healed;
+    /// a pin left unreconciled stopped the mirror, or counted below its floor
+    /// (ruling Q13). Until it completes nothing that reads what it recovers
+    /// goes on: `run` is not written, no attach runs (the attach's own wait,
+    /// [`Bridge::run_names_this_boot`], tries it again first), and the
+    /// mirror judges no pin ([`Bridge::mirror_hello_answered`]).
+    ///
+    /// ONLY WHAT A CLEAN DISK HEALS IS OWED ([`crate::state::a_clean_disk_heals`]).
+    /// A step whose error is any other — a copy of the pin damaged, a link
+    /// planted where the quarantine goes, a permission — meets every try the
+    /// same, and waiting on it would wedge the bridge in this boot and every
+    /// later one with nothing said of the file to repair. It is said and
+    /// survived, as before sim item S7: what it left is refused where it is
+    /// read, and the mirror's stop on a pin that does not read names the
+    /// file ([`Bridge::mirror_pin_remedy`]).
+    ///
+    /// `true` once all three completed or failed for good — each is
+    /// idempotent, so a try after a partial one does only what is left, and
+    /// moves no file twice ([`StateDir::set_aside_torn`]'s one copy per
+    /// file) — or where the verdict does not read: nothing is moved then in
+    /// any bridge, and what is damaged is refused where it is read, as
+    /// before. `false` while the recovery is owed ([`Bridge::recovery_owed`]),
+    /// said once.
+    fn recover(&mut self) -> bool {
+        // NEGATIVE CONTROL (`crate::sim`): every try copies every file again.
+        #[cfg(test)]
+        self.state
+            .copy_on_every_try(self.fx.mutant(crate::sim::world::Mutant::CopyOnEveryTry));
+        let swept = self.set_aside_torn_state();
+        let retired = self.retire_in_flight_state();
+        let reconciled = self.reconcile_logpin_state();
+        // NEGATIVE CONTROL (`crate::sim`): before sim item S7 — a failed step
+        // was said and survived, `run` written after it all the same.
+        #[cfg(test)]
+        if self
+            .fx
+            .mutant(crate::sim::world::Mutant::BeginRunPastAFailedRecovery)
+        {
+            return true;
+        }
+        let owed = !(swept && retired && reconciled)
+            && matches!(self.state.torn_files_possible(), Ok(true));
+        if owed && !self.recovery_owed {
+            eprintln!(
+                "aterm-link: the recovery the last bridge's unclean stop in an earlier boot owes \
+                 is not complete: the run record is not written, no attach goes on and the \
+                 mirror judges no pin until it is; each attach tries it again"
+            );
+        }
+        self.recovery_owed = owed;
+        !owed
     }
 
     /// THIS RUN BEGINS ([`StateDir::begin_run`]), after the sweep and before
@@ -12079,8 +12524,9 @@ impl Bridge {
     /// the next boot knows this one did not stop cleanly unless
     /// [`Bridge::end_run`] says it did. A failure is said and survived:
     /// no marker is removed to force a legacy fallback, and unavailable
-    /// recovery stays fail-closed. Where the record it could not replace
-    /// names an earlier boot's unclean stop, every attach first writes it
+    /// recovery stays fail-closed. Where the record it could not replace is
+    /// anything but this open's admitted run — an earlier boot's unclean
+    /// stop, a clean stop's record, none — every attach first writes it
     /// again, and none goes on until it holds ([`Bridge::run_names_this_boot`]).
     /// A record written is said with what it cost. A fresh StateDir open
     /// establishes its own required publication fence, even after a handoff.
@@ -12115,16 +12561,53 @@ impl Bridge {
     /// So the record is written again here, before anything of this attach,
     /// and the attach goes on only once it holds: every in-flight entry is
     /// written while `run` names its boot. A refusal is said once per change
-    /// (`link down reason=error`), and the loop's back-off tries again.
+    /// (`link down reason=error`), and the loop's back-off tries again. And
+    /// first the recovery that verdict owes is finished, where a write error
+    /// stopped it at the start ([`Bridge::recover`], sim item S7).
     ///
     /// Visible OPEN bytes alone are insufficient: a predecessor, or this
     /// attempt, may have died or failed after the rename and before the root
     /// flush. Every attach therefore requires this StateDir open's successful
     /// admission; a reconnect reuses it only while that same OPEN file remains.
+    /// So a clean stop's record a refused start left (sim item S7) waits too:
+    /// it retires nothing in this boot, but the next one judges this boot's
+    /// files by it after a power cut — a clean record vouches for files this
+    /// run wrote unflushed, so a torn one would be refused at every attach
+    /// there.
     fn run_names_this_boot(&mut self) -> bool {
         #[cfg(test)]
         if self.attach_past_an_earlier_boots_run {
             return true;
+        }
+        // THE RECOVERY FIRST (sim item S7): while `run` still names an earlier
+        // boot's unclean stop, what a write error stopped of the sweep, the
+        // retirement and the pin's reconcile is done now, before the record
+        // ends that verdict ([`Bridge::recover`]) — and once it completes,
+        // what it moved is told and the mirror judges the reconciled pin.
+        if matches!(self.state.torn_files_possible(), Ok(true)) {
+            let owed = self.recovery_owed;
+            #[cfg(test)]
+            let old_wait = self
+                .fx
+                .mutant(crate::sim::world::Mutant::BeginRunPastAFailedRecovery);
+            #[cfg(not(test))]
+            let old_wait = false;
+            if !old_wait && !self.recover() {
+                if self.link.down_wants_report("error") {
+                    eprintln!(
+                        "aterm-link: the recovery an unclean stop in an earlier boot owes could \
+                         not be completed; not attaching until it is (a torn file left now \
+                         would be refused at every attach of this boot)"
+                    );
+                }
+                self.link_down("error");
+                return false;
+            }
+            if owed {
+                self.tell_set_aside();
+                self.tell_quarantine();
+                self.mirror_after_recovery();
+            }
         }
         match self.state.begin_run() {
             Ok(_) => true,
@@ -12182,6 +12665,28 @@ impl Bridge {
             eprintln!(
                 "aterm-link: handed off: the run goes on in the successor's bridge, so nothing \
                  is flushed and the run record stays open"
+            );
+            return;
+        }
+        // NO CLEAN STOP OF A RUN WHOSE RECOVERY IS OWED (sim item S7): the
+        // record still names the earlier boot's unclean stop, and what that
+        // stop left — a torn file not yet set aside, a pin not reconciled —
+        // is still here. A clean record written over it would vouch for it:
+        // the next start would sweep nothing and refuse the torn file where
+        // it reads it. So the record stays as it is, for the next start's
+        // recovery.
+        #[cfg(test)]
+        let owed = self.recovery_owed
+            && !self
+                .fx
+                .mutant(crate::sim::world::Mutant::CleanStopOverAnOwedRecovery);
+        #[cfg(not(test))]
+        let owed = self.recovery_owed;
+        if owed {
+            eprintln!(
+                "aterm-link: no clean stop: the recovery the last bridge's unclean stop in an \
+                 earlier boot owes is not complete, so the run record stays as it is and the \
+                 next start does it"
             );
             return;
         }
@@ -12456,10 +12961,14 @@ impl Bridge {
         // reconciled with its durable copies, whose verdict `begin_run`
         // ends — and where the disk refuses it, no attach goes on until it
         // has ([`Bridge::run_names_this_boot`]).
-        self.set_aside_torn_state();
-        self.retire_in_flight_state();
-        self.reconcile_logpin_state();
-        self.begin_run();
+        //
+        // ALL OF IT BEFORE THE RECORD (sim item S7): a recovery a write error
+        // stopped leaves `run` unwritten, so the verdict stands and each
+        // attach tries the recovery again before it goes on
+        // ([`Bridge::recover`]).
+        if self.recover() {
+            self.begin_run();
+        }
         self.introduce();
         self.tell_set_aside();
         self.tell_quarantine();
@@ -17218,11 +17727,14 @@ mod tests {
     /// `log=` line: it still reads, as an entry with no witness, which
     /// [`Bridge::settle_in_flight`] refuses at every attach. In boot 2 the
     /// sweep sets it aside and the attach goes on. NEGATIVE CONTROL: without
-    /// the sweep, boot 2's attach refuses — finding F1's wedge.
+    /// the sweep — the start's, and the attach's own wait's, which does what
+    /// a start's recovery left undone (sim item S7) — boot 2's attach refuses:
+    /// finding F1's wedge.
     #[test]
     fn a_reply_entry_cut_before_its_witness_is_set_aside_and_the_next_boot_attaches() {
         for sweep in [true, false] {
             let (lane, mut bridge) = FakeVerbLane::bridge(&[]);
+            bridge.attach_past_an_earlier_boots_run = !sweep;
             let socket = lane.dir.path().join("broker.sock");
             let broker = crate::test_broker(lane.dir.path().join("broker.log")).unwrap();
             let _server = broker.serve(&socket).unwrap();
@@ -17667,6 +18179,162 @@ mod tests {
                 );
             }
             bridge.close_subscriptions();
+        }
+    }
+
+    /// **NO ATTACH RUNS UNDER A CLEAN STOP'S RECORD, SO THE NEXT BOOT SWEEPS
+    /// WHAT THIS ONE WROTE** (sim item S7: the run record's wait, widened). A
+    /// bridge of boot 1 stops cleanly — `run` says so — and aterm comes back
+    /// in the same boot, where the disk refuses its start's record (full).
+    /// Had the attach gone on, the files it writes unflushed — an in-flight
+    /// entry — would be judged after a power cut by that clean record, which
+    /// vouches for them: the next boot sweeps nothing and refuses a torn one
+    /// at every attach, a wedge no clean disk heals. So the attach waits,
+    /// writes nothing (no incarnation), and goes on once `run` names boot 1's
+    /// open run (this open's admission, [`StateDir::begin_run`]); the power
+    /// cut then tears the entry, and boot 2's start sets it aside and
+    /// attaches. NEGATIVE CONTROL: an attach that admits no run (the wait as
+    /// it was before main's per-open admission and sim item S7: only an
+    /// earlier boot's unclean stop waited) attaches under the clean record,
+    /// and boot 2's attach refuses the torn entry.
+    #[cfg(unix)]
+    #[test]
+    fn no_attach_runs_under_a_clean_stops_record_so_the_next_boot_sweeps_what_it_wrote() {
+        for widened in [true, false] {
+            let case = format!("widened={widened}");
+            let (lane, mut bridge) = FakeVerbLane::bridge(&[]);
+            let (socket, broker, _server) = serve_log(&lane, "s7-run");
+            bridge.cfg.broker = socket;
+            bridge.attach_past_an_earlier_boots_run = !widened;
+            bridge.simulate_boot(crate::durability::test_boot(1), 0);
+            bridge.begin_run();
+            bridge.state.end_run_clean().unwrap();
+            // aterm quits and comes back in boot 1: the start's record is
+            // refused, said and survived.
+            bridge.state.refuse_writes_of(Some("run"));
+            if bridge.recover() {
+                bridge.begin_run();
+            }
+            let clean_one = Some(crate::state::LastRun {
+                boot: Some(crate::durability::test_boot(1)),
+                clean: true,
+            });
+            assert_eq!(bridge.state.last_run().unwrap(), clean_one, "{case}");
+            if widened {
+                assert!(
+                    !bridge.attach_broker(),
+                    "{case}: an attach ran under a clean stop's record"
+                );
+                assert!(bridge.conn.is_none(), "{case}: no connection is kept");
+                assert_eq!(bridge.state.incarnation(), 0, "{case}: no incarnation");
+                bridge.state.refuse_writes_of(None);
+            }
+            assert!(bridge.attach_broker(), "{case}: boot 1's attach");
+            let run = bridge.state.last_run().unwrap();
+            if widened {
+                assert_eq!(
+                    run,
+                    Some(crate::state::LastRun {
+                        boot: Some(crate::durability::test_boot(1)),
+                        clean: false,
+                    }),
+                    "{case}: the attach wrote `run` before anything else"
+                );
+            } else {
+                assert_eq!(run, clean_one, "{case}: CONTROL: attached under it");
+            }
+            // An entry in flight, unflushed, as the attach writes one; the
+            // power cut tears it (its data was never on the media).
+            let face = format!(
+                "/f/{}/in/{}/s-b/{}/note",
+                bridge.cfg.fleet, bridge.node, bridge.node
+            );
+            let body = b"v=1 t=1 text=live".to_vec();
+            let pin = plain_pin(bridge.next_seq().unwrap(), &face, &body);
+            bridge
+                .state
+                .set_in_flight(&InFlight {
+                    pin: pin.clone(),
+                    subject: face,
+                    body,
+                    log: Some(broker.log_identity()),
+                })
+                .unwrap();
+            bridge.close_subscriptions();
+            bridge.conn = None;
+            let entry = bridge.state.root().join(format!("inflight/{}", pin.seq));
+            let text = std::fs::read(&entry).unwrap();
+            std::fs::write(&entry, &text[..text.len() / 2]).unwrap();
+            // BOOT 2: the start's recovery and record, then its attach.
+            bridge.attach_past_an_earlier_boots_run = false;
+            bridge.simulate_boot(crate::durability::test_boot(2), 0);
+            if bridge.recover() {
+                bridge.begin_run();
+            }
+            assert_eq!(
+                bridge.attach_broker(),
+                widened,
+                "{case}: boot 2's attach (the torn entry set aside, or refused)"
+            );
+            assert_eq!(
+                bridge
+                    .state
+                    .root()
+                    .join(format!("quarantine/inflight.{}", pin.seq))
+                    .exists(),
+                widened,
+                "{case}: the torn entry is in the quarantine"
+            );
+            bridge.close_subscriptions();
+        }
+    }
+
+    /// **A POST ROUTES ON A TOFU PIN ONLY ONCE IT IS ON THE MEDIA** (sim item
+    /// S7's review, [`StateDir::settle_pins`]). A first sight of the remote
+    /// `@s-x` pins it to `n-far`: the table is renamed in, and its directory
+    /// flush fails, so the pin reads and the media may not hold it. The next
+    /// post to `@s-x` reads the pin — and `StateDir::pin`, which would write
+    /// it again, is never called for a sid already pinned — so the route
+    /// writes the table again, durably, before it goes on. NEGATIVE CONTROL:
+    /// routed on the pin as it reads, nothing is written, and a power cut
+    /// may take the first sight back (`sim::tests`'s
+    /// `a_durable_write_whose_flush_failed_is_not_trusted_and_is_written_again`
+    /// shows the cut).
+    #[cfg(unix)]
+    #[test]
+    fn a_post_routes_on_a_tofu_pin_only_once_it_is_on_the_media() {
+        for settle in [true, false] {
+            let (_lane, mut bridge) = FakeVerbLane::bridge(&[]);
+            bridge.route_on_a_pin_that_reads = !settle;
+            let root = bridge.state.root().to_path_buf();
+            bridge.state.refuse_directory_flush(Some((
+                root.as_path(),
+                aterm_durable::Flush::Durable,
+                io::ErrorKind::Other,
+            )));
+            assert!(
+                bridge.state.pin("s-x", "n-far").is_err(),
+                "the first sight's flush failed"
+            );
+            bridge.state.refuse_directory_flush(None);
+            assert_eq!(
+                bridge.state.pins().get("s-x").map(String::as_str),
+                Some("n-far"),
+                "and it reads"
+            );
+            assert!(!bridge.state.on_the_media("pins"));
+            // The route, which reads the pin and walks: no broker answers the
+            // walk here, and the settle comes before it.
+            let _ = bridge.pinned_node_for("s-x");
+            assert_eq!(
+                bridge.state.on_the_media("pins"),
+                settle,
+                "settle={settle}: the table written again before the route"
+            );
+            assert_eq!(
+                bridge.state.pins().get("s-x").map(String::as_str),
+                Some("n-far")
+            );
         }
     }
 
@@ -18705,6 +19373,140 @@ mod tests {
         );
     }
 
+    /// **A RECORD THE ATTACH PUBLISHED AGAIN IS DELIVERED ONLY ONCE ITS POST
+    /// IS RETIRED, SO A MOVE DELIVERS IT ONCE** (sim item S7,
+    /// [`Bridge::land_replayed`]). s-a's note to s-b landed on log A and its
+    /// bridge died before aterm took the retirement: the post is still
+    /// queued, its in-flight entry stands. The next bridge's attach replays
+    /// the entry (the broker dedups it to its record) and its drain's try of
+    /// the post fails (the entry's write refused, a full disk), so the post
+    /// stays queued. Then A is replaced by B, and the next attach publishes
+    /// the entry on B and its drain retires the post there. With the replay
+    /// held until the drain retires the post, the note reaches s-b once, from
+    /// B. NEGATIVE CONTROL: delivered as the replay lands, it reaches s-b from
+    /// A too, and the drain on B publishes the post again: twice.
+    #[cfg(unix)]
+    #[test]
+    fn a_replayed_record_waits_for_its_posts_retirement_so_a_move_delivers_it_once() {
+        for hold in [true, false] {
+            let case = format!("hold={hold}");
+            let sessions = [(1, "s-a"), (2, "s-b")];
+            let (lane, mut first) = FakeVerbLane::bridge(&sessions);
+            let state = first.state.root().to_path_buf();
+            let (a, _broker_a, _server_a) = serve_log(&lane, "replay-a");
+            first.cfg.broker = a.clone();
+            assert!(first.attach_broker(), "{case}: boot's first attach");
+            lane.refuse_retirements(true);
+            let post = "post sid=s-a id=1 to=@s-b kind=note len=4\nonce".to_string();
+            *lane.outbox.lock().unwrap() = Some(post.clone());
+            first.drain_outbox();
+            let pin = first
+                .state
+                .post_pin("s-a", 1)
+                .unwrap()
+                .expect("the post's pin stays with its retirement refused");
+            let face = pin.identity.as_ref().unwrap().subject.clone();
+            let (rows, _) = first.conn_now().unwrap().fetch(0, &face, 1).unwrap();
+            let (on_a, subject, bytes) = rows.into_iter().next().expect("the note on A");
+            // THE KILL before the entry's unlink: it stands, as it was written.
+            first
+                .state
+                .set_in_flight(&InFlight {
+                    pin: pin.clone(),
+                    subject,
+                    body: bytes,
+                    log: first.conn.as_ref().and_then(|c| c.seen_log_identity()),
+                })
+                .unwrap();
+            first.close_subscriptions();
+            drop(first);
+
+            // THE NEXT BRIDGE, on A, the post still queued and its drain's
+            // try refused by the disk.
+            let (second, mut bridge) = FakeVerbLane::bridge_with_state(&sessions, Some(&state));
+            bridge.deliver_replay_at_once = !hold;
+            bridge.cfg.broker = a;
+            second.retire_from_outbox();
+            *second.outbox.lock().unwrap() = Some(post.clone());
+            bridge
+                .state
+                .refuse_writes_of(Some(&format!("inflight/{}", pin.seq)));
+            assert_eq!(
+                bridge.attach_broker(),
+                !hold,
+                "{case}: the attach on A, which meets the held record (hold) or delivers it"
+            );
+            assert_eq!(
+                second.delivery_offsets().contains(&on_a),
+                !hold,
+                "{case}: the replayed note delivered on A before its post was retired"
+            );
+            bridge.close_subscriptions();
+            bridge.conn = None;
+            bridge.state.refuse_writes_of(None);
+
+            // A IS REPLACED BY B, its offsets elsewhere.
+            let (b, _broker_b, _server_b) = serve_log(&second, "replay-b");
+            bridge.cfg.broker = b;
+            let (mut padding, _) = bridge.connect().unwrap();
+            for seq in 1..=32 {
+                padding.publish(92, seq, "/f/f/x/padding", b"v=1").unwrap();
+            }
+            drop(padding);
+            assert!(bridge.attach_broker(), "{case}: the attach on B");
+            // THE LOOP'S ROUND ON B: its drain, then the live tail read up
+            // to a sentinel published after it, so every record before it
+            // was offered to its session.
+            bridge.drain_outbox();
+            let (mut writer, _) = bridge.connect().unwrap();
+            let sentinel_face = format!(
+                "/f/{}/in/{}/s-b/h-writer/note",
+                bridge.cfg.fleet, bridge.node
+            );
+            let (sentinel, _) = writer
+                .publish(81, 1, &sentinel_face, b"v=1 t=1 text=sentinel")
+                .unwrap();
+            loop {
+                match bridge.mailbox.take(aterm_spec::wait::MUST_HAPPEN) {
+                    Some(Item::Inbox(rec)) => {
+                        let at = rec.0;
+                        bridge.on_inbox_record(&rec);
+                        if at == sentinel {
+                            break;
+                        }
+                    }
+                    Some(_) => {}
+                    None => panic!("{case}: the live tail ended before the sentinel"),
+                }
+            }
+            assert!(
+                bridge.state.in_flight().unwrap().is_empty(),
+                "{case}: the entry settled on B"
+            );
+            let (notes, _) = bridge.conn_now().unwrap().fetch(0, &face, 8).unwrap();
+            let on_b: Vec<u64> = notes.iter().map(|(off, _, _)| *off).collect();
+            assert_eq!(on_b.len(), 1, "{case}: the note on B once: {on_b:?}");
+            // Each offset the note reached s-b at, from either log.
+            let reached: BTreeSet<String> = second
+                .deliveries()
+                .iter()
+                .filter(|l| l.starts_with("deliver s-b ") && l.ends_with("text=once"))
+                .filter_map(|l| l.split_whitespace().find(|w| w.starts_with("off=")))
+                .map(str::to_string)
+                .collect();
+            let want: BTreeSet<String> = if hold {
+                [format!("off={}", on_b[0])].into()
+            } else {
+                [format!("off={on_a}"), format!("off={}", on_b[0])].into()
+            };
+            assert_eq!(
+                reached, want,
+                "{case}: once from B (hold), or from A and again from B (the control)"
+            );
+            bridge.close_subscriptions();
+        }
+    }
+
     #[test]
     fn a_key_winner_republished_on_another_log_does_not_become_a_later_ask() {
         const SID: &str = "s-host";
@@ -18790,7 +19592,9 @@ mod tests {
         assert_ne!(landed, old_off, "offsets belong to their broker log");
         assert_eq!(publication_identity(&notes[0].1, &notes[0].2), *original);
 
-        bridge.drain_outbox();
+        // THE ATTACH'S OWN DRAIN RETIRED IT: the entry it published again is
+        // pinned to a queued post, which is retired before the refill can
+        // deliver the record (sim item S7, `Bridge::land_replayed`).
         assert_eq!(lane.sent.lock().unwrap().len(), 2);
         assert!(
             bridge.asked.is_empty() && bridge.deadlines.is_empty(),
@@ -21901,11 +22705,15 @@ mod tests {
         assert!(bridge.attach_broker());
         assert_eq!(bridge.state.seen_off(SID), Some(b_halt));
 
-        // A RE-BASE WHOSE WITNESS COULD NOT BE WRITTEN IS OWED, and the next
-        // attach to that same log finishes it without forgetting again what
-        // the node learned there. (A directory where `bus-log` goes makes the
-        // write fail.) Negative control: judged against the state dir's stale
-        // witness, the second attach calls C replaced again and `seen` goes.
+        // A RE-BASE WHOSE WITNESS COULD NOT BE WRITTEN IS OWED, and that
+        // attach goes no further: nothing is delivered on C while the state
+        // dir names B (sim item S7) — the next attach would tell the endpoint
+        // the move again from B and the endpoint forget what it took on C.
+        // The next attach to that same log finishes it without forgetting
+        // again what the node learned there. (A directory where `bus-log`
+        // goes makes the write fail.) Negative control: judged against the
+        // state dir's stale witness, the second attach calls C replaced again
+        // and `seen` goes.
         let (c, broker_c, _server_c) = serve_log(&lane, "c");
         let witness = bridge.state.root().join("bus-log");
         std::fs::remove_file(&witness).unwrap();
@@ -21913,7 +22721,11 @@ mod tests {
         bridge.close_subscriptions();
         bridge.conn = None;
         bridge.cfg.broker = c;
-        assert!(bridge.attach_broker());
+        assert!(
+            !bridge.attach_broker(),
+            "no attach past an unwritten witness"
+        );
+        assert!(bridge.conn.is_none(), "and no connection is kept");
         assert!(bridge.log_replaced.is_some(), "the re-base is owed");
         bridge.state.set_seen_off(SID, 1).unwrap();
         std::fs::remove_dir(&witness).unwrap();
@@ -21940,6 +22752,9 @@ mod tests {
         const SID: &str = "s-kept";
         let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, SID)]);
         lane.answer_hello_with(&format!("OK lane={LINK_LOG_LANE} build=test\n"));
+        // This boot's run begun, as every start begins it: an attach writes
+        // the record first where it does not name this boot's run.
+        bridge.begin_run();
         bridge.introduce();
         assert!(bridge.refresh_sessions().is_ok());
         let (socket, broker, _server) = serve_log(&lane, "rewound");

@@ -48,11 +48,16 @@
 @PREFERENCES@
 ;; HOME CONTENTS: guard the actual UID account independently of the caller's HOME. Reopen only the selected lab's
 ;; state/source/builds and scratch/project, then let the narrower protected-data rules below deny their contents.
+;; No directory of a home is reopened on the way to them: the run sits outside every home (the harness's tape store opens
+;; each directory from / down to the instance's state root, and a fenced one would cost the lab its tapes)
 @HOME_READ_DENY@
-(allow file-read-data @TRUSTED@ (subpath "@RUN@/scratch") (subpath "@SOCKDIR@/proj"))
-;; ... and each directory from a fenced home down to the run directory, alone (its names, nothing under it): the
-;; harness's tape store opens every one on its way to the instance's state root, and keeps no tape when one is refused
-@RUN_WALK@
+;; EVERY CHECKOUT'S DEFAULT LAB STATE sits under one root outside the homes (/private/tmp/at.lab-<uid>): what is under it is
+;; fenced too, so no lab reads another checkout's runs, logs, tapes or results; the root's own entry names stay open (the
+;; tape store's walk passes through it), and this lab's own state dir is reopened just below
+@STATES_READ_DENY@
+;; ... and reopen what aterm-lab trusts from outside the jail (below), but the checkout's target/ itself, whose entry
+;; names nothing in the jail reads
+(allow file-read-data @TRUSTED_READ@ (subpath "@RUN@/scratch") (subpath "@SOCKDIR@/proj"))
 ;; THE OWNER'S DATA, neither read nor written: one rule for each entry of the protected list
 @PROTECTED@
 @AGENT_STORE@

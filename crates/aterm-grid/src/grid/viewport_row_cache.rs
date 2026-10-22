@@ -82,6 +82,7 @@ impl Inner {
     }
 
     /// The slot an absolute row maps to, or `None` for an empty table.
+    #[inline]
     fn index_of(&self, abs_row: u64) -> Option<usize> {
         let len = u64::try_from(self.slots.len()).ok()?;
         if len == 0 {
@@ -93,6 +94,7 @@ impl Inner {
 
 /// Slots for a viewport: two screens' worth, so a reversed wheel scrub still
 /// hits and no two rows of one viewport collide.
+#[inline]
 fn capacity_for(visible_rows: u16) -> usize {
     usize::from(visible_rows)
         .saturating_mul(2)
@@ -109,6 +111,7 @@ pub(in crate::grid) struct ViewportRowCache {
 impl ViewportRowCache {
     /// The memoized row for `abs_row` under `epoch`, or `None` on a miss.
     /// Syncing to `epoch` is part of the lookup, so a caller cannot forget it.
+    #[inline]
     pub(in crate::grid) fn lookup(
         &self,
         epoch: HistoryEpoch,
@@ -126,6 +129,7 @@ impl ViewportRowCache {
     /// Memoize `row` for `abs_row` under `epoch`, replacing the slot's occupant. The borrow
     /// lives only inside this call, never across the materialize that produced `row`, so the
     /// `RefCell` cannot panic.
+    #[inline]
     pub(in crate::grid) fn store(
         &self,
         epoch: HistoryEpoch,

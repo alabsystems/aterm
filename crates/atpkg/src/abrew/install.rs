@@ -374,7 +374,7 @@ pub fn install(
                     // upgrades retain their old and new versions on later failure.
                     for done in installed_now.iter().rev() {
                         eprintln!("abrew: rolling back {done} (installed for this failed plan)");
-                        let _ = uninstall(api, prefix, done, true, false);
+                        let _ = uninstall(api, prefix, done, true, true, false);
                     }
                     return Err(super::after_native_progress(e, completed));
                 }
@@ -1059,12 +1059,46 @@ fn replacement_target_owned_at(
 }
 
 /// Point `opt/<name>` at the newest admitted keg and link its files unless keg-only.
-pub fn relink(prefix: &Prefix, f: &Formula) -> Result<(), InstallError> {
+/// Relink an installed keg; returns the file symlinks in the
+/// activation plan (brew's "N symlinks created" — the opt record
+/// is not counted).
+pub fn relink(prefix: &Prefix, f: &Formula) -> Result<usize, InstallError> {
     let inst = prefix
         .installed_one(Kind::Formula, &f.name)
         .ok_or_else(|| InstallError::Failed(format!("abrew: {} is not installed", f.name)))?;
     let (keg, links) = activation_links(prefix, &f.name, &inst.version, f.keg_only)?;
-    activate_keg(prefix, &keg, &links, false)
+    let created = links.iter().filter(|l| !l.directory).count();
+    activate_keg(prefix, &keg, &links, false)?;
+    Ok(created)
+}
+
+/// Whether every file in the keg's link plan already links into
+/// the keg (brew's already-linked warning). Partial or unreadable
+/// link state reads as not linked, so `link` repairs it.
+pub fn is_linked(prefix: &Prefix, name: &str, version: &str) -> bool {
+    keg_was_linked(prefix, name, version).unwrap_or(false)
+}
+
+/// The file-link destinations a `link` would create, plan only:
+/// nothing is written (dry-run).
+pub fn link_destinations(prefix: &Prefix, f: &Formula) -> Result<Vec<PathBuf>, InstallError> {
+    let inst = prefix
+        .installed_one(Kind::Formula, &f.name)
+        .ok_or_else(|| InstallError::Failed(format!("abrew: {} is not installed", f.name)))?;
+    if f.keg_only {
+        return Ok(Vec::new());
+    }
+    let keg = prefix.keg(&f.name, &inst.version);
+    Ok(keg_link_plan(prefix, &keg)?
+        .into_iter()
+        .filter(|l| !l.directory)
+        .map(|l| l.destination)
+        .collect())
+}
+
+/// The prefix links an `unlink` would remove, plan only (dry-run).
+pub fn unlink_targets(prefix: &Prefix, name: &str) -> Result<Vec<PathBuf>, String> {
+    owned_keg_links(prefix, name, false)
 }
 
 /// Switch only after the target, opt entry and every link destination are admitted.
@@ -1592,11 +1626,40 @@ fn selected_bottle_payload(
 /// Uninstall one formula: unlink and remove only receipt-admitted kegs, drop the
 /// opt link and any pin. Refuses while installed dependents remain
 /// (receipt dep scan) unless `ignore_dependencies`.
+/// The versions an uninstall removes: every receipted version
+/// under `--force`, else the one default keg — the opt-linked
+/// version when it stands, else the latest (brew's
+/// `resolve_default_keg`).
+pub fn uninstall_versions(prefix: &Prefix, inst: &Installed, force: bool) -> Vec<String> {
+    if force {
+        return inst.versions.clone();
+    }
+    let default = prefix
+        .optlinked_version(&inst.name)
+        .filter(|v| inst.versions.contains(v))
+        .unwrap_or_else(|| inst.version.clone());
+    vec![default]
+}
+
+/// Remove prefix links that point into one version's keg only, so
+/// removing the default keg never strips another version's links.
+fn unlink_keg_version(prefix: &Prefix, name: &str, version: &str) -> Result<(), String> {
+    let keg = prefix.keg(name, version);
+    for link in owned_keg_links(prefix, name, false)? {
+        if link_points_into(&link, &keg) {
+            std::fs::remove_file(&link).map_err(|e| format!("abrew: {e}"))?;
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
 pub fn uninstall(
     api: &Api,
     prefix: &Prefix,
     name: &str,
     ignore_dependencies: bool,
+    force: bool,
     dry_run: bool,
 ) -> Result<(), InstallError> {
     let short = Formula::short_name(name);
@@ -1609,22 +1672,42 @@ pub fn uninstall(
         let deps_on = dependents(api, prefix, short)?;
         if !deps_on.is_empty() {
             return Err(InstallError::Failed(format!(
-                "abrew: refusing to uninstall {short}: still needed by {} (use --ignore-dependencies to force)",
-                deps_on.join(", ")
+                "Error: Refusing to uninstall {}\nbecause it is required by {}, which {} currently installed.\nYou can override this and force removal with:\n  brew uninstall --ignore-dependencies {short}",
+                prefix.keg(short, &inst.version).display(),
+                super::commands::to_sentence(&deps_on),
+                if deps_on.len() == 1 { "is" } else { "are" }
             )));
         }
     }
+    // Brew refuses a pinned formula without --force and leaves
+    // everything standing; --force removes the pin with the kegs.
+    let pinned = prefix.pinned_version(short);
+    if pinned.is_some() && !force {
+        return Err(InstallError::Failed(format!(
+            "Error: {short} is pinned. You must unpin it to uninstall."
+        )));
+    }
+    let targets = uninstall_versions(prefix, &inst, force);
     if dry_run {
-        println!("Would uninstall {short} (all versions)");
+        if force {
+            println!("Would uninstall {short} (all versions)");
+        } else {
+            println!("Would uninstall {short} {}", targets[0]);
+        }
         return Ok(());
     }
-    unlink_keg(prefix, short)?;
-    remove_owned_opt_link(prefix, short)?;
+    let opt_version = prefix.optlinked_version(short);
+    for version in &targets {
+        unlink_keg_version(prefix, short, version)?;
+    }
+    if force || opt_version.is_some_and(|v| targets.contains(&v)) {
+        remove_owned_opt_link(prefix, short)?;
+    }
     let base = prefix.cellar().join(short);
-    if prefix.pinned_version(short).is_some() {
+    if force && pinned.is_some() {
         prefix.unpin(short)?;
     }
-    for version in inst.versions {
+    for version in &targets {
         std::fs::remove_dir_all(base.join(version)).map_err(|e| format!("abrew: {e}"))?;
     }
     let _ = std::fs::remove_dir(&base);
@@ -2025,7 +2108,7 @@ mod tests {
             for action in 0..3 {
                 let result = match action {
                     0 => switch_keg(&p, "demo", "1.0", false),
-                    1 => relink(&p, &formula),
+                    1 => relink(&p, &formula).map(|_| ()),
                     _ => link_keg(&p, &new, false),
                 };
                 assert!(
@@ -2441,7 +2524,7 @@ mod tests {
             std::fs::read_link(prefix.bin().join("demo")).unwrap(),
             foreign_link
         );
-        uninstall(&api, &prefix, "demo", true, false).unwrap();
+        uninstall(&api, &prefix, "demo", true, true, false).unwrap();
         assert!(!prefix.keg("demo", "1.0_2").exists());
         assert_eq!(std::fs::read(foreign.join("notes")).unwrap(), b"keep");
         assert_eq!(
@@ -2751,6 +2834,49 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
+    fn plain_uninstall_removes_only_default_keg_and_refuses_pinned() {
+        let tmp = aterm_tempfile::tempdir().unwrap();
+        let prefix = Prefix::at(&tmp.path().join("prefix"));
+        prefix.ensure().unwrap();
+        for v in ["1", "2"] {
+            let keg = prefix.keg("demo", v);
+            std::fs::create_dir_all(keg.join("bin")).unwrap();
+            std::fs::write(keg.join("bin/tool"), b"x").unwrap();
+            prefix
+                .write_receipt(
+                    &keg,
+                    &[("name", "demo"), ("version", v), ("installed_by", "abrew")],
+                )
+                .unwrap();
+        }
+        // opt points at 2 (the default keg); bin links into 2.
+        crate::abrew::prefix::symlink_dir(&prefix.keg("demo", "2"), &prefix.opt("demo")).unwrap();
+        std::fs::create_dir_all(prefix.bin()).unwrap();
+        crate::abrew::prefix::symlink_file(
+            &prefix.keg("demo", "2").join("bin/tool"),
+            &prefix.bin().join("tool"),
+        )
+        .unwrap();
+        let api = Api::new(prefix.clone());
+        uninstall(&api, &prefix, "demo", true, false, false).unwrap();
+        assert!(!prefix.keg("demo", "2").exists(), "default keg removed");
+        assert!(prefix.keg("demo", "1").exists(), "other version kept");
+        assert!(std::fs::symlink_metadata(prefix.bin().join("tool")).is_err());
+        assert!(std::fs::symlink_metadata(prefix.opt("demo")).is_err());
+        // Pinned: plain uninstall refuses and leaves everything;
+        // --force removes keg and pin.
+        prefix.pin("demo").unwrap();
+        let err = uninstall(&api, &prefix, "demo", true, false, false).unwrap_err();
+        assert!(matches!(err, InstallError::Failed(m) if m.contains("is pinned")));
+        assert!(prefix.keg("demo", "1").exists());
+        assert!(prefix.pinned_version("demo").is_some());
+        uninstall(&api, &prefix, "demo", true, true, false).unwrap();
+        assert!(!prefix.keg("demo", "1").exists());
+        assert!(prefix.pinned_version("demo").is_none());
+    }
+
+    #[test]
     fn unknown_dependency_metadata_refuses_removal_unless_explicitly_ignored() {
         let tmp = aterm_tempfile::tempdir().unwrap();
         let prefix = Prefix::at(&tmp.path().join("prefix"));
@@ -2770,9 +2896,9 @@ mod tests {
         // Valid cached JSON reaches the metadata refusal without any network request.
         std::fs::write(cache.join("formula-other.json"), b"{}").unwrap();
         let api = Api::new(prefix.clone());
-        assert!(uninstall(&api, &prefix, "demo", false, false).is_err());
+        assert!(uninstall(&api, &prefix, "demo", false, true, false).is_err());
         assert!(prefix.keg("demo", "1").exists());
-        uninstall(&api, &prefix, "demo", true, false).unwrap();
+        uninstall(&api, &prefix, "demo", true, true, false).unwrap();
         assert!(!prefix.keg("demo", "1").exists());
         let keg = prefix.keg("demo", "1");
         std::fs::create_dir_all(&keg).unwrap();
@@ -2791,7 +2917,7 @@ mod tests {
             br#"{"name":"other","versions":{"stable":"1"},"revision":0,"dependencies":[]}"#,
         )
         .unwrap();
-        uninstall(&api, &prefix, "demo", false, false).unwrap();
+        uninstall(&api, &prefix, "demo", false, true, false).unwrap();
         assert!(!keg.exists());
     }
 

@@ -154,18 +154,23 @@ impl LexState {
 
     /// The bracket nesting (`(`, `[`, `{`) the line starts at, in Rust and
     /// TOML; zero in the other languages.
+    #[inline]
+    #[must_use]
     pub const fn depth(self) -> u16 {
         self.depth
     }
 
     /// Whether the line starts inside a string, a comment or a fenced block
     /// rather than in code or prose.
+    #[inline]
+    #[must_use]
     pub const fn in_literal(self) -> bool {
         !matches!(self.mode, Mode::Code | Mode::Hunk(..))
     }
 
     /// Whether the line starts inside a string, where every byte is the
     /// string's own and a line break adds and removes nothing.
+    #[inline]
     const fn in_string(self) -> bool {
         matches!(
             self.mode,

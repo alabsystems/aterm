@@ -307,6 +307,123 @@ fn the_container_election_matrix() {
     }
 }
 
+/// The lean default's deferral is a function of who owns this Mac's console
+/// (docs/DESIGN-init-system-2026-10-20.md §4.2, "The SSH install"): the toolset
+/// waits for the window only when the installing user is at the screen, and is
+/// seeded here for any other owner (another login, loginwindow's root) or one
+/// that cannot be read. Under `sudo` the installing user is `$SUDO_UID`, and a
+/// root run never seeds: one for the console's own user is the ordinary
+/// deferral, any other stays deferred and says so (`TOOLSET_AS_ROOT`). A run
+/// that deferred nothing (--no-toolchain, a pinned DMG) is left as it was.
+#[test]
+fn the_toolsets_deferral_is_a_function_of_the_console_owner() {
+    let scratch = Scratch::new();
+    let (dmg, zip) = ("aterm-0.48.0.dmg", "aterm-0.48.0-mac.zip");
+    let vars = ["TOOLCHAIN_DEFERRED", "TOOLSET_NO_WINDOW", "TOOLSET_AS_ROOT"];
+    /// (toolchain, zip, console owner, euid, SUDO_UID) -> (deferred, no window, as root)
+    type Row = (
+        (u8, &'static str, &'static str, &'static str, &'static str),
+        (&'static str, &'static str, &'static str),
+    );
+    let rows: &[Row] = &[
+        ((1, zip, "501", "501", ""), ("1", "0", "0")),
+        ((1, zip, "502", "501", ""), ("0", "1", "0")),
+        ((1, zip, "0", "501", ""), ("0", "1", "0")),
+        ((1, zip, "", "501", ""), ("0", "1", "0")),
+        // A $SUDO_UID left in a user's environment names nobody: only root's is read.
+        ((1, zip, "502", "501", "502"), ("0", "1", "0")),
+        // `sudo` by the person at the screen: their own window seeds it.
+        ((1, zip, "501", "0", "501"), ("1", "0", "0")),
+        // `sudo` by someone else, and root at the loginwindow: never seeded as root.
+        ((1, zip, "502", "0", "501"), ("1", "0", "1")),
+        ((1, zip, "", "0", "501"), ("1", "0", "1")),
+        ((1, zip, "501", "0", ""), ("1", "0", "1")),
+        ((1, zip, "0", "0", ""), ("1", "0", "0")),
+        ((0, zip, "502", "501", ""), ("0", "0", "0")),
+        ((1, "", "502", "501", ""), ("0", "0", "0")),
+    ];
+    let mut lib = Lib::new();
+    let calls: Vec<usize> = rows
+        .iter()
+        .map(|((toolchain, zip, console, euid, sudo), _)| {
+            let zip_sha = if zip.is_empty() { "" } else { SHA_ZIP };
+            lib.call(
+                format!(
+                    "elect_container {toolchain} 0.48.0 {dmg} {SHA_DMG} '{zip}' '{zip_sha}' && \
+                     toolset_deferral '{console}' '{euid}' '{sudo}'"
+                ),
+                &vars,
+            )
+        })
+        .collect();
+    let recs = lib.run(&scratch);
+    for ((input, want), i) in rows.iter().zip(calls) {
+        let rec = &recs[i];
+        assert_eq!(rec.rc, 0, "{input:?}: {}", rec.err);
+        assert_eq!(
+            (rec.var(vars[0]), rec.var(vars[1]), rec.var(vars[2])),
+            *want,
+            "{input:?}"
+        );
+    }
+}
+
+/// The one step the plan and the install both run (`elect_install_lane`) decides
+/// over the console's real owner, or `ATERM_INSTALL_CONSOLE_UID`'s stand-in: the
+/// election, then the deferral, in that order (the election resets the deferral).
+#[test]
+fn the_install_lane_defers_by_the_console_owner_after_the_election() {
+    let scratch = Scratch::new();
+    let (dmg, zip) = ("aterm-0.48.0.dmg", "aterm-0.48.0-mac.zip");
+    let vars = ["TOOLCHAIN_DEFERRED", "TOOLSET_NO_WINDOW"];
+    let mut lib = Lib::new();
+    let me = lib.call("id -u", &[]);
+    let recs = lib.run(&scratch);
+    let me = recs[me].out.trim().to_string();
+    assert_ne!(me, "0", "the suite does not run as root");
+    let other = (me.parse::<u32>().unwrap() + 1).to_string();
+    let rows = [(me.clone(), ("1", "0")), (other, ("0", "1"))];
+    let mut lib = Lib::new();
+    let calls: Vec<usize> = rows
+        .iter()
+        .map(|(console, _)| {
+            lib.call(
+                format!(
+                    "ATERM_INSTALL_CONSOLE_UID={console} elect_install_lane 1 0.48.0 {dmg} \
+                     {SHA_DMG} '{zip}' '{SHA_ZIP}'"
+                ),
+                &vars,
+            )
+        })
+        .collect();
+    let recs = lib.run(&scratch);
+    for ((console, want), call) in rows.iter().zip(calls) {
+        let rec = &recs[call];
+        assert_eq!(rec.rc, 0, "{}", rec.err);
+        assert_eq!(
+            (rec.var(vars[0]), rec.var(vars[1])),
+            *want,
+            "console {console}, installer {me}"
+        );
+    }
+}
+
+/// The owner the deferral reads is `/dev/console`'s, as the kernel reports it.
+#[cfg(target_os = "macos")]
+#[test]
+fn the_console_owner_is_dev_consoles_uid() {
+    use std::os::unix::fs::MetadataExt as _;
+    let scratch = Scratch::new();
+    let owner = std::fs::metadata("/dev/console")
+        .expect("macOS has a /dev/console")
+        .uid();
+    let mut lib = Lib::new();
+    let call = lib.call("console_owner_uid", &[]);
+    let recs = lib.run(&scratch);
+    assert_eq!(recs[call].rc, 0, "{}", recs[call].err);
+    assert_eq!(recs[call].out.trim(), owner.to_string());
+}
+
 /// The manifest parse reads the current keys; the retired Intel pair's keys
 /// are neither required nor read, so they can never masquerade as a zip.
 #[test]

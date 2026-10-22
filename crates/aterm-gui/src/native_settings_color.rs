@@ -912,7 +912,7 @@ pub(super) fn page_owned_control_form(
     } else if offers_color_chooser(state, field, modified_only) {
         add_color_chooser(state, field, row, (width, inline, text_width));
     } else if wallpaper_row_links(state, field, modified_only) {
-        link_wallpaper_row(state, field, row, text_width);
+        link_wallpaper_row(state, field, row);
     }
 }
 
@@ -931,7 +931,7 @@ fn wallpaper_row_links(state: &SettingsViewState, field: &EditField, modified_on
 /// the head of its path; [`wallpaper_words`]), the whole path its value, and
 /// opens the Wallpaper page, which chooses and removes it. The row's Reset
 /// still removes it.
-fn link_wallpaper_row(state: &SettingsViewState, field: &EditField, row: &mut UiNode, room: f32) {
+fn link_wallpaper_row(state: &SettingsViewState, field: &EditField, row: &mut UiNode) {
     let key = format!("settings/control/{}", field.key);
     let Some((visual, spoken)) = wallpaper_words(state) else {
         return;
@@ -939,12 +939,11 @@ fn link_wallpaper_row(state: &SettingsViewState, field: &EditField, row: &mut Ui
     let Some(control) = find_node(row, &key) else {
         return;
     };
-    let width = match control.layout.width {
-        Length::Fixed(width) => width,
-        _ => room,
-    };
-    // The label's room: the button's insets and its forward arrow.
-    let shown = crate::native_ui::fit_native_button_label(&visual, (width - 48.0).max(0.0));
+    // Its words whole: fitted with the row, on every form of it, as a
+    // choice's are ([`fit_row_button_words`]) — the size dropped before any
+    // letter of the name, then the name on lines. Elided from its end on
+    // one line, the file's name read "sun…" at 2× text in a 22-column
+    // window, "sunset-over-the…" at 320pt.
     let path = state.raw_value(field.key).unwrap_or_default();
     let focused = state
         .common
@@ -957,7 +956,7 @@ fn link_wallpaper_row(state: &SettingsViewState, field: &EditField, row: &mut Ui
                 // Named by the words it paints first (the file's name and
                 // size), then the row and the whole image.
                 label: format!("{visual}: Wallpaper image {spoken}; opens Wallpaper"),
-                visual_label: Some(shown),
+                visual_label: Some(visual.clone()),
                 visual_icon: None,
                 trailing_icon: Some(ButtonIcon::Forward),
                 description: Some("Opens Wallpaper, to choose or remove the image".to_string()),
@@ -1108,23 +1107,16 @@ fn add_color_chooser(
         // field must show whole whatever is written — "#RRGGBB" (an unset
         // field fits its placeholder to what is left) — so writing or
         // clearing the colour never moves the button or the row's height.
-        // So must its placeholder's least whole words ("Theme…" of "Theme
-        // (#282A36)"): beside a Choose… that left it less, it was cut inside
-        // its first word ("Them…").
-        let least = field
-            .placeholder
+        // So must every word of its placeholder's plain words, whole, on
+        // the lines the field sets them on ([`fit_row_field_placeholder`]):
+        // beside a Choose… that left it less, "Theme" was cut inside itself
+        // ("Them…").
+        let plain = crate::native_ui::plain_placeholder(&field.placeholder);
+        let widest = plain
             .split_whitespace()
-            .next()
-            .map(|first| {
-                if first.len() < field.placeholder.trim().len() {
-                    format!("{first}\u{2026}")
-                } else {
-                    first.to_string()
-                }
-            })
-            .unwrap_or_default();
-        let words = crate::native_ui::text_field_width_for("#DDDDDD", true)
-            .max(crate::native_ui::text_field_width_for(&least, true));
+            .map(|word| crate::native_ui::text_field_width_for(word, true))
+            .fold(0.0_f32, f32::max);
+        let words = crate::native_ui::text_field_width_for("#DDDDDD", true).max(widest);
         if text_width - button_width - 6.0 >= words {
             if let Some(controls) = row.children.get_mut(1) {
                 let at = controls.children.len().min(1);
@@ -1135,6 +1127,31 @@ fn add_color_chooser(
             // and its words wrap to it, never cut ("Choos…" at 2× text in
             // a 22-column window).
             let mut button = button;
+            // THE CHIP TAKES A LINE OF ITS OWN WHERE IT WOULD COST THE FIELD
+            // A WORD: a field whose unset words are not whole beside its chip
+            // (each word of them, on the lines the field sets them on) sets
+            // the chip under them at its end, the words the field's whole
+            // width ([`crate::native_ui::TextFieldSpec::swatch_line`]).
+            // Decided on the unset words, so a colour written or typed never
+            // moves the chip. At 2× text in a 22-column window the field
+            // showed its chip alone and "Theme" nowhere, though the field's
+            // own width holds it.
+            let px = crate::native_ui::native_type_px(crate::type_scale::TypeStep::Secondary).get();
+            let beside_chip = crate::native_ui::field_placeholder_room(text_width, true);
+            let costs_words = unset_field_words(state, field).is_some_and(|words| {
+                crate::native_ui::plain_placeholder(&words)
+                    .split_whitespace()
+                    .any(|word| {
+                        crate::tray_raster::ui_text_width(word, px)
+                            > beside_chip + crate::native_ui::TEXT_FIT_SLACK
+                    })
+            });
+            if costs_words
+                && let Some(control) = find_node(row, &format!("settings/control/{key}"))
+                && let UiContent::TextField(field) = &mut control.content
+            {
+                field.spec.swatch_line = true;
+            }
             let width = button_width.min(text_width);
             let mut lines = 1;
             if let UiContent::Button(control) = &mut button.content {

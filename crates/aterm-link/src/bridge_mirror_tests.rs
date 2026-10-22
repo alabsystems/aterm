@@ -1080,6 +1080,109 @@ fn a_stopped_pins_remedy_names_what_each_choice_costs_and_no_cause_it_cannot_sho
     }
 }
 
+/// **A RECOVERY NO CLEAN DISK HEALS IS SAID AND SURVIVED: THE BRIDGE ATTACHES
+/// IN EVERY LATER BOOT, AND THE MIRROR'S STOP NAMES THE FILE TO REPAIR**
+/// (sim item S7, `Bridge::recover`). The last bridge ran in boot 1 and did
+/// not stop cleanly; the next boot finds the mirror's pin torn and a copy
+/// damaged (`logkey`, `logfloor`) or a link planted at `quarantine`, so the
+/// pin's reconcile fails — and fails the same at every try, since nothing in
+/// it is the disk's to heal. Each start of boots 2 and 3 goes through
+/// `recover` as `Bridge::start` does: the failure is said and survived, `run`
+/// names the boot, the attach goes on, and the mirror stops on the pin with
+/// the remedy that names the file. With the mirror off the reconcile still
+/// runs, and the attach still goes on. A write error, which a clean disk
+/// heals, is the other case: the recovery stays owed
+/// (`sim::tests::every_seed_with_write_errors_holds_every_law`).
+#[cfg(unix)]
+#[test]
+fn a_recovery_no_clean_disk_heals_is_survived_and_the_mirror_stop_names_its_remedy() {
+    let key = [0x3c; 16];
+    for (world, mirror_on) in [
+        ("logkey damaged", true),
+        ("logfloor damaged", true),
+        ("reconcile refused", true),
+        ("logkey damaged", false),
+    ] {
+        let case = format!("{world}, mirror on={mirror_on}");
+        let (lane, mut b) = FakeVerbLane::bridge_with_state(&[], None);
+        let (socket, _broker, _server) = serve_log(&lane, "for-good");
+        b.cfg.broker = socket;
+        let state = b.state.root().to_path_buf();
+        b.simulate_boot(crate::durability::test_boot(1), 0);
+        b.begin_run();
+        b.state.set_logkey(&key).unwrap();
+        b.state.raise_logfloor(9000).unwrap();
+        let pin = crate::mirror::Pin {
+            key: Some(key),
+            total: 8000,
+            ..crate::mirror::Pin::default()
+        }
+        .render();
+        b.state.set_logpin(&pin).unwrap();
+        match world {
+            "logkey damaged" => std::fs::write(state.join("logkey"), b"3c3c\n").unwrap(),
+            "logfloor damaged" => std::fs::write(state.join("logfloor"), b"9x\n").unwrap(),
+            _ => std::os::unix::fs::symlink(state.join("elsewhere"), state.join("quarantine"))
+                .unwrap(),
+        }
+        let torn = pin[..pin.len() - 5].to_string();
+        std::fs::write(state.join("logpin"), &torn).unwrap();
+        for boot in [2, 3] {
+            let case = format!("{case}, boot {boot}");
+            b.simulate_boot(crate::durability::test_boot(boot), 0);
+            // THE START, as `Bridge::start` makes it.
+            if b.recover() {
+                b.begin_run();
+            }
+            lane.links.lock().unwrap().clear();
+            if mirror_on {
+                b.mirror = MirrorRun::new(
+                    crate::mirror::LogMode::Turns,
+                    &b.state,
+                    Instant::now(),
+                    crate::mirror::mint_alias_key,
+                );
+                b.mirror_hello_answered("OK lane=2 build=b log=turns");
+                let why = b
+                    .mirror
+                    .as_deref()
+                    .and_then(MirrorRun::stopped)
+                    .unwrap_or_else(|| panic!("{case}: the mirror stops"))
+                    .to_string();
+                let says = |text: &str| assert!(why.contains(text), "{case}: {text:?} in {why}");
+                match world {
+                    "reconcile refused" => says("could not set it aside"),
+                    _ => says("put its whole bytes back"),
+                }
+                assert!(
+                    lane.links
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .any(|l| l == "link mirror stopped reason=pin"),
+                    "{case}: the stop is said"
+                );
+            }
+            assert!(b.attach_broker(), "{case}: attached");
+            assert_eq!(
+                b.state.last_run().unwrap(),
+                Some(crate::state::LastRun {
+                    boot: Some(crate::durability::test_boot(boot)),
+                    clean: false,
+                }),
+                "{case}: `run` names this boot's run"
+            );
+            assert_eq!(
+                std::fs::read_to_string(state.join("logpin")).unwrap(),
+                torn,
+                "{case}: the pin kept as it is"
+            );
+            b.close_subscriptions();
+            b.conn = None;
+        }
+    }
+}
+
 /// NEGATIVE CONTROLS (ruling Q12): each mutant's witness replayed against
 /// the real system through the broken call it stands for, and the projected
 /// law breaks.

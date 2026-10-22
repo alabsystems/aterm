@@ -10,6 +10,20 @@
 //! worker behind an inline confirm that only a second ⌫ from the same hand
 //! resolves (⏎ always goes there), esc closes.
 //!
+//! ON THE FABRIC (session log Phase 6 step 6E-7, ruling U42): where this
+//! aterm's fabric is on, a group after the windows lists each session on the
+//! fabric's other machines whose bus log says it needs the person
+//! ([`FabricChip`], composed by [`crate::overview_fabric`] from one bounded
+//! `aterm fabric brief --json` read): ◇ for a box or a question, ◆ for a
+//! failure, a wall or a session not responding, in the clause's own words,
+//! its node and how old its log is. An open need on a fresh read counts in
+//! the title at any age, as this aterm's own do; a chip from a read older
+//! than the fleet glance's `COUNT_FRESH` (the last good one, when the reads
+//! since failed), or of a session whose node is gone, is listed, said
+//! older, and never counted. A failed read says so on the group's header. It
+//! is read, never acted on (D1: a conclusion never acts on a session): ⏎,
+//! `t`, `r` and ⌫ on one do nothing, and the hint names its node.
+//!
 //! Pure like the palette and the picker: the App glue ([`crate::app_overview`])
 //! snapshots the words under the leaf locks every reader already takes (the
 //! published need verdict, the agent publication, the task record, the holds)
@@ -173,6 +187,46 @@ pub(crate) struct OverviewGroup {
     pub(crate) chips: Vec<OverviewChip>,
 }
 
+/// One session on another machine of this aterm's fabric whose log, read
+/// from the bus alone, says it needs the person (step 6E-7): never one of
+/// this aterm's, never acted on.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct FabricChip {
+    /// Its node id.
+    pub(crate) node: String,
+    /// Its face on the bus: the session's sid there.
+    pub(crate) sid: String,
+    /// ◇ decide (a box, a question) or ◆ stuck (a failure, a wall, not
+    /// responding).
+    pub(crate) mark: ChipMark,
+    /// The need's word (`approval:bash`): `controls overview`'s `need=`.
+    pub(crate) need: String,
+    /// The need's words as the clause says them (`approval · bash`).
+    pub(crate) words: String,
+    /// How old its log's newest record is, in seconds, as of the compose;
+    /// `None` when the brief could not say. Shown, never what decides
+    /// [`Self::older`]: a session waiting in a box writes nothing.
+    pub(crate) age_s: Option<u64>,
+    /// Not known to stand now: its read is older than the fleet glance's
+    /// `COUNT_FRESH` (the reads since failed), or its node is gone (the
+    /// brief's `partial` says `node-gone`). Listed, never counted.
+    pub(crate) older: bool,
+}
+
+/// The fabric group as the card shows it: its chips, and the closed word
+/// for why the last read of the fabric's log failed (`None` after a good
+/// one), which the group's header and `controls overview` say.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct FabricGroup {
+    /// The chips, in the brief's order.
+    pub(crate) chips: Vec<FabricChip>,
+    /// Why the last read failed (`overview_fabric::ReadFail::word`).
+    pub(crate) failed: Option<&'static str>,
+}
+
+/// The fabric group's header.
+pub(crate) const FABRIC_GROUP: &str = "On the fabric";
+
 /// One "manages" line: a manager and the workers its tasks started.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Manages {
@@ -190,8 +244,17 @@ pub(crate) struct Manages {
 /// order (every group's chips first, then the manages lines).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum OverviewItem {
-    Chip { group: usize, chip: usize },
-    Manages { line: usize },
+    Chip {
+        group: usize,
+        chip: usize,
+    },
+    /// A [`FabricChip`], by its index.
+    Fabric {
+        chip: usize,
+    },
+    Manages {
+        line: usize,
+    },
 }
 
 /// What a key on the selection means — decided here so keyboard, pointer and
@@ -229,6 +292,12 @@ enum OverviewLine {
         group: usize,
         chip: usize,
     },
+    /// The fabric group's header ([`FABRIC_GROUP`]).
+    FabricHeader,
+    Fabric {
+        item: usize,
+        chip: usize,
+    },
     ManagesHeader,
     Manages {
         item: usize,
@@ -250,6 +319,11 @@ pub(crate) struct OverviewState {
     /// The hosting (frontmost-at-open) window.
     pub(crate) window: crate::WindowId,
     groups: Vec<OverviewGroup>,
+    /// The fabric group's chips ([`FabricChip`]), empty where the fabric is
+    /// off or its log names no need.
+    fabric: Vec<FabricChip>,
+    /// Why the last read of the fabric's log failed ([`FabricGroup::failed`]).
+    fabric_failed: Option<&'static str>,
     manages: Vec<Manages>,
     /// Cursor over [`Self::items`].
     selected: usize,
@@ -274,6 +348,8 @@ pub(crate) struct OverviewState {
 #[derive(Clone, PartialEq, Eq, Debug)]
 enum Identity {
     Chip(SessionId),
+    /// A fabric chip, by its node and face.
+    Fabric(String, String),
     Manages(SessionId),
 }
 
@@ -286,6 +362,8 @@ impl OverviewState {
         Self {
             window,
             groups,
+            fabric: Vec::new(),
+            fabric_failed: None,
             manages,
             selected: 0,
             scroll: 0,
@@ -310,6 +388,9 @@ impl OverviewState {
             for c in 0..group.chips.len() {
                 out.push(OverviewItem::Chip { group: g, chip: c });
             }
+        }
+        for chip in 0..self.fabric.len() {
+            out.push(OverviewItem::Fabric { chip });
         }
         for line in 0..self.manages.len() {
             out.push(OverviewItem::Manages { line });
@@ -340,6 +421,13 @@ impl OverviewState {
                 item += 1;
             }
         }
+        if self.fabric_shown() {
+            out.push(OverviewLine::FabricHeader);
+            for chip in 0..self.fabric.len() {
+                out.push(OverviewLine::Fabric { item, chip });
+                item += 1;
+            }
+        }
         if !self.manages.is_empty() {
             out.push(OverviewLine::ManagesHeader);
             for line in 0..self.manages.len() {
@@ -355,16 +443,40 @@ impl OverviewState {
 
     fn line_of_item(&self, idx: usize) -> Option<usize> {
         self.lines().iter().position(|l| match l {
-            OverviewLine::Chip { item, .. } | OverviewLine::Manages { item, .. } => *item == idx,
+            OverviewLine::Chip { item, .. }
+            | OverviewLine::Fabric { item, .. }
+            | OverviewLine::Manages { item, .. } => *item == idx,
             _ => false,
         })
     }
 
+    /// A chip of THIS aterm's: what every act on the card acts on. A
+    /// fabric chip is none ([`Self::fabric_chip`]), so no act reaches one.
     fn chip(&self, item: OverviewItem) -> Option<&OverviewChip> {
         match item {
             OverviewItem::Chip { group, chip } => self.groups.get(group)?.chips.get(chip),
-            OverviewItem::Manages { .. } => None,
+            OverviewItem::Fabric { .. } | OverviewItem::Manages { .. } => None,
         }
+    }
+
+    /// The fabric chip `item` is, when it is one.
+    fn fabric_chip(&self, item: OverviewItem) -> Option<&FabricChip> {
+        match item {
+            OverviewItem::Fabric { chip } => self.fabric.get(chip),
+            OverviewItem::Chip { .. } | OverviewItem::Manages { .. } => None,
+        }
+    }
+
+    /// Whether the card shows the fabric group: it lists a chip, or the last
+    /// read failed (its header alone then says so).
+    fn fabric_shown(&self) -> bool {
+        !self.fabric.is_empty() || self.fabric_failed.is_some()
+    }
+
+    /// The selected fabric chip, when the selection is one: the hint names
+    /// its node.
+    pub(crate) fn selected_fabric(&self) -> Option<&FabricChip> {
+        self.fabric_chip(self.selected_item()?)
     }
 
     /// The selected element, or `None` on an empty card.
@@ -378,7 +490,9 @@ impl OverviewState {
     }
 
     /// How many sessions the card lists, how many need the person, and how
-    /// many are workers.
+    /// many are workers. The needs count the fabric chips not said older
+    /// ([`FabricChip::older`]: a fresh read's open needs, at any age); the
+    /// sessions and workers are this aterm's.
     fn counts(&self) -> (usize, usize, usize) {
         let chips = self.groups.iter().flat_map(|g| g.chips.iter());
         let (mut sessions, mut needs, mut workers) = (0, 0, 0);
@@ -387,6 +501,7 @@ impl OverviewState {
             needs += usize::from(chip.need.is_some());
             workers += usize::from(chip.worker_of);
         }
+        needs += self.fabric.iter().filter(|c| !c.older).count();
         (sessions, needs, workers)
     }
 
@@ -455,6 +570,29 @@ impl OverviewState {
         s
     }
 
+    /// A fabric chip's display line (paint == a11y): `◇ approval · bash —
+    /// s-1e91 on n-7c2a · 4m` (no age where the brief could not say one),
+    /// and `older` where it is not known to stand ([`FabricChip::older`]).
+    /// What the card shows of a chip is exactly this: its exact age moves
+    /// nothing until these coarse words do ([`Self::set_fabric`]).
+    fn fabric_text(chip: &FabricChip) -> String {
+        let mut s = format!(
+            "{} {} \u{2014} {} on {}",
+            chip.mark.glyph(),
+            chip.words,
+            aterm_messages::presence::short_sid(&chip.sid),
+            chip.node,
+        );
+        if let Some(age_s) = chip.age_s {
+            s.push_str(" \u{00b7} ");
+            s.push_str(&crate::app_overview::coarse_age(age_s.saturating_mul(1000)));
+        }
+        if chip.older {
+            s.push_str(" \u{00b7} older");
+        }
+        s
+    }
+
     /// Whether `t` hands the selected tab back (the person holds it) rather
     /// than takes it over: what the key hint names.
     pub(crate) fn t_hands_back(&self) -> bool {
@@ -471,6 +609,15 @@ impl OverviewState {
         )
     }
 
+    /// TEST READ: the painted body lines' words, in order.
+    #[cfg(test)]
+    pub(crate) fn line_texts(&self) -> Vec<String> {
+        self.lines()
+            .into_iter()
+            .map(|line| self.line_text(line))
+            .collect()
+    }
+
     fn line_text(&self, line: OverviewLine) -> String {
         match line {
             OverviewLine::Group(g) => format!("\u{25b8} {}", self.groups[g].label),
@@ -481,6 +628,11 @@ impl OverviewState {
                 .held
                 .clone()
                 .unwrap_or_default(),
+            OverviewLine::FabricHeader => match self.fabric_failed {
+                Some(_) => format!("\u{25b8} {FABRIC_GROUP} \u{00b7} the last read failed"),
+                None => format!("\u{25b8} {FABRIC_GROUP}"),
+            },
+            OverviewLine::Fabric { chip, .. } => Self::fabric_text(&self.fabric[chip]),
             OverviewLine::ManagesHeader => format!("manages ({})", self.manages.len()),
             OverviewLine::Manages { line, .. } => self.manages_text(&self.manages[line]),
             OverviewLine::Empty => "no sessions".to_string(),
@@ -492,6 +644,10 @@ impl OverviewState {
             item @ OverviewItem::Chip { .. } => {
                 self.chip(item).map(|c| Identity::Chip(c.sid.clone()))
             }
+            OverviewItem::Fabric { chip } => self
+                .fabric
+                .get(chip)
+                .map(|c| Identity::Fabric(c.node.clone(), c.sid.clone())),
             OverviewItem::Manages { line } => self
                 .manages
                 .get(line)
@@ -506,15 +662,65 @@ impl OverviewState {
         if self.groups == groups && self.manages == manages {
             return false;
         }
+        self.reshape(|state| {
+            state.groups = groups;
+            state.manages = manages;
+        });
+        true
+    }
+
+    /// Replace the fabric group (a read of the fabric's log landed, or its
+    /// ages moved), selection and confirm surviving by identity as
+    /// [`Self::retarget`]'s do. Reports whether what the card SHOWS changed
+    /// ([`Self::fabric_text`] of each chip, and whether a read failed): an
+    /// age that moved a second, which every compose's does, is kept for
+    /// `controls overview` and repaints nothing until its coarse words move.
+    pub(crate) fn set_fabric(&mut self, group: FabricGroup) -> bool {
+        let FabricGroup {
+            chips: fabric,
+            failed,
+        } = group;
+        if self.fabric == fabric && self.fabric_failed == failed {
+            return false;
+        }
+        let same_items = self.fabric.len() == fabric.len()
+            && self
+                .fabric
+                .iter()
+                .zip(&fabric)
+                .all(|(a, b)| a.node == b.node && a.sid == b.sid);
+        let shown_moved = self.fabric_failed != failed
+            || !same_items
+            || self
+                .fabric
+                .iter()
+                .zip(&fabric)
+                .any(|(a, b)| Self::fabric_text(a) != Self::fabric_text(b));
+        if same_items && self.fabric_failed == failed {
+            self.fabric = fabric;
+        } else {
+            self.reshape(|state| {
+                state.fabric = fabric;
+                state.fabric_failed = failed;
+            });
+        }
+        shown_moved
+    }
+
+    /// Apply `change` to the lists, then re-find the selection and the armed
+    /// confirm by identity.
+    fn reshape(&mut self, change: impl FnOnce(&mut Self)) {
         let keep_selected = self.identity(self.selected);
         let keep_confirm = self.confirm.and_then(|idx| self.identity(idx));
-        self.groups = groups;
-        self.manages = manages;
+        change(self);
         let find = |state: &Self, id: &Identity| -> Option<usize> {
             state.items().iter().position(|it| match (it, id) {
                 (OverviewItem::Chip { .. }, Identity::Chip(sid)) => {
                     state.chip(*it).is_some_and(|c| c.sid == *sid)
                 }
+                (OverviewItem::Fabric { .. }, Identity::Fabric(node, sid)) => state
+                    .fabric_chip(*it)
+                    .is_some_and(|c| c.node == *node && c.sid == *sid),
                 (OverviewItem::Manages { line }, Identity::Manages(sid)) => {
                     state.manages.get(*line).is_some_and(|m| m.manager == *sid)
                 }
@@ -539,7 +745,6 @@ impl OverviewState {
         self.pointer_over = None;
         self.pointer_armed = None;
         self.clamp_scroll();
-        true
     }
 
     /// Move the cursor (wrapping); movement cancels an armed confirm.
@@ -633,11 +838,13 @@ impl OverviewState {
     /// ⏎ / click: go to a chip's session; on a manages line, to the manager.
     /// NEVER A STOP, armed or not: ⏎ is the person's habitual key, so an
     /// armed Stop Worker confirm is dropped and only a second ⌫ resolves one
-    /// ([`Self::stop_pressed`]).
+    /// ([`Self::stop_pressed`]). On a fabric chip, nothing: no session of
+    /// this aterm's is that one, and a conclusion read off the fabric never
+    /// acts on a session (D1).
     pub(crate) fn activate(&mut self) -> OverviewAct {
         self.confirm = None;
         match self.selected_item() {
-            None => OverviewAct::None,
+            None | Some(OverviewItem::Fabric { .. }) => OverviewAct::None,
             Some(item @ OverviewItem::Chip { .. }) => self
                 .chip(item)
                 .map_or(OverviewAct::None, |c| OverviewAct::Raise(c.local_id)),
@@ -769,7 +976,7 @@ impl OverviewState {
         let (sessions, needs, workers) = self.counts();
         let mut out = vec![format!(
             "overview window={} sessions={sessions} needs={needs} workers={workers} \
-             manages={} selected={} confirm={} confirm_by={}",
+             manages={} selected={} confirm={} confirm_by={} fabric={} fabric_error={}",
             self.window.0,
             self.manages.len(),
             self.selected,
@@ -780,6 +987,8 @@ impl OverviewState {
                 (Some(_), true) => "controller",
                 (Some(_), false) => "person",
             },
+            self.fabric.len(),
+            self.fabric_failed.unwrap_or("-"),
         )];
         let mut item = 0usize;
         for group in &self.groups {
@@ -805,6 +1014,23 @@ impl OverviewState {
                 ));
                 item += 1;
             }
+        }
+        if self.fabric_shown() {
+            out.push(format!("overview group label={FABRIC_GROUP:?}"));
+        }
+        for chip in &self.fabric {
+            out.push(format!(
+                "overview fabric chip node={} sid={} need={} age={} mark={} older={} selected={}",
+                chip.node,
+                chip.sid,
+                chip.need,
+                chip.age_s
+                    .map_or_else(|| "-".to_string(), |a| a.to_string()),
+                chip.mark.word(),
+                u8::from(chip.older),
+                item == self.selected,
+            ));
+            item += 1;
         }
         for manages in &self.manages {
             let workers: Vec<&str> = manages.workers.iter().map(|(s, _)| s.as_str()).collect();
@@ -849,6 +1075,12 @@ impl OverviewState {
                 chip.held_by_person.hash(&mut h);
             }
         }
+        // What the card shows of the fabric group, never a chip's exact age
+        // (`set_fabric`): a second's move repaints nothing.
+        for chip in &self.fabric {
+            Self::fabric_text(chip).hash(&mut h);
+        }
+        self.fabric_failed.hash(&mut h);
         for manages in &self.manages {
             manages.manager.as_str().hash(&mut h);
             manages.manager_label.hash(&mut h);
@@ -871,6 +1103,13 @@ impl OverviewState {
                     0u8.hash(&mut h);
                     if let Some(c) = self.chip(item) {
                         c.sid.as_str().hash(&mut h);
+                    }
+                }
+                OverviewItem::Fabric { chip } => {
+                    2u8.hash(&mut h);
+                    if let Some(c) = self.fabric.get(chip) {
+                        c.node.hash(&mut h);
+                        c.sid.hash(&mut h);
                     }
                 }
                 OverviewItem::Manages { line } => {
@@ -951,6 +1190,7 @@ pub(crate) fn overview_item_hit(
                 Some(
                     OverviewLine::Chip { item, .. }
                     | OverviewLine::Held { item, .. }
+                    | OverviewLine::Fabric { item, .. }
                     | OverviewLine::Manages { item, .. },
                 ) => Some(*item),
                 _ => None,
@@ -1017,13 +1257,19 @@ pub(crate) fn overview_tray(
         };
         let y0 = card_y + (1 + slot) as f32 * ch;
         let (indent, color) = match line {
-            OverviewLine::Group(_) | OverviewLine::ManagesHeader => (cw * 1.5, r.text_secondary),
-            OverviewLine::Chip { .. } | OverviewLine::Manages { .. } => (cw * 2.5, r.text_primary),
+            OverviewLine::Group(_) | OverviewLine::FabricHeader | OverviewLine::ManagesHeader => {
+                (cw * 1.5, r.text_secondary)
+            }
+            OverviewLine::Chip { .. }
+            | OverviewLine::Fabric { .. }
+            | OverviewLine::Manages { .. } => (cw * 2.5, r.text_primary),
             // Under the chip's words, past its mark: the chip's own line.
             OverviewLine::Held { .. } => (cw * 4.5, r.text_secondary),
             OverviewLine::Empty => (cw * 2.0, r.text_tertiary),
         };
-        if let OverviewLine::Chip { item, .. } | OverviewLine::Manages { item, .. } = line
+        if let OverviewLine::Chip { item, .. }
+        | OverviewLine::Fabric { item, .. }
+        | OverviewLine::Manages { item, .. } = line
             && item == state.selected
         {
             let (x, y, w, mut h) = overview_row_rect_in(&layout, g, slot)
@@ -1071,9 +1317,16 @@ pub(crate) fn overview_tray(
             rgba(color, 0xFF),
         );
     }
+    let fabric_hint;
     let hint = match (state.confirm.is_some(), state.confirm_by_controller) {
         (true, false) => "\u{232b} again stop worker   \u{23ce} go   esc keep",
         (true, true) => "\u{232b}\u{232b} stop worker   \u{23ce} go   esc keep",
+        // A fabric chip's session is on another machine: nothing here acts
+        // on it, and the hint says where it is.
+        (false, _) if state.selected_fabric().is_some() => {
+            fabric_hint = fabric_hint_of(state.selected_fabric().map_or("", |c| &c.node));
+            fabric_hint.as_str()
+        }
         (false, _) if state.t_hands_back() => {
             "\u{2191}\u{2193} move   \u{23ce} go   t hand back   r read result   \u{232b} stop worker   \
              esc close"
@@ -1084,6 +1337,11 @@ pub(crate) fn overview_tray(
         }
     };
     finish_overlay_card(prims, hint, layout.card, layout.card_rows, g, &r)
+}
+
+/// The key hint on a fabric chip: its node, and nothing to do here.
+pub(crate) fn fabric_hint_of(node: &str) -> String {
+    format!("\u{2191}\u{2193} move   on {node}, answered there   esc close")
 }
 
 /// The card's accessibility tree — the palette scheme verbatim: a ListBox of
@@ -1104,6 +1362,7 @@ pub(crate) fn overview_a11y(state: &OverviewState) -> aterm_a11y::model::TreeUpd
                     None => text,
                 }
             }
+            OverviewItem::Fabric { chip } => OverviewState::fabric_text(&state.fabric[chip]),
             OverviewItem::Manages { line } => state.manages_text(&state.manages[line]),
         };
         node.set_label(label);

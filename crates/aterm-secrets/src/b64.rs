@@ -38,11 +38,13 @@ pub fn decode_nopad(text: &str) -> Option<Vec<u8>> {
 
 /// Padded base64 of `bytes`. Empty for input past aterm-codec's 64 MiB bound, which no
 /// caller here approaches (an envelope is at most 16 MiB).
+#[inline]
 pub fn encode_padded(bytes: &[u8]) -> String {
     base64::encode(bytes).unwrap_or_default()
 }
 
 /// Decode padded base64 strictly (required padding, zero trailing bits, no whitespace).
+#[inline]
 pub fn decode_padded(text: &str) -> Option<Vec<u8>> {
     base64::decode_strict(text.as_bytes()).ok()
 }

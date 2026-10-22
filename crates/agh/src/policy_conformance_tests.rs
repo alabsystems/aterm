@@ -120,6 +120,22 @@ struct World {
 
 /// The canonical config, written as a real agh.toml under `root` and read back by
 /// `config::load`, with the dev token file iff `dev` and the release one iff `rel`.
+/// A new setup file, 0600, written whole and NOT flushed: `write_private`, the store's
+/// own writer, ends each write with two `F_FULLFSYNC`s, and a world per reachable state
+/// made those flushes nearly all of this test's 4.1 s (0.26 s CPU). Nothing it reads
+/// depends on the drive's cache.
+fn setup_file(path: &std::path::Path, bytes: &[u8]) {
+    use std::io::Write as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
+        .and_then(|mut f| f.write_all(bytes))
+        .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+}
+
 fn world(dev: bool, rel: bool) -> World {
     let root = aterm_tempfile::Builder::new()
         .prefix("agh-wall-")
@@ -132,13 +148,12 @@ fn world(dev: bool, rel: bool) -> World {
     let parent = dirs.config.parent().expect("the config's parent");
     std::fs::create_dir_all(parent).expect("the config's parent");
     aterm_uds::private_file::create_private_dir(&dirs.config).expect("the config directory");
-    aterm_uds::private_file::write_private(&dirs.config, "agh.toml", text.as_bytes())
-        .expect("agh.toml");
+    setup_file(&dirs.config.join("agh.toml"), text.as_bytes());
     let token = |dir: &str, name: &str, seed: &str| {
         let dir = base.join(dir);
         aterm_uds::private_file::create_private_dir(&dir).expect("a token directory");
         let value = format!("{}\n", agh_fake::token(seed));
-        aterm_uds::private_file::write_private(&dir, name, value.as_bytes()).expect("a token");
+        setup_file(&dir.join(name), value.as_bytes());
     };
     if dev {
         token("tokens", "dev.token", "dev");

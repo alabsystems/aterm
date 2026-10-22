@@ -48,18 +48,22 @@ impl<'a> InnerPosition<'a> {
         })
     }
 
-    fn is_run_start(&self) -> bool {
+    #[inline]
+    const fn is_run_start(&self) -> bool {
         self.character_index == 0
     }
 
-    fn is_line_start(&self) -> bool {
+    #[inline]
+    const fn is_line_start(&self) -> bool {
         self.is_run_start()
     }
 
+    #[inline]
     fn is_run_end(&self) -> bool {
         self.character_index == self.node.data().character_lengths().len()
     }
 
+    #[inline]
     fn is_line_end(&self) -> bool {
         self.is_run_end()
     }
@@ -109,13 +113,15 @@ impl<'a> InnerPosition<'a> {
         )
     }
 
-    fn line_start(&self) -> Self {
+    #[inline]
+    const fn line_start(&self) -> Self {
         Self {
             node: self.node,
             character_index: 0,
         }
     }
 
+    #[inline]
     fn line_end(&self) -> Self {
         Self {
             node: self.node,
@@ -123,7 +129,8 @@ impl<'a> InnerPosition<'a> {
         }
     }
 
-    pub(crate) fn downgrade(&self) -> WeakPosition {
+    #[inline]
+    pub(crate) const fn downgrade(&self) -> WeakPosition {
         WeakPosition {
             node: self.node.id().0,
             character_index: self.character_index,
@@ -132,6 +139,7 @@ impl<'a> InnerPosition<'a> {
 }
 
 impl PartialEq for InnerPosition<'_> {
+    #[inline]
     fn eq(&self, other: &Self) -> bool {
         self.node.id() == other.node.id() && self.character_index == other.character_index
     }
@@ -147,7 +155,8 @@ pub(crate) struct Position<'a> {
 }
 
 impl<'a> Position<'a> {
-    pub(crate) fn inner_node(&self) -> &Node<'a> {
+    #[inline]
+    pub(crate) const fn inner_node(&self) -> &Node<'a> {
         &self.inner.node
     }
 
@@ -162,7 +171,8 @@ impl<'a> Position<'a> {
                 .is_ok()
     }
 
-    pub(crate) fn is_line_start(&self) -> bool {
+    #[inline]
+    pub(crate) const fn is_line_start(&self) -> bool {
         self.inner.is_line_start()
     }
 
@@ -185,10 +195,12 @@ impl<'a> Position<'a> {
                 })
     }
 
+    #[inline]
     pub(crate) fn is_document_end(&self) -> bool {
         self.inner.is_document_end(&self.root_node)
     }
 
+    #[inline]
     pub(crate) fn to_degenerate_range(self) -> Range<'a> {
         Range::new(self.root_node, self.inner, self.inner)
     }
@@ -388,6 +400,7 @@ impl<'a> Position<'a> {
         current
     }
 
+    #[inline]
     pub(crate) fn biased_to_end(&self) -> Self {
         Self {
             root_node: self.root_node,
@@ -395,16 +408,19 @@ impl<'a> Position<'a> {
         }
     }
 
+    #[inline]
     pub(crate) fn document_end(&self) -> Self {
         self.root_node.document_end()
     }
 
+    #[inline]
     pub(crate) fn document_start(&self) -> Self {
         self.root_node.document_start()
     }
 }
 
 impl PartialEq for Position<'_> {
+    #[inline]
     fn eq(&self, other: &Self) -> bool {
         self.root_node.id() == other.root_node.id() && self.inner == other.inner
     }
@@ -439,14 +455,16 @@ impl<'a> Range<'a> {
         Self { node, start, end }
     }
 
-    pub(crate) fn start(&self) -> Position<'a> {
+    #[inline]
+    pub(crate) const fn start(&self) -> Position<'a> {
         Position {
             root_node: self.node,
             inner: self.start,
         }
     }
 
-    pub(crate) fn end(&self) -> Position<'a> {
+    #[inline]
+    pub(crate) const fn end(&self) -> Position<'a> {
         Position {
             root_node: self.node,
             inner: self.end,

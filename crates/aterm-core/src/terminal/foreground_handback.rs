@@ -80,6 +80,7 @@ pub mod evidence {
     /// asserts (turns on, whether or not already on), or `0`. Read by the DEC
     /// mode dispatcher into
     /// [`Terminal::take_evidence_asserted`](super::Terminal::take_evidence_asserted).
+    #[inline]
     #[must_use]
     pub const fn asserted_by_dec_mode(param: u16, set: bool) -> u16 {
         match (param, set) {
@@ -126,6 +127,7 @@ impl Terminal {
     /// 1007, 67, 1036 and a mouse encoding without tracking; one-shot commands
     /// (`tput rmam`, `smkx`, `smacs`, `smir`) set these and expect them to
     /// persist.
+    #[inline]
     #[must_use]
     pub fn program_owns_terminal(&self) -> bool {
         self.program_evidence() != 0
@@ -189,6 +191,7 @@ impl Terminal {
     /// asserted bits a job that re-arms an already-on mode becomes its owner,
     /// so its death hands the mode back even if an earlier owner was
     /// misattributed.
+    #[inline]
     pub fn take_evidence_asserted(&mut self) -> u16 {
         core::mem::take(&mut self.evidence_asserted)
     }
@@ -196,6 +199,7 @@ impl Terminal {
     /// Hand the terminal back after a foreground-process-group change:
     /// [`Self::foreground_handback_scoped`] with the modes in scope. The host
     /// calls it only where the modes are orphaned (see the module docs).
+    #[inline]
     pub fn foreground_handback(&mut self) -> Option<ForegroundHandback> {
         self.foreground_handback_scoped(true)
     }
@@ -238,6 +242,7 @@ impl Terminal {
     /// survived phase A (`1049l` copies the alt screen's DECSTBM onto main) is
     /// cleared, and since DECSTBM/DECOM home the cursor, the cursor position
     /// read before is written back with a CUP.
+    #[inline]
     pub fn foreground_handback_scoped(
         &mut self,
         restore_modes: bool,

@@ -281,3 +281,59 @@ fn an_older_tape_waits_in_the_step_its_recorded_settle_gave() {
     assert_eq!(back.setup, setup, "the step the recorded settle gave");
     assert_eq!(back.supplied, ["[setup] wait_step"]);
 }
+
+/// THE LADDER'S DEVELOPMENT SEAM (`ATERM_DEV_LADDER_SCALE`,
+/// [`TurnEndTiming::for_build`]): its factor scales
+/// the short back-off ladder's first step and its cap, so the steps a lab
+/// waits out still double up to the cap (2, 4, 8, 16, 32, 60, 60 min at an
+/// eighth: 15, 30, 60, 120, 240, 450, 450 s), and moves nothing else. A
+/// value is a factor only in `(0, 1]`: none, `0`, a negative, one above `1`,
+/// one not finite and one that is no number leave the shipped ladder.
+/// NEGATIVE CONTROL: the shipped timing, unscaled, is every step's shipped
+/// value. And a tape's header holds the scaled ladder, so a replay of a run
+/// under the seam waits as it did.
+#[test]
+fn the_ladder_seam_scales_the_short_back_off_ladder_and_nothing_else() {
+    use std::ffi::OsStr;
+    let shipped = TurnEndTiming::default();
+    let scaled = TurnEndTiming::default().ladder_scaled(0.125);
+    let steps = |t: &TurnEndTiming| -> Vec<u64> {
+        (0..7)
+            .map(|n| {
+                crate::supervise::ladder::doubling(t.short_backoff, n, t.short_backoff_max)
+                    .as_secs()
+            })
+            .collect()
+    };
+    assert_eq!(steps(&scaled), [15, 30, 60, 120, 240, 450, 450]);
+    assert_eq!(steps(&shipped), [120, 240, 480, 960, 1920, 3600, 3600]);
+    assert_eq!(
+        TurnEndTiming {
+            short_backoff: shipped.short_backoff,
+            short_backoff_max: shipped.short_backoff_max,
+            ..scaled.clone()
+        },
+        shipped,
+        "only the ladder moves"
+    );
+    assert_eq!(TurnEndTiming::default().ladder_scaled(1.0), shipped);
+    let read = |v: &str| TurnEndTiming::ladder_scale(Some(OsStr::new(v)));
+    assert_eq!(read("0.125"), Some(0.125));
+    assert_eq!(read(" 0.5 "), Some(0.5));
+    assert_eq!(read("1"), Some(1.0));
+    for bad in ["0", "-0.5", "1.5", "nan", "inf", "eighth", ""] {
+        assert_eq!(read(bad), None, "{bad:?}");
+    }
+    assert_eq!(TurnEndTiming::ladder_scale(None), None);
+    // the tape's header carries it: a replay waits the scaled ladder
+    let mut setup = SessionSetup::new(None);
+    setup.approval_env.worker = WorkerSource::Session;
+    setup.turn_end_timing = scaled.clone();
+    let text = Header::capture("t", Entry::Watch, None, &setup, &SuperviseOpts::default()).encode();
+    assert!(
+        text.lines().any(|l| l == "turn_end.short_backoff=15s"),
+        "{text}"
+    );
+    let back = Header::decode(&text).expect("decodes");
+    assert_eq!(back.setup.turn_end_timing, scaled);
+}

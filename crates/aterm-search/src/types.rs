@@ -17,8 +17,9 @@ pub struct SearchMatch {
 
 impl SearchMatch {
     /// Create a new search match.
+    #[inline]
     #[must_use]
-    pub fn new(line: usize, start_col: usize, end_col: usize) -> Self {
+    pub const fn new(line: usize, start_col: usize, end_col: usize) -> Self {
         Self {
             line,
             start_col,
@@ -29,14 +30,14 @@ impl SearchMatch {
     /// Get the length of the match in columns.
     #[must_use]
     #[inline]
-    pub fn len(&self) -> usize {
+    pub const fn len(&self) -> usize {
         self.end_col.saturating_sub(self.start_col)
     }
 
     /// Check if this is an empty match (zero length).
     #[must_use]
     #[inline]
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.end_col <= self.start_col
     }
 }
@@ -76,8 +77,13 @@ pub struct SearchResults {
 
 impl SearchResults {
     /// Bundle `matches` with the eviction signal.
+    #[inline]
     #[must_use]
-    pub fn new(matches: Vec<SearchMatch>, incomplete: bool, lowest_retained_line: usize) -> Self {
+    pub const fn new(
+        matches: Vec<SearchMatch>,
+        incomplete: bool,
+        lowest_retained_line: usize,
+    ) -> Self {
         Self {
             matches,
             incomplete,
@@ -88,17 +94,19 @@ impl SearchResults {
 
     /// Record `lines` lines not searched to their end, which makes the results
     /// incomplete when there are any.
+    #[inline]
     #[must_use]
-    pub fn with_cut_short_lines(mut self, lines: usize) -> Self {
+    pub const fn with_cut_short_lines(mut self, lines: usize) -> Self {
         self.cut_short_lines = lines;
         self.incomplete |= lines > 0;
         self
     }
 
     /// True if there are no matches.
+    #[inline]
     #[must_use]
     #[cfg(test)]
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.matches.is_empty()
     }
 }
@@ -123,7 +131,8 @@ pub struct LineFrame {
 
 impl LineFrame {
     /// An empty frame whose offsets count from `base`.
-    pub(crate) fn with_base(base: usize) -> Self {
+    #[inline]
+    pub(crate) const fn with_base(base: usize) -> Self {
         Self {
             base,
             offsets: Vec::new(),
@@ -131,24 +140,28 @@ impl LineFrame {
     }
 
     /// Append the line `base + offset`; offsets arrive ascending.
+    #[inline]
     pub(crate) fn push_offset(&mut self, offset: u32) {
         debug_assert!(self.offsets.last().is_none_or(|&last| last < offset));
         self.offsets.push(offset);
     }
 
     /// How many lines the frame holds.
+    #[inline]
     #[must_use]
-    pub fn len(&self) -> usize {
+    pub const fn len(&self) -> usize {
         self.offsets.len()
     }
 
     /// True if the frame holds no lines.
+    #[inline]
     #[must_use]
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.offsets.is_empty()
     }
 
     /// The lines, ascending.
+    #[inline]
     pub fn lines(&self) -> impl Iterator<Item = usize> + '_ {
         let base = self.base;
         self.offsets
@@ -157,6 +170,7 @@ impl LineFrame {
     }
 
     /// Whether `line` is in the frame.
+    #[inline]
     #[must_use]
     pub fn contains(&self, line: usize) -> bool {
         line.checked_sub(self.base)

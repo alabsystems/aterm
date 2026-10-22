@@ -138,8 +138,9 @@ impl ExitWatch {
     }
 
     /// The pid this watch names.
+    #[inline]
     #[must_use]
-    pub fn pid(&self) -> u32 {
+    pub const fn pid(&self) -> u32 {
         self.pid
     }
 

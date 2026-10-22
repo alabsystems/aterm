@@ -59,6 +59,7 @@ pub struct Transition {
 
 impl Transition {
     /// Create a new transition.
+    #[inline]
     pub const fn new(next_state: State, action: ActionType) -> Self {
         Self { next_state, action }
     }

@@ -34,7 +34,8 @@ pub enum Speaker {
 }
 
 impl Speaker {
-    fn name(self) -> &'static str {
+    #[inline]
+    const fn name(self) -> &'static str {
         match self {
             Self::Aterm => "aterm",
             Self::Amacs => "amacs",

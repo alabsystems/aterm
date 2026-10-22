@@ -86,6 +86,7 @@ pub struct ProxyTarget {
 impl ProxyTarget {
     /// The proxy's `http://` URL without its userinfo; only its host and port
     /// are used.
+    #[inline]
     #[must_use]
     pub const fn uri(&self) -> &Uri {
         &self.uri
@@ -93,6 +94,7 @@ impl ProxyTarget {
 
     /// The base64 of `user:password` for `Proxy-Authorization: Basic`, when
     /// the proxy URL named a user.
+    #[inline]
     #[must_use]
     pub fn basic_auth(&self) -> Option<&str> {
         self.basic_auth.as_deref()

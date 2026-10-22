@@ -36,12 +36,14 @@ pub enum Cursor {
 }
 
 impl Default for Cursor {
+    #[inline]
     fn default() -> Self {
         Self::Icon(CursorIcon::default())
     }
 }
 
 impl From<CursorIcon> for Cursor {
+    #[inline]
     fn from(icon: CursorIcon) -> Self {
         Self::Icon(icon)
     }
@@ -49,6 +51,7 @@ impl From<CursorIcon> for Cursor {
 
 #[cfg(windows_platform)]
 impl From<CustomCursor> for Cursor {
+    #[inline]
     fn from(custom: CustomCursor) -> Self {
         Self::Custom(custom)
     }

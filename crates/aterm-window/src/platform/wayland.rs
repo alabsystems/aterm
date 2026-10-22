@@ -105,6 +105,15 @@ pub trait WindowExtWayland {
     /// [`WindowEvent::Resized`](crate::event::WindowEvent::Resized), possibly of the same size.
     /// An aterm addition (LW.5): this backend draws no frame of its own.
     fn client_decorations(&self) -> Option<ClientDecorations>;
+
+    /// [`Window::focus_window`] for an activation another client handed this process with
+    /// `token` (a notification server's click, its `ActivationToken`): on Wayland an
+    /// xdg-activation token, which activates the surface (`xdg_activation_v1.activate`); on
+    /// X11 a startup id, whose `_TIME` stamps the `_NET_ACTIVE_WINDOW` request and whose
+    /// launch sequence is ended, as a launchee ends its launch's, so the launcher's busy
+    /// cursor stops. An aterm addition, like [`WindowAttributesExtWayland::with_activation_token`],
+    /// and like it for both backends.
+    fn focus_window_with_activation_token(&self, token: &str);
 }
 
 impl WindowExtWayland for Window {
@@ -116,6 +125,14 @@ impl WindowExtWayland for Window {
             #[cfg(wayland_platform)]
             crate::platform_impl::Window::Wayland(window) => window.client_decorations(),
         }
+    }
+
+    #[inline]
+    fn focus_window_with_activation_token(&self, token: &str) {
+        let _span =
+            tracing::debug_span!("aterm_window::Window::focus_window_with_activation_token")
+                .entered();
+        self.window.focus_window_with_activation_token(token);
     }
 }
 

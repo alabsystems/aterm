@@ -72,6 +72,7 @@ pub(super) fn encode_character_legacy(
 /// is only a fallback: a chord whose base is in the table keeps its byte (Ctrl+Shift+'/'
 /// stays 0x1F, not Ctrl-? = 0x7F). The typed character is the layout's (`layout_glyph`, German
 /// Shift+ß is '?') when given, else the US Shift table's.
+#[inline]
 pub(super) fn chord_ctrl_byte(
     c: char,
     modifiers: Modifiers,
@@ -228,6 +229,7 @@ fn encode_navigation_named_legacy(
 }
 
 /// `byte`, ESC-prefixed when Alt is held.
+#[inline]
 fn alt_prefixed(modifiers: Modifiers, byte: u8) -> Vec<u8> {
     if modifiers.contains(Modifiers::ALT) {
         vec![0x1b, byte]
@@ -347,7 +349,8 @@ fn encode_numpad_named_legacy(
     })
 }
 
-pub(super) fn ctrl_character(c: char) -> Option<u8> {
+#[inline]
+pub(super) const fn ctrl_character(c: char) -> Option<u8> {
     let c_upper = c.to_ascii_uppercase();
     if c_upper.is_ascii_uppercase() {
         // `c_upper` is 'A'..='Z', so the byte is 1..=26; the saturating ops are identity

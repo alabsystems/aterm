@@ -282,3 +282,36 @@ fn the_aarch64_darwin_asset_keeps_its_bare_name_and_every_other_target_names_its
     }
     assert_eq!(pkgdoc::manifest_name("ay", 9), "pkg-ay-9.toml");
 }
+
+/// A shell is never shimmed (design S13), so the writer never renders a manifest exposing
+/// one: a fresh manifest naming `fish` is refused, and so is a merge onto a base signed
+/// before `pwsh` was refused, naming each. The control is the same header with only tool
+/// names, which renders and merges.
+#[test]
+fn the_writer_refuses_an_exposed_shell_fresh_or_merged() {
+    let r = row(AARCH64_APPLE_DARWIN, Kind::Binary);
+    let x86 = row(X86_64_APPLE_DARWIN, Kind::Binary);
+    let exposing = |names: &[&str]| Header {
+        exposes: names.iter().map(|n| (*n).to_string()).collect(),
+        ..header()
+    };
+
+    let err = pkgdoc::fresh(&exposing(&["ay", "fish"]), &r).expect_err("fish is a shell");
+    assert!(err.to_string().contains("ay exposes `fish`"), "{err}");
+    assert_eq!(err.exit_code(), 1);
+    let err = pkgdoc::fresh(&exposing(&["FISH"]), &r).expect_err("any spelling");
+    assert!(err.to_string().contains("`FISH`"), "{err}");
+
+    // A base an older writer signed for `["ay", "pwsh"]`, spelled as it would have been.
+    let base = String::from_utf8(pkgdoc::fresh(&header(), &r).expect("base").bytes().to_vec())
+        .expect("utf8")
+        .replace("\"ay-lsp\"", "\"pwsh\"");
+    let err = pkgdoc::merge(base.into_bytes(), &exposing(&["ay", "pwsh"]), &x86)
+        .expect_err("the base's shell is refused, not extended");
+    assert!(err.to_string().contains("`pwsh`"), "{err}");
+
+    // The control: tool names only.
+    let base = pkgdoc::fresh(&header(), &r).expect("tool names render");
+    pkgdoc::merge(base.bytes().to_vec(), &header(), &x86).expect("and merge");
+    pkgdoc::check_exposes("ay", &header().exposes).expect("tool names pass the gate");
+}

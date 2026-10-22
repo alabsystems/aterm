@@ -1562,6 +1562,18 @@ fn a_gemini_clis_own_restart_is_read_as_the_exit_is_seen() {
         || Some(look(false, None, false)),
         |_| false
     ));
+    // The record kept for the attempt says it too ([`ExitRecord::Restarted`],
+    // owed as a crash is; the review of 3a4586a01e, R2): the word that told
+    // it may be drawn no more by then. NEGATIVE CONTROL: a plain crash is
+    // `Crashed`.
+    let kept = exit_record(|| Some(look(false, Some(true), true)), |_| true);
+    assert_eq!(kept, ExitRecord::Restarted);
+    assert!(kept.crashed());
+    assert_eq!(kept.word(), "restarted");
+    assert_eq!(
+        exit_record(|| Some(look(false, Some(true), false)), |_| true),
+        ExitRecord::Crashed
+    );
 }
 
 /// AN EXIT NO LOOK DECIDES IS READ BY NOTHING: a Codex's end is aterm's copy of codex-alab's

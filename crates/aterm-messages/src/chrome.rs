@@ -59,18 +59,21 @@ pub struct RegrowFloor {
 impl RegrowFloor {
     /// The window's chrome rows rose at `now`. The floor keeps the latest rise:
     /// a stale `now` moves nothing, so it can never hasten a fall.
+    #[inline]
     pub fn rose(&mut self, now: Instant) {
         self.last_rise = Some(self.last_rise.map_or(now, |x| x.max(now)));
     }
 
     /// When the window's chrome rows last rose; `None` if they never have.
+    #[inline]
     #[must_use]
-    pub fn last_rise(self) -> Option<Instant> {
+    pub const fn last_rise(self) -> Option<Instant> {
         self.last_rise
     }
 
     /// The earliest instant an unforced fall may re-grid the window:
     /// [`CHROME_REGROW_SETTLE`] past the last rise. `None` with no rise.
+    #[inline]
     #[must_use]
     pub fn floor(self) -> Option<Instant> {
         self.last_rise
@@ -81,6 +84,7 @@ impl RegrowFloor {
 /// Whether an unforced fall may re-grid at `now` against `floor` (a window's
 /// [`RegrowFloor::floor`], or the [`latest`] of several): at or past it, or
 /// with no floor at all.
+#[inline]
 #[must_use]
 pub fn fall_allowed(floor: Option<Instant>, now: Instant) -> bool {
     floor.is_none_or(|f| now >= f)
@@ -89,6 +93,7 @@ pub fn fall_allowed(floor: Option<Instant>, now: Instant) -> bool {
 /// When a fall due at `due` by its own law may commit: the later of that and
 /// `floor`. A deadline built on it never names an instant the fall's commit
 /// would decline, so the host's timer never spins on it.
+#[inline]
 #[must_use]
 pub fn at_floor(due: Instant, floor: Option<Instant>) -> Instant {
     floor.map_or(due, |f| due.max(f))
@@ -96,6 +101,7 @@ pub fn at_floor(due: Instant, floor: Option<Instant>) -> Instant {
 
 /// The latest of several windows' floors — what a fall that re-grids all of
 /// them waits (the band's). `None` when none has one.
+#[inline]
 #[must_use]
 pub fn latest(floors: impl IntoIterator<Item = Option<Instant>>) -> Option<Instant> {
     floors.into_iter().flatten().max()
@@ -103,8 +109,9 @@ pub fn latest(floors: impl IntoIterator<Item = Option<Instant>>) -> Option<Insta
 
 /// Whether a re-grid of chrome rows from `reserved` to `rows` is a rise (the
 /// grid shrinks), which the host notes on every window it re-grids.
+#[inline]
 #[must_use]
-pub fn is_rise(reserved: u16, rows: u16) -> bool {
+pub const fn is_rise(reserved: u16, rows: u16) -> bool {
     rows > reserved
 }
 

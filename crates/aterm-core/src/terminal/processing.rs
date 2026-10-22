@@ -29,6 +29,7 @@ impl ClockReading {
     /// production processing pipeline; everything downstream observes the
     /// captured values via `transient`.
     #[must_use]
+    #[inline]
     #[expect(
         clippy::disallowed_methods,
         reason = "the sole pipeline clock capture, injected into process_at"
@@ -49,10 +50,11 @@ impl ClockReading {
 /// `content_scroll_delta` nonzero, which routes a mixed batch to the
 /// fail-closed selection-clear arm.
 #[inline]
-fn splice_accounts_for_batch_row_advance(before: u64, after: u64, inserted: u64) -> bool {
-    after
-        .checked_sub(before)
-        .is_some_and(|advance| advance == inserted)
+const fn splice_accounts_for_batch_row_advance(before: u64, after: u64, inserted: u64) -> bool {
+    match after.checked_sub(before) {
+        Some(advance) => advance == inserted,
+        None => false,
+    }
 }
 
 /// What one [`Terminal::advance_kitty_animations`] did.
@@ -99,6 +101,7 @@ impl Terminal {
     /// Whether a Kitty graphics animation is running, shown on screen or not;
     /// an animation in an unshown session waits until it is drawn again.
     #[must_use]
+    #[inline]
     pub fn kitty_animation_playing(&self) -> bool {
         self.transient
             .kitty_frames
@@ -351,6 +354,7 @@ impl Terminal {
     ///
     /// Pinned by `AltSelectionPark`'s conformance, which drives that batch from
     /// both screens.
+    #[inline]
     fn finish_ris_batch(&mut self) {
         self.secure_keyboard_entry = false;
         self.text_selection.clear();

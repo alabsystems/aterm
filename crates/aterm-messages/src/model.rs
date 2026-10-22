@@ -27,12 +27,14 @@ impl MessageId {
     pub const FIRST: MessageId = MessageId(1);
 
     /// The raw number, for the wire and the log.
+    #[inline]
     #[must_use]
     pub const fn raw(self) -> u64 {
         self.0
     }
 
     /// An id from its raw number; `None` for 0, which no message ever has.
+    #[inline]
     #[must_use]
     pub const fn from_raw(raw: u64) -> Option<Self> {
         if raw == 0 { None } else { Some(Self(raw)) }
@@ -40,6 +42,7 @@ impl MessageId {
 
     /// The id after this one (saturating at `u64::MAX`, which no process
     /// reaches).
+    #[inline]
     #[must_use]
     pub(crate) const fn next(self) -> Self {
         Self(self.0.saturating_add(1))
@@ -68,6 +71,7 @@ pub enum Severity {
 
 impl Severity {
     /// The wire word: `success` | `info` | `warn` | `error`.
+    #[inline]
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -79,6 +83,7 @@ impl Severity {
     }
 
     /// The severity for a wire word; `None` for anything else.
+    #[inline]
     #[must_use]
     pub fn parse(s: &str) -> Option<Self> {
         match s {
@@ -92,6 +97,7 @@ impl Severity {
 
     /// The hold a [`Hold::Default`] row of this severity takes: 8 s / 30 s /
     /// 45 s / 60 s.
+    #[inline]
     #[must_use]
     pub const fn default_hold(self) -> Duration {
         match self {
@@ -104,6 +110,7 @@ impl Severity {
 
     /// The glyph a row of this severity carries unless the reporter picks
     /// another: ✓ ℹ ⚠ ✕.
+    #[inline]
     #[must_use]
     pub const fn default_glyph(self) -> Glyph {
         match self {
@@ -171,6 +178,7 @@ impl Tag {
     }
 
     /// The word.
+    #[inline]
     #[must_use]
     pub fn as_str(&self) -> &str {
         &self.0
@@ -281,6 +289,7 @@ impl Glyph {
     }
 
     /// The character.
+    #[inline]
     #[must_use]
     pub const fn ch(self) -> char {
         self.0
@@ -312,6 +321,7 @@ impl UpgradeWord {
     pub const ALL: [UpgradeWord; 3] = [Self::Now, Self::NotToday, Self::Skip];
 
     /// The codec's word: `now`, `not-today`, `skip`.
+    #[inline]
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -322,6 +332,7 @@ impl UpgradeWord {
     }
 
     /// [`Self::as_str`] read back.
+    #[inline]
     #[must_use]
     pub fn parse(word: &str) -> Option<Self> {
         Self::ALL.into_iter().find(|w| w.as_str() == word)
@@ -329,6 +340,7 @@ impl UpgradeWord {
 
     /// The full label: the capsule's, the tab menu's and a screen reader's. "Skip
     /// version", not "Skip this version": a label is at most 16 chars.
+    #[inline]
     #[must_use]
     pub const fn label(self) -> &'static str {
         match self {
@@ -467,6 +479,7 @@ impl Intent {
     /// nothing, so it is never the one action: a row that stands past a glance and whose
     /// only capsules decline is a record ([`Message::admit`]). A decline may ride beside a
     /// real action.
+    #[inline]
     #[must_use]
     pub const fn is_snooze(&self) -> bool {
         matches!(
@@ -553,6 +566,7 @@ impl Intent {
 
     /// Only `NotNow` closes its row: every other intent leaves the row for a supersede or
     /// a fold.
+    #[inline]
     #[must_use]
     pub(crate) const fn closes_row(&self) -> bool {
         matches!(self, Self::NotNow { .. })
@@ -562,6 +576,7 @@ impl Intent {
     /// tab a row named — and so ends with it: a retired record never
     /// offers it again (design ruling 265; the wire's `messages` rows too,
     /// ruling 267).
+    #[inline]
     #[must_use]
     pub const fn ends_with_row(&self) -> bool {
         matches!(
@@ -575,6 +590,7 @@ impl Intent {
     }
 
     /// `NotNow`: a row carrying one is a decision row.
+    #[inline]
     #[must_use]
     pub const fn is_ask(&self) -> bool {
         matches!(self, Self::NotNow { .. })
@@ -585,6 +601,7 @@ impl Intent {
     /// `EndRecovered`, an agent upgrade's `Upgrade now`). The glass paints these, and only
     /// these, as the accent-filled Primary chip; a navigation or a decline is the quiet
     /// Secondary chip, and `Details` wears its own role.
+    #[inline]
     #[must_use]
     pub const fn is_consequential(&self) -> bool {
         matches!(
@@ -604,6 +621,7 @@ impl Intent {
     /// A decline (`Not now`, an upgrade's `Not today` or `Skip version`): a press that
     /// puts the work off. The glass paints it as the quiet Secondary chip, and the page
     /// never promotes it to its Primary past a first intent a press cannot perform.
+    #[inline]
     #[must_use]
     pub const fn is_decline(&self) -> bool {
         matches!(
@@ -619,6 +637,7 @@ impl Intent {
     /// A press that stops the row's own work in flight (`StopPaste`): the one decision a
     /// progress row may carry. The glass paints it as the accent chip
     /// ([`Intent::is_consequential`]); the attention rule keeps the row Progress.
+    #[inline]
     #[must_use]
     pub const fn stops_work(&self) -> bool {
         matches!(self, Self::StopPaste { .. })
@@ -911,6 +930,7 @@ impl ActionIndex {
     pub const DETAILS: ActionIndex = ActionIndex(255);
 
     /// `true` for the implicit capsule.
+    #[inline]
     #[must_use]
     pub const fn is_details(self) -> bool {
         self.0 == Self::DETAILS.0
@@ -988,6 +1008,7 @@ impl Hold {
     }
 
     /// `true` for the holds a fold ends (Default / For / Ask).
+    #[inline]
     #[must_use]
     pub const fn is_held(self) -> bool {
         matches!(self, Self::Default | Self::For(_) | Self::Ask { .. })
@@ -995,12 +1016,14 @@ impl Hold {
 
     /// `true` for the holds that outlast a look (Standing, Ask): the ones
     /// only a [`Need::Now`] may carry.
+    #[inline]
     #[must_use]
     pub const fn persists(self) -> bool {
         matches!(self, Self::Standing(_) | Self::Ask { .. })
     }
 
     /// `true` for [`Hold::Standing`].
+    #[inline]
     #[must_use]
     pub const fn is_standing(self) -> bool {
         matches!(self, Self::Standing(_))
@@ -1229,6 +1252,7 @@ pub enum Unit {
 
 impl Unit {
     /// The wire's word for it: `bytes`, `items` or `steps`.
+    #[inline]
     #[must_use]
     pub(crate) const fn word(self) -> &'static str {
         match self {
@@ -1239,6 +1263,7 @@ impl Unit {
     }
 
     /// What the count is, for the estimator: a held step is a step.
+    #[inline]
     #[must_use]
     pub(crate) const fn count(self) -> Self {
         match self {

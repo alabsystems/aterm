@@ -28,14 +28,16 @@ pub enum Item {
 
 impl Item {
     /// Is this the vacant entry?
+    #[inline]
     #[must_use]
-    pub fn is_none(&self) -> bool {
+    pub const fn is_none(&self) -> bool {
         matches!(self, Item::None)
     }
 
     /// The value, if this entry is one.
+    #[inline]
     #[must_use]
-    pub fn as_value(&self) -> Option<&Value> {
+    pub const fn as_value(&self) -> Option<&Value> {
         match self {
             Item::Value(v) => Some(v),
             _ => None,
@@ -43,7 +45,8 @@ impl Item {
     }
 
     /// The value, mutably.
-    pub fn as_value_mut(&mut self) -> Option<&mut Value> {
+    #[inline]
+    pub const fn as_value_mut(&mut self) -> Option<&mut Value> {
         match self {
             Item::Value(v) => Some(v),
             _ => None,
@@ -52,8 +55,9 @@ impl Item {
 
     /// The `[header]` table, if this entry is one. An inline table is not one:
     /// [`Item::as_table_like`] spans both spellings.
+    #[inline]
     #[must_use]
-    pub fn as_table(&self) -> Option<&Table> {
+    pub const fn as_table(&self) -> Option<&Table> {
         match self {
             Item::Table(t) => Some(t),
             _ => None,
@@ -61,7 +65,8 @@ impl Item {
     }
 
     /// The `[header]` table, mutably.
-    pub fn as_table_mut(&mut self) -> Option<&mut Table> {
+    #[inline]
+    pub const fn as_table_mut(&mut self) -> Option<&mut Table> {
         match self {
             Item::Table(t) => Some(t),
             _ => None,
@@ -69,8 +74,9 @@ impl Item {
     }
 
     /// The array of tables, if this entry is one.
+    #[inline]
     #[must_use]
-    pub fn as_array_of_tables(&self) -> Option<&ArrayOfTables> {
+    pub const fn as_array_of_tables(&self) -> Option<&ArrayOfTables> {
         match self {
             Item::ArrayOfTables(a) => Some(a),
             _ => None,
@@ -78,6 +84,7 @@ impl Item {
     }
 
     /// Either table spelling — `[header]` or `{ inline }` — behind one trait.
+    #[inline]
     #[must_use]
     pub fn as_table_like(&self) -> Option<&dyn TableLike> {
         match self {
@@ -88,6 +95,7 @@ impl Item {
     }
 
     /// Either table spelling, mutably.
+    #[inline]
     pub fn as_table_like_mut(&mut self) -> Option<&mut dyn TableLike> {
         match self {
             Item::Table(t) => Some(t),
@@ -97,42 +105,49 @@ impl Item {
     }
 
     /// Is this entry a table in either spelling?
+    #[inline]
     #[must_use]
     pub fn is_table_like(&self) -> bool {
         self.as_table_like().is_some()
     }
 
     /// Is this entry a `[header]` table?
+    #[inline]
     #[must_use]
-    pub fn is_table(&self) -> bool {
+    pub const fn is_table(&self) -> bool {
         matches!(self, Item::Table(_))
     }
 
     /// Is this entry an array of tables?
+    #[inline]
     #[must_use]
-    pub fn is_array_of_tables(&self) -> bool {
+    pub const fn is_array_of_tables(&self) -> bool {
         matches!(self, Item::ArrayOfTables(_))
     }
 
     /// The string, if this entry is one.
+    #[inline]
     #[must_use]
     pub fn as_str(&self) -> Option<&str> {
         self.as_value().and_then(Value::as_str)
     }
 
     /// The integer, if this entry is one.
+    #[inline]
     #[must_use]
     pub fn as_integer(&self) -> Option<i64> {
         self.as_value().and_then(Value::as_integer)
     }
 
     /// The float, if this entry is one.
+    #[inline]
     #[must_use]
     pub fn as_float(&self) -> Option<f64> {
         self.as_value().and_then(Value::as_float)
     }
 
     /// The boolean, if this entry is one.
+    #[inline]
     #[must_use]
     pub fn as_bool(&self) -> Option<bool> {
         self.as_value().and_then(Value::as_bool)
@@ -140,54 +155,63 @@ impl Item {
 
     /// The array, if this entry is one. An array of tables is
     /// [`Item::as_array_of_tables`].
+    #[inline]
     #[must_use]
     pub fn as_array(&self) -> Option<&super::Array> {
         self.as_value().and_then(Value::as_array)
     }
 
     /// Is this entry a value (rather than a table or an array of tables)?
+    #[inline]
     #[must_use]
-    pub fn is_value(&self) -> bool {
+    pub const fn is_value(&self) -> bool {
         matches!(self, Item::Value(_))
     }
 
     /// Is this entry a string?
+    #[inline]
     #[must_use]
     pub fn is_str(&self) -> bool {
         self.as_value().is_some_and(Value::is_str)
     }
 
     /// Is this entry an integer?
+    #[inline]
     #[must_use]
     pub fn is_integer(&self) -> bool {
         self.as_value().is_some_and(Value::is_integer)
     }
 
     /// Is this entry a float?
+    #[inline]
     #[must_use]
     pub fn is_float(&self) -> bool {
         self.as_value().is_some_and(Value::is_float)
     }
 
     /// Is this entry a boolean?
+    #[inline]
     #[must_use]
     pub fn is_bool(&self) -> bool {
         self.as_value().is_some_and(Value::is_bool)
     }
 
     /// Is this entry a date-time?
+    #[inline]
     #[must_use]
     pub fn is_datetime(&self) -> bool {
         self.as_value().is_some_and(Value::is_datetime)
     }
 
     /// Is this entry an array? An array of tables is [`Item::is_array_of_tables`].
+    #[inline]
     #[must_use]
     pub fn is_array(&self) -> bool {
         self.as_value().is_some_and(Value::is_array)
     }
 
     /// Look one level down, through either table spelling.
+    #[inline]
     #[must_use]
     pub fn get(&self, key: &str) -> Option<&Item> {
         self.as_table_like()?.get(key)
@@ -199,6 +223,7 @@ impl Item {
     /// header line. It is `None` for a synthesized node, for an array of
     /// tables (whose elements each carry their own), and after a mutation that
     /// invalidated it.
+    #[inline]
     #[must_use]
     pub fn span(&self) -> Option<Range<usize>> {
         match self {
@@ -209,8 +234,9 @@ impl Item {
     }
 
     /// A human-facing name for this entry's kind, for error messages.
+    #[inline]
     #[must_use]
-    pub fn type_name(&self) -> &'static str {
+    pub const fn type_name(&self) -> &'static str {
         match self {
             Item::None => "none",
             Item::Value(v) => v.type_name(),
@@ -302,10 +328,12 @@ impl KeyMap {
         self.entries.into_iter()
     }
 
-    pub(crate) fn len(&self) -> usize {
+    #[inline]
+    pub(crate) const fn len(&self) -> usize {
         self.entries.len()
     }
 
+    #[inline]
     pub(crate) fn contains_key(&self, key: &str) -> bool {
         self.index.contains_key(key)
     }
@@ -347,45 +375,53 @@ pub struct Table {
 
 impl Table {
     /// An empty table with canonical formatting.
+    #[inline]
     #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
     /// Does this table lack an authored `[header]`?
+    #[inline]
     #[must_use]
-    pub fn is_implicit(&self) -> bool {
+    pub const fn is_implicit(&self) -> bool {
         self.implicit
     }
 
     /// Declare whether this table's header is printed when it has children.
-    pub fn set_implicit(&mut self, implicit: bool) {
+    #[inline]
+    pub const fn set_implicit(&mut self, implicit: bool) {
         self.implicit = implicit;
     }
 
     /// Byte range of the `[header]` line in the source.
+    #[inline]
     #[must_use]
     pub fn span(&self) -> Option<Range<usize>> {
         self.span.clone()
     }
 
     /// Entries in authored order.
+    #[inline]
     pub fn iter(&self) -> impl Iterator<Item = (&str, &Item)> {
         self.items.iter().map(|(k, v)| (k.get(), v))
     }
 
     /// The entry for `key`.
+    #[inline]
     #[must_use]
     pub fn get(&self, key: &str) -> Option<&Item> {
         self.items.get(key)
     }
 
     /// The entry for `key`, mutably.
+    #[inline]
     pub fn get_mut(&mut self, key: &str) -> Option<&mut Item> {
         self.items.get_mut(key)
     }
 
     /// Is `key` present?
+    #[inline]
     #[must_use]
     pub fn contains_key(&self, key: &str) -> bool {
         self.items.contains_key(key)
@@ -488,29 +524,34 @@ pub struct ArrayOfTables {
 
 impl ArrayOfTables {
     /// An empty array of tables.
+    #[inline]
     #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
     /// Number of elements.
+    #[inline]
     #[must_use]
-    pub fn len(&self) -> usize {
+    pub const fn len(&self) -> usize {
         self.values.len()
     }
 
     /// Are there no elements?
+    #[inline]
     #[must_use]
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.values.is_empty()
     }
 
     /// Elements in document order.
+    #[inline]
     pub fn iter(&self) -> impl Iterator<Item = &Table> {
         self.values.iter()
     }
 
     /// Append an element.
+    #[inline]
     pub fn push(&mut self, table: Table) {
         self.values.push(table);
     }

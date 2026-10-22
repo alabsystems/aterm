@@ -1582,6 +1582,56 @@ fn stat_at(dir: RawFd, name: &CString) -> io::Result<Option<EntryStat>> {
     }))
 }
 
+/// Which of an entry's times [`touch_now`] sets to now.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Touch {
+    /// The access time (a file's: what a read sets).
+    Accessed,
+    /// The modification time (a directory's: what an entry made in it sets).
+    Modified,
+}
+
+/// Set one of the times of the entry at the absolute `path` to now, the other
+/// left as it is, its directory reached through no link on its whole path and
+/// the entry itself never followed (a link there gets the time itself). The
+/// change time moves too, as it does for any change of an entry's times.
+/// `Ok(false)` when nothing is there.
+///
+/// # Errors
+/// A link on the directory's path, or the kernel's refusal.
+pub fn touch_now(path: &std::path::Path, which: Touch) -> io::Result<bool> {
+    let Some((dir, name)) = open_parent(path)? else {
+        return Ok(false);
+    };
+    let at = |nsec| libc::timespec {
+        tv_sec: 0,
+        tv_nsec: nsec,
+    };
+    let times = match which {
+        Touch::Accessed => [at(libc::UTIME_NOW), at(libc::UTIME_OMIT)],
+        Touch::Modified => [at(libc::UTIME_OMIT), at(libc::UTIME_NOW)],
+    };
+    // SAFETY: `dir` is an open directory, `name` a valid C string and `times` two live timespecs;
+    // AT_SYMLINK_NOFOLLOW sets the entry's own times, never a link's target's.
+    let rc = unsafe {
+        libc::utimensat(
+            std::os::fd::AsRawFd::as_raw_fd(&dir),
+            name.as_ptr(),
+            times.as_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
+    if rc == 0 {
+        return Ok(true);
+    }
+    let e = io::Error::last_os_error();
+    if e.raw_os_error() == Some(libc::ENOENT) {
+        Ok(false)
+    } else {
+        Err(e)
+    }
+}
+
 /// What stands at the absolute `path`, its directory reached through no link
 /// on its whole path and the entry itself not followed (a link there is read
 /// as a link). `Ok(None)` when nothing is there.

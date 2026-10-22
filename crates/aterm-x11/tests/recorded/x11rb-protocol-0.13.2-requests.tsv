@@ -5,6 +5,8 @@
 # in this host's byte order (little-endian). <case> <hex>; put_image_big_head
 # is the first 24 bytes and the total length of a request past 16 bits.
 # LW.7 added create_colormap and grab_pointer_confine, the window system's own.
+# 2026-10-22 added SYNC's counter requests at 134 (sync_*), the window system's
+# _NET_WM_SYNC_REQUEST counter.
 create_window	01180c000100600023010000fbff07008002e0010000010021000000022a00000088ff00010000000000420020000000
 create_window_clipboard	0100090002004000e3040000000000000100010000000100210000000008000000004000
 change_window_attributes	0200050001006000004800000100200009006000
@@ -70,3 +72,9 @@ randr_get_output_primary	8c1f0200e3040000
 xi_query_version	832f020002000300
 xi_select_events	832e080001006000020000000100010050001000000002000008000000000000
 xi_query_pointer	832803000100600002000000
+sync_initialize	8600020003010000
+sync_create_counter	86020400070060000000000000000000
+sync_set_counter	86030400070060000500000001000080
+sync_set_counter_negative	8603040007006000fffffffffeffffff
+sync_query_counter	8605020007006000
+sync_destroy_counter	8606020007006000

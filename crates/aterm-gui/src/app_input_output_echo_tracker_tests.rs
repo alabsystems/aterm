@@ -1111,3 +1111,66 @@ fn fifo_admission_receipt_is_not_pty_acceptance() {
         "only the writer thread's real seam may stamp echo evidence"
     );
 }
+
+/// THE SUBMISSION COUNT rides every input write's acceptance
+/// ([`crate::submit_count`]): the egress law's ([`tracked_egress`], a key or a
+/// controller's `send` on any route) and the guarded actuator's
+/// ([`OutputEchoTracker::begin_event`], then `finish_delivery`, as
+/// `control_input::input_if_fenced_observed` writes a fenced `key`). An Enter
+/// counts once something was composed since the last, and only once the sink
+/// accepted it: a refused write moved nothing.
+#[cfg(unix)]
+#[test]
+fn an_accepted_enter_over_composed_input_counts_one_submission() {
+    let mut pipe = [0; 2];
+    assert_eq!(unsafe { libc::pipe(pipe.as_mut_ptr()) }, 0, "pipe");
+    let sink = SinkWriter::new(pipe[1]);
+    let term = Mutex::new(Terminal::new(24, 80));
+    let modes = crate::mode_mirror_of(&term);
+    let tracker = OutputEchoTracker::default();
+    let write = |ev: &InputEvent| {
+        tracked_egress(
+            &term,
+            &modes,
+            &sink,
+            &tracker,
+            ev,
+            input::EgressMode::Interactive,
+        )
+    };
+    let plain = enter(TMods::empty(), KeyEventType::Press);
+    // NEGATIVE CONTROL: an Enter over an empty composer.
+    write(&plain);
+    assert_eq!(tracker.submits(), 0);
+    write(&InputEvent::KeySequence(b"keep going".to_vec()));
+    assert_eq!(tracker.submits(), 0, "a draft is no submission");
+    // A refused Enter (the program stopped reading) counts nothing, and the
+    // draft stays composed for the Enter that lands.
+    tracker
+        .begin_event(&plain)
+        .finish_delivery(input::Delivery::BusyZero, None, &sink);
+    assert_eq!(tracker.submits(), 0, "a refused write moved nothing");
+    // The guarded actuator's accepted Enter counts.
+    let fenced = tracker.begin_event(&plain);
+    let receipt =
+        input::seam_egress_receipt(&term, &modes, &sink, &plain, input::EgressMode::Interactive);
+    fenced.finish_delivery(input::Delivery::Full, receipt.accepted_order(), &sink);
+    assert_eq!(tracker.submits(), 1);
+    // A second Enter counts none.
+    write(&plain);
+    assert_eq!(tracker.submits(), 1);
+    // A person's typed key and Enter through the egress law count one more.
+    write(&InputEvent::Key {
+        key: TKey::Character('y'),
+        mods: TMods::empty(),
+        base_layout: None,
+        layout_text: None,
+        event_type: KeyEventType::Press,
+    });
+    write(&plain);
+    assert_eq!(tracker.submits(), 2);
+    drop(sink);
+    unsafe {
+        libc::close(pipe[0]);
+    }
+}

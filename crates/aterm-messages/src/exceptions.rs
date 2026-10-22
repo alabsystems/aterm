@@ -115,6 +115,7 @@ pub enum Family {
 impl Family {
     /// The key stem: `Fingerprint::new(stem, subject, cause)` is an entry's
     /// key, so `stem` + `.` is the prefix a family pass sweeps.
+    #[inline]
     #[must_use]
     pub const fn stem(self) -> &'static str {
         match self {
@@ -150,6 +151,7 @@ impl Family {
     /// raise an entry under its prefix; a [`Mode::Event`] family raises and clears by
     /// event (`post`, `clear_digest`) and is never swept. The host refuses the wrong
     /// call (`App::except`, `App::except_replace`).
+    #[inline]
     #[must_use]
     pub const fn mode(self) -> Mode {
         match self {
@@ -197,6 +199,7 @@ impl Family {
     ];
 
     /// The message tag the family's entries carry.
+    #[inline]
     #[must_use]
     pub const fn tag(self) -> Tag {
         match self {
@@ -344,14 +347,16 @@ impl Entry {
     }
 
     /// The `aterm.log` line, if the reporter gave one.
+    #[inline]
     #[must_use]
     pub fn log_line_text(&self) -> Option<&str> {
         self.log_line.as_deref()
     }
 
     /// The family.
+    #[inline]
     #[must_use]
-    pub fn family(&self) -> Family {
+    pub const fn family(&self) -> Family {
         self.family
     }
 

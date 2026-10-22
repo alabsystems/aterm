@@ -16,12 +16,14 @@ pub struct SessionId(String);
 impl SessionId {
     /// Wrap an existing id string (e.g. read back from `<id>/meta`). Code minting a
     /// fresh identity uses [`SessionId::generate`].
+    #[inline]
     pub fn new(s: impl Into<String>) -> Self {
         Self(s.into())
     }
 
     /// The id as a string slice (the on-wire / on-disk form).
     #[must_use]
+    #[inline]
     pub fn as_str(&self) -> &str {
         &self.0
     }
@@ -41,6 +43,7 @@ impl SessionId {
     /// Whether this id has the shape [`SessionId::generate`] mints
     /// ([`is_minted_sid`]).
     #[must_use]
+    #[inline]
     pub fn is_minted(&self) -> bool {
         is_minted_sid(&self.0)
     }
@@ -52,6 +55,7 @@ impl SessionId {
 /// it reads as one, so a session log never attributes a record to a word
 /// that was never a session's (phase 3A ruling R1).
 #[must_use]
+#[inline]
 pub fn is_minted_sid(s: &str) -> bool {
     let b = s.as_bytes();
     b.len() == 22
@@ -66,6 +70,7 @@ pub fn is_minted_sid(s: &str) -> bool {
 /// selector finds its session without minting an owned id. The derived `Hash` and
 /// `Eq` read the one `String`, which hashes and compares as its `str`.
 impl std::borrow::Borrow<str> for SessionId {
+    #[inline]
     fn borrow(&self) -> &str {
         &self.0
     }
@@ -88,7 +93,8 @@ pub struct LaunchNonce([u8; 16]);
 impl LaunchNonce {
     /// Wrap raw nonce bytes (e.g. parsed from `meta.nonce`).
     #[must_use]
-    pub fn from_bytes(b: [u8; 16]) -> Self {
+    #[inline]
+    pub const fn from_bytes(b: [u8; 16]) -> Self {
         Self(b)
     }
 

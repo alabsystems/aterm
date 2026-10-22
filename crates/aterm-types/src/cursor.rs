@@ -36,7 +36,9 @@ pub enum CursorStyle {
 
 impl CursorStyle {
     /// Map a DECSCUSR parameter to a cursor style.
-    pub fn from_param(param: u16) -> Option<Self> {
+    #[inline]
+    #[must_use]
+    pub const fn from_param(param: u16) -> Option<Self> {
         match param {
             0 | 1 => Some(Self::BlinkingBlock),
             2 => Some(Self::SteadyBlock),
@@ -51,6 +53,7 @@ impl CursorStyle {
     /// Whether this style is one of the three blinking DECSCUSR shapes. The rendered blink
     /// follows the style, so this is the answer `CSI ? 12 $ p` (DEC mode 12) reports. The
     /// frontend-only shapes (`Hidden`, `HollowBlock`, `Bolt`) never blink.
+    #[inline]
     #[must_use]
     pub const fn blinks(self) -> bool {
         matches!(
@@ -61,6 +64,7 @@ impl CursorStyle {
 
     /// The same shape with its blink bit set to `blink`: DEC mode 12 (`CSI ? 12 h` blinking,
     /// `CSI ? 12 l` steady) never changes the shape. The frontend-only shapes pass through.
+    #[inline]
     #[must_use]
     pub const fn with_blink(self, blink: bool) -> Self {
         match self {

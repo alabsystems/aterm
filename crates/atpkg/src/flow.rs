@@ -879,6 +879,11 @@ fn install_inner(
         },
         &|dl| fetch_artifact(fetcher, program, repo, artifact, dl),
     )?;
+    // The names refused a shim go into the record the doctor's `base.pkg.refused` row reads
+    // (design S13), here on the pass's thread where the signed `exposes` was admitted: no
+    // verb that lays shims later holds that list, and [`land_artifact`] also runs on the
+    // vendor lane's rider threads, which write no status. Diagnostics, never a failure.
+    let _ = crate::status::record_refused_shims(layout, program, pinned, &landed.refused);
     Ok(InstallReport {
         program: program.to_string(),
         build: pinned,
@@ -1337,7 +1342,10 @@ pub(crate) fn roll_back_to(
 /// Lay a failing tombstone shim (§7) over every tool `program`'s active build exposes (its
 /// live `bin/` shims), so a yanked or below-floor build is disabled. Nothing to do when not
 /// installed. Best-effort per tool; a tombstone never shadows a sensitive name, since
-/// `active_tools` yields only admitted [`crate::store::ToolName`]s.
+/// `active_tools` yields only admitted [`crate::store::ToolName`]s. A shim an older atpkg
+/// laid under a name no shim may carry now, forwarding into the program's store, is removed
+/// rather than tombstoned (a tombstone under that name would itself be the shim the name is
+/// refused), so a revoked build's `bin/pwsh` stops running it too.
 pub(crate) fn install_tombstone_shims(layout: &Layout, program: &str, installed: Option<u64>) {
     if let Some(cur) = installed {
         // The `alab-<tool>` aliases forward to the same revoked executable, so they go too.
@@ -1346,6 +1354,7 @@ pub(crate) fn install_tombstone_shims(layout: &Layout, program: &str, installed:
         for tool in tools.iter().chain(&aliases) {
             let _ = install_tombstone_shim(layout, tool);
         }
+        crate::activate::remove_refused_name_shims(layout, Some(program));
     }
 }
 
@@ -3905,13 +3914,17 @@ fn stage_fetched(
     }
     // This member's bytes are good, whatever an earlier pass recorded about them.
     crate::store::clear_stage_refusal(&build_dir);
+    // Refused (sensitive/malformed) names are dropped once here, not per flip; they are not
+    // a stage failure, matching `install`, which records them the same way. The entry is
+    // this build's, kept beside the live build's, so the doctor says the live build's until
+    // a flip makes this one current, and a held or aborted flip changes nothing it says.
+    let (exposes, refused) = crate::store::split_exposed(&pkg.exposes);
+    let _ = crate::status::record_refused_shims(layout, program, pinned, &refused);
     // The archive stays until the transaction knows the tuple's fate (`carried_archive`).
     Some(Staged {
         build: pinned,
         build_dir,
-        // Refused (sensitive/malformed) names are dropped once here, not per flip; they
-        // are not a stage failure, matching `install`.
-        exposes: crate::store::split_exposed(&pkg.exposes).0,
+        exposes,
         prior_build,
         was_live,
         reloc,

@@ -91,8 +91,9 @@ impl TokenBucket {
     ///
     /// The bucket starts at full capacity.
     #[must_use]
-    pub fn from_config(cfg: &RateLimit) -> Self {
-        let capacity_bytes = u64::from(cfg.capacity_bytes);
+    #[inline]
+    pub const fn from_config(cfg: &RateLimit) -> Self {
+        let capacity_bytes = cfg.capacity_bytes as u64;
         Self {
             #[allow(
                 clippy::cast_precision_loss,
@@ -100,8 +101,8 @@ impl TokenBucket {
             )]
             tokens: capacity_bytes as f64,
             capacity_bytes,
-            refill_per_second: u64::from(cfg.refill_per_second),
-            per_sequence_max: u64::from(cfg.per_sequence_max),
+            refill_per_second: cfg.refill_per_second as u64,
+            per_sequence_max: cfg.per_sequence_max as u64,
             last_refill: None,
         }
     }
@@ -278,6 +279,7 @@ impl RateLimiterSet {
     /// bucket with that id; debiting that slot allows, exactly as passing the
     /// unknown id to [`Self::try_consume`] would.
     #[must_use]
+    #[inline]
     pub fn slot(&self, id: &str) -> RateLimitSlot {
         RateLimitSlot(self.slots.get(id).copied())
     }
@@ -293,6 +295,7 @@ impl RateLimiterSet {
     /// The "unknown id ⇒ allow" branch is deliberate: the engine's
     /// fail-closed posture is enforced at rule-evaluation time via
     /// `defaults.unmatched`. Rate limits only narrow *matched* rules.
+    #[inline]
     pub fn try_consume<T: TimeSource>(&mut self, id: &str, amount: u64, clock: &T) -> bool {
         let slot = self.slot(id);
         self.try_consume_slot(slot, amount, clock)
@@ -305,6 +308,7 @@ impl RateLimiterSet {
     /// "unknown id ⇒ allow". A slot issued by a DIFFERENT set whose index is
     /// past this set's buckets also allows, so the operation stays total (see
     /// the [`RateLimitSlot`] docs on why a caller must not rely on that).
+    #[inline]
     pub fn try_consume_slot<T: TimeSource>(
         &mut self,
         slot: RateLimitSlot,

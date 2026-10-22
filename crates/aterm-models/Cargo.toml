@@ -22,6 +22,7 @@ doctest = false
 aterm-spec.workspace = true
 # Every domain crate, so a binary that calls `link_all` registers every model.
 aterm-models-agh.workspace = true
+aterm-models-aos.workspace = true
 aterm-models-atpkg.workspace = true
 aterm-models-core.workspace = true
 aterm-models-effects.workspace = true

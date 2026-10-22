@@ -700,6 +700,122 @@ pub const CLAUDE_CANCEL: Cancel = Cancel {
     cancelled: "Automatic continue cancelled",
 };
 
+/// THE RESIDUALS, LIVE (`--mode resid`, `--mode ladder`): what the review's
+/// fix pass and `b9/resid3` left to their unit tests.
+///
+/// `same-words`' first prompt carries this token, holding no space, so its
+/// opener — one row of the window's 144 columns, two of [`RESIZED`]'s — re-wraps
+/// at the narrower width (F2: a long word split elsewhere hashed as another
+/// opener). The prompt still fits one composer row, as the lab reads a
+/// composer's draft by its first row.
+pub const LONG_TOKEN: &str = "lab/parser-module-parser-module-parser.rs";
+/// The size `same-words`' tab is resized to once its first point is decided
+/// (`resize <rows> <cols>`): narrower, so the opener re-wraps, and taller, so
+/// more of the conversation above the reply comes into sight.
+pub const RESIZED: (u16, u16) = (104, 62);
+// narrower than the window
+const _: () = assert!(RESIZED.0 < 144);
+/// How long after the first point's back-off was decided the tab is resized.
+const RESIZE_AFTER_MS: i64 = 5_000;
+/// How long after the resize the orchestrator's turn comes: the loop has read
+/// the re-wrapped screen (its recheck is 5 s at the most) and decided there.
+const TURN_AFTER_RESIZE_MS: i64 = 30_000;
+/// `same-words`' orchestrator's turn, answered with the very words of the
+/// reply before it ([`WORK`]) under its own opener.
+const SAME_TURN: &str = "now carry on with the parser module and report";
+/// The words its reply is picked by: none (every turn of the chain is
+/// answered with [`WORK`]).
+const SAME_TURN_KEY: &str = "now carry on with the parser module";
+
+/// F3's reply to its tool's result: no words, so the turn ends on the tool's
+/// row ([`read_call`]).
+pub const TOOL_AFTER: &str = "";
+
+/// The factor `--mode ladder` scales the short back-off ladder by (the
+/// product's development seam, `turn_end::LADDER_SCALE_SEAM`): an eighth, so
+/// the steps of 2, 4, 8, 16, 32 and 60 min are 15 s to 7.5 min, and the
+/// ladder to its cap and the cap decided again fit in about 16 min.
+pub const LADDER_SCALE: f64 = 0.125;
+/// How many back-offs `ladder` must see decided: the doubling steps to the
+/// cap (2, 4, 8, 16, 32, 60 min), and the cap once more.
+pub const LADDER_STEPS: u32 = 7;
+/// `ladder`'s hang detector: the scaled ladder's six steps waited out
+/// (about 15.3 min) and the seventh decided, with room.
+const LADDER_LIMIT_MS: i64 = 25 * 60 * 1000;
+/// How far a step measured off the journal (its `until=` less the time its
+/// `WAITING` was journaled) may fall short of the step the ladder names: the
+/// journal cuts `until=` to its second, and journals the decision at the read
+/// that judged the point, a moment after it showed.
+const STEP_SLACK_MS: i64 = 2_500;
+
+/// The instance environment `--mode ladder` runs its aterm under: the
+/// ladder's seam at [`LADDER_SCALE`] (a development build reads it, a shipped
+/// one never).
+#[must_use]
+pub fn ladder_env() -> String {
+    format!("{}={LADDER_SCALE}", turn_end::LADDER_SCALE_SEAM)
+}
+
+/// The shipped short back-off ladder, in minutes, one step per short turn
+/// in a row from the first: 2 min doubled to the 60 min cap, and the cap
+/// again — the judge's own word of it, which the product's timing is held to
+/// in a test (`forever_tests.rs`).
+pub const SHIPPED_LADDER_MIN: [i64; LADDER_STEPS as usize] = [2, 4, 8, 16, 32, 60, 60];
+
+/// The step the ladder names for a point that closed `streak` short turns
+/// ([`SHIPPED_LADDER_MIN`], the cap past its end), scaled by `scale`, in ms.
+#[must_use]
+pub fn ladder_step_ms(streak: u32, scale: f64) -> i64 {
+    let i = usize::try_from(streak.max(1) - 1)
+        .unwrap_or(usize::MAX)
+        .min(SHIPPED_LADDER_MIN.len() - 1);
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_precision_loss,
+        reason = "a step of minutes scaled by a factor at most 1: far inside both"
+    )]
+    let ms = (SHIPPED_LADDER_MIN[i] as f64 * 60_000.0 * scale).round() as i64;
+    ms
+}
+
+/// F3's tool call on harness `h`: a read of the chain's own `README.md`
+/// (`file`, its physical path), read-only, which each CLI runs with no
+/// confirm in the lab's jail: Claude Code's `Read`, Gemini CLI's
+/// `read_file`, agy's `view_file`, Muse Code's `read_file` (its path read
+/// from its workspace root: an absolute one only where its file policy
+/// allows).
+#[must_use]
+pub fn read_call(h: Harness, file: &Path) -> J {
+    let abs = file.to_string_lossy().into_owned();
+    let (name, input) = match h {
+        Harness::Claude => ("Read", J::obj([("file_path", J::s(abs))])),
+        Harness::Gemini => ("read_file", J::obj([("file_path", J::s(abs))])),
+        Harness::Agy => (
+            "view_file",
+            J::obj([
+                ("AbsolutePath", J::s(abs)),
+                ("toolSummary", J::s("README read")),
+                ("toolAction", J::s("Reading the README")),
+            ]),
+        ),
+        Harness::Muse => ("read_file", J::obj([("path", J::s("README.md"))])),
+    };
+    J::obj([("name", J::s(name)), ("input", input)])
+}
+
+/// Why F3 is out of this lab's reach on harness `h`: no turn of its ends on a
+/// tool's row with no words after it (`None` where one does). Measured live
+/// on agy 1.4.0 (`r3-res-agy`, 2026-10-21): an empty reply after the tool's
+/// result is no output to it, so it sends `Error: model output error: model
+/// output must contain either output text or tool calls, these cannot both be
+/// empty, please try again` as a turn of its own and asks again, every time.
+#[must_use]
+pub fn tool_end_out_of_reach(h: Harness) -> Option<&'static str> {
+    (h == Harness::Agy).then_some(
+        "agy refuses a reply holding neither text nor a tool call: after the tool's result it sends \"Error: model output error: model output must contain either output text or tool calls, these cannot both be empty, please try again\" as a turn of its own and asks again, so no turn of its ends on a tool's row with no words after it",
+    )
+}
+
 /// Why W1 or W2 (`mode`'s scenario) is out of this lab's reach on harness
 /// `h`, where it is: `None` where the stub draws the harness's own usage wall
 /// and, for W2, the lab takes its notice off the screen ([`hide_of`]). Claude Code reads the stub's usage limit (its unified-limit
@@ -721,7 +837,13 @@ pub fn wall_out_of_reach(h: Harness, mode: Mode) -> Option<&'static str> {
                 "the stub's per-day quota is the Gemini API's: only Gemini CLI draws it as a usage-limit dialog that names no reset",
             ),
         },
-        Mode::Land | Mode::Cruise | Mode::Both | Mode::Cover | Mode::Cap => None,
+        Mode::Land
+        | Mode::Cruise
+        | Mode::Both
+        | Mode::Cover
+        | Mode::Cap
+        | Mode::Resid
+        | Mode::Ladder => None,
     }
 }
 
@@ -866,6 +988,10 @@ pub enum Mode {
     Wall,
     /// W2: the wall whose notice leaves the screen (`wall-hid`).
     WallHid,
+    /// The residuals live (`resid`): F18, F1 and F2, the same words, F3.
+    Resid,
+    /// The back-off ladder past its fourth step, scaled (`ladder`).
+    Ladder,
     /// W1 on the usage-limit dialog that names no reset (`wall-day`): Gemini
     /// CLI's on a key's spent per-day quota.
     WallDay,
@@ -884,6 +1010,8 @@ impl Mode {
             "cap" => Mode::Cap,
             "wall" => Mode::Wall,
             "wall-hid" => Mode::WallHid,
+            "resid" => Mode::Resid,
+            "ladder" => Mode::Ladder,
             "wall-day" => Mode::WallDay,
             "wall-climb" => Mode::WallClimb,
             _ => return None,
@@ -897,7 +1025,13 @@ impl Mode {
         match self {
             Mode::Wall | Mode::WallDay | Mode::WallClimb => Some(Scenario::W1),
             Mode::WallHid => Some(Scenario::W2),
-            Mode::Land | Mode::Cruise | Mode::Both | Mode::Cover | Mode::Cap => None,
+            Mode::Land
+            | Mode::Cruise
+            | Mode::Both
+            | Mode::Cover
+            | Mode::Cap
+            | Mode::Resid
+            | Mode::Ladder => None,
         }
     }
 }
@@ -1022,6 +1156,16 @@ pub enum Chain {
     Wall,
     /// W2 (the usage wall whose notice leaves the screen: the remembered wall).
     WallHid,
+    /// F18 (a person's keystroke into an instant turn: P4C's chain, its
+    /// person's prompt typed `as=person`).
+    InstantPerson,
+    /// F1 and F2 (a judged turn's opener re-wrapped and revealed by a resize)
+    /// and SAME (a new turn answered with the very words of the one before).
+    SameWords,
+    /// F3 (a first turn ended on a tool's row after a launch).
+    ToolEnd,
+    /// LADDER (the back-off ladder doubled to its cap, scaled).
+    Ladder,
     /// W1 on Gemini CLI's usage-limit dialog that names no reset (a key's
     /// spent per-day quota), kept trying on the entitlement ladder while a
     /// person is told.
@@ -1070,6 +1214,19 @@ pub enum Scenario {
     /// The harness's END (§12.5.4): the window at rest with ends and needs
     /// standing, then each chain's chip in front ([`surfaces::judge_end`]).
     End,
+    /// A person's keystroke into an instant turn no read saw run: their own
+    /// exchange, left to them (the review's F18).
+    F18,
+    /// A judged turn's opener re-wrapped and revealed by a resize, nothing
+    /// submitted: not judged again (the review's F1 and F2).
+    Rewrap,
+    /// A new turn answered with the very words of the reply before it, under
+    /// its own opener: judged as its own point (`b9/resid3`'s submission).
+    SameWords,
+    /// A first turn ended on a tool's row after a launch: judged (F3).
+    F3,
+    /// The back-off ladder doubled to its cap, each act at its due (scaled).
+    Ladder,
 }
 
 impl Scenario {
@@ -1110,6 +1267,11 @@ impl Scenario {
             Scenario::N3 => "N3",
             Scenario::N4 => "N4",
             Scenario::End => "END",
+            Scenario::F18 => "F18",
+            Scenario::Rewrap => "F1F2",
+            Scenario::SameWords => "SAME",
+            Scenario::F3 => "F3",
+            Scenario::Ladder => "LADDER",
         }
     }
 
@@ -1155,6 +1317,11 @@ impl Scenario {
             Scenario::W2 => {
                 "its notice scrolled away: the remembered wall waited out, resumed, landed"
             }
+            Scenario::F18 => "a person's key into an instant turn: LEFT, theirs, nothing typed",
+            Scenario::Rewrap => "a judged opener re-wrapped by a resize: not judged again",
+            Scenario::SameWords => "a new turn answered with the same words: its own point",
+            Scenario::F3 => "a first turn ended on a tool's row after a launch: judged",
+            Scenario::Ladder => "the back-off ladder doubled to its cap, each act at its due",
         }
     }
 }
@@ -1224,6 +1391,21 @@ impl Chain {
     /// own for W1's reason).
     pub const WALL_HID: [Chain; 1] = [Chain::WallHid];
 
+    /// The residuals' chains (`--mode resid`): F18's beside its negative
+    /// control, P4C's chain whose person's prompt goes through the control
+    /// socket (judged as a turn of the conversation); F1, F2 and SAME's; F3's;
+    /// and the Off control.
+    pub const RESID: [Chain; 5] = [
+        Chain::InstantCruise,
+        Chain::InstantPerson,
+        Chain::SameWords,
+        Chain::ToolEnd,
+        Chain::Off,
+    ];
+
+    /// The ladder's chain (`--mode ladder`, on a lab of its own: the scale is
+    /// the instance's, [`ladder_env`]) and the Off control.
+    pub const LADDER: [Chain; 2] = [Chain::Ladder, Chain::Off];
     /// The per-day quota's chain (`--mode wall-day`, alone on a lab of its
     /// own for W1's reason).
     pub const WALL_DAY: [Chain; 1] = [Chain::WallDay];
@@ -1242,6 +1424,8 @@ impl Chain {
             .chain(Chain::CAPPED)
             .chain(Chain::WALLED)
             .chain(Chain::WALL_HID)
+            .chain(Chain::RESID)
+            .chain(Chain::LADDER)
             .chain(Chain::WALL_DAY)
             .chain(Chain::WALL_CLIMB)
         {
@@ -1260,6 +1444,8 @@ impl Chain {
             Mode::Cap => Chain::CAPPED.to_vec(),
             Mode::Wall => Chain::WALLED.to_vec(),
             Mode::WallHid => Chain::WALL_HID.to_vec(),
+            Mode::Resid => Chain::RESID.to_vec(),
+            Mode::Ladder => Chain::LADDER.to_vec(),
             Mode::WallDay => Chain::WALL_DAY.to_vec(),
             Mode::WallClimb => Chain::WALL_CLIMB.to_vec(),
             Mode::Land | Mode::Cruise | Mode::Both => Chain::ALL
@@ -1282,6 +1468,7 @@ impl Chain {
             .into_iter()
             .filter(|c| match c {
                 Chain::WallHid => wall_out_of_reach(h, Mode::WallHid).is_none(),
+                Chain::ToolEnd => tool_end_out_of_reach(h).is_none(),
                 Chain::WallDay => wall_out_of_reach(h, Mode::WallDay).is_none(),
                 Chain::WallClimb => wall_out_of_reach(h, Mode::WallClimb).is_none(),
                 _ => true,
@@ -1340,6 +1527,7 @@ impl Chain {
             Chain::Cap => CAP_LIMIT_MS,
             // three back-offs (2, 4 and 8 min) before N4's reply
             Chain::CruiseN => CRUISE_N_LIMIT_MS,
+            Chain::Ladder => LADDER_LIMIT_MS,
             // the ladder's first rung, 30 min from the dialog's first read
             Chain::WallDay => WALL_DAY_LIMIT_MS,
             // its second rung, 2 h after the first
@@ -1385,6 +1573,10 @@ impl Chain {
             Chain::CruiseN => "cruise-n",
             Chain::CruiseO => "cruise-o",
             Chain::WallHid => "hid-wall",
+            Chain::InstantPerson => "instant-person",
+            Chain::SameWords => "same-words",
+            Chain::ToolEnd => "tool-end",
+            Chain::Ladder => "ladder",
             Chain::WallDay => "day-wall",
             Chain::WallClimb => "climb-wall",
         }
@@ -1407,6 +1599,9 @@ impl Chain {
             | Chain::InstantCruise
             | Chain::WroteC
             | Chain::CruiseN
+            | Chain::InstantPerson
+            | Chain::SameWords
+            | Chain::Ladder
             | Chain::CruiseO => "cruise",
             Chain::Off | Chain::Mgr => "off",
             _ => "land",
@@ -1443,6 +1638,10 @@ impl Chain {
             Chain::LandK => &[Scenario::L17],
             Chain::CruiseN => &[Scenario::N1, Scenario::N2, Scenario::N3, Scenario::N4],
             Chain::WallHid => &[Scenario::W2],
+            Chain::InstantPerson => &[Scenario::F18],
+            Chain::SameWords => &[Scenario::Rewrap, Scenario::SameWords],
+            Chain::ToolEnd => &[Scenario::F3],
+            Chain::Ladder => &[Scenario::Ladder],
             Chain::WallDay | Chain::WallClimb => &[Scenario::W1],
         }
     }
@@ -1491,7 +1690,14 @@ impl Chain {
     /// worker busy). The other chains' are paced ([`REPLY_DELAY_MS`]).
     #[must_use]
     pub fn instant(self) -> bool {
-        matches!(self, Chain::InstantLand | Chain::InstantCruise)
+        matches!(
+            self,
+            Chain::InstantLand
+                | Chain::InstantCruise
+                | Chain::InstantPerson
+                | Chain::SameWords
+                | Chain::ToolEnd
+        )
     }
 
     /// A PERSON'S PROMPT MID-CHAIN (P4P): typed as the first prompt is, once
@@ -1499,7 +1705,16 @@ impl Chain {
     /// back-off. Its reply ([`ASK_REPLY`]) is sent at once.
     #[must_use]
     pub fn asks(self) -> Option<String> {
-        (self == Chain::InstantCruise).then(|| format!("{} {ASK_KEY}", self.token()))
+        matches!(self, Chain::InstantCruise | Chain::InstantPerson)
+            .then(|| format!("{} {ASK_KEY}", self.token()))
+    }
+
+    /// Its person's prompt mid-chain ([`Self::asks`]) is typed AS A PERSON
+    /// TYPES IT ([`person_turn`]: `send|key as=person`, a person's hand on the
+    /// session), not through the control socket (F18).
+    #[must_use]
+    pub fn asks_as_person(self) -> bool {
+        self == Chain::InstantPerson
     }
 
     /// The first prompt (L13's a person's question; L15's the worker's task).
@@ -1507,6 +1722,12 @@ impl Chain {
     pub fn prompt(self) -> String {
         if self == Chain::LandP {
             return format!("{} {PERSON_ASKS}", self.token());
+        }
+        if self == Chain::SameWords {
+            return format!(
+                "{} write the parser for this repository under {LONG_TOKEN} and land it",
+                self.token()
+            );
         }
         format!(
             "{} write the parser for this repository and land it",
@@ -1635,7 +1856,7 @@ impl Chain {
                 rule(LAND_KEY, CLEAN),
                 rule("", WORK),
             ],
-            Chain::InstantCruise => vec![
+            Chain::InstantCruise | Chain::InstantPerson => vec![
                 rule(ASK_KEY, ASK_REPLY),
                 rule(CHECK_KEY, CLEAN),
                 rule(CONTINUE_KEY, DONE_CLAIM),
@@ -1670,6 +1891,19 @@ impl Chain {
                 rule(MARK, CLEAN),
                 rule("", WORK),
             ],
+            // F1, F2, SAME: every turn answered with the work report, the
+            // orchestrator's too — the very words of the reply before it
+            Chain::SameWords => vec![rule(SAME_TURN_KEY, WORK), rule("", WORK)],
+            // F3: the first prompt answered with a tool's call ([`read_call`],
+            // filled per harness by [`spec_on`]), its result with no words
+            Chain::ToolEnd => vec![
+                rule(NUDGE_KEY, CLEAN),
+                rule(LAND_KEY, CLEAN),
+                rule("", TOOL_AFTER),
+            ],
+            // LADDER: every turn short and plain, paced: read run, and each
+            // point closes one short turn more
+            Chain::Ladder => vec![rule("", WORK)],
         }
     }
 
@@ -1680,6 +1914,7 @@ impl Chain {
         match self {
             Chain::LandP => Some(ORCHESTRATED),
             Chain::Cap => Some(RESUMED),
+            Chain::SameWords => Some(SAME_TURN),
             _ => None,
         }
     }
@@ -1733,6 +1968,39 @@ pub fn spec(chains: &[Chain]) -> J {
             J::Arr(chains.iter().flat_map(|c| c.rules()).collect()),
         ),
     ])
+}
+
+/// [`spec`] for a run on harness `h`, `dirs` its chains' repositories (in
+/// `chains`' order): F3's first turn answered with that harness's read of
+/// its own `README.md` ([`read_call`]) on the rule that answers its prompt.
+#[must_use]
+pub fn spec_on(chains: &[Chain], h: Harness, dirs: &[PathBuf]) -> J {
+    let mut sp = spec(chains);
+    let Some(dir) = chains
+        .iter()
+        .zip(dirs)
+        .find(|(c, _)| **c == Chain::ToolEnd)
+        .map(|(_, d)| d)
+    else {
+        return sp;
+    };
+    let call = read_call(h, &dir.join("README.md"));
+    let token = Chain::ToolEnd.token();
+    if let Some(J::Arr(rules)) = sp.get("replies").cloned() {
+        let rules = rules
+            .into_iter()
+            .map(|mut r| {
+                let ours = r.get("when").and_then(J::as_str) == Some(token.as_str())
+                    && r.get("last").and_then(J::as_str) == Some("");
+                if ours {
+                    r.set("tool", call.clone());
+                }
+                r
+            })
+            .collect();
+        sp.set("replies", J::Arr(rules));
+    }
+    sp
 }
 
 /// What a scenario came to.
@@ -1890,6 +2158,19 @@ pub struct Cover {
     pub hidden: Option<Hidden>,
     /// W2: why the notice was not taken off the screen, where it was not.
     pub hide_gave_up: Option<String>,
+    /// F18: `status human_ms=` read once the person's mid-chain Enter took
+    /// their draft ([`Chain::asks_as_person`]): a stamp where a person's hand
+    /// reached the session.
+    pub ask_stamp: Option<String>,
+    /// F1, F2: when the lab resized the tab ([`RESIZED`]), and what the
+    /// resize and `dims` answered.
+    pub resized: Option<(i64, String)>,
+    /// F3: how many of the conversation's requests carried a tool's result
+    /// back (the stub's dumps), read once its watch is over.
+    pub tool_results: Option<usize>,
+    /// F3: the screen's last rows read once the first point after the prompt
+    /// was journaled, and when.
+    pub first_screen: Option<(i64, Vec<String>)>,
 }
 
 /// L13's prompt typed through `hwkey` (`forever --window`, [`person_keys`]):
@@ -2293,6 +2574,11 @@ fn judge_scenarios(chain: Chain, seen: &Seen, program: &str, t0: i64) -> Vec<(Sc
             // the harness's, judged once over every tab ([`surfaces::judge_end`])
             Scenario::End => continue,
             Scenario::W2 => cover::judge_wall_hidden(seen, land, program, t0),
+            Scenario::F18 => cover::judge_person_instant(seen, t0),
+            Scenario::Rewrap => cover::judge_rewrap(seen, t0),
+            Scenario::SameWords => cover::judge_same_words(seen, t0),
+            Scenario::F3 => cover::judge_tool_end(seen, land, t0),
+            Scenario::Ladder => cover::judge_ladder(seen, LADDER_SCALE, t0),
         };
         let cx = surfaces::Ctx { chain, program, t0 };
         out.push((s, surfaces::with_window(s, seen, &cx, v)));
@@ -3194,6 +3480,96 @@ fn backoff_due(line: &str) -> Option<i64> {
     }
     let (_, rest) = line.split_once(" until=")?;
     crate::workers::iso_ms(rest.split_whitespace().next()?)
+}
+
+/// How far apart two dues of ONE back-off may be read ([`same_backoff`]):
+/// each `until=` is the decision's own stamp, to the second.
+const SAME_DUE_MS: i64 = 1000;
+
+/// Whether two journal lines tell THE SAME BACK-OFF ([`backoff_named`]): the
+/// same short turns in a row (none, for a wall's) and dues within
+/// [`SAME_DUE_MS`]. A standing back-off told again at a re-read of its point
+/// keeps its streak and its due, under the re-read's own `seq=` or its
+/// point's (`r3-res-claude`, agy, Muse Code: the re-wrap's re-read journaled
+/// `WAITING seq=1219`, `1147`, `1198` with the first point's `until=`).
+fn same_backoff(a: &str, b: &str) -> bool {
+    backoff_named(a)
+        && backoff_named(b)
+        && backoff_streak(a) == backoff_streak(b)
+        && matches!((backoff_due(a), backoff_due(b)), (Some(x), Some(y)) if (x - y).abs() <= SAME_DUE_MS)
+}
+
+/// The first back-off decided after `t` at a point of its own
+/// ([`backoff_named`]): a `WAITING` that tells none journaled at or before
+/// `t` again — neither by its `seq=` (the same point's) nor by its streak and
+/// due ([`same_backoff`]: a re-read of the point under a `seq=` of its own).
+fn own_backoff_after(seen: &Seen, t: i64) -> Option<&Line> {
+    let standing: Vec<&str> = seen
+        .journal
+        .iter()
+        .filter(|(at, l)| *at <= t && backoff_named(l))
+        .map(|(_, l)| l.as_str())
+        .collect();
+    seen.journal.iter().find(|(at, l)| {
+        *at > t
+            && backoff_named(l)
+            && !standing
+                .iter()
+                .any(|s| word(s, "seq") == word(l, "seq") || same_backoff(s, l))
+    })
+}
+
+/// The short turns in a row a turn-end back-off names (`WAITING … until=<stamp>
+/// N short turn(s) in a row: …`).
+fn backoff_streak(line: &str) -> Option<u32> {
+    let (_, rest) = line.split_once(" until=")?;
+    let mut words = rest.split_whitespace().skip(1);
+    let n = words.next()?.parse().ok()?;
+    (words.next() == Some("short")).then_some(n)
+}
+
+/// A step of the short back-off ladder as the journal decided it
+/// ([`ladder_steps`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Step {
+    /// When its `WAITING` was journaled first.
+    pub at: i64,
+    /// The short turns in a row it names.
+    pub streak: u32,
+    /// Its `until=`, unix ms.
+    pub due: i64,
+    /// Its journal line.
+    pub line: String,
+}
+
+/// The short back-off ladder's steps from `t0`, as the journal decided them:
+/// the first turn-end `WAITING … N short turn(s) in a row: …` of each point,
+/// in order — a wall's back-off and the take window's left out, and a step
+/// told again left out whether under its point's `seq=` or a re-read's own
+/// ([`same_backoff`]: the same streak and due).
+#[must_use]
+pub fn ladder_steps(seen: &Seen, t0: i64) -> Vec<Step> {
+    let mut seqs: Vec<Option<String>> = Vec::new();
+    let mut out: Vec<Step> = Vec::new();
+    for (t, l) in &seen.journal {
+        let Some(streak) = backoff_streak(l).filter(|_| *t >= t0 && backoff_named(l)) else {
+            continue;
+        };
+        let seq = word(l, "seq");
+        if seqs.contains(&seq) || out.iter().any(|st| same_backoff(&st.line, l)) {
+            continue;
+        }
+        seqs.push(seq);
+        if let Some(due) = backoff_due(l) {
+            out.push(Step {
+                at: *t,
+                streak,
+                due,
+                line: l.clone(),
+            });
+        }
+    }
+    out
 }
 
 /// A point's journal line with words: `EVENT <phase> seq=<n> <words>`, its
@@ -4458,8 +4834,107 @@ fn orchestrator_due(chain: Chain, seen: &Seen, now: i64) -> bool {
             .all_acts()
             .first()
             .is_some_and(|(t1, _)| now - t1 >= cap_window_ms() + PAST_WINDOW_MS),
+        // once the resized screen was read and decided: the turn the very
+        // words of the reply before it answer
+        Chain::SameWords => seen
+            .cover
+            .resized
+            .as_ref()
+            .is_some_and(|(r, _)| now - r >= TURN_AFTER_RESIZE_MS),
         _ => false,
     }
+}
+
+/// F1 AND F2's DRIVE of the screen ([`Cover::resized`]): once `same-words`'
+/// first point's back-off was decided [`RESIZE_AFTER_MS`] ago, with nothing
+/// typed since its prompt, its tab is resized to [`RESIZED`] (`resize <rows>
+/// <cols>`, the cell form: the session's own grid and PTY, never the
+/// window's, as the tab is not the front one): its opener's long token
+/// ([`LONG_TOKEN`]) re-wraps, and more of the conversation comes into sight,
+/// with nothing submitted. Once.
+fn resize_step(door: &Door<'_>, tab: &mut Tab, now: i64) -> Result<(), Fail> {
+    if tab.chain != Chain::SameWords || tab.seen.cover.resized.is_some() {
+        return Ok(());
+    }
+    let Some((tw, _)) = tab
+        .seen
+        .journal
+        .iter()
+        .find(|(t, l)| *t > tab.t0 && backoff_named(l))
+    else {
+        return Ok(());
+    };
+    if now - tw < RESIZE_AFTER_MS || !tab.seen.all_acts().is_empty() {
+        return Ok(());
+    }
+    let (cols, rows) = RESIZED;
+    let who = format!("@{}", tab.sid);
+    let r = door.ctl(&[&who, "resize", &rows.to_string(), &cols.to_string()])?;
+    let dims = on(door, &tab.sid, &["dims"]);
+    let t = now_ms();
+    let said = format!(
+        "resize {rows} {cols}: {}{} (exit {}); dims {}",
+        r.stdout.trim(),
+        r.stderr.trim(),
+        r.code,
+        crate::util::one_line(dims.trim(), 160)
+    );
+    println!(
+        "  [{}] +{} resize  {}",
+        tab.chain.name(),
+        at(tab.t0, t),
+        crate::util::one_line(&said, 220)
+    );
+    tab.seen.cover.resized = Some((t, said));
+    Ok(())
+}
+
+/// F3's EVIDENCE of the screen ([`Cover::first_screen`]): its last rows, read
+/// once the first point after the prompt was judged (its `point@v1` record),
+/// where a turn ended on a tool's row draws that row last above the composer.
+fn first_screen_step(door: &Door<'_>, tab: &mut Tab) {
+    if tab.chain != Chain::ToolEnd || tab.seen.cover.first_screen.is_some() {
+        return;
+    }
+    let pointed = tab
+        .seen
+        .ledger
+        .iter()
+        .any(|r| r.rule == RULE_POINT && r.ts >= tab.t0);
+    if !pointed {
+        return;
+    }
+    let rows = tail_rows(door, &tab.sid, 12);
+    let t = now_ms();
+    println!(
+        "  [{}] +{} screen  at the first point:",
+        tab.chain.name(),
+        at(tab.t0, t)
+    );
+    for l in &rows {
+        println!("    | {l}");
+    }
+    tab.seen.cover.first_screen = Some((t, rows));
+}
+
+/// How many of conversation `token`'s requests carried a tool's result back,
+/// in their newest message or the conversation before it (the stub's dumps:
+/// each API's reader, [`crate::stub::messages_answered`],
+/// [`crate::stub::gemini::results_answered`],
+/// [`crate::stub::muse::results_answered`]): F3's call run by its agent.
+fn tool_results_of(run: &Run, token: &str) -> usize {
+    std::fs::read_dir(run.w.join("dump"))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|e| std::fs::read(e.path()).ok())
+        .filter(|body| String::from_utf8_lossy(body).contains(token))
+        .filter(|body| {
+            crate::stub::messages_answered(body)
+                || crate::stub::gemini::results_answered(body)
+                || crate::stub::muse::results_answered(body)
+        })
+        .count()
 }
 
 /// The tab's journal lines `(t, line)` and ledger rows, read through no link.
@@ -4755,6 +5230,17 @@ fn window_witness(run: &Run, tab: &Tab) -> Option<StubSeen> {
             let (t1, _) = tab.seen.all_acts().first().copied()?;
             let typed = usize::from(tab.seen.ledger.iter().any(|r| r.decision == "typed"));
             Some(StubSeen::within(&dumps_of(run, &token), *t1, until, typed))
+        }
+        // F18: from the person's Enter to the watch's end, the acts typed
+        // before it (the done check) the conversation's baseline
+        Chain::InstantPerson => {
+            let asked = tab.seen.asked_ms?;
+            Some(StubSeen::within(
+                &dumps_of(run, &token),
+                asked,
+                tab.seen.end_ms,
+                typed_by(asked),
+            ))
         }
         Chain::Wall | Chain::WallHid | Chain::WallDay | Chain::WallClimb => {
             let (_, reset_s) = tab.seen.cover.wall?;
@@ -5396,6 +5882,52 @@ fn finished(tab: &Tab, now: i64) -> bool {
             .is_some_and(|r| now - r >= QUIET_UNDER_OFF_MS + 5000),
         // its end stands (the window reads it at END)
         Chain::LandJ | Chain::LandK => done_since(20_000),
+        // F18: left to the person and quiet past the window; or an act typed
+        // into the exchange, a back-off decided at its point (judged as a
+        // turn of the conversation), a prompt never judged or not taken
+        Chain::InstantPerson => {
+            let asked = s.asked_ms;
+            let left = asked.and_then(|a| {
+                s.journal
+                    .iter()
+                    .find(|(t, l)| *t > a && l.starts_with("LEFT "))
+                    .map(|(t, _)| *t)
+            });
+            let decided = asked.and_then(|a| own_backoff_after(s, a)).map(|(t, _)| *t);
+            let typed_into =
+                asked.is_some_and(|a| s.all_acts().iter().any(|(t, _)| *t > a && now - *t >= 3000));
+            let unjudged =
+                asked.is_some_and(|a| left.is_none() && decided.is_none() && now - a > 150_000);
+            let refused = s.ask_refused_ms.is_some_and(|a| now - a > 5000);
+            left.is_some_and(|l| now - l >= QUIET_UNDER_OFF_MS + 5000)
+                || decided.is_some_and(|d| now - d >= 10_000)
+                || typed_into
+                || unjudged
+                || refused
+                || done_since(20_000)
+                || (s.all_acts().is_empty() && now - tab.t0 > 300_000)
+        }
+        // F1, F2, SAME: the act after the orchestrator's turn typed, and
+        // watched 20 s past it
+        Chain::SameWords => {
+            s.cover.turn_ms.is_some_and(|tt| {
+                s.all_acts()
+                    .iter()
+                    .any(|(t, _)| *t > tt && now - *t >= 20_000)
+            }) || done_since(20_000)
+                || (s.all_acts().is_empty() && now - tab.t0 > 330_000)
+        }
+        // F3: the act at the first point's due typed, and watched 30 s past
+        // it; nothing judged past the persistence deadline
+        Chain::ToolEnd => {
+            s.all_acts().first().is_some_and(|(t, _)| now - t >= 30_000)
+                || done_since(20_000)
+                || (s.all_acts().is_empty() && now - tab.t0 > 330_000)
+        }
+        // LADDER: its last step decided
+        Chain::Ladder => ladder_steps(s, tab.t0)
+            .get(LADDER_STEPS as usize - 1)
+            .is_some_and(|st| now - st.at >= 5_000),
         // N4's reply read, and its needs settled
         Chain::CruiseN => {
             let acts = s.all_acts();
@@ -5469,7 +6001,7 @@ fn run_check(
             chains.contains(&Chain::Worker),
         ),
     )?;
-    crate::verbs::set_custom_mode(&run, MODE, &spec(chains))?;
+    crate::verbs::set_custom_mode(&run, MODE, &spec_on(chains, h, &dirs))?;
     println!(
         "  stub      mode {MODE}: {} rule(s)",
         chains.iter().map(|c| c.rules().len()).sum::<usize>()
@@ -5742,25 +6274,43 @@ fn run_check(
             {
                 tab.ask_tried = true;
                 let asked = now_ms();
-                let took = tab_turn(&door, &tab.sid, h.name(), &ask)?;
+                // F18's is typed as a person types it (its Enter the time it
+                // was asked); P4P's through the control socket
+                let (took, entered) = if tab.chain.asks_as_person() {
+                    match person_turn(&door, &tab.sid, h.name(), &ask)? {
+                        Some((pressed, stamp)) => {
+                            tab.seen.cover.ask_stamp = Some(stamp);
+                            (true, pressed)
+                        }
+                        None => (false, asked),
+                    }
+                } else {
+                    (tab_turn(&door, &tab.sid, h.name(), &ask)?, asked)
+                };
                 println!(
                     "  [{}] +{} prompt  a person's, mid-chain: \"{ask}\"{}",
                     tab.chain.name(),
                     at(tab.t0, asked),
-                    if took {
-                        ""
-                    } else {
-                        " — the composer did not take it"
+                    match (took, tab.seen.cover.ask_stamp.as_deref()) {
+                        (false, _) => " — the composer did not take it".to_string(),
+                        (true, Some(stamp)) => format!(
+                            " as a person types it (the draft stood {} s, Enter at +{}; status human_ms={stamp})",
+                            PERSON_STAND_MS / 1000,
+                            at(tab.t0, entered)
+                        ),
+                        (true, None) => String::new(),
                     }
                 );
                 if took {
-                    tab.seen.asked_ms = Some(asked);
+                    tab.seen.asked_ms = Some(entered);
                 } else {
                     tab.seen.ask_refused_ms = Some(asked);
                 }
             }
             wall_step(&run, h, tab, now)?;
             hide_step(&door, h, tab, now)?;
+            resize_step(&door, tab, now)?;
+            first_screen_step(&door, tab);
             if let Some(text) = tab.chain.orchestrated()
                 && orchestrator_due(tab.chain, &tab.seen, now)
             {
@@ -5795,6 +6345,9 @@ fn run_check(
                         texts.len(),
                         texts.iter().filter(|t| t.contains(['\n', '\r'])).count()
                     );
+                }
+                if tab.chain == Chain::ToolEnd {
+                    tab.seen.cover.tool_results = Some(tool_results_of(&run, &tab.chain.token()));
                 }
                 if tab.chain == Chain::Worker {
                     let aim = format!("@{}", tab.sid);
@@ -5986,6 +6539,13 @@ fn lab_opts(
         // the cap is the instance's: set before it starts
         u.harness_keys = format!("{}\ncontinue_per_hour = {CAP_PER_HOUR}", u.harness_keys);
     }
+    if mode == Mode::Ladder {
+        // the ladder's scale is the instance's: its aterm reads the seam once
+        // at each loop's start
+        u.instance_env = format!("{} {}", u.instance_env, ladder_env())
+            .trim()
+            .to_string();
+    }
     match crate::lab::opts_refused(&u) {
         Some(why) => Err(Fail::usage(format!("forever: {why}"))),
         None => Ok(u),
@@ -6074,7 +6634,7 @@ fn parse_args(args: &[String]) -> Result<Option<Asked>, Fail> {
                 let w = it.next().map(String::as_str);
                 mode = w.and_then(Mode::of).ok_or_else(|| {
                     usage(&format!(
-                        "--mode takes land, cruise, both, cover, cap, wall, wall-hid, wall-day or wall-climb, not {w:?}"
+                        "--mode takes land, cruise, both, cover, cap, wall, wall-hid, wall-day, wall-climb, resid or ladder, not {w:?}"
                     ))
                 })?;
             }
@@ -6141,7 +6701,7 @@ fn parse_args(args: &[String]) -> Result<Option<Asked>, Fail> {
     Ok(Some(asked))
 }
 
-/// `forever --harness <claude|gemini|agy|muse|all> [--mode land|cruise|both|cover|cap|wall|wall-hid|wall-day|wall-climb] [--chains a,b] [--no-surfaces] [--window] [tag] [--keep]`.
+/// `forever --harness <claude|gemini|agy|muse|all> [--mode land|cruise|both|cover|cap|wall|wall-hid|wall-day|wall-climb|resid|ladder] [--chains a,b] [--no-surfaces] [--window] [tag] [--keep]`.
 pub fn cmd_forever(args: &[String]) -> Res {
     let Some(a) = parse_args(args)? else {
         print!("{}", crate::USAGE);
@@ -6171,6 +6731,15 @@ pub fn cmd_forever(args: &[String]) -> Res {
             )));
         }
         let chains = a.chains(h);
+        // F3 where no turn ends on a tool's row: named, not run
+        let tool_end_asked = Chain::of_mode(a.mode).contains(&Chain::ToolEnd)
+            && a.chains
+                .as_ref()
+                .is_none_or(|only| only.contains(&Chain::ToolEnd));
+        if tool_end_asked && let Some(why) = tool_end_out_of_reach(h) {
+            println!("forever: {} F3 is out of this lab's reach: {why}", h.name());
+            lines.push((h, Scenario::F3, Verdict::Unobserved(why.to_string())));
+        }
         if chains.is_empty() && a.mode.walled().is_none() {
             // `--chains` names none this harness runs of the mode's: nothing
             // here to bring up

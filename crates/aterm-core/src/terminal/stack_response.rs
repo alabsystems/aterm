@@ -20,7 +20,7 @@ pub(super) struct StackResponse<const N: usize> {
 impl<const N: usize> StackResponse<N> {
     /// Create an empty builder.
     #[inline]
-    pub(super) fn new() -> Self {
+    pub(super) const fn new() -> Self {
         Self {
             buf: [0u8; N],
             len: 0,
@@ -29,8 +29,8 @@ impl<const N: usize> StackResponse<N> {
 
     /// The bytes written so far.
     #[inline]
-    pub(super) fn as_bytes(&self) -> &[u8] {
-        &self.buf[..self.len]
+    pub(super) const fn as_bytes(&self) -> &[u8] {
+        self.buf.split_at(self.len).0
     }
 
     /// Append a raw byte slice (for fixed ASCII fragments).

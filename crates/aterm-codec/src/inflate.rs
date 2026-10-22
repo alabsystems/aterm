@@ -74,7 +74,8 @@ struct BitReader<'a> {
 }
 
 impl<'a> BitReader<'a> {
-    fn new(data: &'a [u8]) -> Self {
+    #[inline]
+    const fn new(data: &'a [u8]) -> Self {
         Self {
             data,
             byte_pos: 0,
@@ -107,6 +108,7 @@ impl<'a> BitReader<'a> {
         self.byte_pos = pos;
     }
 
+    #[inline]
     fn read_bit(&mut self) -> Result<u32, InflateError> {
         if self.bits_in_buffer == 0 {
             self.refill();
@@ -122,6 +124,7 @@ impl<'a> BitReader<'a> {
         Ok(bit)
     }
 
+    #[inline]
     fn read_bits(&mut self, n: u32) -> Result<u32, InflateError> {
         // Callers request at most 13 bits; the clamp bounds the mask shift.
         let n = n.min(32);
@@ -149,6 +152,7 @@ impl<'a> BitReader<'a> {
     /// Returns `(bits, avail)`: `avail = min(want, bits available)` and `bits`
     /// holds the low `avail` bits, LSB-first. A table entry longer than `avail`
     /// must not be trusted, since the bits that would select it do not exist.
+    #[inline]
     fn peek_bits(&mut self, want: u32) -> (u32, u32) {
         if self.bits_in_buffer < want {
             self.refill();
@@ -162,6 +166,7 @@ impl<'a> BitReader<'a> {
 
     /// Drop `n` bits already validated by [`peek_bits`](Self::peek_bits);
     /// clamped to what is buffered.
+    #[inline]
     fn consume_bits(&mut self, n: u32) {
         let n = n.min(self.bits_in_buffer);
         // `n <= bits_in_buffer <= 64`; `wrapping_shr` masks the amount, which is
@@ -171,6 +176,7 @@ impl<'a> BitReader<'a> {
     }
 
     /// Discard bits up to the next byte boundary (for stored blocks).
+    #[inline]
     fn align_to_byte(&mut self) {
         // Single field read into a local so `drop <= bits` is locally provable
         // (the verifier cannot relate two separate reads of the same field).
@@ -184,6 +190,7 @@ impl<'a> BitReader<'a> {
 
     /// Read a byte-aligned `u8` (caller must be byte-aligned, i.e. after
     /// `align_to_byte`, so `bits_in_buffer` is a multiple of 8).
+    #[inline]
     fn read_aligned_byte(&mut self) -> Result<u8, InflateError> {
         if self.bits_in_buffer >= 8 {
             let b = (self.bit_buffer & 0xff) as u8;
@@ -202,6 +209,7 @@ impl<'a> BitReader<'a> {
     }
 
     /// Read a byte-aligned little-endian `u16`.
+    #[inline]
     fn read_aligned_u16(&mut self) -> Result<u16, InflateError> {
         let lo = self.read_aligned_byte()?;
         let hi = self.read_aligned_byte()?;
@@ -234,6 +242,7 @@ const ROOT_BUILD_AFTER: u32 = 1024;
 /// DEFLATE sends Huffman codes MSB-first in an LSB-first bit stream, so the
 /// reversed code is what the decoder peeks and indexes the table with. `len` is
 /// clamped to `ROOT_BITS`, so the result is `< ROOT_SIZE`.
+#[inline]
 fn reverse_code(code: u32, len: u32) -> u32 {
     let len = len.min(ROOT_BITS);
     let mut src = code;
@@ -407,6 +416,7 @@ impl Huffman {
     /// symbol or the same error. A failed decode need not leave the bit cursor
     /// at the same position; callers abort or restore a checkpoint on error.
     /// An unarmed table misses and falls through, which is also correct.
+    #[inline]
     fn decode(&self, br: &mut BitReader) -> Result<u16, InflateError> {
         #[cfg(test)]
         if oracle::force_bitwise() {
@@ -760,6 +770,7 @@ fn block_loop<const TABLE: bool>(
 /// # Errors
 /// Returns an [`InflateError`] for any malformed input or if the decompressed
 /// size would exceed `max_output` (decompression-bomb guard). Never panics.
+#[inline]
 pub fn inflate(input: &[u8], max_output: usize) -> Result<Vec<u8>, InflateError> {
     inflate_prefix(input, max_output).map(|(out, _)| out)
 }
@@ -817,6 +828,7 @@ pub(crate) struct Adler32 {
 
 impl Adler32 {
     /// The specified seed (`a = 1`, `b = 0`).
+    #[inline]
     pub(crate) const fn new() -> Self {
         Self { a: 1, b: 0 }
     }
@@ -847,12 +859,14 @@ impl Adler32 {
     }
 
     /// The finished checksum.
+    #[inline]
     pub(crate) const fn finish(self) -> u32 {
         (self.b << 16) | self.a
     }
 }
 
 /// The RFC 1950 Adler-32 checksum of `data`.
+#[inline]
 fn adler32(data: &[u8]) -> u32 {
     let mut sum = Adler32::new();
     sum.update(data);
@@ -864,6 +878,7 @@ fn adler32(data: &[u8]) -> u32 {
 ///
 /// The streaming reader's check. The one-shot forms below spell the same three
 /// tests inline, where the verifier proves them in place.
+#[inline]
 fn check_zlib_header(cmf: u8, flg: u8) -> Result<(), InflateError> {
     if (cmf & 0x0f) != 8 {
         return Err(InflateError::BadZlibHeader); // CM must be 8 (DEFLATE)

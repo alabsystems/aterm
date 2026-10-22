@@ -664,14 +664,50 @@ pub(crate) fn agent_switch(key: &str) -> Option<Program> {
     aterm_phase::program_of(word).filter(|p| p.harness_table() && p.name() == word)
 }
 
-/// The name a row is searched by as its OWN, beside its label and key
-/// (`native_config_language::query_match_rank`): an agent's switch answers
-/// to its agent's word (`claude`, `codex`), which its label says only
-/// mid-sentence ("Supervise Claude Code sessions") and its key only
-/// mid-path, so a search for the agent finds its switch before the rows
-/// that list the word as a synonym ([`keywords_of`]).
-pub(crate) fn own_name_of(key: &str) -> Option<&'static str> {
-    agent_switch(key).map(Program::name)
+/// The names a row is searched by as its OWN, beside its label and key
+/// (`native_config_language::query_match_rank`): everything the agent a row
+/// is about is called, which its label says only mid-sentence ("Supervise
+/// Claude Code sessions", "Use Claude Code on this machine") and its key only
+/// mid-path. An agent's switch answers to its agent's word (`claude`,
+/// `codex`) and its product name (`claude code`, `antigravity cli`); an AI
+/// CLI's Use row the same way, to the CLI's word (`agy`, which its key holds
+/// only mid-path) and its product name (`codex cli`). So a search for the
+/// agent by either name finds its rows before the ones that list the word
+/// as a synonym ([`keywords_of`]: the packages switch lists `agy`).
+/// Lowercase, as the search ladder compares; read from the rosters, so a new
+/// agent needs no list here. Two at most, as an array a caller flattens (no
+/// allocation on a keystroke's sweep).
+pub(crate) fn own_names_of(key: &str) -> [Option<&'static str>; 2] {
+    if let Some(agent) = agent_switch(key) {
+        [Some(agent.name()), Some(folded_product(agent.product()))]
+    } else if let Some(cli) = ai_use_switch(key) {
+        [Some(cli.id), Some(folded_product(cli.product))]
+    } else {
+        [None, None]
+    }
+}
+
+/// An agent's or AI CLI's product name (`Program::product`,
+/// `Connector::product`) in lowercase, folded once for the whole roster;
+/// any other name as it is.
+fn folded_product(product: &'static str) -> &'static str {
+    static FOLDED: std::sync::OnceLock<Vec<(&'static str, String)>> = std::sync::OnceLock::new();
+    FOLDED
+        .get_or_init(|| {
+            Program::ALL
+                .into_iter()
+                .map(Program::product)
+                .chain(
+                    aterm_agent::ai::connector::ROWS
+                        .iter()
+                        .map(|cli| cli.product),
+                )
+                .map(|product| (product, product.to_ascii_lowercase()))
+                .collect()
+        })
+        .iter()
+        .find(|(name, _)| *name == product)
+        .map_or(product, |(_, folded)| folded.as_str())
 }
 
 /// `[ai] enabled`: whether the window looks at the AI CLIs aterm manages and
@@ -4250,7 +4286,7 @@ const BELL_SOUND_NOTE: &str =
 /// inside that row under its name ([`row_notes`]), so a note never sits under
 /// another row, on a screen, a search result or a Modified list that lacks its
 /// own. `None` for rows that need none — notes explain consequences, they never
-/// restate the control (an empty color field already says "Theme default").
+/// restate the control (an empty color field already says "Theme (default)").
 /// A note several rows share names what it covers ("that agent's sessions"),
 /// never "these": it is drawn once, after the last of them, and may be the
 /// only one of them a search or Modified lists.
@@ -4764,12 +4800,50 @@ pub(crate) struct Range {
 }
 
 /// THE UNIT A NUMERIC SETTING IS COUNTED IN, as the suffix its number takes
-/// (" px", " ms", "%", "×"): the one table every reading of a number states
-/// its unit from — the slider, the preview's badge, a status, Undo, Reset,
-/// Modified's default, a refusal ([`numeric_reading`]) and Manual's range
-/// and default — so no label carries "(px)" and no caller writes a unit by
-/// hand. `None`: a bare count (columns, lines, a density).
-pub(crate) fn numeric_unit(key: &str) -> Option<&'static str> {
+/// (" px", " ms", "%", "×", " cells"): the one table every reading of a
+/// number states its unit from — the slider, the preview's badge, a status,
+/// Undo, Reset, Modified's default, a refusal ([`numeric_reading`]), a
+/// field's placeholder and Manual's range and default — so no label carries
+/// "(px)" and no caller writes a unit by hand. `None`: a bare count
+/// (columns, lines, a density).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct NumericUnit {
+    /// The suffix after exactly one ("1 cell").
+    pub(crate) one: &'static str,
+    /// The suffix after every other number, and after a range ("24 cells",
+    /// "0.6 cells", "range 1–512 cells").
+    pub(crate) many: &'static str,
+}
+
+impl NumericUnit {
+    /// A symbol (" px", "%"), the same after any number.
+    const fn symbol(suffix: &'static str) -> Self {
+        Self {
+            one: suffix,
+            many: suffix,
+        }
+    }
+
+    /// The suffix `value` takes: a word unit is singular after exactly one
+    /// and plural after every other number.
+    pub(crate) fn after(self, value: f64) -> &'static str {
+        if value == 1.0 { self.one } else { self.many }
+    }
+}
+
+/// [`NumericUnit`] of `key`, from the one table.
+pub(crate) fn numeric_unit(key: &str) -> Option<NumericUnit> {
+    Some(match key {
+        EDIT_CURSOR_TRAIL_LENGTH | EDIT_CURSOR_TRAIL_RADIUS => NumericUnit {
+            one: " cell",
+            many: " cells",
+        },
+        _ => NumericUnit::symbol(numeric_symbol(key)?),
+    })
+}
+
+/// The symbol units of [`numeric_unit`]: a suffix no number changes.
+fn numeric_symbol(key: &str) -> Option<&'static str> {
     Some(match key {
         EDIT_FONT_PX
         | EDIT_WINDOW_PADDING
@@ -4787,7 +4861,6 @@ pub(crate) fn numeric_unit(key: &str) -> Option<&'static str> {
         | "privacy.warmup_hold_ms"
         | "privacy.probe_interval_ms" => " ms",
         "matrix_rain.idle_secs" | "output_streak.idle_secs" => " s",
-        EDIT_CURSOR_TRAIL_LENGTH | EDIT_CURSOR_TRAIL_RADIUS => " cells",
         // Stored 0–100, a percent as written.
         "sparkle_words.profanity.supernova_chance" | "sparkle_words.custom.burst.chance" => "%",
         // Multiples: of the font's own line, of the renderer's bloom.
@@ -4808,7 +4881,7 @@ pub(crate) fn numeric_reading(key: &str, value: f64, shown: &str) -> Option<Stri
         return Some(format!("{:.0}%", value * 100.0));
     }
     if let Some(unit) = numeric_unit(key) {
-        return Some(format!("{shown}{unit}"));
+        return Some(format!("{shown}{}", unit.after(value)));
     }
     range_of(key)
         .is_some_and(|range| range.min == 0.0 && range.max == 1.0)
@@ -4818,8 +4891,15 @@ pub(crate) fn numeric_reading(key: &str, value: f64, shown: &str) -> Option<Stri
 /// [`numeric_reading`] of a whole number, or the number itself.
 pub(crate) fn integer_reading(key: &str, value: i64) -> String {
     let shown = value.to_string();
-    #[allow(clippy::cast_precision_loss)] // only a fraction's percent reads `value`
+    #[allow(clippy::cast_precision_loss)] // a count far below 2^52
     numeric_reading(key, value as f64, &shown).unwrap_or(shown)
+}
+
+/// [`numeric_reading`] of a stored float, written as the field takes it back,
+/// or the number itself.
+pub(crate) fn float_reading(key: &str, value: f32) -> String {
+    let shown = value.to_string();
+    numeric_reading(key, f64::from(value), &shown).unwrap_or(shown)
 }
 
 pub(crate) fn range_of(key: &str) -> Option<Range> {
@@ -4925,9 +5005,9 @@ const SHELL_KEYWORDS: &[&str] = &["shell", "bash", "zsh", "command", "login", "a
 /// the by-name aliases, which need no path.
 #[cfg(windows)]
 const SHELL_PLACEHOLDER: &str =
-    "platform default — pwsh, powershell, cmd, bash, wsl, nu, or a path";
+    "Platform (default) — pwsh, powershell, cmd, bash, wsl, nu, or a path";
 #[cfg(not(windows))]
-const SHELL_PLACEHOLDER: &str = "platform default";
+const SHELL_PLACEHOLDER: &str = "Platform (default)";
 
 /// Keep ALab tools up to date's search words: what its card says, the
 /// retired spellings a file may still hold, and every coding agent aterm
@@ -5486,11 +5566,12 @@ pub(crate) fn keywords_of(key: &str) -> &'static [&'static str] {
             "decide",
         ],
         // An agent's switch answers to the words for leaving it alone; its
-        // agent's own word is an own name ([`own_name_of`]), never a synonym.
+        // agent's word and product name are own names ([`own_names_of`]),
+        // never synonyms.
         k if agent_switch(k).is_some() => &["harness", "agent", "supervise", "disable", "off"],
         // The AI CLIs' rows answer to the words a person reaches for to
-        // choose among them or turn one away (its own names are its label
-        // and key).
+        // choose among them or turn one away (a Use row's own names are its
+        // label, its key, its CLI's word and product name: [`own_names_of`]).
         EDIT_AI_PREFERRED => &["ai", "cli", "preferred", "main", "default", "review"],
         EDIT_AI_ENABLED => &["ai", "cli", "login", "sign in", "doctor", "messages"],
         EDIT_AI_REVIEWS => &["ai", "cli", "review", "reviewer", "second opinion"],
@@ -6068,8 +6149,10 @@ pub(crate) fn editable_fields(cfg: &Config) -> Vec<EditField> {
             kind: EditKind::Integer,
             seed: cfg.cursor_trail_ms.map(|n| n.to_string()),
             placeholder: match cfg.cursor_trail_ms {
-                Some(n) => format!("{n} ms"),
-                None => "260 ms (default)".to_string(),
+                Some(n) => {
+                    integer_reading(EDIT_CURSOR_TRAIL_MS, i64::try_from(n).unwrap_or(i64::MAX))
+                }
+                None => format!("{} (default)", integer_reading(EDIT_CURSOR_TRAIL_MS, 260)),
             },
         },
         EditField {
@@ -6078,8 +6161,14 @@ pub(crate) fn editable_fields(cfg: &Config) -> Vec<EditField> {
             kind: EditKind::Integer,
             seed: cfg.cursor_trail_length.map(|n| n.to_string()),
             placeholder: match cfg.cursor_trail_length {
-                Some(n) => format!("{n} cells"),
-                None => "24 cells (default)".to_string(),
+                Some(n) => integer_reading(
+                    EDIT_CURSOR_TRAIL_LENGTH,
+                    i64::try_from(n).unwrap_or(i64::MAX),
+                ),
+                None => format!(
+                    "{} (default)",
+                    integer_reading(EDIT_CURSOR_TRAIL_LENGTH, 24)
+                ),
             },
         },
         EditField {
@@ -6106,8 +6195,8 @@ pub(crate) fn editable_fields(cfg: &Config) -> Vec<EditField> {
             kind: EditKind::Float,
             seed: cfg.cursor_trail_radius.map(|v| v.to_string()),
             placeholder: match cfg.cursor_trail_radius {
-                Some(v) => format!("{v} cells"),
-                None => "0.6 cells (default)".to_string(),
+                Some(v) => float_reading(EDIT_CURSOR_TRAIL_RADIUS, v),
+                None => format!("{} (default)", float_reading(EDIT_CURSOR_TRAIL_RADIUS, 0.6)),
             },
         },
         EditField {
@@ -6278,7 +6367,7 @@ pub(crate) fn editable_fields(cfg: &Config) -> Vec<EditField> {
             kind: EditKind::Color,
             placeholder: foreground
                 .clone()
-                .unwrap_or_else(|| "Theme default".to_string()),
+                .unwrap_or_else(|| "Theme (default)".to_string()),
             seed: foreground,
         },
         EditField {
@@ -6287,7 +6376,7 @@ pub(crate) fn editable_fields(cfg: &Config) -> Vec<EditField> {
             kind: EditKind::Color,
             placeholder: background
                 .clone()
-                .unwrap_or_else(|| "Theme default".to_string()),
+                .unwrap_or_else(|| "Theme (default)".to_string()),
             seed: background,
         },
         EditField {
@@ -6296,7 +6385,7 @@ pub(crate) fn editable_fields(cfg: &Config) -> Vec<EditField> {
             kind: EditKind::Color,
             placeholder: cursor_color
                 .clone()
-                .unwrap_or_else(|| "Theme default".to_string()),
+                .unwrap_or_else(|| "Theme (default)".to_string()),
             seed: cursor_color,
         },
         EditField {
@@ -6305,7 +6394,7 @@ pub(crate) fn editable_fields(cfg: &Config) -> Vec<EditField> {
             kind: EditKind::Color,
             placeholder: selection_color
                 .clone()
-                .unwrap_or_else(|| "Theme default".to_string()),
+                .unwrap_or_else(|| "Theme (default)".to_string()),
             seed: selection_color,
         },
         EditField {
@@ -7081,6 +7170,45 @@ mod trail_style_tests {
     /// `Some(v)` helper to keep the edit lists terse.
     fn set(v: &str) -> Option<String> {
         Some(v.to_string())
+    }
+
+    /// A word unit agrees with its number: exactly one cell is "1 cell" on
+    /// every surface that reads the number (the slider, the preview header, a
+    /// refusal, the field's placeholder), any other number "cells"; a symbol
+    /// unit never changes.
+    #[test]
+    fn a_word_unit_is_singular_after_exactly_one() {
+        use super::{
+            EDIT_CURSOR_TRAIL_LENGTH, EDIT_CURSOR_TRAIL_MS, EDIT_CURSOR_TRAIL_RADIUS,
+            editable_fields, integer_reading, numeric_reading,
+        };
+        assert_eq!(integer_reading(EDIT_CURSOR_TRAIL_LENGTH, 1), "1 cell");
+        assert_eq!(integer_reading(EDIT_CURSOR_TRAIL_LENGTH, 24), "24 cells");
+        assert_eq!(
+            numeric_reading(EDIT_CURSOR_TRAIL_RADIUS, 1.0, "1").as_deref(),
+            Some("1 cell")
+        );
+        assert_eq!(
+            numeric_reading(EDIT_CURSOR_TRAIL_RADIUS, 0.6, "0.6").as_deref(),
+            Some("0.6 cells")
+        );
+        assert_eq!(integer_reading(EDIT_CURSOR_TRAIL_MS, 1), "1 ms");
+        let doc = "cursor_trail_length = 1\ncursor_trail_radius = 1.0\n";
+        let fields = editable_fields(&Config::parse(doc).expect("parses"));
+        let placeholder = |key: &str| {
+            fields
+                .iter()
+                .find(|field| field.key == key)
+                .map(|field| field.placeholder.clone())
+        };
+        assert_eq!(
+            placeholder(EDIT_CURSOR_TRAIL_LENGTH).as_deref(),
+            Some("1 cell")
+        );
+        assert_eq!(
+            placeholder(EDIT_CURSOR_TRAIL_RADIUS).as_deref(),
+            Some("1 cell")
+        );
     }
 
     /// What one spelling draws: the engine style, the companion and the
@@ -9158,7 +9286,7 @@ auto_apply = true # hands off
         assert_eq!(
             super::footnote_of(EDIT_FOREGROUND),
             None,
-            "the field says Theme default"
+            "the field says Theme (default)"
         );
     }
 

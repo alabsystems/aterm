@@ -31,8 +31,14 @@
 //!    (`aterm_link::wait_tally`).
 //! 4. **attach time**: a bridge starting with N sessions (default 1, 8, 32),
 //!    from its pid file to every session's presence row acked, and durable,
-//!    again.
-//! 5. **records per delivered message**: every record the broker wrote over
+//!    again; and, with the same restart, from the kill to a note queued at
+//!    the kill visible (behind the rows: the bus mirror's start, over a
+//!    retaining broker at `--log auto`, then the refill and the live drain).
+//! 5. **handoff**: a successor instance's bridge standing by on the held
+//!    state dir while the holder quits saying `bye handoff` (the bridges'
+//!    half of a seamless update): the outage from the old bridge's exit to
+//!    the successor's rows acked, and a post queued in the gap.
+//! 6. **records per delivered message**: every record the broker wrote over
 //!    each measured window, hidden commits included, by kind ([`census`]) —
 //!    the count the bridge's batching reduces (in the burst, how far depends
 //!    on scheduling: the README says which counts compare) — and the broker's
@@ -65,6 +71,7 @@
 //! targo --unverified verify perf fabric [--profile dev|opt] [--latency-samples N]
 //!     [--burst N] [--pingpong-rounds N] [--attach-sessions 1,8,32] [--attach-rounds N]
 //!     [--durability strict,ordered,relaxed] [--horizon-ms 1000,100] [--passes N]
+//!     [--retention on|off] [--log auto|off] [--retention-interval-ms N]
 //!     [--json-out PATH]
 //! ```
 //!

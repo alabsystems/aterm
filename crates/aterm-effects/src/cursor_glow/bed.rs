@@ -158,6 +158,12 @@ pub(crate) struct BedShape {
     /// ([`dark_bed_ink`]; `1` at the bar): a quieter ground under a style
     /// whose colour lives in its light, not under its letters.
     pub(crate) dim: f32,
+    /// A jump's piece of a run is a wedge as long as the path it laid, where
+    /// a typing piece is the fixed [`Self::wedge`]: the path `Length` cuts is
+    /// the tail the bed lays under the letters a completion crosses, as the
+    /// beam is the path it lights over air (Comet). Off, a jump's piece is
+    /// the fixed wedge too.
+    pub(crate) leap_path: bool,
 }
 
 /// The hue family of a style's bed ([`BedShape::hue`]).
@@ -186,6 +192,7 @@ impl BedShape {
         hue: BedHue::True,
         core: 0.5,
         dim: 1.0,
+        leap_path: false,
     };
 
     /// The shape of `style`'s bed, `None` for a style that lays none (fire's
@@ -213,6 +220,7 @@ impl BedShape {
                 full: 215.0,
                 wedge: 3.5,
                 rail: 0.16,
+                leap_path: true,
                 ..Self::BASE
             }),
             // The charged conductor: a narrow violet cable the bolts fork off.
@@ -364,6 +372,10 @@ pub(crate) struct BedScratch {
     tube: Vec<BeamVertex>,
     /// Each sample's taper (the wedge's and the tail's), in run order.
     taper: Vec<f32>,
+    /// Each run's wedge length in cells, where [`wedge_runs`] laid it (a
+    /// jump's wedge is as long as its path); a run past its end, or none
+    /// laid, takes the shape's [`BedShape::wedge`].
+    pub(crate) wedges: Vec<f32>,
 }
 
 /// Lay the dark bed under `runs` into `under` (the glyph-under stream),
@@ -403,6 +415,7 @@ pub(crate) fn lay_dark_bed(
         verts,
         tube,
         taper,
+        wedges,
     } = scratch;
     let cell_of = |x: f32, y: f32| {
         (
@@ -415,10 +428,11 @@ pub(crate) fn lay_dark_bed(
         t * t * (3.0 - 2.0 * t)
     };
     let mut at = 0usize;
-    for run in runs {
+    for (index, run) in runs.iter().enumerate() {
         if run.is_empty() {
             continue;
         }
+        let wedge_cells = wedges.get(index).copied().unwrap_or(shape.wedge);
         let ink = &inks[at..at + run.len()];
         let rail = rails.get(at..at + run.len());
         at += run.len();
@@ -439,9 +453,9 @@ pub(crate) fn lay_dark_bed(
                 return 1.0;
             }
             let tail = smooth((x - tail_x).abs() / (cwf * DARK_BED_TAIL_CELLS));
-            let wedge = if shape.wedge > 0.0 {
+            let wedge = if wedge_cells > 0.0 {
                 let behind = ((last.x - x) * dir).max(0.0);
-                (1.0 - behind / (cwf * shape.wedge)).clamp(0.0, 1.0)
+                (1.0 - behind / (cwf * wedge_cells)).clamp(0.0, 1.0)
             } else {
                 1.0
             };
@@ -679,42 +693,98 @@ pub(crate) fn lay_dark_bed(
 /// leap) is its own samples.
 fn wedge_runs(
     runs: &[Vec<CometSample>],
+    typing: &[Vec<bool>],
+    leaps: &[(Instant, u16, u16, u16)],
     geom: Geom,
-    wedge: f32,
+    shape: BedShape,
     out: &mut Vec<Vec<CometSample>>,
+    lengths: &mut Vec<f32>,
 ) -> usize {
+    lengths.clear();
     let cwf = geom.cw as f32;
+    let wedge = shape.wedge;
     let knots = (wedge * 4.0).ceil().max(1.0) as usize;
     let mut n = 0usize;
-    for run in runs {
-        let Some(&head) = run.last() else {
-            continue;
-        };
+    let mut next = |out: &mut Vec<Vec<CometSample>>| {
         if n == out.len() {
             out.push(Vec::new());
         }
-        let dst = &mut out[n];
-        dst.clear();
         n += 1;
+        let dst = &mut out[n - 1];
+        dst.clear();
+        n - 1
+    };
+    for (index, run) in runs.iter().enumerate() {
+        let Some(&head) = run.last() else {
+            continue;
+        };
         if !run.iter().all(|s| s.y == head.y) {
-            dst.extend_from_slice(run);
+            let at = next(out);
+            out[at].extend_from_slice(run);
+            lengths.push(wedge);
             continue;
         }
-        let back = match run.first() {
-            Some(tail) if run.len() > 1 && tail.x > head.x => 1.0,
-            _ => -1.0,
-        };
-        let cov = run.iter().map(|s| s.cov).max().unwrap_or(head.cov);
-        let span = wedge * cwf;
-        dst.extend((0..=knots).rev().map(|k| {
-            let d = span * k as f32 / knots as f32;
-            CometSample {
-                x: head.x + back * d,
-                y: head.y,
-                cov,
-                pos: 1.0 - d / span,
+        // A one-row run in pieces of one kind: each typing piece is the
+        // wedge behind its own head; where the shape keeps a jump's path,
+        // each jump's piece is a wedge as long as the path it laid (the path
+        // `Length` cut), from its head back past its last cell.
+        let kinds = typing.get(index).map_or(&[][..], Vec::as_slice);
+        let typed = |i: usize| !shape.leap_path || kinds.get(i).copied().unwrap_or(true);
+        let mut start = 0;
+        while start < run.len() {
+            let kind = typed(start);
+            let mut end = start + 1;
+            while end < run.len() && typed(end) == kind {
+                end += 1;
             }
-        }));
+            let piece = &run[start..end];
+            let at = next(out);
+            let head = piece[piece.len() - 1];
+            let tail = piece[0];
+            let mut back = if piece.len() > 1 && tail.x > head.x {
+                1.0
+            } else {
+                -1.0
+            };
+            let mut cells = wedge;
+            if !kind {
+                // The jump's whole laid path on this row, its faded tail
+                // included: the wedge reaches back to its far end.
+                cells = (head.x - tail.x).abs() / cwf + 1.0;
+                let row = ((head.y - f32::from(geom.origin_y)) / geom.ch as f32)
+                    .floor()
+                    .clamp(0.0, f32::from(u16::MAX)) as u16;
+                let col = ((head.x - f32::from(geom.origin_x)) / cwf).floor();
+                if let Some(&(_, _, first, last)) = leaps.iter().find(|(_, r, first, last)| {
+                    *r == row && col >= f32::from(*first) - 1.0 && col <= f32::from(*last) + 1.0
+                }) {
+                    let (first, last) = (f32::from(first), f32::from(last));
+                    if last - col > col - first {
+                        back = 1.0;
+                    }
+                    let far = if back > 0.0 { last } else { first };
+                    cells = cells.max((col - far).abs() + 1.0);
+                }
+            }
+            let knots = if kind {
+                knots
+            } else {
+                (cells * 4.0).ceil().max(1.0) as usize
+            };
+            let cov = piece.iter().map(|s| s.cov).max().unwrap_or(head.cov);
+            lengths.push(cells);
+            let span = cells * cwf;
+            out[at].extend((0..=knots).rev().map(|k| {
+                let d = span * k as f32 / knots as f32;
+                CometSample {
+                    x: head.x + back * d,
+                    y: head.y,
+                    cov,
+                    pos: 1.0 - d / span,
+                }
+            }));
+            start = end;
+        }
     }
     n
 }
@@ -867,8 +937,37 @@ impl CursorGlow {
         scratch.inks.clear();
         scratch.rails.clear();
         let mut wedges = std::mem::take(&mut self.wedge_runs);
+        // Each live jump's whole laid path, the cells its tail has faded out
+        // of included: the extent of the path `Length` cut.
+        self.leap_spans.clear();
+        if shape.leap_path {
+            for spark in self.sparks.iter().filter(|spark| !spark.typing) {
+                match self
+                    .leap_spans
+                    .iter_mut()
+                    .find(|(born, row, ..)| *born == spark.born && *row == spark.row)
+                {
+                    Some((_, _, first, last)) => {
+                        *first = (*first).min(spark.col);
+                        *last = (*last).max(spark.col);
+                    }
+                    None => self
+                        .leap_spans
+                        .push((spark.born, spark.row, spark.col, spark.col)),
+                }
+            }
+        }
+        scratch.wedges.clear();
         let runs: &[Vec<CometSample>] = if shape.wedge > 0.0 {
-            let n = wedge_runs(&self.comet_runs[..runs_len], geom, shape.wedge, &mut wedges);
+            let n = wedge_runs(
+                &self.comet_runs[..runs_len],
+                &self.comet_typing[..runs_len.min(self.comet_typing.len())],
+                &self.leap_spans,
+                geom,
+                shape,
+                &mut wedges,
+                &mut scratch.wedges,
+            );
             &wedges[..n]
         } else {
             &self.comet_runs[..runs_len]

@@ -44,7 +44,7 @@
 //! installed on this Mac would otherwise be what ran.
 //!
 //! THE RECORD: every run writes its Markdown under the lab's state
-//! (`$LAB_STATE/results/fleet-sim-<N>-<stamp>.md`, `target/` by default);
+//! (`$LAB_STATE/results/fleet-sim-<N>-<stamp>.md`, `/private/tmp/at.lab-<uid>/` by default);
 //! `--record` on a run where every assertion held writes it to
 //! `docs/measured/fleet-sim-<N>-<date>.md` instead, carrying forward the
 //! earlier recorded invocations of that file, so consecutive green runs are

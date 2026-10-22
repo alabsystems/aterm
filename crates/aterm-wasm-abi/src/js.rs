@@ -31,8 +31,9 @@ pub struct JsObject {
 
 impl JsObject {
     /// The object's index in the glue's table, for an import to name it by.
+    #[inline]
     #[must_use]
-    pub fn index(&self) -> u32 {
+    pub const fn index(&self) -> u32 {
         self.index
     }
 }
@@ -55,6 +56,7 @@ impl FromAbi for JsObject {
     /// # Safety
     /// `index` is a slot the glue filled for this call ([`FromAbi`]'s
     /// contract: the words are this type's lowering), now owned here.
+    #[inline]
     unsafe fn from_abi(index: u32, _: u32) -> Result<Self, Thrown> {
         if index == 0 {
             return Err(Thrown::Error(

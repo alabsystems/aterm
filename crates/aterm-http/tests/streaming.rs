@@ -482,8 +482,9 @@ fn a_proxy_that_refuses_the_tunnel_is_a_protocol_error_unsent() {
 #[test]
 fn the_request_deadline_takes_over_once_the_connect_budget_has_opened_the_stream() {
     // The answer comes later than the whole connect budget could last, so it
-    // is read only if the stream left that budget behind when it opened.
-    const CONNECT: Duration = Duration::from_secs(2);
+    // is read only if the stream left that budget behind when it opened. A
+    // loopback connect takes milliseconds of the budget's 500.
+    const CONNECT: Duration = Duration::from_millis(500);
     let (endpoint, _rx) = one_connection(|mut stream| {
         let _ = read_head(&mut stream);
         std::thread::sleep(CONNECT + Duration::from_millis(200));

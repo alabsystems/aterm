@@ -983,6 +983,14 @@ mod tests {
             (f::BOX_RM_MOUNTED_DRIVE_2_1_307, "rm-breaker"),
             (f::BOX_BASH_TOUCH_2_1_307, "bash"),
             (f::BOX_STATEMENT_FOLLOWS_16_2_1_307, "bash"),
+            // 2.1.308's, MEASURED: the same boxes, read the same.
+            (f::BOX_RM_TOO_MANY_2_1_308, "rm-breaker"),
+            (f::BOX_RM_TOO_MANY_NO_RM_2_1_308, "rm-breaker"),
+            (f::BOX_RM_MOUNTED_DRIVE_2_1_308, "rm-breaker"),
+            (f::BOX_RM_TOO_MANY_NO_RM_BYPASS_2_1_308, "rm-breaker"),
+            (f::BOX_RM_NESTED_2_1_308, "rm-breaker"),
+            (f::BOX_BASH_TOUCH_2_1_308, "bash"),
+            (f::BOX_STATEMENT_FOLLOWS_16_2_1_308, "bash"),
         ] {
             let (kind, _) = kind_and_subject(
                 &aterm_phase::ClaudeReader,

@@ -66,6 +66,7 @@ impl Sums {
     }
 
     /// Entries counted: files and directories.
+    #[inline]
     #[must_use]
     pub const fn entries(&self) -> u64 {
         self.files.saturating_add(self.dirs)
@@ -80,7 +81,8 @@ impl DirId {
     /// The root's id.
     pub const ROOT: DirId = DirId(0);
 
-    fn ix(self) -> usize {
+    #[inline]
+    const fn ix(self) -> usize {
         self.0 as usize
     }
 }
@@ -235,35 +237,41 @@ impl Tree {
     }
 
     #[cfg(any(unix, test))]
+    #[inline]
     pub(crate) fn rec_mut(&mut self, id: DirId) -> &mut DirRec {
         &mut self.dirs[id.ix()]
     }
 
     /// The root path the tree was walked from.
+    #[inline]
     #[must_use]
     pub fn root_path(&self) -> &Path {
         &self.root
     }
 
     /// Every directory record, the root first.
+    #[inline]
     #[must_use]
     pub fn dirs(&self) -> &[DirRec] {
         &self.dirs
     }
 
     /// One record.
+    #[inline]
     #[must_use]
     pub fn get(&self, id: DirId) -> Option<&DirRec> {
         self.dirs.get(id.ix())
     }
 
     /// The root's record.
+    #[inline]
     #[must_use]
     pub fn root(&self) -> &DirRec {
         &self.dirs[0]
     }
 
     /// A record's name (empty for the root).
+    #[inline]
     #[must_use]
     pub fn name(&self, id: DirId) -> &[u8] {
         self.get(id).map_or(&[][..], |r| {

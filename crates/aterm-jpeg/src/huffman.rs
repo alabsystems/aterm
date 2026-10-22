@@ -84,7 +84,8 @@ pub(crate) struct BitReader<'a> {
 }
 
 impl<'a> BitReader<'a> {
-    pub(crate) fn new(data: &'a [u8], pos: usize) -> Self {
+    #[inline]
+    pub(crate) const fn new(data: &'a [u8], pos: usize) -> Self {
         Self {
             data,
             pos,
@@ -96,10 +97,12 @@ impl<'a> BitReader<'a> {
 
     /// Where the segment's bytes stop: at the marker that ended it, or past
     /// the last byte loaded.
-    pub(crate) fn position(&self) -> usize {
+    #[inline]
+    pub(crate) const fn position(&self) -> usize {
         self.pos
     }
 
+    #[inline]
     fn refill(&mut self) {
         while self.bits <= 56 {
             let byte = if self.ended {
@@ -137,6 +140,7 @@ impl<'a> BitReader<'a> {
     }
 
     /// The next `n` (1..=16) bits as an unsigned number.
+    #[inline]
     pub(crate) fn bits(&mut self, n: u32) -> u32 {
         if n == 0 {
             return 0;
@@ -150,11 +154,13 @@ impl<'a> BitReader<'a> {
         value
     }
 
+    #[inline]
     pub(crate) fn bit(&mut self) -> bool {
         self.bits(1) != 0
     }
 
     /// `n` bits as a signed coefficient (T.81 F.2.2.1, EXTEND).
+    #[inline]
     pub(crate) fn receive_extend(&mut self, n: u32) -> i32 {
         if n == 0 || n > 16 {
             return 0;
@@ -168,6 +174,7 @@ impl<'a> BitReader<'a> {
     }
 
     /// The next Huffman symbol, or `None` for a bit pattern no code has.
+    #[inline]
     pub(crate) fn decode(&mut self, table: &HuffmanTable) -> Option<u8> {
         if self.bits < 16 {
             self.refill();

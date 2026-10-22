@@ -109,13 +109,17 @@ pub fn decode(text: &str) -> Option<Saved> {
 /// The mode to start in at `now` from what was `saved`, in the boot `boot_now`: off when
 /// nothing was saved, when it was saved in another boot (or either boot is unknown), or when
 /// its deadline has passed.
+#[inline]
 #[must_use]
-pub fn restore(saved: Option<Saved>, boot_now: Option<u128>, now: u64) -> Mode {
-    match saved {
-        Some(Saved {
-            mode,
-            boot: Some(then),
-        }) if boot_now == Some(then) => mode.settled(now),
+pub const fn restore(saved: Option<Saved>, boot_now: Option<u128>, now: u64) -> Mode {
+    match (saved, boot_now) {
+        (
+            Some(Saved {
+                mode,
+                boot: Some(then),
+            }),
+            Some(now_boot),
+        ) if now_boot == then => mode.settled(now),
         _ => Mode::Off,
     }
 }

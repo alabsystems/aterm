@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The hand-written binding to EGL 1.5 and OpenGL ES 3.0: the types, the
-//! constants the GL arm names, and the function tables.
+//! The hand-written binding to EGL 1.5, GLX 1.4 and OpenGL ES 3.0: the types,
+//! the constants the GL arm names, and the function tables.
 //!
 //! Nothing links against a GL library. On Linux `Egl::open` `dlopen`s
 //! `libEGL.so.1` (the vendor-neutral dispatcher every Linux GL stack ships:
@@ -10,7 +10,10 @@
 //! function then comes from `eglGetProcAddress`, which EGL 1.5 (and
 //! `EGL_KHR_get_all_proc_addresses` before it) defines for core functions too,
 //! so `libGLESv2` is never opened. This is how wgpu's GL backend loads as well;
-//! aterm's own table names only the ~65 functions the renderer calls.
+//! aterm's own table names only the ~65 functions the renderer calls. An X11
+//! window system's device is GLX's instead (`super::glx`): `Glx::open`
+//! `dlopen`s `libGLX.so.0` and `libX11.so.6` the same way, and GL comes from
+//! `glXGetProcAddressARB`.
 //!
 //! On wasm32 there is no EGL. The same GL table is filled from the module's
 //! `aterm_gl` imports (`GlFns::imported`): each GL function under its GL name
@@ -36,6 +39,8 @@ use std::ffi::{CStr, c_char, c_void};
 
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) use egl::*;
+#[cfg(all(not(wgpu_arm), not(target_arch = "wasm32")))]
+pub(crate) use glx::*;
 
 // ---------------------------------------------------------------- GL types
 
@@ -58,6 +63,30 @@ pub(crate) const GL_CONTEXT_LOST: GLenum = 0x0507;
 /// `getError` answers once when the browser loses the context.
 #[cfg(target_arch = "wasm32")]
 pub(crate) const GL_CONTEXT_LOST_WEBGL: GLenum = 0x9242;
+/// `KHR_robustness` (core in GLES 3.2): what `glGetGraphicsResetStatus`
+/// answers after a reset the context caused, did not cause, or cannot place.
+#[cfg(all(not(wgpu_arm), not(target_arch = "wasm32")))]
+pub(crate) const GL_GUILTY_CONTEXT_RESET: GLenum = 0x8253;
+#[cfg(all(not(wgpu_arm), not(target_arch = "wasm32")))]
+pub(crate) const GL_INNOCENT_CONTEXT_RESET: GLenum = 0x8254;
+#[cfg(all(not(wgpu_arm), not(target_arch = "wasm32")))]
+pub(crate) const GL_UNKNOWN_CONTEXT_RESET: GLenum = 0x8255;
+/// `NV_robustness_video_memory_purge`: the driver purged the context's video
+/// memory (a VT switch, a mode switch, suspend and resume), which a context
+/// made with `GLX_GENERATE_RESET_ON_VIDEO_MEMORY_PURGE_NV` hears as a reset.
+#[cfg(all(not(wgpu_arm), not(target_arch = "wasm32")))]
+pub(crate) const GL_PURGED_CONTEXT_RESET_NV: GLenum = 0x92BB;
+/// `KHR_robustness`: the context's reset notification strategy, and its two
+/// answers (the GLX context's test reads it).
+#[cfg(all(test, not(wgpu_arm), not(target_arch = "wasm32")))]
+pub(crate) const GL_RESET_NOTIFICATION_STRATEGY: GLenum = 0x8256;
+#[cfg(all(test, not(wgpu_arm), not(target_arch = "wasm32")))]
+pub(crate) const GL_LOSE_CONTEXT_ON_RESET: GLint = 0x8252;
+/// `glGetGraphicsResetStatus` (GLES 3.2), or its `KHR_robustness`,
+/// `EXT_robustness` or `ARB_robustness` spelling, read through the device's
+/// proc-address lookup.
+#[cfg(all(not(wgpu_arm), not(target_arch = "wasm32")))]
+pub(crate) type GetGraphicsResetStatusFn = unsafe extern "C" fn() -> GLenum;
 pub(crate) const GL_ZERO: GLenum = 0;
 pub(crate) const GL_ONE: GLenum = 1;
 pub(crate) const GL_ONE_MINUS_SRC_COLOR: GLenum = 0x0301;
@@ -217,10 +246,14 @@ macro_rules! fn_table {
         }
     };
 }
+// The X11 binding's windowed test declares its Xlib with the same macro.
+#[cfg(all(test, not(wgpu_arm), not(target_arch = "wasm32")))]
+pub(crate) use fn_table;
 
 fn_table! {
     /// The OpenGL ES 3.0 entry points the GL arm calls, read through
-    /// `eglGetProcAddress` (on wasm32, the module's `aterm_gl` imports).
+    /// `eglGetProcAddress` or `glXGetProcAddressARB` (on wasm32, the module's
+    /// `aterm_gl` imports).
     pub(crate) struct GlFns {
         get_error = "glGetError": fn() -> GLenum;
         get_string = "glGetString": fn(GLenum) -> *const u8;
@@ -321,6 +354,19 @@ pub(crate) fn gl_error_name(code: GLenum) -> String {
         0x0507 => "GL_CONTEXT_LOST".to_owned(),
         0x9242 => "CONTEXT_LOST_WEBGL".to_owned(),
         other => format!("GL error {other:#x}"),
+    }
+}
+
+/// The registry name of a `glGetGraphicsResetStatus` answer.
+#[cfg(all(not(wgpu_arm), not(target_arch = "wasm32")))]
+pub(crate) fn gl_reset_name(code: GLenum) -> String {
+    match code {
+        GL_NO_ERROR => "GL_NO_ERROR".to_owned(),
+        GL_GUILTY_CONTEXT_RESET => "GL_GUILTY_CONTEXT_RESET".to_owned(),
+        GL_INNOCENT_CONTEXT_RESET => "GL_INNOCENT_CONTEXT_RESET".to_owned(),
+        GL_UNKNOWN_CONTEXT_RESET => "GL_UNKNOWN_CONTEXT_RESET".to_owned(),
+        GL_PURGED_CONTEXT_RESET_NV => "GL_PURGED_CONTEXT_RESET_NV".to_owned(),
+        other => format!("reset status {other:#x}"),
     }
 }
 
@@ -545,5 +591,158 @@ mod egl {
             0x300E => "EGL_CONTEXT_LOST".to_owned(),
             other => format!("EGL error {other:#x}"),
         }
+    }
+}
+
+/// GLX 1.4 and the three libX11 calls the X11 binding makes (`super::glx`):
+/// the shipped build's X11 windows post through GLX.
+#[cfg(all(not(wgpu_arm), not(target_arch = "wasm32")))]
+mod glx {
+    use std::ffi::{CStr, c_char, c_int, c_uint, c_ulong, c_void};
+
+    // ---------------------------------------------------------------- GLX types
+
+    /// An Xlib `Display *`.
+    pub(crate) type XDisplay = *mut c_void;
+    pub(crate) type GLXFBConfig = *mut c_void;
+    pub(crate) type GLXContext = *mut c_void;
+    /// A GLX drawable's XID (a `GLXWindow`, a `GLXPbuffer`); 0 is `None`.
+    pub(crate) type GLXDrawable = c_ulong;
+
+    pub(crate) const GLX_DOUBLEBUFFER: c_int = 5;
+    pub(crate) const GLX_RED_SIZE: c_int = 8;
+    pub(crate) const GLX_GREEN_SIZE: c_int = 9;
+    pub(crate) const GLX_BLUE_SIZE: c_int = 10;
+    pub(crate) const GLX_ALPHA_SIZE: c_int = 11;
+    pub(crate) const GLX_X_VISUAL_TYPE: c_int = 0x22;
+    pub(crate) const GLX_TRUE_COLOR: c_int = 0x8002;
+    pub(crate) const GLX_VISUAL_ID: c_int = 0x800B;
+    pub(crate) const GLX_DRAWABLE_TYPE: c_int = 0x8010;
+    pub(crate) const GLX_RENDER_TYPE: c_int = 0x8011;
+    pub(crate) const GLX_X_RENDERABLE: c_int = 0x8012;
+    pub(crate) const GLX_WINDOW_BIT: c_int = 0x1;
+    pub(crate) const GLX_PBUFFER_BIT: c_int = 0x4;
+    pub(crate) const GLX_RGBA_BIT: c_int = 0x1;
+    /// `GLX_ARB_multisample`.
+    pub(crate) const GLX_SAMPLE_BUFFERS: c_int = 100_000;
+    pub(crate) const GLX_WIDTH: c_int = 0x801D;
+    pub(crate) const GLX_HEIGHT: c_int = 0x801E;
+    pub(crate) const GLX_PBUFFER_HEIGHT: c_int = 0x8040;
+    pub(crate) const GLX_PBUFFER_WIDTH: c_int = 0x8041;
+    /// `GLX_ARB_create_context` and `GLX_ARB_create_context_profile`.
+    pub(crate) const GLX_CONTEXT_MAJOR_VERSION_ARB: c_int = 0x2091;
+    pub(crate) const GLX_CONTEXT_MINOR_VERSION_ARB: c_int = 0x2092;
+    pub(crate) const GLX_CONTEXT_PROFILE_MASK_ARB: c_int = 0x9126;
+    /// `GLX_EXT_create_context_es2_profile`: an OpenGL ES context of the
+    /// version asked (3.0 here), not only ES 2.
+    pub(crate) const GLX_CONTEXT_ES2_PROFILE_BIT_EXT: c_int = 0x4;
+    /// `GLX_ARB_create_context_robustness`: the context flags with their
+    /// robust-access bit, and the reset notification strategy that loses the
+    /// context on a reset (and says so through `glGetGraphicsResetStatus`).
+    pub(crate) const GLX_CONTEXT_FLAGS_ARB: c_int = 0x2094;
+    pub(crate) const GLX_CONTEXT_ROBUST_ACCESS_BIT_ARB: c_int = 0x4;
+    pub(crate) const GLX_CONTEXT_RESET_NOTIFICATION_STRATEGY_ARB: c_int = 0x8256;
+    pub(crate) const GLX_LOSE_CONTEXT_ON_RESET_ARB: c_int = 0x8252;
+    /// `GLX_NV_robustness_video_memory_purge`: a purge of the context's video
+    /// memory is reported as a reset (`GL_PURGED_CONTEXT_RESET_NV`).
+    pub(crate) const GLX_GENERATE_RESET_ON_VIDEO_MEMORY_PURGE_NV: c_int = 0x20F7;
+
+    /// `glXCreateContextAttribsARB` (`GLX_ARB_create_context`), read through
+    /// `glXGetProcAddressARB`.
+    pub(crate) type CreateContextAttribsFn =
+        unsafe extern "C" fn(XDisplay, GLXFBConfig, GLXContext, c_int, *const c_int) -> GLXContext;
+    /// `glXSwapIntervalEXT` (`GLX_EXT_swap_control`): one drawable's interval.
+    pub(crate) type SwapIntervalExtFn = unsafe extern "C" fn(XDisplay, GLXDrawable, c_int);
+    /// `glXSwapIntervalMESA` (`GLX_MESA_swap_control`): the current drawable's.
+    pub(crate) type SwapIntervalMesaFn = unsafe extern "C" fn(c_uint) -> c_int;
+    /// `glXSwapIntervalSGI` (`GLX_SGI_swap_control`): the current drawable's,
+    /// 1 or more.
+    pub(crate) type SwapIntervalSgiFn = unsafe extern "C" fn(c_int) -> c_int;
+
+    fn_table! {
+        /// The GLX 1.4 entry points, read from libGLX by `dlsym`.
+        pub(crate) struct GlxFns {
+            query_extensions_string = "glXQueryExtensionsString":
+                fn(XDisplay, c_int) -> *const c_char;
+            choose_fb_config = "glXChooseFBConfig":
+                fn(XDisplay, c_int, *const c_int, *mut c_int) -> *mut GLXFBConfig;
+            get_fb_config_attrib = "glXGetFBConfigAttrib":
+                fn(XDisplay, GLXFBConfig, c_int, *mut c_int) -> c_int;
+            get_proc_address = "glXGetProcAddressARB": fn(*const u8) -> *const c_void;
+            make_context_current = "glXMakeContextCurrent":
+                fn(XDisplay, GLXDrawable, GLXDrawable, GLXContext) -> c_int;
+            destroy_context = "glXDestroyContext": fn(XDisplay, GLXContext);
+            create_window = "glXCreateWindow":
+                fn(XDisplay, GLXFBConfig, c_ulong, *const c_int) -> GLXDrawable;
+            destroy_window = "glXDestroyWindow": fn(XDisplay, GLXDrawable);
+            create_pbuffer = "glXCreatePbuffer":
+                fn(XDisplay, GLXFBConfig, *const c_int) -> GLXDrawable;
+            destroy_pbuffer = "glXDestroyPbuffer": fn(XDisplay, GLXDrawable);
+            swap_buffers = "glXSwapBuffers": fn(XDisplay, GLXDrawable);
+            query_drawable = "glXQueryDrawable": fn(XDisplay, GLXDrawable, c_int, *mut c_uint);
+        }
+    }
+
+    fn_table! {
+        /// The libX11 calls GLX needs beside it: freeing the config list
+        /// `glXChooseFBConfig` returns, naming the screen's default visual, and
+        /// asking whether a compositing manager runs (`_NET_WM_CM_S<n>`).
+        pub(crate) struct XlibFns {
+            free = "XFree": fn(*mut c_void) -> c_int;
+            default_visual = "XDefaultVisual": fn(XDisplay, c_int) -> *mut c_void;
+            visual_id_from_visual = "XVisualIDFromVisual": fn(*mut c_void) -> c_ulong;
+            intern_atom = "XInternAtom": fn(XDisplay, *const c_char, c_int) -> c_ulong;
+            get_selection_owner = "XGetSelectionOwner": fn(XDisplay, c_ulong) -> c_ulong;
+        }
+    }
+
+    /// libGLX and libX11, opened once per process and never closed (as `Egl`).
+    pub(crate) struct Glx {
+        pub(crate) fns: GlxFns,
+        pub(crate) x: XlibFns,
+    }
+
+    // SAFETY: immutable function pointers into libraries that stay loaded for
+    // the process's life; Xlib is thread-safe once `XInitThreads` ran, which
+    // the windowing crate's connection does first.
+    unsafe impl Send for Glx {}
+    // SAFETY: as above; `&Glx` hands out only the immutable tables.
+    unsafe impl Sync for Glx {}
+
+    impl Glx {
+        /// The process's GLX, opened on first use; the error (no library, or
+        /// one missing a GLX 1.4 entry point) is cached like `Egl::get`'s.
+        pub(crate) fn get() -> Result<&'static Glx, String> {
+            static GLX: std::sync::OnceLock<Result<Glx, String>> = std::sync::OnceLock::new();
+            GLX.get_or_init(Self::open).as_ref().map_err(Clone::clone)
+        }
+
+        fn open() -> Result<Glx, String> {
+            // glvnd's dispatcher first (every current Linux GL stack), then a
+            // pre-glvnd stack's libGL.
+            let gl = open_first(&[c"libGLX.so.0", c"libGL.so.1"])
+                .ok_or("no GLX library (libGLX.so.0, libGL.so.1) on this machine")?;
+            let x = open_first(&[c"libX11.so.6"]).ok_or("no libX11.so.6 on this machine")?;
+            // SAFETY: `dlsym` on live handles returns the symbol's address or
+            // null; the tables declare each function's registry signature.
+            let fns = unsafe {
+                GlxFns::load(&mut |sym: &CStr| libc::dlsym(gl, sym.as_ptr()).cast_const())
+            }?;
+            // SAFETY: as above, for libX11's declarations (Xlib.h).
+            let x = unsafe {
+                XlibFns::load(&mut |sym: &CStr| libc::dlsym(x, sym.as_ptr()).cast_const())
+            }?;
+            Ok(Glx { fns, x })
+        }
+    }
+
+    /// The first of `names` `dlopen` opens (never closed; see `Glx`).
+    fn open_first(names: &[&CStr]) -> Option<*mut c_void> {
+        names.iter().find_map(|name| {
+            // SAFETY: a NUL-terminated library name; RTLD_LAZY binds on first
+            // call.
+            let handle = unsafe { libc::dlopen(name.as_ptr(), libc::RTLD_LAZY) };
+            (!handle.is_null()).then_some(handle)
+        })
     }
 }

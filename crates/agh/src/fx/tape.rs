@@ -543,9 +543,11 @@ struct SinkState {
     /// would meet again (a record outside the subset, a rendering the shapes would change, a
     /// tape over `TAPE_MAX`) is `Refused`: its file can never replay, so `finish` removes it.
     remedy: Remedy,
-    /// The bytes written so far, header included: never more than `TAPE_MAX`, the most a
-    /// replay reads.
+    /// The bytes written so far, header included: never more than `max`.
     written: u64,
+    /// The most the file may hold: `TAPE_MAX`, the most a replay reads (`create`), or a
+    /// test's own smaller bound (`create_within`).
+    max: u64,
     /// `discard` removed the file.
     discarded: bool,
     /// `finish` succeeded: the exit record is the tape's last, and a record after it is an
@@ -675,8 +677,25 @@ impl TapeSink {
     /// As `Fx::record`. A header whose rendered lines the shapes would still change (two
     /// arguments that read as one shape once joined, `Bearer` then a long word) is CouldNotRun,
     /// `Sub::Local`, before any file is made. A header that cannot be written removes the file
-    /// it was written to.
+    /// it was written to. A header over the tape's size bound is refused before any file is
+    /// made.
     pub fn create(path: &Path, header: &TapeHeader) -> Result<TapeSink> {
+        Self::open_within(path, header, TAPE_MAX)
+    }
+
+    /// `create` with the file held to `max` bytes in place of `TAPE_MAX`, so a test reaches the
+    /// bound with kilobytes, not the 64 MiB the shapes and the rendering would walk in a debug
+    /// build (2 s). The size check is the same code.
+    ///
+    /// # Errors
+    ///
+    /// As `create`.
+    #[cfg(any(test, debug_assertions))]
+    pub fn create_within(path: &Path, header: &TapeHeader, max: u64) -> Result<TapeSink> {
+        Self::open_within(path, header, max)
+    }
+
+    fn open_within(path: &Path, header: &TapeHeader, max: u64) -> Result<TapeSink> {
         if head_redacts(header) {
             return Err(Error::could_not_run(format!(
                 "the tape {} was not made: its command line holds a token shape across its \
@@ -686,6 +705,15 @@ impl TapeSink {
             .with_sub(Sub::Local)
             .with_next("record a command line that names no token"));
         }
+        let head = head_text(&shaped_header(header));
+        let written = u64::try_from(head.len()).unwrap_or(u64::MAX);
+        if written > max {
+            return Err(latched_error(
+                path,
+                &format!("the header would be over {max} bytes, the tape's size bound"),
+                Remedy::Refused,
+            ));
+        }
         let mut options = std::fs::OpenOptions::new();
         options.write(true).create_new(true);
         #[cfg(unix)]
@@ -693,7 +721,6 @@ impl TapeSink {
             use std::os::unix::fs::OpenOptionsExt;
             options.mode(0o600);
         }
-        let head = head_text(&shaped_header(header));
         let mut file = options.open(path).map_err(|e| {
             if e.kind() == std::io::ErrorKind::AlreadyExists {
                 Error::could_not_run(format!(
@@ -723,7 +750,8 @@ impl TapeSink {
                 path: path.to_path_buf(),
                 failed: None,
                 remedy: Remedy::Kept,
-                written: u64::try_from(head.len()).unwrap_or(u64::MAX),
+                written,
+                max,
                 discarded: false,
                 finished: false,
             })),
@@ -844,9 +872,10 @@ impl TapeSink {
         };
         // The size first: a line no tape can hold is refused without the shapes reading it.
         let size = u64::try_from(text.len()).unwrap_or(u64::MAX);
-        if state.written.saturating_add(size) > TAPE_MAX {
+        if state.written.saturating_add(size) > state.max {
             state.failed = Some(format!(
-                "the tape would be over {TAPE_MAX} bytes, the most a replay reads"
+                "the tape would be over {} bytes, the most a replay reads",
+                state.max
             ));
             state.remedy = Remedy::Refused;
             return;

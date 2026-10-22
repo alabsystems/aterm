@@ -85,9 +85,13 @@ pub struct KittyPlacementTag {
 /// first, as kitty draws them: by z-index, then by when the image was first
 /// transmitted, then by placement order. An image that is not a Kitty
 /// placement (`kitty` is `None`) sorts first among its z-index.
+#[inline]
 #[must_use]
-pub fn layer_order(z_index: i32, kitty: Option<KittyPlacementTag>) -> (i32, u32, u32) {
-    let (image, serial) = kitty.map_or((0, 0), |tag| (tag.image_serial.get(), tag.serial.get()));
+pub const fn layer_order(z_index: i32, kitty: Option<KittyPlacementTag>) -> (i32, u32, u32) {
+    let (image, serial) = match kitty {
+        Some(tag) => (tag.image_serial.get(), tag.serial.get()),
+        None => (0, 0),
+    };
     (z_index, image, serial)
 }
 
@@ -130,24 +134,29 @@ pub struct SourceRect {
 impl SourceRect {
     /// This rectangle clamped to a `src_w × src_h` raster, as
     /// `(x, y, width, height)`, or `None` when nothing of it lies inside.
+    #[inline]
     #[must_use]
-    pub fn clamp_to(self, src_w: u32, src_h: u32) -> Option<(u32, u32, u32, u32)> {
+    pub const fn clamp_to(self, src_w: u32, src_h: u32) -> Option<(u32, u32, u32, u32)> {
         if self.x >= src_w || self.y >= src_h {
             return None;
         }
         let max_w = src_w - self.x;
         let max_h = src_h - self.y;
-        let w = if self.width == 0 {
+        let w = if self.width == 0 || self.width > max_w {
             max_w
         } else {
-            self.width.min(max_w)
+            self.width
         };
-        let h = if self.height == 0 {
+        let h = if self.height == 0 || self.height > max_h {
             max_h
         } else {
-            self.height.min(max_h)
+            self.height
         };
-        (w > 0 && h > 0).then_some((self.x, self.y, w, h))
+        if w > 0 && h > 0 {
+            Some((self.x, self.y, w, h))
+        } else {
+            None
+        }
     }
 }
 

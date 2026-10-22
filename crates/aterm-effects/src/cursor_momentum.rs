@@ -74,6 +74,34 @@
 //!
 //! Off (disabled, intensity 0, degenerate geometry, no cursor, or cold) equals
 //! no effect: `fill: None`, `hot: false`, `fp: 0`, scratch untouched.
+//!
+//! # Hosted as an Aos task
+//!
+//! Two pure additions let the glow run as a checkpointed, replayable task. The
+//! engine above does not change.
+//! * [`snapshot`]: [`MomentumGlow::snapshot`] and [`MomentumGlow::restore`]
+//!   capture the semantic state fieldwise, with instants as signed offsets from
+//!   a declared epoch. [`MomentumGlowSnapshot`] has a fixed canonical encoding
+//!   with a schema, and restore refuses every state that breaks an invariant
+//!   the engine's transitions keep, or a bound of the hosted profile. The
+//!   light-ink memo is a cache, so it is left out.
+//! * [`admission`]: [`MOMENTUM_PROFILE`] and the `admit_*` checks refuse, before
+//!   the call, any input outside the range where every engine call is total
+//!   and bounded. [`admit_tick`] returns the worst-case [`ScratchBudget`] the host
+//!   reserves so that a tick never reallocates.
+
+pub mod admission;
+pub mod snapshot;
+#[cfg(test)]
+mod test_fixtures;
+
+pub use admission::{
+    AdmitRefusal, GeometryFault, MOMENTUM_ENVELOPE, MOMENTUM_PROFILE, MomentumProfile,
+    ScratchBudget, admit_frame_interval, admit_tau, admit_tick, admit_time,
+};
+pub use snapshot::{
+    MOMENTUM_GLOW_SNAPSHOT_SCHEMA, MomentumGlowSnapshot, SnapshotField, SnapshotRefusal,
+};
 
 use std::time::Duration;
 

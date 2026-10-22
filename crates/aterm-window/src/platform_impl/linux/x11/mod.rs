@@ -13,7 +13,9 @@
 // x11-dl and calloop: docs/AUDIT-third-party-2026-10-15.md, LW.7. No failed request panics:
 // a request the backend makes for the application reports its failure (`XConnection::report`),
 // and one the loop makes to start ends it with an error, the display's loss when it has gone:
-// X11-GONE.)
+// X11-GONE. Each turn ends by answering the window manager's resize sync requests no frame is
+// coming for, the loop wakes for one's deadline, and a window's drop destroys its sync counter:
+// `sync_request.rs`.)
 
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -41,17 +43,57 @@ use crate::platform_impl::platform::{min_timeout, WindowId};
 use crate::platform_impl::{ActiveEventLoop as PlatformActiveEventLoop, OsError};
 use crate::window::WindowAttributes;
 
+#[cfg(test)]
+mod activation_tests;
 mod atoms;
+#[cfg(test)]
+mod attention_tests;
+#[cfg(all(test, target_os = "linux"))]
+mod background_tests;
+
+/// Held by each test that makes windows on the process's one X11 connection
+/// (`X11_BACKEND`), so they take turns. Under an XIM server (IBus on the desk) two
+/// input contexts made at once on one `Display` can each take the other's XIM reply
+/// and wait forever: two of six parallel runs of the X11 tests hung on the desk, none
+/// with `XMODIFIERS` unset. aterm makes its windows on one thread.
+#[cfg(test)]
+pub(super) fn shared_display_turn() -> std::sync::MutexGuard<'static, ()> {
+    static TURN: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    TURN.lock().unwrap_or_else(|e| e.into_inner())
+}
+#[cfg(test)]
+mod compose_tests;
+#[cfg(all(test, target_os = "linux"))]
+mod cursor_theme_tests;
 mod dnd;
+#[cfg(all(test, target_os = "linux"))]
+mod dnd_tests;
 mod event_processor;
+#[cfg(all(test, target_os = "linux"))]
+mod exposure_tests;
 pub mod ffi;
+#[cfg(test)]
+mod focus_tests;
+#[cfg(all(test, target_os = "linux"))]
+mod glx_error_tests;
 #[cfg(all(test, target_os = "linux"))]
 mod gone_tests;
 mod ime;
 #[cfg(test)]
+mod ime_spot_tests;
+#[cfg(test)]
 mod level_tests;
 mod monitor;
+#[cfg(all(test, target_os = "linux"))]
+mod occlusion_tests;
+#[cfg(all(test, target_os = "linux"))]
+mod place_tests;
+#[cfg(all(test, target_os = "linux"))]
+mod press_time_tests;
 mod startup_notify;
+mod sync_request;
+#[cfg(all(test, target_os = "linux"))]
+mod sync_request_tests;
 mod util;
 mod window;
 mod xdisplay;
@@ -288,7 +330,7 @@ impl<T: 'static> EventLoop<T> {
             first_touch: None,
             active_window: None,
             modifiers: Default::default(),
-            is_composing: false,
+            composing: None,
         };
 
         // Register for device hotplug events
@@ -455,13 +497,19 @@ impl<T: 'static> EventLoop<T> {
 
             min_timeout(control_flow_timeout, timeout)
         };
+        // A resize sync request is answered by its deadline even when nothing else wakes the
+        // loop (`sync_request.rs`, step 5).
+        let wait = min_timeout(
+            timeout,
+            self.sync_deadline().map(|deadline| deadline.saturating_duration_since(start)),
+        );
 
         let x11_fd = {
             let wt = EventProcessor::window_target(&self.event_processor.target);
             wt.xconn.xcb_connection().file_descriptor()
         };
         let mut fds = [poll::readable(x11_fd), poll::readable(self.waker.as_raw_fd())];
-        if let Err(error) = poll::wait(&mut fds, timeout) {
+        if let Err(error) = poll::wait(&mut fds, wait) {
             tracing::error!("Failed to poll for events: {error:?}");
             let exit_code = error.raw_os_error().unwrap_or(1);
             if self.exit_code().is_none() {
@@ -508,6 +556,8 @@ impl<T: 'static> EventLoop<T> {
             && !matches!(&cause, StartCause::ResumeTimeReached { .. } | StartCause::Poll)
             && timeout.is_none()
         {
+            // No turn for the application; a sync request's deadline may be what woke it.
+            self.end_turn_of_sync_requests();
             return;
         }
 
@@ -550,11 +600,20 @@ impl<T: 'static> EventLoop<T> {
             }
 
             for window_id in windows {
+                // A redraw the server's Expose asked for, whoever else asked too, is dispatched
+                // as an exposure (`platform::x11::redraw_is_exposure`).
+                let exposed = self
+                    .event_processor
+                    .with_window(u64::from(window_id) as xproto::Window, |w| w.take_exposed())
+                    .unwrap_or(false);
                 let window_id = crate::window::WindowId(window_id);
-                callback(
-                    Event::WindowEvent { window_id, event: WindowEvent::RedrawRequested },
-                    &self.event_processor.target,
-                );
+                let event = Event::WindowEvent { window_id, event: WindowEvent::RedrawRequested };
+                let target = &self.event_processor.target;
+                if exposed {
+                    crate::platform::x11::dispatch_exposure(|| callback(event, target));
+                } else {
+                    callback(event, target);
+                }
             }
         }
 
@@ -562,6 +621,35 @@ impl<T: 'static> EventLoop<T> {
         {
             callback(Event::AboutToWait, &self.event_processor.target);
         }
+
+        self.end_turn_of_sync_requests();
+    }
+
+    /// A turn ended, or the loop woke for a deadline: answer each window manager's resize sync
+    /// request the next turn cannot bring a frame for, or whose deadline came (`sync_request.rs`,
+    /// steps 4 and 5). Whether a redraw is queued is asked once, and only of a turn that left a
+    /// request waiting for its frame.
+    fn end_turn_of_sync_requests(&mut self) {
+        if self.connection_broken() {
+            return;
+        }
+        let now = Instant::now();
+        let mut redraw_queued = None;
+        let EventLoop { event_processor, redraw_receiver, .. } = self;
+        let wt = EventProcessor::window_target(&event_processor.target);
+        for window in wt.windows.borrow().values().filter_map(Weak::upgrade) {
+            window.sync_turn_ended(now, || {
+                *redraw_queued.get_or_insert_with(|| redraw_receiver.has_incoming())
+            });
+        }
+    }
+
+    /// The earliest deadline of the windows' pending resize sync requests (`sync_request.rs`,
+    /// step 5).
+    fn sync_deadline(&self) -> Option<Instant> {
+        let wt = EventProcessor::window_target(&self.event_processor.target);
+        let windows = wt.windows.borrow();
+        windows.values().filter_map(Weak::upgrade).filter_map(|window| window.sync_deadline()).min()
     }
 
     fn drain_events<F>(&mut self, callback: &mut F)

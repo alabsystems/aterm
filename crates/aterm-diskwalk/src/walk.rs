@@ -940,10 +940,16 @@ pub(crate) mod imp {
         ))
     }
 
+    /// Whether `st_flags` mark a cloud placeholder (`SF_DATALESS`), which only
+    /// Apple's file systems have.
     #[cfg(target_vendor = "apple")]
-    const SF_DATALESS: u32 = crate::list::bulk::SF_DATALESS;
+    const fn dataless(flags: u32) -> bool {
+        flags & crate::list::bulk::SF_DATALESS != 0
+    }
     #[cfg(not(target_vendor = "apple"))]
-    const SF_DATALESS: u32 = 0;
+    const fn dataless(_: u32) -> bool {
+        false
+    }
 
     pub(super) fn begin(canon: PathBuf, policy: &Policy) -> Result<Walk, Refusal> {
         let fd = open_chain(&canon)?;
@@ -951,7 +957,7 @@ pub(crate) mod imp {
             return Err(why);
         }
         let (dev, ino, alloc, flags) = fstat_of(&fd)?;
-        if SF_DATALESS != 0 && flags & SF_DATALESS != 0 {
+        if dataless(flags) {
             return Err(Refusal::Dataless);
         }
         let mut tree = Tree::new(canon.clone(), ino);

@@ -37,7 +37,8 @@ fn last_n<'a, T>(all: &'a [T], rest: &str) -> &'a [T] {
 }
 
 /// A block state's wire word.
-fn state_word(state: aterm_core::terminal::BlockState) -> &'static str {
+#[inline]
+const fn state_word(state: aterm_core::terminal::BlockState) -> &'static str {
     use aterm_core::terminal::BlockState;
     match state {
         BlockState::PromptOnly => "prompt",

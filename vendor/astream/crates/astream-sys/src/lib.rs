@@ -32,16 +32,48 @@
 //!   panic or a power loss give a new one. Apple: `kern.bootsessionuuid`. Linux:
 //!   `/proc/sys/kernel/random/boot_id` (safe `std`). Elsewhere `None`, which the
 //!   broker reads as "a boot it cannot vouch for": the safe direction.
+//! - `socket_hung_up` (Apple only): whether a zero-wait `poll` sees both directions
+//!   of a socket hung up. astream-broker's client asks it only after setting a
+//!   socket's read or write timeout was refused with `EINVAL`
+//!   (`Subscription::set_read_timeout`, `Closer::set_read_timeout`,
+//!   `Closer::set_write_timeout`), which XNU answers on a socket the peer already
+//!   shut down: then there is nothing left to bound, and the refusal is no error. A
+//!   refusal on a live socket is kept.
+//! - [`install_sighup_handler`] and [`sighup_generation`]: a process-wide `SIGHUP`
+//!   handler that only counts the signals (Apple; elsewhere `Unsupported` and a
+//!   count of zero). Only the broker's revocation file installs it, so that a
+//!   `SIGHUP` reloads the file (`Broker::load_revocation_file`, `asb serve
+//!   --revocation-file`); a broker that loads none never changes the process's
+//!   `SIGHUP` disposition.
 //!
 //! ## The cordon
 //!
 //! The crate root is `deny(unsafe_code)`, and exactly one module re-permits it:
-//! `apple` (`cfg(target_vendor = "apple")`), hand-declared FFI calls with a
-//! `// SAFETY:` note each. Nothing else here may use `unsafe` — the compiler refuses
-//! it — and no errno or raw pointer leaves that module: every call returns
-//! `io::Result` or an owned value. `astream-broker` stays `forbid(unsafe_code)` and
-//! reaches the OS through this crate's safe functions (and reads a barrier's
-//! refusal through [`barrier_refused`], plain errno numbers that need no `unsafe`).
+//! `apple` (`cfg(target_vendor = "apple")`), four hand-declared FFI calls with a
+//! `// SAFETY:` note each: `fcntl(F_BARRIERFSYNC)` behind [`barrier_sync`],
+//! `sysctlbyname("kern.bootsessionuuid")` behind [`boot_session`], `poll` behind
+//! `socket_hung_up`, and `signal(SIGHUP)` behind [`install_sighup_handler`]. Nothing
+//! else here may use `unsafe` — the compiler refuses it — and no errno or raw pointer
+//! leaves that module: every call returns `io::Result` or an owned value.
+//! `astream-broker` stays `forbid(unsafe_code)` and reaches the OS through this
+//! crate's safe functions (and reads a barrier's refusal through
+//! [`barrier_refused`], plain errno numbers that need no `unsafe`).
+//!
+//! ## Who else calls it
+//!
+//! aterm depends on this crate directly (astream's `docs/ROADMAP.md`, "What aterm
+//! uses beyond the fabric"). It reads the boot through [`boot_session`] and
+//! [`parse_boot_id`] in aterm-link, aterm-agent, aterm-caffeine, aterm-gui and
+//! aterm-update (which reads Linux's `boot_id` file itself and judges it with
+//! [`parse_boot_id`]), but not everywhere: aterm-release's publisher fence still
+//! names the boot its own way (Linux's `boot_id` file, else `sysctl -n
+//! kern.boottime`, a wall-clock reading), outside this crate's contract. On Apple
+//! targets every ordered write it makes, to a file or a directory, is finished with
+//! [`barrier_sync`], [`barrier_refused`] telling a volume that takes no barrier from
+//! a failed flush; elsewhere aterm-durable's ordered write is a full flush of its
+//! own, not this crate's. aterm reaches `fcntl`, `sysctlbyname` and `poll` (the last
+//! through astream-broker's client, whose `Closer` it bounds both ways on every
+//! dial), and never installs the `SIGHUP` handler.
 
 #![deny(unsafe_code)]
 
@@ -533,5 +565,37 @@ mod tests {
         let res = barrier_sync(&f);
         let _ = std::fs::remove_dir_all(&dir);
         res.expect("a regular file on the test volume takes a barrier");
+    }
+
+    /// A barrier on a DIRECTORY, opened read-only as `File::open` opens one, succeeds
+    /// on the test volume: on Apple `F_BARRIERFSYNC` takes a directory descriptor, so
+    /// a create, rename or unlink in it can be ordered without a full flush, and the
+    /// answer is not one `barrier_refused` would read as the device's refusal (aterm's
+    /// `aterm_durable::ordered_dir` relies on both). Elsewhere it is the full flush of
+    /// the directory. NEGATIVE CONTROL: `/dev/null`, a descriptor that is no file on a
+    /// volume, is refused on Apple, and read as refused there.
+    #[cfg(unix)]
+    #[test]
+    fn a_barrier_sync_of_a_directory_succeeds_and_is_not_refused() {
+        let dir = std::env::temp_dir().join(format!("astream-sys-dir-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("entry"), b"named").unwrap();
+        let res = File::open(&dir).and_then(|handle| barrier_sync(&handle));
+        let _ = std::fs::remove_dir_all(&dir);
+        if let Err(e) = res {
+            panic!(
+                "a directory on the test volume refused or failed the barrier (refused: {}): {e}",
+                barrier_refused(&e)
+            );
+        }
+        #[cfg(target_vendor = "apple")]
+        {
+            let null = File::open("/dev/null").unwrap();
+            let control = barrier_sync(&null);
+            assert!(
+                control.as_ref().is_err_and(barrier_refused),
+                "CONTROL: /dev/null takes no barrier: {control:?}"
+            );
+        }
     }
 }

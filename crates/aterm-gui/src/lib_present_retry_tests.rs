@@ -1088,3 +1088,83 @@ fn earliest_deadline_retains_its_diagnostic_owner() {
     assert_eq!(deadline, Some(now + Duration::from_millis(8)));
     assert_eq!(owner, DeadlineOwner::TitleDrift);
 }
+
+/// A paint the window system asks for presents the unchanged frame when the surface owes
+/// it (the `window --cpu` launch at 150 % row's band: Windows grew the window under the
+/// last present, and the `WM_PAINT` for the gained rows found nothing changed). With nothing
+/// owed the same paint stays gated.
+#[test]
+fn a_paint_the_window_owes_presents_the_unchanged_frame() {
+    let wid = WindowId(0);
+    let mut app = scripted_app();
+    app.redraw_window(wid);
+    let (size, frame) = glass(&mut app);
+    assert_eq!(surface(&mut app).commits(), 1);
+
+    app.note_owed_repaint(wid);
+    app.redraw_window(wid);
+    assert_eq!(
+        surface(&mut app).commits(),
+        1,
+        "a paint with nothing owed and nothing changed presents nothing"
+    );
+
+    surface(&mut app).owe_repaint(size.1 - 12..size.1);
+    assert_ne!(glass(&mut app).1, frame, "the gained rows hold white");
+    app.note_owed_repaint(wid);
+    app.redraw_window(wid);
+    assert_eq!(surface(&mut app).commits(), 2, "the owed paint presented");
+    assert_eq!(
+        glass(&mut app),
+        (size, frame),
+        "the gained rows hold the frame"
+    );
+    assert!(!app.windows[&wid].present_retry.recovery_redraw_outstanding);
+}
+
+/// The X server's `Expose` re-presents the whole unchanged frame: the server
+/// lost what the window showed (a VT switch, NVIDIA's video-memory purge, an
+/// unredirection) and asks for it again, and nothing here changed, so the
+/// RepaintKey early-out and the CPU present's damage copy would leave the
+/// window as the server left it until a cell moved. aterm's own redraw of the
+/// same unchanged frame stays gated, before and after. The negative controls:
+/// without the exposure branch in `note_owed_repaint` the exposure presents
+/// nothing; with its recovery edge but not its cache drop, the exposure
+/// commits the 1×1 gate-hit damage, and the glass stays black.
+#[cfg(target_os = "linux")]
+#[test]
+fn an_x11_exposure_presents_the_whole_unchanged_frame() {
+    let wid = WindowId(0);
+    let mut app = scripted_app();
+    app.redraw_window(wid);
+    let (size, frame) = glass(&mut app);
+    assert_eq!(surface(&mut app).commits(), 1);
+
+    let redraw = |app: &mut App| {
+        app.note_owed_repaint(wid);
+        app.redraw_window(wid);
+    };
+    redraw(&mut app);
+    assert_eq!(
+        surface(&mut app).commits(),
+        1,
+        "aterm's redraw of an unchanged frame presents nothing"
+    );
+
+    surface(&mut app).lose_glass();
+    aterm_window::platform::x11::dispatch_exposure(|| redraw(&mut app));
+    assert_eq!(surface(&mut app).commits(), 2, "the exposure presented");
+    assert_eq!(
+        glass(&mut app),
+        (size, frame),
+        "the whole frame is back on the glass"
+    );
+    assert!(!app.windows[&wid].present_retry.recovery_redraw_outstanding);
+
+    redraw(&mut app);
+    assert_eq!(
+        surface(&mut app).commits(),
+        2,
+        "the next redraw of the unchanged frame is gated again"
+    );
+}

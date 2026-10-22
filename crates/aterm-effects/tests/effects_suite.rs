@@ -31,6 +31,7 @@ mod walk_census;
 
 mod abandoned_ribbon;
 mod animal_art_quality;
+mod aos_momentum_trace;
 mod busy_status_rows_keep_their_brand;
 mod cat_art_quality;
 mod claude_wrap_band;
@@ -80,6 +81,7 @@ mod pet_coordinate_seams;
 mod pet_degenerate_geometry;
 mod pet_escort_primacy;
 mod pet_follows_a_hidden_caret;
+mod pet_follows_a_running_caret;
 mod pet_holds_through_a_torn_frame;
 mod pet_position_authority;
 mod pet_resident_standoff;

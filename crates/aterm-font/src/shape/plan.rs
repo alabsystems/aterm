@@ -39,6 +39,8 @@ pub struct Feature {
 
 impl Feature {
     /// `tag` at `value` over the whole run.
+    #[inline]
+    #[must_use]
     pub const fn new(tag: Tag, value: u32) -> Self {
         Feature { tag, value }
     }
@@ -117,17 +119,22 @@ impl ShapePlan {
     }
 
     /// The direction the plan shapes in.
-    pub fn direction(&self) -> Direction {
+    #[inline]
+    #[must_use]
+    pub const fn direction(&self) -> Direction {
         self.direction
     }
 
     /// The script the plan shapes, if any.
-    pub fn script(&self) -> Option<Script> {
+    #[inline]
+    #[must_use]
+    pub const fn script(&self) -> Option<Script> {
         self.script
     }
 }
 
 /// Which shaper a script uses.
+#[inline]
 fn categorize(script: Script, direction: Direction, gsub_script: Option<Tag>) -> Shaper {
     match &script.0 {
         b"Arab" | b"Syrc" => {

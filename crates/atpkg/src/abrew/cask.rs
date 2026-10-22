@@ -260,14 +260,15 @@ fn install_deps_inner(
             depth + 1,
             possible_progress,
         )?;
-        let result = install(prefix, &dc, dry_run, false, false, false);
+        let result = install_inner(prefix, &dc, dry_run, false, false, false, false);
         super::after_native_attempt(possible_progress, result)?;
     }
     Ok(())
 }
 
-/// Install one cask. Unsupported recipes refuse before downloading or placing
-/// artifacts. A missing `no_check` cache entry still has to be downloaded.
+/// Install one cask the user named (on request). Unsupported recipes
+/// refuse before downloading or placing artifacts. A missing
+/// `no_check` cache entry still has to be downloaded.
 pub fn install(
     prefix: &Prefix,
     cask: &Cask,
@@ -275,6 +276,19 @@ pub fn install(
     force: bool,
     upgrade: bool,
     reinstall: bool,
+) -> Result<String, InstallError> {
+    install_inner(prefix, cask, dry_run, force, upgrade, reinstall, true)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn install_inner(
+    prefix: &Prefix,
+    cask: &Cask,
+    dry_run: bool,
+    force: bool,
+    upgrade: bool,
+    reinstall: bool,
+    on_request: bool,
 ) -> Result<String, InstallError> {
     if cask.disabled {
         return Err(InstallError::PassThrough(format!(
@@ -295,7 +309,16 @@ pub fn install(
     }
     let mut replacing = false;
     let mut same_version_reinstall = false;
+    // Upgrade/reinstall preserve the recorded install intent, like brew
+    // preserves the tab; only a fresh install takes the caller's word.
+    let mut effective_on_request = on_request;
     if let Some(inst) = prefix.installed_one(Kind::Cask, &cask.token) {
+        if let Some(old) = super::prefix::receipt_word(
+            &prefix.cask_dir(&cask.token, &inst.version),
+            "installed_on_request",
+        ) {
+            effective_on_request = old == "true";
+        }
         let older =
             super::formula::version_cmp(&inst.version, &cask.version) == std::cmp::Ordering::Less;
         if reinstall && inst.version == cask.version {
@@ -478,10 +501,16 @@ pub fn install(
         })
         .collect();
     let artifact_fields = complete_artifact_receipt_fields(prefix, &links)?;
+    let on_request_word = if effective_on_request {
+        "true"
+    } else {
+        "false"
+    };
     let mut receipt_fields: Vec<(&str, &str)> = vec![
         ("token", &cask.token),
         ("version", &cask.version),
         ("installed_by", "abrew"),
+        ("installed_on_request", on_request_word),
         // Casks resolve from the homebrew/cask API, where the token
         // is the full identity (`list --full-name` adds the tap).
         ("full_name", &cask.token),
@@ -1636,6 +1665,15 @@ mod tests {
             b"app"
         );
         assert_eq!(
+            super::super::prefix::receipt_word(
+                &prefix.cask_dir("demo", "1"),
+                "installed_on_request"
+            )
+            .as_deref(),
+            Some("true"),
+            "a named install records on-request intent"
+        );
+        assert_eq!(
             std::fs::read(prefix.root.join("Library/Fonts/Renamed.ttf")).unwrap(),
             b"font"
         );
@@ -1710,6 +1748,30 @@ mod tests {
         assert_eq!(output.stdout, b"naked readyR\n");
         assert!(
             std::fs::symlink_metadata(prefix.caskroom().join(".abrew-reinstall-demo-2")).is_err()
+        );
+        uninstall(&prefix, "demo", false).unwrap();
+        // A dependency install records not-on-request, and a later
+        // upgrade preserves that recorded intent.
+        std::fs::write(&download, b"#!/bin/sh\nprintf 'dep ready\\n'\n").unwrap();
+        c.version = "1".to_string();
+        assert_eq!(
+            install_inner(&prefix, &c, false, false, false, false, false).unwrap(),
+            "1"
+        );
+        let word = |v: &str| {
+            super::super::prefix::receipt_word(&prefix.cask_dir("demo", v), "installed_on_request")
+        };
+        assert_eq!(word("1").as_deref(), Some("false"));
+        std::fs::write(&download, b"#!/bin/sh\nprintf 'dep ready3\\n'\n").unwrap();
+        c.version = "3".to_string();
+        assert_eq!(
+            install(&prefix, &c, false, false, true, false).unwrap(),
+            "3"
+        );
+        assert_eq!(
+            word("3").as_deref(),
+            Some("false"),
+            "upgrade preserves intent"
         );
         uninstall(&prefix, "demo", false).unwrap();
         assert!(std::fs::symlink_metadata(prefix.bin().join("staged-name")).is_err());

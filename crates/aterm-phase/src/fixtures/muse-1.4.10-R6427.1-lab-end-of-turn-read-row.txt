@@ -1,0 +1,51 @@
+# muse 1.4.10-R6427.1 · MEASURED 2026-10-21, `aterm ctl text --json` of a private headless aterm (144x50, aterm 0.108.0+gcbda4ceb1d) running the real Muse Code in the lab's jail (`targo --unverified lab forever --harness muse --mode resid`, chain `tool-end`), a scratch `HOME`, a fake `META_API_KEY` and `--base-url` at the lab's stub of Meta's Responses endpoint · the first turn's end: the stub answered the prompt with one `read_file` call and, after its result, a reply holding no words, so the turn ended on Muse Code's own read row `  Read README.md` (two columns in, no `◆`), the idle composer under it · cursor=8,2 (visible) · the lab's random project dir is spelled /private/tmp/at.lab0 here
+
+  Muse Code 1.4.10
+
+❯ FOREVERLAB-TOOL-END. write the parser for this repository and land it
+
+  Read README.md
+
+── Voice input (⌥ + v to start) ────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  lab-stub · high · /private/tmp/at.lab0/proj/tool-end · Auto-review
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

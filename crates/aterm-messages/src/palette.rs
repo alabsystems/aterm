@@ -74,6 +74,7 @@ impl MeterHue {
     }
 
     /// This hue's colour among the three.
+    #[inline]
     #[must_use]
     pub const fn of(self, cursor: [u8; 3], blue: [u8; 3], cyan: [u8; 3]) -> [u8; 3] {
         match self {
@@ -91,6 +92,7 @@ impl MeterHue {
 ///
 /// `floored` is the label as the host floors it; `blue_floored` the blue floored the
 /// same way.
+#[inline]
 #[must_use]
 pub fn outline_borrows_blue(floored: [u8; 3], blue: [u8; 3], blue_floored: [u8; 3]) -> bool {
     reads_brown(floored) && chroma(blue) >= BORROW_CHROMA && !reads_brown(blue_floored)
@@ -103,6 +105,7 @@ pub fn outline_borrows_blue(floored: [u8; 3], blue: [u8; 3], blue_floored: [u8; 
 /// ([`reads_brown`]) into one that does (`floored`, as the host floors it on the band);
 /// otherwise the floored fill stands byte for byte. Catppuccin Latte's rosewater is the
 /// one built-in case.
+#[inline]
 #[must_use]
 pub fn keeps_pastel(hue: [u8; 3], floored: [u8; 3]) -> bool {
     floored != hue && reads_brown(floored) && !reads_brown(hue)
@@ -147,6 +150,7 @@ pub(crate) const WARM_HUE_MAX: f64 = 110.0;
 pub(crate) const BROWN_LIGHTNESS: f64 = 0.62;
 
 /// Whether `c` reads brown: a warm `OkLCh` hue, dark, with colour.
+#[inline]
 #[must_use]
 pub fn reads_brown(c: [u8; 3]) -> bool {
     let (l, ch, h) = oklch(c);
@@ -154,12 +158,14 @@ pub fn reads_brown(c: [u8; 3]) -> bool {
 }
 
 /// Whether `c` is near-grey: its `OkLCh` chroma under [`NEAR_GREY_CHROMA`].
+#[inline]
 #[must_use]
 pub fn near_grey(c: [u8; 3]) -> bool {
     chroma(c) < NEAR_GREY_CHROMA
 }
 
 /// The `OkLCh` chroma of an sRGB colour (Björn Ottosson's `OkLab`).
+#[inline]
 #[must_use]
 pub fn chroma(c: [u8; 3]) -> f64 {
     oklch(c).1
@@ -167,6 +173,7 @@ pub fn chroma(c: [u8; 3]) -> f64 {
 
 /// The `OkLCh` lightness, chroma and hue (degrees, `[0, 360)`) of an sRGB
 /// colour (Björn Ottosson's `OkLab`).
+#[inline]
 #[must_use]
 #[allow(
     clippy::excessive_precision,
@@ -189,6 +196,7 @@ pub fn oklch(c: [u8; 3]) -> (f64, f64, f64) {
 
 /// The Euclidean `OkLab` distance between two sRGB colours: how far apart
 /// they look, lightness and colour together.
+#[inline]
 #[must_use]
 pub fn oklab_distance(a: [u8; 3], b: [u8; 3]) -> f64 {
     let lab = |c: [u8; 3]| {
@@ -204,6 +212,7 @@ pub fn oklab_distance(a: [u8; 3], b: [u8; 3]) -> f64 {
 ///
 /// The band's side decisions (which end of the scale a word or a fill sits toward) read
 /// this; every contrast ratio is [`contrast`], `aterm_types::Rgb`'s unfused arithmetic.
+#[inline]
 #[must_use]
 pub fn luminance(c: [u8; 3]) -> f64 {
     let [r, g, b] = c.map(lin);
@@ -212,6 +221,7 @@ pub fn luminance(c: [u8; 3]) -> f64 {
 
 /// An sRGB byte in linear light — the one copy the palette, the band's
 /// resolver ([`crate::ink`]) and the hosts' tests read.
+#[inline]
 #[must_use]
 pub fn lin(v: u8) -> f64 {
     let c = f64::from(v) / 255.0;
@@ -223,6 +233,7 @@ pub fn lin(v: u8) -> f64 {
 }
 
 /// Linear light back to an sRGB byte.
+#[inline]
 #[allow(
     clippy::cast_possible_truncation,
     clippy::cast_sign_loss,

@@ -20,12 +20,14 @@ pub struct Stamp {
 
 impl Stamp {
     /// A stamp.
+    #[inline]
     #[must_use]
     pub const fn new(wall_ms: u64, mono_ms: u64) -> Stamp {
         Stamp { wall_ms, mono_ms }
     }
 
     /// This stamp `ms` later on both clocks.
+    #[inline]
     #[must_use]
     pub const fn after(self, ms: u64) -> Stamp {
         Stamp {
@@ -64,8 +66,9 @@ impl Rec {
     /// The turn class the bus mirror carries (§5.5): opens, closes and
     /// amends of the session, runs and turns; `need`, `clear` and `handoff`
     /// marks; gaps and snapshots. Steps and other marks stay local.
+    #[inline]
     #[must_use]
-    pub fn is_turn_class(&self) -> bool {
+    pub const fn is_turn_class(&self) -> bool {
         match self.op {
             Op::Open | Op::Close | Op::Amend => {
                 matches!(self.node.lvl, Lvl::Session | Lvl::Run | Lvl::Turn)
@@ -84,8 +87,9 @@ impl Rec {
     /// only from the step's open and drops them only at its close), and the
     /// `seen` mark that lifts `need=failure`. Tool, subagent and compact
     /// steps and every other mark stay local; a turn's close counts them.
+    #[inline]
     #[must_use]
-    pub fn is_bus_class(&self) -> bool {
+    pub const fn is_bus_class(&self) -> bool {
         match self.op {
             Op::Open | Op::Close | Op::Amend => match self.node.lvl {
                 Lvl::Session | Lvl::Run | Lvl::Turn => true,
@@ -104,6 +108,7 @@ impl Rec {
     }
 
     /// The `out=` word of a close, if any.
+    #[inline]
     #[must_use]
     pub fn out(&self) -> Option<&'static str> {
         self.f.get_word(Key::Out)

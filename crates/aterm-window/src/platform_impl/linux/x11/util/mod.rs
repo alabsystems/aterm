@@ -25,6 +25,9 @@ mod window_property;
 mod wm;
 mod xmodmap;
 
+pub(crate) use self::cursor::CursorFollow;
+#[cfg(test)]
+pub(crate) use self::cursor::CURSOR_LOADS;
 pub use self::geometry::*;
 pub use self::hint::*;
 pub use self::input::*;

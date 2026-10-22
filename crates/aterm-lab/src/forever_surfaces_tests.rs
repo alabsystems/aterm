@@ -231,6 +231,50 @@ fn the_page_is_read_by_key_and_a_session_by_its_label() {
     assert_eq!(page_of(&rows, "Show land-a"), None);
 }
 
+/// A ROW CUT OFF BY THE PAGE'S BOTTOM EDGE (r5's Gemini CLI L2): the text
+/// lists only what the page's screen shows, so a head drawn with no state
+/// row and nothing of the page after its own rows is the screen's last line,
+/// and its state line is unread: the row reads as off the page's screen.
+/// NEGATIVE CONTROLS: a head with no state row and another session's row
+/// below it is a row the page drew with no state line; the last row with its
+/// state drawn is read whole.
+#[test]
+fn a_row_cut_off_by_the_pages_bottom_edge_is_off_its_screen() {
+    let clipped = page_rows(
+        "text key=\"harness/session/0\" role=Group label=\"land-a: Window 2, tab 2 · Claude Code · supervised · autopilot land\"\n\
+         text key=\"harness/session/0/state\" role=Status label=\"landed 03:20\"\n\
+         text key=\"harness/session/4\" role=Group label=\"land-b: Window 2, tab 3 · Claude Code · supervised · autopilot land\"\n\
+         text key=\"harness/session/4/show\" role=Button label=\"Show land-b\"",
+    );
+    assert_eq!(
+        page_of(&clipped, "land-b"),
+        None,
+        "its state line is below the edge"
+    );
+    assert_eq!(
+        page_of(&clipped, "land-a").as_deref(),
+        Some(
+            "head=land-a: Window 2, tab 2 · Claude Code · supervised · autopilot land\nstate=landed 03:20"
+        ),
+        "the row above it is whole"
+    );
+    let stateless = page_rows(
+        "text key=\"harness/session/4\" role=Group label=\"land-b: Window 2, tab 3 · Claude Code · supervised · autopilot land\"\n\
+         text key=\"harness/session/4/show\" role=Button label=\"Show land-b\"\n\
+         text key=\"harness/session/5\" role=Group label=\"land-c: Window 2, tab 4 · Claude Code · supervised · autopilot land\"",
+    );
+    assert_eq!(
+        page_of(&stateless, "land-b").as_deref(),
+        Some("head=land-b: Window 2, tab 3 · Claude Code · supervised · autopilot land"),
+        "a row below it: the page drew no state line"
+    );
+    assert_eq!(
+        page_of(&stateless, "land-c"),
+        None,
+        "the last head alone is cut off"
+    );
+}
+
 #[test]
 fn a_chip_line_is_read_and_its_cells_held_to_its_face() {
     let a = chip_of(CHROME, "s-aa").unwrap();
@@ -315,6 +359,50 @@ window id=1 focused=true tabs=2 active=3
     let ls = "0 0 s-aa - alive alpha meta=1 window=0 active=1\n0 1 s-bb - alive /p meta=0 window=2 active=1";
     assert_eq!(window_of(ls, "s-bb").as_deref(), Some("2"));
     assert_eq!(window_of(ls, "s-b"), None);
+}
+
+/// `invoke NewWindow` answers before its window is made (the window's first
+/// shell spawns off the event loop): the window is waited for, read after
+/// read, and the one `before` lacks is named. NEGATIVE CONTROLS: windows
+/// that stood before are never the new one, and a window that never comes
+/// is none once the wait is over.
+#[test]
+fn a_new_window_is_waited_for_until_it_is_made() {
+    let one = "app-inspection version=app/v1 revision=1 subject=tabs
+window id=0 focused=true tabs=1 active=1
+  tab id=1 index=0 kind=app title=\"Settings\" state=clean active=true
+    leaf path=/ view=1 rect_px=0.0,0.0,1008.0,700.0 focused=true kind=app app=settings title=\"Settings\"";
+    let two = format!(
+        "{one}\nwindow id=1 focused=true tabs=1 active=2\n  tab id=2 index=0 kind=terminal title=\"/p\" state=clean active=true"
+    );
+    let before = vec!["0".to_string()];
+    // the window comes on the third read, as on a loaded machine
+    let mut reads = 0;
+    let made = new_window(&before, STEP_WAIT, || {
+        reads += 1;
+        if reads < 3 {
+            one.to_string()
+        } else {
+            two.clone()
+        }
+    });
+    assert_eq!(made.as_deref(), Some("1"));
+    assert_eq!(reads, 3, "read until it showed, and no more");
+    // from no window at all, the first one made is new
+    assert_eq!(
+        new_window(&[], Duration::ZERO, || one.to_string()).as_deref(),
+        Some("0")
+    );
+    // NEGATIVE CONTROLS: the windows that stood before, and one that never comes
+    assert_eq!(
+        new_window(&["0".to_string(), "1".to_string()], Duration::ZERO, || two
+            .clone()),
+        None
+    );
+    assert_eq!(
+        new_window(&before, Duration::from_millis(200), || one.to_string()),
+        None
+    );
 }
 
 #[test]

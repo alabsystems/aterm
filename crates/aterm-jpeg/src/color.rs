@@ -22,6 +22,7 @@ pub(crate) struct Plane {
 }
 
 impl Plane {
+    #[inline]
     fn row(&self, y: usize) -> &[u8] {
         let y = y.min(self.height.saturating_sub(1));
         let start = y * self.stride;
@@ -69,6 +70,7 @@ impl Plane {
 
     /// For a component halved vertically: the sample row nearest output row
     /// `y` and the one on the far side of it (the edge row repeats).
+    #[inline]
     fn vertical_pair(&self, y: usize) -> (&[u8], &[u8]) {
         let near = y / 2;
         let far = if y.is_multiple_of(2) {
@@ -80,6 +82,7 @@ impl Plane {
     }
 }
 
+#[inline]
 fn copy_row(row: &[u8], out: &mut [u8]) {
     for (x, slot) in out.iter_mut().enumerate() {
         *slot = row.get(x).or_else(|| row.last()).copied().unwrap_or(0);
@@ -88,6 +91,7 @@ fn copy_row(row: &[u8], out: &mut [u8]) {
 
 /// Double a row's width with the triangle filter: each output sample is
 /// three parts its own input sample and one part the neighbour on its side.
+#[inline]
 fn h2_fancy(row: &[u8], out: &mut [u8]) {
     let n = row.len();
     if n == 0 {
@@ -109,6 +113,7 @@ fn h2_fancy(row: &[u8], out: &mut [u8]) {
 
 /// [`h2_fancy`] after the same filter down the column: `near` is the
 /// sample row nearest the output row, `far` the one beyond it.
+#[inline]
 fn h2v2_fancy(near: &[u8], far: &[u8], out: &mut [u8]) {
     let n = near.len();
     if n == 0 {
@@ -144,6 +149,7 @@ pub(crate) enum ColorModel {
 }
 
 /// One pixel of JFIF YCbCr as sRGB (T.871 section 7), in 16-bit fixed point.
+#[inline]
 fn ycbcr_to_rgb(y: u8, cb: u8, cr: u8) -> [u8; 3] {
     let y = (i32::from(y) << 16) + (1 << 15);
     let cb = i32::from(cb) - 128;

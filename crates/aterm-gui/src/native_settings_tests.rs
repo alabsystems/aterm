@@ -282,20 +282,25 @@ fn preview_body_pixels(compiled: &crate::native_ui::CompiledUi, pixels: &[u8]) -
     body
 }
 
-/// THE SEARCH COUNT STATES WHAT ITS LISTS HOLD: the results-range is the
-/// summary of the settings the list draws, the pages it lists and the keys
-/// only aterm.toml holds — read off the rendered screens, so a call site that
-/// passed the wrong list (a count of 0 aterm.toml keys over a card of them)
-/// fails here whatever the wording.
+/// THE SEARCH COUNT STATES WHAT ITS LISTS HOLD: the results-range names
+/// every group the page draws — the pages it lists, the settings it draws
+/// and the keys only aterm.toml holds (the card's rows and its "N more") —
+/// read off the rendered screens, so a call site that passed the wrong list,
+/// or a formatter that dropped a group ("font" read "1 page · 12 settings"
+/// over a card of six aterm.toml keys), fails here whatever the wording. At
+/// both reaches: "board" and "paper" list loose hits only.
 #[test]
 fn search_count_states_what_its_result_lists_hold() {
     let cx = view_cx_at(1_200.0, 900.0);
     for query in [
-        "prime", "shell", "pixel", "blink", "window", "cursor", "theme", "zxqvbn",
+        "prime", "shell", "pixel", "blink", "window", "cursor", "theme", "font", "disk", "board",
+        "paper", "zxqvbn",
     ] {
         let (mut runtime, instance, view, _) = compile_search(query, &cx);
         let mut settings = BTreeSet::new();
         let mut pages = BTreeSet::new();
+        let mut toml_rows = BTreeSet::new();
+        let mut toml_more = 0;
         let mut range = None;
         let mut empty = false;
         each_screen(&mut runtime, instance, view, &cx, |compiled, _| {
@@ -316,6 +321,16 @@ fn search_count_states_what_its_result_lists_hold() {
                         }
                         _ => {}
                     }
+                } else if let Some(ordinal) = key.strip_prefix("settings/search/manual-result/key/")
+                {
+                    toml_rows.insert(ordinal.to_string());
+                } else if key == "settings/search/manual-result/more" {
+                    toml_more = node
+                        .label
+                        .split_whitespace()
+                        .next()
+                        .and_then(|count| count.parse::<usize>().ok())
+                        .expect("the more button says how many");
                 } else if key == "settings/results-range" {
                     range = Some(node.label.clone());
                 } else if key == "settings/empty" {
@@ -323,26 +338,39 @@ fn search_count_states_what_its_result_lists_hold() {
                 }
             }
         });
-        let toml = manual_search_matching_keys(settings_state(&runtime, view), query).len();
+        let toml = toml_rows.len() + toml_more;
+        let state = settings_state(&runtime, view);
+        let search = SearchQuery::of(state, query);
+        assert_eq!(
+            toml,
+            manual_search_matching_keys(state, search).len(),
+            "{query:?}: the card holds every matching key"
+        );
+        let loose = search.reach == MatchReach::Loose;
         assert_eq!(
             range,
-            settings_count_summary(settings.len(), pages.len(), toml),
+            search_count_summary(loose, settings.len(), pages.len(), toml),
             "{query:?}: settings {settings:?}, pages {pages:?}, {toml} aterm.toml keys"
         );
-        // The counts the line states are those lists, zeros left out.
+        assert_eq!(
+            loose && range.is_some(),
+            range
+                .as_deref()
+                .is_some_and(|label| label.starts_with(PARTIAL_MATCHES_LEAD)),
+            "{query:?}: a loose search's count says so"
+        );
+        // The counts the line states are those lists, in the order drawn,
+        // zeros left out.
         let numbers: Vec<usize> = range
             .iter()
+            .map(|label| label.trim_start_matches(PARTIAL_MATCHES_LEAD))
             .flat_map(|label| label.split(" · "))
             .filter_map(|part| part.split_whitespace().next()?.parse().ok())
             .collect();
-        let expected: Vec<usize> = if settings.is_empty() && pages.is_empty() {
-            (toml > 0).then_some(toml).into_iter().collect()
-        } else {
-            [pages.len(), settings.len()]
-                .into_iter()
-                .filter(|count| *count > 0)
-                .collect()
-        };
+        let expected: Vec<usize> = [pages.len(), settings.len(), toml]
+            .into_iter()
+            .filter(|count| *count > 0)
+            .collect();
         assert_eq!(numbers, expected, "{query:?}: {range:?}");
         assert_eq!(
             range.is_none(),
@@ -547,7 +575,7 @@ fn every_visual_field_previews_candidate_semantics_fingerprint_pixels_and_isolat
         // - trail length/radius/ring/accent: this fixture draws the default
         //   style, the rainbow kitty, which reads none of them (the knob law,
         //   `GlowStyle::reads_knob`); the scene's Tab shows them for every
-        //   style that does (`the_jump_knobs_show_after_the_scenes_tab`).
+        //   style that does (`the_jump_knobs_show_visibly_after_the_scenes_tab`).
         // - hdr_glow draws the crown past SDR white on an EDR screen; the
         //   tray is SDR, so the specimen draws the SDR crown either way.
         let body_exempt = matches!(
@@ -5401,18 +5429,25 @@ fn top_settings_rainbow_banner_present_and_yielding() {
     };
     let cx = view_cx_at(1_200.0, roomy);
     let compiled = compile_settings_view(&runtime, instance, view, &cx);
-    let node = compiled
-        .semantic(&key)
-        .expect("roomy Home page shows the rainbow banner");
-    assert!(node.action.is_none(), "the banner is pure decoration");
+    let painted =
+        |compiled: &crate::native_ui::CompiledUi| compiled.paint.iter().any(|node| node.key == key);
+    assert!(
+        painted(&compiled),
+        "roomy Home page shows the rainbow banner"
+    );
+    assert!(
+        compiled.semantic(&key).is_none(),
+        "the banner is pure decoration: nothing for a screen reader to read out"
+    );
+    assert!(
+        compiled.hits.iter().all(|hit| hit.key != key),
+        "the banner has no action"
+    );
     assert_zero_top_paint(&compiled, &format!("rainbow banner at 1200x{roomy} 1x"));
 
     // A host below the fit gate keeps the plain layout.
     let compiled = compile_settings_view(&runtime, instance, view, &view_cx_at(1_200.0, 700.0));
-    assert!(
-        compiled.semantic(&key).is_none(),
-        "short hosts must not gain the banner"
-    );
+    assert!(!painted(&compiled), "short hosts must not gain the banner");
 
     // Serious Mode hides the unapologetically playful.
     let mut serious = view_cx_at(1_200.0, roomy);
@@ -5421,10 +5456,7 @@ fn top_settings_rainbow_banner_present_and_yielding() {
         ..crate::native_app::ViewMotionCx::default()
     };
     let compiled = compile_settings_view(&runtime, instance, view, &serious);
-    assert!(
-        compiled.semantic(&key).is_none(),
-        "Serious Mode must not show the banner"
-    );
+    assert!(!painted(&compiled), "Serious Mode must not show the banner");
 }
 
 /// The Top colour sample ends on a whole row wherever the wide grid grows it:
@@ -6108,10 +6140,14 @@ fn list_bound_sweep(scale: f32) {
                                 }
                             );
                             assert_eq!(limit, Some(plan.limit()), "{context}: one bound");
+                            // The last screen, as it draws, shows its first
+                            // stop and every one after it; drawn as the last
+                            // screen, the one before it would not.
                             let last = plan.limit();
-                            assert_eq!(plan.view(last).end, plan.len(), "{context}");
+                            assert_eq!(plan.screen(last).view.end, plan.len(), "{context}");
+                            assert!(plan.ends_on(last) || last + 1 == plan.len(), "{context}");
                             assert!(
-                                last == 0 || plan.view(last - 1).end < plan.len(),
+                                last == 0 || !plan.ends_on(last - 1),
                                 "{context}: the last screen is full"
                             );
                         }
@@ -9028,7 +9064,7 @@ fn search_finds_every_listed_style_and_the_cursor_shape() {
         .filter(|row| row.style.is_some())
     {
         let query = row.label.to_ascii_lowercase();
-        let hit = search_page_hits(&state, &query)
+        let hit = search_page_hits(&state, SearchQuery::of(&state, &query))
             .into_iter()
             .find(|hit| hit.route == SettingsRoute::CursorStyles)
             .unwrap_or_else(|| panic!("{query:?} finds Cursor Styles"));
@@ -9037,7 +9073,7 @@ fn search_finds_every_listed_style_and_the_cursor_shape() {
     // A row's saved spelling finds it by that spelling too: `laser` is listed
     // as Lightning.
     assert_eq!(
-        search_page_hits(&state, "laser")
+        search_page_hits(&state, SearchQuery::of(&state, "laser"))
             .into_iter()
             .find(|hit| hit.route == SettingsRoute::CursorStyles)
             .and_then(|hit| hit.focus),
@@ -9048,7 +9084,7 @@ fn search_finds_every_listed_style_and_the_cursor_shape() {
     let classic_mono = |toml: &str| {
         let service = VersionedConfigService::new(toml.to_string()).unwrap();
         let state = SettingsViewState::from_snapshot(&service.snapshot()).unwrap();
-        search_page_hits(&state, "classic mono")
+        search_page_hits(&state, SearchQuery::of(&state, "classic mono"))
             .into_iter()
             .find(|hit| hit.route == SettingsRoute::CursorStyles)
             .and_then(|hit| hit.focus)
@@ -9056,7 +9092,7 @@ fn search_finds_every_listed_style_and_the_cursor_shape() {
     assert_eq!(classic_mono(""), Some(cursor_style_row_key("classic")));
     // The owner's A/B control is listed, so a word of its name finds it.
     assert_eq!(
-        search_page_hits(&state, "flat")
+        search_page_hits(&state, SearchQuery::of(&state, "flat"))
             .into_iter()
             .find(|hit| hit.route == SettingsRoute::CursorStyles)
             .and_then(|hit| hit.focus),
@@ -9072,7 +9108,7 @@ fn search_finds_every_listed_style_and_the_cursor_shape() {
         assert!(
             field_match_score_in(
                 shape,
-                query,
+                SearchQuery::of(&state, query),
                 &mut scratch,
                 &crate::app_config::ThemeCatalog::default()
             )
@@ -10248,6 +10284,8 @@ fn machine_state_fixture(
         policy: atpkg::config::UniversalControlPolicy::Off,
         home,
         config_unreadable: false,
+        rosetta: atpkg::machine::RosettaPosture::Present,
+        rosetta_wanted: true,
     }
 }
 
@@ -12234,7 +12272,12 @@ fn a_retired_packages_spelling_is_named_resettable_and_reset_by_reset_all() {
     ] {
         let field = state.field_by_key(key).unwrap();
         assert!(
-            field_match_score(field, query, &crate::app_config::ThemeCatalog::default()).is_some(),
+            field_match_score(
+                field,
+                SearchQuery::of(state, query),
+                &crate::app_config::ThemeCatalog::default()
+            )
+            .is_some(),
             "{query} finds {key}"
         );
     }
@@ -19531,49 +19574,121 @@ fn typography_list_pins_its_specimen_and_reaches_every_field_at_scale(_scale: f3
     }
 }
 
-/// A search for an agent finds its switch first: "claude" and "codex" each
-/// put Supervise <product> sessions at the top of the settings found,
-/// above the rows that only list the word as a synonym (the packages
-/// switch, the harness's other rows): the agent's word is the
-/// switch's own name (`prefs::own_name_of`), and on the same rung a hit on
-/// a row's own names ranks before a synonym's (`SearchRank`). Every
-/// supervisable agent, so a new one is held to it. Negative control: the
-/// synonym rows are still found, below it.
+/// The settings rows a search for `query` lists, in order, from one screen
+/// tall enough for all of them.
+fn searched_rows(query: &str) -> Vec<String> {
+    let (_, _, _, compiled) = compile_search(query, &view_cx_at(1_200.0, 12_000.0));
+    compiled
+        .semantics
+        .iter()
+        .filter_map(|node| node.key.as_str().strip_prefix("settings/row/"))
+        .filter_map(|row| row.split_once('/'))
+        .map(|(_, key)| key.to_string())
+        .collect()
+}
+
+/// A search for an agent finds its switch first, by either of its names:
+/// "claude", "Claude Code" and "claude code" each put Supervise Claude Code
+/// sessions at the top of the settings found, above the rows that only list
+/// a word of it as a synonym (the packages switch lists "claude" and
+/// "codex"): the agent's word and its product name are the switch's own
+/// names (`prefs::own_names_of`), a whole word outranks the start of one
+/// ("code" in "codex"), and on the same rung a hit on a row's own names
+/// ranks before a synonym's (`SearchRank`). An AI CLI's word ("agy") and
+/// its product name ("Antigravity CLI") put its Use row first among the AI
+/// CLIs' rows the same way, and before the packages switch, which lists
+/// "agy" only as a synonym. Every agent and CLI, so a new one is held to it.
+/// Negative control: the synonym rows are still found, below.
 #[test]
 fn a_search_for_an_agent_finds_its_switch_first() {
+    let at = |rows: &[String], key: &str| rows.iter().position(|row| row == key);
     for agent in aterm_phase::Program::ALL
         .into_iter()
         .filter(|agent| agent.harness_table())
     {
-        let (mut runtime, instance, view) = setup();
-        runtime
-            .dispatch(
-                instance,
-                view,
-                AppEvent::Action(ActionInvocation {
-                    id: ActionId::new("settings/search"),
-                    value: Some(SemanticInput::Text(agent.name().to_string())),
-                }),
-            )
-            .unwrap();
-        let compiled = compile_settings_view(&runtime, instance, view, &view_cx());
-        let rows: Vec<&str> = compiled
+        let switch = format!("harness.{}.enabled", agent.name());
+        for query in [
+            agent.name().to_string(),
+            agent.product().to_string(),
+            agent.product().to_ascii_lowercase(),
+        ] {
+            let rows = searched_rows(&query);
+            assert_eq!(rows.first(), Some(&switch), "{query:?}: {rows:?}");
+            if query == agent.name() {
+                assert!(
+                    at(&rows, prefs::EDIT_PACKAGES_ENABLED).is_some(),
+                    "{query:?}: the synonym rows are still found: {rows:?}"
+                );
+            }
+        }
+    }
+    for cli in aterm_agent::ai::connector::ROWS {
+        let switch = format!("ai.{}.use", cli.id);
+        for query in [
+            cli.id.to_string(),
+            cli.product.to_string(),
+            cli.product.to_ascii_lowercase(),
+        ] {
+            let rows = searched_rows(&query);
+            let first_ai = rows.iter().find(|row| row.starts_with("ai."));
+            assert_eq!(first_ai, Some(&switch), "{query:?}: {rows:?}");
+            if let Some(packages) = at(&rows, prefs::EDIT_PACKAGES_ENABLED) {
+                assert!(
+                    at(&rows, &switch) < Some(packages),
+                    "{query:?}: its row before a synonym's: {rows:?}"
+                );
+            }
+        }
+    }
+}
+
+/// A WHOLE WORD BEFORE THE START OF ONE, AND A RESULT GROUP IS ONE CARD:
+/// "code" lists Supervise Claude Code sessions and Supervise Muse Code
+/// sessions, whose names hold the whole word, before Watch codex-alab
+/// sessions and the packages switch, which "code" only starts a word of
+/// ("codex"); and the Harness supervision rows are one card, never dealt
+/// out around another group's. Every search's groups are one card each.
+#[test]
+fn a_search_ranks_whole_words_first_and_draws_each_group_once() {
+    let rows = searched_rows("code");
+    let at = |key: &str| {
+        rows.iter()
+            .position(|row| row == key)
+            .unwrap_or_else(|| panic!("code finds {key}: {rows:?}"))
+    };
+    for whole in [
+        prefs::EDIT_HARNESS_CLAUDE_ENABLED,
+        prefs::EDIT_HARNESS_MUSE_ENABLED,
+    ] {
+        for prefix in [
+            prefs::EDIT_HARNESS_CODEX_ENABLED,
+            prefs::EDIT_PACKAGES_ENABLED,
+        ] {
+            assert!(at(whole) < at(prefix), "{whole} before {prefix}: {rows:?}");
+        }
+    }
+    // "codex" itself still finds its own switch first, the packages switch
+    // after it.
+    let codex = searched_rows("codex");
+    assert_eq!(
+        codex.first().map(String::as_str),
+        Some(prefs::EDIT_HARNESS_CODEX_ENABLED),
+        "{codex:?}"
+    );
+    for query in ["code", "claude code", "cursor", "font", "color", "sound"] {
+        let (_, _, _, compiled) = compile_search(query, &view_cx_at(1_200.0, 12_000.0));
+        let mut cards: Vec<&str> = compiled
             .semantics
             .iter()
-            .map(|node| node.key.as_str())
-            .filter(|key| key.starts_with("settings/row/"))
+            .filter_map(|node| node.key.as_str().strip_prefix("settings/group-heading/"))
+            .filter_map(|heading| heading.split_once('/'))
+            .map(|(caption, _)| caption)
             .collect();
-        let switch = format!("/harness.{}.enabled", agent.name());
-        assert!(
-            rows.first().is_some_and(|row| row.ends_with(&switch)),
-            "{}: {rows:?}",
-            agent.name()
-        );
-        assert!(
-            rows.iter().any(|row| row.ends_with("/packages.enabled")),
-            "{}: the synonym rows are still found: {rows:?}",
-            agent.name()
-        );
+        assert!(!cards.is_empty(), "{query:?} lists groups");
+        let drawn = cards.len();
+        cards.sort_unstable();
+        cards.dedup();
+        assert_eq!(cards.len(), drawn, "{query:?}: a group drawn twice");
     }
 }
 
@@ -20935,7 +21050,8 @@ fn compile_search(
 fn aterm_toml_card_heading_is_the_same_whatever_else_matched() {
     let cx = view_cx_at(1_080.0, 720.0);
     let (runtime, _, view, compiled) = compile_search("disk", &cx);
-    let toml = manual_search_matching_keys(settings_state(&runtime, view), "disk").len();
+    let state = settings_state(&runtime, view);
+    let toml = manual_search_matching_keys(state, SearchQuery::of(state, "disk")).len();
     assert!(toml > 0);
     assert_eq!(
         compiled
@@ -21006,7 +21122,8 @@ fn global_search_surfaces_manual_only_schema_matches_as_an_editor_result() {
     });
     assert!(rows.contains(prefs::EDIT_SHELL), "{rows:?}");
     assert!(!rows.contains(prefs::EDIT_SHELL_ARGS), "{rows:?}");
-    let keys = manual_search_matching_keys(&SettingsViewState::new(&Config::default()), "shell");
+    let state = SettingsViewState::new(&Config::default());
+    let keys = manual_search_matching_keys(&state, SearchQuery::of(&state, "shell"));
     assert!(!keys.iter().any(|key| key == prefs::EDIT_SHELL), "{keys:?}");
     assert_eq!(
         keys[0],
@@ -21057,7 +21174,7 @@ fn search_lists_settings_before_aterm_toml_keys_and_every_key_on_request() {
     );
 
     let state = SettingsViewState::new(&Config::default());
-    let keys = manual_search_matching_keys(&state, "matrix");
+    let keys = manual_search_matching_keys(&state, SearchQuery::of(&state, "matrix"));
     assert!(keys.len() > MANUAL_SEARCH_KEYS_SHOWN + 1, "{keys:?}");
     let (mut runtime, instance, view, compiled) = compile_search("matrix", &cx);
     let listed = |compiled: &crate::native_ui::CompiledUi| {
@@ -21243,7 +21360,7 @@ fn search_takes_every_word_and_the_words_people_use() {
         assert!(
             field_match_score(
                 field(key),
-                query,
+                SearchQuery::of(&state, query),
                 &crate::app_config::ThemeCatalog::default()
             )
             .is_some(),
@@ -21253,7 +21370,7 @@ fn search_takes_every_word_and_the_words_people_use() {
     assert!(
         field_match_score(
             field(prefs::EDIT_WINDOW_THEME),
-            "dark sky",
+            word_search("dark sky"),
             &crate::app_config::ThemeCatalog::default()
         )
         .is_none(),
@@ -21262,7 +21379,7 @@ fn search_takes_every_word_and_the_words_people_use() {
     assert!(
         field_match_score(
             field(prefs::EDIT_THEME),
-            "dark sky",
+            word_search("dark sky"),
             &crate::app_config::ThemeCatalog::default()
         )
         .is_none(),
@@ -21270,16 +21387,22 @@ fn search_takes_every_word_and_the_words_people_use() {
     );
 }
 
-/// EVERY HIT STARTS A WORD, on every surface the one ladder serves: "cat"
-/// finds the settings that list the word cat, never the ones whose words
-/// merely hold the letters (notifiCATions, indiCATor), nor a
-/// label whose initials are spread over a sentence ("Claude's working time
-/// And Tokens").
+/// A SEARCH TAKES LOOSE HITS ONLY WHERE NOTHING STARTS A WORD (h-31): its
+/// reach is the whole search's ([`SearchQuery`]). "cat" has word hits (the
+/// settings that list the word cat), so it never adds the ones whose words
+/// merely hold the letters (notifiCATions, indiCATor) or whose initials
+/// spell it ("Continue A Turn", "Claude's working time And Tokens"), on any
+/// surface: the rows, the pages, the aterm.toml card. "board" and "paper"
+/// start no word anywhere, so they list what holds them inside a word —
+/// Keyboard & Input's rows and page, the Wallpaper page — rather than say
+/// nothing matches a word the sidebar shows; "lh" still finds Line height by
+/// its initials. Negative controls: a query found nowhere lists nothing, and
+/// a short one with word hits ("top") never reaches the loose tier.
 #[test]
-fn search_finds_only_hits_that_start_a_word() {
+fn a_search_takes_loose_hits_only_where_nothing_starts_a_word() {
     let state = SettingsViewState::new(&Config::default());
     let themes = crate::app_config::ThemeCatalog::default();
-    let score = |key: &str, query: &str| {
+    let finds = |key: &str, query: SearchQuery<'_>| {
         field_match_score(
             state
                 .field_by_key(key)
@@ -21287,37 +21410,201 @@ fn search_finds_only_hits_that_start_a_word() {
             query,
             &themes,
         )
+        .is_some()
     };
+    let pages = |query: SearchQuery<'_>| -> Vec<SettingsRoute> {
+        search_page_hits(&state, query)
+            .into_iter()
+            .map(|hit| hit.route)
+            .collect()
+    };
+
+    let cat = SearchQuery::of(&state, "cat");
     for key in [KEYWORD_KITTIES_KEY, prefs::EDIT_CURSOR_TRAIL_STYLE] {
-        assert!(score(key, "cat").is_some(), "cat finds {key}");
+        assert!(finds(key, cat), "cat finds {key}");
     }
     for key in [
         prefs::EDIT_ALLOW_NOTIFICATIONS,
         prefs::EDIT_DESKTOP_ALERTS,
         prefs::EDIT_BELL_SOUND,
     ] {
-        assert_eq!(score(key, "cat"), None, "cat inside a word of {key}");
+        assert!(!finds(key, cat), "cat inside a word of {key}");
     }
     let mut scratch = String::new();
     for key in ["tab_status", "tab_status_badge", "claude_footer.usage"] {
         let entry = crate::native_config_language::config_schema_entry(key)
             .unwrap_or_else(|| panic!("{key} is a schema key"));
         assert_eq!(
-            crate::native_config_language::config_schema_match_score(entry, "cat", &mut scratch),
+            crate::native_config_language::config_schema_match_score(
+                entry,
+                cat.text,
+                cat.reach,
+                &mut scratch
+            ),
             None,
             "cat inside a word of {key}"
         );
     }
+    let cat_keys = manual_search_matching_keys(&state, cat);
     assert!(
-        !manual_search_matching_keys(&state, "cat")
-            .iter()
-            .any(|key| key == "claude_footer.usage" || key.starts_with("tab_status")),
-        "the aterm.toml card takes the same ladder"
+        !cat_keys.iter().any(|key| key == "harness.continue"
+            || key == "claude_footer.usage"
+            || key.starts_with("tab_status")),
+        "the aterm.toml card takes the search's reach: {cat_keys:?}"
     );
+    assert_eq!(cat.reach, MatchReach::Words, "cat starts words");
     // A word, a phrase and a key fragment still count where they start a word.
-    assert!(score(prefs::EDIT_BELL_SOUND, "bell sound").is_some());
-    assert!(score(prefs::EDIT_CURSOR_TRAIL_STYLE, "trail_style").is_some());
-    assert!(score(prefs::EDIT_LINE_HEIGHT, "lh").is_some(), "an acronym");
+    assert!(finds(prefs::EDIT_BELL_SOUND, word_search("bell sound")));
+    assert!(finds(
+        prefs::EDIT_CURSOR_TRAIL_STYLE,
+        word_search("trail_style")
+    ));
+
+    // Inside a word, where nothing starts one.
+    let board = SearchQuery::of(&state, "board");
+    assert!(
+        pages(board).contains(&SettingsRoute::KeyboardInput),
+        "{:?}",
+        pages(board)
+    );
+    for key in [
+        prefs::EDIT_SECURE_KEYBOARD_ENTRY,
+        prefs::EDIT_COPY_ON_SELECT,
+        prefs::EDIT_ALLOW_OSC52_QUERY,
+    ] {
+        assert!(finds(key, board), "board finds {key}");
+        assert!(!finds(key, word_search("board")), "{key} only loosely");
+    }
+    assert_eq!(board.reach, MatchReach::Loose, "board starts no word");
+    let paper = SearchQuery::of(&state, "paper");
+    assert!(pages(paper).contains(&SettingsRoute::Wallpaper));
+    assert_eq!(paper.reach, MatchReach::Loose);
+    // By initials, where nothing starts a word.
+    let lh = SearchQuery::of(&state, "lh");
+    assert!(finds(prefs::EDIT_LINE_HEIGHT, lh), "an acronym");
+    assert_eq!(lh.reach, MatchReach::Loose);
+
+    // Negative controls.
+    let nowhere = SearchQuery::of(&state, "zqzqzq");
+    assert!(pages(nowhere).is_empty());
+    assert!(manual_search_matching_keys(&state, nowhere).is_empty());
+    assert!(
+        !state
+            .legacy
+            .fields
+            .iter()
+            .any(|field| field_match_score(field, nowhere, &themes).is_some())
+    );
+    assert_eq!(SearchQuery::of(&state, "top").reach, MatchReach::Words);
+}
+
+/// EACH THEME FILTER TAKES THE SEARCH'S RULE OVER ITS OWN ROWS: the
+/// picker's filter and the gallery's take loose hits only where no row of
+/// theirs starts a word with the text. "earth" starts a word of the Gruvbox
+/// themes ("earthy colours"), so it lists them and not Hearth, which holds
+/// it inside a word; "uvbox" starts no word, so it still lists the Gruvbox
+/// themes. Negative control: a text found nowhere lists nothing.
+#[test]
+fn a_theme_filter_takes_loose_hits_only_where_no_row_starts_a_word() {
+    let themes = crate::app_config::ThemeCatalog::default();
+    let mut picker = ChoicePicker::for_themes(&themes, "Default", false, false);
+    let mut shown = |text: &str| -> Vec<String> {
+        if let Some(extras) = picker.themes.as_mut() {
+            extras.filter = crate::native_text_input::TextInputState::new(text.to_string());
+        }
+        picker.refilter();
+        picker
+            .shown
+            .iter()
+            .map(|index| picker.options[*index].label.clone())
+            .collect()
+    };
+    let earth = shown("earth");
+    assert!(
+        earth.iter().any(|label| label.starts_with("Gruvbox")),
+        "{earth:?}"
+    );
+    assert!(!earth.iter().any(|label| label == "Hearth"), "{earth:?}");
+    let uvbox = shown("uvbox");
+    assert!(
+        !uvbox.is_empty() && uvbox.iter().all(|label| label.starts_with("Gruvbox")),
+        "{uvbox:?}"
+    );
+    assert!(shown("zqzqzq").is_empty());
+
+    let gallery = showcase_page::ShowcaseState::new(&themes);
+    let listed = |text: &str| -> Vec<String> {
+        gallery
+            .visible_for(text)
+            .into_iter()
+            .map(|index| gallery.cards[index].label.clone())
+            .collect()
+    };
+    assert_eq!(gallery.reach_for("earth"), MatchReach::Words);
+    let earth = listed("earth");
+    assert!(
+        earth.iter().any(|label| label.starts_with("Gruvbox")),
+        "{earth:?}"
+    );
+    assert!(!earth.iter().any(|label| label == "Hearth"), "{earth:?}");
+    assert_eq!(gallery.reach_for("uvbox"), MatchReach::Loose);
+    let uvbox = listed("uvbox");
+    assert!(
+        uvbox.iter().any(|label| label.starts_with("Gruvbox")),
+        "{uvbox:?}"
+    );
+    assert!(listed("zqzqzq").is_empty());
+}
+
+/// A loose search says so over its list: "board" finds rows only inside
+/// words, so its count says they are partial matches at every size, and its
+/// subtitle, where the page draws one, says no word starts with it, as
+/// typed; "cat" keeps the ordinary subtitle and count, and a search that
+/// found nothing at all keeps the ordinary subtitle (its empty card speaks).
+#[test]
+fn a_loose_search_says_its_results_are_partial() {
+    let read = |query: &str, cx: &ViewCx<'_>| {
+        let (_, _, _, compiled) = compile_search(query, cx);
+        let label = |prefix: &str| {
+            compiled
+                .semantics
+                .iter()
+                .find(|node| node.key.as_str().starts_with(prefix))
+                .map(|node| node.label.clone())
+        };
+        (
+            label("settings/page-subtitle/"),
+            label("settings/results-range"),
+        )
+    };
+    let wide = view_cx_at(1_200.0, 900.0);
+    let (subtitle, count) = read("Board", &wide);
+    let subtitle = subtitle.expect("a subtitle");
+    assert_eq!(subtitle, loose_search_subtitle("Board"), "as typed");
+    assert!(subtitle.contains("Board"), "{subtitle:?}");
+    assert!(
+        count
+            .as_deref()
+            .is_some_and(|count| count.starts_with(PARTIAL_MATCHES_LEAD)),
+        "{count:?}"
+    );
+    let (_, count) = read("board", &view_cx_at(390.0, 700.0));
+    assert!(
+        count
+            .as_deref()
+            .is_some_and(|count| count.starts_with(PARTIAL_MATCHES_LEAD)),
+        "a compact page says so too: {count:?}"
+    );
+    let ordinary = settings_fields_subtitle(SettingsRoute::Home, true, false);
+    let (subtitle, count) = read("cat", &wide);
+    assert_eq!(subtitle.as_deref(), Some(ordinary));
+    assert!(
+        count
+            .as_deref()
+            .is_some_and(|count| !count.starts_with(PARTIAL_MATCHES_LEAD)),
+        "{count:?}"
+    );
+    assert_eq!(read("zqzqzq", &wide).0.as_deref(), Some(ordinary));
 }
 
 /// EVERY AGENT FINDS ITS PAGES AND ITS ROWS (r8 D4). The Harness page's search
@@ -21327,12 +21614,14 @@ fn search_finds_only_hits_that_start_a_word() {
 /// Both pages' words now come from the rosters their rows are drawn from:
 /// every agent with a harness switch finds Harness by its word, its product
 /// name and that name's first word, and so does its switch row; every AI CLI
-/// finds AI CLIs and its Use row the same way.
+/// finds AI CLIs and its Use row the same way. Each row answers to its
+/// agent's product name as a name of its own (`prefs::own_names_of`), at the
+/// top rung, as the switch does to the agent's word.
 #[test]
 fn every_agent_finds_its_settings_pages_and_rows_by_name() {
     let state = SettingsViewState::new(&Config::default());
     let page = |query: &str, route: SettingsRoute| {
-        search_page_hits(&state, query)
+        search_page_hits(&state, SearchQuery::of(&state, query))
             .iter()
             .any(|hit| hit.route == route)
     };
@@ -21343,7 +21632,13 @@ fn every_agent_finds_its_settings_pages_and_rows_by_name() {
             .iter()
             .find(|field| field.key == key)
             .unwrap_or_else(|| panic!("{key}: no row"));
-        field_match_score_in(field, query, &mut String::new(), &state.assets.themes).is_some()
+        field_match_score_in(
+            field,
+            SearchQuery::of(&state, query),
+            &mut String::new(),
+            &state.assets.themes,
+        )
+        .is_some()
     };
     let words = |name: &str, product: &str| {
         let product = product.to_ascii_lowercase();
@@ -21362,11 +21657,27 @@ fn every_agent_finds_its_settings_pages_and_rows_by_name() {
         agents.contains(&aterm_phase::Program::Agy),
         "agy has a switch"
     );
+    // Its word and its product name are names of the row's own: found at
+    // the top rung, never only mid-label ("Supervise Claude Code sessions")
+    // or mid-key ("ai.agy.use").
+    let rank = |key: &str, query: &str| {
+        let field = state.field_by_key(key).expect("a row");
+        field_match_score(field, SearchQuery::of(&state, query), &state.assets.themes)
+    };
+    let top = Some(SearchRank::own(
+        crate::native_config_language::WHOLE_AT_START,
+    ));
     for agent in agents {
         let key = format!("harness.{}.enabled", agent.name());
         for query in words(agent.name(), agent.product()) {
             assert!(page(&query, SettingsRoute::Harness), "{query:?} → Harness");
             assert!(row(&key, &query), "{query:?} → {key}");
+        }
+        for query in [
+            agent.name().to_string(),
+            agent.product().to_ascii_lowercase(),
+        ] {
+            assert_eq!(rank(&key, &query), top, "{query:?} names {key}");
         }
     }
     for cli in aterm_agent::ai::connector::ROWS {
@@ -21374,6 +21685,9 @@ fn every_agent_finds_its_settings_pages_and_rows_by_name() {
         for query in words(cli.id, cli.product) {
             assert!(page(&query, SettingsRoute::Ai), "{query:?} → AI CLIs");
             assert!(row(&key, &query), "{query:?} → {key}");
+        }
+        for query in [cli.id.to_string(), cli.product.to_ascii_lowercase()] {
+            assert_eq!(rank(&key, &query), top, "{query:?} names {key}");
         }
     }
 }
@@ -21385,7 +21699,7 @@ fn every_agent_finds_its_settings_pages_and_rows_by_name() {
 fn search_returns_the_pages_that_draw_what_it_found() {
     let state = SettingsViewState::new(&Config::default());
     let hit = |query: &str, route: SettingsRoute| {
-        search_page_hits(&state, query)
+        search_page_hits(&state, SearchQuery::of(&state, query))
             .into_iter()
             .find(|hit| hit.route == route)
     };
@@ -21442,13 +21756,13 @@ fn search_returns_the_pages_that_draw_what_it_found() {
         ("display face", prefs::EDIT_DISPLAY_FONT),
     ] {
         assert!(
-            !manual_search_matching_keys(&state, query)
+            !manual_search_matching_keys(&state, SearchQuery::of(&state, query))
                 .iter()
                 .any(|found| found == key),
             "{key} is a page result, not only aterm.toml's"
         );
     }
-    assert!(search_page_hits(&state, "zxqvbn").is_empty());
+    assert!(search_page_hits(&state, SearchQuery::of(&state, "zxqvbn")).is_empty());
 }
 
 /// A page result opens its page with search cleared, on the control it
@@ -22575,7 +22889,12 @@ fn compact_top_status_cross_product_keeps_controls_and_recovery_actions_reachabl
                     assert_material_hit(compiled, &control, &context);
                     seen.insert(control);
                     // The cursor style's row is a link, not a setting row.
-                    if scale >= 2.0 && key != prefs::EDIT_CURSOR_TRAIL_STYLE {
+                    // A row taller than the room scrolls its name out above
+                    // a control still drawn whole; the control says it.
+                    if scale >= 2.0
+                        && key != prefs::EDIT_CURSOR_TRAIL_STYLE
+                        && !row_name_scrolled_out(compiled, key)
+                    {
                         let label_key = UiKey::new(format!("settings/label/{key}"));
                         assert!(
                             compiled.semantic(&label_key).is_none(),
@@ -23041,6 +23360,12 @@ fn top_settings_builtin_and_hidden_state_matrix_has_zero_renderer_overflow_at_sc
         assets.themes = themes;
         state.assets = Arc::new(assets);
         state.page_scroll = 0;
+        // On the screen that shows it whole: the first screen's peek draws it
+        // as a fading picture where the room's edge cuts it.
+        state.reveal_control(UiKey::new(format!(
+            "settings/control/{}",
+            prefs::EDIT_THEME
+        )));
         let cx = view_cx_at(286.5, 558.0);
         let committed = compile_settings_view(&runtime, instance, view, &cx);
         assert_zero_top_paint(&committed, "long Unicode committed theme");
@@ -23204,11 +23529,13 @@ fn top_settings_is_default_native_page_with_requested_controls_and_previews() {
     // Where nothing can sound (`trail_audio::output_available`), Music effects
     // carries its "No audio" status line, and the grid that line
     // lengthens takes a taller host to hold its four cards (at 1200x820 in
-    // Noto Sans its right column is 494pt in 472).
+    // Noto Sans its right column is 494pt in 472; at 900x860 in Cantarell,
+    // whose 298pt columns wrap that line and Playful effects' description
+    // onto two lines each, 533pt in 528).
     let roomy = if crate::trail_audio::output_available() {
         820.0
     } else {
-        860.0
+        880.0
     };
     let cx = view_cx_at(1_200.0, roomy);
     let compiled = runtime
@@ -28774,15 +29101,24 @@ fn zero_scrollback_rows_paint_what_zero_means_once() {
 #[test]
 fn generic_search_hides_absent_compatibility_keys_but_modified_retains_authored_ones() {
     let state = SettingsViewState::new(&Config::default());
-    assert_eq!(manual_search_matching_keys(&state, "materialize").len(), 0);
-    assert_eq!(manual_search_matching_keys(&state, "orca").len(), 0);
+    assert_eq!(
+        manual_search_matching_keys(&state, SearchQuery::of(&state, "materialize")).len(),
+        0
+    );
+    assert_eq!(
+        manual_search_matching_keys(&state, SearchQuery::of(&state, "orca")).len(),
+        0
+    );
 
     let mut service = VersionedConfigService::new(String::new()).unwrap();
     let snapshot = service
         .replace_external("[matrix_rain]\nmaterialize = true\n".to_string())
         .unwrap();
     let state = SettingsViewState::from_snapshot(&snapshot).unwrap();
-    assert_eq!(manual_search_matching_keys(&state, "materialize").len(), 1);
+    assert_eq!(
+        manual_search_matching_keys(&state, SearchQuery::of(&state, "materialize")).len(),
+        1
+    );
     // Known by what it was for, and removable: taking it out loses nothing.
     assert!(authored_manual_overrides(&state).iter().any(|entry| {
         entry.key == "matrix_rain.materialize"
@@ -28865,7 +29201,7 @@ fn a_search_draws_each_harness_row_as_a_native_control() {
         assert!(!state.is_explicit(key), "{key}");
         for &search in searches {
             assert!(
-                !manual_search_matching_keys(&state, search)
+                !manual_search_matching_keys(&state, SearchQuery::of(&state, search))
                     .iter()
                     .any(|k| k == key),
                 "{key}: a native row, not a Manual match for {search:?}"
@@ -34737,10 +35073,19 @@ fn a_grown_window_reclamps_the_scroll_to_a_full_last_screen() {
         plan.len()
     );
     assert!(compiled.semantic(&UiKey::new("settings/list")).is_some());
+    // Where the grown window's render seated its last screen (which may
+    // draw whole a stop over its seat, over its top).
+    let drawn = messages_view_state(&runtime, view)
+        .scroll_record
+        .borrow()
+        .as_ref()
+        .map(|record| record.top())
+        .expect("a measured list");
+    assert_eq!(drawn, plan.limit(), "seated at the list's end");
     runtime
         .dispatch(instance, view, AppEvent::ScrollLines(0))
         .unwrap();
-    assert_eq!(messages_view_state(&runtime, view).page_scroll, shown.start);
+    assert_eq!(messages_view_state(&runtime, view).page_scroll, drawn);
 }
 
 /// Serious Mode hides the playful rainbow on Top Settings, so it hides the
@@ -36748,11 +37093,11 @@ fn a_theme_name_finds_the_theme_control_and_seeds_the_picker_filter() {
         .into_iter()
         .find(|field| field.key == prefs::EDIT_THEME)
         .unwrap();
-    assert!(field_match_score(&field, "nord", &themes).is_some());
-    assert!(field_match_score(&field, "harbour", &themes).is_some());
+    assert!(field_match_score(&field, word_search("nord"), &themes).is_some());
+    assert!(field_match_score(&field, word_search("harbour"), &themes).is_some());
     // Negative controls: an unknown name, and a mere subsequence.
-    assert!(field_match_score(&field, "zebra", &themes).is_none());
-    assert!(field_match_score(&field, "nrd", &themes).is_none());
+    assert!(field_match_score(&field, word_search("zebra"), &themes).is_none());
+    assert!(field_match_score(&field, word_search("nrd"), &themes).is_none());
 
     let (mut runtime, instance, view) = setup();
     {
@@ -36983,7 +37328,9 @@ fn a_seeded_theme_filter_lists_what_its_text_lists() {
         let picker = state.choice_picker.as_ref().expect("a picker opened");
         let text = picker.filter_text().trim().to_lowercase();
         let typed: Vec<usize> = (0..picker.options.len())
-            .filter(|index| theme_choice_matches(&picker.options[*index], &text))
+            .filter(|index| {
+                theme_choice_matches(&picker.options[*index], &text, picker.filter_reach(&text))
+            })
             .collect();
         assert_eq!(
             picker.shown, typed,
@@ -37075,13 +37422,13 @@ fn a_search_finds_the_theme_rows_wherever_their_picker_seeds() {
         "harbour colour",
     ] {
         assert!(
-            field_match_score(&field, query, &themes).is_some(),
+            field_match_score(&field, word_search(query), &themes).is_some(),
             "{query:?} finds the theme rows"
         );
     }
     for query in ["nord light", "zebra theme", "ord theme"] {
         assert!(
-            field_match_score(&field, query, &themes).is_none(),
+            field_match_score(&field, word_search(query), &themes).is_none(),
             "{query:?} names no theme"
         );
     }
@@ -37317,6 +37664,16 @@ fn theme_written_by(
             .and_then(|edit| edit.value.clone()),
         _ => None,
     })
+}
+
+/// `text` as a search that reaches word hits only ([`MatchReach::Words`]):
+/// what one row of a search some setting word-matches answers to, for a test
+/// that asks about that row alone.
+fn word_search(text: &str) -> SearchQuery<'_> {
+    SearchQuery {
+        text,
+        reach: MatchReach::Words,
+    }
 }
 
 fn settings_state(runtime: &NativeRuntime, view: crate::native_app::ViewId) -> &SettingsViewState {
@@ -40401,7 +40758,7 @@ fn an_outside_change_takes_the_preview_from_the_chosen_style() {
         }
         let spec = cursor_styles_spec(&runtime, view);
         assert_eq!(spec.cursor.trail_style, PreviewTrailStyle::RainbowKitty);
-        assert!(!spec.style_trial);
+        assert!(spec.style_trial.is_none());
     }
 
     // A refused write: the chosen row lets go and the saved style shows.
@@ -40475,7 +40832,7 @@ fn a_tried_style_says_it_is_not_saved() {
         .dispatch(instance, view, AppEvent::FocusChanged(Some(dog.clone())))
         .unwrap();
     let spec = cursor_styles_spec(&runtime, view);
-    assert!(spec.style_trial);
+    assert_eq!(spec.style_trial, Some(StyleTrial::Keyboard));
     assert!(
         spec.semantic_value()
             .contains("trying Rainbow dog (not saved"),
@@ -40490,7 +40847,7 @@ fn a_tried_style_says_it_is_not_saved() {
         )
         .unwrap();
     let spec = cursor_styles_spec(&runtime, view);
-    assert!(!spec.style_trial, "the saved row is no trial");
+    assert!(spec.style_trial.is_none(), "the saved row is no trial");
     assert!(!spec.semantic_value().contains("not saved"));
     {
         let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
@@ -40498,17 +40855,157 @@ fn a_tried_style_says_it_is_not_saved() {
         };
         state.common.hovered = Some(dog);
     }
-    assert!(
+    assert_eq!(
         cursor_styles_spec(&runtime, view).style_trial,
+        Some(StyleTrial::Pointer),
         "the pointer tries too"
     );
     runtime
         .dispatch(instance, view, AppEvent::TextInput(TextInputEvent::Cancel))
         .unwrap();
     assert!(
-        !cursor_styles_spec(&runtime, view).style_trial,
+        cursor_styles_spec(&runtime, view).style_trial.is_none(),
         "Escape ends the trial"
     );
+}
+
+/// A TRIED STYLE'S HINT SAYS WHAT ITS GESTURE REALLY DOES (audit r14 PV8):
+/// Return activates the control with the keyboard, never the row under the
+/// pointer. With no focus, with focus on a button, or with the keyboard on
+/// another row, a style the pointer tries says "Click to save" (painted and
+/// spoken), never "Return"; the keyboard's own row says "Return to save" and
+/// the row Return would activate is the very style it shows; the preview's
+/// own control, keeping the style it was trying, offers no gesture, and
+/// Escape drops that kept style too.
+#[test]
+fn a_tried_styles_hint_says_what_its_gesture_does() {
+    let (mut runtime, instance, view) =
+        cursor_styles_runtime("cursor_trail_style = \"rainbow kitty pet\"\n");
+    compile_settings_view(&runtime, instance, view, &view_cx_at(1_024.0, 768.0));
+    let underline = UiKey::new(cursor_style_row_key("rainbow kitty underline"));
+    let dog = UiKey::new(cursor_style_row_key("rainbow dog pet"));
+    let painted = |spec: &SettingsPreviewSpec| {
+        let mut prims = Vec::new();
+        spec.paint(
+            &mut prims,
+            LogicalRect::new(0.0, 0.0, 900.0, 240.0),
+            aterm_render::Theme::default(),
+            crate::settings::Roles::from_theme(aterm_render::Theme::default()),
+        );
+        prims
+            .iter()
+            .filter_map(|prim| match prim {
+                crate::widget::DrawPrim::Text { s, .. } => Some(s.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join(" | ")
+    };
+    let set = |runtime: &mut NativeRuntime, hovered: Option<&UiKey>, focus: Option<UiKey>| {
+        let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+            unreachable!();
+        };
+        state.common.hovered = hovered.cloned();
+        state.common.last_focus = focus;
+    };
+    let pointer_cases = [
+        ("no focus", None),
+        ("a button focused", Some(UiKey::new("settings/back"))),
+        ("another row focused", Some(dog.clone())),
+    ];
+    for (case, focus) in pointer_cases {
+        set(&mut runtime, Some(&underline), focus);
+        let spec = cursor_styles_spec(&runtime, view);
+        assert_eq!(spec.style_trial, Some(StyleTrial::Pointer), "{case}");
+        let words = painted(&spec);
+        assert!(words.contains("Click to save"), "{case}: {words}");
+        assert!(!words.contains("Return"), "{case}: {words}");
+        let spoken = spec.semantic_value();
+        assert!(
+            spoken.contains("trying Rainbow underline (not saved; click saves"),
+            "{case}: {spoken}"
+        );
+        assert!(!spoken.contains("Return"), "{case}: {spoken}");
+    }
+
+    // The keyboard's row: Return activates exactly the row the preview shows.
+    set(&mut runtime, None, Some(dog.clone()));
+    let spec = cursor_styles_spec(&runtime, view);
+    assert_eq!(spec.style_trial, Some(StyleTrial::Keyboard));
+    assert_eq!(spec.cursor.trail_style_label(), "Rainbow dog");
+    assert!(painted(&spec).contains("Return to save"));
+    assert!(spec.semantic_value().contains("Return saves"));
+    {
+        let Some(AppViewState::Settings(state)) = runtime.view_state(view) else {
+            unreachable!();
+        };
+        let focused = state
+            .common
+            .last_focus
+            .as_ref()
+            .expect("a row has the keyboard");
+        assert_eq!(
+            cursor_style_for_row(state, focused.as_str()).as_deref(),
+            cursor_style_trial(state).as_deref(),
+            "Return's row is the style the hint offers to save"
+        );
+    }
+
+    // The preview's own control keeps the style and offers no gesture.
+    set(
+        &mut runtime,
+        None,
+        Some(UiKey::new("settings/preview/cursor-styles")),
+    );
+    let spec = cursor_styles_spec(&runtime, view);
+    assert_eq!(spec.style_trial, Some(StyleTrial::Kept));
+    let words = painted(&spec);
+    assert!(!words.contains("to save"), "{words}");
+    assert!(
+        spec.semantic_value()
+            .contains("(not saved; Escape goes back)")
+    );
+    runtime
+        .dispatch(instance, view, AppEvent::TextInput(TextInputEvent::Cancel))
+        .unwrap();
+    assert!(
+        cursor_styles_spec(&runtime, view).style_trial.is_none(),
+        "Escape drops the kept style"
+    );
+}
+
+/// A HOVER GOES WITH ITS PAGE (review of audit r14 PV8): a Cursor Styles row
+/// the pointer hovered stayed hovered after the keyboard went to another
+/// page, so coming back tried that style again, "Click to save", with
+/// nothing under the pointer. Another page drops the hover; the next motion
+/// resolves it on the page that shows. CONTROL: on the page, the hovered row
+/// is tried.
+#[test]
+fn a_hover_goes_with_its_page() {
+    let (mut runtime, instance, view) =
+        cursor_styles_runtime("cursor_trail_style = \"rainbow kitty pet\"\n");
+    compile_settings_view(&runtime, instance, view, &view_cx_at(1_024.0, 768.0));
+    let underline = UiKey::new(cursor_style_row_key("rainbow kitty underline"));
+    {
+        let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+            unreachable!();
+        };
+        state.common.hovered = Some(underline);
+    }
+    assert_eq!(
+        cursor_styles_spec(&runtime, view).style_trial,
+        Some(StyleTrial::Pointer),
+        "CONTROL: the hovered row is tried"
+    );
+    {
+        let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+            unreachable!();
+        };
+        state.navigate(SettingsRoute::Home);
+        state.navigate(SettingsRoute::CursorStyles);
+        assert_eq!(state.common.hovered, None, "the hover went with its page");
+    }
+    assert_eq!(cursor_styles_spec(&runtime, view).style_trial, None);
 }
 
 /// THE PREVIEW HEADER TAKES THE ROW'S OWN VERDICT: on a light theme the Bloom
@@ -41380,7 +41877,11 @@ fn a_short_choice_is_its_segments_at_every_width_and_text_size() {
 /// glyph on every redraw (about 1,900 strings for "e" at 150x48, the bulk of
 /// its render); laid out again with nothing changed, it now measures almost
 /// none, every word the UI face draws whole kept from the last layout
-/// ([`crate::tray_raster`]'s `MeasureMemo`).
+/// ([`crate::tray_raster`]'s `MeasureMemo`). What it measures again is only
+/// what reaches past the UI face, whose measure is never kept (a fallback
+/// face lands lazily): how much that is depends on the face — "▸", "①",
+/// "※" and the paragraphs that hold them, 10 strings in Cantarell, which
+/// maps none of the three — so the count of those is no bound here.
 #[test]
 fn a_search_laid_out_again_measures_only_what_is_new() {
     let cx = view_cx_at(1_074.0, 684.0);
@@ -41397,16 +41898,23 @@ fn a_search_laid_out_again_measures_only_what_is_new() {
         .unwrap();
     let first = compile_settings_view(&runtime, instance, view, &cx);
     let walks = crate::tray_raster::measure_walks();
+    let whole = crate::tray_raster::measure_walks_whole();
     let again = compile_settings_view(&runtime, instance, view, &cx);
     let measured = crate::tray_raster::measure_walks() - walks;
+    let whole = crate::tray_raster::measure_walks_whole() - whole;
     assert_eq!(
         again.semantics.len(),
         first.semantics.len(),
         "the same page"
     );
     assert!(
-        measured <= 8,
-        "laid out again it measured {measured} strings glyph by glyph"
+        crate::tray_raster::ui_font_of(crate::widget::TextFace::Ui).is_some(),
+        "a UI face lays the page out, so its words can be kept"
+    );
+    assert_eq!(
+        whole, 0,
+        "laid out again it measured {whole} strings the UI face draws whole glyph by glyph \
+         ({measured} in all)"
     );
 }
 
@@ -42527,4 +43035,197 @@ fn the_hdr_glow_row_says_the_preview_cannot_show_it() {
             );
         }
     }
+}
+
+/// A PREVIEW IS MEASURED AT THE WIDTH IT IS LAID OUT AT (audit r14 PV3/PV4):
+/// its header wraps to its width, so every height its host asks of it
+/// (its least, its whole rows) buys the lines that width needs only if the
+/// host names the width it really lays the preview out at. On every page
+/// that pins one, the Top cards in their list and their grid, an open choice
+/// picker's preview and a compact landscape page's tile, at 1x, 1.5x and 2x
+/// text, from a phone-width window to a wide one: the width each preview was
+/// measured at is its compiled rect's.
+#[test]
+fn every_preview_is_measured_at_the_width_it_is_laid_out_at() {
+    use crate::native_appearance::{AppearancePreferences, install_preferences};
+    let mut checked = 0;
+    let mut wrong = Vec::new();
+    for scale in [1.0_f32, 1.5, 2.0] {
+        let _ = install_preferences(AppearancePreferences {
+            text_scale: scale,
+            ..AppearancePreferences::default()
+        });
+        for (w, h) in [
+            (180.0_f32, 400.0_f32),
+            (286.5, 558.0),
+            (600.0, 520.0),
+            (700.0, 300.0),
+            (1100.0, 800.0),
+            (1400.0, 1200.0),
+        ] {
+            for route in SettingsRoute::ALL {
+                for picker in [
+                    None,
+                    Some(prefs::EDIT_THEME),
+                    Some(prefs::EDIT_CURSOR_TRAIL_STYLE),
+                ] {
+                    let (mut runtime, instance, view) = setup();
+                    runtime
+                        .dispatch(
+                            instance,
+                            view,
+                            AppEvent::Action(ActionInvocation {
+                                id: route_action(route),
+                                value: None,
+                            }),
+                        )
+                        .unwrap();
+                    let cx = view_cx_at(w, h);
+                    let _ = compile_settings_view(&runtime, instance, view, &cx);
+                    if let Some(key) = picker {
+                        let _ = runtime.dispatch(
+                            instance,
+                            view,
+                            AppEvent::Action(ActionInvocation {
+                                id: ActionId::new(format!("settings/set/{key}")),
+                                value: None,
+                            }),
+                        );
+                    }
+                    let compiled = compile_settings_view(&runtime, instance, view, &cx);
+                    for node in &compiled.paint {
+                        let UiContent::SettingsPreview(spec) = &node.content else {
+                            continue;
+                        };
+                        // The Themes demo has no header to wrap.
+                        if spec.scene == PreviewScene::ThemeDemo {
+                            continue;
+                        }
+                        checked += 1;
+                        if !spec
+                            .measure_width
+                            .is_some_and(|measured| (measured - node.rect.width).abs() < 0.5)
+                        {
+                            wrong.push(format!(
+                                "{scale}x {w}x{h} {route:?} picker {picker:?}: {} laid out {:.1} wide, measured at {:?}",
+                                node.key.as_str(),
+                                node.rect.width,
+                                spec.measure_width
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let _ = install_preferences(AppearancePreferences::default());
+    assert!(checked > 300, "{checked} previews");
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+/// A FONT THAT IS NOT FOUND IS SAID TO BE NOT FOUND EVERYWHERE AT ONCE
+/// (audit r14 PV11): two resolvers answer whether a family exists — the
+/// terminal's font generation (the row's "Not found") and the preview's font
+/// worker (the pill, the header's value) — and each surface used to read its
+/// own, so a frame showed "Not found" on the row beside a pill still saying
+/// "Loading font", or the reverse. Whichever answers first is the one
+/// verdict: the row's note, the header's state and value, and the pill
+/// agree in the same frame. NEGATIVE CONTROL: before either answers, all of
+/// them say the name is loading, none that it is not found.
+#[test]
+fn a_font_not_found_is_said_everywhere_in_the_same_frame() {
+    let family = "Fourth Missing Font";
+    let motion = crate::native_app::ViewMotionCx::default();
+    let fresh = || {
+        let service = VersionedConfigService::new(format!("font_family = \"{family}\"\n")).unwrap();
+        let mut state = SettingsViewState::from_snapshot(&service.snapshot()).unwrap();
+        state.navigate(SettingsRoute::TextFonts);
+        state.common.last_focus = Some(UiKey::new(format!(
+            "settings/control/{}",
+            prefs::EDIT_FONT_FAMILY
+        )));
+        state
+    };
+    let prepared = |state: &SettingsViewState, status: String, pending: bool| {
+        let mut prepared =
+            crate::tray_raster::PreparedSemanticFont::unavailable(preview_font_candidate(state));
+        prepared.snapshot.status = status;
+        prepared.snapshot.pending = pending;
+        prepared
+    };
+    let loading = |state: &SettingsViewState| {
+        prepared(
+            state,
+            format!("candidate renderer loading: regular {family:?}"),
+            true,
+        )
+    };
+    let unresolved = |state: &SettingsViewState| {
+        prepared(
+            state,
+            format!(
+                "candidate fallback active: unresolved regular {family:?}: {family:?} does not \
+                 resolve to a font file; requested regular {family:?}"
+            ),
+            false,
+        )
+    };
+    // What each surface says: the row's note, the header, the pill.
+    let surfaces = |state: &SettingsViewState, font: &crate::tray_raster::PreparedSemanticFont| {
+        let note = focused_row_idle_note(state, prefs::EDIT_FONT_FAMILY, motion);
+        let spec = renderer_preview_spec_for_key_with_font(
+            state,
+            prefs::EDIT_FONT_FAMILY,
+            0,
+            motion,
+            13.0,
+            1.0,
+            Some(font),
+        )
+        .expect("a text preview");
+        let runs = spec.text_runs(LogicalRect::new(0.0, 0.0, 720.0, 400.0));
+        let header = runs.first().map(|run| run.says.clone()).unwrap_or_default();
+        let pill = runs.get(1).map(|run| run.says.clone());
+        (note, header, pill)
+    };
+    let not_found = |(note, header, pill): (Option<String>, String, Option<String>)| {
+        assert_eq!(note.as_deref(), Some("Not found"), "the row");
+        assert_eq!(header, "Font: Current font · Not found", "the header");
+        assert_eq!(
+            pill.as_deref(),
+            Some(format!("Not found · Regular: {family}").as_str()),
+            "the pill"
+        );
+    };
+
+    // The terminal answered first; the preview's worker is still loading.
+    let mut state = fresh();
+    state.replace_font_refusals(
+        vec![crate::native_font_catalog::FontRefusal {
+            key: prefs::EDIT_FONT_FAMILY,
+            family: family.to_string(),
+            reason: crate::native_font_catalog::FontRefusalReason::NotFound,
+            from_theme: None,
+        }],
+        false,
+    );
+    let font = loading(&state);
+    state.observe_semantic_font(Some(&font));
+    not_found(surfaces(&state, &font));
+
+    // The preview's worker answered first; the terminal has not yet.
+    let state = fresh();
+    let font = unresolved(&state);
+    state.observe_semantic_font(Some(&font));
+    not_found(surfaces(&state, &font));
+
+    // NEGATIVE CONTROL: neither has answered.
+    let state = fresh();
+    let font = loading(&state);
+    state.observe_semantic_font(Some(&font));
+    let (note, header, pill) = surfaces(&state, &font);
+    assert_eq!(note, None, "the row is not refused yet");
+    assert!(header.starts_with(&format!("Font: {family}")), "{header}");
+    assert!(!header.contains("Not found"), "{header}");
+    assert_eq!(pill.as_deref(), Some("Loading font"));
 }

@@ -46,12 +46,14 @@ pub enum SelectionSide {
 }
 
 impl PartialOrd for SelectionSide {
+    #[inline]
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         Some(self.cmp(other))
     }
 }
 
 impl Ord for SelectionSide {
+    #[inline]
     fn cmp(&self, other: &Self) -> Ordering {
         match (self, other) {
             (SelectionSide::Left, SelectionSide::Right) => Ordering::Less,
@@ -70,7 +72,8 @@ impl Ord for SelectionSide {
 /// Column parameters use `usize` so both core (`u16` columns, promoted via `.into()`)
 /// and bridge (`usize` columns) can call without narrowing casts.
 #[inline]
-pub fn selection_contains_linear(
+#[must_use]
+pub const fn selection_contains_linear(
     row: i32,
     col: usize,
     start_row: i32,
@@ -101,7 +104,8 @@ pub fn selection_contains_linear(
 /// Column parameters use `usize` so both core (`u16` columns, promoted via `.into()`)
 /// and bridge (`usize` columns) can call without narrowing casts.
 #[inline]
-pub fn selection_contains_block(
+#[must_use]
+pub const fn selection_contains_block(
     row: i32,
     col: usize,
     start_row: i32,
@@ -109,10 +113,16 @@ pub fn selection_contains_block(
     end_row: i32,
     end_col: usize,
 ) -> bool {
-    let min_row = start_row.min(end_row);
-    let max_row = start_row.max(end_row);
-    let min_col = start_col.min(end_col);
-    let max_col = start_col.max(end_col);
+    let (min_row, max_row) = if start_row <= end_row {
+        (start_row, end_row)
+    } else {
+        (end_row, start_row)
+    };
+    let (min_col, max_col) = if start_col <= end_col {
+        (start_col, end_col)
+    } else {
+        (end_col, start_col)
+    };
     row >= min_row && row <= max_row && col >= min_col && col <= max_col
 }
 

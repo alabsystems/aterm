@@ -713,7 +713,9 @@ impl<C: Ctl> Session<'_, C> {
 
     /// A POINT BEFORE ANY PROMPT SINCE A LAUNCH WITH NOTHING KEYED SINCE (P3
     /// of `docs/measured/forever-lab-2026-10-20.md`): this loop is the
-    /// session's first ([`Self::first_books`]), it has judged no point, the
+    /// session's first ([`Self::first_books`]) or the agent's process was
+    /// launched after the newest row of the books it found
+    /// ([`Self::books_last_ms`]), it has judged no point, the
     /// screen `r` holds nothing of a conversation
     /// ([`TurnEndReading::holds_no_conversation`]: no message, no reply, no
     /// draft, no wall, no turn read running since), and the host saw the
@@ -734,12 +736,42 @@ impl<C: Ctl> Session<'_, C> {
     /// it reads. A SUCCESSOR (a relaunch's loop, a fault restart's, a
     /// reopened tab's, one started as Off lifted) has books: its first point
     /// is its seeds' to judge (the landing it takes up, the land act it
-    /// finds taken), never read away here.
+    /// finds taken), never read away here — while the agent's process is
+    /// one those books were kept over, launched before their newest row.
+    /// A PROCESS LAUNCHED SINCE THAT ROW is one no loop before this one
+    /// watched (a person quit the agent and started it again in the tab; a
+    /// relaunch no row of the books follows): nothing of the conversation
+    /// the books judged stands on a screen that holds none, so its first
+    /// point is a launch's, under the same premises, and the turn the books
+    /// read running is the old process's ([`Self::launched_since_books`],
+    /// [`TurnEndState::launched_since_books`]). Before (P3's still-open
+    /// case), such a loop read its first frame as the end of the books'
+    /// turn or the point they left: a short turn more, the first reply's
+    /// back-off a step late. The seeds that first point takes are dropped
+    /// there, as a frame that holds nothing never matched them (no landing's
+    /// words, no act's answer); the streak the books left is lengthened by
+    /// the first reply, as any successor's is.
     fn unasked_launch(&self, r: &TurnEndReading, host: Option<&Arc<dyn IdleHost>>) -> bool {
-        self.first_books
+        (self.first_books || self.books_last_ms.is_some())
             && self.turn_end.point_number().is_none()
             && r.holds_no_conversation()
-            && host.is_some_and(|h| h.launch().is_some())
+            && if self.first_books {
+                host.is_some_and(|h| h.launch().is_some())
+            } else {
+                self.launched_since_books(host)
+            }
+    }
+
+    /// THE AGENT'S PROCESS WAS LAUNCHED SINCE THE NEWEST ROW OF THE BOOKS
+    /// THIS LOOP FOUND ([`Self::books_last_ms`], [`IdleHost::launch`] past
+    /// it): no loop before this one watched it. `false` for a first loop
+    /// (it found no books), with no row or no launch seen.
+    fn launched_since_books(&self, host: Option<&Arc<dyn IdleHost>>) -> bool {
+        !self.first_books
+            && self.books_last_ms.is_some_and(|last| {
+                host.and_then(|h| h.launch())
+                    .is_some_and(|launched| launched > last)
+            })
     }
 
     fn turn_end_reading_as(
@@ -1040,11 +1072,14 @@ impl<C: Ctl> Session<'_, C> {
             login_superseded,
             login_method,
             login_shared,
-            // The screen's launch card, or the host's record of whose turns
-            // the conversation holds (the harness's own are no task), or a
-            // first loop's screen holding nothing since a launch the host saw
-            // with nothing keyed since ([`Self::unasked_launch`]).
-            taskless: r.taskless
+            // The screen's launch card — save the conversation the point
+            // judged last held, redrawn with nothing submitted since
+            // ([`TurnEndState::redrawn_fresh`]: a re-wrap its reader took
+            // for a launch card) — or the host's record of whose turns the
+            // conversation holds (the harness's own are no task), or a first
+            // loop's screen holding nothing since a launch the host saw with
+            // nothing keyed since ([`Self::unasked_launch`]).
+            taskless: (r.taskless && !self.turn_end.redrawn_fresh(screen.submits))
                 || host.is_some_and(|h| h.taskless())
                 || self.unasked_launch(&r, host),
             // …and whether that record says the task is finished, read at the
@@ -1063,6 +1098,9 @@ impl<C: Ctl> Session<'_, C> {
             // on named, kept from the read that saw it, and a notice that
             // stands without being drawn ([`Self::note_credits`]).
             credits: self.credits_carry(reader.credits(&screen.rows).as_ref()),
+            // The session's submissions as the host counted them after these
+            // rows ([`TurnEndReading::submits`]).
+            submits: screen.submits,
             ..r
         };
         // …and, where it was read, while an act of the policy's stands
@@ -1133,6 +1171,10 @@ impl<C: Ctl> Session<'_, C> {
                 if !reading.said_cut {
                     reading.said_tail = reader.said_tail(&rows);
                     reading.turn_said = reader.turn_said_before(&rows);
+                    // Words read up to the turn's start open on no message
+                    // ([`TurnEndReading::opens_cut`]); read to the history's
+                    // first row short of it, they still may.
+                    reading.opens_cut = !reader.bounds_messages() && !reader.turn_whole(&rows);
                     // The message that opened the turn, read with it
                     // ([`TurnEndReading::opened_by`]).
                     if let Some(opened) = reader.turn_opened_by(&rows) {
@@ -1569,34 +1611,47 @@ impl<C: Ctl> Session<'_, C> {
     /// where they cannot be read — the grid no longer the screen's, the head
     /// further up than the history is looked through, a request not served
     /// — and the words stay cut.
+    ///
+    /// The last message on them is BOUNDED BY ITS CELLS as the screen's is
+    /// ([`Self::message_bounded_by_cells`]): on the grid read here, a
+    /// message above a tail's rows (whose read could not reach its caret
+    /// row: the review of 3a4586a01e, R1), and with the history above, a
+    /// message whose caret row scrolled up out of the grid
+    /// ([`Self::rows_bounded_by_cells`], T1) — else agy's person's later
+    /// paragraphs read as its reply, and their `NEEDS YOU:` as its need.
     fn said_read_whole(
         &mut self,
         screen: &Screen,
         reader: &'static dyn ScreenReader,
         turn: bool,
     ) -> Option<Vec<String>> {
-        // The screen read from its first row is the whole grid already (the
-        // history read checks it still is); else the grid is read.
-        let whole = if screen.first == 0 {
-            screen.rows.clone()
+        let read = |rows: &[String]| {
+            if turn {
+                reader.turn_whole(rows)
+            } else {
+                reader.said_whole(rows)
+            }
+        };
+        // The screen read from its first row is the whole grid already, its
+        // message bounded by its cells by its read (`Session::read_once`),
+        // and the rows it was read as are what the history read holds
+        // against the grid read again; else the grid is read, and bounded.
+        let (grid, bounded) = if screen.first == 0 {
+            (self.rows_as_read(screen), screen.rows.clone())
         } else {
             let whole = self.grid().ok()?;
-            let same = whole
-                .rows
-                .get(screen.first..)
-                .is_some_and(|rows| super::wall_confirm::same_rows(rows, &screen.rows));
-            if !same {
+            let bounded = self.message_bounded_by_cells(whole.clone(), Some(reader));
+            let same = |rows: &[String]| {
+                rows.get(screen.first..)
+                    .is_some_and(|rows| super::wall_confirm::same_rows(rows, &screen.rows))
+            };
+            if !same(&whole.rows) && !same(&bounded.rows) {
                 return None;
             }
-            whole.rows
+            (whole.rows, bounded.rows)
         };
-        let read = if turn {
-            reader.turn_whole(&whole)
-        } else {
-            reader.said_whole(&whole)
-        };
-        if read {
-            return Some(whole);
+        if read(&bounded) {
+            return Some(bounded);
         }
         let stop = |r: &str| {
             if turn {
@@ -1605,9 +1660,10 @@ impl<C: Ctl> Session<'_, C> {
                 reader.said_history_stop(r)
             }
         };
-        let mut joined = self.rows_up_to(&whole, &stop).ok().flatten()?;
-        joined.extend(whole);
-        Some(joined)
+        let (mut joined, first) = self.rows_up_to_at(&grid, &stop).ok().flatten()?;
+        let abs = first.and_then(|f| f.checked_sub(u64::try_from(joined.len()).ok()?));
+        joined.extend(grid);
+        Some(self.rows_bounded_by_cells(joined, reader, abs))
     }
 
     /// WHAT THE SESSION'S REPOSITORY HOLDS THAT NO REMOTE MAIN HAS, at a
@@ -1964,6 +2020,15 @@ impl<C: Ctl> Session<'_, C> {
         // what Claude Code's done row says (the reading takes the larger of
         // the two, as for the loop that read it running), none where no done
         // row says — never a point no read saw run.
+        // …save where the agent's process was launched since the books' last
+        // row ([`Self::launched_since_books`]): that turn was the old
+        // process's, and no end of it stands on the new one's screen.
+        if worked.is_none()
+            && self.turn_end.point_number().is_none()
+            && self.launched_since_books(opts.idle_host.as_ref())
+        {
+            self.turn_end.launched_since_books();
+        }
         let worked = worked.or_else(|| self.turn_end.take_gap().then_some(Duration::ZERO));
         // THE TURN AN ACT NO READ SAW TAKEN RAN, ended here
         // ([`Self::unseen_act_work`]): its work Claude Code's done row.

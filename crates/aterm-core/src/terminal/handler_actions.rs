@@ -665,12 +665,14 @@ impl TerminalHandler<'_> {
 
     /// Whether this session can read a transmission over `medium`: direct always, the others
     /// only with the host's opt-in resolver.
+    #[inline]
     fn kitty_medium_works(&self, medium: KittyMedium) -> bool {
         medium == KittyMedium::Direct || self.kitty_file_resolver.is_some()
     }
 
     /// The image id a command addresses: its `i=`, else the id of the newest
     /// image transmitted under its `I=` number.
+    #[inline]
     fn resolve_kitty_id(&self, cmd: &KittyCommand) -> Option<u32> {
         cmd.id.or_else(|| {
             cmd.number
@@ -974,6 +976,7 @@ impl TerminalHandler<'_> {
 
     /// The next Kitty serial: placements and images first transmitted share
     /// one count, so each orders by when it happened.
+    #[inline]
     fn next_kitty_serial(&mut self) -> NonZeroU32 {
         let serial = self.transient.kitty_serial.wrapping_add(1).max(1);
         self.transient.kitty_serial = serial;
@@ -983,6 +986,7 @@ impl TerminalHandler<'_> {
     /// A fresh tag for one placement act of image `image_id` under
     /// `placement_id`. An image the store does not hold (an anonymous
     /// `a=T`) is first transmitted now.
+    #[inline]
     fn next_kitty_tag(&mut self, image_id: u32, placement_id: u32) -> KittyPlacementTag {
         let image_serial = match self.transient.kitty_frames.get(&image_id) {
             Some(animation) => animation.image_serial,
@@ -1663,12 +1667,14 @@ impl TerminalHandler<'_> {
     }
 
     /// Whether any visible cell still shows a placement of image `id`.
+    #[inline]
     fn kitty_image_on_screen(&self, id: u32) -> bool {
         self.kitty_tags_on_screen().any(|tag| tag.image_id == id)
     }
 
     /// Whether image `id` has a placement left: on screen, virtual, or
     /// floating.
+    #[inline]
     fn kitty_image_placed(&self, id: u32) -> bool {
         self.transient.kitty_virtual.contains_key(&id)
             || self.kitty_image_floating(id)
@@ -1676,6 +1682,7 @@ impl TerminalHandler<'_> {
     }
 
     /// Whether image `id` has a floating placement.
+    #[inline]
     fn kitty_image_floating(&self, id: u32) -> bool {
         self.transient
             .kitty_floating
@@ -2623,6 +2630,7 @@ struct KittyLayout {
 
 impl KittyLayout {
     /// The layout `image` has.
+    #[inline]
     const fn of(image: &ImageData) -> Self {
         Self {
             cols: image.cols,
@@ -2635,6 +2643,7 @@ impl KittyLayout {
     }
 
     /// The image of `bytes` in `format`, with this layout.
+    #[inline]
     fn image(self, bytes: Vec<u8>, format: ImageFormat) -> ImageData {
         ImageData {
             bytes,
@@ -2686,11 +2695,13 @@ fn kitty_rgba(frame: &ImageData) -> Result<KittyRgba<'_>, &'static str> {
 }
 
 /// A raw RGBA8 frame of `width × height` pixels, laid out as `like`.
+#[inline]
 fn raw_frame(bytes: Vec<u8>, width: u16, height: u16, like: &ImageData) -> ImageData {
     KittyLayout::of(like).image(bytes, ImageFormat::RawRgba8 { width, height })
 }
 
 /// Push `id` onto `ids` unless it is there already.
+#[inline]
 fn push_unique(ids: &mut Vec<u32>, id: u32) {
     if !ids.contains(&id) {
         ids.push(id);
@@ -2762,6 +2773,7 @@ fn kitty_payload_held(t: &TransientState, id: u32) -> usize {
 /// `live_image_charge`: a placement on either grid may still show them (the
 /// store's checks see only the active grid), and from now on they count
 /// against that screen's `MAX_LIVE_IMAGE_BYTES`.
+#[inline]
 fn charge_released_kitty(t: &mut TransientState, bytes: usize) {
     for charge in &mut t.live_image_charge {
         *charge = charge.saturating_add(bytes);
@@ -2770,6 +2782,7 @@ fn charge_released_kitty(t: &mut TransientState, bytes: usize) {
 
 /// The pixel size of a stored Kitty raster (the store holds PNG and raw RGBA
 /// only).
+#[inline]
 fn raster_size(image: &ImageData) -> Option<(u32, u32)> {
     match image.format {
         ImageFormat::RawRgba8 { width, height } => Some((u32::from(width), u32::from(height))),

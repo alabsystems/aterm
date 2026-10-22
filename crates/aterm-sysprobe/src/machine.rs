@@ -818,8 +818,8 @@ pub fn memory_detail() -> Option<MemoryDetail> {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct GpuReading {
     /// `PerformanceStatistics` "Device Utilization %" (Linux amdgpu's
-    /// `gpu_busy_percent`), at most 100; `None` with [`unread`](Self::unread)
-    /// saying why.
+    /// `gpu_busy_percent`, NVIDIA's NVML utilization), at most 100; `None`
+    /// with [`unread`](Self::unread) saying why.
     pub device_pct: Option<u8>,
     /// "Renderer Utilization %", at most 100.
     pub renderer_pct: Option<u8>,
@@ -836,7 +836,7 @@ pub struct GpuReading {
     /// `gpu-core-count` on the accelerator entry, where present.
     pub cores: Option<u16>,
     /// The accelerator's `model` (`"Apple M5"`), else its IOKit class name;
-    /// on Linux the DRM driver's name (`amdgpu`, `i915`).
+    /// on Linux the DRM driver's name (`amdgpu`, `i915`, `nvidia`).
     pub name: Option<String>,
     /// Why [`device_pct`](Self::device_pct) is `None`: the device sleeps
     /// ([`Why::Asleep`], known idle and not woken), its driver publishes no
@@ -863,8 +863,11 @@ pub(crate) fn percent_of(value: i64) -> Option<u8> {
 /// * **Linux**: the DRM cards in `/sys/class/drm` ([`crate::linux::Root::gpu`]):
 ///   a card's `power/runtime_status` first (a suspended one is
 ///   [`Why::Asleep`] and never read, so never woken), then amdgpu's
-///   `gpu_busy_percent`; i915 and xe publish none without `CAP_PERFMON`,
-///   NVIDIA's driver none outside NVML, and the rest none at all.
+///   `gpu_busy_percent` or, for NVIDIA's proprietary driver, NVML's
+///   utilization (`libnvidia-ml.so.1`, opened and initialised once per
+///   process on the first ask), each only where the read cannot keep a
+///   runtime-PM card awake; i915 and xe publish none without
+///   `CAP_PERFMON`, and the rest none at all.
 /// * **Windows**: `None` — the public source, PDH's `GPU Engine` counters,
 ///   expands one instance per engine per process and costs more per read
 ///   than the whole sampler ([`crate::caps`] says `not_read`).

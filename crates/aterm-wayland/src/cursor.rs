@@ -44,7 +44,8 @@ impl Icon {
     ];
 
     /// Its cursor-shape-v1 shape.
-    pub fn shape(self) -> u32 {
+    #[inline]
+    pub const fn shape(self) -> u32 {
         match self {
             Icon::Default => shape::DEFAULT,
             Icon::Pointer => shape::POINTER,
@@ -56,7 +57,8 @@ impl Icon {
     }
 
     /// Its theme names, the CSS name first.
-    pub fn names(self) -> &'static [&'static CStr] {
+    #[inline]
+    pub const fn names(self) -> &'static [&'static CStr] {
         match self {
             Icon::Default => &[
                 c"default",
@@ -177,6 +179,7 @@ impl Theme {
     }
 
     /// The first frame of `icon`, under the first of its names the theme has.
+    #[inline]
     pub fn frame(&self, icon: Icon) -> Option<Frame> {
         self.frame_named(icon.names())
     }

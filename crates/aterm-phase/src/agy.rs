@@ -27,25 +27,30 @@
 //!
 //! **A MESSAGE'S BLANK LINE** is drawn as a blank row, the message's rows
 //! under it two columns in, as a reply's (measured in the lab 2026-10-21,
-//! [`fixtures::lab::WORKER_FIRST_PROMPT`]): nothing on the screen tells it
+//! [`fixtures::lab::WORKER_FIRST_PROMPT`]): nothing in the TEXT tells it
 //! from the blank row that ends a message, so the rows past it read as the
-//! reply ([`said_tail`]). The fixtures show no other mark either: a message's
-//! continuation rows and a reply's both sit two columns in, and no measured
-//! screen records the cells of a message's continuation rows (the one
-//! colour noted is the sent prompt's first row, bold `5c5cff` behind `> `).
-//! A single line break draws the next row of the same message, no blank row
-//! between (measured, `l15a2`). So NOTHING ATERM TYPES INTO AGY HOLDS A
-//! BLANK LINE: every act the harness types goes as one line (the control
-//! wire frames a request per line; `aterm_agent::supervise`'s act executor
-//! makes an owner's text of two paragraphs one), and a worker's first
-//! prompt, written to a file agy reads, drops its blank lines
-//! ([`crate::ScreenReader::bounds_messages`] is `false` here alone):
-//! aterm's own words are read back as nobody's reply, and no `NEEDS YOU:`
-//! or `Nothing left:` in them as agy's need or defense. A message aterm did
-//! not type — a person's own, typed or pasted, or raw bytes a driver sends
-//! (`send`, `paste --stdin`) — that holds a blank line still reads its later
-//! paragraphs as the reply; telling them apart needs a mark the screen draws
-//! for them (UNMEASURED: the cells of a message's continuation rows).
+//! reply ([`said_tail`]). A single line break draws the next row of the
+//! same message, no blank row between (measured, `l15a2`). So nothing aterm
+//! types into agy holds a blank line: every act the harness types goes as
+//! one line (the control wire frames a request per line;
+//! `aterm_agent::supervise`'s act executor makes an owner's text of two
+//! paragraphs one), and a worker's first prompt, written to a file agy
+//! reads, drops its blank lines ([`crate::ScreenReader::bounds_messages`]
+//! is `false` here alone): aterm's own words are read back as nobody's
+//! reply, and no `NEEDS YOU:` or `Nothing left:` in them as agy's need or
+//! defense. A message aterm did not type — a person's own, typed or pasted,
+//! or raw bytes a driver sends — is BOUNDED BY ITS CELLS (MEASURED in the
+//! lab 2026-10-21, [`fixtures::lab::PERSON_PARAGRAPHS`] and
+//! [`fixtures::lab::PERSON_PARAGRAPHS_LONG_REPLY`], the cells in each
+//! file's line 1): agy draws every row of a sent message from column 0 in
+//! its caret row's style — `5c5cff` bold on its default theme, the person's
+//! message and aterm's act alike — its blank rows among them, while the
+//! blank row that ends it and every row of the reply, blank ones too, are
+//! plain (`d0d0d0`, no attribute; the composer's caret is `5c5cff` with
+//! none, a draft's text plain). The text names the rows to read
+//! ([`message_blanks`]); a reader of the cells takes the blank rows drawn
+//! in the caret row's style out of the message ([`fold_message`]) before
+//! any reading, and the message's paragraphs are never agy's reply.
 //!
 //! **THE EMPTY COMPOSER** draws no placeholder (measured) — but while a
 //! permission mode is on (shift+tab cycles them) it draws the mode's hint
@@ -643,6 +648,55 @@ pub fn composer_draft(rows: &[String]) -> Option<(usize, Vec<String>)> {
 /// The last person's message above the composer's top rule.
 fn last_user(rows: &[String], top: usize) -> Option<usize> {
     (1..top).rev().find(|&i| is_user_row(rows, i))
+}
+
+/// THE ROWS WHOSE CELLS BOUND THE LAST MESSAGE (module header's A
+/// MESSAGE'S BLANK LINE): `(its caret row, the blank rows under it that have
+/// words under them above the composer's top rule, top down)`. Each blank
+/// row is the message's own where its column-0 cell is drawn in the caret
+/// row's style; the first that is not ends the message, and the rows under
+/// it are the reply. `None` with no composer, while a turn runs, with no
+/// message on `rows` (its caret row under its rule, [`is_user_row`]), and
+/// with no blank row under it that words follow.
+#[must_use]
+pub fn message_blanks(rows: &[String]) -> Option<(usize, Vec<usize>)> {
+    let f = frame(rows)?;
+    if spinning(rows, f.top) {
+        return None;
+    }
+    let user = last_user(rows, f.top)?;
+    let last = (user + 1..f.top).rev().find(|&i| !blank(&rows[i]))?;
+    let blanks: Vec<usize> = (user + 1..last).filter(|&i| blank(&rows[i])).collect();
+    (!blanks.is_empty()).then_some((user, blanks))
+}
+
+/// THE LAST MESSAGE BOUNDED BY ITS CELLS (module header): `rows` with the
+/// blank rows `inner` of the message whose caret row is `caret` — those of
+/// [`message_blanks`] a read of the cells found drawn in the caret row's
+/// style — taken out, and as many empty rows put above the rule over the
+/// message. Its rows then meet, the blank row that ends it is the first
+/// under them, and that row and every row under it (the reply, the
+/// composer, the footer) keep their index; the rows above the rule keep
+/// theirs too. `rows` as they are where `inner` names no blank row under
+/// `caret`, or `caret` is no message's.
+#[must_use]
+pub fn fold_message(rows: &[String], caret: usize, inner: &[usize]) -> Vec<String> {
+    let folds = |i: usize| i > caret && inner.contains(&i) && blank(&rows[i]);
+    if !is_user_row(rows, caret) || !(caret + 1..rows.len()).any(folds) {
+        return rows.to_vec();
+    }
+    let n = (caret + 1..rows.len()).filter(|&i| folds(i)).count();
+    let mut out = Vec::with_capacity(rows.len());
+    out.extend(rows[..caret - 1].iter().cloned());
+    out.extend(std::iter::repeat_n(String::new(), n));
+    out.extend(
+        rows.iter()
+            .enumerate()
+            .skip(caret - 1)
+            .filter(|&(i, _)| !folds(i))
+            .map(|(_, r)| r.clone()),
+    );
+    out
 }
 
 /// Whether a turn runs: a spinner row among the turn's rows above the
@@ -2141,6 +2195,22 @@ pub mod fixtures {
         /// LINE).
         pub const WORKER_FIRST_PROMPT: &str =
             include_str!("fixtures/agy-1.4.0-lab-worker-first-prompt.txt");
+        /// A person's message of three paragraphs (a line break, then a
+        /// blank line, each later one opening `NEEDS YOU:`) sent through
+        /// `send`/`key as=person`, the stub's reply under it, then the
+        /// harness's Cruise act and its reply: the message's blank line a
+        /// blank row like the one that ends it. Its cells (line 1) tell
+        /// them apart: the message's rows, that blank row among them,
+        /// `5c5cff` bold from column 0; the blank row under it plain.
+        pub const PERSON_PARAGRAPHS: &str =
+            include_str!("fixtures/agy-1.4.0-lab-person-paragraphs.txt");
+        /// A later screen of the same session: a second person's message of
+        /// two paragraphs (a blank line between, the second `NEEDS YOU:`)
+        /// under the stub's long reply of three paragraphs, blank rows
+        /// between them; its cells in `aterm-agent`'s
+        /// `supervise/fixtures/agy-1.4.0-lab-person-paragraphs-long-reply.cells`.
+        pub const PERSON_PARAGRAPHS_LONG_REPLY: &str =
+            include_str!("fixtures/agy-1.4.0-lab-person-paragraphs-long-reply.txt");
         /// The pane at 50 columns: a reply of two paragraphs, the second
         /// wrapped over three rows at column two, two cells short of the
         /// pane's edge, its last `or 2)?`.

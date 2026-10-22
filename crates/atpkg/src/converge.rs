@@ -45,6 +45,11 @@ pub const STUBS: &str = "base.pkg.stubs";
 pub const REROUTE: &str = "base.pkg.reroute";
 /// (4) A bin/ shim, `@<name>`: essential when its target is gone.
 pub const SHIMS: &str = "base.pkg.shims";
+/// (4b) The exposed names an active build was refused a shim (design S13): one row, or
+/// `@<program>` for each program the record names.
+pub const REFUSED: &str = "base.pkg.refused";
+/// (4) A shim an older atpkg laid under a name no shim may carry now, `@<name>`.
+pub const REFUSED_SHIM: &str = "base.pkg.refused.shim";
 /// (5) The active builds' store trees; `@<program>` for one that is missing or incomplete.
 pub const STORE: &str = "base.pkg.store";
 /// (5c) A solver the trust bundle pins privately, `@<program>`.
@@ -85,6 +90,8 @@ pub const DISK: &str = "base.pkg.disk";
 pub const DEVTOOLS: &str = "base.privacy.devtools";
 /// (7c) Universal Control.
 pub const UNIVERSAL_CONTROL: &str = "base.machine.universal-control";
+/// (7d) Rosetta 2, on Apple silicon.
+pub const ROSETTA: &str = "base.machine.rosetta";
 /// (8) The last completed update pass.
 pub const INDEX_AGE: &str = "base.pkg.index-age";
 /// (8) Whether the signed index has been reached lately.

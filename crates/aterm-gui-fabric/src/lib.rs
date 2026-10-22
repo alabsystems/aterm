@@ -498,24 +498,28 @@ pub const FABRIC_EVENT_KINDS: &[&str] = &[
 ];
 
 /// The `events` wire name for a timeline record kind the fabric wrote, or `None`.
+#[inline]
 pub fn fabric_event_wire_kind(kind: &str) -> Option<&'static str> {
     FABRIC_EVENT_KINDS.iter().copied().find(|k| *k == kind)
 }
 
 /// Return `true` iff a decoded message body length is within [`BODY_MAX`] (`256 KiB`).
 #[must_use]
+#[inline]
 pub const fn is_within_body_max(len: usize) -> bool {
     len <= BODY_MAX
 }
 
 /// Return `true` iff an inline `post` text length is within [`POST_INLINE_MAX`] (`4 KiB`).
 #[must_use]
+#[inline]
 pub const fn is_within_post_inline_max(len: usize) -> bool {
     len <= POST_INLINE_MAX
 }
 
 /// Return `true` iff a peer with `unlisted_from_peer` unlisted inbox rows has room under [`SENDER_QUOTA`].
 #[must_use]
+#[inline]
 pub const fn sender_within_quota(unlisted_from_peer: usize) -> bool {
     unlisted_from_peer < SENDER_QUOTA
 }
@@ -523,6 +527,7 @@ pub const fn sender_within_quota(unlisted_from_peer: usize) -> bool {
 /// Return `true` iff adding `add_bytes` to an outbox with `(queued_posts, queued_bytes)` stays within
 /// [`OUTBOX_CAP`], [`BODY_MAX`], and [`OUTBOX_BYTES_MAX`].
 #[must_use]
+#[inline]
 pub const fn outbox_has_room(queued_posts: usize, queued_bytes: usize, add_bytes: usize) -> bool {
     queued_posts < OUTBOX_CAP
         && add_bytes <= BODY_MAX
@@ -531,6 +536,7 @@ pub const fn outbox_has_room(queued_posts: usize, queued_bytes: usize, add_bytes
 
 /// Encode `(seen_id, listed_id)` inbox watermarks into 16 little-endian bytes.
 #[must_use]
+#[inline]
 pub const fn encode_fabric_watermarks_le(seen_id: u64, listed_id: u64) -> [u8; 16] {
     [
         seen_id as u8,
@@ -554,6 +560,7 @@ pub const fn encode_fabric_watermarks_le(seen_id: u64, listed_id: u64) -> [u8; 1
 
 /// Decode 16 little-endian bytes into `(seen_id, listed_id)` inbox watermarks.
 #[must_use]
+#[inline]
 pub const fn decode_fabric_watermarks_le(bytes: [u8; 16]) -> (u64, u64) {
     let seen_id = (bytes[0] as u64)
         | ((bytes[1] as u64) << 8)
@@ -746,6 +753,7 @@ impl InboxRow {
     /// Whether this row's sender is a HUMAN principal. Eviction never drops one of
     /// these ahead of an agent's row: a burst from a peer must not be able to push
     /// out the one message a person sent.
+    #[inline]
     fn is_human(&self) -> bool {
         self.from.starts_with("h-")
     }
@@ -755,6 +763,7 @@ impl InboxRow {
 /// `<src>` segment carries: `h-` a human, `s-` another session's agent, `a-` a
 /// service. Anything else is `other`, which `from=` can still name — a filter
 /// never silently matches nothing it did not ask for.
+#[inline]
 pub fn sender_class(from: &str) -> &'static str {
     if from.starts_with("h-") {
         "human"

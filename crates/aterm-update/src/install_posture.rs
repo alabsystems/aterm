@@ -25,8 +25,9 @@ pub enum InstallPosture {
 
 impl InstallPosture {
     /// One line, in the user's terms. No trailing period: callers put it in a sentence.
+    #[inline]
     #[must_use]
-    pub fn summary(self) -> &'static str {
+    pub const fn summary(self) -> &'static str {
         match self {
             Self::Installed => "aterm is installed and can keep itself up to date",
             Self::MountedImage => "aterm is running from a mounted volume, not from Applications",
@@ -40,8 +41,9 @@ impl InstallPosture {
 
     /// What the person should do, or `None` when there is nothing to fix. It names both
     /// consequences, which are otherwise invisible: no self-update and no `aterm` on PATH.
+    #[inline]
     #[must_use]
-    pub fn remedy(self) -> Option<&'static str> {
+    pub const fn remedy(self) -> Option<&'static str> {
         match self {
             Self::Installed | Self::NotABundle => None,
             Self::MountedImage => Some(

@@ -36,6 +36,20 @@
 //! first, gets its share of what is left, its head line alone when its share
 //! holds no more, and the sessions past the budget are `more=sessions:<k>`.
 //!
+//! THE MACHINE FORM (`--json`, session log Phase 6 step 6E-6): the same
+//! fold as ONE JSON object, its `sessions` one object per session, newest
+//! first, in a closed schema of ids, closed words and counts only —
+//! `node`, `sid` (the session's face, as the bus names it), `this` (whether
+//! the node is the one this host's state dir names), `ep`, `need` (the most
+//! urgent observed need's word, `brief`'s own, or null) and its `detail`
+//! (a wall's reset, a failure's exit code, or null), `open` (the open
+//! path's `level` and `kind`, run first), `mail_in` and `mail_out`,
+//! `last_seq`, `age_s` (how old the fold's newest record is, or null) and
+//! `partial` (the `why=` words). Like the text, it prints no host or content
+//! field: the bus never carried one. It is held to the same `--budget`: each
+//! session's object counts its tokens, and the sessions past the budget are
+//! `more`. The Overview's "On the fabric" group reads it (step 6E-7).
+//!
 //! A session without its close is `partial why=node-gone` (ruling Q4) when
 //! its node's presence ended (`state=gone`, its will) or its own presence
 //! row is an earlier incarnation's than the node's live one (a crash or a
@@ -50,11 +64,13 @@
 
 use std::collections::BTreeMap;
 use std::io;
+use std::path::Path;
 use std::process::ExitCode;
 
 use aterm_slog::bus::BusSpace;
 
 use crate::bridge::Config;
+use crate::fabric::J;
 use crate::render::safe;
 use crate::transport;
 
@@ -82,6 +98,8 @@ pub struct BriefOpts {
     pub budget: Option<usize>,
     /// `--cap-file <path>`: read under these caps instead of the node's.
     pub cap_files: Vec<String>,
+    /// `--json`: the machine form (the module doc).
+    pub json: bool,
 }
 
 impl BriefOpts {
@@ -119,6 +137,7 @@ impl BriefOpts {
                     o.budget = Some(n);
                 }
                 "--cap-file" => o.cap_files.push(value()?),
+                "--json" => o.json = true,
                 at if at.starts_with('@') && o.sid.is_none() => {
                     let mut parts = at[1..].splitn(2, '@');
                     let sid = parts.next().unwrap_or_default();
@@ -342,17 +361,47 @@ fn gone_without_close(r: &Read, node: &str, s: &Session) -> Option<&'static str>
     (s.presence.as_deref() == Some("live") && earlier).then_some("node-gone")
 }
 
-/// The brief's text: a header, then each session's lines, newest first.
-fn render(cfg: &Config, opts: &BriefOpts, r: &Read, now_ms: u64) -> String {
-    let budget = opts.budget.unwrap_or(BUDGET_DEFAULT);
-    let mut shown: Vec<(&(String, String), &Session)> = r
+/// One session the read holds, by its `(node, sid)`.
+type Held<'a> = (&'a (String, String), &'a Session);
+
+/// The sessions a brief shows, newest first: every one the read holds a
+/// seq space of, at most [`SESSIONS_MAX`]; the rest's count beside them.
+fn shown(r: &Read) -> (Vec<Held<'_>>, usize) {
+    let mut shown: Vec<Held<'_>> = r
         .sessions
         .iter()
         .filter(|(_, s)| !s.spaces.is_empty())
         .collect();
     shown.sort_by_key(|(_, s)| std::cmp::Reverse(s.newest_off));
-    let mut more = shown.len().saturating_sub(SESSIONS_MAX);
+    let more = shown.len().saturating_sub(SESSIONS_MAX);
     shown.truncate(SESSIONS_MAX);
+    (shown, more)
+}
+
+/// Why a session's newest fold is partial: its seed's word, then its close
+/// missing although its node or its own presence says it is gone (the
+/// module doc). Empty when it is whole.
+fn partial_why(
+    r: &Read,
+    node: &str,
+    s: &Session,
+    seed: aterm_slog::bus::Seed,
+    closed: bool,
+) -> Vec<&'static str> {
+    let mut why: Vec<&'static str> = Vec::new();
+    if let Some(w) = seed.why() {
+        why.push(w);
+    }
+    if let Some(w) = gone_without_close(r, node, s).filter(|_| !closed) {
+        why.push(w);
+    }
+    why
+}
+
+/// The brief's text: a header, then each session's lines, newest first.
+fn render(cfg: &Config, opts: &BriefOpts, r: &Read, now_ms: u64) -> String {
+    let budget = opts.budget.unwrap_or(BUDGET_DEFAULT);
+    let (shown, mut more) = shown(r);
     // The `more=` line's own room is kept back from the start.
     let budget_lines = budget.saturating_sub(line_tokens("more=sessions:99999"));
     let (mut lines, mut used, mut partial, mut folded) = (Vec::new(), 0usize, 0usize, 0usize);
@@ -363,13 +412,7 @@ fn render(cfg: &Config, opts: &BriefOpts, r: &Read, now_ms: u64) -> String {
         };
         let (fold, seed) = space.fold_seeded();
         let st = fold.state();
-        let mut why: Vec<&str> = Vec::new();
-        if let Some(w) = seed.why() {
-            why.push(w);
-        }
-        if let Some(w) = gone_without_close(r, node, s).filter(|_| st.closed.is_none()) {
-            why.push(w);
-        }
+        let why = partial_why(r, node, s, seed, st.closed.is_some());
         // Loss nobody said, from the first `ms` the window reaches: one that
         // does not reach the space's start (nor the log's) cut it, which
         // `no-start` says.
@@ -460,8 +503,112 @@ fn render(cfg: &Config, opts: &BriefOpts, r: &Read, now_ms: u64) -> String {
     out
 }
 
+/// The open path's level words, run first ([`aterm_slog::SessionState::open`]).
+const OPEN_LEVELS: [&str; 3] = ["run", "turn", "step"];
+
+/// One session's object of the machine form (the module doc's closed
+/// schema), from its newest space's fold at `now_ms`, and whether that fold
+/// is partial.
+fn session_json(
+    r: &Read,
+    key: &(String, String),
+    s: &Session,
+    now_ms: u64,
+    this: Option<&str>,
+) -> Option<(J, bool)> {
+    let (node, sid) = key;
+    let (ep, space) = s.spaces.iter().next_back()?;
+    let (fold, seed) = space.fold_seeded();
+    let st = fold.state();
+    let why = partial_why(r, node, s, seed, st.closed.is_some());
+    let need = st.top_observed_need();
+    let open = st
+        .open
+        .iter()
+        .zip(OPEN_LEVELS)
+        .filter_map(|(n, level)| {
+            n.as_ref()
+                .map(|n| J::Obj(vec![("level", J::s(level)), ("kind", J::s(n.kind.word()))]))
+        })
+        .collect();
+    let age_s = (st.last_t > 0).then(|| now_ms.saturating_sub(st.last_t) / 1000);
+    let partial = !why.is_empty();
+    let obj = J::Obj(vec![
+        ("node", J::s(&safe(node, 48))),
+        ("sid", J::s(&safe(sid, 48))),
+        ("this", J::Bool(this == Some(node.as_str()))),
+        ("ep", J::Num(u64::from(*ep))),
+        ("need", J::opt_s(need.map(|n| n.word))),
+        ("detail", J::opt_s(need.and_then(|n| n.detail.as_deref()))),
+        ("open", J::Arr(open)),
+        ("mail_in", J::Num(u64::from(st.totals.mail_in))),
+        ("mail_out", J::Num(u64::from(st.totals.mail_out))),
+        ("last_seq", J::Num(st.as_of)),
+        ("age_s", J::opt_n(age_s)),
+        ("partial", J::Arr(why.into_iter().map(J::s).collect())),
+    ]);
+    Some((obj, partial))
+}
+
+/// The brief's machine form (`--json`, the module doc): one object, its
+/// `sessions` newest first while their objects fit the budget, the rest
+/// counted `more`. `this` is the node this host's state dir names.
+fn render_json(
+    cfg: &Config,
+    opts: &BriefOpts,
+    r: &Read,
+    now_ms: u64,
+    this: Option<&str>,
+) -> String {
+    let budget = opts.budget.unwrap_or(BUDGET_DEFAULT);
+    let (shown, mut more) = shown(r);
+    let (mut sessions, mut used, mut partial) = (Vec::new(), 0usize, 0u64);
+    let (mut dup, mut reordered, mut foreign) = (0u64, 0u64, 0u64);
+    for (i, (key, s)) in shown.iter().enumerate() {
+        let Some((obj, is_partial)) = session_json(r, key, s, now_ms, this) else {
+            continue;
+        };
+        let mut one = String::new();
+        obj.render(&mut one);
+        // Its comma's room counted with it, as a text line's newline is.
+        let t = line_tokens(&one);
+        if used + t > budget {
+            more += shown.len() - i;
+            break;
+        }
+        if let Some((_, space)) = s.spaces.iter().next_back() {
+            dup += space.dup;
+            reordered += space.reordered;
+            foreign += space.foreign;
+        }
+        used += t;
+        partial += u64::from(is_partial);
+        sessions.push(obj);
+    }
+    let mut out = String::new();
+    J::Obj(vec![
+        ("v", J::Num(2)),
+        ("fleet", J::s(&safe(&cfg.fleet, 32))),
+        ("head", J::Num(r.head)),
+        ("from", J::Num(r.from)),
+        ("scanned", J::Num(r.scanned)),
+        ("pages", J::Num(r.pages)),
+        ("partial", J::Num(partial)),
+        ("opaque", J::Num(r.opaque)),
+        ("foreign", J::Num(foreign)),
+        ("dup", J::Num(dup)),
+        ("reordered", J::Num(reordered)),
+        ("budget", J::Num(budget as u64)),
+        ("used", J::Num(used as u64)),
+        ("more", J::Num(more as u64)),
+        ("sessions", J::Arr(sessions)),
+    ])
+    .render(&mut out);
+    out
+}
+
 /// `aterm fabric brief [@<sid>[@<node>]] [--window <n>] [--budget <tokens>]
-/// [--cap-file <path>]`.
+/// [--cap-file <path>] [--json]`.
 #[must_use]
 pub fn brief_main(opts: &BriefOpts) -> ExitCode {
     let cfg = match crate::fabric::configured_for_reads() {
@@ -470,7 +617,12 @@ pub fn brief_main(opts: &BriefOpts) -> ExitCode {
     };
     match read(&cfg, opts) {
         Ok(r) => {
-            let text = render(&cfg, opts, &r, crate::now_ms());
+            let text = if opts.json {
+                let this = crate::enable::read_node(Path::new(&cfg.state_dir));
+                render_json(&cfg, opts, &r, crate::now_ms(), this.as_deref())
+            } else {
+                render(&cfg, opts, &r, crate::now_ms())
+            };
             aterm_uds::stdout::answer_exit("aterm fabric brief", &format!("{text}\n"), 0)
         }
         Err(e) => {

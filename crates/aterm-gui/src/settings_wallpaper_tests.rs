@@ -50,19 +50,35 @@ fn ready(path: &str, w: u32, h: u32) -> crate::app_config::WallpaperAsset {
 
 /// MODIFIED NAMES THE WALLPAPER BY ITS FILE: the row's control is a way to
 /// the Wallpaper page that paints the file's name and size (not the head of
-/// a long path, cut mid-word), says the whole path, and fits, at the
-/// regular, wide and compact widths and at larger text. Negative control: an
-/// image that did not load is named by its file alone.
+/// a long path, cut mid-word), says the whole path, and fits, from a
+/// 22-column window to a wide one, at 1×, 1.25×, 1.5× and 2× text — every
+/// letter of the file's name painted, the size given up first, then the
+/// name set on lines, never cut (the round-14 audit: elided from its end on
+/// one line it read "sun…" at 178pt and 2×, "sunset-over-the…" at 320pt).
+/// Negative control: an image that did not load is named by its file
+/// alone.
 #[test]
 fn modified_names_the_wallpaper_by_its_file() {
+    at_each_text_scale(&[1.0, 1.25, 1.5, 2.0], "wallpaper words", |scale| {
+        wallpaper_words_at_scale(scale);
+    });
+}
+
+fn wallpaper_words_at_scale(scale: f32) {
     let path = "/Users//someone/Library/Mobile Documents/com~apple~CloudDocs/Pictures/Backdrops/2026/sunset-over-the-bay.png";
     let key = "settings/control/wallpaper";
-    for (width, height) in [(744.0_f32, 420.0_f32), (1_200.0, 820.0), (320.0, 568.0)] {
+    for (width, height) in [
+        (178.0_f32, 568.0_f32),
+        (234.0, 568.0),
+        (320.0, 568.0),
+        (744.0, 420.0),
+        (1_200.0, 820.0),
+    ] {
         let mut state = wallpaper_state(path, ready(path, 1074, 686));
         state.navigate(SettingsRoute::Modified);
         state.reveal_control(UiKey::new(key));
         let compiled = settings_route_at(&state, &view_cx_at(width, height));
-        let at = format!("{width}×{height}");
+        let at = format!("{scale}\u{d7} {width}×{height}");
         let node = compiled
             .semantic(&UiKey::new(key))
             .unwrap_or_else(|| panic!("{at}: the row"));
@@ -84,17 +100,27 @@ fn modified_names_the_wallpaper_by_its_file() {
             "{at}"
         );
         let painted = button_words(&compiled, key);
+        // Every letter of the name, on however many lines (a line may break
+        // after a hyphen, or with one inside a word wider than the button).
+        let letters = |text: &str| text.replace(['\n', '-'], "");
         assert!(
-            painted.contains("sunset-over-the-bay") || painted.starts_with("sunset"),
-            "{at}: the file by its name: {painted:?}"
+            letters(&painted).contains(&letters("sunset-over-the-bay.png")),
+            "{at}: the file by its whole name: {painted:?}"
         );
-        if width >= 744.0 {
+        assert!(
+            !painted.contains('\u{2026}'),
+            "{at}: never cut: {painted:?}"
+        );
+        if width >= 744.0 && scale <= 1.0 {
             assert_eq!(painted, "sunset-over-the-bay.png · 1074 × 686", "{at}");
         }
         let cut: Vec<_> = compiled
             .paint_audit_lines()
             .into_iter()
-            .filter(|line| line.contains(key) && line.contains("overflow=true"))
+            .filter(|line| {
+                line.contains(key)
+                    && (line.contains("overflow=true") || line.contains("clip-truncated=true"))
+            })
             .collect();
         assert!(cut.is_empty(), "{at}: {cut:?}");
     }

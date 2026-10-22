@@ -34,8 +34,9 @@ pub enum State {
 
 impl State {
     /// Its word.
+    #[inline]
     #[must_use]
-    pub fn word(self) -> &'static str {
+    pub const fn word(self) -> &'static str {
         match self {
             State::Ok => "ok",
             State::Idle => "idle",
@@ -49,8 +50,9 @@ impl State {
     }
 
     /// Whether a review may be asked of it.
+    #[inline]
     #[must_use]
-    pub fn usable(self) -> bool {
+    pub const fn usable(self) -> bool {
         matches!(
             self,
             State::Ok | State::Idle | State::Due(_) | State::Unproven
@@ -59,6 +61,7 @@ impl State {
 
     /// Whether a wanted CLI has a definite install or sign-in action.
     /// Unknown login evidence and intentional exclusions need no action.
+    #[inline]
     #[must_use]
     pub const fn needs_person(self, wanted: bool) -> bool {
         wanted && matches!(self, State::NotInstalled | State::SignedOut | State::Due(_))
@@ -80,8 +83,9 @@ pub enum Mark {
 
 impl Mark {
     /// Its word, as `aterm doctor` prints it.
+    #[inline]
     #[must_use]
-    pub fn word(self) -> &'static str {
+    pub const fn word(self) -> &'static str {
         match self {
             Mark::Ok => "ok",
             Mark::Note => "note",

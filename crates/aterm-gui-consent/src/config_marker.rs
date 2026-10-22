@@ -24,6 +24,7 @@ use std::path::Path;
 
 /// The marker's text, when a regular, non-symlink file of at most `max_bytes` sits at `path`;
 /// `None` for everything else.
+#[inline]
 pub fn read_marker(path: &Path, max_bytes: usize) -> Option<String> {
     aterm_effects::file_feed::read_bounded_regular_utf8(path, max_bytes).ok()
 }
@@ -101,6 +102,7 @@ pub fn remove_marker(path: &Path) -> std::io::Result<()> {
 
 /// Return `true` when `len` fits within `max_bytes`.
 #[must_use]
+#[inline]
 pub const fn is_within_marker_cap(len: usize, max_bytes: usize) -> bool {
     len <= max_bytes
 }
@@ -108,6 +110,7 @@ pub const fn is_within_marker_cap(len: usize, max_bytes: usize) -> bool {
 /// Encode the four FDA record fields (`asked_at`, `opened_at`, `verified_at`, `verified_build`)
 /// into 16 little-endian bytes (`u32` each).
 #[must_use]
+#[inline]
 pub const fn encode_fda_timestamps_le(
     asked_at: u32,
     opened_at: u32,
@@ -136,6 +139,7 @@ pub const fn encode_fda_timestamps_le(
 
 /// Decode 16 little-endian bytes into the four FDA record fields.
 #[must_use]
+#[inline]
 pub const fn decode_fda_timestamps_le(bytes: [u8; 16]) -> (u32, u32, u32, u32) {
     let asked_at = (bytes[0] as u32)
         | ((bytes[1] as u32) << 8)

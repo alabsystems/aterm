@@ -285,3 +285,67 @@ fn with_the_sweep_off_the_inbox_keeps_nothing() {
     );
     assert_eq!(bed.requested_at(), Some(t0), "and asks nothing");
 }
+
+/// Seamless restore (`adopt_restored_holder`) notes the foreground group on
+/// the timeline before the status observer's first look at the session, so the
+/// first sweep's `sweep_slog` sees `group_changed == false`. The observer still
+/// owes the initial program lookup (`first_unnamed`) and names `claude`.
+#[cfg(unix)]
+#[test]
+fn a_restored_holder_adopted_before_the_first_sweep_is_still_named() {
+    let mut app = App::headless_for_test();
+    app.session_factory.fg_probe = front;
+    let asked = Arc::new(Mutex::new(Vec::new()));
+    let log = Arc::clone(&asked);
+    let names = Arc::new(Mutex::new(HashMap::from([
+        (SHELL, "zsh"),
+        (CLAUDE, "claude"),
+    ])));
+    let images = Arc::clone(&names);
+    app.session_status.programs = ProgramResolver::with_lookup(move |pgid, _shell| {
+        log.lock().unwrap().push(pgid);
+        LeaderFacts {
+            program: images.lock().unwrap().get(&pgid).map(|n| (*n).into()),
+            ..LeaderFacts::default()
+        }
+    });
+    let session = app
+        .front_terminal(WindowId(0))
+        .expect("a front terminal")
+        .session;
+    let (term, timeline, pid) = {
+        let pooled = app.pool.sessions.get_mut(&session).expect("pooled");
+        pooled.session.master = i32::MAX;
+        (
+            Arc::clone(&pooled.session.term),
+            Arc::clone(&pooled.session.ctx.timeline),
+            pooled.session.pid,
+        )
+    };
+    FRONT.with(|f| f.set(CLAUDE));
+    crate::spawn::adopt_restored_holder(
+        &term,
+        &timeline,
+        i32::MAX,
+        pid,
+        app.session_factory.fg_probe,
+        app.session_factory.edge_image,
+    );
+    assert_eq!(
+        timeline.lock().unwrap().agent().program_pgid,
+        CLAUDE,
+        "PRECONDITION: foreground group already recorded on timeline before first sweep"
+    );
+    assert_eq!(timeline.lock().unwrap().agent().program, None);
+    let mut bed = Bed {
+        app,
+        session,
+        asked,
+        names,
+    };
+    let t0 = Instant::now();
+    let _ = sweep_mut(&mut bed, t0);
+    assert_eq!(bed.requested_at(), Some(t0), "asked on the first sweep");
+    bed.wait_named("claude");
+    assert_eq!(*bed.asked.lock().unwrap(), vec![CLAUDE]);
+}

@@ -257,6 +257,7 @@ pub fn write_key_file(dir: &Path, secret: &[u8]) -> io::Result<()> {
 }
 
 /// Whether `word` is a node id: 32 lowercase hex digits.
+#[inline]
 #[must_use]
 pub fn is_node_id(word: &str) -> bool {
     aterm_codec::hex::is_lower(word, 32)
@@ -650,6 +651,7 @@ pub fn code_spans(text: &str) -> Vec<std::ops::Range<usize>> {
 
 /// The value of one code character, Crockford's way: either case, `o` as
 /// `0`, `i` and `l` as `1`.
+#[inline]
 fn symbol_of(c: char) -> Option<u8> {
     let c = match c.to_ascii_lowercase() {
         'o' => '0',
@@ -700,7 +702,8 @@ fn from_symbols(symbols: &[u8]) -> [u8; SECRET_LEN] {
 }
 
 /// Multiplication in GF(32) modulo [`GF_POLY`].
-fn gf_mul(mut a: u8, mut b: u8) -> u8 {
+#[inline]
+const fn gf_mul(mut a: u8, mut b: u8) -> u8 {
     let mut product = 0;
     while b != 0 {
         if b & 1 != 0 {
@@ -717,15 +720,20 @@ fn gf_mul(mut a: u8, mut b: u8) -> u8 {
 
 /// The code's generator, `(x + 1)(x + α)(x + α²)(x + α³)` with `α = x`,
 /// highest power first.
-fn generator() -> [u8; CHECK_SYMBOLS + 1] {
+#[inline]
+const fn generator() -> [u8; CHECK_SYMBOLS + 1] {
     let mut g = [0u8; CHECK_SYMBOLS + 1];
     g[0] = 1;
     let mut root = 1u8;
-    for degree in 0..CHECK_SYMBOLS {
-        for i in (1..=degree + 1).rev() {
+    let mut degree = 0;
+    while degree < CHECK_SYMBOLS {
+        let mut i = degree + 1;
+        while i >= 1 {
             g[i] ^= gf_mul(g[i - 1], root);
+            i -= 1;
         }
         root = gf_mul(root, 2);
+        degree += 1;
     }
     g
 }
@@ -770,6 +778,7 @@ fn is_codeword(symbols: &[u8]) -> bool {
 /// letters, digits, `.`, `-` and `_` (at most 253, not starting with `.` or
 /// `-`). Nothing that could carry a control character, a space or a `:` into
 /// a line, a file or a screen.
+#[inline]
 #[must_use]
 pub fn is_host(host: &str) -> bool {
     if host.parse::<IpAddr>().is_ok() {
@@ -860,6 +869,7 @@ pub enum Via {
 
 impl Via {
     /// The word the book spells it with.
+    #[inline]
     #[must_use]
     pub const fn word(self) -> &'static str {
         match self {
@@ -870,6 +880,7 @@ impl Via {
         }
     }
 
+    #[inline]
     fn from_word(word: &str) -> Option<Self> {
         [Self::Joined, Self::Issuer, Self::Manual, Self::IssuerBook]
             .into_iter()
@@ -879,6 +890,7 @@ impl Via {
     /// Whether an entry that came in this way is the issuer's own knowledge,
     /// which its book shares ([`serve_book`]): a registration, or a peer its
     /// person named. Never its issuer's entry, nor a copy of another book.
+    #[inline]
     const fn first_hand(self) -> bool {
         matches!(self, Self::Joined | Self::Manual)
     }

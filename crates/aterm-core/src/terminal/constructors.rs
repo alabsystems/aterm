@@ -27,12 +27,14 @@ static EXTRACT_IDENTITY_SOURCE: std::sync::atomic::AtomicU64 = std::sync::atomic
 impl Terminal {
     /// Create a new terminal with the given dimensions.
     #[must_use]
+    #[inline]
     pub fn new(rows: u16, cols: u16) -> Self {
         Self::with_size(TerminalSize::new(rows, cols))
     }
 
     /// Create a new terminal with the given size.
     #[must_use]
+    #[inline]
     pub(crate) fn with_size(size: TerminalSize) -> Self {
         Self::with_grid(Grid::new(size.rows(), size.cols()))
     }
@@ -132,6 +134,7 @@ impl Terminal {
 
     /// Create a terminal with tiered scrollback.
     #[must_use]
+    #[inline]
     pub fn with_scrollback(
         rows: u16,
         cols: u16,

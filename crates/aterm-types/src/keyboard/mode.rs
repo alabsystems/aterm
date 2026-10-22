@@ -90,8 +90,9 @@ bitflags! {
 
 impl KeyboardMode {
     /// Get the xterm modifyOtherKeys level (0, 1, or 2).
+    #[inline]
     #[must_use]
-    pub fn xterm_modify_other_keys_level(self) -> u8 {
+    pub const fn xterm_modify_other_keys_level(self) -> u8 {
         if self.contains(Self::XTERM_MODIFY_OTHER_KEYS_LEVEL2) {
             2
         } else if self.contains(Self::XTERM_MODIFY_OTHER_KEYS_LEVEL1) {
@@ -102,8 +103,9 @@ impl KeyboardMode {
     }
 
     /// Check if xterm formatOtherKeys is enabled.
+    #[inline]
     #[must_use]
-    pub fn xterm_format_other_keys(self) -> bool {
+    pub const fn xterm_format_other_keys(self) -> bool {
         self.contains(Self::XTERM_FORMAT_OTHER_KEYS)
     }
 }

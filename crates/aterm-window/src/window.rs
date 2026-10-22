@@ -101,6 +101,7 @@ impl WindowId {
     /// The only guarantee made about the return value of this function is that
     /// it will always be equal to itself and to future values returned by this function.
     /// No other guarantees are made. This may be equal to a real [`WindowId`].
+    #[inline]
     pub const fn dummy() -> Self {
         WindowId(platform_impl::WindowId::dummy())
     }
@@ -113,12 +114,14 @@ impl fmt::Debug for WindowId {
 }
 
 impl From<WindowId> for u64 {
+    #[inline]
     fn from(window_id: WindowId) -> Self {
         window_id.0.into()
     }
 }
 
 impl From<u64> for WindowId {
+    #[inline]
     fn from(raw_id: u64) -> Self {
         Self(raw_id.into())
     }
@@ -1191,7 +1194,7 @@ impl Window {
     ///
     /// - **iOS / Android / Web / Orbital:** Unsupported.
     /// - **macOS:** `None` has no effect.
-    /// - **X11:** Requests for user attention must be manually cleared.
+    /// - **X11:** The request is cleared when the window gains focus.
     /// - **Wayland:** Requires `xdg_activation_v1` protocol, `None` has no effect.
     #[inline]
     pub fn request_user_attention(&self, request_type: Option<UserAttentionType>) {

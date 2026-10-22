@@ -2867,9 +2867,16 @@ pub(crate) fn notify(title: &str, body: &str) {
     crate::win_alert_ok(title, body);
 }
 
-/// Linux has no native alert wired: the caller's own `eprintln!` is the channel, and a Linux
-/// GUI launch keeps its stderr.
-#[cfg(not(any(target_os = "macos", windows)))]
+/// Linux: a desktop notification (`org.freedesktop.Notifications`), sent before this returns.
+/// A launch from the desktop has no terminal, so the caller's own `eprintln!` reaches only the
+/// journal, and a launch that cannot start (or a file that cannot open) would vanish unseen.
+#[cfg(target_os = "linux")]
+pub(crate) fn notify(title: &str, body: &str) {
+    crate::notify::deliver_now(title, body);
+}
+
+/// Elsewhere off macOS and Windows no alert is wired: the caller's own `eprintln!` is the channel.
+#[cfg(not(any(target_os = "macos", windows, target_os = "linux")))]
 pub(crate) fn notify(_title: &str, _body: &str) {}
 
 /// Help, off macOS: the project page in the default browser, through the helper a Ctrl-clicked

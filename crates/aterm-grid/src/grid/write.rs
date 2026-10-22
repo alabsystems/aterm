@@ -72,8 +72,9 @@ impl StaleExtras {
         }
     }
 
-    fn is_empty(&self) -> bool {
-        self.overwritten.is_empty() && self.halves == [None, None]
+    #[inline]
+    const fn is_empty(&self) -> bool {
+        self.overwritten.is_empty() && matches!(self.halves, [None, None])
     }
 }
 

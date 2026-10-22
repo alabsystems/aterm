@@ -1,10 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The measured phases, over two worlds booted exactly as the fabric suite
+//! The measured phases, over four worlds booted exactly as the fabric suite
 //! boots them (`harness::World`: a guarded broker in this process, opened with
-//! aterm's own options for the arm's tier — strict by default — a headless
-//! `aterm`, and the real `aterm link serve` child it launched):
+//! aterm's own options for the arm's tier — ordered at aterm's horizon by
+//! default — and retained by aterm's default rules as `aterm link broker`
+//! retains it, a headless `aterm`, and the real `aterm link serve` child it
+//! launched, its bus mirror at `--log auto`; [`boot_world`] takes an arm's
+//! `retention=off`, `log=off` and tick interval):
 //!
 //! 1. MESSAGING, on one node. [`latency`]: session A posts a `note` to session
 //!    B, one at a time on an idle bridge, and the clock runs from the `post`
@@ -19,7 +22,15 @@
 //! 3. ATTACH, on a third node: a bridge that starts with N sessions, until
 //!    its node row and every session's presence row are on the broker again,
 //!    for each population in the spec; the census of what it wrote, the
-//!    killed bridge's fired will counted apart.
+//!    killed bridge's fired will counted apart. And a second stop each
+//!    restart: a note the boot session posts to itself the moment the bridge
+//!    is killed, until it is visible — after the presence rows, the bus
+//!    mirror's start (over a retaining broker at `--log auto`), the refill
+//!    the rows owe and the live drain.
+//! 4. HANDOFF, on a fourth node ([`handoff`]): a successor instance's bridge
+//!    standing by on the held state dir while the holder quits saying `bye
+//!    handoff`; the outage until the successor's rows are acked, and a post
+//!    queued in the gap.
 //!
 //! Each world also runs the [`calibrate`] yardstick — bare strict, ordered and
 //! escalated publishes, no aterm — before and after its phases, and every
@@ -67,11 +78,14 @@ use crate::census::{self, Rec};
 use crate::clock::{self, Clock, Heads, StopOnDrop, ms};
 use crate::harness::{self, DEADLINE, FLEET, World, kv, until};
 use crate::profile::{self, Profile};
-use crate::spec::{ORDERED_HORIZON_MS, Spec, Tier};
+use crate::spec::{Log, ORDERED_HORIZON_MS, Spec, Tier};
 use crate::stats;
 
 #[path = "run/pingpong.rs"]
 mod pingpong;
+
+#[path = "run/handoff.rs"]
+mod handoff;
 
 /// What a run hands back.
 pub struct Report {
@@ -582,6 +596,51 @@ fn flushes_line(f: FlushCounts, n: usize) -> String {
     )
 }
 
+/// The broker's RETENTION TICKS so far: how many it ran and how many it
+/// skipped because a compaction was under way (`BrokerStats::retention_ticks`
+/// and `retention_skips`). `0` and `0` on a broker nothing retains, which
+/// never ticks. A tick runs when a batch's bytes pass a rule's bound or the
+/// interval passes (`Broker::set_retention_interval`, a minute unless the arm
+/// names `retention_interval_ms=`); the bench's bytes are far below every
+/// rule's, so at the shipped interval a window holds none.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct Ticks {
+    run: u64,
+    skipped: u64,
+}
+
+/// The broker's ticks now: read through `Broker::stats`, under the log lock,
+/// so never inside a timed round trip.
+fn ticks(broker: &Broker) -> Ticks {
+    let stats = broker.stats();
+    Ticks {
+        run: stats.retention_ticks,
+        skipped: stats.retention_skips,
+    }
+}
+
+/// The ticks a window held: `after - before`.
+fn ticks_between(before: Ticks, after: Ticks) -> Ticks {
+    Ticks {
+        run: after.run - before.run,
+        skipped: after.skipped - before.skipped,
+    }
+}
+
+/// A window's ticks for the report's JSON.
+fn ticks_json(t: Ticks) -> Value {
+    json!({ "run": t.run, "skipped": t.skipped })
+}
+
+/// A window's ticks for the report's tables, beside its flushes.
+fn ticks_line(t: Ticks) -> String {
+    format!(
+        "Retention ticks in the window (`BrokerStats::retention_ticks`, `retention_skips`): {} \
+         run, {} skipped.\n",
+        t.run, t.skipped
+    )
+}
+
 // ---------------------------------------------------------------------------
 // the yardstick: the disk, measured beside the stack
 // ---------------------------------------------------------------------------
@@ -758,6 +817,28 @@ impl Drop for Ruler {
     }
 }
 
+/// BOOT ONE OF THE RUN'S WORLDS as the arm names it: its broker opened with
+/// [`opts_for`], retained by aterm's default rules unless the arm says
+/// `retention=off` (what `aterm link broker` opens: the rules at every open),
+/// its tick at the arm's interval when it names one, and the bridge's
+/// `--log off` when the arm says `log=off` (else the bridge's own default,
+/// `auto`, what ships). `env` is the `aterm` instance's extra environment,
+/// which its bridge child inherits ([`World::boot_arm`]).
+fn boot_world(tag: &str, spec: &Spec, env: &[(&str, &str)]) -> World {
+    let flags: &[&str] = match spec.log {
+        Log::Auto => &[],
+        Log::Off => &["--log", "off"],
+    };
+    let w = World::boot_arm(tag, opts_for(spec), spec.retention, flags, env);
+    if let Some(ms) = spec.retention_interval_ms {
+        w.broker
+            .as_ref()
+            .expect("the world serves its own broker")
+            .set_retention_interval(Duration::from_millis(ms));
+    }
+    w
+}
+
 /// The options a run's world opens its broker with: aterm's own for the arm's
 /// tier ([`harness::broker_opts`]: the tier and, on a weak one, aterm's
 /// escalation table) — so the ordered arm measures aterm's real table — with
@@ -872,6 +953,8 @@ struct LatRaw {
     /// the first measured post to the end of the last one's idle wait (its
     /// commit acked).
     flushes: FlushCounts,
+    /// The broker's retention ticks over the same window ([`Ticks`]).
+    ticks: Ticks,
 }
 
 /// The latency phase: `warmup + samples` round trips, one at a time.
@@ -903,10 +986,12 @@ fn latency(w: &World, broker: &Broker, spec: &Spec, clock: Clock, a: &str, b: &s
     let mut out = Vec::with_capacity(spec.samples);
     let mut texts = Vec::with_capacity(spec.warmup + spec.samples);
     let mut flushes_before = broker.flush_counts();
+    let mut ticks_before = ticks(broker);
     for i in 0..spec.warmup + spec.samples {
         if i == spec.warmup {
             // Between two round trips: the last warm-up's commit is acked.
             flushes_before = broker.flush_counts();
+            ticks_before = ticks(broker);
         }
         let text = format!("lat-{i}");
         let (t_call, t_ret) = post(&mut ctl, clock, a, b, &text);
@@ -942,6 +1027,7 @@ fn latency(w: &World, broker: &Broker, spec: &Spec, clock: Clock, a: &str, b: &s
         texts,
         since,
         flushes: flushes_between(flushes_before, broker.flush_counts()),
+        ticks: ticks_between(ticks_before, ticks(broker)),
     }
 }
 
@@ -963,6 +1049,8 @@ struct BurstRaw {
     /// The flushes those batches cost, by kind, over the same window
     /// ([`Broker::flush_counts`]).
     flushes: FlushCounts,
+    /// The broker's retention ticks over the same window ([`Ticks`]).
+    ticks: Ticks,
 }
 
 /// The burst phase, reading `b`'s inbox on from row `since` (the latency
@@ -1004,6 +1092,7 @@ fn burst(
     };
     let flushed_before = flushed();
     let flush_counts_before = broker.flush_counts();
+    let ticks_before = ticks(broker);
     let (t0, rets, consumed) = std::thread::scope(|scope| {
         let consumer = scope.spawn(|| {
             let _close = CloseOnDrop(&credit);
@@ -1051,6 +1140,7 @@ fn burst(
     });
     let batches = flushed() - flushed_before;
     let flushes = flushes_between(flush_counts_before, broker.flush_counts());
+    let ticks = ticks_between(ticks_before, ticks(broker));
     post(&mut ctl, clock, a, b, "fence-0");
     consume(&mut ctl, clock, b, consumed.since, "fence-", 1, None)
         .unwrap_or_else(|e| panic!("burst fence: {e}"));
@@ -1061,38 +1151,55 @@ fn burst(
         seen,
         batches,
         flushes,
+        ticks,
     }
 }
 
 /// What a world's broker serves, in one line for its section: the tier in
 /// force, the one asked, why they differ, the horizon and the rule count —
 /// read from the broker itself (astream serves ordered strict off Apple and
-/// off the boot volume), never from the arm's word.
-fn served_line(w: &World) -> String {
-    let s = w
-        .broker
-        .as_ref()
-        .expect("the world serves its own broker")
-        .served_durability();
+/// off the boot volume), never from the arm's word — and what it retains,
+/// read from it too (its retention rules and its tick's interval), beside the
+/// bridge's `--log` the arm set.
+fn served_line(w: &World, spec: &Spec) -> String {
+    let broker = w.broker.as_ref().expect("the world serves its own broker");
+    let s = broker.served_durability();
     let horizon = s
         .horizon_ms
         .map_or_else(|| "none".to_string(), |ms| format!("{ms} ms"));
+    let retains = match broker.retention() {
+        Some(rules) => format!(
+            "retains its log by {} rules (aterm's defaults, `broker_rules::retain`), its \
+             retention tick every {} ms",
+            rules.rules().len() + 1,
+            broker.retention_interval().as_millis()
+        ),
+        None => {
+            "retains nothing (no retention rules: a broker from before astream's R4)".to_string()
+        }
+    };
     format!(
         "The world's broker serves **{}** (asked {}, reason {:?}; horizon {horizon}; {} \
-         escalation rules).\n",
+         escalation rules) and {retains}; the bridge runs `--log {}`{}.\n",
         aterm_link::durability::tier_name(s.served),
         aterm_link::durability::tier_name(s.requested),
         s.reason,
-        s.rules
+        s.rules,
+        spec.log.word(),
+        match (spec.log, broker.retention().is_some()) {
+            (Log::Auto, true) => " (the mirror is on: the broker retains the `ev` faces)",
+            (Log::Auto, false) => " (the mirror stays off: the broker retains nothing)",
+            (Log::Off, _) => " (no mirror)",
+        }
     )
 }
 
 /// The messaging world: boot, measure, census.
 fn messaging(spec: &Spec, clock: Clock) -> (Value, Vec<String>) {
     eprintln!("fabric bench: booting the messaging world");
-    let mut w = World::boot_opts("fbench-msg", opts_for(spec));
+    let mut w = boot_world("fbench-msg", spec, &[]);
     w.wait_ready();
-    let served = served_line(&w);
+    let served = served_line(&w, spec);
     let (a, b) = w.two_sessions();
     wait_live(
         &w,
@@ -1263,6 +1370,7 @@ fn messaging(spec: &Spec, clock: Clock) -> (Value, Vec<String>) {
             "post_to_durable_head_ms": stats::to_json(&to_durable),
             "visible_to_commit_acked_ms": stats::to_json(&visible_to_committed),
             "flushes": flushes_json(lat_raw.flushes, lat.len()),
+            "retention_ticks": ticks_json(lat_raw.ticks),
             "census": census::to_json(&lat_census, lat.len(), (lat_lo, lat_hi)),
         },
         "burst": {
@@ -1279,6 +1387,7 @@ fn messaging(spec: &Spec, clock: Clock) -> (Value, Vec<String>) {
             "broker_batches": bur.batches,
             "broker_batches_per_message": (n > 0).then(|| stats::round3(bur.batches as f64 / n as f64)),
             "flushes": flushes_json(bur.flushes, n),
+            "retention_ticks": ticks_json(bur.ticks),
             "deliver_ms": stats::to_json(&b_deliver),
             "post_to_acked_ms": stats::to_json(&b_to_acked),
             "acked_to_visible_ms": stats::to_json(&b_acked_to_visible),
@@ -1318,6 +1427,7 @@ fn messaging(spec: &Spec, clock: Clock) -> (Value, Vec<String>) {
         stats::row("visible -> the inbox commit acked", &visible_to_committed),
         String::new(),
         flushes_line(lat_raw.flushes, lat.len()),
+        ticks_line(lat_raw.ticks),
         format!(
             "Records the broker wrote per delivered message (offsets {lat_lo}..={lat_hi}, through \
              the commit covering the last one):\n"
@@ -1380,6 +1490,7 @@ fn messaging(spec: &Spec, clock: Clock) -> (Value, Vec<String>) {
             }
         ),
         flushes_line(bur.flushes, n),
+        ticks_line(bur.ticks),
         format!("Records per delivered message (offsets {b_lo}..={b_hi}):\n"),
     ]);
     md.extend(census::rows(&b_census, n));
@@ -1415,6 +1526,10 @@ struct Round {
     t_kill: u64,
     t_pid: u64,
     sids: Vec<String>,
+    /// THE LIVE MAIL ([`attach`]): its text, and the moment it was visible
+    /// in its recipient's inbox.
+    mail: String,
+    t_mail_seen: u64,
 }
 
 /// The bridge's pid from its state dir, if it has written one.
@@ -1572,9 +1687,9 @@ impl AttachRecords {
 /// at each size, census.
 fn attach(spec: &Spec, clock: Clock) -> (Value, Vec<String>) {
     eprintln!("fabric bench: booting the attach world");
-    let mut w = World::boot_opts("fbench-att", opts_for(spec));
+    let mut w = boot_world("fbench-att", spec, &[]);
     w.wait_ready();
-    let served = served_line(&w);
+    let served = served_line(&w, spec);
     let first = until("aterm's boot session", || {
         w.sessions().first().map(|(_, sid, _)| sid.clone())
     });
@@ -1585,6 +1700,12 @@ fn attach(spec: &Spec, clock: Clock) -> (Value, Vec<String>) {
     let cal_before = calibrate(&ruler, &w, clock, &mut cal_seq);
     let (rounds, heads) = sampled(&w, clock, || {
         let broker = w.broker.as_ref().expect("the world serves its own broker");
+        // THE LIVE MAIL's sender and recipient: the boot session, writing to
+        // itself, so every population has it (sessions are never added for
+        // it). Its control connection is opened here, outside every window.
+        let mut mail_ctl = w.ctl();
+        let mut mail_since = newest_id(&mut mail_ctl, &first);
+        let mailer = first.clone();
         let mut sids = vec![first];
         let mut pid = w.bridge_pid();
         let mut up_since = Instant::now();
@@ -1614,6 +1735,13 @@ fn attach(spec: &Spec, clock: Clock) -> (Value, Vec<String>) {
                     .expect("bound the presence subscription");
                 let t_kill = clock.us();
                 harness::kill(pid, 9);
+                // THE LIVE MAIL, queued the moment the bridge is gone: aterm
+                // holds it in the session's outbox, and only the new bridge
+                // can publish it, after its presence rows, the bus mirror's
+                // start (`--log auto` over a retaining broker) and the refill the
+                // rows owe (`Bridge::attach`), when its live drain starts.
+                let mail = format!("live-{}", rounds.len());
+                post(&mut mail_ctl, clock, &mailer, &mailer, &mail);
                 let new_pid = aterm_spec::wait::within(DEADLINE, PID_POLL, || {
                     read_pid(&w).filter(|p| *p != pid)
                 })
@@ -1621,6 +1749,16 @@ fn attach(spec: &Spec, clock: Clock) -> (Value, Vec<String>) {
                 let t_pid = clock.us();
                 pid = new_pid;
                 up_since = Instant::now();
+                // Parked before the mail can land: the new bridge has only
+                // just written its pid, and its attach's rows come first.
+                let (woke_at, t_mail_seen) = await_note(&mut mail_ctl, clock, &mailer, mail_since)
+                    .unwrap_or_else(|e| panic!("the live mail `{mail}`: {e}"));
+                let listed = list_since(&mut mail_ctl, &mailer, mail_since);
+                assert!(
+                    listed.len() == 1 && listed[0].text == mail && listed[0].id == woke_at,
+                    "the live mail `{mail}`: woke at row {woke_at}, listed {listed:?}"
+                );
+                mail_since = woke_at;
                 await_attach(&mut watch, &node_subject, &session_subjects, new_pid);
                 drop(watch);
                 rounds.push(Round {
@@ -1630,6 +1768,8 @@ fn attach(spec: &Spec, clock: Clock) -> (Value, Vec<String>) {
                     t_kill,
                     t_pid,
                     sids: sids.clone(),
+                    mail,
+                    t_mail_seen,
                 });
             }
         }
@@ -1643,7 +1783,7 @@ fn attach(spec: &Spec, clock: Clock) -> (Value, Vec<String>) {
 
     // Each round, read off the log: where the new bridge's rows landed.
     let mut by_size: BTreeMap<usize, Vec<Value>> = BTreeMap::new();
-    let mut series: BTreeMap<usize, [Vec<f64>; 6]> = BTreeMap::new();
+    let mut series: BTreeMap<usize, [Vec<f64>; 8]> = BTreeMap::new();
     let mut records: BTreeMap<usize, AttachRecords> = BTreeMap::new();
     for r in &rounds {
         let rows: Vec<(u64, &str, &str)> = recs
@@ -1665,7 +1805,31 @@ fn attach(spec: &Spec, clock: Clock) -> (Value, Vec<String>) {
         let t_all = heads.acked.landed(last);
         let t_last_session = found.last_session().and_then(|s| heads.acked.landed(s));
         let t_all_durable = heads.durable.landed(last);
-        let in_window = || census::window(&recs, r.mark, last);
+        // THE LIVE MAIL IS THE NEW BRIDGE'S: one record on the mailer's own
+        // lane, landing after the new bridge's node row (the killed bridge
+        // was gone before it was posted), and never part of the attach's
+        // census.
+        let mail_lane = format!("/f/{FLEET}/in/{}/{}/{}/note", w.node, r.sids[0], w.node);
+        let mut mails = recs
+            .iter()
+            .filter(|rec| rec.subject == mail_lane && rec.text == r.mail);
+        let mail_seq = mails
+            .next()
+            .unwrap_or_else(|| panic!("no record of the live mail `{}` on {mail_lane}", r.mail))
+            .seq;
+        assert!(
+            mails.next().is_none(),
+            "the live mail `{}` is on {mail_lane} twice",
+            r.mail
+        );
+        assert!(
+            mail_seq > found.node,
+            "the live mail `{}` landed at offset {mail_seq}, before the new bridge's node row at \
+             {}: it is not the new bridge's",
+            r.mail,
+            found.node
+        );
+        let in_window = || census::window(&recs, r.mark, last).filter(|rec| rec.seq != mail_seq);
         let c = census::census(in_window().filter(|rec| !fired.contains(&rec.seq)));
         let fired_here = in_window().filter(|rec| fired.contains(&rec.seq)).count();
         let s = series.entry(r.sessions).or_default();
@@ -1675,15 +1839,19 @@ fn attach(spec: &Spec, clock: Clock) -> (Value, Vec<String>) {
         s[3].push(ms(r.t_kill, r.t_pid));
         s[4].extend(ms_opt(Some(r.t_kill), t_all));
         s[5].extend(ms_opt(Some(r.t_pid), t_all_durable));
+        s[6].push(ms(r.t_kill, r.t_mail_seen));
+        s[7].extend(ms_opt(t_all, Some(r.t_mail_seen)));
         by_size.entry(r.sessions).or_default().push(json!({
             "mark": r.mark,
             "pid": r.pid,
             "node_offset": found.node,
             "last_offset": last,
+            "live_mail_offset": mail_seq,
             "records": c.total,
             "fired_wills": fired_here,
             "kill_to_pid_ms": stats::round3(ms(r.t_kill, r.t_pid)),
             "pid_to_all_ms": ms_opt(Some(r.t_pid), t_all).map(stats::round3),
+            "kill_to_live_mail_ms": stats::round3(ms(r.t_kill, r.t_mail_seen)),
         }));
         let rec = records.entry(r.sessions).or_default();
         rec.censuses.push(c);
@@ -1704,8 +1872,13 @@ fn attach(spec: &Spec, clock: Clock) -> (Value, Vec<String>) {
              row durable\" is the durable head's). Inside that window the bench asks the \
              broker nothing: it holds one subscription to the node's presence rows, opened before \
              the kill, and reads the times off the log afterwards. \"node row -> last session \
-             row\" is negative for a bridge that publishes a session's row before its node's. {} \
-             restart(s) per size.\n",
+             row\" is negative for a bridge that publishes a session's row before its node's. \
+             THE SECOND STOP, the live mail: the moment the bridge is killed the boot session \
+             posts a note to itself, which aterm holds in its outbox until the new bridge's live \
+             drain publishes it, after the presence rows, the bus mirror's start (over a \
+             retaining broker at `--log auto`) and the refill the rows owe; \"kill -> the first \
+             live mail visible\" ends when its `await inbox` answers, and its record is \
+             left out of the attach's census. {} restart(s) per size.\n",
             spec.rounds
         ),
         "| sessions | measure (ms) | n | mean | p50 | p95 | p99 |".to_string(),
@@ -1728,6 +1901,8 @@ fn attach(spec: &Spec, clock: Clock) -> (Value, Vec<String>) {
         "kill -> new pid (supervisor relaunch)",
         "kill -> every row acked",
         "pid -> every row durable",
+        "**kill -> the first live mail visible**",
+        "every row acked -> the live mail visible (the mirror's start, the refill, the drain)",
     ];
     for (size, s) in &series {
         for (name, values) in names.iter().zip(s.iter()) {
@@ -1763,6 +1938,8 @@ fn attach(spec: &Spec, clock: Clock) -> (Value, Vec<String>) {
             "kill_to_pid_ms": stats::to_json(&s[3]),
             "kill_to_all_ms": stats::to_json(&s[4]),
             "attach_durable_ms": stats::to_json(&s[5]),
+            "kill_to_live_mail_ms": stats::to_json(&s[6]),
+            "attach_to_live_mail_ms": stats::to_json(&s[7]),
             "records_per_attach": stats::to_json(&recs_per),
             "commit_records_per_attach": stats::to_json(&commits_per),
             "records_by_kind_mean": Value::Object(by_kind),
@@ -1847,6 +2024,39 @@ fn broker_note(spec: &Spec) -> String {
     }
 }
 
+/// What the run's broker RETAINS and what the bridge mirrors, for the
+/// report's head beside [`broker_note`]: what ships (aterm's default rules at
+/// every open, the bridge's `--log auto`, astream's minute between ticks)
+/// unless the arm names otherwise. Each world's section says what its broker
+/// was read to hold.
+fn retention_note(spec: &Spec) -> String {
+    let rules = if spec.retention {
+        "retained by aterm's default rules, set at every open \
+         (`aterm_link::broker_rules::retain`, what `aterm link broker` does)"
+    } else {
+        "NOT retained (no rules: what `aterm link broker` serves when its rules cannot be set, \
+         and every broker before astream's R4)"
+    };
+    let tick = match (spec.retention, spec.retention_interval_ms) {
+        (false, _) => String::new(),
+        (true, None) => ", its retention tick at astream's minute (what ships)".to_string(),
+        (true, Some(ms)) => format!(
+            ", its retention tick every {ms} ms (`Broker::set_retention_interval`; aterm ships \
+             astream's minute)"
+        ),
+    };
+    let mirror = match (spec.log, spec.retention) {
+        (Log::Auto, true) => {
+            "`--log auto` (what ships: the bus mirror is on over a retaining broker)"
+        }
+        (Log::Auto, false) => {
+            "`--log auto`, which mirrors nothing over a broker that retains nothing"
+        }
+        (Log::Off, _) => "`--log off` (no bus mirror)",
+    };
+    format!("**Retention:** the log {rules}{tick}; the bridge runs {mirror}.")
+}
+
 /// Measure everything `spec` names.
 #[must_use]
 pub fn measure(spec: &Spec) -> Report {
@@ -1859,10 +2069,17 @@ pub fn measure(spec: &Spec) -> Report {
     let (messaging, messaging_md) = messaging(spec, clock);
     let (pingpong, pingpong_md) = pingpong::measure(spec, clock);
     let (attach, attach_md) = attach(spec, clock);
-    let mut md = vec![format!("**Broker:** {}", broker_note(spec)), String::new()];
+    let (handoff, handoff_md) = handoff::measure(spec, clock);
+    let mut md = vec![
+        format!("**Broker:** {}", broker_note(spec)),
+        String::new(),
+        retention_note(spec),
+        String::new(),
+    ];
     md.extend(messaging_md);
     md.extend(pingpong_md);
     md.extend(attach_md);
+    md.extend(handoff_md);
     let binary_at_end = binary_identity();
     // THE ARM IS THE BINARY'S. `harness::aterm()` is the window and, through the
     // seam, the bridge; cargo built it, and this test (which holds the broker),
@@ -1876,11 +2093,13 @@ pub fn measure(spec: &Spec) -> Report {
         "aterm_binary": harness::aterm(),
         "aterm_binary_identity": { "start": binary_at_start, "end": binary_at_end },
         "broker": broker_note(spec),
+        "retention": retention_note(spec),
         "clock": "one monotonic origin in the bench process; microsecond stamps",
         "elapsed_s": stats::round3(started.elapsed().as_secs_f64()),
         "messaging": messaging,
         "pingpong": pingpong,
         "attach": attach,
+        "handoff": handoff,
     });
     Report {
         json,

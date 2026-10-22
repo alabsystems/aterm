@@ -1101,6 +1101,208 @@ fn a_redirect_or_a_dash_before_the_name_does_not_hide_it() {
     }
 }
 
+/// A RESERVED WORD IS A KEYWORD ONLY WHERE A COMMAND BEGINS: behind an assignment, a redirect,
+/// zsh's `-`, `timeout` or a wrapper (`env`, `xargs`, `/usr/bin/time` behind an assignment or a
+/// pipe), bash reads it as the command's name and runs a program by that name (MEASURED, bash
+/// 3.2: with an `if` first on `PATH`, `X=1 if true; echo b` ran it; with a `time` first on `PATH`,
+/// `echo x | time if true` ran that `time` with `if true`). A segment does not say whether a
+/// pipeline begins at its `time`, so a reserved word after `time` is never a keyword: `time if …`
+/// is refused too. Claude Code 2.1.307's rm breaker can draw its too-many box over such a line,
+/// whose own statement-follows note would otherwise flag it. NEGATIVE CONTROLS: the same words
+/// where a command begins (`if …; then …; fi`, `for … do … done`, `! grep`, a keyword after a
+/// keyword), a program after `time` (`time ls`, `ls | time -p ls`), and assignments and
+/// redirects after a keyword (`then X=1 ls`, `if 2>/dev/null ls`), stay reads.
+#[test]
+fn a_reserved_word_behind_an_assignment_or_a_redirect_is_a_program() {
+    for cmd in [
+        "X=1 if true; then echo a; fi",
+        "X=1 if true; echo b",
+        "2>/dev/null if true; then echo a; fi",
+        ">/dev/null if true; echo b",
+        "X=1 for x in a; do echo; done",
+        "X=1 while true; do echo; done",
+        "X=1 [[ -n a ]]",
+        "X=1 ! true",
+        "X=1 { echo a; }",
+        "- if true",
+        "timeout 5 if true",
+        "env if true",
+        "env X=1 for x in a",
+        "ls | xargs if true",
+        "echo a; X=1 if true",
+        "X=1 time if true",
+        "if true; then X=1 if true; fi",
+        "ls | time if true",
+        "echo x | time if true",
+        "ls | time -p if true",
+        "ls |& time if true",
+        "echo x | time ! true",
+        "time if true; then echo a; fi",
+        "time for x in a; do echo; done",
+    ] {
+        let v = classify_command(cmd);
+        assert!(!v.read_only, "{cmd:?} must not be read-only: {v:?}");
+        assert!(
+            v.reason.contains("where the shell reads a command's name"),
+            "{cmd:?}: {v:?}"
+        );
+    }
+    for cmd in [
+        "if true; then echo a; fi",
+        "for x in a b; do echo $x; done",
+        "while test -e f; do echo; done",
+        "! grep -q x f && echo y",
+        "time ls",
+        "ls | time ls",
+        "ls | time -p ls",
+        "if ! true; then echo; fi",
+        "if true; then X=1 ls; fi",
+        "if 2>/dev/null ls; then echo; fi",
+        "X=1 time ls",
+        "X=1 ls",
+        "env FOO=1 ls",
+        "ls | while test -e f; do echo; done",
+    ] {
+        assert!(
+            ro(cmd),
+            "{cmd:?} must stay read-only: {:?}",
+            classify_command(cmd)
+        );
+    }
+}
+
+/// AN OPTION AFTER `time` IS `/usr/bin/time`'S OWN: behind a pipe or an assignment `time` is the
+/// program, whose `-o FILE` writes FILE (MEASURED, bash 3.2: `ls | time -o out.txt ls` and `X=1
+/// time -o out.txt ls` each made `out.txt`). The head check had passed the `-o` as a fragment, so
+/// each line was a read, and Claude Code 2.1.307's too-many box over one would have been approved.
+/// The command there is `time` itself, which no list clears. NEGATIVE CONTROLS: `time [-p]` before
+/// a read stays one, at a line's start, behind a pipe and behind an assignment.
+#[test]
+fn an_option_after_time_is_the_time_programs_own() {
+    for cmd in [
+        "ls | time -o out.txt ls",
+        "X=1 time -o out.txt ls",
+        "time -o out.txt ls",
+        "ls | time -a -o out.txt ls",
+        "ls | time -p -o out.txt ls",
+        "ls | time -ao out.txt ls",
+        "ls | time -l ls",
+        "echo a | xargs time -o out.txt ls",
+        "env time -o out.txt ls",
+    ] {
+        let v = classify_command(cmd);
+        assert!(!v.read_only, "{cmd:?} must not be read-only: {v:?}");
+        assert!(v.reason.contains("time"), "{cmd:?}: {v:?}");
+    }
+    // NEGATIVE CONTROLS
+    for cmd in [
+        "time ls",
+        "time -p ls",
+        "ls | time ls",
+        "ls | time -p ls",
+        "X=1 time -p ls",
+        "time -p git status",
+    ] {
+        assert!(
+            ro(cmd),
+            "{cmd:?} must stay read-only: {:?}",
+            classify_command(cmd)
+        );
+    }
+}
+
+/// WHAT A WRAPPER OR `time` RUNS IS NEVER A KEYWORD, in [`runs`] as in the head check: `env if
+/// git status` runs a program `if` (the word `env` execs), not `git`, so `runs` names the `if`.
+/// `supervise::policy::git_config` and [`arithmetic_scan`] place a segment's command by it.
+/// NEGATIVE CONTROLS: where a command begins, the keyword is skipped and the program after it is
+/// the command (`if git status`, `then git log`, `! git status`), and a wrapper's program that is
+/// no reserved word is placed as before (`env git status`, `time git log`).
+#[test]
+fn what_a_wrapper_or_time_runs_is_never_a_keyword() {
+    let placed = |line: &str| -> String {
+        let seg: Vec<String> = line.split_whitespace().map(str::to_string).collect();
+        match runs(&seg) {
+            Ok(Some(r)) => seg[r.at].clone(),
+            other => format!("{other:?}"),
+        }
+    };
+    for (line, want) in [
+        ("env if git status", "if"),
+        ("env X=1 for git log", "for"),
+        ("xargs if git status", "if"),
+        ("timeout 5 if git status", "if"),
+        ("X=1 if git status", "if"),
+        ("time if git status", "if"),
+        ("time -p while git status", "while"),
+    ] {
+        assert_eq!(placed(line), want, "{line:?}");
+    }
+    // NEGATIVE CONTROLS
+    for (line, want) in [
+        ("if git status", "git"),
+        ("then git log", "git"),
+        ("! git status", "git"),
+        ("env git status", "git"),
+        ("time git log", "git"),
+        ("X=1 git status", "git"),
+    ] {
+        assert_eq!(placed(line), want, "{line:?}");
+    }
+}
+
+/// AN ARITHMETIC EVALUATION IS REFUSED WHOLE ([`ARITHMETIC_RUNS`]): `$((…))` and `((…))` assign
+/// any variable in their list, the second and later too, and evaluate a value's subscript.
+/// MEASURED, bash 3.2 in a directory holding `./0/ls`: `echo $((x=1,PATH=0)); ls` and `(( x=1,
+/// PATH=0 )); ls` ran it, and `ls='a[$(touch M)]'; echo $((ls))` made `M`. The segment readers
+/// had read `$((x=1,PATH=0))` as a subshell running an assignment to `x`, so the line was a read
+/// (and Claude Code 2.1.307's too-many box over one, `breaker-read-only@v1`'s, was approved).
+/// NEGATIVE CONTROLS: a substitution or subshell holding a subshell, spaced (`$( (ls) )`, `( (ls)
+/// )`), the same text single-quoted, and a comma in a plain assignment (bash 3.2: `x=1,PATH=0;
+/// ls` leaves `PATH` alone and runs the real `ls`) stay reads.
+#[test]
+fn an_arithmetic_evaluation_is_refused_whole() {
+    for cmd in [
+        "echo $((x=1,PATH=0)); ls",
+        "echo $((a=b=c=PATH=0)); ls",
+        "echo $((x=1,HOME=0)); git diff",
+        "cat f $((x=1,PATH=0))",
+        "echo $((x=1?PATH=0:1)); ls",
+        "echo \"$((x=1,PATH=0))\"; ls",
+        "echo `echo $((x=1,PATH=0))`; ls",
+        "echo $(echo $((x=1,PATH=0))); ls",
+        "(( x=1,PATH=0 )); ls",
+        "((x=1,PATH=0)); ls",
+        "if (( 1 )); then ls; fi",
+        "ls='a[$(touch M)]'; echo $((ls))",
+        "echo $((ls) )",
+        "((ls) )",
+        "echo $((1+2))",
+        "for ((i=0;i<1;i++)); do ls; done",
+    ] {
+        let v = classify_command(cmd);
+        assert!(!v.read_only, "{cmd:?} must not be read-only: {v:?}");
+        assert!(
+            v.reason.contains("an arithmetic evaluation"),
+            "{cmd:?}: {v:?}"
+        );
+    }
+    // NEGATIVE CONTROLS
+    for cmd in [
+        "echo $( (ls) )",
+        "( (ls) )",
+        "( ls )",
+        "echo '$((x=1,PATH=0))'",
+        "x=1,PATH=0; ls",
+        "echo \"$(ls)\"",
+    ] {
+        assert!(
+            ro(cmd),
+            "{cmd:?} must stay read-only: {:?}",
+            classify_command(cmd)
+        );
+    }
+}
+
 /// An awk program or sed script supplied by a parameter is refused like one supplied by a
 /// substitution ([`program_words`] marks every expansion).
 #[test]
@@ -1986,8 +2188,10 @@ fn a_brace_glued_to_a_word_closes_the_group() {
 }
 
 /// The reads a worker writes are plain; every form known to run a command under zsh is not, by
-/// the character that opens it rather than by a rule of its own, and neither is any expansion,
-/// so a form nobody has measured needs one of these characters too.
+/// the character that opens it rather than by a rule of its own, and neither is any expansion
+/// but a plain parameter read or command substitution
+/// ([`a_plain_line_admits_only_the_expansions_zsh_takes_no_further_than_bash`]), so a form
+/// nobody has measured needs one of these characters too.
 #[test]
 fn a_plain_line_expands_nothing() {
     for line in [
@@ -2006,6 +2210,8 @@ fn a_plain_line_expands_nothing() {
         "echo 'it''s' \"a\"'b'",
         "wc -l café.txt [ab]*.md",
         "grep -n for src | grep if; echo 'while' done",
+        "ls \"$HOME\"",
+        "echo ${HOME}",
     ] {
         assert_eq!(plain_zsh_line(line), Ok(()), "{line:?}");
     }
@@ -2026,7 +2232,6 @@ fn a_plain_line_expands_nothing() {
         "if ls; then ls; fi",
         "time ls",
         "export PATH",
-        "printf %d \"path[$(id)]\"",
         "ls $=S",
         "echo \"$S:h\"",
         "diff =(ls) <(ls)",
@@ -2034,9 +2239,7 @@ fn a_plain_line_expands_nothing() {
         "=ls",
         "ls ~[x]",
         "ls ~root",
-        // Any expansion, quote escape or compound.
-        "ls \"$HOME\"",
-        "echo ${HOME}",
+        // Any other expansion, quote escape or compound.
         "echo `id`",
         "ls $'\\x41'",
         "echo \"\\$x\"",
@@ -2061,6 +2264,104 @@ fn a_plain_line_expands_nothing() {
         "ls \u{1b}[2J",
         "ls 'open",
         "ls \"open",
+    ] {
+        assert!(plain_zsh_line(line).is_err(), "{line:?} must not be plain");
+    }
+}
+
+/// A PLAIN LINE ADMITS ONLY THE EXPANSIONS ZSH TAKES NO FURTHER THAN BASH (MEASURED 2026-10-22
+/// against `/bin/zsh` 5.9 run as Claude Code's Bash tool runs it, a scratch HOME and ZDOTDIR,
+/// `docs/measured/breaker-transcript-and-zsh-2026-10-22.md`): a parameter read `$NAME` or
+/// `${NAME}`, quoted or not (zsh neither splits nor globs it unquoted; bash does both), and a
+/// command substitution `$(…)` over a plain line (zsh splits and does not glob it; bash globs
+/// too), nested, quoted, and with quotes inside; the classifier still judges what each runs and
+/// which words it feeds (`printf %d "path[$(id)]"` is plain and no read: zsh evaluates printf's
+/// numeric argument as arithmetic).
+///
+/// NEGATIVE CONTROLS, each measured to run code, assign or expand further under zsh, or written
+/// so this reader could not tell where zsh ends it: `${(e)x}` (ran `touch`), `${~x}` (globs),
+/// `${=x}` (splits), `${^x}`, a subscript right after a read (`$x[PATH=0]` assigned PATH and ran
+/// `./0/ls`, quoted and braced too), a modifier (`$x:h`), `${x:=v}` (assigns), `$=x`, `$~x`,
+/// `$^x`, `$((…))`, every special parameter, `$'…'`, `$"…"`, a bare `$`, a name run into a
+/// character outside ASCII (zsh may read it as more of the name), and inside a `$(…)`: a
+/// comment (it can hide the `)` from this reader), a newline, a backtick, a subshell, a
+/// reserved word, an assignment, an arithmetic `$((`, a missing `)`, nesting past eight.
+#[test]
+fn a_plain_line_admits_only_the_expansions_zsh_takes_no_further_than_bash() {
+    for line in [
+        "echo $x",
+        "echo ${x}",
+        "ls \"$HOME\"/x ${HOME}/y",
+        "echo $x-y $x.y $x/y $a$b $_x $x,",
+        "echo \"$(ls)\" $(git status --short)",
+        "echo $(echo $(ls))",
+        "echo \"a $(echo \")\") b\"",
+        "echo $(echo 'a)b')",
+        "cat $(echo a) < $(echo f)",
+        "echo $(<f) $()",
+        "printf %d \"path[$(id)]\"",
+        "echo $(echo $(echo $(echo $(echo $(echo $(echo $(echo $(echo a))))))))",
+    ] {
+        assert_eq!(plain_zsh_line(line), Ok(()), "{line:?}");
+    }
+    assert!(
+        plain_zsh_line("echo $((x=1,PATH=0))").is_err_and(|e| e.contains("arithmetic")),
+        "refused as the arithmetic it is"
+    );
+    let v = classify_command("printf %d \"path[$(id)]\"");
+    assert!(!v.read_only, "{v:?}");
+    let v = classify_command("echo \"$(ls)\" $x ${HOME}");
+    assert!(v.read_only, "{v:?}");
+    // NEGATIVE CONTROLS
+    for line in [
+        "echo ${(e)x}",
+        "echo ${~x}",
+        "echo ${=x}",
+        "echo ${^x}",
+        "echo $x[PATH=0]; ls",
+        "echo \"$x[PATH=0]\"; ls",
+        "echo ${x[PATH=0]}; ls",
+        "echo ${x}[1]",
+        "echo $x:h",
+        "echo \"$x:h\"",
+        "echo ${x:h}",
+        "echo ${x:=v}",
+        "echo ${#x}",
+        "echo $=x $~x $^x",
+        "echo $~x",
+        "echo $^x",
+        "echo $((x=1,PATH=0)); ls",
+        "echo \"$(( 1 ))\"",
+        "echo $1",
+        "echo $#",
+        "echo $$",
+        "echo $?",
+        "echo \"$@\"",
+        "echo $*",
+        "echo $-",
+        "echo $!",
+        "echo $'a'",
+        "echo $\"a\"",
+        "echo $",
+        "echo \"$\"",
+        "echo $x(N)",
+        "echo $x{a,b}",
+        "echo $x\u{e9}",
+        "echo ${x}\u{e9}",
+        "echo $(echo a # )\n)",
+        "echo $(echo a # ) ')'",
+        "echo $(echo a\nls)",
+        "echo $(ls",
+        "echo $(echo `id`)",
+        "echo $( (ls) )",
+        "echo $(for x in a; do ls; done)",
+        "echo $(path=/x ls)",
+        "echo $(echo $((1)))",
+        "echo \"$(echo \"$((1))\")\"",
+        "echo $(echo \\x)",
+        "echo $(echo $(echo $(echo $(echo $(echo $(echo $(echo $(echo $(echo a)))))))))",
+        "echo $(echo a)[1]",
+        "echo $(echo /a/b):h",
     ] {
         assert!(plain_zsh_line(line).is_err(), "{line:?} must not be plain");
     }

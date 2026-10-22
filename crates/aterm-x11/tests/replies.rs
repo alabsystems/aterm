@@ -16,7 +16,7 @@ use std::collections::BTreeMap;
 use crate::support::*;
 use aterm_x11::proto::event::Event;
 use aterm_x11::proto::xproto::*;
-use aterm_x11::proto::{ParseError, Reply, randr, shm, xinput};
+use aterm_x11::proto::{ParseError, Reply, randr, shm, sync, xinput};
 
 const REPLIES: &str = "x11rb-protocol-0.13.2-replies.tsv";
 const EVENTS: &str = "x11rb-protocol-0.13.2-events.tsv";
@@ -343,6 +343,15 @@ fn parse_reply(case: &str, bytes: &[u8]) -> String {
                 list(&r.buttons)
             )
         }),
+        "sync_initialize" => render(bytes, |r: &sync::InitializeReply| {
+            format!(
+                "major_version={} minor_version={}",
+                r.major_version, r.minor_version
+            )
+        }),
+        c if c.starts_with("sync_query_counter") => render(bytes, |r: &sync::QueryCounterReply| {
+            format!("counter_value={}", r.counter_value)
+        }),
         c if c.starts_with("setup") => {
             Setup::parse(bytes).map_or_else(|_| "ERR".to_owned(), |s| render_setup(&s))
         }
@@ -398,7 +407,7 @@ fn recorded(name: &str) -> BTreeMap<String, (Vec<u8>, String)> {
 #[test]
 fn every_reply_and_setup_parses_as_x11rb_protocol_parsed_it() {
     let rec = recorded(REPLIES);
-    assert!(rec.len() >= 38, "the corpus is whole: {}", rec.len());
+    assert!(rec.len() >= 43, "the corpus is whole: {}", rec.len());
     let want: BTreeMap<_, _> = rec
         .iter()
         .map(|(c, (_, f))| (c.clone(), f.clone()))

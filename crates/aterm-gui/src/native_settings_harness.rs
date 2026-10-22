@@ -77,9 +77,10 @@
 //!    more are at their defaults, and under the card a disclosure that lists
 //!    all of them (thirty keys are most of a page on their own).
 //!
-//! The cards are whole: a control card taller than one screen's room is split
-//! into continued cards ([`chunk_rows`]), a row taller than a screen is listed
-//! a part at a time by the page's list, as on every page
+//! The cards are whole: a control card taller than one screen's room is
+//! listed a row at a time by the page's list, which keeps its heading over a
+//! screen that starts inside it ([`scroll::SplitCard`]), a row taller than a
+//! screen is listed a part at a time, as on every page
 //! ([`scroll::row_parts`]), a fact card taller than the screen scrolls by its
 //! rows, and the cards are one scrolling list, as on every Settings page. A
 //! heading that would not be whole takes its short words ([`card_heading`]);
@@ -266,35 +267,21 @@ fn harness_page_title(width: f32) -> &'static str {
     }
 }
 
-/// A card's heading at `width`: its full words, else its short ones; a
-/// continued card's says so after them where that fits too. Where not even
-/// the short words are one line, the full words, which the card wraps to its
-/// column ([`caption_node`]) — a caption is never cut ("SUPERVISI…" at 2×
-/// text on a phone-width card).
-pub(super) fn card_heading(full: &str, short: &str, continued: bool, width: f32) -> String {
+/// A card's heading at `width`: its full words, else its short ones. Where
+/// not even the short words are one line, the full words, which the card
+/// wraps to its column ([`caption_node`]) — a caption is never cut
+/// ("SUPERVISI…" at 2× text on a phone-width card).
+pub(super) fn card_heading(full: &str, short: &str, width: f32) -> String {
     let (px, face) = crate::native_ui::text_paint_metrics(SemanticRole::Heading, StyleRef::Quiet);
     let fits = |text: &str| {
         crate::tray_raster::ui_text_width_for(face, text, px)
             <= width + crate::native_ui::TEXT_FIT_SLACK
     };
-    let mut candidates = Vec::new();
-    if continued {
-        candidates.push(format!("{full} \u{b7} CONTINUED"));
-        candidates.push(format!("{short} \u{b7} CONTINUED"));
-    }
-    candidates.push(full.to_string());
-    candidates.push(short.to_string());
-    candidates
-        .iter()
+    [full, short]
+        .into_iter()
         .find(|text| fits(text))
-        .cloned()
-        .unwrap_or_else(|| {
-            if continued {
-                format!("{full} \u{b7} CONTINUED")
-            } else {
-                full.to_string()
-            }
-        })
+        .unwrap_or(full)
+        .to_string()
 }
 
 /// The page's palette commands while it is the route.
@@ -1197,15 +1184,21 @@ pub(super) fn metadata_cards(
     card_width: f32,
     label_width: f32,
 ) -> Vec<(UiNode, f32)> {
-    let caption = card_heading(heading.0, heading.1, false, card_text_width(card_width));
+    let caption = card_heading(heading.0, heading.1, card_text_width(card_width));
     vec![metadata_card(key, &caption, rows, card_width, label_width)]
 }
 
-/// A card of control rows, split into continued cards no taller than `room`
-/// ([`chunk_rows`]): a Secondary group, its heading, then its rows. `names`
-/// is its semantic label and its heading's full and short words. Its padding
-/// is the page's, or, over and under its rows, a tight one where the room
-/// holds its tallest row only that way (a short host at large type).
+/// A card of control rows: a Secondary group, its heading, then its rows —
+/// ONE CARD, however tall, as every group of a settings list is: the page's
+/// list lists it a row at a time and keeps its heading over a screen that
+/// starts inside it ([`scroll::SplitCard`]). Cut into continued cards no
+/// taller than the room, a group drew a second `· CONTINUED` heading under
+/// the one the list keeps, two identical headings on one screen (Settings ▸
+/// Harness at 102x29: SUPERVISION · CONTINUED over a shared note, again
+/// over Default autopilot). `names` is its semantic label and its heading's
+/// full and short words. Its padding is the page's, or, over and under its
+/// rows, a tight one where the room holds its tallest row only that way (a
+/// short host at large type).
 ///
 /// ITS ROWS ARE MEASURED IN THE BOX THEY ARE DRAWN IN: every caller lays its
 /// rows out in the card's text column ([`card_text_width`]), so the card
@@ -1245,17 +1238,12 @@ fn row_cards_inset(
     let (label, heading) = names;
     let side = card_side_padding(card_width);
     let inner = card_text_width(card_width);
-    // The caption a card wears, its continuations' too, wrapped to the
-    // card's text column ([`caption_node`]); the taller of the two sets the
-    // room each card's rows get, so every continued card fits as the first.
-    let caption = |key: &str, continued: bool| {
-        caption_node(
-            &format!("{key}/heading"),
-            &card_heading(heading.0, heading.1, continued, inner),
-            inner,
-        )
-    };
-    let heading_height = caption(key, false).1.max(caption(key, true).1);
+    // The caption, wrapped to the card's text column ([`caption_node`]).
+    let (heading, heading_height) = caption_node(
+        &format!("{key}/heading"),
+        &card_heading(heading.0, heading.1, inner),
+        inner,
+    );
     // The tallest ROW, whole (the page's list lists a row taller than its
     // screen a part at a time, [`scroll::row_parts`]): the padding is the
     // list's, decided by its rows, so a row that comes to be listed in parts
@@ -1270,101 +1258,66 @@ fn row_cards_inset(
     } else {
         TIGHT_CARD_PAD
     };
-    let fixed = 2.0 * pad + heading_height;
     let (inset_x, inset_y) = if blocks {
         (ROW_INSET, CARD_GAP / 2.0)
     } else {
         (0.0, 0.0)
     };
-    chunk_rows(rows, room - fixed)
-        .into_iter()
-        .enumerate()
-        .map(|(index, rows)| {
-            let (key, label) = if index == 0 {
-                (key.to_string(), label.to_string())
-            } else {
-                (
-                    format!("{key}/continued-{index}"),
-                    format!("{label}, continued"),
-                )
-            };
-            let (mut heading, heading_height) = caption(&key, index > 0);
-            let height = 2.0 * pad
-                + heading_height
-                + rows
-                    .iter()
-                    .map(|(_, height)| height + CARD_GAP)
-                    .sum::<f32>();
-            if blocks {
-                heading = UiNode::new(
-                    format!("{key}/heading-frame"),
-                    UiContent::Group(GroupSpec::unlabeled(SemanticRole::Group)),
-                )
-                .layout(
-                    Layout::column()
-                        .height(Length::Fixed(heading_height + inset_y))
-                        .padding(Insets {
-                            top: 0.0,
-                            right: inset_x,
-                            bottom: inset_y,
-                            left: inset_x,
-                        }),
-                )
-                .paint_only()
-                .children(vec![heading]);
-            }
-            let mut children = vec![heading];
-            children.extend(rows.into_iter().map(|(mut row, height)| {
-                if blocks {
-                    row.layout = row
-                        .layout
-                        .height(Length::Fixed(height + 2.0 * inset_y))
-                        .padding(Insets::symmetric(inset_x, inset_y));
-                }
-                row
-            }));
-            let card = UiNode::new(
-                key,
-                UiContent::Group(GroupSpec::new(label).style(StyleRef::Secondary)),
-            )
-            .layout(
-                Layout::column()
-                    .width(Length::Fill)
-                    .height(Length::Fixed(height))
-                    .padding(Insets {
-                        top: pad,
-                        right: side - inset_x,
-                        bottom: pad - inset_y,
-                        left: side - inset_x,
-                    })
-                    .gap(CARD_GAP - 2.0 * inset_y)
-                    .clipped(),
-            )
-            .children(children);
-            (card, height)
-        })
-        .collect()
-}
-
-/// `rows` in order, greedily grouped so each group's rows (and the gap above
-/// each) fit `room`; every group holds at least one row. Pure.
-fn chunk_rows(rows: Vec<(UiNode, f32)>, room: f32) -> Vec<Vec<(UiNode, f32)>> {
-    let mut chunks: Vec<Vec<(UiNode, f32)>> = Vec::new();
-    let mut current = Vec::new();
-    let mut used = 0.0_f32;
-    for (row, height) in rows {
-        let cost = height + CARD_GAP;
-        if !current.is_empty() && used + cost > room {
-            chunks.push(std::mem::take(&mut current));
-            used = 0.0;
+    let height = 2.0 * pad
+        + heading_height
+        + rows
+            .iter()
+            .map(|(_, height)| height + CARD_GAP)
+            .sum::<f32>();
+    let heading = if blocks {
+        UiNode::new(
+            format!("{key}/heading-frame"),
+            UiContent::Group(GroupSpec::unlabeled(SemanticRole::Group)),
+        )
+        .layout(
+            Layout::column()
+                .height(Length::Fixed(heading_height + inset_y))
+                .padding(Insets {
+                    top: 0.0,
+                    right: inset_x,
+                    bottom: inset_y,
+                    left: inset_x,
+                }),
+        )
+        .paint_only()
+        .children(vec![heading])
+    } else {
+        heading
+    };
+    let mut children = vec![heading];
+    children.extend(rows.into_iter().map(|(mut row, height)| {
+        if blocks {
+            row.layout = row
+                .layout
+                .height(Length::Fixed(height + 2.0 * inset_y))
+                .padding(Insets::symmetric(inset_x, inset_y));
         }
-        used += cost;
-        current.push((row, height));
-    }
-    if !current.is_empty() || chunks.is_empty() {
-        chunks.push(current);
-    }
-    chunks
+        row
+    }));
+    let card = UiNode::new(
+        key,
+        UiContent::Group(GroupSpec::new(label).style(StyleRef::Secondary)),
+    )
+    .layout(
+        Layout::column()
+            .width(Length::Fill)
+            .height(Length::Fixed(height))
+            .padding(Insets {
+                top: pad,
+                right: side - inset_x,
+                bottom: pad - inset_y,
+                left: side - inset_x,
+            })
+            .gap(CARD_GAP - 2.0 * inset_y)
+            .clipped(),
+    )
+    .children(children);
+    vec![(card, height)]
 }
 
 /// The page's four actions under the STATUS card: Refresh (busy while the
@@ -1533,8 +1486,8 @@ fn switch_rows(
         .filter(|key| state.field_index_of(key).is_some())
         .collect();
     let notes = prefs::row_notes(&keys);
-    // What one row of a continued card may take: the room under its heading,
-    // at the tight padding.
+    // What one row may take: the room under its card's heading, at the
+    // tight padding.
     let heading_height = 22.0_f32.max(16.0 * settings_text_scale());
     let row_room = (room - 2.0 * TIGHT_CARD_PAD - heading_height - CARD_GAP).max(0.0);
     let rows: Vec<(&str, Option<prefs::RowNote<'_>>)> = keys.iter().copied().zip(notes).collect();

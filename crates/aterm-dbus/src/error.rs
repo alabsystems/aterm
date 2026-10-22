@@ -36,7 +36,8 @@ pub enum Error {
 pub type Result<T> = std::result::Result<T, Error>;
 
 impl Error {
-    pub(crate) fn malformed(what: &'static str, at: usize) -> Self {
+    #[inline]
+    pub(crate) const fn malformed(what: &'static str, at: usize) -> Self {
         Self::Malformed { what, at }
     }
 }

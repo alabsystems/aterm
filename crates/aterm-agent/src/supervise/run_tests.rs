@@ -343,6 +343,16 @@ struct Mock {
     /// This many `key` requests find the content seq moved one on (a row
     /// that ticks between the read and the press, the box unchanged).
     tick_at_key: usize,
+    /// The screen redraws itself this often on the run's clock, the box
+    /// unchanged (Claude Code's auto-deny countdown, `1:59`, `1:58`, …): a
+    /// `key` fenced `if-gen=` that arrives this long or longer after the last
+    /// `text` read finds the content seq moved one on and is skipped
+    /// (`OK skipped reason=changed`) before it reaches the program, so it
+    /// releases no gate ([`Self::key_gates`]).
+    ticks: Option<Duration>,
+    /// When the last `text` read was served, on the run's clock
+    /// ([`Self::ticks`]).
+    read_at: Option<Instant>,
     /// `status program=`: the session's foreground program.
     program: &'static str,
     /// The program's name as the server resolves it late (off its event loop): `await agent
@@ -411,6 +421,10 @@ struct Mock {
     /// Per-screen wire count, overriding `human_seq` without changing the
     /// server's own counter: a later read can omit a formerly supplied field.
     human_seq_on: BTreeMap<usize, Option<u64>>,
+    /// `text --json`'s `"submits"` on each screen (by index), the host's
+    /// count of submissions written to the session (aterm-gui's
+    /// `submit_count`); a screen with none sends none, as an older host.
+    submits_on: BTreeMap<usize, u64>,
     /// The server's launch witness (aterm-gui's `launch_witness`), as its
     /// last signed command start left it; `None`: a host that sends none.
     /// Published as the server publishes it, `text --json`'s `"launch"`
@@ -446,6 +460,11 @@ struct Mock {
     /// [`Self::cell_fg`] and [`Self::cell_attrs`]: a measured cell (a
     /// completion menu's entry drawn in its colour).
     cells: BTreeMap<(usize, usize), String>,
+    /// The reply a `cell abs=<n> <col>` read gets at a row of
+    /// [`Self::scrollback`] (`n` below its length, as the server places the
+    /// grid's first row at `screen_first=`); a grid row's is
+    /// [`Self::cells`]'s at `n` less the history's length.
+    history_cells: BTreeMap<(usize, usize), String>,
     /// `human_ms` for the status reads to come, one each, before it
     /// answers for all the rest: a person who stops typing.
     human_ms_reads: VecDeque<Option<u64>>,
@@ -1219,6 +1238,8 @@ impl Mock {
             uncounted: 0,
             idle_never: false,
             tick_at_key: 0,
+            ticks: None,
+            read_at: None,
             program: "claude",
             program_resolves_to: None,
             agent: "-",
@@ -1243,6 +1264,7 @@ impl Mock {
             hand: "-",
             human_seq: None,
             human_seq_on: BTreeMap::new(),
+            submits_on: BTreeMap::new(),
             launch: None,
             person_at_key: 0,
             person_at_send: 0,
@@ -1253,6 +1275,7 @@ impl Mock {
             cell_fg: "d0d0d0",
             cell_unreadable: false,
             cells: BTreeMap::new(),
+            history_cells: BTreeMap::new(),
             human_ms_reads: VecDeque::new(),
             status_human_from: BTreeMap::new(),
             agent_pushes: false,
@@ -1477,12 +1500,21 @@ impl Mock {
         )
     }
     /// The measured reply of the `cell <row> <col>` read `tail` names
-    /// ([`Self::cells`]).
+    /// ([`Self::cells`]), or of `cell abs=<n> <col>` ([`Self::history_cells`]
+    /// above the grid, [`Self::cells`] on it).
     fn measured_cell(&self, tail: &[&str]) -> Option<String> {
         let [row, col] = tail else { return None };
-        self.cells
-            .get(&(row.parse().ok()?, col.parse().ok()?))
-            .cloned()
+        let col = col.parse().ok()?;
+        let Some(abs) = row.strip_prefix("abs=") else {
+            return self.cells.get(&(row.parse().ok()?, col)).cloned();
+        };
+        let abs: usize = abs.parse().ok()?;
+        let above = self.history().len();
+        if abs < above {
+            self.history_cells.get(&(abs, col)).cloned()
+        } else {
+            self.cells.get(&(abs - above, col)).cloned()
+        }
     }
 
     /// `search <^literal> regex` over [`Self::scrollback`] and the screen
@@ -1723,6 +1755,9 @@ impl Mock {
         }
         if let Some(launch) = self.launch {
             human.push_str(&format!(",\"launch\":{}", launch.json(self.human_seq)));
+        }
+        if let Some(n) = self.submits_on.get(&i) {
+            human.push_str(&format!(",\"submits\":{n}"));
         }
         // `dims.rows` is the PANE's height, as the server sends it: the
         // screen's whole height, whatever slice `tail=` served.
@@ -2543,6 +2578,7 @@ impl Mock {
                 self.reset_read();
                 let before = self.served;
                 let body = self.screen_json(rows);
+                self.read_at = Some(run_now(self.waits.as_deref()));
                 if let Some(word) = self.autopilot_on.get(&before) {
                     self.autopilot = *word;
                 }
@@ -2790,6 +2826,15 @@ impl Mock {
                     {
                         return Ok(r);
                     }
+                }
+                // A screen that ticks ([`Self::ticks`]): a fenced key a tick
+                // after its read never reaches the program.
+                if let (Some(tick), Some(read)) = (self.ticks, self.read_at)
+                    && tail.iter().any(|a| a.starts_with("if-gen="))
+                    && run_since(self.waits.as_deref(), read) >= tick
+                {
+                    self.seq += 1;
+                    return Ok(ok(&format!("OK skipped reason=changed seq={}\n", self.seq)));
                 }
                 self.keyed = true;
                 self.keys += 1;
@@ -3948,6 +3993,116 @@ fn a_span_the_grid_no_longer_has_is_read_again() {
     );
 }
 
+/// A READ TORN MID-REPAINT IS NO POINT (`r7-both` L6, Claude Code 2.1.307,
+/// 2026-10-22). A reply growing under the window is repainted row by row,
+/// its footer last; the busy footer's `await gone` latched at a batch between
+/// the bottom rule (drawn 109 of 144 columns, on the grid's last row) and the
+/// footer row, and the read there showed the composer frame and no busy
+/// footer: idle to every reader, `- check 65 passed` of 80 judged a point,
+/// and the reply's `NEEDS YOU:` above the window never read. An idle read
+/// straight after that latch whose frame is not whole — its bottom rule cut
+/// short, or on the last row with no footer under it — is read again after
+/// the short settle, and that read decides: here the reply still streaming
+/// (the footer back), then its end. NEGATIVE CONTROL: a whole frame read
+/// after the latch is the point at once, with no settle.
+#[test]
+fn an_idle_read_torn_mid_repaint_is_read_again_after_the_settle() {
+    let footer = "  ⏵⏵ auto mode on (shift+tab to cycle)";
+    // The reply streaming, its rows from `first` to `last` in sight (a read
+    // is the window's tail).
+    let streaming = |first: usize, last: usize| {
+        let mut r = if first == 1 {
+            rows(&[
+                "⏺ Here is the landing report.",
+                "  NEEDS YOU: rotate the deploy key",
+                "",
+            ])
+        } else {
+            Vec::new()
+        };
+        r.extend((first..=last).map(|i| format!("  - check {i} passed")));
+        r.push(String::new());
+        r.extend(composer(&format!("{footer} · esc to interrupt")));
+        r
+    };
+    // The frame cut where a repaint stood, with no footer row under it: the
+    // live read's bottom rule part drawn, and the rule whole with the footer
+    // still to come.
+    let torn = |bottom: usize| {
+        let mut r: Vec<String> = (30..=65).map(|i| format!("  - check {i} passed")).collect();
+        r.extend([
+            String::new(),
+            "─".repeat(120),
+            "❯".to_string(),
+            "─".repeat(bottom),
+        ]);
+        r
+    };
+    let mut end: Vec<String> = (75..=80).map(|i| format!("  - check {i} passed")).collect();
+    end.extend(rows(&[
+        "  Nothing left: the parser is committed and pushed to origin/main.",
+        "",
+        "✻ Worked for 5s · done 6:12 PM",
+        "",
+    ]));
+    end.extend(composer(footer));
+    let run = |screens: Vec<Vec<String>>| {
+        let mut m = Mock::new(screens);
+        m.gone_on_next = true;
+        let mut s = session(&mut m, None);
+        let t = s.await_turn(Duration::from_secs(60)).expect("turn");
+        (t, m.requests)
+    };
+    for bottom in [90, 120] {
+        let cut = torn(bottom);
+        assert_eq!(
+            worker_phase(&cut),
+            Phase::Idle,
+            "every reader reads it idle"
+        );
+        assert!(has_composer_frame(&cut));
+        let (t, requests) = run(vec![streaming(1, 21), cut, streaming(36, 70), end.clone()]);
+        assert_eq!(t.phase, Phase::Idle, "{bottom}: {requests:#?}");
+        assert_eq!(
+            t.screen.rows, end,
+            "{bottom}: the reply's end decides, never the torn read: {requests:#?}"
+        );
+        assert_eq!(
+            requests[2..6],
+            [
+                "await gone esc.to.interrupt rows 1 28 timeout 20000",
+                "text --json tail=40",
+                "await idle 500 timeout 1500",
+                "text --json tail=40",
+            ],
+            "{bottom}: {requests:#?}"
+        );
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|r| r.starts_with("await idle"))
+                .count(),
+            1,
+            "{bottom}: the end's whole frame takes no settle: {requests:#?}"
+        );
+    }
+    // NEGATIVE CONTROL: no tear, the footer leaving at the end.
+    let (t, requests) = run(vec![streaming(1, 21), end.clone()]);
+    assert_eq!(
+        (t.phase, &t.screen.rows),
+        (Phase::Idle, &end),
+        "{requests:#?}"
+    );
+    assert_eq!(
+        requests[2..],
+        [
+            "await gone esc.to.interrupt rows 1 28 timeout 20000",
+            "text --json tail=40",
+        ],
+        "{requests:#?}"
+    );
+}
+
 /// A transport that answers every request with one reply and records
 /// what it was sent: the session log's `act` marks, alone.
 struct MarkFake {
@@ -3970,7 +4125,7 @@ impl Ctl for MarkFake {
 /// no other verb is ever sent for one.
 #[test]
 fn a_refused_act_mark_latches_the_rest_off() {
-    let first = "@s-1 mark - act word=approve rule=read-only.classify-v3";
+    let first = "@s-1 mark - act word=approve rule=read-only.classify-v4";
     for (err, latched) in [
         ("ERR unknown verb 'mark' (help lists them)", true),
         ("ERR usage: mark <node|-> <kind> [word=<w>] …", true),
@@ -3987,7 +4142,7 @@ fn a_refused_act_mark_latches_the_rest_off() {
         };
         let mut s = Session::new(&mut fake, Some("@s-1".to_string()));
         s.act_marks
-            .queue("act word=approve rule=read-only.classify-v3".to_string());
+            .queue("act word=approve rule=read-only.classify-v4".to_string());
         s.act_marks.queue("act word=escalate".to_string());
         s.send_act_marks();
         s.act_marks.queue("act word=deny rule=write.v1".to_string());
@@ -4043,7 +4198,7 @@ fn supervise_auto_approves_reads_guarded_and_hands_over_writes() {
             "@s-9 key if-human=7 if-gen=1.101 if=^\\x20{3}git\\x20log\\x20--oneline\\x20-5\\s*$ 1",
             "@s-9 await seq 101 timeout 20000",
             "@s-9 text --json tail=40",
-            "@s-9 mark - act word=approve rule=read-only.classify-v3",
+            "@s-9 mark - act word=approve rule=read-only.classify-v4",
             "@s-9 await idle 500 timeout 1500",
             "@s-9 text --json tail=40",
             "@s-9 status",
@@ -4210,7 +4365,7 @@ fn the_same_box_is_never_pressed_twice_on_an_unchanged_screen() {
             "key if-human=7 if-gen=1.101 if=^\\x20{3}git\\x20log\\x20--oneline\\x20-5\\s*$ 1",
             "await seq 101 timeout 20000",
             "text --json tail=40",
-            "mark - act word=approve rule=read-only.classify-v3",
+            "mark - act word=approve rule=read-only.classify-v4",
         ],
         "{:?}",
         m.requests
@@ -5191,7 +5346,7 @@ fn nothing_happens_after_the_budget() {
     assert_eq!(m.requests.len(), 9, "nothing read after: {:?}", m.requests);
     assert_eq!(
         m.requests.last().map(String::as_str),
-        Some("mark - act word=approve rule=read-only.classify-v3")
+        Some("mark - act word=approve rule=read-only.classify-v4")
     );
 }
 

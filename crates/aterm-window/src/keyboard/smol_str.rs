@@ -38,6 +38,7 @@ enum Repr {
 
 impl SmolStr {
     /// `text` as a `SmolStr`.
+    #[inline]
     pub fn new<T: AsRef<str>>(text: T) -> SmolStr {
         let text = text.as_ref();
         match u8::try_from(text.len()) {
@@ -51,6 +52,7 @@ impl SmolStr {
     }
 
     /// The text.
+    #[inline]
     pub fn as_str(&self) -> &str {
         match &self.0 {
             // `new` copied exactly `len` bytes of a `str` here, so this never fails; the check
@@ -63,6 +65,7 @@ impl SmolStr {
 }
 
 impl Default for SmolStr {
+    #[inline]
     fn default() -> Self {
         SmolStr(Repr::Inline { len: 0, buf: [0; INLINE_CAP] })
     }
@@ -71,30 +74,35 @@ impl Default for SmolStr {
 impl Deref for SmolStr {
     type Target = str;
 
+    #[inline]
     fn deref(&self) -> &str {
         self.as_str()
     }
 }
 
 impl AsRef<str> for SmolStr {
+    #[inline]
     fn as_ref(&self) -> &str {
         self.as_str()
     }
 }
 
 impl Borrow<str> for SmolStr {
+    #[inline]
     fn borrow(&self) -> &str {
         self.as_str()
     }
 }
 
 impl From<&str> for SmolStr {
+    #[inline]
     fn from(text: &str) -> Self {
         SmolStr::new(text)
     }
 }
 
 impl From<String> for SmolStr {
+    #[inline]
     fn from(text: String) -> Self {
         SmolStr::new(text)
     }
@@ -102,6 +110,7 @@ impl From<String> for SmolStr {
 
 // Equality, order and hash are the text's, as `Borrow<str>` requires.
 impl PartialEq for SmolStr {
+    #[inline]
     fn eq(&self, other: &Self) -> bool {
         self.as_str() == other.as_str()
     }
@@ -110,30 +119,35 @@ impl PartialEq for SmolStr {
 impl Eq for SmolStr {}
 
 impl PartialEq<str> for SmolStr {
+    #[inline]
     fn eq(&self, other: &str) -> bool {
         self.as_str() == other
     }
 }
 
 impl PartialEq<&str> for SmolStr {
+    #[inline]
     fn eq(&self, other: &&str) -> bool {
         self.as_str() == *other
     }
 }
 
 impl PartialOrd for SmolStr {
+    #[inline]
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         Some(self.cmp(other))
     }
 }
 
 impl Ord for SmolStr {
+    #[inline]
     fn cmp(&self, other: &Self) -> Ordering {
         self.as_str().cmp(other.as_str())
     }
 }
 
 impl Hash for SmolStr {
+    #[inline]
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.as_str().hash(state);
     }

@@ -83,6 +83,7 @@ impl fmt::Display for Refusal {
 impl std::error::Error for Refusal {}
 
 /// Whether an `after` edge `want` names the item `id`.
+#[inline]
 fn names(want: &str, id: &str) -> bool {
     match want.strip_suffix('*') {
         Some(prefix) => id.starts_with(prefix),

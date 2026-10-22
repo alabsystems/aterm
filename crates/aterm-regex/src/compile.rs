@@ -259,7 +259,8 @@ fn matches_empty(ast: &Ast) -> bool {
 }
 
 /// A two-way branch that prefers `body` when greedy and `exit` when not.
-fn split(body: usize, exit: usize, greedy: bool) -> Inst {
+#[inline]
+const fn split(body: usize, exit: usize, greedy: bool) -> Inst {
     if greedy {
         Inst::Split { a: body, b: exit }
     } else {

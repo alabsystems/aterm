@@ -4875,6 +4875,16 @@ pub enum ExitRecord {
     /// someone's end: a relaunch would meet the same refusal, so none is made
     /// (critic X4 of the lanes research, 2026-10-17).
     Refused,
+    /// A GEMINI CLI'S OWN RESTART REFUSED FOR ITS OWN SESSION ID, read at the
+    /// exit by its shell's word ([`ExitLook::restarted_itself`]): its
+    /// `/settings`, IDE trust or admin settings restart ran a worker's argv
+    /// again and met the `--session-id` its first start wrote (`42`). Owed a
+    /// relaunch as a crash is ([`Self::crashed`]), and resumed quietly, nothing
+    /// typed after it, whatever the shell draws by the attempt: the word
+    /// that told it is gone once another command's block is the newest, and
+    /// a crash read there as a restart (any `--session-id` launch's) went
+    /// with no continuation (the review of 3a4586a01e, R2).
+    Restarted,
 }
 
 impl ExitRecord {
@@ -4889,7 +4899,7 @@ impl ExitRecord {
     /// retirement, 2026-10-16).
     #[must_use]
     pub fn crashed(&self) -> bool {
-        matches!(self, Self::Survived(_) | Self::Crashed)
+        matches!(self, Self::Survived(_) | Self::Crashed | Self::Restarted)
     }
 
     /// One word for the host's log.
@@ -4901,6 +4911,7 @@ impl ExitRecord {
             Self::Removed => "removed",
             Self::Crashed => "crashed",
             Self::Refused => "refused",
+            Self::Restarted => "restarted",
         }
     }
 }
@@ -5108,6 +5119,7 @@ pub fn exit_record(
                 // crash file).
                 upgrade::Agent::Muse | upgrade::Agent::Agy | upgrade::Agent::Gemini => {
                     match now.crashed {
+                        Some(true) if now.restarted_itself => return ExitRecord::Restarted,
                         Some(true) => return ExitRecord::Crashed,
                         Some(false) if now.refused => return ExitRecord::Refused,
                         Some(false) => return ExitRecord::Removed,
@@ -5322,11 +5334,14 @@ fn after_exit_as(
     let survivor = match left {
         ExitRecord::Survived(sf) => Some(SessionFile::clone(sf)),
         ExitRecord::Removed => None,
-        // (`Crashed` and `Refused` are a Muse Code's and an agy's words; a
-        // Claude Code look never says them.)
-        ExitRecord::Unread | ExitRecord::Crashed | ExitRecord::Refused => records
-            .session_file(snap.pid)
-            .filter(|sf| squash(&sf.proc_start) == snap.start),
+        // (`Crashed` and `Refused` are a Muse Code's, an agy's and a Gemini
+        // CLI's words, `Restarted` a Gemini CLI's; a Claude Code look never
+        // says them.)
+        ExitRecord::Unread | ExitRecord::Crashed | ExitRecord::Refused | ExitRecord::Restarted => {
+            records
+                .session_file(snap.pid)
+                .filter(|sf| squash(&sf.proc_start) == snap.start)
+        }
     };
     let Some(session) = survivor
         .as_ref()

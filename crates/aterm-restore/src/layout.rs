@@ -153,12 +153,14 @@ pub const OFF_CTL_LEN: usize = 520;
 pub const OFF_CTL_COUNT: usize = 576;
 
 /// The header word holding slot `slot`'s commit word (`slot` is 0 or 1).
+#[inline]
 #[must_use]
 pub const fn kf_commit_word(slot: usize) -> usize {
     OFF_KF_COMMIT + 8 * (slot & 1)
 }
 
 /// The header word holding slot `slot`'s record length.
+#[inline]
 #[must_use]
 pub const fn kf_len_word(slot: usize) -> usize {
     OFF_KF_LEN + 8 * (slot & 1)
@@ -166,6 +168,7 @@ pub const fn kf_len_word(slot: usize) -> usize {
 
 /// The [`OFF_CELL_PX`] word for a cell size: `width << 16 | height`, 0 for none (a zero
 /// axis reads as none too, as the engine clamps one to 1 and a window never reports one).
+#[inline]
 #[must_use]
 pub const fn cell_px_word(px: Option<(u16, u16)>) -> u64 {
     match px {
@@ -176,6 +179,7 @@ pub const fn cell_px_word(px: Option<(u16, u16)>) -> u64 {
 
 /// The inverse of [`cell_px_word`]: `None` for 0, for a zero axis, or for bits above
 /// the two halves (a word this build never writes).
+#[inline]
 #[must_use]
 pub const fn cell_px_of(word: u64) -> Option<(u16, u16)> {
     let (w, h) = ((word >> 16) & 0xffff, word & 0xffff);
@@ -188,6 +192,7 @@ pub const fn cell_px_of(word: u64) -> Option<(u16, u16)> {
 
 /// The keyframe slot a sequence number goes to: `seq & 1`. Sequence numbers start
 /// at 1 (a commit word of 0 means empty), so the first keyframe lands in slot 1.
+#[inline]
 #[must_use]
 pub const fn slot_of(seq: u64) -> usize {
     (seq & 1) as usize
@@ -245,6 +250,7 @@ const MIN_SECTION: usize = 64;
 
 impl Geometry {
     /// The v1 layout of a [`REGION_LEN`] region.
+    #[inline]
     #[must_use]
     pub const fn v1() -> Self {
         let kf_off = HEADER_LEN;
@@ -299,18 +305,21 @@ impl Geometry {
     }
 
     /// Slot `slot`'s offset.
+    #[inline]
     #[must_use]
     pub const fn kf_slot_off(&self, slot: usize) -> usize {
         self.kf_off + (slot & 1) * self.kf_cap
     }
 
     /// The control slot's offset (increment 7).
+    #[inline]
     #[must_use]
     pub const fn ctl_off(&self) -> usize {
         self.tail_off + self.tail_cap
     }
 
     /// The control slot's capacity (increment 7).
+    #[inline]
     #[must_use]
     pub const fn ctl_cap(&self) -> usize {
         self.hist_off.saturating_sub(self.ctl_off())

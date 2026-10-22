@@ -154,6 +154,7 @@ impl FromStr for Datetime {
     }
 }
 
+#[inline]
 fn digits(b: &[u8], at: usize, n: usize) -> Option<u32> {
     let end = at.checked_add(n)?;
     if end > b.len() {
@@ -169,7 +170,8 @@ fn digits(b: &[u8], at: usize, n: usize) -> Option<u32> {
     Some(acc)
 }
 
-fn days_in_month(year: u16, month: u8) -> u8 {
+#[inline]
+const fn days_in_month(year: u16, month: u8) -> u8 {
     match month {
         1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
         4 | 6 | 9 | 11 => 30,

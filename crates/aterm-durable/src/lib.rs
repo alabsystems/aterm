@@ -86,6 +86,7 @@ pub enum Flush {
 
 impl Flush {
     /// Canonical 1-byte wire tag (`1` = `Durable`, `2` = `Ordered`).
+    #[inline]
     #[must_use]
     pub const fn as_u8(self) -> u8 {
         match self {
@@ -95,6 +96,7 @@ impl Flush {
     }
 
     /// Decode a 1-byte wire tag (`1` = `Durable`, `2` = `Ordered`).
+    #[inline]
     #[must_use]
     pub const fn from_u8(tag: u8) -> Option<Self> {
         match tag {
@@ -105,18 +107,21 @@ impl Flush {
     }
 
     /// Whether this flush is [`Flush::Durable`].
+    #[inline]
     #[must_use]
     pub const fn is_durable(self) -> bool {
         matches!(self, Self::Durable)
     }
 
     /// Whether this flush is [`Flush::Ordered`].
+    #[inline]
     #[must_use]
     pub const fn is_ordered(self) -> bool {
         matches!(self, Self::Ordered)
     }
 
     /// [`Flush::Ordered`] when `written_dev == later_dev`, else [`Flush::Durable`].
+    #[inline]
     #[must_use]
     pub const fn for_devices(written_dev: u64, later_dev: u64) -> Self {
         if written_dev == later_dev {
@@ -128,6 +133,7 @@ impl Flush {
 
     /// Encode a 17-byte device-pair decision record `(flush_tag: u8, written_dev: u64, later_dev: u64)`
     /// in little-endian byte order using bitwise shifts.
+    #[inline]
     #[must_use]
     pub const fn encode_device_pair(written_dev: u64, later_dev: u64) -> [u8; 17] {
         let tag = Self::for_devices(written_dev, later_dev).as_u8();
@@ -154,6 +160,7 @@ impl Flush {
 
     /// Decode a 17-byte device-pair decision record `(Flush, written_dev, later_dev)`,
     /// returning `None` if the tag is invalid or inconsistent with `for_devices(written_dev, later_dev)`.
+    #[inline]
     #[must_use]
     pub const fn decode_device_pair(bytes: &[u8; 17]) -> Option<(Self, u64, u64)> {
         let Some(flush) = Self::from_u8(bytes[0]) else {
@@ -186,6 +193,7 @@ impl Flush {
     ///
     /// # Errors
     /// The flush's own error.
+    #[inline]
     pub fn file(self, file: &File) -> io::Result<()> {
         match self {
             Self::Durable => durable(file),
@@ -197,6 +205,7 @@ impl Flush {
     ///
     /// # Errors
     /// The directory could not be opened, or the flush's own error.
+    #[inline]
     pub fn dir(self, dir: &Path) -> io::Result<()> {
         match File::open(dir) {
             Ok(f) => self.file(&f),

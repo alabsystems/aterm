@@ -5,8 +5,9 @@
 //! `tracing` facade. Every macro expands to nothing.
 //!
 //! Published under the package name `tracing` so `[patch.crates-io]` redirects
-//! its upstream consumers — the absorbed winit (`crates/aterm-window`),
-//! `softbuffer`, and `tiny-xlib` — here. It replaces `tracing`, `tracing-core` and
+//! its upstream consumer — the absorbed winit (`crates/aterm-window`); before
+//! linux-windowing LW.6 and LW.3, `tiny-xlib` and `softbuffer` too — here. It
+//! replaces `tracing`, `tracing-core` and
 //! `tracing-attributes` (and `pin-project-lite` on mac and windows).
 //!
 //! # Why a no-op is behaviourally identical
@@ -100,8 +101,8 @@
 
 #![no_std]
 // Unconditionally, not behind the `std` feature: mac, windows and wasm resolve
-// this package with NO features (softbuffer and winit take it
-// `default-features = false`), and nothing here needs an allocator or an OS.
+// this package with NO features (winit takes it `default-features = false`),
+// and nothing here needs an allocator or an OS.
 
 /// A span — always disabled, therefore zero-sized and empty.
 ///
@@ -120,12 +121,14 @@ impl Span {
     /// let moved_later = span;            // a real owned value
     /// let _guard = moved_later.entered();
     /// ```
+    #[inline]
     #[must_use]
     pub const fn none() -> Self {
         Span
     }
 
     /// Enter the span, returning a guard. Consumes the `Span`, as upstream does.
+    #[inline]
     #[must_use]
     pub const fn entered(self) -> EnteredSpan {
         EnteredSpan
@@ -145,6 +148,7 @@ pub struct EnteredSpan;
 
 impl EnteredSpan {
     /// Exit the span, handing back the [`Span`] it was entered from.
+    #[inline]
     #[must_use]
     pub const fn exit(self) -> Span {
         Span

@@ -58,8 +58,8 @@ pub use fold::{
     MAX_MAIL_WAITING, MailLink, MailLinkOf, MailWaiting, Need, OpenNode, Phase, SessionState,
     SnapError, Tone, Totals, Words, amend_refines_out, clause_of, clause_of_proven, clear_lifts,
     confidence_law, lifts_failure, mail_in_window, mail_link_of, mark_may_raise, need_precedence,
-    need_raised, need_takes_amend, shown_label, shown_proven_label, shown_verdicts, starts_epoch,
-    turn_out_rebucket,
+    need_raised, need_takes_amend, need_words, shown_label, shown_proven_label, shown_verdicts,
+    starts_epoch, turn_out_rebucket,
 };
 pub use limit::{MARK_ACTORS, MARK_BURST, MARK_OWED_AUTHORS, MARK_REFILL_MS, MarkLimiter, Owed};
 pub use line::{

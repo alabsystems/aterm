@@ -12,8 +12,9 @@
 //!   of wgpu. Never on wasm32, which has no wgpu at all.
 //! * `gl_arm`: the first-party OpenGL ES arm (`src/gl`,
 //!   docs/AUDIT-third-party-2026-10-15.md GW.4), is compiled into this build:
-//!   every Linux build (GLES 3.0 over EGL) and every wasm32 build (WebGL2
-//!   through aterm-wasm-abi imports, wasm-platform WP.8).
+//!   every Linux build (GLES 3.0 over EGL, and over GLX for X11 windows) and
+//!   every wasm32 build (WebGL2 through aterm-wasm-abi imports, wasm-platform
+//!   WP.8).
 //! * `multi_arm`: more than one backend arm is compiled into this build (the
 //!   device layer's enums then have more than one variant). It gates the
 //!   crossing refusals, the match arms that panic by name when a handle from

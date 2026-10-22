@@ -9,19 +9,21 @@
 //! oracle works on macOS; in a browser the oracle is the frames wgpu's WebGL2
 //! backend drew, recorded before it left (`verify browser`).
 //!
-//! * [`ffi`]: EGL 1.5 and GLES 3.0, loaded at run time (`dlopen` of
-//!   `libEGL.so.1`, GL through `eglGetProcAddress`); nothing links a GL
-//!   library. On wasm32 the same GL table over the module's `aterm_gl`
-//!   imports.
-//! * [`device`]: the EGL display, config and context (or the canvas's WebGL2
-//!   context), its capabilities, and the guard that holds the context
-//!   current.
+//! * [`ffi`]: EGL 1.5, GLX 1.4 and GLES 3.0, loaded at run time (`dlopen` of
+//!   `libEGL.so.1` and `libGLX.so.0`, GL through `eglGetProcAddress` or
+//!   `glXGetProcAddressARB`); nothing links a GL library. On wasm32 the same
+//!   GL table over the module's `aterm_gl` imports.
+//! * [`device`]: the EGL display, config and context, or on X11 the GLX
+//!   context (or the canvas's WebGL2 context), its capabilities, and the
+//!   guard that holds the context current.
+//! * `glx`: an X11 window system's context, which is GLX's: NVIDIA's X11
+//!   EGL posts nothing on an Xorg server its own driver runs.
 //! * [`resources`]: textures, buffers and samplers.
 //! * [`shaders`]: the GLSL ES twins of the WGSL, `shaders/<library>.glsl`.
 //! * [`pipelines`]: programs and fixed-function state from the pipeline table.
 //! * [`encoder`]: the frame and pass verbs the device layer forwards to.
-//! * `surface`: EGL window surfaces (X11, Wayland) and the post; `canvas`,
-//!   its twin on a WebGL2 canvas.
+//! * `surface`: window surfaces (`GLXWindow`s on X11, EGL surfaces on
+//!   Wayland) and the post; `canvas`, its twin on a WebGL2 canvas.
 //!
 //! # Coordinates and colour
 //!
@@ -43,8 +45,10 @@ pub(crate) mod ffi;
 pub(crate) mod pipelines;
 pub(crate) mod resources;
 pub(crate) mod shaders;
-// The EGL window surfaces: the shipped build's swapchain (a build that also
-// carries wgpu attaches windows on wgpu).
+// The X11 windows' GLX context and the window surfaces: the shipped build's
+// swapchain (a build that also carries wgpu attaches windows on wgpu).
+#[cfg(all(not(wgpu_arm), not(target_arch = "wasm32")))]
+pub(crate) mod glx;
 #[cfg(all(not(wgpu_arm), not(target_arch = "wasm32")))]
 pub(crate) mod surface;
 // The WebGL2 canvas: the browser's swapchain.
@@ -53,8 +57,8 @@ pub(crate) mod canvas;
 
 #[cfg(target_arch = "wasm32")]
 pub(crate) use canvas::GlCanvasSurface as WindowSurface;
-/// The swapchain a `GpuSurface` holds on the GL arm: an EGL window surface,
-/// or a WebGL2 canvas.
+/// The swapchain a `GpuSurface` holds on the GL arm: a GLX or EGL window
+/// surface, or a WebGL2 canvas.
 #[cfg(all(not(wgpu_arm), not(target_arch = "wasm32")))]
 pub(crate) use surface::GlWindowSurface as WindowSurface;
 

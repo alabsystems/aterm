@@ -51,18 +51,21 @@ pub struct ModeMirror {
 impl ModeMirror {
     /// The keyboard encoding mode the terminal last published — the same value
     /// `Terminal::keyboard_mode()` returns under the lock, without the lock.
+    #[inline]
     #[must_use]
     pub fn keyboard_mode(&self) -> KeyboardMode {
         KeyboardMode::from_bits_truncate(self.keyboard.load(Ordering::Acquire))
     }
 
     /// The mouse tracking mode the terminal last published.
+    #[inline]
     #[must_use]
     pub fn mouse_mode(&self) -> MouseMode {
         mouse_mode_from_u8(self.mouse.load(Ordering::Acquire))
     }
 
     /// Lock-free twin of `Terminal::mouse_tracking_enabled()`.
+    #[inline]
     #[must_use]
     pub fn mouse_tracking_enabled(&self) -> bool {
         self.mouse.load(Ordering::Acquire) != 0
@@ -71,6 +74,7 @@ impl ModeMirror {
     /// Whether the published tracking mode reports a pointer motion with
     /// `button` held (`3`: none): the rule `Terminal::encode_mouse_motion`
     /// encodes by (`super::mouse::motion_reported`), without the lock.
+    #[inline]
     #[must_use]
     pub fn reports_motion(&self, button: u8) -> bool {
         super::mouse::motion_reported(self.mouse_mode(), button)
@@ -79,6 +83,7 @@ impl ModeMirror {
     /// Whether the published tracking mode reports a wheel notch: the rule
     /// `Terminal::encode_mouse_wheel` encodes by (`super::mouse::wheel_reported`:
     /// not X10, which is press-only), without the lock.
+    #[inline]
     #[must_use]
     pub fn reports_wheel(&self) -> bool {
         super::mouse::wheel_reported(self.mouse_mode())
@@ -86,6 +91,7 @@ impl ModeMirror {
 
     /// Lock-free twin of `Terminal::focus_reporting_enabled()` (DEC 1004), for the focus report
     /// written on the winit thread, which must never take an engine mutex.
+    #[inline]
     #[must_use]
     pub fn focus_reporting_enabled(&self) -> bool {
         self.focus.load(Ordering::Acquire)
@@ -95,18 +101,21 @@ impl ModeMirror {
     /// last answered to learn that the program turned DEC 1004 on again. Read it before
     /// [`Self::focus_reporting_enabled`]: the count is published second, so the mode read
     /// after it is at least as new as that enable.
+    #[inline]
     #[must_use]
     pub fn focus_arms(&self) -> u32 {
         self.focus_arms.load(Ordering::Acquire)
     }
 
     /// Lock-free twin of `Terminal::is_alternate_screen()`.
+    #[inline]
     #[must_use]
     pub fn alternate_screen(&self) -> bool {
         self.alternate_screen.load(Ordering::Acquire)
     }
 
     /// Lock-free twin of `Terminal::modes().alternate_scroll` (DEC 1007).
+    #[inline]
     #[must_use]
     pub fn alternate_scroll(&self) -> bool {
         self.alternate_scroll.load(Ordering::Acquire)
@@ -115,6 +124,7 @@ impl ModeMirror {
     /// Lock-free twin of `Terminal::modes().bracketed_paste` (DEC 2004): the
     /// framing a paste that reads the live mode gets
     /// ([`super::Terminal::format_paste`]).
+    #[inline]
     #[must_use]
     pub fn bracketed_paste(&self) -> bool {
         self.bracketed_paste.load(Ordering::Acquire)
@@ -122,6 +132,7 @@ impl ModeMirror {
 
     /// Publish a fresh fold of `term`. Called only by the terminal, under its
     /// mutex ([`super::Terminal::refresh_mode_mirror`]).
+    #[inline]
     fn publish(&self, term: &super::Terminal) {
         self.keyboard
             .store(term.keyboard_mode().bits(), Ordering::Release);
@@ -140,6 +151,7 @@ impl ModeMirror {
 
 /// Inverse of `MouseMode as u8`. Unknown discriminants decode as `None`
 /// (tracking off) — the fail-safe direction for an encoder gate.
+#[inline]
 const fn mouse_mode_from_u8(v: u8) -> MouseMode {
     match v {
         1 => MouseMode::Normal,
@@ -154,13 +166,15 @@ impl super::Terminal {
     /// The shared lock-free mirror of this terminal's input-encoding modes.
     /// Clone the `Arc` once at session construction; read it on every key
     /// press instead of taking the terminal mutex.
+    #[inline]
     #[must_use]
-    pub fn mode_mirror(&self) -> &std::sync::Arc<ModeMirror> {
+    pub const fn mode_mirror(&self) -> &std::sync::Arc<ModeMirror> {
         &self.mode_mirror
     }
 
     /// Re-publish the fold. Called by every site outside `process()` that can move one of its
     /// inputs, and once per batch by `process_at` after the parser runs.
+    #[inline]
     pub(crate) fn refresh_mode_mirror(&self) {
         self.mode_mirror.publish(self);
     }

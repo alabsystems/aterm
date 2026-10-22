@@ -59,6 +59,7 @@ pub struct SearchRows {
 impl SearchRows {
     /// Room for `rows` rows.
     #[must_use]
+    #[inline]
     pub fn with_capacity(rows: usize) -> Self {
         Self {
             text: Vec::with_capacity(rows),
@@ -67,6 +68,7 @@ impl SearchRows {
         }
     }
 
+    #[inline]
     fn push(&mut self, (text, cells): (String, LineCells), wrapped: bool) {
         self.text.push(text);
         self.cells.push(cells);
@@ -86,6 +88,26 @@ pub enum AbsRowText {
     OutOfRange,
     /// Within retained history, but its stored line could not be read.
     Unreadable,
+}
+
+/// Where an absolute row stands ([`Terminal::abs_row_at`]): what `cell abs=<n>` reads.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AbsRowAt {
+    /// In the retained history, `rev_idx` lines above the live screen (0 = the newest
+    /// scrolled-off line): [`Terminal::render_history_row_into`] resolves its cells.
+    History {
+        /// Lines above the live screen: 0 is the newest scrolled-off line.
+        rev_idx: usize,
+    },
+    /// On the live screen, at `row`.
+    Screen {
+        /// The live screen row, 0 at its top.
+        row: usize,
+    },
+    /// Older than `oldest_absolute_row()`: scrolled past the scrollback cap.
+    Evicted,
+    /// Below the live screen's bottom row (no such row).
+    OutOfRange,
 }
 
 impl Terminal {
@@ -173,6 +195,7 @@ impl Terminal {
     /// continuations: a run whose head has been evicted starts at the oldest row still
     /// there, the only logical line the search index can honestly key.
     #[must_use]
+    #[inline]
     pub fn abs_row_continues(&self, abs: u64) -> bool {
         abs > self.grid.oldest_absolute_row()
             && self
@@ -205,6 +228,7 @@ impl Terminal {
     /// retained row included ([`abs_row_continues`](Self::abs_row_continues) reads that
     /// one as a line's start): what an index joined it as while older rows were still
     /// retained.
+    #[inline]
     pub(crate) fn abs_row_wrap_flag(&self, abs: u64) -> bool {
         self.abs_selection_row(abs)
             .is_some_and(|row| self.row_continues_previous(row))
@@ -260,12 +284,39 @@ impl Terminal {
         )
     }
 
+    /// Where absolute row `abs` (B-2's one coordinate space, `line`'s and `search`'s) stands:
+    /// a history row, by how far above the live screen, or a live screen row — the read
+    /// [`abs_row_text_within`](Self::abs_row_text_within) makes, for a reader of the row's
+    /// cells (`cell abs=<n>`).
+    #[must_use]
+    pub fn abs_row_at(&self, abs: u64) -> AbsRowAt {
+        let grid = &self.grid;
+        let Some(rel) = abs.checked_sub(grid.oldest_absolute_row()) else {
+            return AbsRowAt::Evicted;
+        };
+        let Ok(rel) = usize::try_from(rel) else {
+            return AbsRowAt::OutOfRange;
+        };
+        let scrollback = grid.scrollback_lines();
+        if rel < scrollback {
+            return AbsRowAt::History {
+                rev_idx: scrollback - 1 - rel,
+            };
+        }
+        let row = rel - scrollback;
+        if row >= usize::from(self.rows()) {
+            return AbsRowAt::OutOfRange;
+        }
+        AbsRowAt::Screen { row }
+    }
+
     /// Text of absolute row `abs` as search reads it
     /// ([`abs_row_text_within`](Self::abs_row_text_within) at
     /// [`MAX_SCROLLBACK_LINE_SCAN_BYTES`]), so a snippet equals the line the match came
     /// from. `None` when `abs` is evicted, unreadable or past the live screen. Feeds
     /// `search_summary`'s snippet.
     #[must_use]
+    #[inline]
     pub fn abs_row_text(&self, abs: u64) -> Option<String> {
         match self.abs_row_text_within(abs, MAX_SCROLLBACK_LINE_SCAN_BYTES) {
             AbsRowText::Text(text) => Some(text),
@@ -275,6 +326,7 @@ impl Terminal {
 
     /// The selection-space row of absolute row `abs` (negative in history, `0..rows` on
     /// the live screen), `None` when `abs` is evicted or the row does not fit.
+    #[inline]
     fn abs_selection_row(&self, abs: u64) -> Option<i32> {
         let rel = i128::from(abs.checked_sub(self.grid.oldest_absolute_row())?);
         let scrollback = i128::try_from(self.grid.scrollback_lines()).ok()?;
@@ -285,6 +337,7 @@ impl Terminal {
 /// A history line read for search from the dense history walk
 /// (`Grid::history_lines_from`): its text and cells, or an empty row for a line
 /// the walk could not read, so later rows keep their absolute rows.
+#[inline]
 pub(crate) fn history_row_for_search(
     grid: &Grid,
     line: Option<Cow<'_, Line>>,
@@ -298,6 +351,7 @@ pub(crate) fn history_row_for_search(
 /// [`Terminal::written_line_text`] reads it, with the cells that text is drawn
 /// in. A line the bound cuts has its cells marked ([`LineCells::mark_truncated`]),
 /// so the index counts it as a line it did not search to its end.
+#[inline]
 fn history_row_written(grid: &Grid, line: &Line) -> (String, LineCells) {
     let bytes = line.as_bytes();
     let text = line_text_bounded(bytes, MAX_SCROLLBACK_LINE_SCAN_BYTES).into_owned();
@@ -315,12 +369,14 @@ fn history_row_written(grid: &Grid, line: &Line) -> (String, LineCells) {
 /// double-click's window, a web host's word under a cell, a copy's columns), so a column
 /// names the cell drawn there.
 #[must_use]
+#[inline]
 pub(crate) fn history_line_text_cells(grid: &Grid, line: &Line, text: &str) -> LineCells {
     stored_line_text_cells(line, text, grid.cols())
 }
 
 /// The cells `text`, a read of stored history `line`, is drawn in on a row
 /// `cols` wide: the walk ([`stored_line_cells`]) the row is laid out by.
+#[inline]
 pub(crate) fn stored_line_text_cells(line: &Line, text: &str, cols: u16) -> LineCells {
     let mut cells = LineCells::new();
     for (bytes, col, width, count) in stored_line_cells(line, text, cols) {

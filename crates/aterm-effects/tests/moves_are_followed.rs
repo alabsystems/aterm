@@ -2364,11 +2364,12 @@ fn tear_read_as_copy(id: &str) -> u64 {
 /// (`tests/copies_are_not_moves.rs`), and the move melts. A one-row relocation, or
 /// two rows onto the caret's row, melts from [`tear_read_as_copy`]; after a 200 ms
 /// pause under the GUI's pacing without the pet (idle frames 110–130 ms apart),
-/// from 120 ms. With the pet it melts from [`tear_read_as_copy`] again: 200 ms
-/// after `hello world` the pet is still braking from its run to the line's end
-/// (it stops where its station does, at `STOP_DECEL`), and its frames are the
-/// 16 ms train. A two-row relocation onto an unnamed row is never sampled
-/// between and follows.
+/// from 120 ms. With the pet, from [`STICKY_PACED`]: 200 ms after `hello world`
+/// the pet has come to rest beside the line, its landing a touch-down on the
+/// writing, and its frames are the idle train. (Until 2026-10-22 it sat out a
+/// pounce's landing and was still braking then, its frames the 16 ms train,
+/// and the move melted from [`tear_read_as_copy`].) A two-row relocation onto
+/// an unnamed row is never sampled between and follows.
 /// Claude Code and Codex bracket their frames and never tear; live torn reads last
 /// 2–30 ms.
 #[test]
@@ -2385,6 +2386,8 @@ fn the_limit_a_torn_relocation_whose_new_row_stood_twin_min_is_a_copy() {
                 id.contains("/10-9/") || id.contains("/10-11/") || id.starts_with("d4.t1c.");
             let threshold = if id.starts_with("d4.t1.torn_move/paced/") {
                 120
+            } else if id.starts_with("d4.t1.torn_move/pet/") {
+                STICKY_PACED
             } else {
                 tear_read_as_copy(id)
             };
@@ -2414,19 +2417,19 @@ fn stand_of(id: &str) -> u64 {
 /// The limit: a move onto a row a copy stood on for `TWIN_MIN` melts, because a twin
 /// is sticky (`Seen::twin`). `hello world` on row 10; a copy on row 11 erased `stand`
 /// ms later; 200 ms on, the line relocated onto row 11 in one write. Melts from
-/// [`tear_read_as_copy`] on the flat trains and with the pet, from
-/// [`STICKY_PACED`] under the GUI's pacing without it. The copy lands 200 ms
-/// after the typing, while the pet is still braking to a stand beside the line
-/// (`STOP_DECEL`), so its frames are the 16 ms train. (On 2026-10-20 the pet
-/// stopped dead from its run, at rest by then, and the pet's pacing melted from
-/// [`STICKY_PACED`].)
+/// [`tear_read_as_copy`] on the flat trains, and from [`STICKY_PACED`] under the
+/// GUI's pacing and with the pet: the copy lands 200 ms after the typing, the
+/// pet at rest beside the line by then (its landing a touch-down on the
+/// writing), so its frames are the idle train. (From 2026-10-20 to 2026-10-22
+/// it sat out a pounce's landing and was still braking to its stand then, its
+/// frames the 16 ms train, and the move melted from [`tear_read_as_copy`].)
 #[test]
 fn the_limit_a_move_onto_a_row_a_copy_stood_on_for_twin_min_melts() {
     holds_but(
         all_cases(),
         |id| id.starts_with("d4.t8."),
         |id| {
-            let threshold = if id.contains("/paced/") {
+            let threshold = if id.contains("/paced/") || id.contains("/pet/") {
                 STICKY_PACED
             } else {
                 tear_read_as_copy(id)

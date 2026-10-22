@@ -444,6 +444,13 @@ pub struct KittyCursorPlacement {
     leg: KittyCursorPlacementLeg,
     facing_left: bool,
     sampled_at: Option<Instant>,
+    drawn: Option<PreparedKittyCursorDraw>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct PreparedKittyCursorDraw {
+    rect: CatFootprint,
+    settle: Option<(f32, f32)>,
 }
 
 impl KittyCursorPlacement {
@@ -454,6 +461,17 @@ impl KittyCursorPlacement {
             leg: KittyCursorPlacementLeg::Settled,
             facing_left: false,
             sampled_at: None,
+            drawn: None,
+        }
+    }
+
+    /// The actual animated body rectangle prepared for this frame, including
+    /// its follower, pose and fold leg. The palette target remains `sample`.
+    #[must_use]
+    pub const fn drawn_footprint(self) -> Option<CatFootprint> {
+        match self.drawn {
+            Some(draw) => Some(draw.rect),
+            None => None,
         }
     }
 
@@ -2916,6 +2934,7 @@ impl WordDecorations {
                 leg: KittyCursorPlacementLeg::Settled,
                 facing_left: motion.facing_left,
                 sampled_at: Some(motion.sampled_at),
+                drawn: None,
             });
         }
 
@@ -2927,6 +2946,7 @@ impl WordDecorations {
                 leg: KittyCursorPlacementLeg::Settled,
                 facing_left: motion.facing_left,
                 sampled_at: Some(motion.sampled_at),
+                drawn: None,
             });
         };
 
@@ -2952,6 +2972,7 @@ impl WordDecorations {
                 leg: KittyCursorPlacementLeg::Settled,
                 facing_left: motion.facing_left,
                 sampled_at: Some(motion.sampled_at),
+                drawn: None,
             });
         };
         let progress = if fold.progress.is_finite() {
@@ -2963,6 +2984,7 @@ impl WordDecorations {
                 leg: KittyCursorPlacementLeg::Settled,
                 facing_left: motion.facing_left,
                 sampled_at: Some(motion.sampled_at),
+                drawn: None,
             });
         };
         let leg = if progress < 0.5 {
@@ -2983,6 +3005,7 @@ impl WordDecorations {
             leg,
             facing_left: motion.facing_left,
             sampled_at: Some(motion.sampled_at),
+            drawn: None,
         })
     }
 
@@ -3050,6 +3073,169 @@ impl WordDecorations {
             lift: frame.lift,
         })?;
         self.kitty_cursor_at_placement(frame, KittyCursorPlacement::settled(footprint), free)
+    }
+
+    /// Resolve the body's exact draw rectangle before the word pass, without
+    /// advancing its follower. Emission consumes the same immutable placement;
+    /// it commits the prepared follower only after body and tile admission.
+    #[must_use]
+    pub fn prepare_kitty_cursor_placement(
+        &mut self,
+        layout: KittyCursorLayout,
+        motion: crate::kitty_cursor::CursorCatPlacementFrame,
+        pose: crate::kitty_cursor::CatPose,
+    ) -> Option<KittyCursorPlacement> {
+        let mut placement = self.resolve_kitty_cursor_placement(layout, motion)?;
+        placement.drawn =
+            Some(self.kitty_cursor_draw_geometry(layout.geom, layout.bob, pose, placement));
+        Some(placement)
+    }
+
+    fn kitty_cursor_draw_geometry(
+        &self,
+        geom: EffectGeom,
+        bob: f32,
+        pose: crate::kitty_cursor::CatPose,
+        placement: KittyCursorPlacement,
+    ) -> PreparedKittyCursorDraw {
+        let footprint = placement.sample;
+        let (nat_w, nat_h) = (footprint.w, footprint.h);
+        let mut settle = self.kitty_cursor_placement.settle;
+        let grid_w = i32::from(geom.cols).saturating_mul(i32::from(geom.cell_w));
+        let dest_w = ((f32::from(nat_w) * pose.scale_x).round() as i32)
+            .clamp(1, grid_w.max(1).min(i32::from(u16::MAX))) as u16;
+        let dest_h =
+            ((f32::from(nat_h) * pose.scale_y).round() as i32).clamp(1, i32::from(u16::MAX)) as u16;
+        let flip_x = placement.facing_left;
+        let lead_px =
+            (pose.lead * f32::from(geom.cell_w)).round() as i32 * if flip_x { -1 } else { 1 };
+        let cx = footprint.x + i32::from(nat_w) / 2;
+        let cy = footprint.y + i32::from(nat_h) / 2;
+        let base_x = (footprint.x + lead_px).clamp(0, grid_w - i32::from(nat_w));
+        let target_x = (cx - i32::from(dest_w) / 2 + lead_px).clamp(0, grid_w - i32::from(dest_w));
+        let target_y = cy - i32::from(dest_h) / 2;
+        let scale_dx = target_x - base_x;
+        let scale_dy = target_y - footprint.y;
+        let clearance = i32::from(dest_w)
+            .max(i32::from(nat_w))
+            .saturating_add(i32::from(geom.cell_w).saturating_mul(2));
+        let lift = |q: f32| (0.18 * f32::from(geom.cell_h) * 4.0 * q * (1.0 - q)).round() as i32;
+        let lerp_px = |a: i32, b: i32, q: f32| {
+            (f64::from(a) + (f64::from(b) - f64::from(a)) * f64::from(q))
+                .round()
+                .clamp(f64::from(i32::MIN), f64::from(i32::MAX)) as i32
+        };
+        let (sprite_x, sprite_y) = match placement.leg {
+            // Settled leg: one exponential rest-position follower
+            // ([`Self::PLACE_TAU`]) smooths the per-key x hop, margin-rise steps,
+            // the seat's lift and unauthenticated wraps. The target excludes the
+            // hover bob and centre-scaling offsets (re-added after, keeping full
+            // amplitude, phase, and symmetric squash/stretch centring). It snaps
+            // instead when continuity is dead (first emission, or a gap at or
+            // past `CURSOR_FOLD_DURATION`) or the target jumped more than two
+            // rows.
+            KittyCursorPlacementLeg::Settled => match placement.sampled_at {
+                // The clockless one-shot path (`Self::kitty_cursor`, settings
+                // preview) draws the raw placement and never touches the
+                // follower.
+                None => (target_x, target_y),
+                Some(at) => {
+                    let ch = f32::from(geom.cell_h);
+                    let bob_px = (bob * ch).round() as i32;
+                    let rest = (base_x as f32, (footprint.y - bob_px) as f32);
+                    let prev_at = self.kitty_cursor_placement.last_emitted_at;
+                    let fresh = prev_at.is_some_and(|prev| {
+                        at.saturating_duration_since(prev)
+                            < crate::kitty_cursor::CURSOR_FOLD_DURATION
+                    });
+                    // Seeding from the last emitted body makes a post-fold
+                    // landing glide in like a mid-line keystroke.
+                    let followed = settle
+                        .or_else(|| {
+                            fresh
+                                .then_some(self.kitty_cursor_placement.last_sprite)
+                                .flatten()
+                                .map(|(sx, sy)| {
+                                    ((sx - scale_dx) as f32, (sy - bob_px - scale_dy) as f32)
+                                })
+                        })
+                        .filter(|p| fresh && (rest.1 - p.1).abs() <= 2.0 * ch);
+                    match followed {
+                        Some((mut px, mut py)) => {
+                            // dt as in `kitty_cursor::advance_spine`: clamped so
+                            // an occluded gap moves one 100 ms step.
+                            let dt = prev_at
+                                .map(|prev| at.saturating_duration_since(prev).as_secs_f32())
+                                .unwrap_or(0.0)
+                                .min(0.1);
+                            let alpha = 1.0 - (-dt / Self::PLACE_TAU).exp();
+                            px += (rest.0 - px) * alpha;
+                            py += (rest.1 - py) * alpha;
+                            settle = Some((px, py));
+                            (
+                                px.round() as i32 + scale_dx,
+                                py.round() as i32 + bob_px + scale_dy,
+                            )
+                        }
+                        None => {
+                            settle = Some(rest);
+                            (target_x, target_y)
+                        }
+                    }
+                }
+            },
+            KittyCursorPlacementLeg::Exit {
+                direction,
+                eased,
+                from,
+                from_sprite,
+            } => {
+                // A fold owns the body for both half-beats; the settled
+                // follower re-seeds from the landing's emitted sprite.
+                settle = None;
+                let from_cx = from.x + i32::from(from.w) / 2;
+                let from_x = (from_cx - i32::from(dest_w) / 2 + lead_px)
+                    .clamp(0, grid_w - i32::from(dest_w));
+                let from_y = from.y + i32::from(from.h) / 2 - i32::from(dest_h) / 2;
+                let (start_x, start_y) = from_sprite.unwrap_or((from_x, from_y));
+                let end_x = match direction {
+                    crate::kitty_cursor::CatFoldDirection::Forward => {
+                        grid_w.saturating_add(clearance)
+                    }
+                    crate::kitty_cursor::CatFoldDirection::Reverse => {
+                        -i32::from(dest_w) - clearance
+                    }
+                };
+                (
+                    lerp_px(start_x, end_x, eased),
+                    lerp_px(start_y, from_y, eased).saturating_sub(lift(eased)),
+                )
+            }
+            KittyCursorPlacementLeg::Enter { direction, eased } => {
+                settle = None;
+                let start_x = match direction {
+                    crate::kitty_cursor::CatFoldDirection::Forward => {
+                        -i32::from(dest_w) - clearance
+                    }
+                    crate::kitty_cursor::CatFoldDirection::Reverse => {
+                        grid_w.saturating_add(clearance)
+                    }
+                };
+                (
+                    lerp_px(start_x, target_x, eased),
+                    target_y.saturating_sub(lift(eased)),
+                )
+            }
+        };
+        PreparedKittyCursorDraw {
+            rect: CatFootprint {
+                x: sprite_x,
+                y: sprite_y,
+                w: dest_w,
+                h: dest_h,
+            },
+            settle,
+        }
     }
 
     /// Emit one cursor kitty at the placement from
@@ -3157,134 +3343,17 @@ impl WordDecorations {
         // shifts it, at draw only. `aw/ah` stay the source size, so the
         // renderer NEAREST-scales the fixed tile.
         let (nat_w, nat_h) = (w, h);
-        let grid_w = i32::from(geom.cols).saturating_mul(i32::from(geom.cell_w));
-        let dest_w = ((f32::from(nat_w) * pose.scale_x).round() as i32)
-            .clamp(1, grid_w.max(1).min(i32::from(u16::MAX))) as u16;
-        let dest_h =
-            ((f32::from(nat_h) * pose.scale_y).round() as i32).clamp(1, i32::from(u16::MAX)) as u16;
         let flip_x = placement.facing_left;
-        let lead_px =
-            (pose.lead * f32::from(geom.cell_w)).round() as i32 * if flip_x { -1 } else { 1 };
-        let cx = footprint.x + i32::from(nat_w) / 2;
-        let cy = footprint.y + i32::from(nat_h) / 2;
-        let base_x = (footprint.x + lead_px).clamp(0, grid_w - i32::from(nat_w));
-        let target_x = (cx - i32::from(dest_w) / 2 + lead_px).clamp(0, grid_w - i32::from(dest_w));
-        let target_y = cy - i32::from(dest_h) / 2;
-        let scale_dx = target_x - base_x;
-        let scale_dy = target_y - footprint.y;
-        let clearance = i32::from(dest_w)
-            .max(i32::from(nat_w))
-            .saturating_add(i32::from(geom.cell_w).saturating_mul(2));
-        let lift = |q: f32| (0.18 * f32::from(geom.cell_h) * 4.0 * q * (1.0 - q)).round() as i32;
-        let lerp_px = |a: i32, b: i32, q: f32| {
-            (f64::from(a) + (f64::from(b) - f64::from(a)) * f64::from(q))
-                .round()
-                .clamp(f64::from(i32::MIN), f64::from(i32::MAX)) as i32
-        };
-        let (sprite_x, sprite_y) = match placement.leg {
-            // Settled leg: one exponential rest-position follower
-            // ([`Self::PLACE_TAU`]) smooths the per-key x hop, margin-rise steps,
-            // the seat's lift and unauthenticated wraps. The target excludes the
-            // hover bob and centre-scaling offsets (re-added after, keeping full
-            // amplitude, phase, and symmetric squash/stretch centring). It snaps
-            // instead when continuity is dead (first emission, or a gap at or
-            // past `CURSOR_FOLD_DURATION`) or the target jumped more than two
-            // rows.
-            KittyCursorPlacementLeg::Settled => match placement.sampled_at {
-                // The clockless one-shot path (`Self::kitty_cursor`, settings
-                // preview) draws the raw placement and never touches the
-                // follower.
-                None => (target_x, target_y),
-                Some(at) => {
-                    let ch = f32::from(geom.cell_h);
-                    let bob_px = (bob * ch).round() as i32;
-                    let rest = (base_x as f32, (footprint.y - bob_px) as f32);
-                    let prev_at = self.kitty_cursor_placement.last_emitted_at;
-                    let fresh = prev_at.is_some_and(|prev| {
-                        at.saturating_duration_since(prev)
-                            < crate::kitty_cursor::CURSOR_FOLD_DURATION
-                    });
-                    // Seeding from the last emitted body makes a post-fold
-                    // landing glide in like a mid-line keystroke.
-                    let followed = self
-                        .kitty_cursor_placement
-                        .settle
-                        .or_else(|| {
-                            fresh
-                                .then_some(self.kitty_cursor_placement.last_sprite)
-                                .flatten()
-                                .map(|(sx, sy)| {
-                                    ((sx - scale_dx) as f32, (sy - bob_px - scale_dy) as f32)
-                                })
-                        })
-                        .filter(|p| fresh && (rest.1 - p.1).abs() <= 2.0 * ch);
-                    match followed {
-                        Some((mut px, mut py)) => {
-                            // dt as in `kitty_cursor::advance_spine`: clamped so
-                            // an occluded gap moves one 100 ms step.
-                            let dt = prev_at
-                                .map(|prev| at.saturating_duration_since(prev).as_secs_f32())
-                                .unwrap_or(0.0)
-                                .min(0.1);
-                            let alpha = 1.0 - (-dt / Self::PLACE_TAU).exp();
-                            px += (rest.0 - px) * alpha;
-                            py += (rest.1 - py) * alpha;
-                            self.kitty_cursor_placement.settle = Some((px, py));
-                            (
-                                px.round() as i32 + scale_dx,
-                                py.round() as i32 + bob_px + scale_dy,
-                            )
-                        }
-                        None => {
-                            self.kitty_cursor_placement.settle = Some(rest);
-                            (target_x, target_y)
-                        }
-                    }
-                }
-            },
-            KittyCursorPlacementLeg::Exit {
-                direction,
-                eased,
-                from,
-                from_sprite,
-            } => {
-                // A fold owns the body for both half-beats; the settled
-                // follower re-seeds from the landing's emitted sprite.
-                self.kitty_cursor_placement.settle = None;
-                let from_cx = from.x + i32::from(from.w) / 2;
-                let from_x = (from_cx - i32::from(dest_w) / 2 + lead_px)
-                    .clamp(0, grid_w - i32::from(dest_w));
-                let from_y = from.y + i32::from(from.h) / 2 - i32::from(dest_h) / 2;
-                let (start_x, start_y) = from_sprite.unwrap_or((from_x, from_y));
-                let end_x = match direction {
-                    crate::kitty_cursor::CatFoldDirection::Forward => {
-                        grid_w.saturating_add(clearance)
-                    }
-                    crate::kitty_cursor::CatFoldDirection::Reverse => {
-                        -i32::from(dest_w) - clearance
-                    }
-                };
-                (
-                    lerp_px(start_x, end_x, eased),
-                    lerp_px(start_y, from_y, eased).saturating_sub(lift(eased)),
-                )
-            }
-            KittyCursorPlacementLeg::Enter { direction, eased } => {
-                self.kitty_cursor_placement.settle = None;
-                let start_x = match direction {
-                    crate::kitty_cursor::CatFoldDirection::Forward => {
-                        -i32::from(dest_w) - clearance
-                    }
-                    crate::kitty_cursor::CatFoldDirection::Reverse => {
-                        grid_w.saturating_add(clearance)
-                    }
-                };
-                (
-                    lerp_px(start_x, target_x, eased),
-                    target_y.saturating_sub(lift(eased)),
-                )
-            }
-        };
+        let draw = placement
+            .drawn
+            .unwrap_or_else(|| self.kitty_cursor_draw_geometry(geom, bob, pose, placement));
+        let CatFootprint {
+            x: sprite_x,
+            y: sprite_y,
+            w: dest_w,
+            h: dest_h,
+        } = draw.rect;
+        self.kitty_cursor_placement.settle = draw.settle;
         let sprite = FreeSprite {
             x: sprite_x,
             y: sprite_y,
@@ -18212,9 +18281,26 @@ mod tests {
 
         let emit_pose = |wd: &mut WordDecorations, pose: crate::kitty_cursor::CatPose, at| {
             let layout = still_layout(g, cursor);
+            let before = (
+                wd.kitty_cursor_placement.settle,
+                wd.kitty_cursor_placement.last_sprite,
+                wd.kitty_cursor_placement.last_emitted_at,
+            );
             let placement = wd
-                .resolve_kitty_cursor_placement(layout, settled_at(at))
+                .prepare_kitty_cursor_placement(layout, settled_at(at), pose)
                 .expect("placeable companion");
+            // With live continuity, preparation must not advance the follower
+            // or pretend a body was emitted.
+            if before.2.is_some() {
+                assert_eq!(
+                    (
+                        wd.kitty_cursor_placement.settle,
+                        wd.kitty_cursor_placement.last_sprite,
+                        wd.kitty_cursor_placement.last_emitted_at
+                    ),
+                    before
+                );
+            }
             let mut free = Vec::new();
             wd.kitty_cursor_at_placement(
                 KittyCursorFrame {
@@ -18225,7 +18311,22 @@ mod tests {
                 &mut free,
             )
             .expect("companion emitted");
-            *free.last().expect("body emitted")
+            let body = *free.last().expect("body emitted");
+            assert_eq!(
+                placement.drawn_footprint(),
+                Some(CatFootprint {
+                    x: body.x,
+                    y: body.y,
+                    w: body.w,
+                    h: body.h,
+                })
+            );
+            assert_eq!(
+                (body.aw, body.ah),
+                (placement.sample.w, placement.sample.h),
+                "pose scales the destination, never the natural atlas tile"
+            );
+            body
         };
 
         let natural = emit_pose(&mut wd, crate::kitty_cursor::CatPose::STILL, t0);
@@ -18249,6 +18350,114 @@ mod tests {
             (sq_cx, sq_cy),
             (nat_cx, nat_cy),
             "centre-scaling offset bypasses PLACE_TAU follower lag so impact stays centred"
+        );
+
+        let leaning = emit_pose(
+            &mut wd,
+            crate::kitty_cursor::CatPose {
+                lead: 0.75,
+                ..crate::kitty_cursor::CatPose::STILL
+            },
+            t0 + Duration::from_millis(32),
+        );
+        assert!(
+            leaning.x > natural.x,
+            "the prepared draw includes the pose's lead"
+        );
+
+        // The one-body gate can reject a correctly prepared next placement.
+        // Neither preparation nor that rejection may commit a follower step.
+        let at = t0 + Duration::from_millis(48);
+        let before = (
+            wd.kitty_cursor_placement.settle,
+            wd.kitty_cursor_placement.last_sprite,
+            wd.kitty_cursor_placement.last_emitted_at,
+        );
+        let layout = still_layout(g, (cursor.0, cursor.1 + 1));
+        let placement = wd
+            .prepare_kitty_cursor_placement(
+                layout,
+                settled_at(at),
+                crate::kitty_cursor::CatPose::STILL,
+            )
+            .expect("next placement");
+        wd.begin_host_frame();
+        assert!(wd.claim_companion_body());
+        let mut free = Vec::new();
+        assert!(
+            wd.kitty_cursor_at_placement(still_frame(g, layout.cursor), placement, &mut free,)
+                .is_none()
+        );
+        assert!(free.is_empty());
+        assert_eq!(
+            (
+                wd.kitty_cursor_placement.settle,
+                wd.kitty_cursor_placement.last_sprite,
+                wd.kitty_cursor_placement.last_emitted_at
+            ),
+            before
+        );
+        wd.begin_host_frame();
+        assert!(
+            wd.kitty_cursor_at_placement(still_frame(g, layout.cursor), placement, &mut free,)
+                .is_some(),
+            "the same prepared placement can actually emit after admission"
+        );
+
+        // An admitted body can still miss its atlas tile. Spend the real bake
+        // budget and request a cold palette: that refusal also keeps all three
+        // follower/emission fields unchanged.
+        let layout = still_layout(g, (cursor.0, cursor.1 + 2));
+        let placement = wd
+            .prepare_kitty_cursor_placement(
+                layout,
+                settled_at(t0 + Duration::from_millis(64)),
+                crate::kitty_cursor::CatPose::STILL,
+            )
+            .expect("cold-palette placement");
+        let before = (
+            wd.kitty_cursor_placement.settle,
+            wd.kitty_cursor_placement.last_sprite,
+            wd.kitty_cursor_placement.last_emitted_at,
+        );
+        let cold_frame = || {
+            let mut frame = still_frame(g, layout.cursor);
+            frame.colors.accent ^= 1;
+            frame
+        };
+        wd.begin_host_frame();
+        wd.begin_baker_frame(g, true);
+        let rgba = [255u8; 4 * 4 * 4];
+        assert!(wd.cat_baker.host_tile(0xAA01, 4, 4, &rgba).is_some());
+        assert!(wd.cat_baker.host_tile(0xAA02, 4, 4, &rgba).is_some());
+        free.clear();
+        assert!(
+            wd.kitty_cursor_at_placement(cold_frame(), placement, &mut free)
+                .is_none()
+        );
+        assert!(free.is_empty());
+        assert_eq!(
+            (
+                wd.kitty_cursor_placement.settle,
+                wd.kitty_cursor_placement.last_sprite,
+                wd.kitty_cursor_placement.last_emitted_at
+            ),
+            before
+        );
+        wd.begin_host_frame();
+        assert!(
+            wd.kitty_cursor_at_placement(cold_frame(), placement, &mut free)
+                .is_some()
+        );
+        let body = free.last().expect("cold tile admitted on the next frame");
+        assert_eq!(
+            placement.drawn_footprint(),
+            Some(CatFootprint {
+                x: body.x,
+                y: body.y,
+                w: body.w,
+                h: body.h,
+            })
         );
     }
 
@@ -18276,7 +18485,7 @@ mod tests {
                 ..still_layout(g, cursor)
             };
             let placement = wd
-                .resolve_kitty_cursor_placement(layout, motion)
+                .prepare_kitty_cursor_placement(layout, motion, crate::kitty_cursor::CatPose::STILL)
                 .expect("placeable companion");
             let mut free = Vec::new();
             wd.kitty_cursor_at_placement(
@@ -18288,7 +18497,18 @@ mod tests {
                 &mut free,
             )
             .expect("companion emitted");
-            (placement, *free.last().expect("body emitted"))
+            let body = *free.last().expect("body emitted");
+            assert_eq!(
+                placement.drawn_footprint(),
+                Some(CatFootprint {
+                    x: body.x,
+                    y: body.y,
+                    w: body.w,
+                    h: body.h,
+                }),
+                "the reserved fold/glide rectangle is the emitted body"
+            );
+            (placement, body)
         };
 
         // Seed at column 0 in the wide SpecStretch variant, then fire a
@@ -18322,6 +18542,35 @@ mod tests {
             (seeded.x, seeded.y),
             "reverse fold launches C0-continuously from the last drawn body"
         );
+
+        // Both directions' seam endpoints stay signed and off glass. A raw
+        // logical target or viewport clamp cannot stand in for this body.
+        for direction in [CatFoldDirection::Forward, CatFoldDirection::Reverse] {
+            let mut folded = WordDecorations::default();
+            let _ = emit_look(&mut folded, (3, 5), wide_look, settled_at(t0));
+            for progress in [0.499, 0.5] {
+                let (_, body) = emit_look(
+                    &mut folded,
+                    (4, 0),
+                    startled_look,
+                    CursorCatPlacementFrame {
+                        sampled_at: fold_at,
+                        fold: Some(CatFoldFrame {
+                            started: fold_at,
+                            direction,
+                            progress,
+                        }),
+                        facing_left: direction == CatFoldDirection::Reverse,
+                    },
+                );
+                let exits_right = (direction == CatFoldDirection::Forward) == (progress < 0.5);
+                if exits_right {
+                    assert!(body.x > i32::from(g.cols) * i32::from(g.cell_w));
+                } else {
+                    assert!(body.x + i32::from(body.w) < 0);
+                }
+            }
+        }
 
         // At the right margin, expiring from Startled (narrow) back to
         // SpecStretch (wide) must glide via PLACE_TAU instead of snapping.

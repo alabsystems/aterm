@@ -71,6 +71,7 @@ pub struct StartMark {
 impl StartFlags {
     /// Parse `pre:<n>,s:<n>,j:<n|->,r:<0|1>` strictly: every field once, in
     /// that order, nothing else.
+    #[inline]
     #[must_use]
     pub fn parse(value: &str) -> Option<Self> {
         let mut parts = value.split(',');
@@ -124,6 +125,7 @@ impl CwdReport {
     /// naming them queues; `None` when the engine would not store it
     /// (`handler_osc::reported_cwd_is_storable`). What a checkpoint carries
     /// and a job's end restores, rebuilt as OSC 7 would build it.
+    #[inline]
     pub(super) fn of(path: Option<&str>, host: Option<&str>) -> Option<Self> {
         let Some(path) = path else {
             return Some(Self {

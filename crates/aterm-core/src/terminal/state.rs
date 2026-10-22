@@ -112,9 +112,10 @@ impl ContentScrollState {
     /// which is why [`Self::delta_since`] never hands out more than 16.
     #[must_use]
     #[inline]
-    pub fn band(&self, seq: u64) -> RowBandMove {
-        let slot = usize::try_from(seq % CONTENT_SCROLL_BAND_RING as u64).unwrap_or_default();
-        self.bands.get(slot).copied().unwrap_or_default()
+    #[allow(clippy::cast_possible_truncation)]
+    pub const fn band(&self, seq: u64) -> RowBandMove {
+        let slot = (seq % CONTENT_SCROLL_BAND_RING as u64) as usize;
+        self.bands[slot]
     }
 
     /// One number that changes exactly when content rows moved under the active screen's
@@ -123,7 +124,7 @@ impl ContentScrollState {
     /// counters only grow, so the sum moves whenever either does.
     #[must_use]
     #[inline]
-    pub fn coordinate_generation(&self) -> u64 {
+    pub const fn coordinate_generation(&self) -> u64 {
         self.uniform_up_rows.wrapping_add(self.invalidation_epoch)
     }
 
@@ -138,7 +139,9 @@ impl ContentScrollState {
     /// * `d_e > 0`: `Bands` iff `d_u == 0`, every epoch step was a band batch
     ///   (`d_e == d_bb`) and the moves fit the ring (`1 <= d_bs <= 16`); else `Invalidate`.
     #[must_use]
-    pub fn delta_since(previous: Option<Self>, current: Self) -> ContentScrollDelta {
+    #[inline]
+    #[allow(clippy::cast_possible_truncation)]
+    pub const fn delta_since(previous: Option<Self>, current: Self) -> ContentScrollDelta {
         let Some(p) = previous else {
             return ContentScrollDelta::Baseline;
         };
@@ -160,24 +163,19 @@ impl ContentScrollState {
             }
             return if d_u == 0 {
                 ContentScrollDelta::Unchanged
-            } else if let Ok(rows) = u16::try_from(d_u) {
-                ContentScrollDelta::Translate(rows)
+            } else if d_u <= u16::MAX as u64 {
+                ContentScrollDelta::Translate(d_u as u16)
             } else {
                 ContentScrollDelta::Invalidate
             };
         }
-        match u8::try_from(d_bs) {
-            Ok(count)
-                if d_u == 0
-                    && d_e == d_bb
-                    && (1..=CONTENT_SCROLL_BAND_RING).contains(&usize::from(count)) =>
-            {
-                ContentScrollDelta::Bands {
-                    first_seq: p.band_seq,
-                    count,
-                }
+        if d_u == 0 && d_e == d_bb && d_bs >= 1 && d_bs <= CONTENT_SCROLL_BAND_RING as u64 {
+            ContentScrollDelta::Bands {
+                first_seq: p.band_seq,
+                count: d_bs as u8,
             }
-            _ => ContentScrollDelta::Invalidate,
+        } else {
+            ContentScrollDelta::Invalidate
         }
     }
 }
@@ -206,6 +204,7 @@ pub(super) struct ConfiguredModes {
 impl Default for ConfiguredModes {
     /// The DEC power-on values, also `TerminalConfig`'s defaults, so applying a default
     /// config to a fresh terminal writes nothing.
+    #[inline]
     fn default() -> Self {
         Self {
             auto_wrap: true,
@@ -445,24 +444,30 @@ impl std::fmt::Debug for Terminal {
 
 impl Terminal {
     /// The active grid.
+    #[inline]
     #[must_use]
-    pub fn grid(&self) -> &Grid {
+    pub const fn grid(&self) -> &Grid {
         &self.grid
     }
 
     /// The main-buffer grid whatever the alt-screen state: while the alternate screen is up
     /// it is the inactive grid in `alt_grid`, holding the only real scrollback. Use it to
     /// reach scrollback that must survive an alt-screen session (snapshot, cold restore).
+    #[inline]
     #[must_use]
-    pub fn main_grid(&self) -> &Grid {
+    pub const fn main_grid(&self) -> &Grid {
         if self.modes.alternate_screen {
-            self.alt_grid.as_ref().unwrap_or(&self.grid)
+            match self.alt_grid.as_ref() {
+                Some(alt) => alt,
+                None => &self.grid,
+            }
         } else {
             &self.grid
         }
     }
 
     /// The active grid, mutably.
+    #[inline]
     pub fn grid_mut(&mut self) -> &mut Grid {
         // The caller may replace or regrid it without a parsed close.
         self.transient.sync_end_caret = None;
@@ -481,6 +486,7 @@ impl Terminal {
     /// Consume and clear the grid's damage after a present (the
     /// [`Damage`](crate::grid::Damage) tracker keeps its allocations) and re-arm
     /// [`damage_epoch`](Self::damage_epoch). Call exactly once per real present.
+    #[inline]
     pub fn take_damage(&mut self) {
         self.grid.clear_damage();
         self.damage_epoch_counted = false;
@@ -493,6 +499,7 @@ impl Terminal {
     /// session (re-armed by [`take_damage`](Self::take_damage)): a write, scroll, erase or
     /// resize advances it, a no-op `process()` does not. It keys off the grid's damage
     /// tracker, so every path that marks damage feeds it.
+    #[inline]
     pub fn damage_epoch(&mut self) -> u64 {
         if !self.damage_epoch_counted && self.grid.damage().has_damage() {
             self.damage_epoch = self.damage_epoch.wrapping_add(1);
@@ -518,7 +525,7 @@ impl Terminal {
     /// stepped in between.
     #[must_use]
     #[inline]
-    pub fn screen_mutations(&self) -> u64 {
+    pub const fn screen_mutations(&self) -> u64 {
         self.transient.screen_mutations
     }
 
@@ -526,33 +533,34 @@ impl Terminal {
     /// [`ContentScrollState::delta_since`].
     #[must_use]
     #[inline]
-    pub fn content_scroll_state(&self) -> ContentScrollState {
+    pub const fn content_scroll_state(&self) -> ContentScrollState {
         self.content_scroll_state
     }
 
     /// Revision for top-anchored protected-footer row insertions.
     #[must_use]
     #[inline]
-    pub fn absolute_row_revision(&self) -> u64 {
+    pub const fn absolute_row_revision(&self) -> u64 {
         self.absolute_row_revision
     }
 
     /// The text selection state.
     #[must_use]
     #[inline]
-    pub fn text_selection(&self) -> &crate::selection::TextSelection {
+    pub const fn text_selection(&self) -> &crate::selection::TextSelection {
         &self.text_selection
     }
 
     /// The text selection state, mutably.
     #[inline]
-    pub fn text_selection_mut(&mut self) -> &mut crate::selection::TextSelection {
+    pub const fn text_selection_mut(&mut self) -> &mut crate::selection::TextSelection {
         &mut self.text_selection
     }
 
     /// Get the terminal modes.
+    #[inline]
     #[must_use]
-    pub fn modes(&self) -> &TerminalModes {
+    pub const fn modes(&self) -> &TerminalModes {
         &self.modes
     }
 
@@ -560,8 +568,9 @@ impl Terminal {
     /// processed `?2026l`, reset or timeout force-clear. A present-hold host
     /// releases when it advances; the mode level alone cannot tell a closed and
     /// reopened bracket from one still open.
+    #[inline]
     #[must_use]
-    pub fn sync_end_seq(&self) -> u64 {
+    pub const fn sync_end_seq(&self) -> u64 {
         self.transient.sync_end_seq
     }
 
@@ -571,6 +580,7 @@ impl Terminal {
     /// that frame, since later unbracketed output may already have moved it.
     /// A timeout, reset, screen replacement or resize invalidates the reading;
     /// it is transient and a restored engine starts with none.
+    #[inline]
     #[must_use]
     pub fn sync_end_caret(&self) -> Option<(u16, u16)> {
         self.transient
@@ -588,8 +598,9 @@ impl Terminal {
     /// damage predicate. `false` with an advanced [`sync_end_seq`](Self::sync_end_seq) lets
     /// a presenter show the just-closed frame; `true` means the grid may hold a prefix of
     /// the next frame and stays held (subject to the timeout).
+    #[inline]
     #[must_use]
-    pub fn sync_open_dirty(&self) -> bool {
+    pub const fn sync_open_dirty(&self) -> bool {
         self.modes.synchronized_output && self.transient.sync_open_dirty
     }
 
@@ -598,8 +609,9 @@ impl Terminal {
     /// `sync_timeout_ms` force-clear, ending only on the program's `?2026l`, DECSTR or RIS;
     /// a bracket reopened with nothing written reads `false`. Hosts use it to know the
     /// visible cursor may be the program's write position, not its caret.
+    #[inline]
     #[must_use]
-    pub fn sync_frame_unfinished(&self) -> bool {
+    pub const fn sync_frame_unfinished(&self) -> bool {
         self.transient.app_sync_open && self.transient.app_sync_dirty
     }
 
@@ -608,14 +620,16 @@ impl Terminal {
     /// unwrapped until the wrapper's `ESC \\`). The I/O-queue fast path uses it
     /// to route reads after a chunk that ended mid-sequence through the
     /// ordered slow path.
+    #[inline]
     #[must_use]
     pub fn parser_is_ground(&self) -> bool {
         self.parser.state().is_ground() && !self.parser.tmux_passthrough().is_open()
     }
 
     /// Whether the alternate screen is active.
+    #[inline]
     #[must_use]
-    pub fn is_alternate_screen(&self) -> bool {
+    pub const fn is_alternate_screen(&self) -> bool {
         self.modes.alternate_screen
     }
 

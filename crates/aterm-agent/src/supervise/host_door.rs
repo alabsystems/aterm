@@ -663,10 +663,9 @@ pub trait IdleHost: Send + Sync + std::fmt::Debug {
     }
 
     /// THE TASK'S FACE, TOLD AS IT MOVES (§9.4.2): open, landed or theirs
-    /// ([`TaskFace`](crate::harness::acts::TaskFace); FOREVER CRUISE / FOREVER
-    /// LAND retired done and spent), told once at the loop's start and then
-    /// on each change, so the window's chip and `status task=` say whether a
-    /// landing landed. Reporting only: nothing the loop decides reads it
+    /// ([`TaskFace`](crate::harness::acts::TaskFace), its only faces), told
+    /// once at the loop's start and then on each change, so the window's chip
+    /// and `status task=` say whether a landing landed. Reporting only: nothing the loop decides reads it
     /// back. The default ignores it.
     fn task_face(&self, face: crate::harness::acts::TaskFace) {
         let _ = face;

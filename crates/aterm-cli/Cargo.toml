@@ -94,3 +94,8 @@ aterm-time = { workspace = true }
 # `wait::past_text_busy`: the shim tests exec files they just wrote while sibling
 # test threads fork (Linux's ETXTBSY).
 aterm-spec = { workspace = true }
+
+# The setup doctor's unit-test flush (`macos_doctor::durable_directory`): a plain
+# `fsync(2)` through the counting seam. Already in the graph via aterm-machines.
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+aterm-durable = { workspace = true }

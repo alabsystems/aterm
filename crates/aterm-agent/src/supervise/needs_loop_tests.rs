@@ -1496,3 +1496,464 @@ fn a_first_point_reads_a_reply_cut_at_the_rows_top_whole() {
         );
     }
 }
+
+/// The measured column-0 cells of agy's screen
+/// `aterm_phase::agy::fixtures::lab::PERSON_PARAGRAPHS_LONG_REPLY`, by grid
+/// row (`supervise/fixtures/agy-1.4.0-lab-person-paragraphs-long-reply.cells`).
+fn agy_paragraph_cells() -> BTreeMap<(usize, usize), String> {
+    include_str!("fixtures/agy-1.4.0-lab-person-paragraphs-long-reply.cells")
+        .lines()
+        .filter(|l| !l.starts_with('#'))
+        .filter_map(|l| {
+            let (row, reply) = l.split_once(' ')?;
+            Some(((row.parse().ok()?, 0), reply.to_string()))
+        })
+        .collect()
+}
+
+/// A PERSON'S PARAGRAPHS IN AGY ARE NEVER AGY'S NEED
+/// (`Session::message_bounded_by_cells`; lab r16o): on agy's measured screen
+/// of a person's message of two paragraphs — the second `NEEDS YOU: the
+/// person's own words after a blank line.`, agy's blank row between them
+/// like the one that ends the message — under the stub's long reply, the
+/// loop reads the message's column-0 cells (the measured ones), takes the
+/// blank row drawn in its caret row's style out of the message, and puts up
+/// no need at the point: the reply is agy's alone. The cells read are the
+/// caret row's and the blank rows' down to the first plain one, at column 0,
+/// and every read of the screen meets the message's rows. A `NEEDS YOU:` in agy's
+/// own reply is still put up with the same cells. NEGATIVE CONTROL: a host
+/// whose cells cannot be read leaves the screen as its text reads, and the
+/// person's paragraph goes up as agy's need — the defect.
+#[test]
+fn a_persons_paragraphs_in_agy_are_never_its_need() {
+    use aterm_phase::agy::fixtures::lab::PERSON_PARAGRAPHS_LONG_REPLY;
+    use aterm_phase::prompt::fixtures::screen;
+    let theirs = "the person's own words after a blank line.";
+    let run = |shown: Vec<String>, cells: bool| {
+        let mut m = Mock::new(vec![shown.clone()]);
+        m.program = "agy";
+        m.screen_cursors.insert(
+            0,
+            aterm_phase::agy::composer(&shown).expect("agy's composer"),
+        );
+        m.autopilot = Some("cruise");
+        if cells {
+            m.cells = agy_paragraph_cells();
+        } else {
+            m.cell_unreadable = true;
+        }
+        let opts = SuperviseOpts {
+            policy: owners_policy(),
+            ..auto(30)
+        };
+        let mut notes = Notes::default();
+        let again = {
+            let mut s = session(&mut m, None);
+            s.set_clock(TEST_NOW, PDT);
+            s.set_zone_lookup(test_zones);
+            s.reconcile(&mut notes).expect("the loop's start");
+            let screen = s.screen().expect("the point");
+            let point = s.turn_of(screen);
+            let _ = s.turn_end_at_point(&point, None, &opts).expect("decided");
+            for _ in 0..2 {
+                s.task_edge(&point.screen, &opts, &mut notes)
+                    .expect("the point's edge");
+            }
+            s.screen().expect("the same screen again").rows
+        };
+        let cells: Vec<String> = m
+            .requests
+            .iter()
+            .filter(|r| r.starts_with("cell "))
+            .cloned()
+            .collect();
+        (m.needs_calls.clone(), cells, again)
+    };
+    let shown = screen(PERSON_PARAGRAPHS_LONG_REPLY);
+    let (calls, cells, again) = run(shown.clone(), true);
+    assert!(
+        !calls
+            .iter()
+            .any(|c| c.starts_with("set attention owner=needs ")),
+        "{calls:#?}"
+    );
+    assert_eq!(
+        cells[..3],
+        ["cell 30 0", "cell 31 0", "cell 33 0"],
+        "{cells:#?}"
+    );
+    assert!(cells.iter().all(|c| c.ends_with(" 0")), "{cells:#?}");
+    // The message's rows meet in every read: its blank row taken out.
+    let at = again
+        .iter()
+        .position(|r| r.starts_with("  NEEDS YOU: the person's own words"))
+        .expect("the person's paragraph");
+    assert_eq!(
+        again[at - 1],
+        "> Second message, first paragraph.",
+        "{again:#?}"
+    );
+    assert!(again[at + 1].is_empty(), "{again:#?}");
+    // agy's own need in its reply, the same cells: put up.
+    let mut needing = shown.clone();
+    let advice = needing
+        .iter()
+        .position(|r| r.starts_with("  Nothing here is advice."))
+        .expect("the reply's second paragraph");
+    needing[advice] = format!("  NEEDS YOU: {NEED}");
+    let (calls, _, _) = run(needing, true);
+    assert!(
+        calls
+            .iter()
+            .any(|c| c.starts_with("set attention owner=needs ") && c.contains(NEED)),
+        "{calls:#?}"
+    );
+    // NEGATIVE CONTROL: no cells, the person's paragraph is agy's need.
+    let (calls, cells, _) = run(shown, false);
+    assert!(
+        calls
+            .iter()
+            .any(|c| c.starts_with("set attention owner=needs ") && c.contains(theirs)),
+        "{calls:#?}"
+    );
+    assert!(!cells.is_empty(), "the cells were asked: {cells:#?}");
+}
+
+/// What the cells say of agy's screen at a loop's point (the runs of the
+/// tests below): the screen read, [`Mock::cells`] for its grid rows or
+/// none readable, and the history above it with [`Mock::history_cells`].
+struct AgyCells {
+    shown: Vec<String>,
+    cells: Option<BTreeMap<(usize, usize), String>>,
+    history: Option<(Vec<String>, Cells)>,
+}
+
+/// Measured `cell <r> <c>` replies by row and column ([`Mock::cells`]).
+type Cells = BTreeMap<(usize, usize), String>;
+
+/// What a loop's point on agy's screen came to ([`agy_point`]).
+struct AgyPoint {
+    /// The needs standing after it, every one (the entry names the first).
+    needs: Vec<String>,
+    /// The `cell` reads, in order.
+    cells: Vec<String>,
+    /// The screen read again after it.
+    again: Vec<String>,
+}
+
+/// A loop's point under Cruise on agy's screen as `at` serves it, as
+/// `a_persons_paragraphs_in_agy_are_never_its_need` runs one; the entry it
+/// put up, if any, names the needs standing.
+fn agy_point(at: AgyCells) -> AgyPoint {
+    let mut m = Mock::new(vec![at.shown.clone()]);
+    m.program = "agy";
+    m.screen_cursors.insert(
+        0,
+        aterm_phase::agy::composer(&at.shown).expect("agy's composer"),
+    );
+    m.autopilot = Some("cruise");
+    m.alt_screen = Some(false);
+    match at.cells {
+        Some(cells) => m.cells = cells,
+        None => m.cell_unreadable = true,
+    }
+    if let Some((above, cells)) = at.history {
+        m.scrollback = Some(above);
+        m.history_cells = cells;
+    }
+    let opts = SuperviseOpts {
+        policy: owners_policy(),
+        ..auto(30)
+    };
+    let mut notes = Notes::default();
+    let (needs, again) = {
+        let mut s = session(&mut m, None);
+        s.set_clock(TEST_NOW, PDT);
+        s.set_zone_lookup(test_zones);
+        s.reconcile(&mut notes).expect("the loop's start");
+        let screen = s.screen().expect("the point");
+        let point = s.turn_of(screen);
+        let _ = s.turn_end_at_point(&point, None, &opts).expect("decided");
+        for _ in 0..2 {
+            s.task_edge(&point.screen, &opts, &mut notes)
+                .expect("the point's edge");
+        }
+        let needs = s.turn_end.standing_needs().to_vec();
+        (needs, s.screen().expect("the same screen again").rows)
+    };
+    let up = m
+        .needs_calls
+        .iter()
+        .any(|c| c.starts_with("set attention owner=needs "));
+    assert_eq!(up, !needs.is_empty(), "{:#?}", m.needs_calls);
+    let cells: Vec<String> = m
+        .requests
+        .iter()
+        .filter(|r| r.starts_with("cell "))
+        .cloned()
+        .collect();
+    AgyPoint {
+        needs,
+        cells,
+        again,
+    }
+}
+
+/// The measured screen `PERSON_PARAGRAPHS_LONG_REPLY` with its reply drawn
+/// `more` paragraphs of three longer (the stub's three again, a blank row
+/// before each, as agy draws a reply's paragraphs: DRAWN, not measured),
+/// and its cells: the measured ones, the rows drawn in a reply's
+/// (`d0d0d0`, no attribute, as every measured reply row's), the composer's
+/// moved down with it.
+fn agy_long_reply(more: usize) -> (Vec<String>, BTreeMap<(usize, usize), String>) {
+    use aterm_phase::agy::fixtures::lab::PERSON_PARAGRAPHS_LONG_REPLY;
+    use aterm_phase::prompt::fixtures::screen;
+    let measured = screen(PERSON_PARAGRAPHS_LONG_REPLY);
+    let rule = measured
+        .iter()
+        .rposition(|r| r.starts_with('>'))
+        .map(|caret| caret - 1)
+        .expect("the composer's top rule");
+    let first = measured
+        .iter()
+        .position(|r| r.starts_with("  This is a long canned reply"))
+        .expect("the reply's first row");
+    let paragraphs = &measured[first..rule - 1];
+    let mut drawn = measured[..rule].to_vec();
+    for _ in 0..more {
+        drawn.push(String::new());
+        drawn.extend(paragraphs.iter().cloned());
+    }
+    let added = drawn.len() - rule;
+    drawn.extend(measured[rule..].iter().cloned());
+    let measured_cells = agy_paragraph_cells();
+    let reply_cell = "OK %20 d0d0d0 111318 none".to_string();
+    let cells = (0..drawn.len())
+        .map(|row| {
+            let cell = if row < rule {
+                measured_cells[&(row, 0)].clone()
+            } else if row < rule + added {
+                reply_cell.clone()
+            } else {
+                measured_cells[&(row - added, 0)].clone()
+            };
+            ((row, 0), cell)
+        })
+        .collect();
+    (drawn, cells)
+}
+
+/// The person's paragraph after a blank line in the measured message.
+const THEIRS: &str = "the person's own words after a blank line.";
+
+/// `shown` with the first row from the bottom that starts with `prefix`
+/// agy's own need, two columns in as its reply's rows.
+fn agys_need_at(shown: &[String], prefix: &str) -> Vec<String> {
+    let mut rows = shown.to_vec();
+    let at = rows
+        .iter()
+        .rposition(|r| r.starts_with(prefix))
+        .expect("a reply row");
+    rows[at] = format!("  NEEDS YOU: {NEED}");
+    rows
+}
+
+/// A PERSON'S PARAGRAPHS ABOVE THE ROWS READ ARE NEVER AGY'S NEED (the
+/// review of 3a4586a01e, R1): on a pane taller than the loop's 40-row tail
+/// whose reply under the person's message runs past it — the message's
+/// caret row, its blank row and its `NEEDS YOU:` paragraph above the tail's
+/// first row, so its read bounds nothing and the reply reads cut at the
+/// rows' top — the point's read of the turn whole reads the grid and bounds
+/// the message there by its cells (`cell <r> 0` of the grid's rows), and no
+/// need stands; agy's own need in that reply still does, alone. NEGATIVE
+/// CONTROL: the same screen with no cells readable puts the person's
+/// paragraph up as agy's need (the defect, before the grid read was
+/// bounded).
+#[test]
+fn a_persons_paragraphs_above_the_rows_read_are_never_agys_need() {
+    let (shown, cells) = agy_long_reply(3);
+    let caret = shown
+        .iter()
+        .position(|r| r == "> Second message, first paragraph.")
+        .expect("the person's caret row");
+    assert!(
+        shown.len() - 40 > caret + 3,
+        "the message's rows are above the tail: {} rows",
+        shown.len()
+    );
+    let p = agy_point(AgyCells {
+        shown: shown.clone(),
+        cells: Some(cells.clone()),
+        history: None,
+    });
+    assert!(p.needs.is_empty(), "{:#?}", p.needs);
+    let at = |row: usize| format!("cell {row} 0");
+    assert!(
+        p.cells
+            .windows(3)
+            .any(|w| w == [at(caret), at(caret + 1), at(caret + 3)]),
+        "the grid's cells were read: {:#?}",
+        p.cells
+    );
+    // agy's own need in the reply, the same cells: it alone stands.
+    let p = agy_point(AgyCells {
+        shown: agys_need_at(&shown, "  Nothing here is advice."),
+        cells: Some(cells),
+        history: None,
+    });
+    assert!(
+        p.needs.len() == 1 && p.needs[0].starts_with(NEED),
+        "{:#?}",
+        p.needs
+    );
+    // NEGATIVE CONTROL: no cells, the person's paragraph is agy's need.
+    let p = agy_point(AgyCells {
+        shown,
+        cells: None,
+        history: None,
+    });
+    assert!(p.needs.iter().any(|n| n == THEIRS), "{:#?}", p.needs);
+}
+
+/// A PERSON'S PARAGRAPHS SCROLLED INTO THE HISTORY ARE NEVER AGY'S NEED
+/// (the review of 3a4586a01e, T1): the person's message's caret row, its
+/// blank row and its `NEEDS YOU:` paragraph scrolled up out of the grid, its
+/// reply's later rows and the composer on it, the point's read of the turn
+/// whole joins the history above the grid and bounds the message there by
+/// the cells of the history's rows (`cell abs=<n> 0`, which reads a history
+/// row's cells as they were drawn: `aterm-gui`'s
+/// `a_history_rows_cell_reads_as_it_did_on_the_screen`), and no need
+/// stands; agy's own need in that reply still does, alone. NEGATIVE
+/// CONTROL: the same rows with no cells readable put the person's paragraph
+/// up as agy's need (the defect, before the history read was bounded).
+#[test]
+fn a_persons_paragraphs_scrolled_into_the_history_are_never_agys_need() {
+    let (drawn, cells) = agy_long_reply(3);
+    let caret = drawn
+        .iter()
+        .position(|r| r == "> Second message, first paragraph.")
+        .expect("the person's caret row");
+    // The grid from the reply's second row down, read whole.
+    let split = caret + 5;
+    let run = |drawn: &[String], readable: bool| {
+        let above = drawn[..split].to_vec();
+        let shown = drawn[split..].to_vec();
+        assert!(shown.len() <= 40, "{} rows", shown.len());
+        let history_cells: BTreeMap<(usize, usize), String> = cells
+            .iter()
+            .filter(|((row, _), _)| *row < split)
+            .map(|(k, v)| (*k, v.clone()))
+            .collect();
+        let grid_cells: BTreeMap<(usize, usize), String> = cells
+            .iter()
+            .filter(|((row, _), _)| *row >= split)
+            .map(|((row, col), v)| ((row - split, *col), v.clone()))
+            .collect();
+        agy_point(AgyCells {
+            shown,
+            cells: readable.then_some(grid_cells),
+            history: Some((above, history_cells)),
+        })
+    };
+    let p = run(&drawn, true);
+    assert!(p.needs.is_empty(), "{:#?}", p.needs);
+    let at = |row: usize| format!("cell abs={row} 0");
+    assert!(
+        p.cells
+            .windows(3)
+            .any(|w| w == [at(caret), at(caret + 1), at(caret + 3)]),
+        "the history's cells were read: {:#?}",
+        p.cells
+    );
+    // agy's own need in the reply on the grid, the same cells: it alone.
+    let p = run(&agys_need_at(&drawn, "  Nothing here is advice."), true);
+    assert!(
+        p.needs.len() == 1 && p.needs[0].starts_with(NEED),
+        "{:#?}",
+        p.needs
+    );
+    // NEGATIVE CONTROL: no cells, the person's paragraph is agy's need.
+    let p = run(&drawn, false);
+    assert!(p.needs.iter().any(|n| n == THEIRS), "{:#?}", p.needs);
+}
+
+/// A MESSAGE'S CELLS FOLD NOTHING THEY DO NOT PROVE
+/// (`Session::message_cells`; the review of 3a4586a01e, T2): on agy's
+/// measured screen, the message's blank rows are taken out only where the
+/// caret row's cell reads agy's caret, every blank row taken out reads a
+/// blank in its style, and a plain blank row under them ends the message —
+/// otherwise the screen stays as its text reads (FAIL TOWARD A KEPT NEED):
+/// every blank row read in the caret's style (no row ends the message)
+/// keeps agy's own need in its reply standing; a blank row that reads a
+/// glyph, or reads nothing, under the message keeps agy's need on its
+/// reply's first row standing; a caret row whose cell reads no `>` (the
+/// screen moved under the reads) folds nothing, and the person's paragraph
+/// stands as the text reads it. CONTROL: the measured cells fold the
+/// message's blank row and no need stands
+/// (`a_persons_paragraphs_in_agy_are_never_its_need`).
+#[test]
+fn a_messages_cells_fold_nothing_they_do_not_prove() {
+    use aterm_phase::agy::fixtures::lab::PERSON_PARAGRAPHS_LONG_REPLY;
+    use aterm_phase::prompt::fixtures::screen;
+    let shown = screen(PERSON_PARAGRAPHS_LONG_REPLY);
+    let measured = agy_paragraph_cells();
+    let caret = shown
+        .iter()
+        .position(|r| r == "> Second message, first paragraph.")
+        .expect("the person's caret row");
+    let (_, blanks) = aterm_phase::agy::message_blanks(&shown).expect("the message's blanks");
+    assert_eq!(blanks[..2], [caret + 1, caret + 3], "{blanks:?}");
+    let own = measured[&(caret + 1, 0)].clone();
+    // The loop's 40-row tail, as it reads the screen again.
+    let tail = |rows: &[String]| rows[rows.len() - 40..].to_vec();
+    let run = |shown: &[String], cells: BTreeMap<(usize, usize), String>| {
+        agy_point(AgyCells {
+            shown: shown.to_vec(),
+            cells: Some(cells),
+            history: None,
+        })
+    };
+    // Every blank row in the caret's style: no row ends the message.
+    let mut all_own = measured.clone();
+    for &row in &blanks {
+        all_own.insert((row, 0), own.clone());
+    }
+    let needing = agys_need_at(&shown, "  Nothing here is advice.");
+    let p = run(&needing, all_own);
+    assert!(
+        p.needs.iter().any(|n| n.starts_with(NEED)),
+        "every blank own: {:#?}",
+        p.needs
+    );
+    assert_eq!(p.again, tail(&needing), "every blank own: nothing folded");
+    // A blank row under the message that reads a glyph, or nothing.
+    let needing = agys_need_at(&shown, "  This is a long canned reply");
+    for (name, cell) in [
+        ("a glyph", "OK x d0d0d0 111318 none"),
+        ("nothing", "ERR evicted"),
+    ] {
+        let mut odd = measured.clone();
+        odd.insert((caret + 3, 0), cell.to_string());
+        let p = run(&needing, odd);
+        assert!(
+            p.needs.iter().any(|n| n.starts_with(NEED)),
+            "{name}: {:#?}",
+            p.needs
+        );
+        assert_eq!(p.again, tail(&needing), "{name}: nothing folded");
+    }
+    // A caret row whose cell reads no caret.
+    let mut moved = measured.clone();
+    moved.insert((caret, 0), own);
+    let p = run(&shown, moved);
+    assert!(
+        p.needs.iter().any(|n| n == THEIRS),
+        "no caret: {:#?}",
+        p.needs
+    );
+    assert_eq!(p.again, tail(&shown), "no caret: nothing folded");
+    // CONTROL: the measured cells fold the message's blank row.
+    let p = run(&shown, measured);
+    assert!(p.needs.is_empty(), "{:#?}", p.needs);
+    assert_ne!(p.again, tail(&shown));
+}

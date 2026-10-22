@@ -179,7 +179,7 @@ pub fn request_visual_swapchain() {
 
 /// Withdraw the visual-swapchain request. Called by:
 ///   * the GPU-init-failure arm (later windows use plain HWND attributes, since
-///     a softbuffer present into a `WS_EX_NOREDIRECTIONBITMAP` window shows
+///     a CPU (GDI) present into a `WS_EX_NOREDIRECTIONBITMAP` window shows
 ///     nothing);
 ///   * the GPU-loss downgrade (same reason);
 ///   * the fail-soft arm after the first composition configure failed, before
@@ -214,7 +214,7 @@ pub enum SurfaceAttachFallback {
     /// opaque HWND swapchain, and retry the attach once.
     RebuildOpaque,
     /// First/only window on a plain instance (or the opaque retry failed too):
-    /// downgrade the whole app to the CPU softbuffer renderer.
+    /// downgrade the whole app to the CPU renderer.
     CpuRenderer,
 }
 
@@ -433,7 +433,7 @@ const fn default_backends() -> wgpu::Backends {
 
 /// The first-party Metal renderer is the macOS backend, unconditionally: wgpu is
 /// not in the macOS production graph. A Mac where Metal fails to initialize falls
-/// to the softbuffer CPU present, as on device loss. A `const fn` so every
+/// to the CPU present, as on device loss. A `const fn` so every
 /// armed-path site reads as this decision.
 #[cfg(target_os = "macos")]
 #[must_use]

@@ -1279,6 +1279,79 @@ fn the_gpu_reads_on_this_host_in_whole_percent() {
     }
 }
 
+/// NVML's return codes as the vitals say them: not supported is
+/// `unsupported`, no permission names NVML's gate, and every other failure
+/// (uninitialised, not found, GPU lost, a library behind its kernel module)
+/// is `not_read`.
+#[cfg(target_os = "linux")]
+#[test]
+fn an_nvml_failure_says_why() {
+    assert_eq!(crate::nvml::why(3), Why::Unsupported);
+    assert_eq!(crate::nvml::why(4), Why::NeedsPrivilege("nvml"));
+    assert_eq!(
+        Why::NeedsPrivilege("nvml").to_string(),
+        "needs_privilege:nvml"
+    );
+    for code in [1, 2, 6, 9, 15, 18, 999] {
+        assert_eq!(crate::nvml::why(code), Why::NotRead, "{code}");
+    }
+}
+
+/// Live: this host's NVIDIA card, where it has one and the driver's
+/// `libnvidia-ml.so.1`, reads a whole percent from the real NVML by its PCI
+/// slot, and, where its runtime PM cannot move, through the system root's
+/// GPU reader too. The figures and the two reads' costs are printed (the
+/// first read opens and initialises NVML unless another test of this
+/// process already has). SKIP where there is no NVIDIA card, no library, or
+/// a card under runtime PM, which NVML would wake.
+#[cfg(target_os = "linux")]
+#[test]
+fn nvml_reads_the_nvidia_card_on_this_host() {
+    let drm = Path::new("/sys/class/drm");
+    let card = std::fs::read_dir(drm).ok().and_then(|cards| {
+        cards.flatten().find_map(|e| {
+            let dev = e.path().join("device");
+            let uevent = std::fs::read_to_string(dev.join("uevent")).ok()?;
+            uevent.lines().any(|l| l == "DRIVER=nvidia").then_some(())?;
+            let slot = uevent
+                .lines()
+                .find_map(|l| l.strip_prefix("PCI_SLOT_NAME="))?;
+            Some((dev, slot.to_owned()))
+        })
+    });
+    let Some((dev, slot)) = card else {
+        eprintln!("SKIP: no NVIDIA DRM card with a PCI slot");
+        return;
+    };
+    if aterm_dl::Library::open(crate::nvml::SONAMES).is_err() {
+        eprintln!("SKIP: no libnvidia-ml.so.1");
+        return;
+    }
+    let word = |file: &str| {
+        std::fs::read_to_string(dev.join(file))
+            .map(|t| t.trim().to_owned())
+            .unwrap_or_default()
+    };
+    let status = word("power/runtime_status");
+    let settled = linux::pm_settled(&status, &word("power/control"), &word("boot_vga"));
+    if status == "suspended" || !settled {
+        eprintln!("SKIP: {slot} is under runtime PM ({status}); NVML would wake it");
+        return;
+    }
+    let first = Instant::now();
+    let pct = crate::nvml::device_pct(&slot).expect("NVML's figure");
+    let first = first.elapsed();
+    let again = Instant::now();
+    let pct2 = crate::nvml::device_pct(&slot).expect("NVML's figure, again");
+    let again = again.elapsed();
+    assert!(pct <= 100 && pct2 <= 100, "{pct} {pct2}");
+    eprintln!("nvml {slot}: {pct}% in {first:?}, then {pct2}% in {again:?}");
+    let g = linux::Root::system().gpu().expect("a GPU");
+    eprintln!("Root::system().gpu(): {g:?}");
+    assert!(g.device_pct.is_some_and(|p| p <= 100), "{g:?}");
+    assert_eq!(g.unread, None, "{g:?}");
+}
+
 /// Live: the root volume's figures are in order and name their mount and
 /// type. NEGATIVE CONTROLS: a path that does not exist, and one with a NUL.
 #[cfg(any(target_os = "macos", target_os = "linux"))]

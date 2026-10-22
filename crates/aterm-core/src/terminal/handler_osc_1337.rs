@@ -118,12 +118,19 @@ impl Dimension {
     /// `viewport_cells` the grid extent on this axis, `auto_cells` the footprint
     /// derived from the image's own pixel size. Always returns at least 1 (a
     /// placed image occupies space) when the inputs are non-degenerate.
-    fn to_cells(self, cell_px: u16, viewport_cells: u16, auto_cells: u16) -> u16 {
+    #[inline]
+    const fn to_cells(self, cell_px: u16, viewport_cells: u16, auto_cells: u16) -> u16 {
         let cells = match self {
             Dimension::Cells(c) => c,
-            Dimension::Pixels(px) => px.div_ceil(u32::from(cell_px.max(1))),
-            Dimension::Percent(p) => (u32::from(viewport_cells).saturating_mul(p) / 100).max(1),
-            Dimension::Auto => u32::from(auto_cells),
+            Dimension::Pixels(px) => {
+                let denom = if cell_px == 0 { 1 } else { cell_px as u32 };
+                px.div_ceil(denom)
+            }
+            Dimension::Percent(p) => {
+                let scaled = (viewport_cells as u32).saturating_mul(p) / 100;
+                if scaled == 0 { 1 } else { scaled }
+            }
+            Dimension::Auto => auto_cells as u32,
         };
         clamp_cells(cells)
     }
@@ -135,15 +142,29 @@ impl Dimension {
     clippy::cast_possible_truncation,
     reason = "min(MAX_FOOTPRINT_CELLS=4096) guarantees the value fits u16"
 )]
-fn clamp_cells(cells: u32) -> u16 {
-    cells.min(u32::from(MAX_FOOTPRINT_CELLS)) as u16
+#[inline]
+const fn clamp_cells(cells: u32) -> u16 {
+    if cells > MAX_FOOTPRINT_CELLS as u32 {
+        MAX_FOOTPRINT_CELLS
+    } else {
+        cells as u16
+    }
 }
 
 /// Narrow a `usize` cell span to `u32`, saturating. Used by the sixel placement
 /// path so a span (already bounded by the decoder's dimension cap) feeds
 /// `clamp_cells` without a truncating cast.
-fn clamp_u32(v: usize) -> u32 {
-    u32::try_from(v).unwrap_or(u32::MAX)
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "v <= u32::MAX is checked before narrowing"
+)]
+#[inline]
+const fn clamp_u32(v: usize) -> u32 {
+    if v > u32::MAX as usize {
+        u32::MAX
+    } else {
+        v as u32
+    }
 }
 
 /// Parsed `File=` arguments (everything before the `:` payload separator).
@@ -354,6 +375,7 @@ impl TerminalHandler<'_> {
     /// `start_col` is the anchor: 0 for iTerm2 OSC 1337 (left margin, per spec),
     /// the cursor column for sixel (VT340/xterm). Cells past the right edge are
     /// clipped, not wrapped.
+    #[inline]
     pub(super) fn place_image(
         &mut self,
         image: &Arc<ImageData>,
@@ -674,6 +696,7 @@ fn parse_file_args(args: &[u8]) -> FileArgs {
 }
 
 /// Case-insensitively strip an ASCII prefix, returning the remainder.
+#[inline]
 fn strip_prefix_ascii_ci<'a>(haystack: &'a [u8], prefix: &[u8]) -> Option<&'a [u8]> {
     if haystack.len() >= prefix.len() && haystack[..prefix.len()].eq_ignore_ascii_case(prefix) {
         Some(&haystack[prefix.len()..])
@@ -683,8 +706,9 @@ fn strip_prefix_ascii_ci<'a>(haystack: &'a [u8], prefix: &[u8]) -> Option<&'a [u
 }
 
 /// Classify the raw payload by magic bytes. Only PNG is renderable.
-fn detect_format(bytes: &[u8]) -> ImageFormat {
-    if bytes.starts_with(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]) {
+#[inline]
+const fn detect_format(bytes: &[u8]) -> ImageFormat {
+    if matches!(bytes, [0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, ..]) {
         ImageFormat::Png
     } else {
         ImageFormat::Unknown
@@ -693,9 +717,10 @@ fn detect_format(bytes: &[u8]) -> ImageFormat {
 
 /// A PNG's pixel dimensions from the IHDR chunk (the big-endian u32s at byte
 /// offset 16), without decoding. `None` for a non-PNG or truncated header.
-fn png_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
+#[inline]
+const fn png_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
     // 8-byte signature + 4-byte length + "IHDR" (4) → width@16, height@20.
-    if bytes.len() < 24 || !bytes.starts_with(&[0x89, b'P', b'N', b'G']) {
+    if bytes.len() < 24 || !matches!(bytes, [0x89, b'P', b'N', b'G', ..]) {
         return None;
     }
     let w = u32::from_be_bytes([bytes[16], bytes[17], bytes[18], bytes[19]]);

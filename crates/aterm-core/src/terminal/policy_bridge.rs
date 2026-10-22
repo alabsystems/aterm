@@ -35,7 +35,7 @@ impl BridgeDecision {
     /// Resolve against the caller's legacy boolean: `true` when the mint should proceed.
     #[inline]
     #[must_use]
-    pub(super) fn resolve(self, legacy_allow: bool) -> bool {
+    pub(super) const fn resolve(self, legacy_allow: bool) -> bool {
         match self {
             Self::Allow => true,
             Self::Deny => false,

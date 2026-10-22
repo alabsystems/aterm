@@ -156,7 +156,8 @@ pub struct StyleRepr {
 }
 
 impl StyleRepr {
-    fn capture(style: &CurrentStyle) -> Self {
+    #[inline]
+    const fn capture(style: &CurrentStyle) -> Self {
         Self {
             fg: style.fg,
             bg: style.bg,
@@ -165,6 +166,7 @@ impl StyleRepr {
         }
     }
 
+    #[inline]
     fn into_style(self) -> CurrentStyle {
         CurrentStyle::new(self.fg, self.bg, self.flags, self.protected)
     }
@@ -177,10 +179,12 @@ impl StyleRepr {
 pub struct SavedCursorPendingWrap(bool);
 
 impl SavedCursorPendingWrap {
+    #[inline]
     const fn new(value: bool) -> Self {
         Self(value)
     }
 
+    #[inline]
     const fn get(self) -> bool {
         self.0
     }
@@ -214,7 +218,8 @@ impl SavedCursorRepr {
     /// the grid grows back first: the projection must not clamp. The wire bounds the
     /// slot by the protocol ceiling, not the current grid
     /// (`seamless::checkpoint_meta_bound_violation`).
-    fn capture(saved: SavedCursorState) -> Self {
+    #[inline]
+    const fn capture(saved: SavedCursorState) -> Self {
         Self {
             cursor_row: saved.cursor.row,
             cursor_col: saved.cursor.col,
@@ -230,6 +235,7 @@ impl SavedCursorRepr {
         }
     }
 
+    #[inline]
     fn into_saved(self) -> SavedCursorState {
         SavedCursorState {
             cursor: Cursor::new(self.cursor_row, self.cursor_col),
@@ -310,8 +316,9 @@ pub enum ShellIntegrationPosture {
 
 impl ShellIntegrationPosture {
     /// The wire word.
+    #[inline]
     #[must_use]
-    pub fn as_str(self) -> &'static str {
+    pub const fn as_str(self) -> &'static str {
         match self {
             Self::Off => "off",
             Self::On => "on",
@@ -517,6 +524,7 @@ impl Terminal {
     /// nonce in use (every mark dropped so far), or not required. A re-key the
     /// shell has not taken yet ([`Self::authorize_shell_integration_on_first_mark`])
     /// is not in use: it reads `Degraded` until a mark signed with it arrives.
+    #[inline]
     #[must_use]
     pub fn shell_integration_posture(&self) -> ShellIntegrationPosture {
         match (
@@ -534,6 +542,7 @@ impl Terminal {
     /// The parser must be in Ground state: a checkpoint taken
     /// mid-sequence would silently lose the parser's partial state (which is not
     /// in the projection). This is `debug_assert`ed.
+    #[inline]
     #[must_use]
     pub fn checkpoint(&self) -> TerminalCheckpoint {
         self.checkpoint_with_scrollback(true)
@@ -549,6 +558,7 @@ impl Terminal {
     /// Needed because an adopted engine can be restored mid-sequence, and the
     /// recorder's first keyframe of it is taken before its reader runs. Like
     /// `checkpoint`, it carries no shell-integration nonce.
+    #[inline]
     #[must_use]
     pub fn checkpoint_continuing(&self) -> Option<TerminalCheckpoint> {
         self.checkpoint_continuing_bounded(usize::MAX)
@@ -613,6 +623,7 @@ impl Terminal {
     /// This is the latency-bounded process-handoff projection: screen continuity
     /// needs the visible rows, cursor, modes, and saved alternate grid, but it must
     /// not turn an update click into work proportional to an arbitrarily deep history.
+    #[inline]
     #[must_use]
     pub fn checkpoint_visible(&self) -> Option<TerminalCheckpoint> {
         self.checkpoint_carry(0)
@@ -801,6 +812,7 @@ impl Terminal {
     /// carry it ([`Self::checkpoint_carry`],
     /// [`Self::checkpoint_carry_abandoning_partial`]). Only a nonce in use: a re-key
     /// the shell has not taken yet stays behind, and the successor re-keys afresh.
+    #[inline]
     fn carried_shell_integration_nonce(&self) -> Option<ShellIntegrationNonce> {
         self.shell_integration_auth
             .nonce_in_use()
@@ -813,6 +825,7 @@ impl Terminal {
     /// sequence is carried or abandoned is
     /// [`Self::partial_sequence_uncarried`]'s answer. A pure read of the
     /// parser; nothing is projected.
+    #[inline]
     #[must_use]
     pub fn partial_sequence_state(&self) -> Option<&'static str> {
         let state = self.parser.state();
@@ -829,6 +842,7 @@ impl Terminal {
     /// seamless capture asks this before treating a mid-sequence parser over queued
     /// output as a timing miss: a carried sequence continues in the successor. A pure
     /// read.
+    #[inline]
     #[must_use]
     pub fn partial_sequence_uncarried(&self) -> Option<&'static str> {
         self.parser_carry()
@@ -841,6 +855,7 @@ impl Terminal {
     /// byte decides whether it ends complete or broken off
     /// ([`aterm_parser::Parser::in_hooked_dcs`]). The parser cannot see it; this
     /// engine's DCS router can.
+    #[inline]
     fn hooked_dcs(&self) -> Option<HookedDcs> {
         if !self.parser.in_hooked_dcs() {
             return None;
@@ -864,6 +879,7 @@ impl Terminal {
     /// as one to ignore to its terminator ([`aterm_parser::Parser::carry_unhooking`]),
     /// so the successor swallows its tail instead of printing it, and a tab streaming
     /// sixel frames or tmux control-mode lines does not miss every park.
+    #[inline]
     fn parser_carry(&self) -> Option<ParserCarry> {
         match self.hooked_dcs() {
             None => self.parser.carry(),
@@ -881,6 +897,7 @@ impl Terminal {
     /// the seamless capture treats this as a timing miss and re-parks on a sequence
     /// boundary; over a quiet PTY the carry still goes, as a stalled sequence may
     /// never end. A pure read.
+    #[inline]
     #[must_use]
     pub fn partial_sequence_swallowed(&self) -> Option<&'static str> {
         (self.parser.carry_swallows_sequence() || self.hooked_dcs() == Some(HookedDcs::Picture))
@@ -893,6 +910,7 @@ impl Terminal {
     /// crash-restore journal never cuts a keyframe there
     /// ([`Self::checkpoint_journal`]); the seamless carries do, as they carry the nonce
     /// itself. A pure read.
+    #[inline]
     #[must_use]
     pub fn partial_sequence_is_shell_mark(&self) -> bool {
         self.parser.state() == aterm_parser::State::OscString
@@ -907,6 +925,7 @@ impl Terminal {
     /// ([`aterm_parser::Parser::carry_swallows_picture`]). The seamless capture
     /// carries one rather than miss every park while the stream plays; an OSC 52
     /// clipboard write and every other swallowed sequence stay a miss. A pure read.
+    #[inline]
     #[must_use]
     pub fn partial_sequence_swallows_picture(&self) -> bool {
         self.parser.carry_swallows_picture() || self.hooked_dcs() == Some(HookedDcs::Picture)
@@ -923,9 +942,13 @@ impl Terminal {
     /// re-parks over queued output; over a quiet PTY it carries anyway (a link may
     /// never close). The rest of the output state is not named: an older successor
     /// never had it. A pure read.
+    #[inline]
     #[must_use]
-    pub fn output_state_in_flight(&self) -> Option<&'static str> {
-        if self.transient.vt52_cursor_state != super::Vt52CursorState::None {
+    pub const fn output_state_in_flight(&self) -> Option<&'static str> {
+        if !matches!(
+            self.transient.vt52_cursor_state,
+            super::Vt52CursorState::None
+        ) {
             Some("Vt52CursorAddress")
         } else if self.transient.current_hyperlink.is_some() {
             Some("Osc8HyperlinkOpen")
@@ -939,6 +962,7 @@ impl Terminal {
     /// the engine's timeout fires only from it, so without re-arming a program that
     /// died before its `?2026l` would leave the mode on for good. Armed as `?2026h`
     /// arms it, at this engine's processing clock.
+    #[inline]
     fn arm_carried_sync_window(&mut self) {
         self.transient.sync_start = self
             .modes
@@ -949,6 +973,7 @@ impl Terminal {
     /// The parser's partial state as a checkpoint carries it: `None` for a
     /// Ground parser with nothing pending (a fresh parser already is that) and
     /// for a hooked DCS string no carry holds ([`Self::parser_carry`]).
+    #[inline]
     fn carried_parser(&self) -> Option<ParserCarry> {
         self.parser_carry().filter(|carry| !carry.is_ground())
     }
@@ -976,8 +1001,9 @@ impl Terminal {
     /// The seamless capture prices a carry's cell cost with this (the inactive
     /// grid is a second visible grid) exactly as the consumer and
     /// `screen_digest` will, before paying for the projection. A pure read.
+    #[inline]
     #[must_use]
-    pub fn has_inactive_grid(&self) -> bool {
+    pub const fn has_inactive_grid(&self) -> bool {
         self.alt_grid.is_some()
     }
 

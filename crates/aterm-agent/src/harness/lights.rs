@@ -639,93 +639,51 @@ mod tests {
         }
     }
 
-    /// THE 2.1.307 FOOTERS (measured 2026-10-21 by `aterm-lab footers` in the
-    /// lab's private headless aterm at 80x24, model opus at the top effort
-    /// level; docs/measured/claude-code-2.1.307-2026-10-21.md): each reads as
-    /// the mode and turn it was captured in, the mode row under the composer's
+    /// THE 2.1.307 AND 2.1.308 FOOTERS (measured 2026-10-21 and 2026-10-22 by
+    /// `aterm-lab footers` in the lab's private headless aterm at 80x24, model
+    /// opus at the top effort level; docs/measured/claude-code-2.1.307-2026-10-21.md
+    /// and docs/measured/claude-code-2.1.308-2026-10-21.md): each reads as the
+    /// mode and turn it was captured in, the mode row under the composer's
     /// rule, with the vendor's `← for agents` hint gone from the rows drawn
     /// past its first 10 s and the bypass row's effort tag wrapped onto a row
     /// of its own. NEGATIVE CONTROL: the same screen with its mode row blanked
     /// reads no mode.
     #[test]
-    fn the_2_1_307_screens_read_as_measured() {
-        let cases: [(&str, &str, Mode, bool); 8] = [
-            (
-                "auto-idle",
-                include_str!(
-                    "../../../aterm-phase/src/fixtures/claude-2.1.307-footer-auto-idle.txt"
-                ),
-                Mode::Auto,
-                false,
-            ),
-            (
-                "auto-draft",
-                include_str!(
-                    "../../../aterm-phase/src/fixtures/claude-2.1.307-footer-auto-draft.txt"
-                ),
-                Mode::Auto,
-                false,
-            ),
-            (
-                "manual",
-                include_str!("../../../aterm-phase/src/fixtures/claude-2.1.307-footer-manual.txt"),
-                Mode::Manual,
-                false,
-            ),
-            (
-                "accept-edits",
-                include_str!(
-                    "../../../aterm-phase/src/fixtures/claude-2.1.307-footer-accept-edits.txt"
-                ),
-                Mode::AcceptEdits,
-                false,
-            ),
-            (
-                "plan",
-                include_str!("../../../aterm-phase/src/fixtures/claude-2.1.307-footer-plan.txt"),
-                Mode::Plan,
-                false,
-            ),
-            (
-                "busy",
-                include_str!("../../../aterm-phase/src/fixtures/claude-2.1.307-footer-busy.txt"),
-                Mode::Auto,
-                true,
-            ),
-            (
-                "after-turn",
-                include_str!(
-                    "../../../aterm-phase/src/fixtures/claude-2.1.307-footer-after-turn.txt"
-                ),
-                Mode::Auto,
-                false,
-            ),
-            (
-                "bypass-idle",
-                include_str!(
-                    "../../../aterm-phase/src/fixtures/claude-2.1.307-footer-bypass-idle.txt"
-                ),
-                Mode::Bypass,
-                false,
-            ),
+    fn the_lab_footer_screens_read_as_measured() {
+        let cases: [(&str, Mode, bool); 8] = [
+            ("auto-idle", Mode::Auto, false),
+            ("auto-draft", Mode::Auto, false),
+            ("manual", Mode::Manual, false),
+            ("accept-edits", Mode::AcceptEdits, false),
+            ("plan", Mode::Plan, false),
+            ("busy", Mode::Auto, true),
+            ("after-turn", Mode::Auto, false),
+            ("bypass-idle", Mode::Bypass, false),
         ];
-        for (name, text, mode, busy) in cases {
-            let rows: Vec<String> = text.lines().skip(1).map(str::to_owned).collect();
-            let s = read_screen(&rows).unwrap_or_else(|| panic!("{name}: a composer"));
-            assert_eq!(s.mode, Some(mode), "{name}");
-            assert_eq!(s.busy, busy, "{name}");
-            let rule = aterm_phase::phase::composer_bottom(&rows)
-                .unwrap_or_else(|| panic!("{name}: the composer's bottom rule"));
-            let row = footer::mode_row(&rows)
-                .filter(|r| *r > rule)
-                .unwrap_or_else(|| panic!("{name}: the mode row under the rule"));
-            let mut blank = rows.clone();
-            blank[row].clear();
-            assert_eq!(
-                read_screen(&blank).and_then(|s| s.mode),
-                None,
-                "{name}: CONTROL"
-            );
+        let dir =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../aterm-phase/src/fixtures");
+        for build in ["2.1.307", "2.1.308"] {
+            for (name, mode, busy) in cases {
+                let file = format!("claude-{build}-footer-{name}.txt");
+                let text = std::fs::read_to_string(dir.join(&file))
+                    .unwrap_or_else(|e| panic!("{file}: {e}"));
+                let rows: Vec<String> = text.lines().skip(1).map(str::to_owned).collect();
+                let s = read_screen(&rows).unwrap_or_else(|| panic!("{file}: a composer"));
+                assert_eq!(s.mode, Some(mode), "{file}");
+                assert_eq!(s.busy, busy, "{file}");
+                let rule = aterm_phase::phase::composer_bottom(&rows)
+                    .unwrap_or_else(|| panic!("{file}: the composer's bottom rule"));
+                let row = footer::mode_row(&rows)
+                    .filter(|r| *r > rule)
+                    .unwrap_or_else(|| panic!("{file}: the mode row under the rule"));
+                let mut blank = rows.clone();
+                blank[row].clear();
+                assert_eq!(
+                    read_screen(&blank).and_then(|s| s.mode),
+                    None,
+                    "{file}: CONTROL"
+                );
+            }
         }
     }
 

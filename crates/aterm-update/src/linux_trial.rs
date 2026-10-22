@@ -33,6 +33,7 @@ pub(crate) const START_SETTLES_SECS: i64 = 20;
 /// for. A stamp in the future (the clock stepped back) is not young either, so a wrong
 /// clock delays no verdict. The shipping caller passes `now_unix` on the stamp's own clock
 /// ([`judged_now`]).
+#[inline]
 pub(crate) fn start_is_young(previous_start_unix: i64, now_unix: i64) -> bool {
     previous_start_unix > 0
         && (0..START_SETTLES_SECS).contains(&now_unix.saturating_sub(previous_start_unix))
@@ -43,11 +44,13 @@ pub(crate) fn start_is_young(previous_start_unix: i64, now_unix: i64) -> bool {
 /// later, and only while the stamp is still young ([`start_is_young`]). A settled stamp is
 /// a verdict due, which a deferral that landed late must not make young again, so the move
 /// defers the verdict by less than one window, once per stamp, and never confirms.
+#[inline]
 pub(crate) fn defer_moves(own_unix: i64, now_unix: i64) -> bool {
     now_unix > own_unix && start_is_young(own_unix, now_unix)
 }
 
 /// Whether the start just counted — `starts` includes it — rolls the trial back.
+#[inline]
 pub(crate) fn start_rolls_back(starts: u32, previous_start_unix: i64, now_unix: i64) -> bool {
     starts > crate::LINUX_TRIAL_LAUNCHES && !start_is_young(previous_start_unix, now_unix)
 }
@@ -57,6 +60,7 @@ pub(crate) fn start_rolls_back(starts: u32, previous_start_unix: i64, now_unix: 
 /// budget, the stamp as it stood once past it. A restamp past the budget would open a fresh
 /// settle window, so starts less than [`START_SETTLES_SECS`] apart would defer the verdict
 /// for as long as they kept coming.
+#[inline]
 pub(crate) fn start_stamp<T>(starts: u32, previous_start: T, now: T) -> T {
     if starts <= crate::LINUX_TRIAL_LAUNCHES {
         now
@@ -173,7 +177,8 @@ pub(crate) struct Lanes {
 
 /// Whether a start from `lane` counts against the trial: a session while nothing
 /// has confirmed it, a window until a window has.
-pub(crate) fn start_counts(lane: Lane, lanes: Lanes) -> bool {
+#[inline]
+pub(crate) const fn start_counts(lane: Lane, lanes: Lanes) -> bool {
     match lane {
         Lane::Window => !lanes.window_proven,
         Lane::Session => !lanes.healthy,
@@ -197,6 +202,7 @@ pub(crate) enum LaneConfirm {
 /// ([`LaneConfirm`]). A window's confirmation settles every lane; a session's
 /// settles the trial for checks and applies and leaves the window lane to prove
 /// itself.
+#[inline]
 pub(crate) fn confirm(lane: Lane, lanes: Lanes) -> LaneConfirm {
     if !start_counts(lane, lanes) {
         return LaneConfirm::NotPending;
@@ -218,7 +224,8 @@ pub(crate) fn confirm(lane: Lane, lanes: Lanes) -> LaneConfirm {
 /// window has tried stays its successor's target, so a terminal-only copy does not roll
 /// back further every release.
 #[cfg(any(target_os = "linux", all(test, target_os = "macos")))]
-pub(crate) fn installed_window_unproven(lanes: Lanes, starts: u32) -> bool {
+#[inline]
+pub(crate) const fn installed_window_unproven(lanes: Lanes, starts: u32) -> bool {
     lanes.healthy && !lanes.window_proven && starts > 0
 }
 

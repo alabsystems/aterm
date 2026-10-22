@@ -31,13 +31,15 @@ impl Terminal {
     /// The OSC 133 shell-integration state: `Ground` (waiting for a prompt),
     /// `ReceivingPrompt` (after `A`), `EnteringCommand` (after `B`), `Executing` (after `C`).
     #[must_use]
-    pub fn shell_state(&self) -> ShellState {
+    #[inline]
+    pub const fn shell_state(&self) -> ShellState {
         self.shell.state
     }
 
     /// All completed command marks: each a command's prompt, command and output ranges and
     /// exit code.
     #[must_use]
+    #[inline]
     pub fn command_marks(&self) -> &[CommandMark] {
         self.shell.command_marks.as_slices().0
     }
@@ -46,7 +48,8 @@ impl Terminal {
     /// [`Self::last_completed_command`] it is an unambiguous "a command just finished" edge
     /// (same-millisecond completions share an end time, never a seq). Survives `reset`.
     #[must_use]
-    pub fn completed_command_seq(&self) -> u64 {
+    #[inline]
+    pub const fn completed_command_seq(&self) -> u64 {
         self.shell.completed_seq
     }
 
@@ -60,7 +63,8 @@ impl Terminal {
     /// a checkpoint round trip; a restore never sets it below the carried
     /// blocks that reached C (a predecessor that did not count carries none).
     #[must_use]
-    pub fn started_command_seq(&self) -> u64 {
+    #[inline]
+    pub const fn started_command_seq(&self) -> u64 {
         self.shell.started_seq
     }
 
@@ -68,6 +72,7 @@ impl Terminal {
     /// script folder, from the last signed `633;P;AtermIntegration=` mark or carried across
     /// a seamless update. `None` until one arrives (scripts without a loader send none).
     #[must_use]
+    #[inline]
     pub fn shell_integration_rev(&self) -> Option<&str> {
         self.shell
             .integration_rev
@@ -79,26 +84,30 @@ impl Terminal {
     /// once: the first signed `633;P;AtermStart=` with the rc folder and flags
     /// that preceded it, or `None` before it and after the take. Only the first
     /// record a shell signs is ever kept.
-    pub fn take_start_mark(&mut self) -> Option<super::StartMark> {
+    #[inline]
+    pub const fn take_start_mark(&mut self) -> Option<super::StartMark> {
         self.shell.spare.mark.take()
     }
 
     /// Whether a signed `633;P;AtermSpare=parked` arrived since the last take:
     /// a spare shell waits at its parked hold, before any startup file.
-    pub fn take_spare_parked(&mut self) -> bool {
-        std::mem::take(&mut self.shell.spare.parked)
+    #[inline]
+    pub const fn take_spare_parked(&mut self) -> bool {
+        std::mem::replace(&mut self.shell.spare.parked, false)
     }
 
     /// Signed spare marks refused as malformed (`AtermSpare=`, `AtermStart*=`).
     #[must_use]
-    pub fn spare_marks_refused(&self) -> u32 {
+    #[inline]
+    pub const fn spare_marks_refused(&self) -> u32 {
         self.shell.spare.refused
     }
 
     /// Whether the shell has signed a prompt start (an accepted OSC 133/633 `A`)
     /// since this engine began: a released spare has left every hold by then.
     #[must_use]
-    pub fn shell_prompt_started(&self) -> bool {
+    #[inline]
+    pub const fn shell_prompt_started(&self) -> bool {
         self.shell.next_block_id > 0
     }
 
@@ -146,6 +155,7 @@ impl Terminal {
     /// new `B`, which is why the predictor trusts it only for the FIRST key of
     /// a prompt, over the buffer the mark found empty.
     #[must_use]
+    #[inline]
     pub fn input_region_start(&self) -> Option<InputRegionStart> {
         let prompt = self.prompt_in_front()?;
         if !self.shell.input_start_attested
@@ -174,6 +184,7 @@ impl Terminal {
     /// Enter the line editor kept for itself (accepting a completion menu's
     /// pick) opens nothing at the prompt it was pressed at.
     #[must_use]
+    #[inline]
     pub fn prompt_in_front(&self) -> Option<u64> {
         if !self.modes.require_shell_integration_nonce
             || self.shell_integration_auth.nonce_in_use().is_none()
@@ -190,6 +201,7 @@ impl Terminal {
     /// regardless of status — the "what just finished" probe (PHOSPHOR's
     /// exit-status weather reads this per frame under the render lock).
     #[must_use]
+    #[inline]
     pub fn last_completed_command(&self) -> Option<&CommandMark> {
         self.shell
             .command_marks
@@ -203,6 +215,7 @@ impl Terminal {
     /// All terminal marks (OSC 1337 SetMark): navigation points an application or user set
     /// explicitly, unlike OSC 133 command marks.
     #[must_use]
+    #[inline]
     pub fn terminal_marks(&self) -> &[TerminalMark] {
         self.marks_state.marks.as_slices().0
     }
@@ -226,6 +239,7 @@ impl Terminal {
     /// All annotations (OSC 1337 AddAnnotation): notes attached to regions of output,
     /// visible or hidden.
     #[must_use]
+    #[inline]
     pub fn annotations(&self) -> &[Annotation] {
         self.marks_state.annotations.as_slices().0
     }
@@ -284,7 +298,8 @@ impl Terminal {
     /// [`DEFAULT_CELL_PX`](super::grouped_state) 8×16 placeholder until a host reports. Use
     /// [`Self::host_cell_pixel_size`] where the placeholder must not pass for a measurement.
     #[must_use]
-    pub fn cell_pixel_size(&self) -> (u16, u16) {
+    #[inline]
+    pub const fn cell_pixel_size(&self) -> (u16, u16) {
         self.iterm2.cell_px
     }
 
@@ -293,7 +308,8 @@ impl Terminal {
     /// zero on either axis is unreported too. A wire query answers from this and stays
     /// silent on `None` (`handler_window`'s XTWINOPS pixel reports).
     #[must_use]
-    pub fn host_cell_pixel_size(&self) -> Option<(u16, u16)> {
+    #[inline]
+    pub const fn host_cell_pixel_size(&self) -> Option<(u16, u16)> {
         self.iterm2.host_cell_px()
     }
 
@@ -309,7 +325,8 @@ impl Terminal {
     /// assert_eq!(term.taskbar_progress(), Some(TaskbarProgress::Normal(50)));
     /// ```
     #[must_use]
-    pub fn taskbar_progress(&self) -> Option<TaskbarProgress> {
+    #[inline]
+    pub const fn taskbar_progress(&self) -> Option<TaskbarProgress> {
         self.taskbar_progress
     }
 
@@ -329,7 +346,8 @@ impl Terminal {
     /// assert_eq!(report.state.map(|s| s.state), Some(ProgramStateWord::Working));
     /// ```
     #[must_use]
-    pub fn program_state(&self) -> super::program_state::ProgramStateReport {
+    #[inline]
+    pub const fn program_state(&self) -> super::program_state::ProgramStateReport {
         self.program_state
     }
 }

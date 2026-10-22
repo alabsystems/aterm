@@ -145,12 +145,14 @@ pub enum Bracket {
 impl BaseDirection {
     /// Return `true` when the direction is explicitly forced (`Ltr` or `Rtl`).
     #[must_use]
+    #[inline]
     pub const fn is_explicit(self) -> bool {
         !matches!(self, Self::Auto)
     }
 
     /// Return the default paragraph embedding level (`1` for `Rtl`, `0` otherwise).
     #[must_use]
+    #[inline]
     pub const fn default_level(self) -> u8 {
         match self {
             Self::Rtl => 1,
@@ -162,24 +164,28 @@ impl BaseDirection {
 impl BidiClass {
     /// Return `true` when this class is a strong directional class (`L`, `R`, or `AL`).
     #[must_use]
+    #[inline]
     pub const fn is_strong(self) -> bool {
         matches!(self, Self::L | Self::R | Self::AL)
     }
 
     /// Return `true` when this class is a strong right-to-left class (`R` or `AL`).
     #[must_use]
+    #[inline]
     pub const fn is_rtl_strong(self) -> bool {
         matches!(self, Self::R | Self::AL)
     }
 
     /// Return `true` when this class is a numeric class (`EN` or `AN`).
     #[must_use]
+    #[inline]
     pub const fn is_number(self) -> bool {
         matches!(self, Self::EN | Self::AN)
     }
 
     /// Return `true` when this class is an isolate initiator (`LRI`, `RLI`, or `FSI`).
     #[must_use]
+    #[inline]
     pub const fn is_isolate_initiator(self) -> bool {
         matches!(self, Self::LRI | Self::RLI | Self::FSI)
     }
@@ -188,18 +194,21 @@ impl BidiClass {
 impl Bracket {
     /// Return `true` when this bracket is an opening bracket (`Open(_)`).
     #[must_use]
+    #[inline]
     pub const fn is_open(self) -> bool {
         matches!(self, Self::Open(_))
     }
 
     /// Return `true` when this bracket is a closing bracket (`Close(_)`).
     #[must_use]
+    #[inline]
     pub const fn is_close(self) -> bool {
         matches!(self, Self::Close(_))
     }
 
     /// Return the canonical opening bracket codepoint, if any.
     #[must_use]
+    #[inline]
     pub const fn canonical_open(self) -> Option<u32> {
         match self {
             Self::None => None,
@@ -210,6 +219,7 @@ impl Bracket {
 
 /// Encode a resolved bidirectional run descriptor (`start`, `end`, `level`, `flags`) into 16 LE bytes.
 #[must_use]
+#[inline]
 pub const fn encode_bidi_run_le(start: u32, end: u32, level: u32, flags: u32) -> [u8; 16] {
     [
         start as u8,
@@ -233,6 +243,7 @@ pub const fn encode_bidi_run_le(start: u32, end: u32, level: u32, flags: u32) ->
 
 /// Decode 16 LE bytes into a resolved bidirectional run descriptor (`start`, `end`, `level`, `flags`).
 #[must_use]
+#[inline]
 pub const fn decode_bidi_run_le(bytes: [u8; 16]) -> (u32, u32, u32, u32) {
     let start = (bytes[0] as u32)
         | ((bytes[1] as u32) << 8)
@@ -325,28 +336,31 @@ verify_island! {
 /// The bidirectional class of `c` (the UCD `Bidi_Class` property).
 #[must_use]
 #[inline]
-pub fn bidi_class(c: char) -> BidiClass {
-    let u = u32::from(c);
+pub const fn bidi_class(c: char) -> BidiClass {
+    let u = c as u32;
     if u < 0x80 {
         return ASCII_BIDI_CLASS[u as usize];
     }
     bidi_class_table(u)
 }
 
-fn bidi_class_table(u: u32) -> BidiClass {
+#[inline]
+const fn bidi_class_table(u: u32) -> BidiClass {
     let table = tables::BIDI_CLASS_RANGES;
-    match table.binary_search_by(|&(lo, hi, _)| {
-        if hi < u {
-            std::cmp::Ordering::Less
-        } else if lo > u {
-            std::cmp::Ordering::Greater
+    let mut lo = 0usize;
+    let mut hi = table.len();
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        let (range_lo, range_hi, class) = table[mid];
+        if range_hi < u {
+            lo = mid + 1;
+        } else if range_lo > u {
+            hi = mid;
         } else {
-            std::cmp::Ordering::Equal
+            return class;
         }
-    }) {
-        Ok(i) => table.get(i).map_or(L, |&(_, _, class)| class),
-        Err(_) => L,
     }
+    L
 }
 
 /// The `Bidi_Mirroring_Glyph` of `c`: the character whose glyph depicts `c`
@@ -354,17 +368,42 @@ fn bidi_class_table(u: u32) -> BidiClass {
 /// `None` for a character with no mirror pair, including a `Bidi_Mirrored`
 /// one whose mirror has no code point of its own (`∛`).
 #[must_use]
-pub fn mirror_glyph(c: char) -> Option<char> {
-    let u = u32::from(c);
+#[inline]
+pub const fn mirror_glyph(c: char) -> Option<char> {
+    let u = c as u32;
+    // Fast path for ASCII, Latin-1 guillemets, and Hebrew/Arabic scripts
+    // (`< 0x0F3A`), plus everything past `0xFF63`.
+    if u < 0x0F3A {
+        return match u {
+            0x0028 => Some(')'),
+            0x0029 => Some('('),
+            0x003C => Some('>'),
+            0x003E => Some('<'),
+            0x005B => Some(']'),
+            0x005D => Some('['),
+            0x007B => Some('}'),
+            0x007D => Some('{'),
+            0x00AB => Some('\u{00BB}'),
+            0x00BB => Some('\u{00AB}'),
+            _ => None,
+        };
+    }
+    if u > 0xFF63 {
+        return None;
+    }
+    mirror_glyph_table(u)
+}
+
+const fn mirror_glyph_table(u: u32) -> Option<char> {
     let pairs = &mirroring::MIRROR_PAIRS;
     let count = pairs.len() / 2;
     let mut lo = 0usize;
     let mut hi = count;
     while lo < hi {
         let mid = lo + (hi - lo) / 2;
-        let source = pairs.get(mid * 2).copied()?;
+        let source = pairs[mid * 2];
         if source == u {
-            return pairs.get(mid * 2 + 1).copied().and_then(char::from_u32);
+            return char::from_u32(pairs[mid * 2 + 1]);
         }
         if source < u {
             lo = mid + 1;
@@ -376,7 +415,8 @@ pub fn mirror_glyph(c: char) -> Option<char> {
 }
 
 /// Canonical equivalence for the two bracket pairs that have one (BD16).
-fn canonical_bracket(u: u32) -> u32 {
+#[inline]
+const fn canonical_bracket(u: u32) -> u32 {
     match u {
         0x2329 => 0x3008,
         0x232A => 0x3009,
@@ -387,8 +427,8 @@ fn canonical_bracket(u: u32) -> u32 {
 /// The paired-bracket property of `c` (see [`Bracket`]).
 #[must_use]
 #[inline]
-pub fn bracket_of(c: char) -> Bracket {
-    let u = u32::from(c);
+pub const fn bracket_of(c: char) -> Bracket {
+    let u = c as u32;
     if u < 0x80 {
         return match u as u8 {
             b'(' => Bracket::Open(0x0028),
@@ -400,30 +440,55 @@ pub fn bracket_of(c: char) -> Bracket {
             _ => Bracket::None,
         };
     }
+    // Every non-ASCII paired bracket in UCD `BidiBrackets.txt` lies in
+    // `0x0F3A..=0xFF63`; skip the binary searches for Latin-1, Hebrew, Arabic,
+    // Indic scripts, and all supplementary planes.
+    if u < 0x0F3A || u > 0xFF63 {
+        return Bracket::None;
+    }
     bracket_of_table(u)
 }
 
-fn bracket_of_table(u: u32) -> Bracket {
-    if tables::BRACKET_PAIRS
-        .binary_search_by_key(&u, |&(open, _)| open)
-        .is_ok()
-    {
-        return Bracket::Open(canonical_bracket(u));
+const fn bracket_of_table(u: u32) -> Bracket {
+    let pairs = tables::BRACKET_PAIRS;
+    let mut lo = 0usize;
+    let mut hi = pairs.len();
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        let (open, _) = pairs[mid];
+        if open == u {
+            return Bracket::Open(canonical_bracket(u));
+        }
+        if open < u {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
     }
     let closers = tables::BRACKET_CLOSERS;
-    match closers.binary_search_by_key(&u, |&(close, _)| close) {
-        Ok(i) => closers.get(i).map_or(Bracket::None, |&(_, open)| {
-            Bracket::Close(canonical_bracket(open))
-        }),
-        Err(_) => Bracket::None,
+    let mut lo = 0usize;
+    let mut hi = closers.len();
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        let (close, open) = closers[mid];
+        if close == u {
+            return Bracket::Close(canonical_bracket(open));
+        }
+        if close < u {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
     }
+    Bracket::None
 }
 
 /// Whether rule X9 removes a character of this class (the embedding controls
 /// and `BN`). Removed characters get no level of their own in UAX #9's
 /// conformance data; here they take the level before them (see the crate docs).
 #[must_use]
-pub fn removed_by_x9(class: BidiClass) -> bool {
+#[inline]
+pub const fn removed_by_x9(class: BidiClass) -> bool {
     matches!(class, RLE | LRE | RLO | LRO | PDF | BN)
 }
 
@@ -434,6 +499,7 @@ pub fn removed_by_x9(class: BidiClass) -> bool {
 /// (RLE/RLO/RLI/FSI). A line for which this is `false` resolves to even levels
 /// only, so its visual order is the identity and the renderer can skip it.
 #[must_use]
+#[inline]
 pub fn has_bidi(text: &[char]) -> bool {
     text.iter()
         .any(|&c| u32::from(c) >= 0x0590 && is_bidi_class(bidi_class_table(u32::from(c))))
@@ -441,11 +507,13 @@ pub fn has_bidi(text: &[char]) -> bool {
 
 /// Class-slice companion to [`has_bidi`].
 #[must_use]
+#[inline]
 pub fn has_bidi_classes(classes: &[BidiClass]) -> bool {
     classes.iter().any(|&c| is_bidi_class(c))
 }
 
-fn is_bidi_class(c: BidiClass) -> bool {
+#[inline]
+const fn is_bidi_class(c: BidiClass) -> bool {
     matches!(c, R | AL | AN | RLE | RLO | RLI | FSI)
 }
 
@@ -901,7 +969,8 @@ fn paragraph_level_of(classes: &[BidiClass], matching: &[usize], base: BaseDirec
     }
 }
 
-fn least_greater_odd(level: u8) -> u8 {
+#[inline]
+const fn least_greater_odd(level: u8) -> u8 {
     if level.is_multiple_of(2) {
         level.saturating_add(1)
     } else {
@@ -909,7 +978,8 @@ fn least_greater_odd(level: u8) -> u8 {
     }
 }
 
-fn least_greater_even(level: u8) -> u8 {
+#[inline]
+const fn least_greater_even(level: u8) -> u8 {
     if level.is_multiple_of(2) {
         level.saturating_add(2)
     } else {
@@ -917,7 +987,8 @@ fn least_greater_even(level: u8) -> u8 {
     }
 }
 
-fn direction_of(level: u8) -> BidiClass {
+#[inline]
+const fn direction_of(level: u8) -> BidiClass {
     if level.is_multiple_of(2) { L } else { R }
 }
 
@@ -1753,5 +1824,20 @@ mod generated {
             is_bidi_class(bidi_class_table(0x0590)),
             "U+0590 is the first RTL-triggering codepoint"
         );
+        for u in 0..=0x10000u32 {
+            let Some(c) = char::from_u32(u) else {
+                continue;
+            };
+            assert_eq!(
+                mirror_glyph(c),
+                mirror_glyph_table(u),
+                "mirror_glyph fast-path mismatch at U+{u:04X}"
+            );
+            assert_eq!(
+                bracket_of(c),
+                bracket_of_table(u),
+                "bracket_of fast-path mismatch at U+{u:04X}"
+            );
+        }
     }
 }

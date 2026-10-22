@@ -60,6 +60,119 @@ pub struct ProgramStatus {
     pub tree_root: String,
 }
 
+/// The most refused names one program's entry keeps ([`RefusedShims::names`]); the rest
+/// are counted.
+pub const MAX_REFUSED_RECORDED: usize = 16;
+
+/// The longest refused name an entry keeps, in characters; a longer one is cut, ending in
+/// `…`. A signed `exposes` has no length bound of its own, and the record has one.
+pub const MAX_REFUSED_NAME_CHARS: usize = 64;
+
+/// The most builds one program's list keeps an entry for ([`Status::refused_shims`]): the
+/// newest, as the store keeps them. A program's live build and the one a pass stages beside
+/// it each keep their own, so a flip that is held or aborted leaves the live build's said.
+pub const MAX_REFUSED_BUILDS: usize = 8;
+
+/// One build's exposed names that were refused a shim ([`crate::store::shim_allowed`]: a
+/// shell, another command a shim must never intercept, or no tool name at all), in the
+/// order its manifest lists them (design S13).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RefusedShims {
+    /// The build whose manifest named them. The entry speaks for that build only: a reader
+    /// takes the entry of the build `store/<program>/current` names ([`Status::refused_for`]),
+    /// and the next record drops it once that build is gone from the store.
+    pub build: u64,
+    /// The names, at most [`MAX_REFUSED_RECORDED`], each at most
+    /// [`MAX_REFUSED_NAME_CHARS`] characters.
+    pub names: Vec<String>,
+    /// How many names were refused; more than `names` holds when the list was cut.
+    pub count: u64,
+}
+
+impl RefusedShims {
+    /// The entry for `build` whose landing refused `refused`, or `None` when it refused
+    /// nothing.
+    #[must_use]
+    pub fn of(build: u64, refused: &[String]) -> Option<Self> {
+        if refused.is_empty() {
+            return None;
+        }
+        let names = refused
+            .iter()
+            .take(MAX_REFUSED_RECORDED)
+            .map(|name| {
+                if name.chars().count() <= MAX_REFUSED_NAME_CHARS {
+                    return name.clone();
+                }
+                let mut cut: String = name.chars().take(MAX_REFUSED_NAME_CHARS - 1).collect();
+                cut.push('\u{2026}');
+                cut
+            })
+            .collect();
+        Some(Self {
+            build,
+            names,
+            count: u64::try_from(refused.len()).unwrap_or(u64::MAX),
+        })
+    }
+}
+
+/// Record that `program`'s `build` was refused a shim for each of `refused` (none: that
+/// build's entry goes), beside the entries of the program's other builds, in the same write
+/// dropping every entry whose build is no longer in the store. Called on the pass's own
+/// thread where a landing admits a signed `exposes` ([`crate::store::split_exposed`]): the
+/// index lane's singleton landing and a group member's stage. The vendor lane never records,
+/// because its `exposes` is the compiled table, every name of which a shim may carry (the
+/// table's own test), and its landings run on rider threads that write no status. A landing
+/// that changes nothing writes nothing, so a pass whose programs expose only tool names keeps
+/// its one write. Best-effort, like every status write.
+///
+/// # Errors
+/// [`read_checked`]'s diagnostic for an unreadable record, or the write's.
+pub fn record_refused_shims(
+    layout: &Layout,
+    program: &str,
+    build: u64,
+    refused: &[String],
+) -> io::Result<()> {
+    let entry = RefusedShims::of(build, refused);
+    let wanted = |have: &BTreeMap<String, Vec<RefusedShims>>| {
+        let mut want: BTreeMap<String, Vec<RefusedShims>> = have
+            .iter()
+            .map(|(p, entries)| {
+                let kept: Vec<RefusedShims> = entries
+                    .iter()
+                    .filter(|r| !(p == program && r.build == build))
+                    .filter(|r| layout.build_dir(p, r.build).is_dir())
+                    .cloned()
+                    .collect();
+                (p.clone(), kept)
+            })
+            .collect();
+        if let Some(entry) = &entry {
+            want.entry(program.to_string())
+                .or_default()
+                .push(entry.clone());
+        }
+        want.retain(|_, kept| !kept.is_empty());
+        for kept in want.values_mut() {
+            kept.sort_by_key(|r| r.build);
+            let over = kept.len().saturating_sub(MAX_REFUSED_BUILDS);
+            kept.drain(..over);
+        }
+        want
+    };
+    let have = read_checked(layout)?
+        .map(|s| s.refused_shims)
+        .unwrap_or_default();
+    if wanted(&have) == have {
+        return Ok(());
+    }
+    let mut status = seed_for_rewrite(layout)?;
+    status.refused_shims = wanted(&status.refused_shims);
+    write(layout, &status)
+}
+
 /// The aggregate status snapshot written after a check/apply pass.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct Status {
@@ -140,6 +253,12 @@ pub struct Status {
     /// Per-program states, keyed by program name.
     #[serde(default)]
     pub programs: BTreeMap<String, ProgramStatus>,
+    /// Per program, one entry for each of its builds (at most [`MAX_REFUSED_BUILDS`], by
+    /// build) whose signed `exposes` holds names that were refused a shim ([`RefusedShims`]),
+    /// written where a landing admits that list ([`record_refused_shims`]). A program none
+    /// were refused for has no entry, so a record without one is written as before.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub refused_shims: BTreeMap<String, Vec<RefusedShims>>,
     /// Every top-level key this build does not know, carried verbatim through each rewrite,
     /// so builds sharing a store never erase each other's fields.
     #[serde(flatten)]
@@ -290,6 +409,15 @@ pub fn pass_seq(layout: &Layout) -> u64 {
 }
 
 impl Status {
+    /// The names `program`'s `build` was refused a shim, when its landing recorded any.
+    #[must_use]
+    pub fn refused_for(&self, program: &str, build: u64) -> Option<&RefusedShims> {
+        self.refused_shims
+            .get(program)?
+            .iter()
+            .find(|r| r.build == build)
+    }
+
     /// Serialize to TOML.
     ///
     /// # Errors
@@ -349,17 +477,41 @@ fn only_stamps_differ(a: &Status, b: &Status) -> bool {
     unstamped(a) == unstamped(b)
 }
 
-/// `status` as the bytes [`write`] puts on disk, or why it may not be written.
-fn render(status: &Status) -> io::Result<String> {
-    if status.programs.len() > MAX_STATUS_PROGRAMS {
+/// Refuse a record with more per-program rows than [`MAX_STATUS_PROGRAMS`], in either map
+/// keyed by program, or a program with more refused-name entries than
+/// [`MAX_REFUSED_BUILDS`]: the bound every read and every write holds.
+fn bounded_rows(status: &Status) -> io::Result<()> {
+    for (what, rows) in [
+        ("programs", status.programs.len()),
+        ("refused_shims rows", status.refused_shims.len()),
+    ] {
+        if rows > MAX_STATUS_PROGRAMS {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("status.toml has {rows} {what}; limit is {MAX_STATUS_PROGRAMS}"),
+            ));
+        }
+    }
+    if let Some((program, entries)) = status
+        .refused_shims
+        .iter()
+        .find(|(_, entries)| entries.len() > MAX_REFUSED_BUILDS)
+    {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!(
-                "status.toml has {} programs; limit is {MAX_STATUS_PROGRAMS}",
-                status.programs.len()
+                "status.toml has {} refused_shims entries for {program}; limit is \
+                 {MAX_REFUSED_BUILDS}",
+                entries.len()
             ),
         ));
     }
+    Ok(())
+}
+
+/// `status` as the bytes [`write`] puts on disk, or why it may not be written.
+fn render(status: &Status) -> io::Result<String> {
+    bounded_rows(status)?;
     let text = status
         .to_toml()
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
@@ -454,15 +606,7 @@ fn read_disk(layout: &Layout) -> io::Result<Option<Status>> {
             format!("status.toml is invalid: {error}"),
         )
     })?;
-    if status.programs.len() > MAX_STATUS_PROGRAMS {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!(
-                "status.toml has {} programs; limit is {MAX_STATUS_PROGRAMS}",
-                status.programs.len()
-            ),
-        ));
-    }
+    bounded_rows(&status)?;
     Ok(Some(status))
 }
 
@@ -1157,6 +1301,7 @@ mod tests {
             pass_seq: 3,
             stale_index_only_pass_seq: 0,
             programs,
+            refused_shims: BTreeMap::new(),
             extra: Default::default(),
         };
         write(&l, &s).unwrap();
@@ -1180,6 +1325,149 @@ mod tests {
         let back = read_checked(&l).unwrap().expect("legacy record parses");
         assert!(back.seams.is_empty(), "no key ⇒ no seams");
         assert_eq!(back.programs["trust"].installed_build, Some(6808));
+        let _ = std::fs::remove_dir_all(&l.prefix);
+    }
+
+    /// The refused names a landing records (design S13): kept per build, beside the
+    /// program's other builds, bounded, dropped with the build, and never a write for a
+    /// landing that refused nothing, so a record without them is the bytes it was.
+    #[test]
+    fn refused_shims_are_recorded_per_build_bounded_and_dropped_with_the_build() {
+        let l = layout("refused-shims");
+        let names = |list: &[&str]| list.iter().map(|s| (*s).to_string()).collect::<Vec<_>>();
+        std::fs::create_dir_all(l.build_dir("ay", 18)).unwrap();
+        std::fs::create_dir_all(l.build_dir("ay", 19)).unwrap();
+        std::fs::create_dir_all(l.build_dir("ny", 4)).unwrap();
+
+        // The control first: nothing refused, no record, nothing written.
+        record_refused_shims(&l, "ay", 18, &[]).unwrap();
+        assert!(
+            !l.status().exists(),
+            "a landing that refused nothing writes nothing"
+        );
+
+        record_refused_shims(&l, "ay", 18, &names(&["pwsh", "git"])).unwrap();
+        let long = "x".repeat(MAX_REFUSED_NAME_CHARS + 9);
+        let many: Vec<String> = std::iter::once(long.clone())
+            .chain((0..MAX_REFUSED_RECORDED + 3).map(|i| format!("a/{i}")))
+            .collect();
+        record_refused_shims(&l, "ny", 4, &many).unwrap();
+        // ay's next build is staged beside the live one: each build keeps its own entry, so
+        // a flip that never happens leaves build 18's said.
+        record_refused_shims(&l, "ay", 19, &names(&["zsh"])).unwrap();
+        let back = read_checked(&l).unwrap().expect("recorded");
+        assert_eq!(
+            back.refused_for("ay", 18),
+            Some(&RefusedShims {
+                build: 18,
+                names: names(&["pwsh", "git"]),
+                count: 2,
+            })
+        );
+        assert_eq!(
+            back.refused_for("ay", 19).map(|r| r.names.clone()),
+            Some(names(&["zsh"]))
+        );
+        assert_eq!(back.refused_for("ay", 17), None);
+        let ny = back.refused_for("ny", 4).expect("ny's entry");
+        assert_eq!(ny.names.len(), MAX_REFUSED_RECORDED);
+        assert_eq!(ny.count, u64::try_from(many.len()).unwrap());
+        assert_eq!(ny.names[0].chars().count(), MAX_REFUSED_NAME_CHARS);
+        assert!(ny.names[0].ends_with('\u{2026}') && long.starts_with(&ny.names[0][..60]));
+
+        // The same landing again changes nothing, and so writes nothing.
+        #[cfg(unix)]
+        {
+            let writes = counted::writes(&l);
+            record_refused_shims(&l, "ay", 18, &names(&["pwsh", "git"])).unwrap();
+            assert_eq!(
+                counted::writes(&l),
+                writes,
+                "an unchanged entry is not rewritten"
+            );
+        }
+
+        // A program keeps at most MAX_REFUSED_BUILDS entries, the newest.
+        for build in 20..20 + u64::try_from(MAX_REFUSED_BUILDS).unwrap() {
+            std::fs::create_dir_all(l.build_dir("ay", build)).unwrap();
+            record_refused_shims(&l, "ay", build, &names(&["fish"])).unwrap();
+        }
+        let back = read_checked(&l).unwrap().expect("recorded");
+        let builds: Vec<u64> = back.refused_shims["ay"].iter().map(|r| r.build).collect();
+        assert_eq!(
+            builds,
+            (20..20 + u64::try_from(MAX_REFUSED_BUILDS).unwrap()).collect::<Vec<_>>()
+        );
+
+        // ny's build leaves the store, and each of ay's builds lands again refusing nothing.
+        // Every entry goes, and the record is written without the key at all.
+        std::fs::remove_dir_all(l.build_dir("ny", 4)).unwrap();
+        for build in 20..20 + u64::try_from(MAX_REFUSED_BUILDS).unwrap() {
+            record_refused_shims(&l, "ay", build, &[]).unwrap();
+        }
+        let back = read_checked(&l).unwrap().expect("recorded");
+        assert!(back.refused_shims.is_empty(), "{:?}", back.refused_shims);
+        assert!(
+            !std::fs::read_to_string(l.status())
+                .unwrap()
+                .contains("refused_shims"),
+            "an empty map is not written"
+        );
+        let _ = std::fs::remove_dir_all(&l.prefix);
+    }
+
+    /// The record's refused-name map holds the bound every read and write holds: no more
+    /// programs than [`MAX_STATUS_PROGRAMS`], no more than [`MAX_REFUSED_BUILDS`] entries
+    /// for one. The control is a record at both bounds, written and read back.
+    #[test]
+    fn a_record_over_the_refused_shims_bounds_is_neither_written_nor_read() {
+        let l = layout("refused-bounds");
+        let entry = |build: u64| RefusedShims {
+            build,
+            names: vec!["pwsh".to_string()],
+            count: 1,
+        };
+        let at_bounds = Status {
+            schema: 1,
+            refused_shims: (0..MAX_STATUS_PROGRAMS)
+                .map(|i| (format!("p{i}"), vec![entry(1)]))
+                .chain(std::iter::once((
+                    "p0".to_string(),
+                    (0..u64::try_from(MAX_REFUSED_BUILDS).unwrap())
+                        .map(entry)
+                        .collect(),
+                )))
+                .collect(),
+            ..Default::default()
+        };
+        write(&l, &at_bounds).unwrap();
+        assert_eq!(read_checked(&l).unwrap().as_ref(), Some(&at_bounds));
+        let good = std::fs::read_to_string(l.status()).unwrap();
+
+        let mut programs = at_bounds.clone();
+        programs
+            .refused_shims
+            .insert("one-more".to_string(), vec![entry(1)]);
+        let mut builds = at_bounds.clone();
+        builds
+            .refused_shims
+            .get_mut("p1")
+            .unwrap()
+            .extend((2..=u64::try_from(MAX_REFUSED_BUILDS).unwrap() + 1).map(entry));
+        for (what, over) in [("programs", &programs), ("builds", &builds)] {
+            let err = write(&l, over).unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::InvalidData, "{what}: {err}");
+            assert_eq!(
+                std::fs::read_to_string(l.status()).unwrap(),
+                good,
+                "{what}: a refused write leaves the record"
+            );
+            // The same bytes on disk, as another writer could leave them, are refused too.
+            std::fs::write(l.status(), over.to_toml().unwrap()).unwrap();
+            let err = read_checked(&l).unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::InvalidData, "{what}: {err}");
+            std::fs::write(l.status(), &good).unwrap();
+        }
         let _ = std::fs::remove_dir_all(&l.prefix);
     }
 

@@ -28,6 +28,7 @@ pub struct Decoder<R> {
 
 impl<R: Read> Decoder<R> {
     /// Wrap a source of PNG bytes.
+    #[inline]
     pub fn new(source: R) -> Self {
         Self {
             source,
@@ -37,12 +38,14 @@ impl<R: Read> Decoder<R> {
     }
 
     /// Bound what a decode may allocate. See [`Limits`].
-    pub fn set_limits(&mut self, limits: Limits) {
+    #[inline]
+    pub const fn set_limits(&mut self, limits: Limits) {
         self.limits = limits;
     }
 
     /// Choose the output transforms. See [`Transformations`].
-    pub fn set_transformations(&mut self, transformations: Transformations) {
+    #[inline]
+    pub const fn set_transformations(&mut self, transformations: Transformations) {
         self.transformations = transformations;
     }
 
@@ -337,13 +340,15 @@ impl Reader {
 
     /// What the file says about itself, before transforms.
     #[must_use]
-    pub fn info(&self) -> &Info {
+    #[inline]
+    pub const fn info(&self) -> &Info {
         &self.info
     }
 
     /// Bytes [`Reader::next_frame`] will fill.
     #[must_use]
-    pub fn output_buffer_size(&self) -> usize {
+    #[inline]
+    pub const fn output_buffer_size(&self) -> usize {
         self.output.buffer_size()
     }
 
@@ -600,13 +605,15 @@ impl Reader {
 
 /// Mask a 16-bit `tRNS` color key to the low `depth` bits for sub-16-bit
 /// samples so keys with stray high-byte bits still match.
-fn mask_trns_key(key: u16, depth: u32) -> u16 {
+#[inline]
+const fn mask_trns_key(key: u16, depth: u32) -> u16 {
     if depth < 16 { key & 0x00FF } else { key }
 }
 
 /// Read sample number `index` from a packed row at `depth` bits per sample.
 /// Out-of-range reads yield zero rather than panicking; the row length is
 /// derived from the header, so this can only be reached on a malformed file.
+#[inline]
 fn read_sample(row: &[u8], index: usize, depth: u32) -> u16 {
     match depth {
         16 => {
@@ -633,6 +640,7 @@ fn read_sample(row: &[u8], index: usize, depth: u32) -> u16 {
 /// Sub-byte output only ever happens when the transform is a no-op for this
 /// image, and the only sub-byte colour types are Grayscale and Indexed — both
 /// one sample per pixel — so the packed case never has to interleave channels.
+#[inline]
 fn write_pixel(row: &mut [u8], x: usize, samples: &[u16; 4], n: usize, depth: BitDepth) {
     match depth {
         BitDepth::Sixteen => {
@@ -679,7 +687,8 @@ const ADAM7: [(u32, u32, u32, u32); 7] = [
 ];
 
 /// How many pixels wide and tall Adam7 pass `pass` is for a `w` x `h` image.
-fn adam7_pass_size(pass: usize, w: u32, h: u32) -> (u32, u32) {
+#[inline]
+const fn adam7_pass_size(pass: usize, w: u32, h: u32) -> (u32, u32) {
     let (x0, y0, dx, dy) = ADAM7[pass];
     let pw = if w > x0 { (w - x0).div_ceil(dx) } else { 0 };
     let ph = if h > y0 { (h - y0).div_ceil(dy) } else { 0 };
@@ -707,6 +716,7 @@ fn read_image_data(stream: &mut impl Read, buf: &mut [u8]) -> Result<(), Decodin
 /// Reverse one scanline filter in place. `prev` is the already-unfiltered row
 /// above (all zeroes for the first row of a pass), `bpp` the byte distance to
 /// the pixel to the left.
+#[inline]
 fn unfilter(filter: u8, bpp: usize, prev: &[u8], row: &mut [u8]) -> Result<(), DecodingError> {
     match filter {
         0 => {}
@@ -745,11 +755,12 @@ fn unfilter(filter: u8, bpp: usize, prev: &[u8], row: &mut [u8]) -> Result<(), D
 /// and upper-left is closest to `a + b - c`, ties going to `a` then `b`.
 ///
 /// Shared with the encoder, which subtracts exactly what this adds back.
-pub(crate) fn paeth_predictor(a: u8, b: u8, c: u8) -> u8 {
-    let p = i16::from(a) + i16::from(b) - i16::from(c);
-    let pa = (p - i16::from(a)).abs();
-    let pb = (p - i16::from(b)).abs();
-    let pc = (p - i16::from(c)).abs();
+#[inline]
+pub(crate) const fn paeth_predictor(a: u8, b: u8, c: u8) -> u8 {
+    let p = (a as i16) + (b as i16) - (c as i16);
+    let pa = (p - (a as i16)).abs();
+    let pb = (p - (b as i16)).abs();
+    let pc = (p - (c as i16)).abs();
     if pa <= pb && pa <= pc {
         a
     } else if pb <= pc {

@@ -2588,12 +2588,13 @@ fn a_landing_draws_all_of_the_block_it_selects() {
     );
 }
 
-/// THE LANDING DRAWS ALL OF A BLOCK THAT HEADS A CONTINUED CARD (the
+/// THE LANDING DRAWS ALL OF A BLOCK THAT HEADS A RUN OF ITS CARD (the
 /// post-landing check's behaviour-1): at 2× text on the lab's narrow page
 /// (504 × 628 pt, and a few heights about it), three sessions each under
 /// an `18:00` timer, the Autopilot menu's `Harness settings…` lands on
 /// each row with its Timer open. Where the
-/// row heads `SESSIONS · CONTINUED`, its block fits the list's room but not
+/// row heads its run of SESSIONS under the caption the list keeps over a
+/// screen that starts inside the card, its block fits the list's room but not
 /// under the card's caption kept whole over it (the block and the caption's
 /// lead together are taller than the room); the landing then seats the list
 /// past the caption, which scrolls off whole, and draws all of the block,
@@ -2606,7 +2607,7 @@ fn a_landing_draws_all_of_the_block_it_selects() {
 /// next render (`seat_fits` false for a bare seat) drops the block 43 pt
 /// under the caption again at the republish.
 #[test]
-fn a_landing_draws_all_of_a_block_that_heads_a_continued_card() {
+fn a_landing_draws_all_of_a_block_that_heads_a_run_of_its_card() {
     use crate::native_app::SemanticInput;
     let mut state = fixture_with_a_day(true);
     let mut third = state.sessions[1].clone();
@@ -2629,7 +2630,7 @@ fn a_landing_draws_all_of_a_block_that_heads_a_continued_card() {
         session.glass.land_at = Some(at);
     }
     let headed = std::sync::Mutex::new(0_usize);
-    at_each_text_scale(&[2.0], "the continued card's landed block", |scale| {
+    at_each_text_scale(&[2.0], "the run's landed block", |scale| {
         for height in [600.0, 628.0, 660.0] {
             for id in [7_u64, 8, 9] {
                 let context = format!("{scale}\u{d7} 504\u{d7}{height}, session {id}");
@@ -2674,18 +2675,17 @@ fn a_landing_draws_all_of_a_block_that_heads_a_continued_card() {
                 let card = page
                     .paint
                     .iter()
-                    .filter(|n| {
-                        let k = n.key.as_str();
-                        k == "harness/sessions" || k.starts_with("harness/sessions/continued-")
-                    })
+                    .filter(|n| n.key.as_str() == "harness/sessions")
                     .find(|n| {
                         n.rect.y <= block.rect.y + 0.01
                             && n.rect.y + n.rect.height >= block.rect.y + block.rect.height - 0.01
                     })
                     .unwrap_or_else(|| panic!("{context}: the block's card is drawn"));
+                // The block heads the card's run on this screen: right under
+                // its caption, which the list keeps over a run that starts
+                // inside the card.
                 let lead = block.rect.y - card.rect.y;
-                if card.key.as_str().starts_with("harness/sessions/continued-")
-                    && lead < 60.0
+                if lead < 60.0
                     && lead + block.rect.height > room + 0.01
                     && block.rect.height <= room + 0.01
                 {
@@ -2752,7 +2752,7 @@ fn a_landing_draws_all_of_a_block_that_heads_a_continued_card() {
     });
     assert!(
         *headed.lock().unwrap() >= 1,
-        "some landed block heads a continued card, and with the caption's lead is taller than \
+        "some landed block heads its card's run, and with the caption's lead is taller than \
          the room"
     );
 }

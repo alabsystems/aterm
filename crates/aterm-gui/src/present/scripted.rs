@@ -28,8 +28,8 @@ use super::{CpuFrameBuffer, CpuPresenter, DamageRect};
 type PlatformSurface = super::mac::MacCpuPresenter;
 #[cfg(target_os = "linux")]
 type PlatformSurface = super::linux::LinuxPresenter;
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
-type PlatformSurface = super::softbuffer_surface::SoftbufferPresenter;
+#[cfg(windows)]
+type PlatformSurface = super::win32::Win32Presenter;
 
 /// One scripted failure, consumed by the present it applies to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -53,6 +53,9 @@ pub(crate) struct ScriptedPresenter {
     age: u8,
     script: VecDeque<ScriptedOutcome>,
     commits: usize,
+    /// The window system asks for part of the glass to be drawn again
+    /// ([`Self::owe_repaint`]); a successful commit settles it.
+    owed: bool,
 }
 
 impl ScriptedPresenter {
@@ -74,6 +77,33 @@ impl ScriptedPresenter {
     /// Successful commits so far.
     pub(crate) fn commits(&self) -> usize {
         self.commits
+    }
+
+    /// The window gains `rows` its last commit never reached, as Windows
+    /// grows a window under a present: the glass there holds the window
+    /// system's white, and the surface owes a repaint until a commit draws
+    /// the frame it retains.
+    pub(crate) fn owe_repaint(&mut self, rows: std::ops::Range<usize>) {
+        for row in rows {
+            let at = row * self.width;
+            if let Some(line) = self.glass.get_mut(at..at + self.width) {
+                line.fill(0x00ff_ffff);
+            }
+        }
+        self.owed = true;
+    }
+
+    /// The window system drops what the glass showed, as an X server does
+    /// before it sends an `Expose` (a VT switch, a video-memory purge): the
+    /// glass goes black, and the surface owes nothing it knows of. The retained
+    /// buffer goes black too, though its age still says it holds the last
+    /// present: a scripted commit copies the whole buffer, so this stands for
+    /// a surface that sends only the damage it is given (X11's ShmPutImage per
+    /// rectangle), where only a full copy puts the frame back.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn lose_glass(&mut self) {
+        self.glass.fill(0);
+        self.back.fill(0);
     }
 }
 
@@ -173,6 +203,13 @@ impl CpuPresenter for TestCpuSurface {
             }
         }
     }
+
+    fn owes_repaint(&self) -> bool {
+        match self {
+            Self::Platform(p) => p.owes_repaint(),
+            Self::Scripted(s) => s.owed,
+        }
+    }
 }
 
 impl Deref for TestCpuFrame<'_> {
@@ -207,6 +244,7 @@ impl TestCpuFrame<'_> {
         s.glass.clone_from(&s.back);
         s.age = 1;
         s.commits += 1;
+        s.owed = false;
         Ok(())
     }
 }

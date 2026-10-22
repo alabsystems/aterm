@@ -9,12 +9,14 @@ use std::sync::Arc;
 impl Terminal {
     /// The OSC 8 hyperlink URL applied to newly printed characters.
     #[must_use]
-    pub fn current_hyperlink(&self) -> Option<&Arc<str>> {
+    #[inline]
+    pub const fn current_hyperlink(&self) -> Option<&Arc<str>> {
         self.transient.current_hyperlink.as_ref()
     }
 
     /// Get the hyperlink URL attached to a rendered cell, if any.
     #[must_use]
+    #[inline]
     pub fn hyperlink_at(&self, row: u16, col: u16) -> Option<&str> {
         self.grid
             .cell_extra(row, col)
@@ -28,6 +30,7 @@ impl Terminal {
     ///
     /// [`Grid::visible_row_view`]: aterm_grid::Grid::visible_row_view
     #[must_use]
+    #[inline]
     pub fn hyperlink_at_visible(&self, visible_row: u16, col: u16) -> Option<Arc<str>> {
         let view = self.grid.visible_row_view(visible_row);
         let cell = view.cell(col)?;
@@ -42,6 +45,7 @@ impl Terminal {
     /// The `id=` parameter groups cells into the same hyperlink span. When present,
     /// two cells belong to the same hyperlink only if both the URL and `id=` match.
     #[must_use]
+    #[inline]
     pub fn hyperlink_id_at(&self, row: u16, col: u16) -> Option<&str> {
         self.grid
             .cell_extra(row, col)
@@ -52,6 +56,7 @@ impl Terminal {
     /// The percent-decoded path of the working directory URL the shell set
     /// (OSC 7).
     #[must_use]
+    #[inline]
     pub fn current_working_directory(&self) -> Option<&str> {
         self.current_working_directory.as_deref()
     }
@@ -64,6 +69,7 @@ impl Terminal {
     /// cannot know its own name, so whether a named host is this machine is
     /// the embedder's call: a shell reporting its own hostname is common.
     #[must_use]
+    #[inline]
     pub fn reported_cwd_host(&self) -> Option<&str> {
         self.shell.cwd_host.as_deref()
     }
@@ -77,19 +83,26 @@ impl Terminal {
     /// front when it first saw report `n` and know a later report by its new
     /// number.
     #[must_use]
-    pub fn reported_cwd_seq(&self) -> Option<u64> {
-        (!self.shell.cwd_carried).then_some(self.shell.cwd_reports)
+    #[inline]
+    pub const fn reported_cwd_seq(&self) -> Option<u64> {
+        if self.shell.cwd_carried {
+            None
+        } else {
+            Some(self.shell.cwd_reports)
+        }
     }
 
     /// The indexed (0-255) color palette.
     #[must_use]
-    pub fn color_palette(&self) -> &ColorPalette {
+    #[inline]
+    pub const fn color_palette(&self) -> &ColorPalette {
         self.color.palette()
     }
 
     /// The RGB value for an indexed color.
     #[must_use]
-    pub fn palette_color(&self, index: u8) -> Rgb {
+    #[inline]
+    pub const fn palette_color(&self, index: u8) -> Rgb {
         self.color.palette().get(index)
     }
 
@@ -100,6 +113,7 @@ impl Terminal {
     /// configured slot starts from the built-in palette rather than cloning the
     /// live palette, so a prior program-issued OSC 4 mutation can never become a
     /// host reset default accidentally.
+    #[inline]
     pub fn set_palette_color(&mut self, index: u8, color: Rgb) {
         self.color.palette_mut().set(index, color);
         self.color
@@ -110,6 +124,7 @@ impl Terminal {
     }
 
     /// Set indexed color from primitive RGB components.
+    #[inline]
     pub fn set_palette_color_components(&mut self, index: u8, r: u8, g: u8, b: u8) {
         self.set_palette_color(index, Rgb { r, g, b });
     }
@@ -119,7 +134,8 @@ impl Terminal {
     /// This is the color used for cells with default foreground styling.
     /// Modified via OSC 10, reset via OSC 110.
     #[must_use]
-    pub fn default_foreground(&self) -> Rgb {
+    #[inline]
+    pub const fn default_foreground(&self) -> Rgb {
         self.color.default_foreground
     }
 
@@ -127,6 +143,7 @@ impl Terminal {
     ///
     /// This seeds both the live value and the reset baseline: a later OSC 10
     /// may replace the live value, while OSC 110 restores `color`.
+    #[inline]
     pub fn set_default_foreground(&mut self, color: Rgb) {
         self.color.default_foreground = color;
         self.color.configured_foreground = color;
@@ -139,7 +156,8 @@ impl Terminal {
     /// This is the color used for cells with default background styling.
     /// Modified via OSC 11, reset via OSC 111.
     #[must_use]
-    pub fn default_background(&self) -> Rgb {
+    #[inline]
+    pub const fn default_background(&self) -> Rgb {
         self.color.default_background
     }
 
@@ -147,6 +165,7 @@ impl Terminal {
     ///
     /// This seeds both the live value and the reset baseline: a later OSC 11
     /// may replace the live value, while OSC 111 restores `color`.
+    #[inline]
     pub fn set_default_background(&mut self, color: Rgb) {
         self.color.default_background = color;
         self.color.configured_background = color;
@@ -159,6 +178,7 @@ impl Terminal {
     ///
     /// This seeds both the live OSC 12 value and the OSC 112/RIS reset
     /// baseline. `None` makes the configured fallback the default foreground.
+    #[inline]
     pub fn set_default_cursor_color(&mut self, color: Option<Rgb>) {
         self.color.cursor_color = color;
         self.color.configured_cursor = color;
@@ -171,13 +191,15 @@ impl Terminal {
     /// Returns `None` if the cursor uses the default foreground color.
     /// Modified via OSC 12, reset via OSC 112.
     #[must_use]
-    pub fn cursor_color(&self) -> Option<Rgb> {
+    #[inline]
+    pub const fn cursor_color(&self) -> Option<Rgb> {
         self.color.cursor_color
     }
 
     /// Whether a program has overridden the cursor color via OSC 12 relative to
     /// the host baseline set by [`Self::set_default_cursor_color`].
     #[must_use]
+    #[inline]
     pub fn cursor_color_recoloured(&self) -> bool {
         self.color.cursor_color != self.color.configured_cursor
     }
@@ -187,7 +209,8 @@ impl Terminal {
     /// Returns `None` if the selection uses the renderer default color.
     /// Modified via OSC 17 / OSC 21 `selection_background`.
     #[must_use]
-    pub fn selection_background(&self) -> Option<Rgb> {
+    #[inline]
+    pub const fn selection_background(&self) -> Option<Rgb> {
         self.color.selection_background
     }
 
@@ -195,6 +218,7 @@ impl Terminal {
     ///
     /// Seeds both the live OSC 17/21 value and the OSC 117/RIS baseline.
     /// `None` delegates selection fill to the renderer theme.
+    #[inline]
     pub fn set_default_selection_background(&mut self, color: Option<Rgb>) {
         self.color.selection_background = color;
         self.color.configured_selection_background = color;
@@ -206,7 +230,8 @@ impl Terminal {
     /// Returns `None` if selected text uses the renderer's automatic/default
     /// foreground. Modified via OSC 19 and reset via OSC 119.
     #[must_use]
-    pub fn selection_foreground(&self) -> Option<Rgb> {
+    #[inline]
+    pub const fn selection_foreground(&self) -> Option<Rgb> {
         self.color.selection_foreground
     }
 
@@ -214,6 +239,7 @@ impl Terminal {
     ///
     /// Seeds both the live OSC 19 value and the OSC 119/RIS baseline. `None`
     /// leaves selected-text contrast resolution to the renderer.
+    #[inline]
     pub fn set_default_selection_foreground(&mut self, color: Option<Rgb>) {
         self.color.selection_foreground = color;
         self.color.configured_selection_foreground = color;

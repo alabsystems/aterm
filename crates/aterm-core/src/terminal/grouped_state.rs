@@ -37,6 +37,7 @@ pub(super) struct MarksState {
 }
 
 impl MarksState {
+    #[inline]
     pub(super) fn new() -> Self {
         Self {
             marks: VecDeque::new(),
@@ -130,6 +131,7 @@ pub(super) struct ColorState {
 }
 
 impl ColorState {
+    #[inline]
     pub(super) fn new() -> Self {
         Self {
             palette: ColorPalette::new(),
@@ -160,7 +162,7 @@ impl ColorState {
 
     /// Read-only access to the 256-color palette.
     #[inline]
-    pub(super) fn palette(&self) -> &ColorPalette {
+    pub(super) const fn palette(&self) -> &ColorPalette {
         &self.palette
     }
 
@@ -225,6 +227,7 @@ impl ColorState {
     /// `color_resolve` and deliberately not consulted: a visual-bell flash
     /// must not emit a pair of 997 pushes. Neither is the host's query
     /// callback, which answers OSC 10/11 queries, not the scheme.
+    #[inline]
     pub(super) fn reported_scheme(&self) -> (aterm_types::Appearance, super::ColorSchemeSource) {
         use aterm_types::Appearance;
         if self.default_background == self.configured_background {
@@ -246,6 +249,7 @@ impl ColorState {
     /// Terminal::reset): palette, dynamic colors, cursor color and color stack.
     /// Callbacks and configured defaults are kept (they are not terminal
     /// state).
+    #[inline]
     pub(super) fn reset(&mut self) {
         self.stack.clear();
         // Reset to the configured default, never a transient state: reverse
@@ -423,6 +427,7 @@ pub(super) struct ShellIntegrationState {
 }
 
 impl ShellIntegrationState {
+    #[inline]
     pub(super) fn new() -> Self {
         Self {
             state: ShellState::Ground,
@@ -455,6 +460,7 @@ impl ShellIntegrationState {
     }
 
     /// Reset data fields while preserving the block ID counter.
+    #[inline]
     pub(super) fn reset(&mut self) {
         self.state = ShellState::Ground;
         self.phase = ShellIntegrationPhase::None;
@@ -478,6 +484,7 @@ impl ShellIntegrationState {
     /// When the shell's prompt began by its own marks: its `A` (the current
     /// mark's `prompt_time_ms`), or, from its `D` until its next `A`, that `D`.
     /// `None` with no mark or no clock reading.
+    #[inline]
     pub(super) fn prompt_since_ms(&self) -> Option<u64> {
         match &self.current_mark {
             Some(mark) => mark.prompt_time_ms,
@@ -491,6 +498,7 @@ impl ShellIntegrationState {
     /// Whether the host says a program the shell started since its prompt
     /// began runs now ([`Self::program_probe`]); `false` with no probe or no
     /// prompt time.
+    #[inline]
     pub(super) fn program_runs_since_prompt(&self) -> bool {
         match (&self.program_probe, self.prompt_since_ms()) {
             (Some(probe), Some(since)) => probe(since),
@@ -511,7 +519,8 @@ pub(super) struct CursorSaveState {
 }
 
 impl CursorSaveState {
-    pub(super) fn new() -> Self {
+    #[inline]
+    pub(super) const fn new() -> Self {
         Self {
             main: None,
             alt: None,
@@ -519,7 +528,8 @@ impl CursorSaveState {
     }
 
     /// Reset all saved cursor positions (called during terminal reset).
-    pub(super) fn reset(&mut self) {
+    #[inline]
+    pub(super) const fn reset(&mut self) {
         *self = Self::new();
     }
 }
@@ -546,6 +556,7 @@ pub(super) struct TitleState {
 }
 
 impl TitleState {
+    #[inline]
     pub(super) fn new() -> Self {
         Self {
             window: Arc::from(""),
@@ -557,6 +568,7 @@ impl TitleState {
 
     /// Reset title data (xterm clears titles on RIS). Hosts see the clear
     /// through [`Terminal::title_epoch`](super::Terminal::title_epoch).
+    #[inline]
     pub(super) fn reset(&mut self) {
         // Clearing a non-empty window title is a real title change: bump the
         // epoch so hosts see the RIS clear.
@@ -586,6 +598,7 @@ pub(super) struct NotificationState {
 // separate callback-rate limiter.
 
 impl NotificationState {
+    #[inline]
     pub(super) fn new() -> Self {
         Self {
             callback: None,
@@ -595,6 +608,7 @@ impl NotificationState {
     }
 
     /// Reset pending notifications while preserving callbacks.
+    #[inline]
     pub(super) fn reset(&mut self) {
         self.pending.clear();
     }
@@ -607,7 +621,8 @@ pub(super) struct ClipboardState {
 }
 
 impl ClipboardState {
-    pub(super) fn new() -> Self {
+    #[inline]
+    pub(super) const fn new() -> Self {
         Self { callback: None }
     }
 }
@@ -648,6 +663,7 @@ pub(super) struct Iterm2State {
 pub(super) const DEFAULT_CELL_PX: (u16, u16) = (8, 16);
 
 impl Iterm2State {
+    #[inline]
     pub(super) fn new() -> Self {
         Self {
             user_vars: UserVarsMap::default(),
@@ -663,12 +679,18 @@ impl Iterm2State {
     /// The cell box a host measured, or `None` for the placeholder: the one
     /// predicate behind [`Terminal::host_cell_pixel_size`] and the XTWINOPS
     /// pixel reports. A zero axis counts as unreported.
-    pub(super) fn host_cell_px(&self) -> Option<(u16, u16)> {
+    #[inline]
+    pub(super) const fn host_cell_px(&self) -> Option<(u16, u16)> {
         let (w, h) = self.cell_px;
-        (self.cell_px_from_host && w > 0 && h > 0).then_some((w, h))
+        if self.cell_px_from_host && w > 0 && h > 0 {
+            Some((w, h))
+        } else {
+            None
+        }
     }
 
     /// Reset the program-set fields; the host's cell size survives.
+    #[inline]
     pub(super) fn reset(&mut self) {
         self.remote_host = None;
         self.highlight_cursor_line = None;
@@ -689,6 +711,7 @@ pub(super) struct BiDiGroupState {
 }
 
 impl BiDiGroupState {
+    #[inline]
     pub(super) fn new() -> Self {
         Self {
             config: crate::config::BiDiConfig::default(),
@@ -719,6 +742,7 @@ pub(super) struct BidiScratch {
 }
 
 impl BidiScratch {
+    #[inline]
     pub(super) fn new() -> Self {
         Self {
             classes: Vec::new(),

@@ -63,6 +63,7 @@ pub(crate) struct ClipboardAuth {
 
 impl ClipboardAuth {
     /// Construct an authorization state with no capabilities granted.
+    #[inline]
     pub(crate) const fn new() -> Self {
         Self {
             write_authorized: false,
@@ -72,23 +73,27 @@ impl ClipboardAuth {
 
     /// Authorize OSC 52 clipboard set: PTY-origin set sequences then mint a
     /// [`ClipboardWriteCapability`] and reach the callback.
-    pub(crate) fn authorize_write(&mut self) {
+    #[inline]
+    pub(crate) const fn authorize_write(&mut self) {
         self.write_authorized = true;
     }
 
     /// Revoke OSC 52 clipboard *set*: PTY-origin sets are dropped until
     /// [`Self::authorize_write`] is called again.
-    pub(crate) fn revoke_write(&mut self) {
+    #[inline]
+    pub(crate) const fn revoke_write(&mut self) {
         self.write_authorized = false;
     }
 
     /// Authorize OSC 52 clipboard *query* (read).
-    pub(crate) fn authorize_query(&mut self) {
+    #[inline]
+    pub(crate) const fn authorize_query(&mut self) {
         self.query_authorized = true;
     }
 
     /// Revoke OSC 52 clipboard *query*.
-    pub(crate) fn revoke_query(&mut self) {
+    #[inline]
+    pub(crate) const fn revoke_query(&mut self) {
         self.query_authorized = false;
     }
 
@@ -106,7 +111,8 @@ impl ClipboardAuth {
     ///
     /// The probe and origin are literals, so the verdict is resolved once per
     /// installed policy; `policy_bridge.rs` has the decision tree.
-    pub(super) fn try_mint_write_capability_with_engine(
+    #[inline]
+    pub(super) const fn try_mint_write_capability_with_engine(
         &self,
         gates: PolicyGates,
     ) -> Option<ClipboardWriteCapability> {
@@ -120,7 +126,8 @@ impl ClipboardAuth {
     /// Mint a query capability: the same rules as
     /// [`Self::try_mint_write_capability_with_engine`], against the
     /// `OSC 52 query` selector and `query_authorized`.
-    pub(super) fn try_mint_query_capability_with_engine(
+    #[inline]
+    pub(super) const fn try_mint_query_capability_with_engine(
         &self,
         gates: PolicyGates,
     ) -> Option<ClipboardQueryCapability> {
@@ -149,6 +156,7 @@ pub(super) fn probe_osc52_query() -> DispatchedSequence {
 
 /// Invoke the host clipboard callback with a set operation, consuming the
 /// capability. A no-op without a callback.
+#[inline]
 pub(super) fn invoke_set(
     callback_slot: &mut Option<ClipboardCallback>,
     _token: ClipboardWriteCapability,
@@ -166,6 +174,7 @@ pub(super) fn invoke_set(
 
 /// Invoke the host clipboard callback with a query operation: the host's content, or
 /// `None` when it denies, has none, or no callback is wired.
+#[inline]
 pub(super) fn invoke_query(
     callback_slot: &mut Option<ClipboardCallback>,
     _token: ClipboardQueryCapability,
@@ -181,6 +190,7 @@ pub(super) fn invoke_query(
 /// Invoke the host clipboard callback with a clear operation. Clear takes the write
 /// capability: it can only empty the clipboard, and a host that wants clear but not
 /// set enforces that in the callback.
+#[inline]
 pub(super) fn invoke_clear(
     callback_slot: &mut Option<ClipboardCallback>,
     _token: ClipboardWriteCapability,

@@ -16,6 +16,7 @@ use super::*;
 
 /// Map host-supplied display coordinates into the selection's terminal space.
 /// An off-screen i32 endpoint remains off-screen even at the numeric limits.
+#[inline]
 fn display_row_to_terminal(term: &Terminal, display_row: i32) -> i32 {
     let offset = i32::try_from(term.grid().display_offset()).unwrap_or(i32::MAX);
     display_row.saturating_sub(offset)
@@ -23,6 +24,7 @@ fn display_row_to_terminal(term: &Terminal, display_row: i32) -> i32 {
 
 /// Project the selection into the visible viewport, clipping off-screen ends.
 /// Both web hosts use the same geometry for their public selection bounds.
+#[inline]
 pub(crate) fn selection_range_for(
     term: &Terminal,
     rows: usize,

@@ -31,12 +31,14 @@ impl Default for DocumentMut {
 
 impl DocumentMut {
     /// An empty document.
+    #[inline]
     #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
     /// The root table.
+    #[inline]
     #[must_use]
     pub fn as_table(&self) -> &Table {
         self.root
@@ -45,6 +47,7 @@ impl DocumentMut {
     }
 
     /// The root table, mutably.
+    #[inline]
     pub fn as_table_mut(&mut self) -> &mut Table {
         self.root
             .as_table_mut()
@@ -53,22 +56,26 @@ impl DocumentMut {
 
     /// The root as an [`Item`], for code that walks documents and sub-tables
     /// with the same loop.
+    #[inline]
     #[must_use]
-    pub fn as_item(&self) -> &Item {
+    pub const fn as_item(&self) -> &Item {
         &self.root
     }
 
     /// The root as a mutable [`Item`].
-    pub fn as_item_mut(&mut self) -> &mut Item {
+    #[inline]
+    pub const fn as_item_mut(&mut self) -> &mut Item {
         &mut self.root
     }
 
     /// Top-level entries in authored order.
+    #[inline]
     pub fn iter(&self) -> impl Iterator<Item = (&str, &Item)> {
         self.as_table().iter()
     }
 
     /// The top-level entry for `key`.
+    #[inline]
     #[must_use]
     pub fn get(&self, key: &str) -> Option<&Item> {
         self.as_table().get(key)

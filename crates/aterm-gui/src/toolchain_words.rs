@@ -1060,8 +1060,9 @@ pub(crate) fn machine_settings(text: &str) -> Vec<Message> {
 /// `universal-control disabled` → "ALab tools turned off Universal Control", whose
 /// detail is the whole undo: the `[machine]` switch set to leave (the default
 /// policy turns it off again) and the revert command,
-/// [`atpkg::machine::UNIVERSAL_CONTROL_REVERT`] byte for byte. An unknown item is
-/// its own title, verbatim, with no detail.
+/// [`atpkg::machine::UNIVERSAL_CONTROL_REVERT`] byte for byte; `rosetta installed` → "ALab
+/// tools installed Rosetta 2", whose detail says macOS keeps it and names the switch that
+/// stops a reinstall. An unknown item is its own title, verbatim, with no detail.
 pub(crate) fn machine_setting_words(item: &str) -> (String, String) {
     let item = sanitize_for_tty(item, 80);
     let (title, detail) = if item == atpkg::machine::UNIVERSAL_CONTROL_ENTRY {
@@ -1071,6 +1072,13 @@ pub(crate) fn machine_setting_words(item: &str) -> (String, String) {
                 "to turn it back on, set Universal Control on this Mac to leave and run: {}",
                 atpkg::machine::UNIVERSAL_CONTROL_REVERT
             ),
+        )
+    } else if item == atpkg::machine::ROSETTA_ENTRY {
+        (
+            "ALab tools installed Rosetta 2".to_string(),
+            "Intel apps and tools now run on this Mac; macOS keeps Rosetta 2, and [machine] \
+             rosetta = false stops aterm installing it again"
+                .to_string(),
         )
     } else {
         (item.clone(), String::new())
@@ -1185,6 +1193,64 @@ pub(crate) fn foreign_tools_entry(
         "toolchain-foreign scope={scope} items={}",
         items.len()
     ))
+}
+
+/// Why a pass files the C toolchain's entry ([`c_toolchain_entry`]): the
+/// [`atpkg::cli::C_TOOLCHAIN_MARKER`] body it said.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CToolchain {
+    /// `missing`: no toolchain is installed (on a Mac, no Command Line Tools).
+    Missing,
+    /// `broken`: a compiler is installed and cannot build, which installing the
+    /// toolchain fixes (off macOS: most often the libc headers).
+    Broken,
+}
+
+/// The digest entry for a pass that found no C toolchain that builds where an
+/// install would fix it (`c-toolchain: missing|broken`,
+/// [`atpkg::cli::C_TOOLCHAIN_MARKER`]; docs/DESIGN-init-system-2026-10-20.md §4.2
+/// `base.clt`): on a Mac, Apple's Command Line Tools, which nothing may redistribute
+/// and only a password installs. A fact for later, never on screen: the programs
+/// work, and what needs the tools (a build that compiles C, `git`) says so when it
+/// runs. The step is atpkg's own fix ([`atpkg::prereq::act`], on macOS `aterm init
+/// --only base.clt`). One entry per cause, re-said as a duplicate by every pass that
+/// finds the same; not installing the tools may be the owner's own choice, so a
+/// dismissal holds a month ([`aterm_messages::need::Resurface::CHOICE`]). Ended by
+/// the first pass that finds a toolchain an install would not change
+/// (`App::note_c_toolchain`).
+pub(crate) fn c_toolchain_entry(cause: CToolchain) -> aterm_messages::exceptions::Entry {
+    use aterm_messages::exceptions::{Entry, Family};
+    use aterm_messages::need::{Reason, Resurface, Then, Why};
+    let mac = cfg!(target_os = "macos");
+    let (word, what) = match cause {
+        CToolchain::Missing if mac => ("missing", "Command Line Tools are missing"),
+        CToolchain::Missing => ("missing", "No C compiler is installed"),
+        CToolchain::Broken => ("broken", "The C compiler cannot build"),
+    };
+    Entry::new(
+        Family::Toolchain,
+        "clt",
+        word,
+        what,
+        Why::OnlyYou(Reason::new(if mac {
+            "installing them asks for your password in a terminal"
+        } else {
+            "installing one needs your distribution's package manager as root"
+        })),
+        if mac {
+            Then::step(format!("Run `{}` in a terminal", atpkg::prereq::act()))
+                .or_short("Run the command under Details")
+        } else {
+            Then::step("Install your distribution's C compiler")
+        },
+    )
+    .resurface(Resurface::CHOICE)
+    .more(if mac {
+        "Builds that compile C (most Rust crates), git and make need cc and the macOS SDK"
+    } else {
+        atpkg::prereq::act()
+    })
+    .log_line(format!("toolchain-c {word}"))
 }
 
 // ---------------------------------------------------------------------------

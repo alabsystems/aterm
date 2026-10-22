@@ -35,22 +35,22 @@ pub enum Direction {
 
 impl Direction {
     #[inline]
-    pub(crate) fn is_horizontal(self) -> bool {
+    pub(crate) const fn is_horizontal(self) -> bool {
         matches!(self, Direction::LeftToRight | Direction::RightToLeft)
     }
 
     #[inline]
-    pub(crate) fn is_forward(self) -> bool {
+    pub(crate) const fn is_forward(self) -> bool {
         matches!(self, Direction::LeftToRight | Direction::TopToBottom)
     }
 
     #[inline]
-    pub(crate) fn is_backward(self) -> bool {
+    pub(crate) const fn is_backward(self) -> bool {
         !self.is_forward()
     }
 
     #[inline]
-    pub(crate) fn reverse(self) -> Self {
+    pub(crate) const fn reverse(self) -> Self {
         match self {
             Direction::Invalid => Direction::Invalid,
             Direction::LeftToRight => Direction::RightToLeft,
@@ -62,7 +62,8 @@ impl Direction {
 
     /// The horizontal direction `script` is written in; `None` for the
     /// scripts written either way (harfbuzz#1000).
-    pub(crate) fn from_script(script: Script) -> Option<Self> {
+    #[inline]
+    pub(crate) const fn from_script(script: Script) -> Option<Self> {
         match &script.0 {
             // Unicode 1.1 to 14.0 right-to-left scripts, as upstream lists
             // them, and Garay (16.0), which upstream's script table does not
@@ -99,7 +100,8 @@ pub(crate) fn script_tags(script: Option<Script>) -> Vec<Tag> {
     tags
 }
 
-fn new_tag_from_script(script: Script) -> Option<Tag> {
+#[inline]
+const fn new_tag_from_script(script: Script) -> Option<Tag> {
     let tag: &[u8; 4] = match &script.0 {
         b"Beng" => b"bng2",
         b"Deva" => b"dev2",
@@ -116,7 +118,8 @@ fn new_tag_from_script(script: Script) -> Option<Tag> {
     Some(Tag::from_bytes(tag))
 }
 
-fn old_tag_from_script(script: Script) -> Tag {
+#[inline]
+const fn old_tag_from_script(script: Script) -> Tag {
     match &script.0 {
         // Katakana and Hiragana both map to `kana`.
         b"Hira" => Tag::from_bytes(b"kana"),

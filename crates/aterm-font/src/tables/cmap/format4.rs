@@ -25,6 +25,7 @@ pub struct Subtable4<'a> {
 
 impl<'a> Subtable4<'a> {
     /// Parses a subtable from raw data.
+    #[inline]
     pub fn parse(data: &'a [u8]) -> Option<Self> {
         let mut s = Stream::new(data);
         s.advance(6); // format + length + language
@@ -56,6 +57,7 @@ impl<'a> Subtable4<'a> {
     /// Returns a glyph index for a code point.
     ///
     /// Returns `None` when `code_point` is larger than `u16`.
+    #[inline]
     pub fn glyph_index(&self, code_point: u32) -> Option<GlyphId> {
         // This subtable supports code points only in a u16 range.
         let code_point = u16::try_from(code_point).ok()?;

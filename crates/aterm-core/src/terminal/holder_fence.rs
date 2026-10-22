@@ -97,6 +97,7 @@ impl HolderView {
     };
 
     /// The filled spans.
+    #[inline]
     #[must_use]
     pub fn spans(&self) -> &[(u64, u64)] {
         &self.spans[..usize::from(self.n).min(MAX_HOLDER_SPANS)]
@@ -104,6 +105,7 @@ impl HolderView {
 
     /// Whether main-screen rows `[lo, hi)` were all written by the current
     /// drawer: one span holds them all, and nothing taints the mark.
+    #[inline]
     #[must_use]
     #[cfg_attr(
         any(test, debug_assertions),
@@ -124,8 +126,9 @@ impl HolderView {
     }
 
     /// Whether the alternate screen holds only the current drawer's writes.
+    #[inline]
     #[must_use]
-    pub fn admits_alt(&self) -> bool {
+    pub const fn admits_alt(&self) -> bool {
         self.token != 0 && self.alt_fresh
     }
 }
@@ -184,6 +187,7 @@ struct At {
 }
 
 impl At {
+    #[inline]
     fn of(grid: &Grid) -> Self {
         let cursor = grid.cursor();
         let rows = grid.rows();
@@ -195,16 +199,19 @@ impl At {
         }
     }
 
+    #[inline]
     fn cursor_row(self) -> u64 {
         self.base + u64::from(self.row)
     }
 
     /// The row a new span starts on: the cursor's, or the next one when the
     /// cursor stands inside a row someone else began.
+    #[inline]
     fn lay_row(self) -> u64 {
         self.cursor_row() + u64::from(self.col != 0)
     }
 
+    #[inline]
     fn visible(self, row: u64) -> Option<u16> {
         row.checked_sub(self.base)
             .and_then(|r| u16::try_from(r).ok())
@@ -214,22 +221,26 @@ impl At {
 
 impl HolderFence {
     /// Whether any mark exists (the fence is free while none does).
+    #[inline]
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.marks.is_empty()
     }
 
     /// The current drawer's token.
+    #[inline]
     #[must_use]
     pub fn current_token(&self) -> Option<u64> {
         self.current_mark().map(|m| m.token)
     }
 
     /// Every mark's token, current or suspended.
+    #[inline]
     pub fn tokens(&self) -> impl Iterator<Item = u64> + '_ {
         self.marks.iter().map(|m| m.token)
     }
 
+    #[inline]
     fn current_mark(&self) -> Option<&Mark> {
         self.current.and_then(|i| self.marks.get(usize::from(i)))
     }
@@ -418,6 +429,7 @@ impl HolderFence {
 
     /// The marks a new one may join: [`MAX_HOLDER_MARKS`], or one under the
     /// count-eviction knob.
+    #[inline]
     fn capacity() -> usize {
         if knob(FenceKnob::CountEviction) {
             1
@@ -567,6 +579,7 @@ impl HolderFence {
             project = "aterm_core::terminal::holder_fence_conformance::project"
         )
     )]
+    #[inline]
     pub fn note_alt_cleared(&mut self) {
         if let Some(mark) = self
             .current
@@ -585,6 +598,7 @@ impl HolderFence {
             project = "aterm_core::terminal::holder_fence_conformance::project"
         )
     )]
+    #[inline]
     pub fn note_alt_exit(&mut self) {
         for mark in &mut self.marks {
             mark.alt_fresh = false;
@@ -718,6 +732,7 @@ impl super::Terminal {
     /// names the main grid mutably: the cuts, the checkpoint's install and
     /// the width lend all reach it here, so the anchors never land in the
     /// other grid.
+    #[inline]
     pub(super) fn fence_and_main_grid(&mut self) -> (&mut HolderFence, &mut Grid) {
         let grid = if self.modes.alternate_screen {
             self.alt_grid.as_mut().unwrap_or(&mut self.grid)
@@ -729,6 +744,7 @@ impl super::Terminal {
 
     /// The primary-content grid, mutably: the inactive one while the
     /// alternate screen is up.
+    #[inline]
     pub(super) fn main_grid_mut(&mut self) -> &mut Grid {
         self.fence_and_main_grid().1
     }
@@ -816,6 +832,7 @@ impl super::Terminal {
             project = "aterm_core::terminal::holder_fence_conformance::project"
         )
     )]
+    #[inline]
     pub fn note_holder_cut(&mut self, cut: HolderCut) {
         let (fence, grid) = self.fence_and_main_grid();
         fence.note_cut(cut, grid);
@@ -830,6 +847,7 @@ impl super::Terminal {
             project = "aterm_core::terminal::holder_fence_conformance::project"
         )
     )]
+    #[inline]
     pub fn retire_holder_mark(&mut self, token: u64) {
         let (fence, grid) = self.fence_and_main_grid();
         fence.retire(token, grid);
@@ -837,14 +855,16 @@ impl super::Terminal {
 
     /// The current holder's admitted rows (the render input's
     /// `RenderInput::holder`).
+    #[inline]
     #[must_use]
     pub fn holder_view(&self) -> HolderView {
         self.holder_fence.view(self.main_grid())
     }
 
     /// The holder fence.
+    #[inline]
     #[must_use]
-    pub fn holder_fence(&self) -> &HolderFence {
+    pub const fn holder_fence(&self) -> &HolderFence {
         &self.holder_fence
     }
 

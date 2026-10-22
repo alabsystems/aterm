@@ -35,7 +35,8 @@ pub const COPIED_COMMANDS: &str = super::COPIED_COMMANDS;
 pub const LINKS: &str = "base.shell.links";
 /// `base.shell.hooks`: the `~/.aterm/shell.d` hooks.
 pub const HOOKS: &str = super::HOOKS;
-/// `base.shell.rc`: atpkg's block in each rc that exists.
+/// `base.shell.rc`: atpkg's block in each rc that exists, and in the login shell's own rc,
+/// the one file it creates when absent ([`crate::hooks::login_rc`]).
 pub const RC: &str = super::RC;
 /// `base.pkg.stubs`: the reroute stubs, abrew's `brew` included.
 pub const STUBS: &str = super::STUBS;
@@ -81,9 +82,10 @@ pub enum Pass {
     /// the exec roots at `Deep`, the recorded rustup seams — run again over an `Ok` probe
     /// ([`Item::refresh`]), as they did before they were items.
     Repair,
-    /// Bare `aterm doctor` and `aterm init`: each item applies only where its probe
-    /// differs, and a deleted rc block stays deleted (design §5: "minus the opt-out
-    /// re-lay").
+    /// Every other pass — bare `aterm doctor`, `aterm init`, the seed and the end of an
+    /// install or update pass (`atpkg`'s `relay_base`): each item applies only where its
+    /// probe differs, and a deleted rc block (or a deleted login rc) stays deleted (design
+    /// §5: "minus the opt-out re-lay").
     Doctor,
 }
 
@@ -98,17 +100,23 @@ pub struct Ground {
     pub exe: Option<PathBuf>,
     /// rustup's home (`$RUSTUP_HOME`, else `~/.rustup`); `None` when unknown.
     pub rustup_home: Option<PathBuf>,
+    /// The rc the account's login shell reads, the one rc a pass creates when it is absent
+    /// ([`crate::hooks::login_rc`]); `None` when the login shell reads no rc atpkg wires.
+    pub login_rc: Option<&'static str>,
     /// Which surface runs the items.
     pub pass: Pass,
 }
 
 impl Ground {
-    /// The ground of this process: its home, its own executable and rustup's home.
+    /// The ground of this process: its home, its own executable, rustup's home and the
+    /// login shell's rc (the account record's shell, never `$SHELL`).
     #[must_use]
     pub fn of_process(layout: Layout, pass: Pass) -> Self {
+        let home = aterm_types::dirs::home_dir();
         Self {
             layout,
-            home: aterm_types::dirs::home_dir(),
+            login_rc: home.as_deref().and_then(crate::hooks::account_login_rc),
+            home,
             exe: std::env::current_exe()
                 .and_then(|exe| exe.canonicalize())
                 .ok(),
@@ -623,12 +631,22 @@ impl Repair {
         }
     }
 
-    /// The rc files a pass of this kind would wire now.
+    /// The absent login rc ([`Ground::login_rc`]) and how a pass treats it
+    /// ([`crate::hooks::absent_login_rc`]): `None` when it stands, or none is to be made.
+    #[cfg(unix)]
+    fn absent_login_rc(&self, home: &Path) -> Option<(&'static str, crate::hooks::RcState)> {
+        let rc = self.ground.login_rc?;
+        crate::hooks::absent_login_rc(home, rc).map(|state| (rc, state))
+    }
+
+    /// The rc files a pass of this kind would wire now, the absent login rc it would create
+    /// among them.
     #[cfg(unix)]
     fn rc_to_wire(&self, home: &Path) -> Vec<&'static str> {
         use crate::hooks::RcState;
         crate::hooks::rc_wiring(home)
             .into_iter()
+            .chain(self.absent_login_rc(home))
             .filter(|(rc, state)| {
                 crate::hooks::RC_FILES.iter().any(|(row, _)| row == rc)
                     && match state {
@@ -672,6 +690,7 @@ impl Repair {
         let Ok(home) = self.home() else {
             return blocked("$HOME is unknown, so no rc file can be read");
         };
+        let absent = self.absent_login_rc(home);
         let wire = self.rc_to_wire(home);
         if !wire.is_empty() {
             if let Err(why) = self.require_current_hooks() {
@@ -680,27 +699,60 @@ impl Repair {
                     why,
                 };
             }
-            let names: Vec<String> = wire.iter().map(|rc| format!("~/{rc}")).collect();
-            return change(
-                format!("{} does not source ~/.aterm/shell.d", names.join(", ")),
-                "atpkg's block in it",
-            );
+            let (create, edit): (Vec<&str>, Vec<&str>) = wire
+                .iter()
+                .partition(|rc| absent.is_some_and(|(login, _)| login == **rc));
+            let names = |rcs: &[&str]| -> String {
+                rcs.iter()
+                    .map(|rc| format!("~/{rc}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            };
+            let mut from = Vec::new();
+            let mut to = Vec::new();
+            if !edit.is_empty() {
+                from.push(format!("{} does not source ~/.aterm/shell.d", names(&edit)));
+                to.push(format!("atpkg's block in {}", names(&edit)));
+            }
+            if !create.is_empty() {
+                from.push(format!(
+                    "{} does not exist, and your login shell reads it",
+                    names(&create)
+                ));
+                to.push(format!("{} holding atpkg's block", names(&create)));
+            }
+            return change(from.join("; "), to.join("; "));
         }
         let wiring = crate::hooks::rc_wiring(home);
         let stands = crate::hooks::RC_FILES
             .iter()
             .any(|(rc, _)| std::fs::symlink_metadata(home.join(rc)).is_ok());
-        if wiring.is_empty() && !stands {
+        if wiring.is_empty() && !stands && absent.is_none() {
             let names: Vec<String> = crate::hooks::RC_FILES
                 .iter()
                 .map(|(rc, _)| format!("~/{rc}"))
                 .collect();
             return not_applicable(format!(
-                "none of {} exists, so no rc is wired (atpkg never creates one)",
+                "none of {} exists and your login shell reads none of them, so no rc is wired \
+                 (atpkg creates only the login shell's own rc)",
                 names.join(", ")
             ));
         }
         let mut now: Vec<String> = Vec::new();
+        if let Some((rc, state)) = absent {
+            match state {
+                RcState::OptedOut => now.push(format!(
+                    "~/{rc} left absent — you deleted the one atpkg made for your login shell \
+                     (`aterm pkg repair` makes it again)"
+                )),
+                RcState::ConsentFenced => now.push(format!(
+                    "~/{rc} not made — its folder resolves under one macOS guards with a consent \
+                     dialog, which no atpkg pass opens; source ~/.aterm/shell.d from your login \
+                     shell's rc yourself, or use the export line `aterm pkg doctor` prints"
+                )),
+                RcState::Wired | RcState::SourcedElsewhere | RcState::Unwired => {}
+            }
+        }
         for (rc, state) in &wiring {
             match state {
                 RcState::OptedOut => now.push(format!(
@@ -752,11 +804,17 @@ impl Repair {
             Pass::Doctor => RcWiring::HonorOptOut,
         };
         let mut failed = Vec::new();
-        for (rc, outcome) in crate::hooks::ensure_rc_sources_hooks(home, wiring) {
+        for (rc, outcome) in
+            crate::hooks::ensure_rc_sources_hooks(home, wiring, self.ground.login_rc)
+        {
             match outcome {
                 RcOutcome::Appended => self.say([format!(
                     "appended atpkg's block to ~/{rc} (it sources ~/.aterm/shell.d; delete the \
                      block to opt out)"
+                )]),
+                RcOutcome::Created => self.say([format!(
+                    "created ~/{rc}, the rc your login shell reads, holding atpkg's block (it \
+                     sources ~/.aterm/shell.d; delete the block or the file to opt out)"
                 )]),
                 RcOutcome::RelaidOverOptOut => self.say([format!(
                     "re-laid atpkg's block in ~/{rc} — you had deleted it; delete it again to \
@@ -937,16 +995,28 @@ impl Repair {
                     })
             })
             .collect();
+        // A shim an older atpkg laid under a name no shim may carry now (design S13) is the
+        // sweep's to remove, whichever program's store it forwards into.
+        let refused = crate::activate::refused_name_shims(self.layout());
         // A program whose development link cannot be read keeps its shims, and the rest
         // are still re-laid (the apply then fails on it, naming it): one unreadable marker
         // holds no other program's commands back. `pkg repair` re-lays every program, as
         // it always has, so there it is a change whatever the rest read.
-        if !broken.is_empty() || (!plan.failed.is_empty() && self.ground.pass == Pass::Repair) {
+        if !broken.is_empty()
+            || !refused.is_empty()
+            || (!plan.failed.is_empty() && self.ground.pass == Pass::Repair)
+        {
             let mut from = Vec::new();
             if !broken.is_empty() {
                 from.push(format!(
                     "bin/ shims missing or broken: {}",
                     broken.join(", ")
+                ));
+            }
+            if !refused.is_empty() {
+                from.push(format!(
+                    "bin/ shims under a name no shim may carry: {}",
+                    refused.join(", ")
                 ));
             }
             from.extend(plan.failed.iter().cloned());
@@ -966,6 +1036,15 @@ impl Repair {
     }
 
     fn apply_shims(&self) -> Result<(), String> {
+        // The refused-name shims go first: the re-lay reads the names a program's shims
+        // still carry, and would only refuse each of these again.
+        let removed = crate::activate::remove_refused_name_shims(self.layout(), None);
+        if !removed.is_empty() {
+            self.say([format!(
+                "removed bin/ shim(s) an older atpkg laid under a name no shim may carry: {}",
+                removed.join(", ")
+            )]);
+        }
         let relaid = relay(self.layout());
         self.say(relaid.notes);
         if relaid.relaid > 0 {

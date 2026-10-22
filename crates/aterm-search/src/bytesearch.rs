@@ -39,6 +39,7 @@ const LO: usize = usize::MAX / 0xFF;
 const HI: usize = LO << 7;
 
 /// `byte` repeated into every lane of a word.
+#[inline]
 const fn splat(byte: u8) -> usize {
     LO.wrapping_mul(byte as usize)
 }
@@ -46,11 +47,13 @@ const fn splat(byte: u8) -> usize {
 /// The SWAR zero test of `word`, as a mask so a block of them can be OR-ed into one
 /// branch. Exact only for the lowest set lane: every caller re-scans byte by byte
 /// once it is non-zero.
+#[inline]
 const fn zero_mask(word: usize) -> usize {
     word.wrapping_sub(LO) & !word & HI
 }
 
 /// Whether `word` contains a zero byte.
+#[inline]
 const fn has_zero(word: usize) -> bool {
     zero_mask(word) != 0
 }
@@ -76,6 +79,7 @@ fn block_mask(block: &[u8; BLOCK], splatted: usize) -> usize {
 }
 
 /// The first index in `haystack` holding `needle`.
+#[inline]
 pub(crate) fn memchr(needle: u8, haystack: &[u8]) -> Option<usize> {
     let splatted = splat(needle);
     let (blocks, tail) = haystack.as_chunks::<BLOCK>();
@@ -112,6 +116,7 @@ pub(crate) fn memchr(needle: u8, haystack: &[u8]) -> Option<usize> {
 
 /// The first index in `haystack` holding `first` or `second` (in ASCII
 /// case-insensitive scans, the two cases of one letter).
+#[inline]
 pub(crate) fn memchr2(first: u8, second: u8, haystack: &[u8]) -> Option<usize> {
     let splat_first = splat(first);
     let splat_second = splat(second);
@@ -149,6 +154,7 @@ pub(crate) fn memchr2(first: u8, second: u8, haystack: &[u8]) -> Option<usize> {
 
 /// The last index in `haystack` holding `needle`: [`memchr`]'s split walked from the
 /// far end.
+#[inline]
 fn memrchr(needle: u8, haystack: &[u8]) -> Option<usize> {
     let splatted = splat(needle);
     let (blocks, tail) = haystack.as_chunks::<BLOCK>();
@@ -236,6 +242,7 @@ const COMMONNESS: [u8; 256] = {
 
 /// The needle byte to skip on, as `(byte, offset)`, picking the rarest and the
 /// earliest among equals so the choice is a function of the needle alone.
+#[inline]
 fn rare_byte(needle: &[u8]) -> Option<(u8, usize)> {
     let mut best_at = 0usize;
     let mut best_score = u8::MAX;
@@ -274,7 +281,8 @@ struct Skip {
 
 impl Skip {
     /// A skip on `byte` at logical `offset`, switched on.
-    fn new(byte: u8, offset: usize) -> Self {
+    #[inline]
+    const fn new(byte: u8, offset: usize) -> Self {
         Self {
             byte,
             offset,
@@ -287,6 +295,7 @@ impl Skip {
     /// The first position at or after `at` where the skip byte lines up; `None` means
     /// the needle does not occur at or after `at`. Every position stepped over has
     /// `needle[offset]` mismatched, so no occurrence is skipped.
+    #[inline]
     fn advance<const REV: bool>(&mut self, haystack: &View<'_, REV>, at: usize) -> Option<usize> {
         if !self.on {
             return Some(at);
@@ -318,13 +327,14 @@ struct View<'a, const REV: bool> {
 
 impl<'a, const REV: bool> View<'a, REV> {
     /// A view of `bytes`.
-    fn new(bytes: &'a [u8]) -> Self {
+    #[inline]
+    const fn new(bytes: &'a [u8]) -> Self {
         Self { bytes }
     }
 
     /// The number of bytes in the view.
     #[inline]
-    fn len(&self) -> usize {
+    const fn len(&self) -> usize {
         self.bytes.len()
     }
 
@@ -527,7 +537,8 @@ pub(crate) struct Searcher<'n> {
 
 impl<'n> Searcher<'n> {
     /// Prepare `needle`.
-    pub(crate) fn new(needle: &'n [u8]) -> Self {
+    #[inline]
+    pub(crate) const fn new(needle: &'n [u8]) -> Self {
         Self {
             needle,
             forward: Cell::new(None),
@@ -537,6 +548,7 @@ impl<'n> Searcher<'n> {
     }
 
     /// The skip byte and its physical offset, choosing it once.
+    #[inline]
     fn rare(&self) -> Option<(u8, usize)> {
         match self.rare.get() {
             Some(ready) => Some(ready),
@@ -549,11 +561,13 @@ impl<'n> Searcher<'n> {
     }
 
     /// The bytes this searcher looks for.
-    pub(crate) fn needle(&self) -> &'n [u8] {
+    #[inline]
+    pub(crate) const fn needle(&self) -> &'n [u8] {
         self.needle
     }
 
     /// The factorization for `REV`, computing it once.
+    #[inline]
     fn factorization<const REV: bool>(&self) -> Factorization {
         let slot = if REV { &self.backward } else { &self.forward };
         match slot.get() {
@@ -567,6 +581,7 @@ impl<'n> Searcher<'n> {
     }
 
     /// The first index at which the needle occurs in `haystack`.
+    #[inline]
     pub(crate) fn find_in(&self, haystack: &[u8]) -> Option<usize> {
         let m = self.needle.len();
         let Some(&first) = self.needle.first() else {
@@ -594,6 +609,7 @@ impl<'n> Searcher<'n> {
     }
 
     /// The last index at which the needle occurs in `haystack`.
+    #[inline]
     pub(crate) fn rfind_in(&self, haystack: &[u8]) -> Option<usize> {
         let n = haystack.len();
         let m = self.needle.len();

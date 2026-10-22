@@ -32,8 +32,9 @@ pub enum Level {
 
 impl Level {
     /// Its word.
+    #[inline]
     #[must_use]
-    pub fn word(self) -> &'static str {
+    pub const fn word(self) -> &'static str {
         match self {
             Level::Yolo => "yolo",
             Level::Edits => "edits",
@@ -43,6 +44,7 @@ impl Level {
     }
 
     /// The level a word names.
+    #[inline]
     #[must_use]
     pub fn parse(word: &str) -> Option<Level> {
         [Level::Yolo, Level::Edits, Level::Ask, Level::Plan]
@@ -65,8 +67,9 @@ pub enum Choice {
 
 impl Choice {
     /// Its word.
+    #[inline]
     #[must_use]
-    pub fn word(self) -> &'static str {
+    pub const fn word(self) -> &'static str {
         match self {
             Choice::Inherit => "inherit",
             Choice::Fixed(l) => l.word(),
@@ -74,6 +77,7 @@ impl Choice {
     }
 
     /// The choice a word names.
+    #[inline]
     #[must_use]
     pub fn parse(word: &str) -> Option<Choice> {
         if word == "inherit" {
@@ -97,8 +101,9 @@ pub enum Asker {
 
 impl Asker {
     /// The identified agent, where one was proved.
+    #[inline]
     #[must_use]
-    pub fn agent(self) -> Option<(&'static str, Level)> {
+    pub const fn agent(self) -> Option<(&'static str, Level)> {
         match self {
             Self::Agent(id, level) => Some((id, level)),
             _ => None,

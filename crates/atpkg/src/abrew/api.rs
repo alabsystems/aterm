@@ -195,6 +195,33 @@ impl Api {
         self.cask_doc(token)
     }
 
+    /// Index rows already in the cache, without any fetch (`None`
+    /// when no readable cached index stands): the "before" side of
+    /// an update diff.
+    pub fn cached_index_rows(&self, casks: bool) -> Option<Vec<IndexRow>> {
+        let file = if casks {
+            "cask-index.json"
+        } else {
+            "formula-index.json"
+        };
+        let bytes =
+            crate::metadata_io::read_bounded_regular(&self.cache_path(file), API_BYTES).ok()?;
+        let v = parse_json(&bytes).ok()?;
+        Some(index_rows(&v, casks))
+    }
+
+    /// Index rows fetched now, ignoring cache freshness: the
+    /// "after" side of an update diff.
+    pub fn index_rows_fresh(&self, casks: bool) -> Result<Vec<IndexRow>, String> {
+        let (rel, file) = if casks {
+            ("cask.json", "cask-index.json")
+        } else {
+            ("formula.json", "formula-index.json")
+        };
+        let v = self.doc_with_freshness(rel, file, 0, false)?;
+        Ok(index_rows(&v, casks))
+    }
+
     /// The full formula or cask index (for `search`): (name, desc).
     /// The index fetched now, ignoring cache freshness (`abrew update`).
     pub fn index_fresh(&self, casks: bool) -> Result<Vec<(String, String)>, String> {
@@ -374,6 +401,65 @@ pub fn fetch_index(casks: bool) -> Result<Vec<u8>, String> {
 }
 
 /// One formula's declared install options, for `brew options`.
+/// One index record's report fields, for the update diff.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IndexRow {
+    pub name: String,
+    pub desc: String,
+    pub version: String,
+    /// Casks only; formulae carry `false`.
+    pub auto_updates: bool,
+}
+
+/// Report rows from a whole-index document.
+fn index_rows(v: &Value, casks: bool) -> Vec<IndexRow> {
+    let mut out = Vec::new();
+    if let Some(arr) = v.as_array() {
+        for item in arr {
+            let name = if casks {
+                item.get("token")
+            } else {
+                item.get("name")
+            }
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+            if name.is_empty() {
+                continue;
+            }
+            let version = if casks {
+                item.get("version").and_then(Value::as_str)
+            } else {
+                item.get("versions")
+                    .and_then(|vs| vs.get("stable"))
+                    .and_then(Value::as_str)
+            }
+            .unwrap_or_default();
+            out.push(IndexRow {
+                name: name.to_string(),
+                desc: item
+                    .get("desc")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+                // Compare formulae with installed keg versions, including
+                // revision-only updates. Cask versions have no keg revision.
+                version: match item.get("revision").and_then(Value::as_u64) {
+                    Some(revision) if !casks && revision > 0 && !version.is_empty() => {
+                        format!("{version}_{revision}")
+                    }
+                    _ => version.to_string(),
+                },
+                auto_updates: casks
+                    && item
+                        .get("auto_updates")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false),
+            });
+        }
+    }
+    out
+}
+
 pub struct OptionsRow {
     pub full_name: String,
     /// (flag without `--`, description), sorted by flag.

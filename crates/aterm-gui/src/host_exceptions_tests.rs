@@ -3803,6 +3803,90 @@ fn foreign_tools_are_one_entry_per_look_with_atpkgs_fix_ended_when_it_sees_none(
     assert!(app.messages.digest().is_empty(), "no fix, no entry");
 }
 
+/// A pass that laid programs down on a machine without a C toolchain says
+/// `c-toolchain: missing`: ONE entry naming atpkg's fix (on macOS `aterm init --only
+/// base.clt`), a fact for later that is never on screen, filed once however many passes say
+/// it, and ended by a pass that finds one that builds (docs/DESIGN-init-system-2026-10-20.md
+/// §4.2 `base.clt`). The window runs no probe: the marker is the whole input.
+#[test]
+fn a_missing_c_toolchain_is_one_entry_naming_atpkgs_fix_ended_when_one_builds() {
+    use crate::toolchain_words::{CToolchain, c_toolchain_entry};
+    use atpkg::cli::{C_TOOLCHAIN_MARKER, C_TOOLCHAIN_MISSING, C_TOOLCHAIN_READY};
+    let mut app = App::headless_for_test();
+    let key = c_toolchain_entry(CToolchain::Missing).key();
+    let feed = |app: &mut App, line: &str| match crate::parse_seed_line(line) {
+        Some(crate::Wake::PkgCToolchain(body)) => app.note_c_toolchain(&body),
+        other => panic!("{line}: {other:?}"),
+    };
+    let missing = format!("atpkg: {C_TOOLCHAIN_MARKER}{C_TOOLCHAIN_MISSING}");
+    let before = glass(&app);
+    feed(&mut app, &missing);
+    assert_eq!(
+        glass(&app),
+        before,
+        "a fact for later: nothing on the glass"
+    );
+    let digest = app.messages.digest();
+    assert_eq!(digest.len(), 1, "{digest:?}");
+    let open = &digest.entries[0];
+    assert_eq!(open.key, key);
+    let said = format!("{open:?}");
+    assert!(said.contains(atpkg::prereq::act()), "atpkg's fix: {said}");
+    // Filed once: the next passes say the same, and nothing is news.
+    let revision = app.messages.digest_revision();
+    feed(&mut app, &missing);
+    feed(&mut app, &missing);
+    assert_eq!(app.messages.digest_revision(), revision, "no news");
+    assert_eq!(app.messages.digest().len(), 1);
+    // Negative control: a verdict this build cannot read changes nothing.
+    feed(&mut app, &format!("atpkg: {C_TOOLCHAIN_MARKER}sideways"));
+    assert!(app.owes_exception(&key));
+    // The tools installed: the next pass's `ready` ends it.
+    feed(
+        &mut app,
+        &format!("atpkg: {C_TOOLCHAIN_MARKER}{C_TOOLCHAIN_READY}"),
+    );
+    assert!(!app.owes_exception(&key), "ended");
+    assert!(app.messages.digest().is_empty());
+}
+
+/// `c-toolchain: broken` (off macOS, a compiler without the headers an install supplies)
+/// is its own entry, worded as a compiler that cannot build, never "no compiler is
+/// installed"; one cause's verdict ends the other's, and `ready` ends whichever is open.
+#[test]
+fn a_broken_c_toolchain_is_its_own_entry_and_each_verdict_ends_the_other() {
+    use crate::toolchain_words::{CToolchain, c_toolchain_entry};
+    use atpkg::cli::{
+        C_TOOLCHAIN_BROKEN, C_TOOLCHAIN_MARKER, C_TOOLCHAIN_MISSING, C_TOOLCHAIN_READY,
+    };
+    let mut app = App::headless_for_test();
+    let missing = c_toolchain_entry(CToolchain::Missing).key();
+    let broken = c_toolchain_entry(CToolchain::Broken).key();
+    assert_ne!(missing, broken);
+    let feed = |app: &mut App, body: &str| match crate::parse_seed_line(&format!(
+        "atpkg: {C_TOOLCHAIN_MARKER}{body}"
+    )) {
+        Some(crate::Wake::PkgCToolchain(body)) => app.note_c_toolchain(&body),
+        other => panic!("{body}: {other:?}"),
+    };
+    feed(&mut app, C_TOOLCHAIN_BROKEN);
+    let digest = app.messages.digest();
+    assert_eq!(digest.len(), 1, "{digest:?}");
+    let said = format!("{:?}", digest.entries[0]);
+    assert!(said.contains("The C compiler cannot build"), "{said}");
+    assert!(
+        !said.contains("is installed") && !said.contains("missing"),
+        "{said}"
+    );
+    feed(&mut app, C_TOOLCHAIN_MISSING);
+    assert!(app.owes_exception(&missing) && !app.owes_exception(&broken));
+    feed(&mut app, C_TOOLCHAIN_BROKEN);
+    assert!(app.owes_exception(&broken) && !app.owes_exception(&missing));
+    feed(&mut app, C_TOOLCHAIN_READY);
+    assert!(!app.owes_exception(&broken) && !app.owes_exception(&missing));
+    assert!(app.messages.digest().is_empty());
+}
+
 /// A RELAUNCH THAT KEEPS FAILING WITH NO COMMAND THE TAB'S MARK COULD NAME
 /// (a Codex, a launch no resume repeats) is the digest's line AT ONCE (LC-5 of
 /// ATERM-KI-1015-1: at attention, where it was a record only): the agent is

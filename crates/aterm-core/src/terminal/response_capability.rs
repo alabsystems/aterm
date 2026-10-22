@@ -87,6 +87,7 @@ impl ResponseCapability {
 /// definition shared by `ResponseCapability::mint_for_dispatch_with_engine` and
 /// [`super::policy_gates::PolicyGates`], so the compiled verdict is the per-dispatch one.
 #[must_use]
+#[inline]
 pub(super) fn probe_for(kind: ProbeKind) -> aterm_policy::selector::DispatchedSequence {
     let ProbeKind::Dcs { final_byte } = kind;
     // DCS has no major code; the "response any" catch-all covers it via the

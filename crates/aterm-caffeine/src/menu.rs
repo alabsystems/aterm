@@ -17,6 +17,7 @@ pub enum Click {
 
 /// A click with the right button, or with the left while Control is held, opens the menu;
 /// any other click toggles.
+#[inline]
 #[must_use]
 pub const fn classify_click(right_button: bool, control_held: bool) -> Click {
     if right_button || control_held {
@@ -50,6 +51,7 @@ impl MenuAction {
 
     /// The `NSMenuItem.tag` this action rides in. Stable once assigned; `0` is never used, so
     /// an untagged item decodes to nothing.
+    #[inline]
     #[must_use]
     pub const fn tag(self) -> isize {
         match self {
@@ -63,6 +65,7 @@ impl MenuAction {
     }
 
     /// The inverse of [`MenuAction::tag`]; an unknown tag is `None` (the item does nothing).
+    #[inline]
     #[must_use]
     pub const fn from_tag(tag: isize) -> Option<Self> {
         match tag {

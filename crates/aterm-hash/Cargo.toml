@@ -10,10 +10,10 @@ repository.workspace = true
 description = "Fast non-cryptographic hashing for aterm: FxHash (replaces rustc-hash) and the stable FNV-1a/64 (astream-wire's)"
 
 [dependencies]
-# ONE FNV-1a/64. astream-wire's `hash::fnv1a_64_update` and `FNV1A_64_INIT`
-# are the byte loop and offset basis astream's `assign_partition` hashes a
-# partition key with; aterm's stable hash folds bytes through the same
-# function, so the two cannot drift. astream-wire has no dependencies and no
+# ONE FNV-1a/64. astream-wire's `hash::fnv1a_64_update`, `FNV1A_64_INIT` and
+# `FNV1A_64_PRIME` are the byte loop, offset basis and prime astream's
+# `assign_partition` hashes a partition key with; aterm's stable hash folds
+# bytes through the same function, so the two cannot drift. astream-wire has no dependencies and no
 # platform code; the macOS and Linux graphs already hold it (aterm-restore,
 # astream-broker), and on Windows and wasm32 this is where it enters.
 astream-wire = { path = "../../vendor/astream/crates/astream-wire" }

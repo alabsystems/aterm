@@ -27,7 +27,7 @@ impl Grid {
     /// drops what it pushes past it, as DECDWL (which blanks the hidden half)
     /// intends. A bounded shift recomputes `len` from the row's content.
     #[inline]
-    fn shift_is_bounded(&self, right_bound: u16, margined: bool) -> bool {
+    const fn shift_is_bounded(&self, right_bound: u16, margined: bool) -> bool {
         margined || right_bound < self.storage.cols
     }
 

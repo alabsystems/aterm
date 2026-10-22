@@ -119,8 +119,9 @@ pub enum Kind {
 
 impl Kind {
     /// The kind a wire byte names, or `None` for one this build does not know.
+    #[inline]
     #[must_use]
-    pub fn from_byte(b: u8) -> Option<Kind> {
+    pub const fn from_byte(b: u8) -> Option<Kind> {
         Some(match b {
             1 => Kind::Hello,
             2 => Kind::Welcome,
@@ -146,8 +147,9 @@ impl Kind {
     /// Whether frames of this kind carry exactly one descriptor. Every other
     /// kind carries none, and a descriptor that arrives with one is a protocol
     /// error (closed, and the connection dropped).
+    #[inline]
     #[must_use]
-    pub fn carries_fd(self) -> bool {
+    pub const fn carries_fd(self) -> bool {
         matches!(
             self,
             Kind::Register | Kind::Offer | Kind::Companion | Kind::CompanionOffer
@@ -281,7 +283,8 @@ pub enum PeerClass {
 }
 
 impl PeerClass {
-    fn from_byte(b: u8) -> Option<PeerClass> {
+    #[inline]
+    const fn from_byte(b: u8) -> Option<PeerClass> {
         match b {
             1 => Some(PeerClass::App),
             2 => Some(PeerClass::Status),
@@ -291,7 +294,8 @@ impl PeerClass {
 }
 
 /// A WELCOME's policy byte. Numbers are the wire's and never change.
-fn policy_byte(policy: IdentityPolicy) -> u8 {
+#[inline]
+const fn policy_byte(policy: IdentityPolicy) -> u8 {
     match policy {
         IdentityPolicy::SameUid => 1,
         IdentityPolicy::Designated => 2,
@@ -299,7 +303,8 @@ fn policy_byte(policy: IdentityPolicy) -> u8 {
 }
 
 /// The policy a WELCOME's byte names; `None` for one this build does not know.
-fn policy_from_byte(b: u8) -> Option<IdentityPolicy> {
+#[inline]
+const fn policy_from_byte(b: u8) -> Option<IdentityPolicy> {
     match b {
         1 => Some(IdentityPolicy::SameUid),
         2 => Some(IdentityPolicy::Designated),
@@ -433,7 +438,8 @@ pub enum RefuseCode {
 }
 
 impl RefuseCode {
-    fn from_byte(b: u8) -> RefuseCode {
+    #[inline]
+    const fn from_byte(b: u8) -> RefuseCode {
         match b {
             1 => RefuseCode::RdevMismatch,
             2 => RefuseCode::TooManyMasters,
@@ -450,8 +456,9 @@ impl RefuseCode {
 
 impl Frame {
     /// The kind this frame is sent as.
+    #[inline]
     #[must_use]
-    pub fn kind(&self) -> Kind {
+    pub const fn kind(&self) -> Kind {
         match self {
             Frame::Hello { .. } => Kind::Hello,
             Frame::Welcome { .. } => Kind::Welcome,

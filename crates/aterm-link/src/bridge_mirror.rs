@@ -132,6 +132,10 @@ pub(super) struct MirrorRun {
     mode: LogMode,
     /// The endpoint answered the hello's `log=turns`.
     acked: bool,
+    /// The pin is not judged yet: the recovery an unclean stop owes, which
+    /// reconciles it, is not complete (sim item S7,
+    /// [`Bridge::mirror_hello_answered`]). Not engaged meanwhile.
+    awaiting: bool,
     /// An `auto` mirror over a broker that retains nothing, said once a
     /// change (`link mirror unretained`).
     unretained: bool,
@@ -216,6 +220,7 @@ impl MirrorRun {
             Box::new(MirrorRun {
                 mode,
                 acked: false,
+                awaiting: false,
                 unretained: false,
                 stopped: None,
                 owed: false,
@@ -480,8 +485,25 @@ impl Bridge {
     /// find none and mint a second key. A pin that does not read, and a copy
     /// that does not, stop the mirror, kept as they are, and the stop says on
     /// stderr exactly what a person does ([`Bridge::mirror_pin_remedy`]).
+    ///
+    /// NOT BEFORE THE PIN IS RECONCILED (sim item S7): where the recovery an
+    /// unclean stop in an earlier boot owes is not complete
+    /// ([`Bridge::recovery_owed`]: a write error stopped it), the pin is the
+    /// one a power cut left — torn, or a total below its floor — and judged
+    /// now it stopped the mirror for this bridge's life, or engaged it below
+    /// ruling Q13. So the mirror waits, not engaged, and judges the pin once
+    /// the recovery completes ([`Bridge::mirror_after_recovery`]).
     pub(super) fn mirror_hello_answered(&mut self, header: &str) {
         let asked = self.mirror_asks();
+        // NEGATIVE CONTROL (`crate::sim`): the pin judged at the hello, the
+        // recovery complete or not, as before sim item S7.
+        #[cfg(test)]
+        let early = self
+            .fx
+            .mutant(crate::sim::world::Mutant::JudgePinBeforeRecovery);
+        #[cfg(not(test))]
+        let early = false;
+        let wait = self.recovery_owed && !early;
         let Some(m) = self.mirror.as_deref_mut() else {
             return;
         };
@@ -500,6 +522,34 @@ impl Bridge {
             );
             return;
         }
+        if wait {
+            m.awaiting = true;
+            eprintln!(
+                "aterm-link: mirror: waits for the recovery an unclean stop owes, which \
+                 reconciles its pin, before it judges the pin"
+            );
+            return;
+        }
+        self.mirror_judge_pin();
+    }
+
+    /// THE RECOVERY COMPLETED ([`Bridge::recover`]): a mirror that waited for
+    /// it at the hello judges the pin now ([`Bridge::mirror_hello_answered`]).
+    pub(super) fn mirror_after_recovery(&mut self) {
+        let Some(m) = self.mirror.as_deref_mut().filter(|m| m.awaiting) else {
+            return;
+        };
+        m.awaiting = false;
+        self.mirror_judge_pin();
+    }
+
+    /// JUDGE THE PIN an acknowledged mirror starts from, and its durable
+    /// copies ([`Bridge::mirror_hello_answered`]'s doc), and say whether the
+    /// mirror runs (`link mirror on`) or stopped for it (`reason=pin`).
+    fn mirror_judge_pin(&mut self) {
+        let Some(m) = self.mirror.as_deref_mut() else {
+            return;
+        };
         let pinned = self.state.logpin().map(|t| t.map(|t| Pin::parse(&t)));
         let absent = matches!(pinned, Ok(None));
         let key_copy = self.state.logkey();
@@ -737,12 +787,15 @@ impl Bridge {
     }
 
     /// Whether the mirror runs on this bridge: on, acknowledged by the
-    /// endpoint, not stopped, and, `auto`, over a broker that retains it. A
-    /// bridge whose mirror is not engaged runs the loop it ran before the
-    /// mirror ([`Bridge::mirror_then_round`]).
+    /// endpoint, its pin judged, not stopped, and, `auto`, over a broker that
+    /// retains it. A bridge whose mirror is not engaged runs the loop it ran
+    /// before the mirror ([`Bridge::mirror_then_round`]).
     pub(super) fn mirror_engaged(&self) -> bool {
         self.mirror.as_deref().is_some_and(|m| {
-            m.acked && m.stopped.is_none() && (m.mode == LogMode::Turns || self.mirror_retained())
+            m.acked
+                && !m.awaiting
+                && m.stopped.is_none()
+                && (m.mode == LogMode::Turns || self.mirror_retained())
         })
     }
 
@@ -1127,16 +1180,38 @@ impl Bridge {
         }
         let bytes: u64 = m.pin.slots.iter().map(|s| s.body.len() as u64).sum();
         let need = m.pin.total.saturating_add(bytes);
-        if need <= m.floor {
+        // ONLY A FLOOR THIS OPEN MADE DURABLE COVERS A BATCH (sim item S7): one
+        // read at the hello may be a killed predecessor's failed flush, one
+        // raised here may have failed after its rename; either is written
+        // again first ([`StateDir::raise_logfloor`]).
+        // NEGATIVE CONTROL (`crate::sim`): the floor that reads trusted, as
+        // before.
+        #[cfg(test)]
+        let admitted = self.state.logfloor_admitted()
+            || self
+                .fx
+                .mutant(crate::sim::world::Mutant::TrustTheFloorThatReads);
+        #[cfg(not(test))]
+        let admitted = self.state.logfloor_admitted();
+        if need <= m.floor && admitted {
             if let Some(m) = self.mirror.as_deref_mut() {
                 m.floored = true;
             }
             return true;
         }
-        match self
-            .state
-            .raise_logfloor(need.saturating_add(mirror::FLOOR_LEASE_BYTES))
+        let top = need.saturating_add(mirror::FLOOR_LEASE_BYTES);
+        #[cfg(test)]
+        let raised = if self
+            .fx
+            .mutant(crate::sim::world::Mutant::TrustTheFloorThatReads)
         {
+            self.state.raise_logfloor_trusting_what_reads(top)
+        } else {
+            self.state.raise_logfloor(top)
+        };
+        #[cfg(not(test))]
+        let raised = self.state.raise_logfloor(top);
+        match raised {
             Ok(floor) => {
                 if let Some(m) = self.mirror.as_deref_mut() {
                     m.floor = floor;

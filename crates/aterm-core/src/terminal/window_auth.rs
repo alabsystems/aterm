@@ -55,7 +55,7 @@ impl WindowMintAuthority {
     /// installed policy and no dispatch allocates or walks rule buckets.
     #[inline]
     #[must_use]
-    pub(super) fn try_mint_with_engine(
+    pub(super) const fn try_mint_with_engine(
         &self,
         gate: super::policy_bridge::BridgeDecision,
         allow_window_ops: bool,
@@ -73,6 +73,7 @@ impl WindowMintAuthority {
 /// [`super::policy_gates`] and its out-of-range live fallback so the two cannot disagree
 /// about which rule bucket a `Ps` lands in.
 #[must_use]
+#[inline]
 pub(super) fn probe_xtwinops(ps: u16) -> aterm_policy::selector::DispatchedSequence {
     aterm_policy::selector::DispatchedSequence::csi(Some(u32::from(ps)), 't', [])
 }

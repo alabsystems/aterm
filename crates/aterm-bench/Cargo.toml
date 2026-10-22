@@ -27,6 +27,9 @@ aterm-pty = { workspace = true }
 # ...and reads the thread's CPU clock and the process's instructions retired (the effects lane's
 # measure of CPU work).
 libc = { workspace = true }
+# The Aos harness (the `aos` lane): checkpoints, the event log and shadow replay of the hosted
+# momentum glow, beside aterm-effects' `MomentumHost`.
+aterm-aos = { workspace = true }
 
 [features]
 # The effects harness's pass-economy ablation (`GpuRenderer::set_unorm_ablation`) is a

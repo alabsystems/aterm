@@ -86,32 +86,38 @@ impl Modes {
     pub const IN_BAND_RESIZE: Self = Self(1 << 5);
     pub const CURSOR: Self = Self(1 << 6);
 
+    #[inline]
     #[must_use]
     pub const fn bits(self) -> u8 {
         self.0
     }
 
     /// The set these bits name; bits no mode uses are dropped.
+    #[inline]
     #[must_use]
     pub const fn from_bits(bits: u8) -> Self {
         Self(bits & 0x7f)
     }
 
+    #[inline]
     #[must_use]
     pub const fn contains(self, other: Self) -> bool {
         self.0 & other.0 == other.0
     }
 
+    #[inline]
     #[must_use]
     pub const fn is_empty(self) -> bool {
         self.0 == 0
     }
 
+    #[inline]
     #[must_use]
     pub const fn union(self, other: Self) -> Self {
         Self(self.0 | other.0)
     }
 
+    #[inline]
     #[must_use]
     pub const fn difference(self, other: Self) -> Self {
         Self(self.0 & !other.0)
@@ -120,6 +126,7 @@ impl Modes {
 
 impl Mode {
     /// The set holding only this mode (any kitty flags are the same mode).
+    #[inline]
     #[must_use]
     pub const fn bit(self) -> Modes {
         match self {

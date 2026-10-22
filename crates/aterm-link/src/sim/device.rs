@@ -86,8 +86,33 @@
 //! (`StateDir::reconcile_logpin`); the world holds it to the key and to a
 //! total never below the highest one a pin was written with
 //! ([`Device::pin_total`]).
+//!
+//! ## Write errors (sim item S7)
+//!
+//! Armed ([`Device::arm_write_errors`], the committed worlds' every other
+//! eight seeds), the device fails the state dir's writes from a stream of
+//! their own, one in `per` (20, 50 or 120, the seed's):
+//!
+//! * BEFORE THE EFFECT ([`Device::fails_before`], the door's `before`): a
+//!   replace — its temp's write, its flush, its rename — or an append, `EIO`
+//!   or `ENOSPC`; an unlink, `EIO` (or `ENOSPC`, as a copy-on-write volume
+//!   whose metadata takes space can answer); a flush of a file or a
+//!   directory, `EIO`. Nothing is made: the temp is removed, nothing renamed.
+//! * AFTER IT ([`Device::made`], the door's `after`): a durable replace whose
+//!   rename is made and whose directory flush fails — its temp's flush
+//!   returned, so its bytes are on the media whole, and its name may be or
+//!   not, until a later flush of its directory; and an append cut part-way,
+//!   `ENOSPC`, the part written in the file and in the journal.
+//! * A FULL DISK while the scheduler says so ([`Device::fill`]): every write
+//!   that takes space fails `ENOSPC`; unlinks and flushes go on.
+//!
+//! The settle phase's disk is clean ([`Device::clean_disk`]). Not modelled: a
+//! failed flush that drops dirty pages it did not write (a later read of the
+//! file sees an older version within the boot), and a write that reports
+//! success and is lost — a disk that lies is no contract to hold a bridge to.
 
 use std::collections::BTreeMap;
+use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
@@ -95,6 +120,69 @@ use aterm_durable::Flush;
 
 use super::{lock, Rng};
 use crate::fx::Write;
+
+/// `EIO`, as macOS and Linux both number it: the device failed the I/O.
+const EIO: i32 = 5;
+/// `ENOSPC`, as macOS and Linux both number it: no space left on the device.
+const ENOSPC: i32 = 28;
+
+/// The name of a simulated write error, for the trace: the same on every
+/// machine, where the OS's message for it is not.
+pub(crate) fn errno_name(e: &io::Error) -> &'static str {
+    match e.raw_os_error() {
+        Some(EIO) => "EIO",
+        Some(ENOSPC) => "ENOSPC",
+        _ => "error",
+    }
+}
+
+/// WHAT THE DEVICE FAILED (sim item S7), counted by kind: the world reads
+/// them into its stats, so a run that injected none cannot pass for one that
+/// did.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct WriteErrors {
+    /// A replace (its temp's write, its flush or its rename) or an append
+    /// that failed with nothing made, `EIO` or `ENOSPC`.
+    pub(crate) writes: u64,
+    /// An unlink that failed, nothing removed.
+    pub(crate) unlinks: u64,
+    /// A flush of a file where it is, or of a directory, that failed, nothing
+    /// more on the media for it.
+    pub(crate) flushes: u64,
+    /// A durable replace whose rename was made and whose directory flush then
+    /// failed: the new version stands, its name not known to be on the media.
+    pub(crate) renamed_unflushed: u64,
+    /// An append that wrote part of its line and failed `ENOSPC`.
+    pub(crate) appends_cut: u64,
+    /// Writes refused `ENOSPC` because the disk was full ([`Device::fill`]).
+    pub(crate) disk_full: u64,
+}
+
+/// THE DEVICE'S WRITE ERRORS (sim item S7): `EIO` and `ENOSPC` on a write, a
+/// rename, a flush or an unlink, drawn from a stream of their own at a rate
+/// the seed chose, and a full disk while the scheduler says so.
+#[derive(Debug)]
+struct Faults {
+    rng: Rng,
+    /// One write in `per` fails before its effect, and one in `per` of the
+    /// writes that can fail after it does, each by its own draw.
+    per: u64,
+    /// The disk is full: every write that takes space fails `ENOSPC`.
+    full: bool,
+    /// Off from the settle phase on: a clean disk.
+    on: bool,
+    counts: WriteErrors,
+}
+
+/// How a write's last step failed after its effect was made
+/// ([`Device::made`]).
+#[derive(Clone, Copy, Debug)]
+enum After {
+    /// A durable replace's rename was made and its directory flush failed.
+    Renamed,
+    /// An append wrote this many bytes of its line, short of all of them.
+    Cut(usize),
+}
 
 /// What a file held at one point: nothing, or bytes under a mode.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -139,6 +227,15 @@ struct File {
 }
 
 impl File {
+    /// A file the media holds nothing of, with nothing written since.
+    fn blank() -> Self {
+        Self {
+            durable: Version::Absent,
+            pending: Vec::new(),
+            floor: 0,
+        }
+    }
+
     /// The versions an image may hold, oldest first, of the first `keep`
     /// writes with `floor` ruled out, each with how it may be torn:
     /// `(version, torn_from, torn_whole)` — a torn image of a replace is cut
@@ -265,6 +362,11 @@ pub(crate) struct Device {
     /// node's mirror had counted (ruling Q13), which no later bridge's total
     /// may fall below, whatever a power cut did to the pin.
     pin_total: Mutex<u64>,
+    /// WRITE ERRORS (sim item S7), once armed ([`Device::arm_write_errors`]).
+    faults: Mutex<Option<Faults>>,
+    /// The path whose next durable replace fails after its rename, once
+    /// ([`Device::fail_after_its_rename`]): a test's exact fault.
+    after_once: Mutex<Option<PathBuf>>,
 }
 
 impl Device {
@@ -275,6 +377,226 @@ impl Device {
             lossless: false,
             tears: false,
             pin_total: Mutex::new(0),
+            faults: Mutex::new(None),
+            after_once: Mutex::new(None),
+        }
+    }
+
+    /// The next durable replace of `path` has its rename made and its
+    /// directory flush fail (`EIO`), once — [`Device::made`]'s
+    /// [`After::Renamed`], where a test needs it and not where a seed draws it.
+    pub(crate) fn fail_after_its_rename(&self, path: &Path) {
+        *lock(&self.after_once) = Some(path.to_path_buf());
+    }
+
+    /// ARM WRITE ERRORS (sim item S7): from now on one write in `per` fails
+    /// with nothing made, and one in `per` of the durable replaces and
+    /// appends fails after its effect, each by a draw of `rng`.
+    pub(crate) fn arm_write_errors(&self, rng: Rng, per: u64) {
+        *lock(&self.faults) = Some(Faults {
+            rng,
+            per: per.max(2),
+            full: false,
+            on: true,
+            counts: WriteErrors::default(),
+        });
+    }
+
+    /// The disk fills (`true`) or has room again (`false`): while it is full,
+    /// every write that takes space — a replace's temp, an append — fails
+    /// `ENOSPC`. Nothing where write errors are not armed.
+    pub(crate) fn fill(&self, full: bool) {
+        if let Some(f) = lock(&self.faults).as_mut().filter(|f| f.on) {
+            f.full = full;
+        }
+    }
+
+    /// Whether the disk is full now ([`Device::fill`]).
+    pub(crate) fn is_full(&self) -> bool {
+        lock(&self.faults).as_ref().is_some_and(|f| f.on && f.full)
+    }
+
+    /// A CLEAN DISK from now on: no write fails, the disk has room. The
+    /// settle phase's, so a wedge a write error left is one a clean disk
+    /// does not heal.
+    pub(crate) fn clean_disk(&self) {
+        if let Some(f) = lock(&self.faults).as_mut() {
+            f.on = false;
+            f.full = false;
+        }
+    }
+
+    /// What the device failed so far ([`WriteErrors`]).
+    pub(crate) fn write_errors(&self) -> WriteErrors {
+        lock(&self.faults)
+            .as_ref()
+            .map(|f| f.counts)
+            .unwrap_or_default()
+    }
+
+    /// `w` as the trace names it: its kind, and its path inside the state dir.
+    pub(crate) fn describe(&self, w: Write<'_>) -> String {
+        let rel = |p: &Path| {
+            let rel = p
+                .strip_prefix(&self.root)
+                .unwrap_or(p)
+                .display()
+                .to_string();
+            if rel.is_empty() {
+                ".".to_string()
+            } else {
+                rel
+            }
+        };
+        match w {
+            Write::Replace { path, flush, .. } => format!(
+                "replace {}{}",
+                rel(path),
+                match flush {
+                    Some(Flush::Durable) => " durable",
+                    Some(Flush::Ordered) => " ordered",
+                    None => "",
+                }
+            ),
+            Write::Append { path, .. } => format!("append {}", rel(path)),
+            Write::Remove { path } => format!("unlink {}", rel(path)),
+            Write::Flush { path, .. } => format!("flush {}", rel(path)),
+            Write::SyncDir { path, .. } => format!("flush dir {}", rel(path)),
+        }
+    }
+
+    /// WHETHER `w` FAILS BEFORE ITS EFFECT ([`crate::fx::Disk::before`]): on
+    /// a full disk a write that takes space fails `ENOSPC`; otherwise, one
+    /// write in `per` fails — a replace or an append `EIO` or `ENOSPC` (its
+    /// temp's write, its flush, its rename: the temp is removed, nothing is
+    /// renamed), an unlink `EIO` (or, on a copy-on-write volume such as APFS,
+    /// whose metadata takes space, `ENOSPC`), a flush `EIO`. Nothing is made
+    /// of a write that fails here.
+    pub(crate) fn fails_before(&self, w: Write<'_>) -> Option<io::Error> {
+        let mut faults = lock(&self.faults);
+        let f = faults.as_mut().filter(|f| f.on)?;
+        let takes_space = matches!(w, Write::Replace { .. } | Write::Append { .. });
+        if f.full && takes_space {
+            f.counts.disk_full += 1;
+            return Some(io::Error::from_raw_os_error(ENOSPC));
+        }
+        if !f.rng.chance(1, f.per) {
+            return None;
+        }
+        let errno = match w {
+            Write::Replace { .. } | Write::Append { .. } => {
+                f.counts.writes += 1;
+                if f.rng.chance(1, 2) {
+                    ENOSPC
+                } else {
+                    EIO
+                }
+            }
+            Write::Remove { .. } => {
+                f.counts.unlinks += 1;
+                if f.rng.chance(1, 4) {
+                    ENOSPC
+                } else {
+                    EIO
+                }
+            }
+            Write::Flush { .. } | Write::SyncDir { .. } => {
+                f.counts.flushes += 1;
+                EIO
+            }
+        };
+        Some(io::Error::from_raw_os_error(errno))
+    }
+
+    /// Whether `w`, made, fails its last step after its effect: one in `per`
+    /// of the durable replaces (its rename made, its directory flush `EIO`)
+    /// and of the appends (part of its line written, `ENOSPC`). Nothing else
+    /// has a step after its effect: an atomic replace's rename, an unlink and
+    /// a flush are all or nothing.
+    fn fails_after(&self, w: Write<'_>) -> Option<After> {
+        if let Write::Replace {
+            path,
+            flush: Some(Flush::Durable),
+            ..
+        } = w
+        {
+            let mut once = lock(&self.after_once);
+            if once.as_deref() == Some(path) {
+                *once = None;
+                return Some(After::Renamed);
+            }
+        }
+        let mut faults = lock(&self.faults);
+        let f = faults.as_mut().filter(|f| f.on)?;
+        match w {
+            Write::Replace {
+                flush: Some(Flush::Durable),
+                ..
+            } if f.rng.chance(1, f.per) => {
+                f.counts.renamed_unflushed += 1;
+                Some(After::Renamed)
+            }
+            Write::Append { bytes, .. } if !bytes.is_empty() && f.rng.chance(1, f.per) => {
+                f.counts.appends_cut += 1;
+                let len = bytes.len() as u64;
+                Some(After::Cut(usize::try_from(f.rng.below(len)).unwrap_or(0)))
+            }
+            _ => None,
+        }
+    }
+
+    /// THE STATE DIR MADE `w` ([`crate::fx::Disk::after`]): journal what the
+    /// media may hold of it, unless its last step fails after its effect
+    /// ([`Device::fails_after`]) — then journal what that left, and answer the
+    /// error the real call returns:
+    ///
+    /// * a durable replace whose directory flush failed: its temp's flush
+    ///   returned, so its bytes are on the media whole (a full flush point),
+    ///   and its rename is made and not known to be — a later flush of its
+    ///   directory settles it, a power cut before one keeps it or not;
+    /// * an append cut short: the file holds the part written, and the media
+    ///   may hold it, as any append's.
+    pub(crate) fn made(&self, w: Write<'_>) -> io::Result<()> {
+        match (self.fails_after(w), w) {
+            (
+                Some(After::Renamed),
+                Write::Replace {
+                    path, bytes, mode, ..
+                },
+            ) => {
+                self.note_pin(path, bytes);
+                let mut j = lock(&self.journal);
+                let at = j.points;
+                j.full_flush();
+                j.files
+                    .entry(path.to_path_buf())
+                    .or_insert_with(File::blank)
+                    .pending
+                    .push(Pending {
+                        op: Op::Replace(bytes.to_vec(), mode),
+                        epoch: at + 1,
+                        data_at: Some(at),
+                    });
+                Err(io::Error::from_raw_os_error(EIO))
+            }
+            (Some(After::Cut(k)), Write::Append { path, bytes }) => {
+                let len = std::fs::metadata(path).expect("the appended file").len();
+                let keep = len - bytes.len() as u64 + k as u64;
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(path)
+                    .and_then(|f| f.set_len(keep))
+                    .expect("cut an append short");
+                self.journal(Write::Append {
+                    path,
+                    bytes: &bytes[..k],
+                });
+                Err(io::Error::from_raw_os_error(ENOSPC))
+            }
+            _ => {
+                self.journal(w);
+                Ok(())
+            }
         }
     }
 
@@ -297,25 +619,27 @@ impl Device {
         );
     }
 
-    /// Journal one write the state dir made ([`crate::fx::Disk::after`]).
-    pub(crate) fn journal(&self, w: Write<'_>) {
-        if let Write::Replace { path, bytes, .. } = &w {
-            if *path == self.root.join(crate::state::LOGPIN) {
-                if let Some(pin) = std::str::from_utf8(bytes)
-                    .ok()
-                    .and_then(|t| crate::mirror::Pin::parse(t).ok())
-                {
-                    let mut max = lock(&self.pin_total);
-                    *max = (*max).max(pin.total);
-                }
+    /// A replace of `path` by `bytes` was made: where it is the mirror's pin,
+    /// the highest total any pin was written with ([`Device::pin_total`]).
+    fn note_pin(&self, path: &Path, bytes: &[u8]) {
+        if path == self.root.join(crate::state::LOGPIN) {
+            if let Some(pin) = std::str::from_utf8(bytes)
+                .ok()
+                .and_then(|t| crate::mirror::Pin::parse(t).ok())
+            {
+                let mut max = lock(&self.pin_total);
+                *max = (*max).max(pin.total);
             }
         }
+    }
+
+    /// Journal one write the state dir made, whole ([`Device::made`]).
+    pub(crate) fn journal(&self, w: Write<'_>) {
+        if let Write::Replace { path, bytes, .. } = &w {
+            self.note_pin(path, bytes);
+        }
         let mut j = lock(&self.journal);
-        let blank = || File {
-            durable: Version::Absent,
-            pending: Vec::new(),
-            floor: 0,
-        };
+        let blank = File::blank;
         let epoch = j.points;
         let push = |j: &mut Journal, path: &Path, p: Pending| {
             j.files

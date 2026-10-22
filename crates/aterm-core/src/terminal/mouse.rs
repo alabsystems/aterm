@@ -29,6 +29,7 @@ pub(crate) struct MouseReportMemo {
 /// lock-free mirror answers ([`super::ModeMirror::reports_motion`]), so a
 /// host that asks the mirror whether a drag reaches the program is told what
 /// the encoder will do (its per-cell deduplication aside).
+#[inline]
 pub(crate) const fn motion_reported(mode: MouseMode, button: u8) -> bool {
     match mode {
         MouseMode::ButtonEvent => button != 3,
@@ -44,6 +45,7 @@ pub(crate) const fn motion_reported(mode: MouseMode, button: u8) -> bool {
 /// lock-free mirror answers ([`super::ModeMirror::reports_wheel`]), so a host
 /// that asks the mirror whether a wheel on the report route reaches the
 /// program is told what the encoder will do.
+#[inline]
 pub(crate) const fn wheel_reported(mode: MouseMode) -> bool {
     match mode {
         MouseMode::Normal | MouseMode::ButtonEvent | MouseMode::AnyEvent => true,
@@ -60,6 +62,7 @@ impl Terminal {
     /// coordinates, so under DEC 1016 (SGR-pixel) a sub-cell move is new, as in kitty. A memo
     /// written under another tracking mode or encoding never matches: the program has seen no
     /// report in the new terms.
+    #[inline]
     #[must_use]
     pub fn mouse_motion_repeats_last_report(&self, x: u16, y: u16) -> bool {
         self.mouse_report_memo == Some(self.mouse_report_at(x, y))
@@ -68,11 +71,13 @@ impl Terminal {
     /// Record that the host just produced a mouse report (press, release, wheel notch or motion)
     /// carrying `(x, y)`, for [`Self::mouse_motion_repeats_last_report`]. The input seam writes
     /// it under this terminal's lock.
+    #[inline]
     pub fn note_mouse_report(&mut self, x: u16, y: u16) {
         self.mouse_report_memo = Some(self.mouse_report_at(x, y));
     }
 
-    fn mouse_report_at(&self, x: u16, y: u16) -> MouseReportMemo {
+    #[inline]
+    const fn mouse_report_at(&self, x: u16, y: u16) -> MouseReportMemo {
         MouseReportMemo {
             mode: self.modes.mouse_mode,
             encoding: self.modes.mouse_encoding,
@@ -85,6 +90,7 @@ impl Terminal {
     ///
     /// Returns the escape sequence to send to the application, or `None` if
     /// mouse reporting is disabled. Coordinates are 0-indexed.
+    #[inline]
     #[must_use]
     pub fn encode_mouse_press(
         &self,
@@ -105,6 +111,7 @@ impl Terminal {
     ///
     /// Returns the escape sequence to send to the application, or `None` if
     /// mouse reporting is disabled. Coordinates are 0-indexed.
+    #[inline]
     #[must_use]
     pub fn encode_mouse_release(
         &self,
@@ -133,6 +140,7 @@ impl Terminal {
     ///
     /// Returns the escape sequence to send to the application, or `None` if
     /// motion tracking is not enabled. Coordinates are 0-indexed.
+    #[inline]
     #[must_use]
     pub fn encode_mouse_motion(
         &self,
@@ -155,6 +163,7 @@ impl Terminal {
     /// Returns the escape sequence to send to the application, or `None` if
     /// mouse reporting is disabled. Coordinates are 0-indexed.
     /// [`WheelDir::code`] carries the button table (xterm buttons 4-7).
+    #[inline]
     #[must_use]
     pub fn encode_mouse_wheel(
         &self,
@@ -173,26 +182,30 @@ impl Terminal {
     }
 
     /// Check if mouse tracking is enabled.
+    #[inline]
     #[must_use]
-    pub fn mouse_tracking_enabled(&self) -> bool {
-        self.modes.mouse_mode != MouseMode::None
+    pub const fn mouse_tracking_enabled(&self) -> bool {
+        !matches!(self.modes.mouse_mode, MouseMode::None)
     }
 
     /// Get the current mouse tracking mode.
+    #[inline]
     #[must_use]
-    pub fn mouse_mode(&self) -> MouseMode {
+    pub const fn mouse_mode(&self) -> MouseMode {
         self.modes.mouse_mode
     }
 
     /// Get the current mouse encoding format.
+    #[inline]
     #[must_use]
-    pub fn mouse_encoding(&self) -> MouseEncoding {
+    pub const fn mouse_encoding(&self) -> MouseEncoding {
         self.modes.mouse_encoding
     }
 
     /// Check if focus reporting is enabled.
+    #[inline]
     #[must_use]
-    pub fn focus_reporting_enabled(&self) -> bool {
+    pub const fn focus_reporting_enabled(&self) -> bool {
         self.modes.focus_reporting
     }
 
@@ -200,14 +213,16 @@ impl Terminal {
     /// XTRESTORE), wrapping: a host that compares it with the value it last saw learns of
     /// an enable it has not answered yet. The host's own arming (`apply_config`) is not
     /// counted. Never rewinds, not even at a reset.
+    #[inline]
     #[must_use]
-    pub fn focus_arms(&self) -> u32 {
+    pub const fn focus_arms(&self) -> u32 {
         self.transient.focus_arms
     }
 
     /// Check if DEC mode 2031 (color-scheme update notifications) is enabled.
+    #[inline]
     #[must_use]
-    pub fn report_color_scheme_enabled(&self) -> bool {
+    pub const fn report_color_scheme_enabled(&self) -> bool {
         self.modes.report_color_scheme
     }
 }

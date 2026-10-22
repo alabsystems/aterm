@@ -26,11 +26,13 @@ pub trait FrameWatchers: Send + Sync {
 
 impl super::Terminal {
     /// Attach the host's watchers of this terminal's frame, replacing any.
+    #[inline]
     pub fn set_frame_watchers(&mut self, watchers: Arc<dyn FrameWatchers>) {
         self.frame_watchers = Some(watchers);
     }
 
     /// The host's watchers of this terminal's frame, if any are attached.
+    #[inline]
     #[must_use]
     pub fn frame_watchers(&self) -> Option<&Arc<dyn FrameWatchers>> {
         self.frame_watchers.as_ref()

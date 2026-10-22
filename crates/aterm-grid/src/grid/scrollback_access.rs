@@ -17,6 +17,7 @@ impl Grid {
     ///
     /// Drains the lazy buffer first so all deferred lines are available
     /// in the tiered scrollback.
+    #[inline]
     pub fn scrollback_mut(&mut self) -> Option<&mut ScrollbackStorage> {
         self.drain_lazy_buffer();
         self.storage.scrollback_mut()
@@ -118,6 +119,7 @@ impl Grid {
 
     /// Get a historical line by index (0 = oldest), logging read failures.
     #[must_use]
+    #[inline]
     pub fn get_history_line(&self, idx: usize) -> Option<Cow<'_, Line>> {
         match self.try_get_history_line(idx) {
             Ok(line) => line,
@@ -129,6 +131,7 @@ impl Grid {
     }
 
     /// A historical line by reverse index (0 = most recent scrollback line).
+    #[inline]
     pub(crate) fn try_history_line_rev(
         &self,
         rev_idx: usize,
@@ -145,6 +148,7 @@ impl Grid {
     /// Returns `Cow::Borrowed` for hot-tier lines (zero-copy render path)
     /// and `Cow::Owned` for warm/cold/ring-buffer lines.
     #[must_use]
+    #[inline]
     pub fn history_line_rev(&self, rev_idx: usize) -> Option<Cow<'_, Line>> {
         match self.try_history_line_rev(rev_idx) {
             Ok(line) => line,
@@ -349,6 +353,7 @@ impl<'a> Iterator for HistoryLines<'a> {
         ))))
     }
 
+    #[inline]
     fn size_hint(&self) -> (usize, Option<usize>) {
         let n = self.end - self.idx;
         (n, Some(n))

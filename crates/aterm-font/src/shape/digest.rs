@@ -21,13 +21,14 @@ pub(crate) struct Digest {
 const SHIFTS: [u32; 3] = [4, 0, 9];
 
 #[inline]
-fn mask_for(g: GlyphId, shift: u32) -> u64 {
-    1u64 << ((u64::from(g.0) >> shift) & 63)
+const fn mask_for(g: GlyphId, shift: u32) -> u64 {
+    1u64 << ((g.0 as u64 >> shift) & 63)
 }
 
 impl Digest {
-    pub(crate) fn new() -> Self {
-        Self::default()
+    #[inline]
+    pub(crate) const fn new() -> Self {
+        Self { masks: [0; 3] }
     }
 
     #[inline]
@@ -37,6 +38,7 @@ impl Digest {
         }
     }
 
+    #[inline]
     pub(crate) fn add_range(&mut self, a: GlyphId, b: GlyphId) {
         for (mask, &shift) in self.masks.iter_mut().zip(&SHIFTS) {
             if *mask == u64::MAX {
@@ -58,16 +60,17 @@ impl Digest {
     }
 
     #[inline]
-    pub(crate) fn may_have(&self, other: &Digest) -> bool {
-        self.masks.iter().zip(&other.masks).all(|(a, b)| a & b != 0)
+    pub(crate) const fn may_have(&self, other: &Digest) -> bool {
+        (self.masks[0] & other.masks[0]) != 0
+            && (self.masks[1] & other.masks[1]) != 0
+            && (self.masks[2] & other.masks[2]) != 0
     }
 
     #[inline]
-    pub(crate) fn may_have_glyph(&self, g: GlyphId) -> bool {
-        self.masks
-            .iter()
-            .zip(&SHIFTS)
-            .all(|(mask, &shift)| mask & mask_for(g, shift) != 0)
+    pub(crate) const fn may_have_glyph(&self, g: GlyphId) -> bool {
+        (self.masks[0] & mask_for(g, SHIFTS[0])) != 0
+            && (self.masks[1] & mask_for(g, SHIFTS[1])) != 0
+            && (self.masks[2] & mask_for(g, SHIFTS[2])) != 0
     }
 }
 

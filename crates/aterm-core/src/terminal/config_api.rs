@@ -43,6 +43,7 @@ struct LiveColors {
 }
 
 impl LiveColors {
+    #[inline]
     fn of(c: &super::grouped_state::ColorState) -> Self {
         Self {
             cursor: c.cursor_color,
@@ -81,6 +82,7 @@ pub struct ColorBaseline {
 
 impl ColorBaseline {
     /// The baseline a [`TerminalConfig`](crate::config::TerminalConfig) declares.
+    #[inline]
     #[must_use]
     pub fn of_config(c: &crate::config::TerminalConfig) -> Self {
         Self {
@@ -114,6 +116,7 @@ impl Terminal {
 
     /// The host's colour baseline now: the configured colours, palette and
     /// declared scheme that OSC 104/110-119 and RIS reset to.
+    #[inline]
     #[must_use]
     pub fn color_baseline(&self) -> ColorBaseline {
         let c = &self.color;
@@ -138,6 +141,7 @@ impl Terminal {
     /// [`allow_palette_reconfigure`](Self::allow_palette_reconfigure). The
     /// reported scheme is reconciled once, after the colours (at most one
     /// `CSI ? 997` push). Marks full damage when any live colour moved.
+    #[inline]
     pub fn rebase_colors(&mut self, baseline: &ColorBaseline) -> ColorRebase {
         let rebase = self.rebase_colors_inner(baseline, self.modes.allow_palette_reconfigure);
         if rebase.cursor_changed || rebase.colors_changed {

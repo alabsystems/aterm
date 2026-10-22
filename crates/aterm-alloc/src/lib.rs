@@ -68,6 +68,7 @@ use core::mem::MaybeUninit;
 /// drops afterwards.
 // Skip: the slot-to-`T` reinterpretation is the crate's init-tracking class
 // (`ArrayVec::pop`'s); the precondition above is the audited invariant.
+#[inline]
 #[cfg_attr(trust_verify, trust::skip)]
 unsafe fn drop_initialized<T>(slots: &mut [MaybeUninit<T>]) {
     let values = core::ptr::slice_from_raw_parts_mut(slots.as_mut_ptr().cast::<T>(), slots.len());
@@ -78,6 +79,7 @@ unsafe fn drop_initialized<T>(slots: &mut [MaybeUninit<T>]) {
 }
 
 /// Return `true` when `len` fits within an inline capacity of `inline_cap`.
+#[inline]
 #[must_use]
 pub const fn fits_inline(len: usize, inline_cap: usize) -> bool {
     len <= inline_cap
@@ -85,6 +87,7 @@ pub const fn fits_inline(len: usize, inline_cap: usize) -> bool {
 
 /// Compute the next heap capacity for `current_cap` to hold at least `min_needed` elements,
 /// doubling `current_cap` (with a minimum of 4) and saturating on overflow.
+#[inline]
 #[must_use]
 pub const fn next_capacity_for(current_cap: usize, min_needed: usize) -> usize {
     let doubled = current_cap.saturating_mul(2);
@@ -93,6 +96,7 @@ pub const fn next_capacity_for(current_cap: usize, min_needed: usize) -> usize {
 }
 
 /// Encode collection allocation counts (`len`, `inline_cap`, `heap_cap`, `elem_size`) into 16 LE bytes.
+#[inline]
 #[must_use]
 pub const fn encode_alloc_counts_le(
     len: u32,
@@ -121,6 +125,7 @@ pub const fn encode_alloc_counts_le(
 }
 
 /// Decode 16 LE bytes into collection allocation counts (`len`, `inline_cap`, `heap_cap`, `elem_size`).
+#[inline]
 #[must_use]
 pub const fn decode_alloc_counts_le(bytes: [u8; 16]) -> (u32, u32, u32, u32) {
     let len = (bytes[0] as u32)

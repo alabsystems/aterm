@@ -15,7 +15,7 @@ use std::collections::BTreeMap;
 use crate::support::*;
 use aterm_x11::proto::event::SelectionNotify;
 use aterm_x11::proto::xproto::{self, PropMode, config, cw, event_mask, gc, image_format};
-use aterm_x11::proto::{Request, ValueList, randr, shm, xinput};
+use aterm_x11::proto::{Request, ValueList, randr, shm, sync, xinput};
 
 const RECORDING: &str = "x11rb-protocol-0.13.2-requests.tsv";
 
@@ -496,6 +496,27 @@ fn cases() -> BTreeMap<String, String> {
         "xi_query_pointer",
         hx(xinput::xi_query_pointer(131, 0x0060_0001, 2)),
     );
+    put("sync_initialize", hx(sync::initialize(134, 3, 1)));
+    put(
+        "sync_create_counter",
+        hx(sync::create_counter(134, 0x0060_0007, 0)),
+    );
+    put(
+        "sync_set_counter",
+        hx(sync::set_counter(134, 0x0060_0007, (5 << 32) | 0x8000_0001)),
+    );
+    put(
+        "sync_set_counter_negative",
+        hx(sync::set_counter(134, 0x0060_0007, -2)),
+    );
+    put(
+        "sync_query_counter",
+        hx(sync::query_counter(134, 0x0060_0007)),
+    );
+    put(
+        "sync_destroy_counter",
+        hx(sync::destroy_counter(134, 0x0060_0007)),
+    );
     c
 }
 
@@ -506,7 +527,7 @@ fn every_request_is_x11rb_protocols_bytes() {
         .map(|(case, rest)| (case, rest.join("\t")))
         .collect();
     assert!(
-        recorded.len() >= 63,
+        recorded.len() >= 71,
         "the corpus is whole: {}",
         recorded.len()
     );
@@ -528,6 +549,11 @@ fn a_request_one_argument_away_misses_its_recording() {
     assert_ne!(
         hex(shm::attach_fd(130, 0x0060_0005, false).bytes()),
         want("shm_attach_fd_ro")
+    );
+    assert_ne!(
+        hex(sync::set_counter(134, 0x0060_0007, (0x8000_0001 << 32) | 5).bytes()),
+        want("sync_set_counter"),
+        "an INT64's halves in the other order"
     );
     assert_ne!(
         hex(xproto::put_image(

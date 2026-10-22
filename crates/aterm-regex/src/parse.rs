@@ -59,6 +59,7 @@ pub(crate) enum PerlClass {
 }
 
 impl PerlClass {
+    #[inline]
     fn matches(self, c: char) -> bool {
         match self {
             Self::Digit => unicode::is_digit(c),
@@ -186,6 +187,7 @@ impl ClassSet {
 
     /// Heap bytes this class costs, charged against the compile-time ceiling
     /// alongside the instruction that indexes it.
+    #[inline]
     pub(crate) fn byte_size(&self) -> usize {
         size_of::<Self>()
             + self.ranges.len() * size_of::<(char, char)>()
@@ -330,14 +332,17 @@ impl Parser<'_> {
         ))
     }
 
+    #[inline]
     fn peek(&self) -> Option<char> {
         self.pat.get(self.pos).copied()
     }
 
+    #[inline]
     fn peek_at(&self, n: usize) -> Option<char> {
         self.pat.get(self.pos + n).copied()
     }
 
+    #[inline]
     fn bump(&mut self) -> Option<char> {
         let c = self.peek();
         if c.is_some() {
@@ -367,6 +372,7 @@ impl Parser<'_> {
         }
     }
 
+    #[inline]
     fn depth(&self) -> usize {
         self.stack.len()
     }
@@ -1059,7 +1065,8 @@ impl Parser<'_> {
     }
 }
 
-fn perl_class(c: char) -> Option<PerlClass> {
+#[inline]
+const fn perl_class(c: char) -> Option<PerlClass> {
     match c {
         'd' => Some(PerlClass::Digit),
         'D' => Some(PerlClass::NotDigit),
@@ -1098,18 +1105,23 @@ fn posix_class(name: &str) -> Option<Ranges> {
 }
 
 /// The code point after `c`, stepping over the surrogate gap.
-fn char_after(c: char) -> Option<char> {
+#[inline]
+const fn char_after(c: char) -> Option<char> {
     match c {
         '\u{d7ff}' => Some('\u{e000}'),
-        _ => char::from_u32(u32::from(c) + 1),
+        _ => char::from_u32(c as u32 + 1),
     }
 }
 
 /// The code point before `c`, stepping over the surrogate gap.
-fn char_before(c: char) -> Option<char> {
+#[inline]
+const fn char_before(c: char) -> Option<char> {
     match c {
         '\u{e000}' => Some('\u{d7ff}'),
-        _ => u32::from(c).checked_sub(1).and_then(char::from_u32),
+        _ => match (c as u32).checked_sub(1) {
+            Some(cp) => char::from_u32(cp),
+            None => None,
+        },
     }
 }
 

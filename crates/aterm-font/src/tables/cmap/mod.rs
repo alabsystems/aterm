@@ -71,7 +71,7 @@ pub struct Subtable<'a> {
 impl<'a> Subtable<'a> {
     /// Checks that the current encoding is Unicode compatible.
     #[inline]
-    pub fn is_unicode(&self) -> bool {
+    pub const fn is_unicode(&self) -> bool {
         // https://docs.microsoft.com/en-us/typography/opentype/spec/name#windows-encoding-ids
         const WINDOWS_UNICODE_BMP_ENCODING_ID: u16 = 1;
         const WINDOWS_UNICODE_FULL_REPERTOIRE_ENCODING_ID: u16 = 10;
@@ -206,6 +206,7 @@ impl core::fmt::Debug for Subtables<'_> {
 
 impl<'a> Subtables<'a> {
     /// Returns a subtable at an index.
+    #[inline]
     pub fn get(&self, index: u16) -> Option<Subtable<'a>> {
         let record = self.records.get(index)?;
         let data = self.data.get(record.offset.to_usize()..)?;
@@ -231,12 +232,13 @@ impl<'a> Subtables<'a> {
 
     /// Returns the number of subtables.
     #[inline]
-    pub fn len(&self) -> u16 {
+    pub const fn len(&self) -> u16 {
         self.records.len()
     }
 
     /// Checks if there are any subtables.
-    pub fn is_empty(&self) -> bool {
+    #[inline]
+    pub const fn is_empty(&self) -> bool {
         self.records.is_empty()
     }
 }
@@ -285,6 +287,7 @@ pub struct Table<'a> {
 
 impl<'a> Table<'a> {
     /// Parses a table from raw data.
+    #[inline]
     pub fn parse(data: &'a [u8]) -> Option<Self> {
         let mut s = Stream::new(data);
         s.skip::<u16>(); // version

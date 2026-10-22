@@ -5,7 +5,8 @@
 # Must be `tracing` so `[patch.crates-io]` matches on package name; the
 # directory keeps the `aterm-` prefix to mark it as first-party.
 name = "tracing"
-# Semver contract with transitive consumers (softbuffer ^0.1.41, winit ^0.1.40).
+# Semver contract with transitive consumers (winit ^0.1.40; softbuffer's
+# ^0.1.41 until it left at linux-windowing LW.3).
 version = "0.1.44"
 edition.workspace = true
 license.workspace = true

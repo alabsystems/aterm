@@ -24,8 +24,9 @@ impl Key {
     /// as their equivalent non-keypad keys" until the app asks to tell them apart) and the
     /// GUI's native pages and press classifier. The PTY encoders never fold outside kitty
     /// legacy semantics.
+    #[inline]
     #[must_use]
-    pub fn main_block_twin(&self) -> Option<Key> {
+    pub const fn main_block_twin(&self) -> Option<Key> {
         let Key::Named(named) = self else {
             return None;
         };
@@ -307,8 +308,9 @@ impl NamedKey {
     /// A sided modifier key's modifier bit and its other-side twin (`ShiftLeft` →
     /// `(SHIFT, ShiftRight)`); `None` for every other key. Kitty keeps a released modifier's bit
     /// set while the twin is held ([`super::encode_key_with_event`]).
+    #[inline]
     #[must_use]
-    pub fn modifier_twin(self) -> Option<(Modifiers, NamedKey)> {
+    pub const fn modifier_twin(self) -> Option<(Modifiers, NamedKey)> {
         Some(match self {
             NamedKey::ShiftLeft => (Modifiers::SHIFT, NamedKey::ShiftRight),
             NamedKey::ShiftRight => (Modifiers::SHIFT, NamedKey::ShiftLeft),
@@ -329,8 +331,9 @@ impl NamedKey {
     /// The Kitty keyboard protocol key code: the code point CSI u sends for this key.
     // One exhaustive match (no table chain or panic edge for the verifier), values from kitty's
     // functional-key table.
+    #[inline]
     #[must_use]
-    pub fn kitty_code(self) -> u32 {
+    pub const fn kitty_code(self) -> u32 {
         match self {
             // Control and navigation keys
             NamedKey::Escape => 27,
@@ -477,16 +480,18 @@ bitflags! {
 impl Modifiers {
     /// The Kitty keyboard protocol modifier value: `modifiers + 1` (1 = none), saturating at
     /// 255 when all eight bits are set.
+    #[inline]
     #[must_use]
-    pub fn kitty_encoded(self) -> u8 {
+    pub const fn kitty_encoded(self) -> u8 {
         self.bits().saturating_add(1)
     }
 
     /// Get the legacy xterm modifier value for CSI sequences.
     ///
     /// Xterm encoding: `1 + shift(1) + alt(2) + ctrl(4) + meta(8)`.
+    #[inline]
     #[must_use]
-    pub fn xterm_encoded(self) -> u8 {
+    pub const fn xterm_encoded(self) -> u8 {
         // Saturating adds are exact (the sum is at most 16); the model checker refutes plain
         // `+=` overflow spuriously.
         let mut val = 1u8;
@@ -522,8 +527,9 @@ pub enum KeyEventType {
 
 impl KeyEventType {
     /// Get the Kitty protocol event type value.
+    #[inline]
     #[must_use]
-    pub fn kitty_value(self) -> u8 {
+    pub const fn kitty_value(self) -> u8 {
         match self {
             KeyEventType::Press => 1,
             KeyEventType::Repeat => 2,

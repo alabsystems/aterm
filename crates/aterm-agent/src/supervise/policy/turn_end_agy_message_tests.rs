@@ -211,8 +211,11 @@ const RULES: &str = "Run the full suite before you push.\n\nNever force-push; a 
                      is for credentials only.\n";
 
 /// A rules file of two paragraphs that never says the token: an owner's
-/// rules that do are the owner's words, read as a reply's would be where a
-/// cut opens on them ([`an_acts_rows_cut_at_the_rows_top_name_no_need_and_land_nothing`]).
+/// rules that do are the owner's words, which agy's reader reads as a
+/// reply's where a cut opens on them
+/// ([`an_acts_rows_cut_at_the_rows_top_name_no_need_and_land_nothing`]), and
+/// the policy drops as the act's own rows
+/// ([`a_cut_opening_on_the_acts_own_rows_names_no_need`]).
 const PLAIN_RULES: &str = "Run the full suite before you push.\n\nNever force-push.\n";
 
 /// The standing rules `text` as the loop types them: read by the loop's own
@@ -502,6 +505,255 @@ fn an_acts_rows_cut_at_the_rows_top_name_no_need_and_land_nothing() {
     assert!(!state.landed());
 }
 
+/// An owner's rules that hold the NEEDS YOU token as a need is said: the
+/// owner's own words, which ride every act this policy types
+/// (`with_rules`), and name a need wherever they are read
+/// ([`a_cut_opening_on_the_acts_own_rows_names_no_need`]).
+const OWNER_NEED_RULES: &str =
+    "Run the full suite before you push.\n\nNEEDS YOU: the release key, which only I hold.\n";
+
+/// The need [`OWNER_NEED_RULES`] names in an act's words read whole (the
+/// standing rules close a parenthesis there).
+const OWNER_NEED: &str = "the release key, which only I hold.)";
+
+/// A CUT OPENING ON THE ACT'S OWN ROWS NAMES NO NEED, whatever the owner's
+/// rules riding it say. agy's reader reads the later rows of a message whose
+/// first row is above the rows read as agy's reply (and a turn of several
+/// replies reads them as its earlier words), and the loop reads such a turn
+/// whole only at its first point and after a turn it saw run: at a point
+/// after a quick answer, or where the history could not be read, the
+/// owner's `NEEDS YOU:` in the act's rows stood as a need nobody said. The
+/// policy drops the rows of words read from the rows' top
+/// ([`TurnEndReading::opens_cut`]) that are, by their letters, the end of the
+/// act it typed last (`without_act_rows`). Drawn at every width of
+/// [`WIDTHS`], under a plain report and a long one, at every cut of the act's
+/// rows that reads the owner's need, the act typed and the point judged with
+/// the turn seen to run and not: no need stands. NEGATIVE CONTROLS: the same
+/// screen after another act (the continuation without the rules) raises the
+/// owner's need, which is what the drop takes away; and a need agy says in
+/// its reply under the act's rows stands alone.
+#[test]
+fn a_cut_opening_on_the_acts_own_rows_names_no_need() {
+    let long = (0..24)
+        .map(|i| format!("Step {i} of the parser is written, tested and committed on its branch."))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let take = TurnEndTiming::default().take_within;
+    let other = continuation_text(&cfg(), None);
+    // The needs standing after `act` was typed and the point `r` judged, the
+    // turn seen to run (`worked`) or not.
+    let needs_after = |act: &str, r: &TurnEndReading, worked: Option<Duration>| {
+        let mut st = TurnEndState::default();
+        let t = t0();
+        st.acted(
+            &TurnEndAction::Type {
+                text: act.to_string(),
+                rule_id: RULE_CONTINUE,
+            },
+            r,
+            t,
+        );
+        let r = TurnEndReading {
+            worked,
+            ..r.clone()
+        };
+        if worked.is_some() {
+            st.observe(&r, t + 3 * MIN);
+        } else {
+            st.observe(&r, t + MIN);
+            st.observe(&r, t + MIN + take + Duration::from_secs(1));
+        }
+        st.standing_needs().to_vec()
+    };
+    let (mut cuts, mut owners) = (0, 0);
+    for (name, act) in every_act_with(OWNER_NEED_RULES) {
+        if needs::needs_you(&typed(&act)) != [OWNER_NEED] {
+            continue;
+        }
+        for cols in WIDTHS {
+            for reply in [PROGRESS, long.as_str()] {
+                let whole = agy_screen(cols, &typed(&act), reply);
+                let at = whole
+                    .iter()
+                    .position(|r| r.starts_with("> "))
+                    .expect("the act's row");
+                let end = (at + 1..whole.len())
+                    .find(|&i| whole[i].is_empty())
+                    .expect("the act's end");
+                for drop in 1..end - at {
+                    let r = agy_reading(&whole[at + drop..]);
+                    // The words the policy folds needs from, as it joins them.
+                    let tail = r.said_tail.as_deref().unwrap_or("");
+                    let read = r
+                        .turn_said
+                        .as_deref()
+                        .map_or_else(|| tail.to_string(), |b| format!("{b}\n\n{tail}"));
+                    let named = needs::needs_you(&read);
+                    if named.is_empty() {
+                        continue;
+                    }
+                    let at_cut = format!("{name} at {cols}, {drop} rows above");
+                    assert!(r.opens_cut, "{at_cut}");
+                    cuts += 1;
+                    owners += usize::from(named.iter().any(|n| n.starts_with("the release key")));
+                    for worked in [Some(3 * MIN), None] {
+                        assert_eq!(
+                            needs_after(&act, &r, worked),
+                            Vec::<String>::new(),
+                            "{at_cut}, worked {worked:?}"
+                        );
+                        // CONTROL: after another act, the owner's words stand
+                        // (as much of them as their rows hold).
+                        assert_eq!(
+                            needs_after(&other, &r, worked),
+                            named,
+                            "CONTROL: {at_cut}, worked {worked:?}"
+                        );
+                    }
+                }
+            }
+        }
+        // CONTROL: agy's own need in its reply under the act's rows stands,
+        // alone.
+        let said = format!("{PROGRESS}\n\nNEEDS YOU: the signing key");
+        let whole = agy_screen(80, &typed(&act), &said);
+        let at = whole
+            .iter()
+            .position(|r| r.starts_with("> "))
+            .expect("the act's row");
+        let r = agy_reading(&whole[at + 1..]);
+        assert!(r.opens_cut, "{name}");
+        for worked in [Some(3 * MIN), None] {
+            assert_eq!(
+                needs_after(&act, &r, worked),
+                ["the signing key"],
+                "CONTROL: {name}, worked {worked:?}"
+            );
+        }
+    }
+    assert!(
+        cuts > 100 && owners > 100,
+        "{cuts} cuts, {owners} the owner's need"
+    );
+    // CONTROL: words read whole drop nothing — agy saying the owner's very
+    // need line under the whole act is its own need (FAIL TOWARD A KEPT NEED).
+    let act = continuation_text(&cfg(), Some(&rules_line(OWNER_NEED_RULES)));
+    let r = agy_reading(&agy_screen(
+        80,
+        &typed(&act),
+        &format!("NEEDS YOU: {OWNER_NEED}"),
+    ));
+    assert!(!r.opens_cut && !r.said_cut);
+    for worked in [Some(3 * MIN), None] {
+        assert_eq!(
+            needs_after(&act, &r, worked),
+            [OWNER_NEED],
+            "CONTROL: {worked:?}"
+        );
+    }
+}
+
+/// A READER THAT BOUNDS ITS MESSAGES DROPS NOTHING FROM A CUT (the review of
+/// 3a4586a01e, T3): Claude Code's and Gemini CLI's words begin at the
+/// worker's own mark under the message (`⏺`, `✦`), never on the message's
+/// rows, so a cut there opens on the worker's words alone, and a first line
+/// of its own that repeats the owner's rule riding the act — `NEEDS YOU: the
+/// release key, which only I hold.`, by its letters the end of the act's
+/// words — is its own need: the reading opens no cut
+/// ([`TurnEndReading::opens_cut`]), and the need stands after the act, the
+/// turn seen to run or not, its message's row above the rows read. NEGATIVE
+/// CONTROL: the same words read on agy, which bounds no message, open on
+/// the act's rows (`a_cut_opening_on_the_acts_own_rows_names_no_need`).
+#[test]
+fn a_reader_that_bounds_its_messages_drops_nothing_from_a_cut() {
+    let act = continuation_text(&cfg(), Some(&rules_line(OWNER_NEED_RULES)));
+    let own = "NEEDS YOU: the release key, which only I hold.";
+    let take = TurnEndTiming::default().take_within;
+    let needs_after = |r: &TurnEndReading, worked: Option<Duration>| {
+        let mut st = TurnEndState::default();
+        let t = t0();
+        st.acted(
+            &TurnEndAction::Type {
+                text: act.clone(),
+                rule_id: RULE_CONTINUE,
+            },
+            r,
+            t,
+        );
+        let r = TurnEndReading {
+            worked,
+            ..r.clone()
+        };
+        if worked.is_some() {
+            st.observe(&r, t + 3 * MIN);
+        } else {
+            st.observe(&r, t + MIN);
+            st.observe(&r, t + MIN + take + Duration::from_secs(1));
+        }
+        st.standing_needs().to_vec()
+    };
+    // Gemini CLI's measured end of a turn, its message's band off the rows
+    // read and its reply the worker's own need line.
+    let gemini: Vec<String> = screen(aterm_phase::gemini::fixtures::END_OF_TURN)
+        .into_iter()
+        .skip_while(|r| !r.starts_with('✦'))
+        .map(|r| {
+            if r.starts_with('✦') {
+                format!("✦ {own}")
+            } else {
+                r
+            }
+        })
+        .collect();
+    // Claude Code's measured idle line, its `❯` row off the rows read.
+    let claude: Vec<String> = {
+        let rows = screen(include_str!(
+            "../../../../aterm-phase/src/fixtures/claude-2.1.303-fast-answers-same-idle-line-measured.txt"
+        ));
+        let last = rows
+            .iter()
+            .rposition(|r| r.starts_with('⏺'))
+            .expect("the last answer");
+        rows[last..]
+            .iter()
+            .enumerate()
+            .map(|(i, r)| {
+                if i == 0 {
+                    format!("⏺ {own}")
+                } else {
+                    r.clone()
+                }
+            })
+            .collect()
+    };
+    for (name, program, rows) in [("gemini", "gemini", gemini), ("claude", "claude", claude)] {
+        let reading = aterm_phase::read(Some(program), &rows, None);
+        assert!(reading.program.reader().bounds_messages(), "{name}");
+        let r = TurnEndReading::of(&reading, &rows, false, Some(3 * MIN), None, None);
+        assert_eq!(r.said_tail.as_deref(), Some(own), "{name}: {rows:#?}");
+        assert!(
+            !reading.program.reader().turn_whole(&rows),
+            "{name}: the message is above the rows read"
+        );
+        assert!(!r.opens_cut, "{name}");
+        for worked in [Some(3 * MIN), None] {
+            assert_eq!(
+                needs_after(&r, worked),
+                ["the release key, which only I hold."],
+                "{name}, worked {worked:?}"
+            );
+        }
+    }
+    // NEGATIVE CONTROL: the letters are the act's end, as the drop reads
+    // them, so only the reader's gate keeps the need.
+    let letters = |t: &str| {
+        t.chars()
+            .filter(|c| c.is_alphanumeric())
+            .collect::<String>()
+    };
+    assert!(letters(&typed(&act)).ends_with(&letters(own)), "{act}");
+}
+
 /// The widths every act is drawn at: the narrow lab pane (50), the L15
 /// worker's (144), and a spread between and around them.
 const WIDTHS: [usize; 12] = [40, 50, 61, 72, 80, 89, 97, 100, 120, 133, 144, 160];
@@ -511,9 +763,12 @@ const WIDTHS: [usize; 12] = [40, 50, 61, 72, 80, 89, 97, 100, 120, 133, 144, 160
 /// x` and `NEEDS YOU: y`, drawn as agy draws a blank line (a blank row, the
 /// second paragraph two columns in), reads back as agy's reply: the need `y`
 /// and the defense `x`, though agy said neither, and the message as the
-/// reader takes it is the first paragraph alone — the RESIDUAL nothing on
-/// agy's screen tells apart (`aterm_phase::agy`'s header): aterm types no
-/// person's words. The same words as the act executor types an act
+/// reader takes it is the first paragraph alone — nothing in agy's TEXT
+/// tells them apart (`aterm_phase::agy`'s header). Its cells do: the loop
+/// takes the message's blank rows drawn in its caret row's style out of it
+/// before any reading (`Session::message_bounded_by_cells`, held on agy's
+/// measured screen and cells by `needs_loop_tests.rs`'s
+/// `a_persons_paragraphs_in_agy_are_never_its_need`). The same words as the act executor types an act
 /// (`turn_end_loop::one_turn`: one line, as no control request can carry a
 /// line break) are one message, and the reply under it reads alone: no
 /// need, no landing, the turn opened by the act's words. An owner's

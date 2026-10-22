@@ -53,6 +53,7 @@ pub(crate) struct ApplyContext<'a, 'f> {
 }
 
 impl<'a, 'f> ApplyContext<'a, 'f> {
+    #[inline]
     pub(crate) fn new(face: &'a ShapeFace<'f>, buffer: &'a mut Buffer, digest: Digest) -> Self {
         ApplyContext {
             face,
@@ -69,17 +70,20 @@ impl<'a, 'f> ApplyContext<'a, 'f> {
         }
     }
 
+    #[inline]
     pub(crate) fn random_number(&mut self) -> u32 {
         // minstd_rand.
         self.random_state = self.random_state.wrapping_mul(48271) % 2_147_483_647;
         self.random_state
     }
 
-    pub(crate) fn set_lookup_mask(&mut self, mask: u32) {
+    #[inline]
+    pub(crate) const fn set_lookup_mask(&mut self, mask: u32) {
         self.lookup_mask = mask;
     }
 
-    pub(crate) fn lookup_mask(&self) -> u32 {
+    #[inline]
+    pub(crate) const fn lookup_mask(&self) -> u32 {
         self.lookup_mask
     }
 
@@ -108,6 +112,7 @@ impl<'a, 'f> ApplyContext<'a, 'f> {
     }
 
     /// Whether the lookup flags in `match_props` let a lookup see `info`.
+    #[inline]
     pub(crate) fn check_glyph_property(&self, info: &GlyphInfo, match_props: u32) -> bool {
         let props = info.glyph_props;
         let flags = match_props as u16;
@@ -128,6 +133,7 @@ impl<'a, 'f> ApplyContext<'a, 'f> {
         true
     }
 
+    #[inline]
     fn set_glyph_class(
         &mut self,
         glyph: GlyphId,
@@ -157,21 +163,25 @@ impl<'a, 'f> ApplyContext<'a, 'f> {
         };
     }
 
+    #[inline]
     pub(crate) fn replace_glyph(&mut self, glyph: GlyphId) {
         self.set_glyph_class(glyph, 0, false, false);
         self.buffer.replace_glyph(u32::from(glyph.0));
     }
 
+    #[inline]
     pub(crate) fn replace_glyph_inplace(&mut self, glyph: GlyphId) {
         self.set_glyph_class(glyph, 0, false, false);
         self.buffer.cur_mut(0).glyph_id = u32::from(glyph.0);
     }
 
+    #[inline]
     pub(crate) fn replace_glyph_with_ligature(&mut self, glyph: GlyphId, class_guess: u16) {
         self.set_glyph_class(glyph, class_guess, true, false);
         self.buffer.replace_glyph(u32::from(glyph.0));
     }
 
+    #[inline]
     pub(crate) fn output_glyph_for_component(&mut self, glyph: GlyphId, class_guess: u16) {
         self.set_glyph_class(glyph, class_guess, false, true);
         self.buffer.output_glyph(u32::from(glyph.0));
@@ -212,6 +222,7 @@ pub(crate) struct SkippyIter<'a, 'b, 'f> {
 }
 
 impl<'a, 'b, 'f> SkippyIter<'a, 'b, 'f> {
+    #[inline]
     pub(crate) fn new(ctx: &'a ApplyContext<'b, 'f>, start: usize, context_match: bool) -> Self {
         SkippyIter {
             ctx,
@@ -232,14 +243,17 @@ impl<'a, 'b, 'f> SkippyIter<'a, 'b, 'f> {
         }
     }
 
+    #[inline]
     pub(crate) fn enable_matching(&mut self, func: &'a MatchFn<'a>) {
         self.matching = Some(func);
     }
 
-    pub(crate) fn index(&self) -> usize {
+    #[inline]
+    pub(crate) const fn index(&self) -> usize {
         self.buf_idx
     }
 
+    #[inline]
     pub(crate) fn next(&mut self) -> bool {
         while self.buf_idx + 1 < self.buf_len {
             self.buf_idx += 1;
@@ -258,6 +272,7 @@ impl<'a, 'b, 'f> SkippyIter<'a, 'b, 'f> {
         false
     }
 
+    #[inline]
     pub(crate) fn prev(&mut self) -> bool {
         while self.buf_idx > 0 {
             self.buf_idx -= 1;
@@ -276,6 +291,7 @@ impl<'a, 'b, 'f> SkippyIter<'a, 'b, 'f> {
         false
     }
 
+    #[inline]
     fn match_(&self, info: &GlyphInfo) -> Outcome {
         let skip = self.may_skip(info);
         if skip == MaySkip::Yes {
@@ -291,6 +307,7 @@ impl<'a, 'b, 'f> SkippyIter<'a, 'b, 'f> {
         Outcome::Skip
     }
 
+    #[inline]
     fn may_match(&self, info: &GlyphInfo) -> MayMatch {
         if info.mask & self.mask == 0 {
             return MayMatch::No;
@@ -307,6 +324,7 @@ impl<'a, 'b, 'f> SkippyIter<'a, 'b, 'f> {
         }
     }
 
+    #[inline]
     fn may_skip(&self, info: &GlyphInfo) -> MaySkip {
         if !self.ctx.check_glyph_property(info, self.lookup_props) {
             return MaySkip::Yes;
@@ -322,6 +340,7 @@ impl<'a, 'b, 'f> SkippyIter<'a, 'b, 'f> {
         MaySkip::No
     }
 
+    #[inline]
     pub(crate) fn may_skip_yes(&self, info: &GlyphInfo) -> bool {
         self.may_skip(info) == MaySkip::Yes
     }
@@ -436,10 +455,12 @@ pub(crate) fn match_lookahead(
     (0..lookahead_len).all(|_| iter.next())
 }
 
+#[inline]
 pub(crate) fn match_glyph(glyph: GlyphId, value: u16) -> bool {
     glyph == GlyphId(value)
 }
 
+#[inline]
 fn match_class<'a>(class_def: ClassDefinition<'a>) -> impl Fn(GlyphId, u16) -> bool + 'a {
     move |glyph, value| class_def.get(glyph) == value
 }

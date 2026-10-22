@@ -36,6 +36,7 @@ pub struct Lab {
     pub b: f32,
 }
 
+#[inline]
 fn srgb_to_linear(c: u8) -> f32 {
     let c = f32::from(c) / 255.0;
     if c <= 0.040_45 {
@@ -45,6 +46,7 @@ fn srgb_to_linear(c: u8) -> f32 {
     }
 }
 
+#[inline]
 fn linear_to_srgb(c: f32) -> u8 {
     let c = c.clamp(0.0, 1.0);
     let s = if c <= 0.003_130_8 {
@@ -56,6 +58,7 @@ fn linear_to_srgb(c: f32) -> u8 {
 }
 
 /// sRGB → OkLab.
+#[inline]
 #[must_use]
 pub fn to_lab(c: Rgb) -> Lab {
     let (r, g, b) = (
@@ -75,6 +78,7 @@ pub fn to_lab(c: Rgb) -> Lab {
 }
 
 /// OkLab → sRGB, clipped to the gamut.
+#[inline]
 #[must_use]
 pub fn from_lab(c: Lab) -> Rgb {
     let l = c.l + 0.396_337_78 * c.a + 0.215_803_76 * c.b;
@@ -89,6 +93,7 @@ pub fn from_lab(c: Lab) -> Rgb {
 }
 
 /// OkLCh (lightness, chroma, hue in degrees) → sRGB.
+#[inline]
 #[must_use]
 pub fn oklch(l: f32, c: f32, h_deg: f32) -> Rgb {
     let h = h_deg.to_radians();
@@ -100,6 +105,7 @@ pub fn oklch(l: f32, c: f32, h_deg: f32) -> Rgb {
 }
 
 /// Linear interpolation in OkLab, `t` in `0..=1`.
+#[inline]
 #[must_use]
 pub fn mix(a: Rgb, b: Rgb, t: f32) -> Rgb {
     let (x, y) = (to_lab(a), to_lab(b));
@@ -112,12 +118,14 @@ pub fn mix(a: Rgb, b: Rgb, t: f32) -> Rgb {
 }
 
 /// WCAG relative luminance.
+#[inline]
 #[must_use]
 pub fn luminance(c: Rgb) -> f32 {
     0.2126 * srgb_to_linear(c[0]) + 0.7152 * srgb_to_linear(c[1]) + 0.0722 * srgb_to_linear(c[2])
 }
 
 /// WCAG contrast ratio between two colours (≥ 1).
+#[inline]
 #[must_use]
 pub fn contrast(a: Rgb, b: Rgb) -> f32 {
     let (x, y) = (luminance(a), luminance(b));
@@ -126,6 +134,7 @@ pub fn contrast(a: Rgb, b: Rgb) -> f32 {
 }
 
 /// Whether `ground` is a dark ground (the polarity every rule keys on).
+#[inline]
 #[must_use]
 pub fn is_dark(ground: Rgb) -> bool {
     to_lab(ground).l < 0.6
@@ -343,8 +352,9 @@ pub const RIM_FLOOR: f32 = 1.5;
 /// 258)` … `oklch(0.910 0.170 98)` dark, `oklch(0.860 0.035 245)` …
 /// `oklch(0.430 0.150 38)` light), taken as measured because the hot dark stop
 /// lies outside sRGB and its gamut mapping is part of what was measured.
+#[inline]
 #[must_use]
-pub fn ramp_stops(dark: bool) -> [Rgb; 5] {
+pub const fn ramp_stops(dark: bool) -> [Rgb; 5] {
     if dark { LOAD_DARK } else { LOAD_LIGHT }
 }
 
@@ -381,8 +391,9 @@ const HEAT_LIGHT: [Rgb; 7] = [
 /// The heat ramp's stops for a ground's polarity (Stats Deck v2 §9.1): the
 /// polyline through their OkLab values carries the seven heat steps. On a
 /// dark ground they are the load ramp's own stops.
+#[inline]
 #[must_use]
-pub fn heat_stops(dark: bool) -> &'static [Rgb] {
+pub const fn heat_stops(dark: bool) -> &'static [Rgb] {
     if dark { &LOAD_DARK } else { &HEAT_LIGHT }
 }
 
@@ -402,8 +413,9 @@ const HEAT_IC_LIGHT: [Rgb; 7] = [
 
 /// The Increase Contrast heat ramp's stops (Stats Deck v2 §9.1): on a dark
 /// ground the heat stops, on a light one [`HEAT_IC_LIGHT`].
+#[inline]
 #[must_use]
-pub fn heat_ic_stops(dark: bool) -> &'static [Rgb] {
+pub const fn heat_ic_stops(dark: bool) -> &'static [Rgb] {
     if dark { &LOAD_DARK } else { &HEAT_IC_LIGHT }
 }
 
@@ -419,6 +431,7 @@ pub const HEAT_HOLD: f32 = 0.01;
 /// unknown value is the caller's `None` and a hollow cell, never a step, so
 /// a NaN (a 0 / 0 that should have been `None`) stops a debug build rather
 /// than draw the filled 0 % cell.
+#[inline]
 #[must_use]
 pub fn heat_step(v: f32) -> u8 {
     debug_assert!(!v.is_nan(), "a heat step for a value that is not a reading");
@@ -434,6 +447,7 @@ pub fn heat_step(v: f32) -> u8 {
 /// The heat step of `v` for a cell that showed step `prev`: it moves only
 /// once `v` is [`HEAT_HOLD`] past an edge, so a value resting on an edge
 /// does not flicker between two inks.
+#[inline]
 #[must_use]
 pub fn heat_step_held(v: f32, prev: u8) -> u8 {
     let up = heat_step(v - HEAT_HOLD);
@@ -452,6 +466,7 @@ pub fn heat_step_held(v: f32, prev: u8) -> u8 {
 /// bottom-anchored, `cell − (6 − step)·q` with `q = max(1, ⌊(cell −
 /// ⌈cell/4⌉) / 6⌋)`. It rises strictly with the step and is at least 1 px in
 /// every cell of 7 px or more; a smaller cell leaves its low steps no height.
+#[inline]
 #[must_use]
 pub fn dwc_height(cell: u32, step: u8) -> u32 {
     let q = ((cell - cell.div_ceil(4)) / 6).max(1);

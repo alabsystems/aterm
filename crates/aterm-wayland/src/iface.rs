@@ -50,6 +50,7 @@ impl TypeRef {
     pub const NULL: TypeRef = TypeRef(null());
 
     /// The argument's interface.
+    #[inline]
     pub const fn to(interface: &'static Interface) -> TypeRef {
         TypeRef(interface)
     }
@@ -68,6 +69,7 @@ pub static NULLS: [TypeRef; 8] = [
     TypeRef::NULL,
 ];
 
+#[inline]
 const fn count(n: usize) -> c_int {
     assert!(n <= c_int::MAX as usize);
     n as c_int
@@ -75,6 +77,7 @@ const fn count(n: usize) -> c_int {
 
 impl Interface {
     /// A table: `requests` and `events` in opcode order.
+    #[inline]
     pub const fn new(
         name: &'static CStr,
         version: u32,
@@ -100,23 +103,27 @@ impl Interface {
     }
 
     /// The interface's name.
+    #[inline]
     pub fn name(&self) -> &'static CStr {
         // SAFETY: built from a `&'static CStr` by `new`.
         unsafe { CStr::from_ptr(self.name) }
     }
 
     /// The highest version this table describes.
+    #[inline]
     pub fn version(&self) -> u32 {
         u32::try_from(self.version).unwrap_or(0)
     }
 
     /// The requests, in opcode order.
+    #[inline]
     pub fn requests(&self) -> &'static [Message] {
         // SAFETY: `new` set the pointer and count from one static slice.
         unsafe { messages(self.methods, self.method_count) }
     }
 
     /// The events, in opcode order.
+    #[inline]
     pub fn events(&self) -> &'static [Message] {
         // SAFETY: as for `requests`.
         unsafe { messages(self.events, self.event_count) }
@@ -125,6 +132,7 @@ impl Interface {
 
 /// # Safety
 /// `p` and `n` come from one static slice (or null and 0).
+#[inline]
 unsafe fn messages(p: *const Message, n: c_int) -> &'static [Message] {
     match usize::try_from(n) {
         Ok(n) if n > 0 && !p.is_null() => {
@@ -142,6 +150,7 @@ impl Message {
     ///
     /// # Panics
     /// Panics when `types` has fewer slots than the signature has arguments.
+    #[inline]
     pub const fn new(
         name: &'static CStr,
         signature: &'static CStr,
@@ -159,6 +168,7 @@ impl Message {
     }
 
     /// The message's name.
+    #[inline]
     pub fn name(&self) -> &'static CStr {
         // SAFETY: built from a `&'static CStr` by `new`.
         unsafe { CStr::from_ptr(self.name) }
@@ -166,12 +176,14 @@ impl Message {
 
     /// The signature: an optional since-version prefix, then one type code
     /// per argument (`i u f s o n a h`), each optionally after `?`.
+    #[inline]
     pub fn signature(&self) -> &'static CStr {
         // SAFETY: as for `name`.
         unsafe { CStr::from_ptr(self.signature) }
     }
 
     /// The interface of signature argument `i`, if it names one.
+    #[inline]
     pub fn arg_interface(&self, i: usize) -> Option<&'static Interface> {
         if i >= signature_args(self.signature().to_bytes()) {
             return None;
@@ -183,6 +195,7 @@ impl Message {
 }
 
 /// The number of arguments a signature describes.
+#[inline]
 pub const fn signature_args(sig: &[u8]) -> usize {
     let mut count = 0;
     let mut i = 0;

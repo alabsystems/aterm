@@ -19,7 +19,8 @@
 //!
 //! ```text
 //! aterm-gui    COM (file picker, jump list, imaging), DXGI peak luminance,
-//!              SetFileInformationByHandle (pinned_dir.rs)
+//!              SetFileInformationByHandle (pinned_dir.rs), GDI (the CPU
+//!              presenter, present/win32.rs)
 //! aterm-gpu    DXGI: the scRGB tag on wgpu's DX12 swap chain
 //! aterm-http   crypt32, the certificate verifier
 //! aterm-net    WinSock's WSAPoll
@@ -27,13 +28,16 @@
 //!
 //! `crates/aterm-windows-sys` (package `windows-sys` 0.61.2, a
 //! `[patch.crates-io]` row) re-exports [`core`] and [`Win32`], so the
-//! packages that name `windows_sys` on the Windows cells compile against this
-//! crate unchanged:
+//! package that names `windows_sys` on the Windows cells compiles against
+//! this crate unchanged:
 //!
 //! ```text
 //! winit 0.30.13 (crates/aterm-window)   the Windows backend
-//! softbuffer 0.4.8                      its GDI backend
 //! ```
+//!
+//! softbuffer 0.4.8's GDI backend was the other until linux-windowing LW.3
+//! of docs/AUDIT-third-party-2026-10-15.md replaced it with aterm-gui's
+//! `present/win32.rs`, a direct consumer.
 //!
 //! # The harvest
 //!

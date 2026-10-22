@@ -43,7 +43,8 @@ pub struct TextKeyDeserializer<D> {
 
 impl<D> TextKeyDeserializer<D> {
     /// Wrap `inner`, the format's deserializer for one map key.
-    pub fn new(inner: D) -> Self {
+    #[inline]
+    pub const fn new(inner: D) -> Self {
         TextKeyDeserializer { inner }
     }
 }
@@ -59,6 +60,7 @@ enum Integer {
 
 impl Integer {
     /// `text` as an integer, if `Display` writes that integer as `text`.
+    #[inline]
     fn parse(text: &str) -> Option<Self> {
         let digits = text.strip_prefix('-').unwrap_or(text);
         let canonical = match digits.as_bytes() {
@@ -79,6 +81,7 @@ impl Integer {
             .ok()
     }
 
+    #[inline]
     fn visit<'de, V, E>(self, visitor: V) -> Result<V::Value, E>
     where
         V: Visitor<'de>,
@@ -188,10 +191,12 @@ where
         deserialize_ignored_any()
     }
 
+    #[inline]
     fn is_human_readable(&self) -> bool {
         self.inner.is_human_readable()
     }
 
+    #[inline]
     fn __deserialize_content_v1<V>(self, visitor: V) -> Result<V::Value, Self::Error>
     where
         V: Visitor<'de, Value = Content<'de>>,

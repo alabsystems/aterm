@@ -20,24 +20,28 @@ pub const COMPAT_DIR: &str = "compat";
 pub const VIEWS_DIR: &str = "rustup";
 
 /// `<prefix>/store/<program>/<build>`.
+#[inline]
 #[must_use]
 pub fn build_dir(prefix: &Path, program: &str, build: u64) -> PathBuf {
     prefix.join(STORE_DIR).join(program).join(build.to_string())
 }
 
 /// `<prefix>/rustup/<name>` — the view the seam `name` targets.
+#[inline]
 #[must_use]
 pub fn view_dir(prefix: &Path, name: &str) -> PathBuf {
     prefix.join(VIEWS_DIR).join(name)
 }
 
 /// Return `true` when `build` is a valid non-zero store build identifier.
+#[inline]
 #[must_use]
 pub const fn is_valid_build_id(build: u64) -> bool {
     build != 0
 }
 
 /// Encode a toolchain lease record (`build_id`, `holder_pid`, `epoch_secs`) into 16 LE bytes.
+#[inline]
 #[must_use]
 pub const fn encode_lease_record_le(build_id: u64, holder_pid: u32, epoch_secs: u32) -> [u8; 16] {
     [
@@ -61,6 +65,7 @@ pub const fn encode_lease_record_le(build_id: u64, holder_pid: u32, epoch_secs: 
 }
 
 /// Decode 16 LE bytes into a toolchain lease record (`build_id`, `holder_pid`, `epoch_secs`).
+#[inline]
 #[must_use]
 pub const fn decode_lease_record_le(bytes: [u8; 16]) -> (u64, u32, u32) {
     let build_id = (bytes[0] as u64)

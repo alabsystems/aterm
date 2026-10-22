@@ -1977,6 +1977,7 @@ impl PackagesService {
             loop_running,
             machine: self.machine.clone(),
             saved_universal_control: atpkg::config::UniversalControlPolicy::Off,
+            saved_rosetta: true,
             pass_trouble: self.pass_trouble.clone(),
             retired_switch_note: None,
             updated: self.updated,
@@ -2032,6 +2033,9 @@ pub(crate) struct PackagesState {
     /// The saved `[machine]` switch, from the host's config: display only, so the status can
     /// say when a saved switch has not been read yet.
     saved_universal_control: atpkg::config::UniversalControlPolicy,
+    /// The saved `[machine] rosetta` switch, from the host's config (default on), which the
+    /// apply child reads fresh, as it reads the Universal Control one.
+    saved_rosetta: bool,
     /// The last background pass's trouble, until a pass completes since
     /// ([`PackagesService::note_pass_trouble`]).
     pass_trouble: Option<PassTrouble>,
@@ -2051,6 +2055,12 @@ impl PackagesState {
         universal_control: atpkg::config::UniversalControlPolicy,
     ) -> Self {
         self.saved_universal_control = universal_control;
+        self
+    }
+
+    /// Attach the host's saved `[machine] rosetta` switch (`Config::machine_rosetta`).
+    pub(crate) fn with_machine_rosetta(mut self, rosetta: bool) -> Self {
+        self.saved_rosetta = rosetta;
         self
     }
 
@@ -2075,6 +2085,7 @@ impl PackagesState {
             loop_running: false,
             machine: MachinePosture::default(),
             saved_universal_control: atpkg::config::UniversalControlPolicy::Off,
+            saved_rosetta: true,
             pass_trouble: None,
             retired_switch_note: None,
             updated: 0,
@@ -2414,7 +2425,7 @@ impl PackagesState {
         now: std::time::SystemTime,
     ) -> MachineProjection {
         use atpkg::config::UniversalControlPolicy;
-        use atpkg::machine::{HomePosture, UcPosture};
+        use atpkg::machine::{HomePosture, MachineState, RosettaPosture, UcPosture};
         let posture = &self.machine;
         let supported = cfg!(target_os = "macos");
         let state = posture.state.as_ref();
@@ -2425,6 +2436,20 @@ impl PackagesState {
         } else {
             ""
         };
+        // Rosetta 2 is said only when there is something to say: missing, or unread.
+        let rosetta = state.and_then(|s| match (s.rosetta, self.saved_rosetta) {
+            (RosettaPosture::Missing, true) => Some(format!(
+                "Rosetta 2 isn\u{2019}t installed, so Intel apps and tools can\u{2019}t run on \
+                 this Mac{prior}."
+            )),
+            (RosettaPosture::Missing, false) => Some(format!(
+                "Rosetta 2 isn\u{2019}t installed, and aterm leaves it so{prior}."
+            )),
+            (RosettaPosture::Unknown, _) => Some(format!(
+                "aterm couldn\u{2019}t check Rosetta 2 on this Mac{prior}."
+            )),
+            (RosettaPosture::Present | RosettaPosture::NotApplicable, _) => None,
+        });
         let universal_control = match state {
             // No record: either the read has not finished, or it failed.
             None if posture.read_error.is_some() => {
@@ -2467,6 +2492,13 @@ impl PackagesState {
                 crate::session_chrome::relative_age(age_ms)
             )
         });
+        // The record under the saved switches, which the apply child reads fresh (the
+        // record's own `policy=` and `rosetta-policy=` feed only the "Saved:" line).
+        let as_saved = |s: &MachineState| MachineState {
+            policy: self.saved_universal_control,
+            rosetta_wanted: self.saved_rosetta,
+            ..s.clone()
+        };
         let reason = if let Some(error) = posture.read_error.as_deref() {
             Some(format!(
                 "Couldn\u{2019}t read this Mac\u{2019}s settings: {error}"
@@ -2483,10 +2515,9 @@ impl PackagesState {
             // A home that isn't the account's stands in the way of a change
             // only: with the Mac already as chosen there is nothing it blocks.
             let wants_change = state.is_some_and(|s| {
-                atpkg::machine::MachineState {
-                    policy: self.saved_universal_control,
+                MachineState {
                     home: HomePosture::Account,
-                    ..s.clone()
+                    ..as_saved(s)
                 }
                 .next()
             });
@@ -2506,13 +2537,9 @@ impl PackagesState {
         // The verdict: `MachineState::next`, the CLI's, over the measured posture and the
         // saved switch, since the apply child reads the file fresh (the record's own
         // `policy=` feeds only the "Saved:" line). False on any home but the account's.
-        let next = state.is_some_and(|s| {
-            atpkg::machine::MachineState {
-                policy: self.saved_universal_control,
-                ..s.clone()
-            }
-            .next()
-        });
+        let next = state.is_some_and(|s| as_saved(s).next());
+        let uc_next = state.is_some_and(|s| as_saved(s).universal_control_next());
+        let rosetta_next = state.is_some_and(|s| as_saved(s).rosetta_next());
         // A switch saved after the last read: the record's `policy=` came from the file as
         // it was then, so say what the next read or pass will do, never as if measured.
         // Apply Now is named only where it is drawn (something left to do, nothing in the
@@ -2528,7 +2555,7 @@ impl PackagesState {
         let saved = state
             .filter(|s| s.policy != self.saved_universal_control)
             .and_then(|s| match self.saved_universal_control {
-                UniversalControlPolicy::Off if next && reason.is_none() => Some(format!(
+                UniversalControlPolicy::Off if uc_next && reason.is_none() => Some(format!(
                     "Saved: aterm turns Universal Control off {off_when}. Apply Now does it now."
                 )),
                 UniversalControlPolicy::Off if s.universal_control == UcPosture::Disabled => None,
@@ -2550,7 +2577,7 @@ impl PackagesState {
         // why — so "nothing to apply" is claimed only when nothing is in the way.
         let nothing_to_apply = posture.observed && reason.is_none() && !next;
         let next = if next && reason.is_none() {
-            MACHINE_APPLY_WOULD.to_string()
+            machine_apply_would(uc_next, rosetta_next).to_string()
         } else if nothing_to_apply {
             MACHINE_NOTHING_TO_APPLY.to_string()
         } else {
@@ -2562,6 +2589,7 @@ impl PackagesState {
             observed: posture.observed,
             refreshing: posture.refreshing || posture.awaiting_record,
             universal_control,
+            rosetta,
             last_change,
             last_verdict: posture.last_verdict.clone(),
             reason,
@@ -2575,6 +2603,20 @@ impl PackagesState {
 
 /// What Apply Now would do, said under the measured state beside the button.
 pub(crate) const MACHINE_APPLY_WOULD: &str = "Apply Now turns Universal Control off for this Mac.";
+/// What Apply Now would do when only Rosetta 2 is left.
+pub(crate) const MACHINE_APPLY_WOULD_ROSETTA: &str = "Apply Now installs Rosetta 2 on this Mac.";
+/// What Apply Now would do when both are left.
+pub(crate) const MACHINE_APPLY_WOULD_BOTH: &str =
+    "Apply Now turns Universal Control off and installs Rosetta 2 on this Mac.";
+
+/// The Apply Now sentence for what is left: Universal Control, Rosetta 2, or both.
+const fn machine_apply_would(universal_control: bool, rosetta: bool) -> &'static str {
+    match (universal_control, rosetta) {
+        (true, true) => MACHINE_APPLY_WOULD_BOTH,
+        (false, true) => MACHINE_APPLY_WOULD_ROSETTA,
+        _ => MACHINE_APPLY_WOULD,
+    }
+}
 /// The verdict when the Mac already matches the saved choice.
 pub(crate) const MACHINE_NOTHING_TO_APPLY: &str =
     "Nothing to apply: Universal Control is already as you chose.";
@@ -2594,6 +2636,9 @@ pub(crate) struct MachineProjection {
     pub(crate) refreshing: bool,
     /// The measured posture, as a sentence.
     pub(crate) universal_control: String,
+    /// Rosetta 2, as a sentence, when there is something to say: missing, or unread. `None`
+    /// when it is installed, or where it does not apply (an Intel Mac, an older atpkg).
+    pub(crate) rosetta: Option<String>,
     /// `Last change: … · <age>`, when this launch changed something.
     pub(crate) last_change: Option<String>,
     /// The last `atpkg machine apply` verdict this launch, when there is one.
@@ -2943,6 +2988,7 @@ mod tests {
             pass_seq: 0,
             stale_index_only_pass_seq: 0,
             programs,
+            refused_shims: Default::default(),
             extra: Default::default(),
         }
     }
@@ -3697,6 +3743,8 @@ mod tests {
             policy: atpkg::config::UniversalControlPolicy::Off,
             home,
             config_unreadable: false,
+            rosetta: atpkg::machine::RosettaPosture::Present,
+            rosetta_wanted: true,
         }
     }
 
@@ -3971,6 +4019,65 @@ mod tests {
             a.machine.saved.is_some(),
             "the saved switch differs from the record"
         );
+    }
+
+    /// A missing Rosetta 2 is something to apply on its own, with Universal Control already
+    /// off: the status says it is missing and Apply Now names the install, not Universal
+    /// Control. The saved `rosetta = false` turns that off; an installed one says nothing.
+    #[test]
+    fn a_missing_rosetta_is_said_and_applied_on_its_own() {
+        use atpkg::machine::{HomePosture, MachineState, RosettaPosture, UcPosture};
+        let mut service = live_service();
+        let missing = MachineState {
+            rosetta: RosettaPosture::Missing,
+            ..machine_state(UcPosture::Disabled, HomePosture::Account)
+        };
+        let _ = service.replace_machine_state(Ok(missing.clone()));
+        let p = service.state(true, true, true).projection().machine;
+        assert!(
+            p.rosetta
+                .as_deref()
+                .is_some_and(|line| line.starts_with("Rosetta 2 isn\u{2019}t installed, so")),
+            "{:?}",
+            p.rosetta
+        );
+        assert_eq!(p.next, MACHINE_APPLY_WOULD_ROSETTA);
+        assert_eq!(p.apply_enabled, cfg!(target_os = "macos"));
+        assert!(!p.nothing_to_apply);
+        assert!(
+            p.saved.is_none(),
+            "the Universal Control switch did not move"
+        );
+        // Both left: one sentence names both.
+        let _ = service.replace_machine_state(Ok(MachineState {
+            universal_control: UcPosture::Default,
+            ..missing.clone()
+        }));
+        let both = service.state(true, true, true).projection().machine;
+        assert_eq!(both.next, MACHINE_APPLY_WOULD_BOTH);
+        // Saved off: nothing to apply, and the line says it is left so.
+        let _ = service.replace_machine_state(Ok(missing));
+        let off = service
+            .state(true, true, true)
+            .with_machine_rosetta(false)
+            .projection()
+            .machine;
+        assert!(!off.apply_enabled);
+        assert!(off.nothing_to_apply);
+        assert!(
+            off.rosetta
+                .as_deref()
+                .is_some_and(|line| line.contains("leaves it so")),
+            "{:?}",
+            off.rosetta
+        );
+        // Installed: no line, nothing to apply.
+        let _ = service
+            .replace_machine_state(Ok(machine_state(UcPosture::Disabled, HomePosture::Account)));
+        let done = service.state(true, true, true).projection().machine;
+        assert!(done.rosetta.is_none());
+        assert!(done.nothing_to_apply);
+        assert_eq!(done.next, MACHINE_NOTHING_TO_APPLY);
     }
 
     /// A read asked for while one is running is queued behind it, never joined: the running

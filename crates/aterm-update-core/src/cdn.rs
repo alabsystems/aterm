@@ -19,6 +19,7 @@
 /// Whether `segment` may be spliced into a synthesized URL path as-is: non-empty, not
 /// `.`/`..`, and only `[A-Za-z0-9._-]`, so no extra segment, query, fragment, `%` escape,
 /// whitespace or control byte.
+#[inline]
 #[must_use]
 pub fn path_segment_safe(segment: &str) -> bool {
     !segment.is_empty()
@@ -65,6 +66,7 @@ pub fn release_download_url(owner: &str, repo: &str, tag: &str, name: &str) -> O
 /// The metered host. A 403 means rate limit only here; from `github.com` it is a blocked host
 /// or proxy (a private or unpublished asset answers 404 there), and GitHub's web-host throttle
 /// is a 429.
+#[inline]
 #[must_use]
 pub fn is_api_host(url: &str) -> bool {
     url.starts_with("https://api.github.com/")

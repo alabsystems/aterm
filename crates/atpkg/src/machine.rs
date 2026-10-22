@@ -13,6 +13,13 @@
 //! `docs/measured/macos-doctor-universal-control-2026-09-06.md`. The switch is per-host and
 //! per-user (`defaults -currentHost`), no sudo, and one pasted line reverts it:
 //! [`UNIVERSAL_CONTROL_REVERT`].
+//!
+//! Rosetta 2 is Apple's x86_64 translator. On an Apple-silicon Mac the apply installs it
+//! when it is missing ([`apply_rosetta`]), so every ALab Mac has it the way it has the
+//! toolset: `softwareupdate --install-rosetta --agree-to-license`, run as the user, which
+//! needs no administrator (owner ruling R1, docs/DESIGN-machines-2026-10-16.md; measured
+//! 2026-10-18 and 2026-10-21). `[machine] rosetta = false` turns it off; elsewhere it is
+//! inert ([`ROSETTA_APPLIES`]).
 
 use crate::config::UniversalControlPolicy;
 
@@ -281,6 +288,195 @@ pub fn apply_universal_control(
     }
 }
 
+// Rosetta 2: one probe (a stat), one install (`softwareupdate`'s Rosetta verb, as the user).
+
+/// The file whose presence says Rosetta 2 is installed: its runtime, an arm64 Mach-O that
+/// the install lays in `/Library/Apple/usr/libexec/oah/` (with the `runtime`,
+/// `debugserver` and `translate_tool` links) beside `RosettaLinux`, which a Mac without
+/// Rosetta 2 already holds. Measured on macOS 27.0.1, 2026-10-17 and 2026-10-21: before the
+/// install the directory held `RosettaLinux` alone. Read by a `stat`, so the probe runs no
+/// x86_64 code and reaches no WindowServer.
+pub const ROSETTA_RUNTIME: &str = "/Library/Apple/usr/libexec/oah/libRosettaRuntime";
+
+/// Whether this build runs where Rosetta 2 can be missing: macOS on Apple silicon. An Intel
+/// Mac runs x86_64 natively and other systems have no Rosetta, so there `[machine] rosetta`
+/// reads nothing and installs nothing.
+pub const ROSETTA_APPLIES: bool = cfg!(all(target_os = "macos", target_arch = "aarch64"));
+
+/// The `machine-settings:` entry for a Rosetta 2 install (contract string).
+pub const ROSETTA_ENTRY: &str = "rosetta installed";
+
+/// How long the install may take before it is killed and reported as failed. Measured
+/// 2026-10-21: about a second from the package macOS 27 keeps on disk
+/// (`/Library/Updates/Rosetta/OnDemand`); a Mac that has to download it first takes longer.
+pub const ROSETTA_INSTALL_WITHIN: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// Rosetta 2 as read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RosettaPosture {
+    /// [`ROSETTA_RUNTIME`] is there.
+    Present,
+    /// `stat` said it is not there: the install is next.
+    Missing,
+    /// `stat` could not say either way. Never "missing": nothing is installed on it.
+    Unknown,
+    /// Not macOS on Apple silicon ([`ROSETTA_APPLIES`]): nothing was read.
+    NotApplicable,
+}
+
+impl RosettaPosture {
+    /// The wire spelling.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Present => "present",
+            Self::Missing => "missing",
+            Self::Unknown => "unknown",
+            Self::NotApplicable => "not-applicable",
+        }
+    }
+
+    fn parse(s: &str) -> Option<Self> {
+        Some(match s {
+            "present" => Self::Present,
+            "missing" => Self::Missing,
+            "unknown" => Self::Unknown,
+            "not-applicable" => Self::NotApplicable,
+            _ => return None,
+        })
+    }
+
+    /// The doctor's row for this posture under `[machine] rosetta = wanted`, or `None` where
+    /// Rosetta 2 does not apply. `warn` only when the apply would install it; its next step
+    /// is the Remedy the caller attaches (`aterm pkg machine apply`).
+    #[must_use]
+    pub fn doctor_row(self, wanted: bool) -> Option<crate::doctor::Row> {
+        use crate::doctor::{Level, Row};
+        let (level, text) = match (self, wanted) {
+            (Self::NotApplicable, _) => return None,
+            (Self::Present, _) => (
+                Level::Ok,
+                "Rosetta 2 is installed (x86_64 programs run on this Mac)".to_string(),
+            ),
+            (Self::Missing, true) => (
+                Level::Warn,
+                "Rosetta 2 is not installed — x86_64 programs cannot run on this Mac; aterm \
+                 installs it once a day, at the first window or terminal session, as you and \
+                 with no password, unless [machine] rosetta = false"
+                    .to_string(),
+            ),
+            (Self::Missing, false) => (
+                Level::Ok,
+                "Rosetta 2 is not installed, and [machine] rosetta = false leaves it so"
+                    .to_string(),
+            ),
+            (Self::Unknown, _) => (
+                Level::Warn,
+                format!(
+                    "Rosetta 2 could not be read on this Mac ({ROSETTA_RUNTIME} could not be \
+                     checked), so nothing is installed on that reading"
+                ),
+            ),
+        };
+        Some(Row { level, text })
+    }
+}
+
+/// The port to the real machine — one probe, one install — so the policy is testable
+/// against a fake and no test runs `softwareupdate`.
+pub trait RosettaPort {
+    /// Whether [`ROSETTA_RUNTIME`] is there: `Ok(false)` only when `stat` said it is not,
+    /// `Err(why)` when it could not say.
+    fn present(&self) -> Result<bool, String>;
+    /// Run the install once; `Err(why)` unless it exited 0 within
+    /// [`ROSETTA_INSTALL_WITHIN`].
+    fn install(&self) -> Result<(), String>;
+}
+
+/// The real port: a `stat` of [`ROSETTA_RUNTIME`] and `/usr/sbin/softwareupdate
+/// --install-rosetta --agree-to-license` ([`crate::platform::rosetta_install`]).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SystemRosetta;
+
+impl RosettaPort for SystemRosetta {
+    fn present(&self) -> Result<bool, String> {
+        crate::platform::rosetta_present(std::path::Path::new(ROSETTA_RUNTIME))
+    }
+    fn install(&self) -> Result<(), String> {
+        crate::platform::rosetta_install(ROSETTA_INSTALL_WITHIN)
+    }
+}
+
+/// Read Rosetta 2 through `port`, where it applies ([`ROSETTA_APPLIES`]).
+#[must_use]
+pub fn rosetta_posture(port: &dyn RosettaPort) -> RosettaPosture {
+    rosetta_posture_on(ROSETTA_APPLIES, port)
+}
+
+/// [`rosetta_posture`] with where it applies injected.
+fn rosetta_posture_on(applies: bool, port: &dyn RosettaPort) -> RosettaPosture {
+    if !applies {
+        return RosettaPosture::NotApplicable;
+    }
+    match port.present() {
+        Ok(true) => RosettaPosture::Present,
+        Ok(false) => RosettaPosture::Missing,
+        Err(_) => RosettaPosture::Unknown,
+    }
+}
+
+/// What one pass did about Rosetta 2.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RosettaOutcome {
+    /// Not macOS on Apple silicon, or `[machine] rosetta = false`: nothing read, nothing run.
+    NotApplicable,
+    /// Already installed: nothing run.
+    AlreadyPresent,
+    /// Installed by this pass and read back — the `machine-settings:` entry.
+    Installed,
+    /// Nothing changed, and why: the probe could not say, the install failed, or it exited
+    /// 0 and the runtime is still not there.
+    Failed(String),
+}
+
+/// Install Rosetta 2 through `port` where it applies and `[machine] rosetta` wants it:
+/// `Installed` only when this pass ran the install and the runtime then reads present.
+/// Idempotent: an installed Mac reads `AlreadyPresent` on every later pass, and nothing runs.
+#[must_use]
+pub fn apply_rosetta(wanted: bool, port: &dyn RosettaPort) -> RosettaOutcome {
+    apply_rosetta_on(ROSETTA_APPLIES, wanted, port)
+}
+
+/// [`apply_rosetta`] with where it applies injected, so both arms are tested on any host.
+fn apply_rosetta_on(applies: bool, wanted: bool, port: &dyn RosettaPort) -> RosettaOutcome {
+    if !applies || !wanted {
+        return RosettaOutcome::NotApplicable;
+    }
+    match port.present() {
+        Ok(true) => return RosettaOutcome::AlreadyPresent,
+        Ok(false) => {}
+        // An unproven read acts on nothing: a runtime that could not be checked may be there.
+        Err(why) => {
+            return RosettaOutcome::Failed(format!(
+                "{ROSETTA_RUNTIME} could not be checked ({why}), so nothing was installed"
+            ));
+        }
+    }
+    if let Err(why) = port.install() {
+        return RosettaOutcome::Failed(why);
+    }
+    // Read back: an install that did not land is not a change to announce.
+    match port.present() {
+        Ok(true) => RosettaOutcome::Installed,
+        Ok(false) => RosettaOutcome::Failed(format!(
+            "softwareupdate exited 0, but {ROSETTA_RUNTIME} is still not there"
+        )),
+        Err(why) => RosettaOutcome::Failed(format!(
+            "softwareupdate exited 0, but {ROSETTA_RUNTIME} could not be checked ({why})"
+        )),
+    }
+}
+
 // The read verb's state: one byte-stable line the window parses, and the one pure verdict
 // both the CLI's `next —` line and the window's Apply button derive from.
 
@@ -393,20 +589,45 @@ pub struct MachineState {
     /// nothing may be applied ([`crate::config::MachineConfig::unreadable`]). Optional in
     /// the record; absent is `false`.
     pub config_unreadable: bool,
+    /// Rosetta 2 as read ([`rosetta_posture`]). Optional in the record: an atpkg from
+    /// before the setting prints none, read as `NotApplicable`, so no window offers an
+    /// install it cannot see.
+    pub rosetta: RosettaPosture,
+    /// `[machine] rosetta`, resolved. Optional in the record; absent is the default, `true`.
+    pub rosetta_wanted: bool,
 }
 
 impl MachineState {
     /// Whether an apply would change this machine: the CLI's `next —` line and the window's
     /// Apply button both read it, so the two cannot drift. Nothing is next when nothing may
-    /// be applied (a synthetic home, a config whose opt-out could not be read), when the
-    /// policy says leave, or when Universal Control is already off; an unreadable posture is
-    /// applied again, never skipped.
+    /// be applied (a synthetic home, a config whose opt-out could not be read), or when
+    /// neither [`Self::universal_control_next`] nor [`Self::rosetta_next`] holds.
     #[must_use]
     pub fn next(&self) -> bool {
-        self.home == HomePosture::Account
-            && !self.config_unreadable
+        self.universal_control_next() || self.rosetta_next()
+    }
+
+    /// Whether an apply would turn Universal Control off: an apply may run here, the policy
+    /// is off, and it is not already off; an unreadable posture is applied again, never
+    /// skipped.
+    #[must_use]
+    pub fn universal_control_next(&self) -> bool {
+        self.applies_here()
             && self.policy == UniversalControlPolicy::Off
             && !matches!(self.universal_control, UcPosture::Disabled)
+    }
+
+    /// Whether an apply would install Rosetta 2: an apply may run here, `[machine] rosetta`
+    /// wants it, and it read missing. An unreadable runtime is not missing: the apply acts
+    /// on no unproven read ([`apply_rosetta`]).
+    #[must_use]
+    pub fn rosetta_next(&self) -> bool {
+        self.applies_here() && self.rosetta_wanted && self.rosetta == RosettaPosture::Missing
+    }
+
+    /// Nothing stands in the way of an apply: this account's home, a readable config.
+    fn applies_here(&self) -> bool {
+        self.home == HomePosture::Account && !self.config_unreadable
     }
 }
 
@@ -415,13 +636,15 @@ impl MachineState {
 #[must_use]
 pub fn machine_state_line(s: &MachineState) -> String {
     format!(
-        "universal-control={}; policy={}; home={}",
+        "universal-control={}; policy={}; home={}; rosetta={}; rosetta-policy={}",
         s.universal_control.as_str(),
         match s.policy {
             UniversalControlPolicy::Off => "off",
             UniversalControlPolicy::Leave => "leave",
         },
         s.home.as_str(),
+        s.rosetta.as_str(),
+        if s.rosetta_wanted { "install" } else { "leave" },
     ) + if s.config_unreadable {
         "; config=unreadable"
     } else {
@@ -429,15 +652,19 @@ pub fn machine_state_line(s: &MachineState) -> String {
     }
 }
 
-/// Parse a [`machine_state_line`] body. Every field required, order free, unknown keys
-/// ignored (a newer atpkg may add one); a missing or malformed field is `None`, never a
-/// default: a window must not guess a posture.
+/// Parse a [`machine_state_line`] body. The Universal Control fields and `home` are
+/// required, order free, unknown keys ignored (a newer atpkg may add one); a missing or
+/// malformed required field is `None`, never a default: a window must not guess a posture.
+/// The Rosetta fields are optional (an older atpkg prints none: `NotApplicable`, wanted),
+/// and a malformed one is `None` too.
 #[must_use]
 pub fn parse_machine_state(body: &str) -> Option<MachineState> {
     let mut uc = None;
     let mut policy = None;
     let mut home = None;
     let mut config_unreadable = false;
+    let mut rosetta = Some(RosettaPosture::NotApplicable);
+    let mut rosetta_wanted = Some(true);
     for pair in body.split(';') {
         let Some((k, v)) = pair.trim().split_once('=') else {
             continue;
@@ -453,6 +680,14 @@ pub fn parse_machine_state(body: &str) -> Option<MachineState> {
                 }
             }
             "home" => home = HomePosture::parse(v),
+            "rosetta" => rosetta = RosettaPosture::parse(v),
+            "rosetta-policy" => {
+                rosetta_wanted = match v {
+                    "install" => Some(true),
+                    "leave" => Some(false),
+                    _ => None,
+                }
+            }
             // Optional: absent means readable.
             "config" => config_unreadable = v == "unreadable",
             _ => {}
@@ -463,17 +698,21 @@ pub fn parse_machine_state(body: &str) -> Option<MachineState> {
         policy: policy?,
         home: home?,
         config_unreadable,
+        rosetta: rosetta?,
+        rosetta_wanted: rosetta_wanted?,
     })
 }
 
 /// The `[machine]` table as one stable text, what [`record_applied`] keeps and
 /// [`changed_since_applied`] compares, spelled from the table as written (the raw
-/// `Option`s), so an edit is a change even when it lands on a default.
+/// `Option`s), so an edit is a change even when it lands on a default. v3 added `rosetta`:
+/// a stamp an older atpkg wrote reads as changed, so the next pass applies once more and
+/// installs Rosetta 2 where it is missing.
 #[must_use]
 pub fn applied_fingerprint(cfg: &crate::config::MachineConfig) -> String {
     format!(
-        "atpkg-machine-applied v2\nuniversal_control={:?}\nunreadable={}\n",
-        cfg.universal_control, cfg.unreadable
+        "atpkg-machine-applied v3\nuniversal_control={:?}\nrosetta={:?}\nunreadable={}\n",
+        cfg.universal_control, cfg.rosetta, cfg.unreadable
     )
 }
 
@@ -707,6 +946,24 @@ mod tests {
             changed_since_applied(&layout, &spelled_default),
             "spelling out a default is an edit too"
         );
+        // The Rosetta switch is in the table too: turning it off is an edit, and so is
+        // turning it back on, so the next pass installs it again.
+        let no_rosetta = crate::config::parse_machine("[machine]\nrosetta = false\n");
+        assert!(changed_since_applied(&layout, &no_rosetta), "rosetta off");
+        record_applied(&layout, &no_rosetta);
+        assert!(!changed_since_applied(&layout, &no_rosetta));
+        let rosetta_on = crate::config::parse_machine("[machine]\nrosetta = true\n");
+        assert!(
+            changed_since_applied(&layout, &rosetta_on),
+            "rosetta back on"
+        );
+        // A stamp an older atpkg wrote (v2, no rosetta key) reads as changed.
+        std::fs::write(
+            applied_stamp_path(&layout),
+            "atpkg-machine-applied v2\nuniversal_control=None\nunreadable=false\n",
+        )
+        .unwrap();
+        assert!(changed_since_applied(&layout, &default), "a v2 stamp");
         let _ = std::fs::remove_dir_all(&p);
     }
 
@@ -835,14 +1092,25 @@ mod tests {
                     HomePosture::Mismatch,
                     HomePosture::Unresolved,
                 ] {
-                    let s = MachineState {
-                        universal_control: uc,
-                        policy,
-                        home,
-                        config_unreadable: uc == UcPosture::Unknown,
-                    };
-                    let line = machine_state_line(&s);
-                    assert_eq!(parse_machine_state(&line), Some(s.clone()), "{line}");
+                    for rosetta in [
+                        RosettaPosture::Present,
+                        RosettaPosture::Missing,
+                        RosettaPosture::Unknown,
+                        RosettaPosture::NotApplicable,
+                    ] {
+                        for rosetta_wanted in [true, false] {
+                            let s = MachineState {
+                                universal_control: uc,
+                                policy,
+                                home,
+                                config_unreadable: uc == UcPosture::Unknown,
+                                rosetta,
+                                rosetta_wanted,
+                            };
+                            let line = machine_state_line(&s);
+                            assert_eq!(parse_machine_state(&line), Some(s.clone()), "{line}");
+                        }
+                    }
                 }
             }
         }
@@ -852,6 +1120,19 @@ mod tests {
         assert!(parse_machine_state("universal-control=disabled; policy=off").is_none());
         assert!(parse_machine_state(&full.replace("home=account", "home=elsewhere")).is_none());
         assert!(parse_machine_state("").is_none());
+        // A record from an atpkg before the Rosetta setting: not applicable, never missing.
+        let older = parse_machine_state(full).unwrap();
+        assert_eq!(older.rosetta, RosettaPosture::NotApplicable);
+        assert!(older.rosetta_wanted);
+        assert!(!older.rosetta_next());
+        // A Rosetta field that is there and malformed is no record, as for every other.
+        assert!(parse_machine_state(&format!("{full}; rosetta=installed")).is_none());
+        assert!(parse_machine_state(&format!("{full}; rosetta-policy=yes")).is_none());
+        assert_eq!(
+            parse_machine_state(&format!("{full}; rosetta=missing; rosetta-policy=leave"))
+                .map(|s| (s.rosetta, s.rosetta_wanted)),
+            Some((RosettaPosture::Missing, false))
+        );
     }
 
     /// The posture derivation: both keys = disabled, one key = partial, neither = the
@@ -903,6 +1184,8 @@ mod tests {
             policy,
             home: HomePosture::Account,
             config_unreadable: false,
+            rosetta: RosettaPosture::Present,
+            rosetta_wanted: true,
         };
         assert!(!at(Disabled, Off).next(), "everything done");
         assert!(at(Default, Off).next());
@@ -934,10 +1217,211 @@ mod tests {
         );
         let flagged = MachineState {
             config_unreadable: true,
-            ..s
+            ..s.clone()
         };
         let line = machine_state_line(&flagged);
         assert!(line.ends_with("; config=unreadable"), "{line}");
         assert_eq!(parse_machine_state(&line), Some(flagged));
+        // Rosetta 2 missing is next on its own, with Universal Control already off; under
+        // `rosetta = false`, unread, or not applicable it is not, and the refusals hold.
+        let missing = MachineState {
+            rosetta: RosettaPosture::Missing,
+            ..at(Disabled, Off)
+        };
+        assert!(missing.next() && missing.rosetta_next());
+        assert!(!missing.universal_control_next());
+        assert!(
+            MachineState {
+                policy: Leave,
+                ..missing.clone()
+            }
+            .next(),
+            "the Universal Control opt-out is not the Rosetta one"
+        );
+        for (rosetta, rosetta_wanted, why) in [
+            (RosettaPosture::Missing, false, "rosetta = false"),
+            (
+                RosettaPosture::Unknown,
+                true,
+                "an unread runtime is not missing",
+            ),
+            (RosettaPosture::NotApplicable, true, "not Apple silicon"),
+            (RosettaPosture::Present, true, "installed"),
+        ] {
+            let state = MachineState {
+                rosetta,
+                rosetta_wanted,
+                ..missing.clone()
+            };
+            assert!(!state.next(), "{why}");
+        }
+        assert!(
+            !MachineState {
+                home: HomePosture::Mismatch,
+                ..missing.clone()
+            }
+            .next()
+        );
+        assert!(
+            !MachineState {
+                config_unreadable: true,
+                ..missing.clone()
+            }
+            .next()
+        );
+        // Both left: next, and each half says so.
+        let both = MachineState {
+            universal_control: Default,
+            ..missing
+        };
+        assert!(both.universal_control_next() && both.rosetta_next());
+        assert_eq!(s.universal_control_next(), s.next());
+    }
+
+    /// A fake Mac for Rosetta 2: whether the runtime is there, whether the probe can say,
+    /// whether the install succeeds and lands, and how often it ran.
+    struct FakeRosetta {
+        present: Cell<bool>,
+        probe_fails: bool,
+        install_ok: bool,
+        install_lands: bool,
+        installs: Cell<u32>,
+    }
+
+    impl FakeRosetta {
+        fn missing() -> Self {
+            FakeRosetta {
+                present: Cell::new(false),
+                probe_fails: false,
+                install_ok: true,
+                install_lands: true,
+                installs: Cell::new(0),
+            }
+        }
+    }
+
+    impl RosettaPort for FakeRosetta {
+        fn present(&self) -> Result<bool, String> {
+            if self.probe_fails {
+                Err("permission denied".into())
+            } else {
+                Ok(self.present.get())
+            }
+        }
+        fn install(&self) -> Result<(), String> {
+            self.installs.set(self.installs.get() + 1);
+            if !self.install_ok {
+                return Err("softwareupdate exited 1: Package Authoring Error".into());
+            }
+            if self.install_lands {
+                self.present.set(true);
+            }
+            Ok(())
+        }
+    }
+
+    /// The policy over the fake: a missing Rosetta 2 is installed once and read back, an
+    /// installed one is left alone, `rosetta = false` and a Mac where it does not apply run
+    /// nothing, and an unread probe, a failed install and one that did not land are
+    /// failures that install nothing more.
+    #[test]
+    fn rosetta_is_installed_once_where_it_applies_and_never_on_an_unproven_read() {
+        let mac = FakeRosetta::missing();
+        assert_eq!(
+            rosetta_posture_on(true, &mac),
+            RosettaPosture::Missing,
+            "read before the install"
+        );
+        assert_eq!(
+            apply_rosetta_on(true, true, &mac),
+            RosettaOutcome::Installed
+        );
+        assert_eq!(mac.installs.get(), 1);
+        assert_eq!(rosetta_posture_on(true, &mac), RosettaPosture::Present);
+        // Idempotent: the next pass runs nothing and says nothing.
+        assert_eq!(
+            apply_rosetta_on(true, true, &mac),
+            RosettaOutcome::AlreadyPresent
+        );
+        assert_eq!(mac.installs.get(), 1);
+        // The opt-out and a Mac it does not apply to: nothing read, nothing run.
+        for (applies, wanted) in [(true, false), (false, true), (false, false)] {
+            let mac = FakeRosetta {
+                probe_fails: true,
+                ..FakeRosetta::missing()
+            };
+            assert_eq!(
+                apply_rosetta_on(applies, wanted, &mac),
+                RosettaOutcome::NotApplicable
+            );
+            assert_eq!(mac.installs.get(), 0);
+        }
+        assert_eq!(
+            rosetta_posture_on(false, &FakeRosetta::missing()),
+            RosettaPosture::NotApplicable
+        );
+        // An unread probe installs nothing.
+        let unread = FakeRosetta {
+            probe_fails: true,
+            ..FakeRosetta::missing()
+        };
+        assert_eq!(rosetta_posture_on(true, &unread), RosettaPosture::Unknown);
+        assert!(matches!(
+            apply_rosetta_on(true, true, &unread),
+            RosettaOutcome::Failed(why) if why.contains("could not be checked")
+        ));
+        assert_eq!(unread.installs.get(), 0);
+        // A failed install says why; one that exits 0 and lays nothing is no change.
+        let refused = FakeRosetta {
+            install_ok: false,
+            ..FakeRosetta::missing()
+        };
+        assert!(matches!(
+            apply_rosetta_on(true, true, &refused),
+            RosettaOutcome::Failed(why) if why.contains("exited 1")
+        ));
+        let hollow = FakeRosetta {
+            install_lands: false,
+            ..FakeRosetta::missing()
+        };
+        assert!(matches!(
+            apply_rosetta_on(true, true, &hollow),
+            RosettaOutcome::Failed(why) if why.contains("still not there")
+        ));
+        assert_eq!(hollow.installs.get(), 1);
+        // The public door is the compiled answer to where it applies.
+        let mac = FakeRosetta::missing();
+        let expected = if ROSETTA_APPLIES {
+            RosettaOutcome::Installed
+        } else {
+            RosettaOutcome::NotApplicable
+        };
+        assert_eq!(apply_rosetta(true, &mac), expected);
+    }
+
+    /// The doctor's Rosetta rows: none where it does not apply, a warning only when the
+    /// apply would install it or could not read it, and the opt-out read as a choice.
+    #[test]
+    fn the_rosetta_doctor_row_warns_only_where_an_apply_would_act_or_could_not_read() {
+        use crate::doctor::Level;
+        assert!(RosettaPosture::NotApplicable.doctor_row(true).is_none());
+        let row = |p: RosettaPosture, wanted| p.doctor_row(wanted).unwrap();
+        assert_eq!(row(RosettaPosture::Present, true).level, Level::Ok);
+        let missing = row(RosettaPosture::Missing, true);
+        assert_eq!(missing.level, Level::Warn);
+        assert!(
+            missing.text.starts_with("Rosetta 2 is not installed — "),
+            "the fact is the first clause: {}",
+            missing.text
+        );
+        assert!(
+            missing.text.contains("[machine] rosetta = false"),
+            "{}",
+            missing.text
+        );
+        let left = row(RosettaPosture::Missing, false);
+        assert_eq!(left.level, Level::Ok);
+        assert!(left.text.contains("rosetta = false"), "{}", left.text);
+        assert_eq!(row(RosettaPosture::Unknown, true).level, Level::Warn);
     }
 }

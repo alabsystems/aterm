@@ -314,6 +314,7 @@ impl TerminalHandler<'_> {
     /// Record the main grid's absolute row counter as this batch parks it (smcup), before the
     /// swap, for the epilogue's re-pin: output earlier in the batch already advanced it, and
     /// the re-pin must include that advance.
+    #[inline]
     fn park_main_row_counter(&mut self) {
         self.transient.alt_park_main_row_counter = Some(self.grid.absolute_row_counter());
     }
@@ -400,6 +401,7 @@ impl TerminalHandler<'_> {
     /// is up. Found by the astream-term differential oracle
     /// (aterm-conformance `tests/vt_oracle`): a line scrolled in after
     /// `CSI 44 m CSI ? 47 h` came up in the alternate buffer's stale default.
+    #[inline]
     fn sync_bce_template(style: &mut CurrentStyle, grid: &mut Grid) {
         style.update_cached_colors();
         grid.set_cursor_template(
@@ -411,6 +413,7 @@ impl TerminalHandler<'_> {
     /// Count a whole-screen replacement for the resize journal's readers
     /// (`Terminal::screen_replaced_count`): the screen the app painted before it
     /// is gone, so a displacement a resize left on it is gone too.
+    #[inline]
     fn note_screen_replaced(&mut self) {
         self.transient.screen_replaced = self.transient.screen_replaced.wrapping_add(1);
         self.transient.render_debt = crate::terminal::RenderDebt::default();
@@ -418,6 +421,7 @@ impl TerminalHandler<'_> {
 
     /// Copy the scroll region and horizontal margins from one grid to another. In xterm they
     /// are fields of the shared `TScreen`, so switching buffers (47/1047/1049) keeps them.
+    #[inline]
     fn copy_margins(from: &Grid, to: &mut Grid) {
         let region = from.scroll_region();
         to.set_scroll_region(region.top, region.bottom);
@@ -690,6 +694,7 @@ impl TerminalHandler<'_> {
     /// its scroll region would keep shell output out of the scrollback (`copy_margins`
     /// carries it onto the primary screen). An app's own exit, on a screen no prompt
     /// proved dead, keeps its modes: they are its own to reset.
+    #[inline]
     fn take_dead_alt_screen(&mut self) -> bool {
         let dead = self.modes.alternate_screen
             && self.transient.dead_alt_screen == Some(self.transient.screen_replaced);
@@ -728,6 +733,7 @@ impl TerminalHandler<'_> {
     /// region and margins wait for the screen to be left: under a host that is
     /// asked to leave (OpenConsole) its dead buffer keeps them until its switch,
     /// and what the shell draws in between must land alike on both sides.
+    #[inline]
     pub(super) fn release_dead_app_input(&mut self) {
         self.modes.mouse_mode = MouseMode::None;
         self.modes.mouse_encoding = MouseEncoding::X10;
@@ -752,6 +758,7 @@ impl TerminalHandler<'_> {
     /// moved the cursor the host's leave carries the prompt for (measured
     /// 2026-10-18). The window now sends such a report at once (aterm-gui's
     /// `App::sync_cell_pixel_size`); one still queued at the prompt is dropped.
+    #[inline]
     pub(super) fn release_dead_app_reports(&mut self) {
         self.modes.in_band_size_reports = false;
         self.transient.size_report_held = false;
@@ -770,13 +777,15 @@ impl TerminalHandler<'_> {
     /// gets it when that screen comes up ([`Self::send_held_size_report`]). Every later
     /// resize reports as before. A Unix PTY, and an app already on the alternate
     /// screen, get it at once.
-    fn hold_size_report(&self) -> bool {
+    #[inline]
+    const fn hold_size_report(&self) -> bool {
         self.modes.win32_input_enabled && !self.modes.alternate_screen
     }
 
     /// The alternate screen came up: a size report held at the enable
     /// ([`Self::hold_size_report`]) goes out now, at the size the screen has, while
     /// the mode is still on.
+    #[inline]
     fn send_held_size_report(&mut self) {
         if std::mem::take(&mut self.transient.size_report_held) && self.modes.in_band_size_reports {
             super::state_accessors::push_in_band_size_report(
@@ -791,6 +800,7 @@ impl TerminalHandler<'_> {
     /// A shell prompt (`133;A`): the program that turned 2048 on has ended, and the
     /// shell reads the console now, so a size report still held for it
     /// ([`Self::hold_size_report`]) is dropped.
+    #[inline]
     pub(super) fn drop_held_size_report(&mut self) {
         self.transient.size_report_held = false;
     }
@@ -826,6 +836,7 @@ impl TerminalHandler<'_> {
     /// a killed vim's `?2004h` turned the next line into junk and every paste
     /// into `ESC [ 200 ~ … ESC [ 201 ~` (measured 2026-10-18). Off, as DECSTR
     /// leaves it.
+    #[inline]
     pub(super) fn release_dead_app_paste(&mut self) {
         if !self.transient.bracketed_paste_from_prompt {
             self.disable_bracketed_paste();
@@ -835,6 +846,7 @@ impl TerminalHandler<'_> {
     /// conhost is about to repaint over our primary screen (switching the alternate buffer it
     /// was left on, `TransientState::conhost_alt_screen_left_up`, which this consumes): move
     /// the screen's rows into the scrollback first. The cursor stays: both repaints home it.
+    #[inline]
     pub(super) fn keep_screen_from_conhost_repaint(&mut self) {
         if std::mem::take(&mut self.transient.conhost_alt_screen_left_up) {
             self.scroll_screen_into_scrollback();
@@ -865,6 +877,7 @@ impl TerminalHandler<'_> {
             project = "aterm_core::terminal::terminal_modes_conformance::project_modes"
         )
     )]
+    #[inline]
     fn enable_bracketed_paste(&mut self) {
         self.modes.bracketed_paste = true;
     }
@@ -877,6 +890,7 @@ impl TerminalHandler<'_> {
             project = "aterm_core::terminal::terminal_modes_conformance::project_modes"
         )
     )]
+    #[inline]
     fn disable_bracketed_paste(&mut self) {
         self.modes.bracketed_paste = false;
     }
@@ -889,6 +903,7 @@ impl TerminalHandler<'_> {
             project = "aterm_core::terminal::terminal_modes_conformance::project_modes"
         )
     )]
+    #[inline]
     fn enable_mouse_x10_tracking(&mut self) {
         self.modes.mouse_mode = MouseMode::X10;
     }
@@ -901,6 +916,7 @@ impl TerminalHandler<'_> {
             project = "aterm_core::terminal::terminal_modes_conformance::project_modes"
         )
     )]
+    #[inline]
     fn enable_mouse_normal_tracking(&mut self) {
         self.modes.mouse_mode = MouseMode::Normal;
     }
@@ -913,6 +929,7 @@ impl TerminalHandler<'_> {
             project = "aterm_core::terminal::terminal_modes_conformance::project_modes"
         )
     )]
+    #[inline]
     fn enable_mouse_button_event_tracking(&mut self) {
         self.modes.mouse_mode = MouseMode::ButtonEvent;
     }
@@ -925,6 +942,7 @@ impl TerminalHandler<'_> {
             project = "aterm_core::terminal::terminal_modes_conformance::project_modes"
         )
     )]
+    #[inline]
     fn enable_mouse_any_event_tracking(&mut self) {
         self.modes.mouse_mode = MouseMode::AnyEvent;
     }
@@ -937,6 +955,7 @@ impl TerminalHandler<'_> {
             project = "aterm_core::terminal::terminal_modes_conformance::project_modes"
         )
     )]
+    #[inline]
     fn disable_mouse_tracking(&mut self) {
         self.modes.mouse_mode = MouseMode::None;
     }
@@ -949,6 +968,7 @@ impl TerminalHandler<'_> {
             project = "aterm_core::terminal::terminal_modes_conformance::project_modes"
         )
     )]
+    #[inline]
     fn enable_sgr_mouse_encoding(&mut self) {
         self.modes.mouse_encoding = MouseEncoding::Sgr;
     }
@@ -961,6 +981,7 @@ impl TerminalHandler<'_> {
             project = "aterm_core::terminal::terminal_modes_conformance::project_modes"
         )
     )]
+    #[inline]
     fn disable_sgr_mouse_encoding(&mut self) {
         if self.modes.mouse_encoding == MouseEncoding::Sgr {
             self.modes.mouse_encoding = MouseEncoding::X10;
@@ -968,6 +989,7 @@ impl TerminalHandler<'_> {
     }
 
     /// Capture cursor position, style, charset and mode flags.
+    #[inline]
     fn snapshot_cursor_state(&self) -> SavedCursorState {
         SavedCursorState {
             cursor: self.grid.cursor(),

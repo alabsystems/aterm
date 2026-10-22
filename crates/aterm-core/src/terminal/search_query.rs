@@ -94,9 +94,10 @@ impl WrapFrame {
     /// ([`super::SearchLayout::Physical`]): every match is already physical, and
     /// the anchor addresses the index as it is.
     #[must_use]
-    pub(crate) fn unjoined(key: &SearchKey) -> Self {
+    #[inline]
+    pub(crate) const fn unjoined(key: &SearchKey) -> Self {
         Self {
-            cols: usize::from(key.cols),
+            cols: key.cols as usize,
             joined: false,
             logical_anchor: None,
         }
@@ -104,7 +105,8 @@ impl WrapFrame {
 
     /// The stride: display columns one grid row holds.
     #[must_use]
-    pub fn cols(self) -> usize {
+    #[inline]
+    pub const fn cols(self) -> usize {
         self.cols
     }
 
@@ -112,13 +114,15 @@ impl WrapFrame {
     /// starts on, column along that line)`; `None` without an anchor, or when its
     /// run is too deep to walk back over (the walks then take the physical anchor).
     #[must_use]
-    pub fn logical_anchor(self) -> Option<(usize, usize)> {
+    #[inline]
+    pub const fn logical_anchor(self) -> Option<(usize, usize)> {
         self.logical_anchor
     }
 
     /// Carry a physical `(row, col)` point into the joined line's columns,
     /// given the row that line starts on.
-    fn to_logical(cols: usize, origin: usize, row: usize, col: usize) -> (usize, usize) {
+    #[inline]
+    const fn to_logical(cols: usize, origin: usize, row: usize, col: usize) -> (usize, usize) {
         (
             origin,
             row.saturating_sub(origin)
@@ -134,6 +138,7 @@ impl WrapFrame {
     /// record to navigate to, carrying the span the highlight has to paint
     /// across the rows below it.
     #[must_use]
+    #[inline]
     pub fn to_physical(self, m: &SearchMatch) -> SearchMatch {
         if !self.joined {
             return m.clone();
@@ -151,6 +156,7 @@ impl WrapFrame {
     }
 
     /// [`Self::to_physical`] over a whole result set, in place.
+    #[inline]
     fn results_to_physical(self, results: &mut SearchResults) {
         for m in &mut results.matches {
             *m = self.to_physical(m);
@@ -392,12 +398,14 @@ thread_local! {
 }
 
 #[cfg(any(test, debug_assertions))]
+#[inline]
 fn record_narrowed_query() {
     NARROWED_QUERY_STEPS.with(|count| count.set(count.get().saturating_add(1)));
 }
 
 #[cfg(not(any(test, debug_assertions)))]
-fn record_narrowed_query() {}
+#[inline]
+const fn record_narrowed_query() {}
 
 /// Take (read and reset) how many queries on THIS thread were served off a
 /// narrowing frame — the deterministic reach signal for the wiring tests

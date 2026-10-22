@@ -18,6 +18,7 @@ use encode_legacy::{
 };
 
 /// Encode a key press into terminal bytes, legacy or Kitty protocol as `mode` says.
+#[inline]
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn encode_key(key: &Key, modifiers: Modifiers, mode: KeyboardMode) -> Vec<u8> {
@@ -38,6 +39,7 @@ pub fn encode_key(key: &Key, modifiers: Modifiers, mode: KeyboardMode) -> Vec<u8
 /// A modifier key's own bit follows kitty, which reports the state the event leaves: a press
 /// or repeat sets it, and on a release `modifiers` is that state (set only while the key's
 /// other side is still held, [`NamedKey::modifier_twin`]).
+#[inline]
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn encode_key_with_event(
@@ -53,6 +55,7 @@ pub fn encode_key_with_event(
 /// on US QWERTY, whatever the active layout. Under `REPORT_ALTERNATE_KEYS` it is the third
 /// colon-delimited value of the first CSI parameter (`key[:shifted[:base_layout]]`), sent only
 /// when it differs from the key. `None` when the platform cannot tell.
+#[inline]
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn encode_key_with_layout(
@@ -187,6 +190,7 @@ const NON_TEXT_MODIFIERS: Modifiers = Modifiers::CTRL
 
 /// `layout_text` when it may stand for the layout's character on this key: a character key
 /// and a printable glyph. See [`encode_key_with_text`].
+#[inline]
 #[cfg_attr(trust_verify, trust::skip)]
 fn layout_glyph(key: &Key, layout_text: Option<char>) -> Option<char> {
     if !matches!(key, Key::Character(_)) {
@@ -239,6 +243,7 @@ fn ctrl_layout_twin(
 /// stays 'a' though it sits on US 'q'), a non-letter, and a letter on a US digit or
 /// symbol key (AZERTY 'é' on 2, Russian 'б' on comma): those keys mean what their
 /// layout says.
+#[inline]
 #[cfg_attr(trust_verify, trust::skip)]
 #[must_use]
 pub fn layout_letter_twin(layout_char: char, base_layout_key: Option<char>) -> Option<char> {
@@ -252,9 +257,10 @@ pub fn layout_letter_twin(layout_char: char, base_layout_key: Option<char>) -> O
 /// ISO_LEVEL3/5_SHIFT, which `NamedKey` lacks). Kitty reports these only under
 /// REPORT_ALL_KEYS_AS_ESC, and the GUI's press path runs no viewport snap or selection clear
 /// for them (holding Command or Shift is not typing): one list keeps the two gates together.
+#[inline]
 #[cfg_attr(trust_verify, trust::skip)]
 #[must_use]
-pub fn is_modifier_or_lock_key(key: &Key) -> bool {
+pub const fn is_modifier_or_lock_key(key: &Key) -> bool {
     matches!(
         key,
         Key::Named(
@@ -277,6 +283,7 @@ pub fn is_modifier_or_lock_key(key: &Key) -> bool {
     )
 }
 
+#[inline]
 #[cfg_attr(trust_verify, trust::skip)]
 fn should_encode_kitty_event(
     key: &Key,
@@ -340,8 +347,9 @@ const CHORD_MODIFIERS: Modifiers = Modifiers::SHIFT
 /// regardless of modifiers. Keeping this test separate from
 /// [`key_event_needs_csi_u`] matters: modified presses/repeats still need their
 /// unambiguous CSI-u form.
+#[inline]
 #[cfg_attr(trust_verify, trust::skip)]
-fn is_reset_escape_hatch_key(key: &Key) -> bool {
+const fn is_reset_escape_hatch_key(key: &Key) -> bool {
     matches!(
         key,
         Key::Named(NamedKey::Enter | NamedKey::Tab | NamedKey::Backspace)
@@ -355,6 +363,7 @@ fn is_reset_escape_hatch_key(key: &Key) -> bool {
 /// Shift+Tab is `ESC[9;2u`). For compatibility with text-preserving TUIs, aterm also
 /// keeps Backspace's legacy DEL/BS byte with Shift alone. This intentionally loses
 /// that modifier unless report-all is requested; it is not Kitty/Alacritty parity.
+#[inline]
 #[cfg_attr(trust_verify, trust::skip)]
 fn key_event_needs_csi_u(key: &Key, modifiers: Modifiers) -> bool {
     let effective_mods = modifiers & CHORD_MODIFIERS;
@@ -640,8 +649,9 @@ fn associated_text_codepoints(
 /// so `associated_text_codepoints` drops them by the spec's one exclusion (code points below
 /// U+0020), which keeps U+0020 in. Backspace's DECBKM byte (0x7f/0x08) does not matter here:
 /// both are control codes.
+#[inline]
 #[must_use]
-fn named_key_text(named: NamedKey) -> Option<char> {
+const fn named_key_text(named: NamedKey) -> Option<char> {
     Some(match named {
         NamedKey::Space => ' ',
         NamedKey::Enter => '\r',
@@ -674,6 +684,7 @@ fn shift_level(glyph: char) -> char {
 /// shift gives the capital, as macOS composes it and kitty's associated text reports it).
 /// The fallback for a key with no layout text (a controller's `key a mods=caps`); the window
 /// asks it whether the layout's own character differs.
+#[inline]
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn typed_character(c: char, modifiers: Modifiers) -> char {
@@ -693,8 +704,10 @@ pub fn typed_character(c: char, modifiers: Modifiers) -> char {
 /// `'/'`→`'?'`; `c` itself when Shift does not change it), or `None` when SHIFT is not held.
 /// The legacy encoder picks its byte from this, and the GUI's predicted echo reaches it
 /// through [`typed_character`], so a predicted glyph matches the shell's echo.
+#[inline]
+#[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
-pub fn shifted_character(c: char, modifiers: Modifiers) -> Option<char> {
+pub const fn shifted_character(c: char, modifiers: Modifiers) -> Option<char> {
     if !modifiers.contains(Modifiers::SHIFT) {
         return None;
     }
@@ -854,7 +867,8 @@ fn win32_enter_chord(key: &Key, modifiers: Modifiers) -> Option<Win32KeyRecord> 
 /// Every other ESC pair and every complete CSI/SS3 sequence arrives intact, so it keeps its
 /// bytes. (`ESC ESC [ E`, Alt+keypad-5 with NumLock off, is dropped before and after the
 /// switch alike, so it is outside this rule.)
-fn conhost_holds_once_switched(legacy: &[u8]) -> bool {
+#[inline]
+const fn conhost_holds_once_switched(legacy: &[u8]) -> bool {
     match legacy {
         [0x1b] => true,
         [0x1b, second] => matches!(
@@ -1257,11 +1271,13 @@ fn xterm_modify_other_keys_level2_applies(key: &Key, modifiers: Modifiers) -> bo
 }
 
 /// Write a u8 as decimal digits to a buffer.
+#[inline]
 #[cfg_attr(trust_verify, trust::skip)]
 fn write_u8(buf: &mut Vec<u8>, val: u8) {
     write_u32(buf, u32::from(val));
 }
 /// Write a u32 as decimal digits to a buffer.
+#[inline]
 #[cfg_attr(trust_verify, trust::skip)]
 fn write_u32(buf: &mut Vec<u8>, val: u32) {
     if val == 0 {

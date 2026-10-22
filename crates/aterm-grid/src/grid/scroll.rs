@@ -38,6 +38,7 @@ impl Grid {
     ///
     /// Machine motion: it does not bump `reader_live_bottom_gen`; the reader's
     /// End press is `scroll_to_bottom`, which bumps for itself.
+    #[inline]
     pub(crate) fn reset_display_offset_with_damage(&mut self) {
         let old_offset = self.storage.display_offset;
         if old_offset == 0 {
@@ -51,6 +52,7 @@ impl Grid {
     /// Mark scroll damage: targeted rows for small scrolls, full for large.
     /// Rows moved into scrollback, so this bumps `content_gen`; pure viewport
     /// scrolls (`scroll_display`) do not come here.
+    #[inline]
     fn mark_scroll_damage(&mut self, n: usize) {
         let visible_rows = self.storage.visible_rows;
         self.storage.mark_content_scroll(visible_rows, n);
@@ -62,6 +64,7 @@ impl Grid {
     /// was non-zero and the offset is now zero. An End already at the live
     /// bottom moved nothing, and the machine putting a reader there is not
     /// their choice. `scrollback_offload`'s re-attach reads the count.
+    #[inline]
     fn note_reader_descent_to_live_bottom(&mut self, before: usize) {
         if before != 0 && self.storage.display_offset == 0 {
             self.storage.reader_live_bottom_gen += 1;
@@ -75,6 +78,7 @@ impl Grid {
     /// `display_offset == 0` precondition of the VT row arithmetic, so it must
     /// not touch `reader_live_bottom_gen`: otherwise every output batch arriving
     /// while someone reads history would look like the reader pressing End.
+    #[inline]
     pub fn pin_viewport_to_live_for_output_batch(&mut self) {
         self.reset_display_offset_with_damage();
         debug_assert_eq!(self.storage.display_offset, 0);
@@ -761,7 +765,8 @@ impl Grid {
     /// worker (which calls [`drain_lazy_bounded`](Self::drain_lazy_bounded) in
     /// bounded batches), keeping the LZ4 promotion spike off the PTY-drain
     /// critical path. Idempotent; set once at session setup.
-    pub fn set_compress_offload_active(&mut self, active: bool) {
+    #[inline]
+    pub const fn set_compress_offload_active(&mut self, active: bool) {
         self.storage.compress_offload_active = active;
     }
 

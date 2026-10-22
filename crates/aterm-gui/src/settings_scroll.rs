@@ -16,51 +16,67 @@
 //! (rows, words, controls; not the card padding under them) ends on the
 //! screen: in the room, or, for the words under a stop's controls (a row's
 //! facts, its note), in the strip under the room while no bar takes it
-//! ([`ScrollPlan::view`]). The screen draws what it shows whole and at full
-//! strength, live where it holds words, its peek fading only under that
-//! ([`ScrollPlan::screen`]): a row's second line drawn in the strip was a
-//! row shown whole that Page Down turned onto again. The scroll's bound,
-//! Page Up and Down, the keyboard's reveal and what the screen draws all
-//! read that one measure, so a stop a screen shows is never shown again by
-//! the next, and none it draws whole goes uncounted. Page Down turns to the
-//! stop after the last the screen shows ([`ScrollPlan::page_after`]); Page
-//! Up to the screen that ends on the stop before its first, seated at a stop
-//! where one does and else scrolled so that stop ends at the room's edge, as
-//! the last screen is ([`ScrollPlan::page_up`]). Only a turn that reaches an
-//! end of the list — its full last screen, its first — shows again what the
-//! screen before showed, as a platform list's last page does.
+//! ([`ScrollPlan::view`]) — the list's last stop as every other, with the
+//! list's end. ONE BOUNDARY: the screen draws what it shows whole, live and
+//! at full strength, down to the first control after those stops that the
+//! room does not hold whole; from there it draws its peek, a picture fading
+//! out to the list's bottom, never live ([`ScrollPlan::screen`]): a row whose
+//! switch ran a few points past the room's edge was painted at full strength,
+//! live above the edge only, and Page Down turned onto it again. The scroll's
+//! bound, Page Up and Down, the keyboard's reveal and what the screen draws
+//! all read that one measure, so a stop a screen shows is never shown again
+//! by the next, and none it draws whole goes uncounted. Page Down turns to
+//! the stop after the last the screen shows ([`ScrollPlan::page_after`]);
+//! Page Up to the screen that ends on the stop before its first, seated at a
+//! stop where one does and else scrolled so that stop ends at the room's
+//! edge, as the last screen is ([`ScrollPlan::page_up`]). The bound is the
+//! least first stop whose screen, as it draws, shows it and every stop after
+//! it ([`ScrollPlan::limit`]), so no turn onto the last screen only moves the
+//! list. Only a turn that reaches an end of the list — its full last screen,
+//! its first — shows again what the screen before showed, as a platform
+//! list's last page does. The wheel, the arrows and a reader's scroll move a
+//! stop at a time, passing over a note on the rows over it that its row
+//! shows with it ([`ScrollPlan::passes_over`]).
 //!
-//! THE EDGE RULE ([`UiNode::room`]): whatever part of a control shows inside
-//! the room is live, at both of the list's edges; a press on one an edge cuts
+//! THE EDGE RULE ([`UiNode::room`]): a control the list's top edge cuts is
+//! live where it shows — drawn with its name, else not drawn at all, as is a
+//! sliver of one ([`crate::native_ui::LIST_PEEK_MIN`]) — and a press on one
 //! scrolls it whole by its hidden part and no more, so it stays under the
 //! pointer that pressed it, as a platform list scrolls a clicked row into
-//! view: one the room's bottom edge cuts is nudged up to end at that edge
-//! ([`ScrollPlan::press_seat_span`]), and one cut at the last screen's top comes
-//! down to the screen that starts with its stop. The list holds the place the
+//! view: it comes down to start where the room does
+//! ([`ScrollPlan::press_seat_span`]). A control past the stops the screen
+//! shows is its peek: a press on its picture scrolls it whole into the room,
+//! ending at the room's edge, and works nothing
+//! ([`SettingsViewState::press_list_picture`]). The list holds the place the
 //! nudge gave it, as a platform list holds where a click scrolled it, until
 //! something scrolls it ([`SettingsViewState::drop_list_nudge`]): the next
 //! press, or the keyboard, on a control it shows whole moves nothing. The
 //! strip under the room, which the page keeps for a status bar that is not
-//! up, holds no control: the words under the controls of the last stop the
-//! screen shows, drawn whole, and under them only a picture — the peek of
-//! the stops after the screen, drawn on to the page's bottom so no screen
-//! ends on a band of blank, fading out and never live — so the bar that
+//! up, holds no live control: the words under the controls of the last stop
+//! the screen shows, drawn whole, and under them only the peek, drawn on to
+//! the page's bottom so no screen ends on a band of blank — so the bar that
 //! comes takes nothing a person can press and no row moves for it (a bar
 //! over a shown row's facts covers those words, and the keyboard on that
-//! row keeps its place). On the last screen the stop before the screen's first
-//! peeks in over the top, cut at the list's top edge and live where it shows,
-//! so the last stop ends at the room's edge and that screen is as full as
-//! every other.
+//! row keeps its place). On the last screen the stop before the screen's
+//! first peeks in over the top, cut at the list's top edge, and the list's
+//! end sits as low as the page lets it — on into the strip while no bar takes
+//! it, at the room's edge while one does ([`ScrollPlan::last_screen`]) — so
+//! that screen is as full as every other; a bar that comes holds the place
+//! the last screen drew, and a scroll to the end with the bar up shows the
+//! last card whole ([`SettingsViewState::seat_scroll`]).
 //!
 //! A HARD EDGE NEVER CUTS THROUGH A CAPTION, AND NO SCREEN ENDS ON BLANK
-//! UNDER A CARD IT CUTS: where no strip fades under the room, the screen
-//! draws on to the page's bottom and its edge cuts the card that crosses it
-//! there, live where it shows; a caption the edge would cut through paints
-//! none of its words, the card's border, padding and backdrop going on to
-//! the edge ([`ScrollPlan::screen`]). Where no card after the screen shows
-//! [`PEEK_MIN`] of itself, the screen ends on its last card's boundary, and
-//! the next screen starts at the card after it. Where the strip fades, the
-//! peek is a picture drawn on to the page's bottom.
+//! UNDER A CARD IT CUTS: the screen draws on to the page's bottom, its peek
+//! fading from where the stops it shows end — in the strip, and in the room
+//! where no strip is kept (a bar is up, the page keeps none); where nothing
+//! fades at the edge, a caption the edge would cut through paints none of
+//! its words, the card's border, padding and backdrop going on to the edge
+//! ([`ScrollPlan::screen`]). Where no card after the screen shows
+//! [`PEEK_MIN`] of itself, a screen that is not the list's first scrolls on
+//! into its first card's padding until the next card peeks in
+//! ([`ScrollPlan::peek_seat`]); the list's first screen, and one whose first
+//! stop has too little padding over it, ends on its last card's boundary,
+//! the next screen starting at the card after it.
 //!
 //! A LIST IN A PANEL SNAPPED TO ITS ROWS ENDS ON WHOLE STOPS
 //! ([`ListFoot::Whole`]: Settings ▸ Themes' chooser, beside the demo or
@@ -92,8 +108,9 @@ use super::{SettingsRoute, SettingsViewState};
 
 /// The least of a card a list's edge leaves in view that reads as the card
 /// going on — its border, its corners and some of its padding
-/// ([`ScrollPlan::screen`]).
-pub(super) const PEEK_MIN: f32 = 16.0;
+/// ([`ScrollPlan::screen`]) — and the least of a control an edge leaves in
+/// view (the compiler's one rule for both, [`crate::native_ui::LIST_PEEK_MIN`]).
+pub(super) const PEEK_MIN: f32 = crate::native_ui::LIST_PEEK_MIN;
 
 /// The strip under a list a page keeps for a status bar ([`seat_room`]): how
 /// tall it is now — none while a bar is up and takes it — and how tall the
@@ -149,6 +166,11 @@ pub(super) struct ScrollPlan {
     captions: Vec<Option<(f32, f32)>>,
     /// Each stop's own caption, a whole card's leading heading.
     card_captions: Vec<Option<CardCaption>>,
+    /// Whether each stop is A NOTE ON THE ROWS OVER IT ([`notes_rows_over`],
+    /// a run's shared note): words that say how the rows above stand, and
+    /// so no seat for a scroll by stops where they and their row fit one
+    /// screen ([`Self::passes_over`]).
+    notes: Vec<bool>,
     /// The gap each group's card sets between its rows, which each of its
     /// stops carries as its share ([`Self::set_row_gap`]): a run's rows end
     /// that much above the sum of its stops.
@@ -186,9 +208,9 @@ pub(super) struct ScrollPlan {
     /// The strip under the list kept for a status bar that is not up: the
     /// screen draws its peek on into it ([`ScrollPlan::screen`]).
     overhang: f32,
-    /// The strip the page keeps for a bar whether or not one is up: the last
-    /// card's padding may fall in it, so where the list's end sits is the same
-    /// with a bar and without.
+    /// The strip the page keeps for a bar whether or not one is up: what a
+    /// screen's own seat is measured to ([`Self::peek_seat`]), so a bar that
+    /// comes moves no row of it.
     kept: f32,
     /// What the screens give up to a plain status whose bar is taller than
     /// the room the page kept for one ([`Self::give_to_status`]): a screen
@@ -296,8 +318,11 @@ pub(super) struct Screen {
     pub(super) offset: f32,
     /// How tall the list draws.
     pub(super) height: f32,
-    /// How far from the list's top what it draws is live: its room, or a
-    /// first stop taller than that.
+    /// How far from the list's top what it draws is live and at full
+    /// strength — its room, a first stop taller than that, the words of its
+    /// last shown stop under the room — never past the first control after
+    /// the stops it shows that the room does not hold whole, where its peek
+    /// starts ([`ScrollPlan::live_on`]).
     pub(super) live: f32,
     /// Whether the list goes on past the screen, so the strip under its room
     /// holds a peek that fades.
@@ -309,12 +334,14 @@ pub(super) struct Screen {
     /// the run's rows scroll under it, or let go — its words the top edge
     /// cuts then paint nothing ([`ScrollPlan::top_caption`]).
     pub(super) caption: Option<TopCaption>,
-    /// Where a hard edge — no strip fading under the room — cuts through the
-    /// caption of the card the screen draws last, and where that caption
-    /// ends, both from the card's top: the words it cuts paint nothing, and
-    /// the card's border, padding and backdrop fill on to the edge
-    /// ([`ScrollPlan::edge_caption`]), so the screen never ends on a caption
-    /// cut through its words nor on a band of blank under the card it cuts.
+    /// Where a hard edge — no fade under the room: no strip, and no control
+    /// past the stops the screen shows for its peek to fade from — cuts
+    /// through the caption of the card the screen draws last, and where that
+    /// caption ends, both from the card's top: the words it cuts paint
+    /// nothing, and the card's border, padding and backdrop fill on to the
+    /// edge ([`ScrollPlan::edge_caption`]), so the screen never ends on a
+    /// caption cut through its words nor on a band of blank under the card
+    /// it cuts.
     pub(super) edge_caption: Option<(f32, f32)>,
     /// Whether the screen lets go of the caption of the run it starts in,
     /// scrolled off whole by its lead, so its first stop is drawn whole
@@ -386,6 +413,12 @@ impl ScrollPlan {
         self.gap
     }
 
+    /// The seat the render chose off its stops ([`Self::seated`]).
+    #[cfg(test)]
+    pub(super) const fn seat(&self) -> Option<Seat> {
+        self.seated
+    }
+
     /// Whether stop `index` draws anything: words, a control, a picture.
     #[cfg(test)]
     pub(super) fn paints(&self, index: usize) -> bool {
@@ -428,6 +461,7 @@ impl ScrollPlan {
             .push((!keys.is_empty()).then_some(height));
         self.previews.push(Vec::new());
         self.card_captions.push(None);
+        self.notes.push(false);
         self.groups.push(None);
         self.control_rows.push(if keys.is_empty() {
             Vec::new()
@@ -453,6 +487,7 @@ impl ScrollPlan {
             .insert(index, (!keys.is_empty()).then_some(height));
         self.previews.insert(index, Vec::new());
         self.card_captions.insert(index, None);
+        self.notes.insert(index, false);
         self.groups.insert(index, None);
         self.control_rows.insert(
             index,
@@ -566,6 +601,51 @@ impl ScrollPlan {
         }
     }
 
+    /// Say that the last stop added is a note on the rows over it
+    /// ([`Self::notes`]).
+    pub(super) fn set_note(&mut self, note: bool) {
+        if let Some(last) = self.notes.last_mut() {
+            *last = note;
+        }
+    }
+
+    /// Whether stop `index` is a row whose run goes on with a note on the
+    /// rows over it ([`Self::notes`]) that a screen seated at the row shows
+    /// with it — the two fit one screen ([`Self::passes_over`]).
+    fn paired(&self, index: usize) -> bool {
+        let next = index + 1;
+        if next >= self.len()
+            || !self.notes[next]
+            || self.notes[index]
+            || self.control_rows[index].is_empty()
+            || self.starts_run(next)
+        {
+            return false;
+        }
+        let at = self.lead_of(index) - self.seat_drop(index);
+        let at_note = self.next_top(at, next);
+        self.shows_at(at, index, self.room)
+            && if next + 1 == self.len() {
+                self.shows_end_at(at_note, next)
+            } else {
+                self.shows_at(at_note, next, self.room)
+            }
+    }
+
+    /// Whether stop `index` is no seat for a scroll by stops — the wheel,
+    /// the arrows, a reader's scroll: a note its row shows with it
+    /// ([`Self::paired`]). A scroll a stop at a time from that row would take
+    /// the row off the screen and leave its note alone at the top, under its
+    /// card's repeated caption, cut off from what it explains (Settings ▸
+    /// Harness at 102x29: the Gemini row's note, "Off, aterm leaves that
+    /// agent's sessions alone…", alone under SUPERVISION); it scrolls on past
+    /// the note instead. Page Down reads on from the row onto the note, as a
+    /// page turn does, and a note that cannot share a screen with its row
+    /// stands alone where it must.
+    pub(super) fn passes_over(&self, index: usize) -> bool {
+        index > 0 && index < self.len() && self.paired(index - 1)
+    }
+
     /// Say where each control the last stop added holds sits in it: its
     /// key, where it starts and how tall it is.
     pub(super) fn set_control_spans(&mut self, spans: Vec<(UiKey, f32, f32)>) {
@@ -660,19 +740,30 @@ impl ScrollPlan {
             + self.groups[index].map_or(0.0, |group| self.closing(group))
     }
 
-    /// How far down a screen whose first stop is `from` stop `index` must
-    /// draw to be SHOWN: its content — and, for the list's last stop, its
-    /// card's padding past what the page keeps for a status bar, so the end
-    /// of the list is on screen.
-    fn shown_by(&self, from: usize, index: usize) -> f32 {
-        let end = self.stop_top(from, index) + self.ink[index];
-        if index + 1 < self.len() {
-            return end;
-        }
-        let bottom = self.stop_top(from, index)
-            + self.heights[index]
-            + self.groups[index].map_or(0.0, |group| self.closing(group));
-        end.max(bottom - self.kept)
+    /// How far under stop `index`'s top what it draws ends where it is the
+    /// list's last stop: its words, and its card's closing padding under it
+    /// — THE LIST'S END ([`Self::shows_end_at`]).
+    fn end_under(&self, index: usize) -> f32 {
+        (self.heights[index] + self.groups[index].map_or(0.0, |group| self.closing(group)))
+            .max(self.ink[index])
+    }
+
+    /// THE LIST'S LAST STOP IS SHOWN AS EVERY STOP IS, AND THE LIST'S END
+    /// WITH IT: drawn from `at` under the list's top, its controls whole in
+    /// the room and all its card draws down to its bottom border — its words
+    /// and its closing padding, the end of the list — on the screen: in the
+    /// room, or in the strip under it while that strip is the list's (no bar
+    /// takes it, [`Self::overhang`]), as the words under any stop's controls
+    /// may end there ([`Self::shows_at`]). Measured against the room alone,
+    /// a screen that drew the last stop whole, its note in the strip, did
+    /// not count it, and the next Page Down only scrolled the list a few
+    /// points to put that note in the room (Cursor Styles at 150x48 with
+    /// Beam saved: 4pt, nothing new); and with a bar up, the last card's
+    /// padding the page kept for that bar was cut by the room's edge on every
+    /// screen, End too (Terminal at 102x29, Modified at 80x24).
+    fn shows_end_at(&self, at: f32, index: usize) -> bool {
+        at + self.controls_of(index).1 <= self.room + 0.01
+            && at + self.end_under(index) <= self.room + self.overhang + 0.01
     }
 
     /// A row of `group`, `height` tall with its share of the card's gaps.
@@ -684,6 +775,7 @@ impl ScrollPlan {
             .push((!keys.is_empty()).then_some(height));
         self.previews.push(Vec::new());
         self.card_captions.push(None);
+        self.notes.push(false);
         self.groups.push(Some(group));
         self.control_rows.push(if keys.is_empty() {
             Vec::new()
@@ -739,9 +831,10 @@ impl ScrollPlan {
             + runs.len().saturating_sub(1) as f32 * self.gap
     }
 
-    /// The stops a screen whose first stop is `top` SHOWS: every one from
-    /// there whose content ends in the room ([`Self::shown_by`]), and the
-    /// first whatever its height.
+    /// The stops a screen seated at its first stop `top` SHOWS: every one
+    /// from there that is shown where it is ([`Self::shows_at`]; the list's
+    /// last stop with the list's end, [`Self::shows_end_at`]), and the first
+    /// whatever its height.
     pub(super) fn view(&self, top: usize) -> Range<usize> {
         let n = self.len();
         if n == 0 {
@@ -756,7 +849,7 @@ impl ScrollPlan {
         while end < n {
             at = self.next_top(at, end);
             let shown = if end + 1 == n {
-                self.shown_by(top, end) - drop <= self.room + 0.01
+                self.shows_end_at(at, end)
             } else {
                 self.shows_at(at, end, self.room)
             };
@@ -774,26 +867,108 @@ impl ScrollPlan {
     /// in the room, or the words under its controls in the strip under the
     /// room while that strip is the list's ([`Self::overhang`]: no bar takes
     /// it). A stop with no control is shown where all of it is in the room.
-    /// The list's last stop is measured by [`Self::shown_by`], so the list's
-    /// end is reached in the room.
+    /// The list's last stop is measured with the list's end where the bound
+    /// and the seat are concerned ([`Self::shows_end_at`]).
     fn shows_at(&self, at: f32, index: usize, room: f32) -> bool {
         at + self.controls_of(index).1 <= room + 0.01
             && at + self.ink[index] <= room + self.overhang + 0.01
     }
 
-    /// The last first stop the list scrolls to: the least whose screen shows
-    /// the last stop, so the last screen is full and no screen before it
-    /// already shows everything after it.
+    /// The last first stop the list scrolls to: the least whose screen, AS
+    /// IT DRAWS — the last screen ([`Self::last_screen`]), its end where the
+    /// page lets the list's end sit — shows it and every stop after it, so
+    /// the last screen is full and no screen before it already draws whole
+    /// everything after it: no turn onto the last screen shows only what the
+    /// screen before it drew whole. Measured on the stops' seat, the bound
+    /// stood a stop past the screen that drew the last stop whole, and the
+    /// turn onto it only moved the list (Cursor Styles at 150x48 with Beam
+    /// saved: the Adjust card 4pt up, its list 32pt shorter). A list that
+    /// ends on whole stops is seated there ([`ListFoot::Whole`]).
     pub(super) fn limit(&self) -> usize {
         let n = self.len();
         if n == 0 {
             return 0;
         }
         let mut top = n - 1;
-        while top > 0 && self.view(top - 1).end >= n {
+        while top > 0 && self.ends_on(top - 1) {
             top -= 1;
         }
         top
+    }
+
+    /// Whether the screen whose first stop is `top`, drawn as the list's
+    /// last screen, shows `top` and every stop after it ([`Self::limit`]),
+    /// the caption of the run it starts in kept as that stop's own seat
+    /// keeps it ([`Self::starts_bare`]): no screen lets a caption go only to
+    /// reach the list's end a stop sooner — two rows under their caption at
+    /// the end of a list that one screen holds whole only with the caption
+    /// scrolled off were drawn on no screen under it.
+    pub(super) fn ends_on(&self, top: usize) -> bool {
+        let n = self.len();
+        if self.foot == ListFoot::Whole {
+            return self.view(top).end >= n;
+        }
+        let screen = self.last_screen(top);
+        if screen.bare && !self.starts_bare(top) {
+            return false;
+        }
+        let shown = self.shown_on(&screen.drawn, screen.offset, screen.caption);
+        !shown.is_empty() && shown.start <= top && shown.end >= n
+    }
+
+    /// THE LAST SCREEN whose first stop is `top`: from the stops before it,
+    /// the least that fill it, scrolled so the list's end sits as low as the
+    /// page lets it — on into the strip under the room while no bar takes
+    /// that strip, at the room's edge while one does — and never so low that
+    /// the last stop's controls leave the room ([`Self::shows_end_at`]).
+    /// The stop before the screen's first peeks in over the top, cut at the
+    /// list's top edge. Its end is where the list's end is with the strip
+    /// as it is now: a bar that comes over it holds the place it drew
+    /// ([`SettingsViewState::seat_scroll`]), so no row moves for the bar,
+    /// and a scroll to the end with the bar up shows the last card whole in
+    /// the room the bar leaves.
+    fn last_screen(&self, top: usize) -> Screen {
+        let n = self.len();
+        let top = top.min(n - 1);
+        let reach = self.room + self.overhang;
+        let anchor = (self.room + self.end_under(n - 1) - self.controls_of(n - 1).1)
+            .min(reach)
+            .max(self.room.min(reach));
+        let mut start = top;
+        while start > 0 && self.span(start..n) + 0.5 < anchor {
+            start -= 1;
+        }
+        let bottom = self.span(start..n);
+        let offset = (bottom - anchor).max(0.0);
+        let height = (bottom - offset).min(reach).max(self.room.min(bottom));
+        // The last screen that starts with a stop lets its run's caption go
+        // where keeping it would cut that stop: one the caption leaves no
+        // room whole ([`Self::starts_bare`]), or one the scroll to the
+        // list's end (its last card's closing padding) would carry under
+        // the caption kept over it — Window's Build badge row at 220x12 at
+        // 2× text, the last stop, was cut 8pt under BUILD BADGE on the only
+        // screen that drew it. Its caption scrolls with it then, whole or
+        // its cut words not drawn.
+        let bare = start == top && (self.starts_bare(start) || offset > self.ink_top[start] + 0.01);
+        let caption = self
+            .top_caption(start..n, offset)
+            .map(|caption| TopCaption {
+                kept: caption.kept && !bare,
+                ..caption
+            });
+        let drawn = start..n;
+        Screen {
+            view: top..n,
+            live: self.live_on(&drawn, offset, caption, self.room),
+            drawn,
+            offset,
+            height,
+            fades: false,
+            whole: false,
+            caption,
+            edge_caption: None,
+            bare,
+        }
     }
 
     /// The first stop of the screen that shows the stops just before `top`
@@ -838,7 +1013,7 @@ impl ScrollPlan {
         }
         let lead = self.lead_of(0);
         let first = if n == 1 {
-            self.shown_by(0, 0)
+            (lead + self.controls_of(0).1).max(lead + self.end_under(0) - self.overhang)
         } else {
             (lead + self.controls_of(0).1).max(lead + self.ink[0] - self.overhang)
         };
@@ -876,14 +1051,16 @@ impl ScrollPlan {
     /// rows under a 50pt caption in a 156pt list, each whole on its bare
     /// screen) read as cut, and kept the page from listing its preview,
     /// which left its 92pt style tiles an 88pt list. THE LIST'S LAST STOP is
-    /// measured as the last screen draws it: no strip under that screen, so
-    /// what it draws ends at the room's edge, its top cut where it is
-    /// taller than the room — Manual's row for a key only aterm.toml holds,
-    /// 74pt in the 68pt list of 220x12 at 2× text, its words "shown" in a
-    /// strip the last screen does not have, was whole on no screen.
+    /// measured as the last screen draws it ([`Self::last_screen`]): its
+    /// controls in the room and its card down to the list's end on the
+    /// screen, its top cut where those are taller than that — Manual's row
+    /// for a key only aterm.toml holds, 74pt in the 68pt list of 220x12 at
+    /// 2× text, was whole on no screen.
     fn cuts(&self, index: usize) -> bool {
         if index + 1 == self.len() {
-            return self.ink[index] - self.ink_top[index] > self.room + 0.01;
+            let top = self.ink_top[index];
+            return self.controls_of(index).1 - top > self.room + 0.01
+                || self.end_under(index) - top > self.room + self.overhang + 0.01;
         }
         let at = self.lead_of(index) - self.seat_drop(index);
         at + self.controls_of(index).1 > self.room + 0.01
@@ -1224,6 +1401,33 @@ impl ScrollPlan {
         }
     }
 
+    /// The control of stop `index` the keyboard can be held on where the
+    /// screen whose first stop is `top` draws it live
+    /// ([`Self::draws_control_live`]): `key`, the control the stop is listed
+    /// by, where it is drawn live, else the first other control the stop
+    /// holds that is. A segmented control wrapped onto lines is listed by
+    /// its selected segment, which may sit on a line under the room's edge
+    /// while the line over it is drawn live: Keyboard & Input's Predictive
+    /// echo at 22x24 at 2× text, whose Page Down found no control it could
+    /// hold the keyboard on and left it on Option as Meta, a screen back.
+    pub(super) fn live_control<'a>(
+        &'a self,
+        index: usize,
+        key: &'a UiKey,
+        top: usize,
+    ) -> Option<&'a UiKey> {
+        if self.draws_control_live(index, key, top) {
+            return Some(key);
+        }
+        self.spans
+            .get(index)?
+            .iter()
+            .find(|(_, from, height)| {
+                self.draws_live(index, top, std::iter::once((*from, *height)))
+            })
+            .map(|(span, _, _)| span)
+    }
+
     /// Whether the screen whose first stop is `top`, as it draws, draws some
     /// of the parts of stop `index` at `spans` (each `(from, height)` under
     /// the stop's top) live: inside its room, under the caption it keeps,
@@ -1241,7 +1445,11 @@ impl ScrollPlan {
         let at = self.stop_top(screen.drawn.start, index) - screen.offset;
         let floor = self.caption_floor(screen.caption, &screen.drawn, index);
         let live = screen.live.min(self.room);
-        spans.any(|(from, height)| at + from < live - 0.5 && at + from + height > floor + 0.5)
+        // One the top edge cuts may be drawn without its name, and so not
+        // at all ([`crate::native_ui::LIST_PEEK_MIN`]'s rule): never counted.
+        spans.any(|(from, height)| {
+            at + from < live - 0.5 && at + from >= floor - 0.5 && at + from + height > floor + 0.5
+        })
     }
 
     /// What the screen whose first stop is `top` draws (THE ONE MEASURE): the
@@ -1334,100 +1542,124 @@ impl ScrollPlan {
                 bare: false,
             };
         }
-        if view.end < n {
-            // THE SCREEN ENDS ON A CUT: it draws the stops after its own down
-            // to the last any of which shows — a card after a gap it starts
-            // only where [`PEEK_MIN`] of it does, a few points reading as a
-            // stray line. Rows that touch (a list box's) go on as a group's
-            // rows do: any of one that shows is drawn.
-            let shows = |stop: usize| {
-                if self.starts_run(stop) && self.gap > 0.01 {
-                    self.card_top(view.start, stop) <= reach - PEEK_MIN + 0.01
-                } else {
-                    self.stop_top(view.start, stop) < reach - 0.01
-                }
-            };
-            let mut end = view.end;
-            while end < n && shows(end) {
-                end += 1;
-            }
-            // NO SCREEN ENDS ON BLANK UNDER A CUT: it draws on to the page's
-            // bottom. A hard edge — no strip fading under the room: a bar is
-            // up, or the page keeps none — cuts the card that crosses it
-            // there, live where it shows (the edge rule), and where it would
-            // cut through that card's caption the caption's cut words paint
-            // nothing, its border, padding and backdrop filling on to the edge
-            // ([`Self::edge_caption`]). Where no card after the screen shows
-            // [`PEEK_MIN`] of itself, the screen ends on its last card's
-            // boundary, the next screen starting at the card after it.
-            let drawn = view.start..end;
-            let screen = Screen {
-                live: self.live_on(&drawn, 0.0, None, base),
-                edge_caption: self.edge_caption(&drawn, 0.0, reach),
-                drawn,
-                view,
-                offset: 0.0,
-                height: reach,
-                fades: true,
-                whole: false,
-                caption: None,
-                bare: false,
-            };
-            // A WHOLE STOP BEATS ITS CAPTION ([`Self::starts_bare`]): the
-            // screen scrolls the run's caption off by its lead.
-            let drop = self.seat_drop(screen.view.start);
-            return if drop > 0.0 {
-                self.nudged(screen, drop, true)
+        if top >= self.limit() {
+            return self.last_screen(top);
+        }
+        // THE SCREEN ENDS ON A FADE: it draws the stops after its own down
+        // to the last any of which shows — a card after a gap it starts
+        // only where [`PEEK_MIN`] of it does, a few points reading as a
+        // stray line. Rows that touch (a list box's) go on as a group's
+        // rows do: any of one that shows is drawn. What it draws past the
+        // stops it shows is its peek, a picture fading out to the page's
+        // bottom ([`Self::live_on`]) — in the strip kept for a status bar,
+        // and in the room where no strip is (a bar is up, the page keeps
+        // none) — so no edge cuts a control live, nor a line of words, and
+        // the screen never ends on blank under a card it cuts. Where no card
+        // after the screen shows [`PEEK_MIN`] of itself, the screen ends on
+        // its last card's boundary, the next screen starting at the card
+        // after it.
+        let shows = |stop: usize| {
+            if self.starts_run(stop) && self.gap > 0.01 {
+                self.card_top(view.start, stop) <= reach - PEEK_MIN + 0.01
             } else {
-                screen
-            };
-        }
-        // The last screen: from the stops before it, the least that fill it.
-        let end_of = |start: usize| {
-            let content = self.shown_by(start, n - 1);
-            let bottom = self.span(start..n);
-            (content, bottom)
-        };
-        let mut start = view.start;
-        while start > 0 {
-            let (content, bottom) = end_of(start);
-            if content + 1.0 >= self.room || bottom + 1.0 >= self.room + self.kept {
-                break;
+                self.stop_top(view.start, stop) < reach - 0.01
             }
-            start -= 1;
+        };
+        let mut end = view.end;
+        while end < n && shows(end) {
+            end += 1;
         }
-        let (content, bottom) = end_of(start);
-        let offset = (content - self.room)
-            .max(bottom - self.room - self.kept)
-            .max(0.0);
-        let height = (bottom - offset).min(reach).max(self.room.min(bottom));
-        // The last screen that starts with a stop lets its run's caption go
-        // where keeping it would cut that stop: one the caption leaves no
-        // room whole ([`Self::starts_bare`]), or one the scroll to the
-        // list's end (its last card's closing padding) would carry under
-        // the caption kept over it — Window's Build badge row at 220x12 at
-        // 2× text, the last stop, was cut 8pt under BUILD BADGE on the only
-        // screen that drew it. Its caption scrolls with it then, whole or
-        // its cut words not drawn.
-        let bare =
-            start == view.start && (self.starts_bare(start) || offset > self.ink_top[start] + 0.01);
-        let caption = self
-            .top_caption(start..n, offset)
-            .map(|caption| TopCaption {
-                kept: caption.kept && !bare,
-                ..caption
-            });
-        Screen {
+        let drawn = view.start..end;
+        let live = self.live_on(&drawn, 0.0, None, base);
+        let screen = Screen {
+            live,
+            edge_caption: self.edge_caption(&drawn, 0.0, reach, live),
+            drawn,
             view,
-            live: self.live_on(&(start..n), offset, caption, self.room),
-            drawn: start..n,
-            offset,
-            height,
-            fades: false,
+            offset: 0.0,
+            height: reach,
+            fades: true,
             whole: false,
-            caption,
-            edge_caption: None,
-            bare,
+            caption: None,
+            bare: false,
+        };
+        // A WHOLE STOP BEATS ITS CAPTION ([`Self::starts_bare`]): the
+        // screen scrolls the run's caption off by its lead.
+        let drop = self.seat_drop(screen.view.start);
+        let screen = if drop > 0.0 {
+            self.nudged(screen, drop, true)
+        } else {
+            screen
+        };
+        self.peek_seat(screen)
+    }
+
+    /// What the screen whose first stop is `top` lacks of the next card's
+    /// least peek, and the padding over its first stop that a peek seat may
+    /// scroll into ([`Self::peek_seat`]); `None` where no next card follows
+    /// it after a gap.
+    #[cfg(test)]
+    pub(super) fn peek_lack(&self, top: usize) -> Option<(f32, f32)> {
+        self.peek_need(&self.screen(top.min(self.limit())))
+    }
+
+    /// What `screen` lacks of [`PEEK_MIN`] of the card after the stops it
+    /// draws, measured to the foot of the strip the page keeps for a status
+    /// bar, up or not, so a bar that comes moves no row of it; and the
+    /// padding over what its top draws first — the top padding of the card
+    /// it heads, over that card's caption, else its first stop's own — that
+    /// a peek seat may scroll into. `None` where no card follows it after a
+    /// gap.
+    fn peek_need(&self, screen: &Screen) -> Option<(f32, f32)> {
+        let next = screen.drawn.end;
+        let first = screen.view.start;
+        if next >= self.len() || self.gap <= 0.01 || !self.starts_run(next) {
+            return None;
+        }
+        let reach = self.room + self.kept;
+        let shows = reach - (self.card_top(screen.drawn.start, next) - screen.offset);
+        let padding = match self.groups[first] {
+            Some(group) => self.captions[group]
+                .map_or(self.ink_top[first], |(top, _)| top.min(self.lead_of(first))),
+            None => self.ink_top[first],
+        };
+        Some((PEEK_MIN - shows, padding))
+    }
+
+    /// THE PEEK SEAT: `screen`, a screen that is not the list's first, ending
+    /// on a whole card with less than [`PEEK_MIN`] of the card after it in
+    /// view — the edge falling in the gap between them, or just past the next
+    /// card's top — scrolled on by what that peek lacks, where its first
+    /// stop's top padding holds that much ([`Self::peek_need`]): the next
+    /// card then shows its border, corners and some padding under the edge,
+    /// and the screen shows the stops it did (its first stop's words and
+    /// controls stay whole, only the padding over them cut). Moving the edge
+    /// alone could only end the screen on a whole card over a band of blank
+    /// (Window at 150x48: 24pt under SESSION, BUILD BADGE next; Appearance at
+    /// 167x36: 26pt under TEXT & CONTRAST, its next card 2pt short of the
+    /// least) or cut the card over a band of blank (Packages at 80x24,
+    /// measured worse). The list's first screen starts at the page's top, and
+    /// a first stop with too little padding over it (a row of buttons flush
+    /// with its card's top) keeps its seat, as does a screen already scrolled
+    /// past its first stop's seat (one that let its caption go for a stop
+    /// that barely fits): those screens end on their card's boundary.
+    fn peek_seat(&self, screen: Screen) -> Screen {
+        if screen.view.start == 0 || screen.offset > 0.01 || screen.bare {
+            return screen;
+        }
+        let Some((lacks, padding)) = self.peek_need(&screen) else {
+            return screen;
+        };
+        if lacks <= 0.01 || lacks > padding + 0.01 {
+            return screen;
+        }
+        let shown = self.shown_on(&screen.drawn, screen.offset, screen.caption);
+        let peeked = self.nudged(screen.clone(), lacks, false);
+        let now = self.shown_on(&peeked.drawn, peeked.offset, peeked.caption);
+        if now.start == shown.start && now.end >= shown.end {
+            peeked
+        } else {
+            screen
         }
     }
 
@@ -1475,33 +1707,31 @@ impl ScrollPlan {
     /// stop's seat with `caption` at its top, SHOWS (THE ONE MEASURE, on the
     /// screen as it draws): the run of them that each start under the room's
     /// top — under a caption kept there over their run — and are shown where
-    /// they are ([`Self::shows_at`]; the list's last stop where what it draws
-    /// ends in the room, the strip under it holding nothing of a stop with
-    /// none after it). Empty where it shows none whole. THE LAST STOP IS
-    /// SHOWN BY WHAT IT DRAWS, as every stop is: a screen that draws its
-    /// content whole, its card's closing padding cut by the edge, shows it,
-    /// though only the last screen scrolls on to the list's end
-    /// ([`Self::view`], [`Self::limit`]). Measured to the list's end here,
-    /// the screen before the last showed the last stop's words and controls
-    /// whole uncounted, and Page Up from the last screen turned back onto it
-    /// (Software Update, Appearance, Cursor Styles, Window at 60x20).
+    /// they are ([`Self::shows_at`]). Empty where it shows none whole. THE
+    /// LAST STOP IS SHOWN BY WHAT IT DRAWS, as every stop is — its controls in
+    /// the room and its words on the screen, its card's closing padding cut
+    /// by the edge or not — though only the last screen scrolls on to the
+    /// list's end ([`Self::view`], [`Self::limit`]). Measured to the list's
+    /// end, the screen before the last showed the last stop's words and
+    /// controls whole uncounted, and Page Up from the last screen turned
+    /// back onto it (Software Update, Appearance, Cursor Styles, Window at
+    /// 60x20).
     fn shown_on(
         &self,
         drawn: &Range<usize>,
         offset: f32,
         caption: Option<TopCaption>,
     ) -> Range<usize> {
-        let n = self.len();
         let mut shown: Option<Range<usize>> = None;
+        let mut at = 0.0;
         for stop in drawn.clone() {
-            let at = self.stop_top(drawn.start, stop) - offset;
+            at = if stop == drawn.start {
+                self.lead_of(stop) - offset
+            } else {
+                self.next_top(at, stop)
+            };
             let whole = at + self.ink_top[stop] >= self.caption_floor(caption, drawn, stop) - 0.01
-                && if stop + 1 == n {
-                    at + self.controls_of(stop).1 <= self.room + 0.01
-                        && at + self.ink[stop] <= self.room + 0.01
-                } else {
-                    self.shows_at(at, stop, self.room)
-                };
+                && self.shows_at(at, stop, self.room);
             match (whole, shown.as_mut()) {
                 (true, Some(run)) => run.end = stop + 1,
                 (true, None) => shown = Some(stop..stop + 1),
@@ -1512,12 +1742,51 @@ impl ScrollPlan {
         shown.unwrap_or(drawn.start..drawn.start)
     }
 
-    /// How far from the list's top a screen drawing `drawn`, scrolled
-    /// `offset` with `caption` at its top, is live and drawn at full
-    /// strength: `base` (its room, or a first stop taller than that), and on
-    /// down to the end of the words of the last stop it shows where those end
-    /// in the strip under the room — words, no control, so a bar that comes
-    /// takes nothing a person can press — its peek fading only under them.
+    /// The lines of controls stop `index` holds, top to bottom, each from
+    /// and to under its top: its controls where it knows each
+    /// ([`Self::set_control_spans`]), else its rows of controls, those that
+    /// share any height merged into one line.
+    fn control_lines(&self, index: usize) -> Vec<(f32, f32)> {
+        let mut parts: Vec<(f32, f32)> = if self.spans[index].is_empty() {
+            self.control_rows[index]
+                .iter()
+                .map(|(_, from, height)| (*from, from + height))
+                .collect()
+        } else {
+            self.spans[index]
+                .iter()
+                .map(|(_, from, height)| (*from, from + height))
+                .collect()
+        };
+        parts.sort_by(|a, b| a.0.total_cmp(&b.0));
+        let mut lines: Vec<(f32, f32)> = Vec::new();
+        for (from, to) in parts {
+            match lines.last_mut() {
+                Some(line) if from < line.1 - 0.5 => line.1 = line.1.max(to),
+                _ => lines.push((from, to)),
+            }
+        }
+        lines
+    }
+
+    /// ONE BOUNDARY FOR WHAT A SCREEN SHOWS AND WHAT IT DRAWS AS SHOWN: how far
+    /// from the list's top a screen drawing `drawn`, scrolled `offset` with
+    /// `caption` at its top, is live and drawn at full strength. The room —
+    /// and under it the words of the last stop the screen shows, where those
+    /// end in the strip — but never past the top of the first control after
+    /// the stops it shows that the room does not hold whole:
+    /// from there down the screen draws its peek, a picture fading out to the
+    /// list's bottom, never live, a press on it scrolling what it pressed into
+    /// the room and working nothing ([`SettingsViewState::press_list_picture`]).
+    /// So a control is drawn live and whole, or fading from its top as a
+    /// picture, never full strength over a part no press reaches: a row whose
+    /// controls ran 3 to 30pt past the room's edge was painted at 0.87 and
+    /// more of full strength, live above the edge only, uncounted — Page Down
+    /// turned onto it again (Appearance, Sound, Terminal and four more pages
+    /// at 102x29), and a press on its lower part only scrolled it. A row of
+    /// controls whole in the room stays live (a card's first row of buttons,
+    /// its next row past the edge). `base` where the screen shows no stop
+    /// whole (a first stop taller than the room is live as far as it reaches).
     fn live_on(
         &self,
         drawn: &Range<usize>,
@@ -1526,13 +1795,56 @@ impl ScrollPlan {
         base: f32,
     ) -> f32 {
         let shown = self.shown_on(drawn, offset, caption);
-        match shown.end.checked_sub(1) {
-            Some(last) if !shown.is_empty() && last + 1 < self.len() => base.max(
-                (self.stop_top(drawn.start, last) - offset + self.ink[last])
-                    .min(self.room + self.overhang),
-            ),
-            _ => base,
+        if shown.is_empty() {
+            return base;
         }
+        let reach = self.room + self.overhang;
+        let (mut at, mut words, mut cut) = (0.0, 0.0_f32, f32::INFINITY);
+        // Where the card of the first stop after those shown begins: down to
+        // it the screen holds only the last shown card's padding and the gap,
+        // and from it the peek fades, its top drawn at full strength where it
+        // starts in the strip — at the strip's foot, past the fade's first
+        // points, a card's top was a picture faded out of sight.
+        let mut next_card = 0.0_f32;
+        for stop in drawn.clone() {
+            at = if stop == drawn.start {
+                self.lead_of(stop) - offset
+            } else {
+                self.next_top(at, stop)
+            };
+            if stop + 1 == shown.end {
+                words = at + self.ink[stop];
+            }
+            if stop < shown.end {
+                continue;
+            }
+            if stop == shown.end {
+                next_card = at
+                    - if self.starts_run(stop) {
+                        self.lead_of(stop)
+                    } else {
+                        0.0
+                    };
+            }
+            // The first line of controls after the stops the screen shows
+            // that the room does not hold whole — a row's control and the
+            // name beside it, a card's next row of buttons, a stacked row's
+            // switch under its name and Reset — is where the peek starts;
+            // the lines over it stay live. A stop whose controls the room
+            // holds, its words past the page's bottom or under a bar, stays
+            // live: the bar covers only its words.
+            if let Some((from, _)) = self
+                .control_lines(stop)
+                .into_iter()
+                .find(|(from, to)| at + to > self.room + 0.01 || at + from < 0.0)
+            {
+                cut = at + from;
+                break;
+            }
+        }
+        base.max(words.min(reach))
+            .max(next_card.min(reach))
+            .min(cut)
     }
 
     /// THE STOPS THE SCREEN WHOSE FIRST STOP IS `top` SHOWS, as it draws
@@ -1625,10 +1937,51 @@ impl ScrollPlan {
     /// (`list_screen_node`), the caption the edge would cut through paints
     /// none of its words. The last screen, and a screen a press nudged
     /// ([`Self::nudged`]), read this one rule.
+    ///
+    /// A WHOLE ROW BEATS A KEPT CAPTION: where the scroll leaves a group's
+    /// first row under its caption whole at the list's top — the row's words
+    /// and controls in the room, only the card's padding and caption over
+    /// them scrolled off — the caption scrolls with its card instead of being
+    /// kept over that row, which it would cut, as a whole stop beats its
+    /// caption on a screen seated at it ([`Self::starts_bare`]); the row
+    /// names itself. (A whole card's caption is its one control's name, and
+    /// stays kept over it.) Kept, it
+    /// came down over the row a few points of scroll had left whole, and
+    /// the edge rule took that row's cut control, name and all: the last
+    /// screen of Cursor & Motion at 102x29 drew EFFECT POLICY over an empty
+    /// card, Serious Mode gone under it; a press on Terminal's Accent color
+    /// picture at 102x29 hid the Ambiguous-character width row under TEXT
+    /// DIRECTION & WIDTH. Past that the stop is cut at the top anyway, and
+    /// the caption is kept over the rows scrolling under it.
+    ///
+    /// A KEPT CAPTION HEADS WHAT IS UNDER IT: kept only while what its rows
+    /// draw goes on under it for at least the least of a control a list's
+    /// edge leaves drawn ([`PEEK_MIN`]); under that, no control and no line
+    /// of words is drawn there, and the caption would head an empty sliver
+    /// of its card. It scrolls with its card then, and what the rows still
+    /// show is the screen's peek over its top. Kept, Top Settings' CURSOR
+    /// TRAIL headed 1pt of its Cursor style row on the last screen at 102x29
+    /// (Cantarell's measures).
     fn top_caption(&self, drawn: Range<usize>, offset: f32) -> Option<TopCaption> {
+        let first = drawn.start;
         match self.runs(drawn).first() {
             Some(ScrollRun::Group { group, rows }) => {
-                let kept = offset > 0.01 && offset < self.run_rows(*group, rows) - 0.01;
+                // A scroll into the card's top padding, over its caption,
+                // only moves the card: the caption is kept once the scroll
+                // reaches it.
+                let padding = self.captions[*group].map_or(0.0, |(top, _)| top);
+                let at = self.lead_of(first) - offset;
+                let row_whole = offset > self.ink_top[first] + 0.01
+                    && at + self.ink_top[first] >= -0.01
+                    && self.shows_at(at, first, self.room);
+                // Where what the run's rows draw ends under their top: the
+                // rows' end, or their last words or control where those end
+                // over it.
+                let last = rows.end - 1;
+                let ink_end = self.stop_top(first, last) - self.lead_of(first) + self.ink[last];
+                let drawn_end = self.run_rows(*group, rows).min(ink_end);
+                let kept =
+                    offset > padding + 0.01 && offset < drawn_end - PEEK_MIN + 0.01 && !row_whole;
                 let cuts = self.captions[*group]
                     .is_some_and(|(top, bottom)| offset > top + 0.01 && offset < bottom - 0.01);
                 (kept || cuts).then(|| TopCaption {
@@ -1646,16 +1999,23 @@ impl ScrollPlan {
         }
     }
 
-    /// Where a screen drawing `drawn`, scrolled `offset`, `height` tall, cuts
-    /// through the caption of the card it draws last, from that card's top:
-    /// the edge, and where the caption ends ([`Screen::edge_caption`]). Only
-    /// where the edge is hard — no strip fades under the room — and the card
-    /// peeks in after a gap: where the strip fades, the peek is a picture
-    /// drawn on to the page's bottom. A CAPTION IS DRAWN WHOLE OR NOT AT ALL:
-    /// the words the edge would cut paint nothing, and the card goes on to
-    /// the edge, so no band of blank is left under it.
-    fn edge_caption(&self, drawn: &Range<usize>, offset: f32, height: f32) -> Option<(f32, f32)> {
-        if self.overhang > 0.01 {
+    /// Where a screen drawing `drawn`, scrolled `offset`, `height` tall and
+    /// live `live` down, cuts through the caption of the card it draws last,
+    /// from that card's top: the edge, and where the caption ends
+    /// ([`Screen::edge_caption`]). Only where the edge is hard — nothing
+    /// fades under the room: no strip, and the screen live down to its edge
+    /// ([`Self::live_on`]) — and the card peeks in after a gap: where its
+    /// peek fades, the caption fades out with it. A CAPTION IS DRAWN WHOLE OR
+    /// NOT AT ALL: the words the edge would cut paint nothing, and the card
+    /// goes on to the edge, so no band of blank is left under it.
+    fn edge_caption(
+        &self,
+        drawn: &Range<usize>,
+        offset: f32,
+        height: f32,
+        live: f32,
+    ) -> Option<(f32, f32)> {
+        if live < height - 0.5 {
             return None;
         }
         let last = drawn.end.checked_sub(1)?;
@@ -1726,8 +2086,10 @@ impl ScrollPlan {
         let (control_top, control_bottom) = (at + from, at + to);
         // A control is whole in the room: a first stop taller than it reads
         // as live past it, words and all, but the list's edge cuts what of
-        // its controls is under it (a bar that came over it).
-        let live = screen.live.min(self.room);
+        // its controls is under it (a bar that came over it); and one the
+        // screen draws as its peek, fading under the room's edge, comes up
+        // to end at that edge.
+        let live = self.room;
         // Where the room starts for the control: under a caption kept whole
         // over the run the screen starts in, else the list's top — on the
         // screen as it draws, and on the screen nudged.
@@ -1798,7 +2160,7 @@ impl ScrollPlan {
             return false;
         }
         let end = self.card_bottom(screen.drawn.start, self.len() - 1) - screen.offset;
-        screen.offset + nudge >= -0.01 && nudge <= end - screen.live + 0.01
+        screen.offset + nudge >= -0.01 && nudge <= end - screen.live.max(self.room) + 0.01
     }
 
     /// Whether `seat` can still stand as the list measures now
@@ -1821,9 +2183,9 @@ impl ScrollPlan {
 
     /// `screen` scrolled `nudge` further ([`Self::press_seat_span`]): the stops
     /// that come into the page then drawn on, the first cut at the list's top
-    /// edge and live where it shows, its captions kept and landed on as the
-    /// last screen's and every screen's are ([`Self::top_caption`],
-    /// [`Self::edge_caption`]).
+    /// edge, its captions kept and landed on as the last screen's and every
+    /// screen's are ([`Self::top_caption`]), its peek fading as every
+    /// screen's does ([`Self::live_on`]).
     fn nudged(&self, screen: Screen, nudge: f32, bare: bool) -> Screen {
         // A screen that let its caption go keeps it gone.
         let bare = bare || screen.bare;
@@ -1863,9 +2225,10 @@ impl ScrollPlan {
         } else {
             self.room
         };
+        let live = self.live_on(&drawn, offset, caption, base);
         Screen {
-            live: self.live_on(&drawn, offset, caption, base),
-            edge_caption: self.edge_caption(&drawn, offset, reach),
+            live,
+            edge_caption: self.edge_caption(&drawn, offset, reach, live),
             drawn,
             offset,
             height: reach,
@@ -2037,6 +2400,10 @@ pub(super) struct ScrollRecord {
     /// The landing this render seated ([`SettingsViewState::land_on_control`]):
     /// its control, found on the list and followed.
     landed: Option<UiKey>,
+    /// Whether the place this screen drew is still the list's: nothing has
+    /// scrolled it since ([`SettingsViewState::drop_list_nudge`]), so the
+    /// next render draws it where it was ([`SettingsViewState::seat_scroll`]).
+    hold: bool,
 }
 
 impl ScrollRecord {
@@ -2118,7 +2485,7 @@ impl SettingsViewState {
         // place under it — a Timer pressed open, its choices under it —
         // never moves the screen by the caption's lead. Opened at 2× text
         // in a 504x660 page, the Every session row's first part grew as
-        // tall as the room, the screen let SESSIONS · CONTINUED go, and the
+        // tall as the room, the screen let the SESSIONS caption go, and the
         // Timer just pressed jumped 53pt up. Decided again where the list
         // scrolls, or its room changes.
         let held_start = self
@@ -2201,10 +2568,20 @@ impl SettingsViewState {
             // end puts above its scroll, the scroll counted past it (the
             // last screen of Appearance at 220x12, its first stop the Output
             // streak row, was one stop further on at 2× text and showed
-            // only the row's note). One numbered as it was keeps the scroll.
+            // only the row's note). One numbered as it was keeps the scroll —
+            // but for one a last screen drew whole over its seat, where the
+            // list measured again (another text size) seats there a screen
+            // that is not the last: from there it showed only the stops
+            // after it (Sound at 102x29: at 2× the screen started a stop past
+            // the row the 1× end drew whole), so the scroll comes to it.
             let moved = (last_top + index).saturating_sub(last);
             let moved = if index == last {
-                moved
+                let kept = moved.min(limit);
+                if index < kept && kept < limit {
+                    index
+                } else {
+                    kept
+                }
             } else {
                 moved.min(index)
             }
@@ -2213,6 +2590,23 @@ impl SettingsViewState {
             top = moved;
         }
         plan.seated = carried.filter(|seat| seat.top == top && plan.seat_fits(*seat));
+        // THE LIST HOLDS WHERE IT DREW: where nothing has scrolled it since
+        // a screen drawn off its stops' seat — the last screen, scrolled to
+        // the list's end, or a screen a press nudged or Page Up anchored —
+        // the next screen draws the stop the place was held by (the control
+        // the person is on, else that screen's top stop) where it was, so no
+        // row moves for what changed under it: a stop the press added after
+        // the list's end (Cursor Styles at 220x60 with Off saved, a style
+        // pressed on the last screen: its Adjust card came after the end,
+        // the same first stop was no longer the last screen's, and every
+        // row went 40pt up from under the pointer), or a status bar that
+        // came over the strip the last screen drew its end into. Where that
+        // place no longer fits the list (it shrank, the window grew), the
+        // list seats as its stops say.
+        if let Some((seat_top, seat)) = self.held_place(plan, top, held) {
+            top = seat_top;
+            plan.seated = seat;
+        }
         let mut landed = None;
         let landing = matches!(self.reveal_as, Reveal::Land | Reveal::LandWhole);
         // A LANDING YIELDS TO A KEYBOARD ALREADY ON THE LIST: a list not yet
@@ -2338,7 +2732,7 @@ impl SettingsViewState {
                 }
             }
         }
-        let view = plan.view(top);
+        let view = plan.screen(top).view;
         self.record_result_page_limit(limit);
         self.page_window.set(Some(plan.shown(top).len().max(1)));
         self.scroll_record.replace(Some(ScrollRecord {
@@ -2347,6 +2741,7 @@ impl SettingsViewState {
             top,
             drawn: Some(top),
             landed,
+            hold: true,
         }));
         view
     }
@@ -2422,6 +2817,107 @@ impl SettingsViewState {
         }
     }
 
+    /// Where the screen the last render drew holds the list on `plan`
+    /// ([`Self::seat_scroll`]'s THE LIST HOLDS WHERE IT DREW), where that
+    /// screen was the list's last — scrolled to the list's end, where the
+    /// strip under the room lets that end sit ([`ScrollPlan::last_screen`]):
+    /// the first stop and seat that draw the stop the place was held by —
+    /// `held`'s, the control the person is on, as the last screen's stop and
+    /// this plan's, else that screen's top stop — at the height it was drawn
+    /// at, where the stops' own seat at `top` does not already; and a press's
+    /// nudge it carried, kept as far past the list's end as it was. `None`
+    /// where nothing holds the list there: it scrolled since, its screen was
+    /// not the last (the stops and the nudge hold it, [`Self::seat_scroll`]),
+    /// or the place does not fit the list as it is now measured.
+    fn held_place(
+        &self,
+        plan: &ScrollPlan,
+        top: usize,
+        held: Option<(usize, usize, usize)>,
+    ) -> Option<(usize, Option<Seat>)> {
+        let record = self.scroll_record.borrow();
+        let record = record.as_ref()?;
+        let was = &record.plan;
+        if !record.hold
+            || record.context != self.scroll_context()
+            || record.top != self.page_scroll.min(was.limit())
+            || record.top < was.limit()
+            || plan.foot == ListFoot::Whole
+            || plan.len() == 0
+        {
+            return None;
+        }
+        // A PRESS'S NUDGE ON THE LAST SCREEN stands as far past the list's
+        // end as it drew, though the end moved with the strip (a bar came).
+        if let Some(seat) = was.seated.filter(|seat| seat.top == record.top)
+            && top == record.top
+            && top >= plan.limit()
+        {
+            let (before, now) = (was.stop_screen(record.top), plan.stop_screen(top));
+            if before.drawn.start == now.drawn.start {
+                if (before.offset - now.offset).abs() < 0.01 {
+                    return None;
+                }
+                let seat = Seat {
+                    nudge: seat.nudge + before.offset - now.offset,
+                    ..seat
+                };
+                return plan.seat_fits(seat).then_some((top, Some(seat)));
+            }
+        }
+        let drawn = was.screen(record.top);
+        if drawn.whole {
+            return None;
+        }
+        let first = drawn.drawn.start;
+        // The stop the place is held by, as that screen drew it and as this
+        // plan lists it.
+        let (anchor_was, anchor) = match held {
+            Some((_, last, index)) if last >= first => (last, index),
+            _ => {
+                let index = was
+                    .identities(first)
+                    .find_map(|id| plan.stop_of_identity(id))?;
+                (first, index)
+            }
+        };
+        let at_was = was.stop_top(first, anchor_was) - drawn.offset;
+        let on = |screen: &Screen| plan.stop_top(screen.drawn.start, anchor) - screen.offset;
+        // Where the stops' seat at `top` draws it there already, they hold it.
+        let seated = plan.stop_screen(top.min(plan.limit()));
+        if seated.drawn.start <= anchor && (on(&seated) - at_was).abs() < 0.5 {
+            return None;
+        }
+        // The screen that starts where that screen started, scrolled so the
+        // stop is where it was.
+        let start = was
+            .identities(first)
+            .find_map(|id| plan.stop_of_identity(id))
+            .filter(|start| *start <= anchor && *start <= plan.limit())?;
+        let base = plan.stop_screen(start);
+        if base.view.start != start || base.whole {
+            return None;
+        }
+        // Only a list measured as it was over that stop holds it there: one
+        // laid out again at another text size or width keeps its place by
+        // the stops it lists ([`Self::seat_scroll`]'s THE LIST HOLDS ITS
+        // PLACE).
+        let over = |plan: &ScrollPlan, start: usize, stop: usize| {
+            (plan.stop_top(start, stop), plan.heights[stop])
+        };
+        let (above_was, tall_was) = over(was, first, anchor_was);
+        let (above, tall) = over(plan, start, anchor);
+        if (above_was - above).abs() > 0.5 || (tall_was - tall).abs() > 0.5 {
+            return None;
+        }
+        let seat = Seat {
+            top: start,
+            nudge: on(&base) - at_was,
+            bare: drawn.bare,
+        };
+        plan.seat_fits(seat).then_some((start, Some(seat)))
+    }
+
     /// THE LIST SCROLLED (a wheel, a key, a reader's scroll, a page opened
     /// at its top): the nudge a press gave it ([`ScrollPlan::press_seat_span`])
     /// goes, and it seats on its stops again — at an end of the list too,
@@ -2429,6 +2925,7 @@ impl SettingsViewState {
     pub(super) fn drop_list_nudge(&self) {
         if let Some(record) = self.scroll_record.borrow_mut().as_mut() {
             record.plan.seated = None;
+            record.hold = false;
         }
     }
 
@@ -2543,8 +3040,17 @@ impl SettingsViewState {
             .is_some_and(|plan| plan.stop_holding(&key).is_some());
         if listed {
             self.reveal_pressed(key);
+            return true;
         }
-        listed
+        // A SIDEBAR ROW ITS LIST'S EDGE DREW WITHOUT ITS NAME
+        // ([`crate::native_ui::LIST_PEEK_MIN`]'s rule): the press takes the
+        // keyboard there, and the sidebar scrolls to keep the keyboard's row
+        // whole; it opens no page it did not name.
+        if key.as_str().starts_with("settings/nav/") {
+            self.common.last_focus = Some(key);
+            return true;
+        }
+        false
     }
 
     /// A PRESS KEEPS ITS CONTROL IN VIEW, however the press came: a pointer
@@ -2719,22 +3225,26 @@ impl SettingsViewState {
     /// a row's note over the next row, that row's slider cut by the room's
     /// edge — Appearance's Minimum contrast note at 80x24 at 2× text), the
     /// first control the screen draws live, cut by its edge, held there with
-    /// the list where the turn put it ([`Reveal::Hold`]): the keyboard is
-    /// never left on a control the screen does not draw. A screen that draws
-    /// no control leaves it where it is.
+    /// the list where the turn put it ([`Reveal::Hold`]) — of a segmented
+    /// control, the first segment it draws live ([`ScrollPlan::live_control`]):
+    /// the keyboard is never left on a control the screen does not draw. A
+    /// screen that draws no control leaves it where it is.
     pub(super) fn focus_list_screen(&mut self) {
         let Some(plan) = self.scroll_plan() else {
             return;
         };
         let top = self.page_scroll.min(plan.limit());
-        let pick = |on: &dyn Fn(usize, &UiKey) -> bool| {
-            plan.controls()
-                .find(|(stop, key)| on(*stop, key))
-                .map(|(_, key)| key.clone())
-        };
-        if let Some(key) = pick(&|stop, _| plan.shows_landing(stop, top)) {
+        let landing = plan
+            .controls()
+            .find(|(stop, _)| plan.shows_landing(*stop, top))
+            .map(|(_, key)| key.clone());
+        if let Some(key) = landing {
             self.land_list_focus(key);
-        } else if let Some(key) = pick(&|stop, key| plan.draws_control_live(stop, key, top)) {
+        } else if let Some(key) = plan
+            .controls()
+            .find_map(|(stop, key)| plan.live_control(stop, key, top))
+            .cloned()
+        {
             self.land_list_focus(key.clone());
             self.page_reveal = Some(key);
             self.reveal_as = Reveal::Hold;
@@ -3909,6 +4419,17 @@ impl SplitCard {
         stops
     }
 
+    /// Whether every one of `rows` is A NOTE ON THE ROWS OVER IT
+    /// ([`notes_rows_over`]), a control over it in the card: a stop of such
+    /// rows says how the rows above stand ([`ScrollPlan::set_note`]).
+    pub(super) fn notes_only(&self, rows: Range<usize>) -> bool {
+        !rows.is_empty()
+            && rows.clone().all(|row| {
+                notes_rows_over(&self.rows[row].0)
+                    && self.rows[..row].iter().any(|(node, _)| holds_control(node))
+            })
+    }
+
     /// The card holding `rows`, its head over them.
     pub(super) fn node(&self, rows: Range<usize>) -> UiNode {
         UiNode::new(self.key.clone(), UiContent::Group(self.spec.clone()))
@@ -4247,8 +4768,10 @@ fn plan_items(items: &[ListItem], gap: f32, room: f32) -> (ScrollPlan, ItemStops
                 stops.push((index, None));
             }
             ListItem::Split(card) if card.rows.is_empty() => {
-                plan.card(card.height(), focus_keys(&card.node(0..card.rows.len())));
+                let node = card.node(0..card.rows.len());
+                plan.card(card.height(), focus_keys(&node));
                 plan.set_ids(vec![UiKey::new(card.key.as_str())]);
+                plan.measure(&node, card.height());
                 plan.note_previews(card.head.iter().map(|(node, _)| node));
                 stops.push((index, None));
             }
@@ -4292,6 +4815,7 @@ fn plan_items(items: &[ListItem], gap: f32, room: f32) -> (ScrollPlan, ItemStops
                     plan.set_within(within);
                     plan.set_control_rows(card.control_rows(rows.clone()));
                     plan.set_control_spans(card.control_spans(rows.clone()));
+                    plan.set_note(card.notes_only(rows.clone()));
                     plan.set_ink(card.ink(rows.clone()));
                     plan.set_ink_top(card.ink_top(rows.clone()));
                     plan.set_first_controls(card.first_controls(rows.clone()));
@@ -4618,7 +5142,10 @@ mod tests {
         let shown = plan(44.0, 18.0, 36.0);
         assert_eq!(shown.view(0), 0..2, "the row is shown");
         let screen = shown.screen(0);
-        assert_eq!(screen.live, 148.0, "drawn whole down to its note's end");
+        assert_eq!(
+            screen.live, 158.0,
+            "drawn whole down to its note's end, and on over the gap to the next card"
+        );
         assert_eq!(shown.page_after(0), 2, "Page Down turns past it");
         // With a bar up the strip is the bar's: the note under it is not shown.
         let barred = plan(0.0, 18.0, 36.0);
@@ -4650,9 +5177,9 @@ mod tests {
     /// lands on the screen scrolled so that stop ends at the room's edge, the
     /// stop over it cut at the list's top, as the last screen ends on the
     /// list's last stop; Page Down from there comes back. From the last
-    /// screen it turns back from the first stop that screen shows whole, not
-    /// from the stop it is seated at. CONTROL: where a seated screen ends
-    /// there, Page Up seats at it.
+    /// screen, seated at the first stop it shows whole though it scrolls into
+    /// that stop's padding, it turns back from that stop. CONTROL: where a
+    /// seated screen ends there, Page Up seats at it.
     /// THE FIRST SCREEN'S LEAD is the list's first stop and, after it, the
     /// first ROW of controls it holds: under a card's words its first row of
     /// buttons, not the rows of buttons under that (Security's MACOS ACCESS
@@ -4744,9 +5271,9 @@ mod tests {
         landed.seated = nudge.map(|nudge| Seat::nudged(top, nudge));
         assert_eq!(landed.shown(top), 3..4, "the tall card cut at the top");
         assert_eq!(landed.page_after(top), 4, "Page Down comes back");
-        // From the last screen, which shows whole a stop before the one it is
-        // seated at (its top edge cuts only that stop's padding), Page Up
-        // turns back from that stop.
+        // From the last screen, which shows its first stop whole though its
+        // top edge cuts that stop's padding, Page Up turns back from that
+        // stop.
         let mut padded = ScrollPlan::new(10.0);
         for _ in 0..6 {
             padded.card(50.0, Vec::new());
@@ -4754,7 +5281,8 @@ mod tests {
         }
         padded.set_room(105.0);
         let last = padded.limit();
-        assert_eq!((last, padded.view(last)), (5, 5..6));
+        assert_eq!((last, padded.view(last)), (4, 4..5));
+        assert_eq!(padded.screen(last).offset, 5.0, "scrolled into 4's padding");
         assert_eq!(padded.shown(last), 4..6, "4 whole under its cut padding");
         assert_eq!(padded.page_up(last), (3, None));
         assert_eq!(padded.shown(3), 3..4);
@@ -5407,8 +5935,10 @@ mod tests {
     /// cut at the top edge — so a press on the cut switch there measured it
     /// under a caption that was not drawn, and a nudge that brought the
     /// caption back over it sent it out from under the pointer (Security at
-    /// 738x418). CONTROLS: a run with more rows under the caption keeps it,
-    /// and a nudge on a screen that kept its caption keeps it.
+    /// 738x418). Kept, it heads what its rows draw under it: at least
+    /// [`PEEK_MIN`] of them, less being a sliver nothing is drawn in. CONTROLS:
+    /// a run with more rows under the caption keeps it, and a nudge on a
+    /// screen that kept its caption keeps it.
     #[test]
     fn a_caption_is_kept_while_its_rows_scroll_under_it_and_a_nudge_never_brings_one_back() {
         let mut plan = ScrollPlan::new(10.0);
@@ -5419,21 +5949,31 @@ mod tests {
         plan.row(group, 66.0, vec![UiKey::new("b")]);
         plan.set_room(200.0);
         // The last row's 62pt under a 64pt scroll: nothing of it scrolls under
-        // the caption, so it is let go; 60pt in, 2pt does, and it is kept.
+        // the caption, so it is let go; 44pt in, 18pt does, and it is kept.
         let tail = plan.top_caption(1..2, 64.0);
         assert_eq!(
             tail, None,
             "64pt into a 62pt run: let go (past its words, so none to hide)"
         );
-        // Without the row gap the plan kept it there.
+        // 48pt in, the gap leaves 14pt under it, a sliver: let go — where
+        // without the row gap the plan counted 18pt and kept it.
+        assert_eq!(
+            plan.top_caption(1..2, 48.0).map(|caption| caption.kept),
+            None
+        );
         let mut gapless = plan.clone();
         gapless.set_row_gap(group, 0.0);
         assert_eq!(
-            gapless.top_caption(1..2, 64.0).map(|caption| caption.kept),
+            gapless.top_caption(1..2, 48.0).map(|caption| caption.kept),
             Some(true)
         );
+        // A sliver under it heads nothing: let go.
         assert_eq!(
-            plan.top_caption(1..2, 60.0),
+            gapless.top_caption(1..2, 64.0).map(|caption| caption.kept),
+            None
+        );
+        assert_eq!(
+            plan.top_caption(1..2, 44.0),
             Some(TopCaption {
                 lead: 40.0,
                 kept: true
@@ -5468,27 +6008,31 @@ mod tests {
         assert_eq!(plan.caption_floor(nudged.caption, &nudged.drawn, 1), 0.0);
         // CONTROL: a screen that kept its caption keeps it, nudged back.
         let kept = Screen {
-            offset: 60.0,
-            caption: plan.top_caption(1..2, 60.0),
+            offset: 44.0,
+            caption: plan.top_caption(1..2, 44.0),
             ..let_go
         };
-        let nudged = plan.nudged(kept, -16.0, false);
+        let nudged = plan.nudged(kept, -2.0, false);
         assert_eq!(nudged.caption.map(|caption| caption.kept), Some(true));
         assert_eq!(plan.caption_floor(nudged.caption, &nudged.drawn, 1), 40.0);
     }
 
-    /// A HARD EDGE NEVER CUTS THROUGH A CARD'S CAPTION, AND LEAVES NO BLANK
-    /// UNDER THE CARD IT CUTS: the card after the screen peeks in on to the
-    /// edge, and where the edge would cut through its caption's words those
-    /// words paint nothing ([`Screen::edge_caption`]: the edge and the
-    /// caption's end, from the card's top). Landing on the caption's top left
-    /// a band of blank as tall as the cut part of the caption under the card
-    /// (Software Update at 60x20). CONTROLS: an edge past the caption keeps it
-    /// whole over the row it heads; where the strip fades, the peek is a
-    /// picture drawn on to the page's bottom; a card whose caption the plan
-    /// does not know is drawn to the edge.
+    /// A HARD EDGE NEVER CUTS A CONTROL LIVE NOR A CAPTION THROUGH ITS WORDS,
+    /// AND LEAVES NO BLANK UNDER THE CARD IT CUTS: where no strip is kept
+    /// under the room (a bar is up, the page keeps none), the card after the
+    /// screen peeks in on to the edge. From the first control the room does
+    /// not hold whole, the peek is a picture fading out to the edge, never
+    /// live — cut there and live, a row lost its words to the edge and kept a
+    /// pressable face (Software Update's switch at 80x24 with no name,
+    /// Terminal's Bidirectional text segments with no words) — and where the
+    /// edge cuts only words, a caption it would cut through paints none of
+    /// them ([`Screen::edge_caption`]: the edge and the caption's end, from
+    /// the card's top). CONTROLS: an edge past the caption cuts the card's
+    /// first row and fades from its top, the caption whole; where the strip
+    /// fades, the peek is a picture drawn on to the page's bottom; a card
+    /// whose caption the plan does not know is drawn to the edge.
     #[test]
-    fn a_hard_edge_never_cuts_through_a_cards_caption_nor_stops_short() {
+    fn a_hard_edge_cuts_no_control_live_and_no_caption_through() {
         let plan = |caption: bool| {
             let mut plan = ScrollPlan::new(10.0);
             plan.card(100.0, Vec::new());
@@ -5496,8 +6040,8 @@ mod tests {
             if caption {
                 plan.set_caption(group, 12.0, 34.0);
             }
-            plan.row(group, 44.0, Vec::new());
-            plan.row(group, 44.0, Vec::new());
+            plan.row(group, 44.0, vec![UiKey::new("a")]);
+            plan.row(group, 44.0, vec![UiKey::new("b")]);
             plan
         };
         // The card ends at 100; the next one starts at 110, its caption's
@@ -5513,12 +6057,12 @@ mod tests {
             "the caption the edge cuts paints none of its words"
         );
         let mut past = plan(true);
-        past.set_room(150.0);
+        past.set_room(170.0);
         let screen = past.screen(0);
         assert_eq!(
-            (screen.height, screen.edge_caption),
-            (150.0, None),
-            "past the caption: drawn to the edge, the caption whole"
+            (screen.height, screen.live, screen.edge_caption),
+            (170.0, 150.0, None),
+            "past the caption: the row the edge cuts fades from its top"
         );
         let mut fading = plan(true);
         seat_room(
@@ -5919,5 +6463,274 @@ mod tests {
         assert!(!plan.shows_span(0, 0, (0.0, 150.0)));
         assert_eq!(plan.reveal_span(0, 0, (0.0, 150.0)), 0);
         assert_eq!(plan.land_selected(0, 0), (0, None));
+    }
+
+    /// Cursor Styles at 150x48 with Beam saved, as the plan measures it:
+    /// three cards, then the Adjust card's caption over five rows, the last a
+    /// slider row whose note runs 2pt past the room into the strip kept for
+    /// a status bar; `now` of that strip free.
+    fn adjust_card(now: f32) -> ScrollPlan {
+        let mut plan = ScrollPlan::new(10.0);
+        for key in ["a", "b", "c"] {
+            plan.card(100.0, vec![UiKey::new(key)]);
+        }
+        let group = plan.group(52.0, 40.0);
+        for (key, height) in [("r0", 50.0), ("r1", 50.0), ("r2", 50.0), ("r3", 68.0)] {
+            plan.row(group, height, vec![UiKey::new(key)]);
+            plan.set_control_rows(vec![(0.0, 4.0, height - 8.0)]);
+            plan.set_ink(height - 4.0);
+            plan.set_ink_top(4.0);
+        }
+        plan.row(group, 72.0, vec![UiKey::new("r4")]);
+        plan.set_control_rows(vec![(0.0, 4.0, 36.0)]);
+        plan.set_ink(70.0);
+        plan.set_ink_top(4.0);
+        seat_room(&mut plan, 326.0, Overhang { now, kept: 44.0 });
+        plan
+    }
+
+    /// NO TURN ONTO THE LAST SCREEN ONLY MOVES THE LIST: the screen seated
+    /// at the Adjust card's first row draws its last row whole — its slider
+    /// in the room, its note 2pt into the strip, the card's closing padding
+    /// on the screen — so it is the list's last screen, and Page Down from
+    /// the screen before lands on it, showing its last rows. The bound stood
+    /// a stop further on, measured to the room alone, and the turn onto it
+    /// moved the card 4pt and shortened the list 32pt, nothing new on it
+    /// (SC1). The last screen ends the list at the strip's foot, no band of
+    /// the strip left blank under it, the card before peeking in over its
+    /// top. CONTROL: with a bar up the strip is the bar's, and the last
+    /// screen ends the list at the room's edge, its last card whole there.
+    #[test]
+    fn the_screen_that_draws_the_lists_end_is_its_last() {
+        let plan = adjust_card(44.0);
+        assert_eq!(plan.limit(), 3, "the screen seated at the card's first row");
+        let screen = plan.screen(3);
+        let end = plan.card_bottom(screen.drawn.start, plan.len() - 1) - screen.offset;
+        assert!(
+            (end - (plan.room() + plan.overhang())).abs() < 0.01 && screen.drawn.start < 3,
+            "the list's end at the strip's foot, the card before peeking in: {screen:?} {end}"
+        );
+        assert_eq!(plan.shown(3), 3..8, "it shows every row, the last too");
+        assert_eq!(plan.page_after(2), 3);
+        let before = plan.shown(2);
+        assert!(
+            plan.shown(3).any(|stop| !before.contains(&stop)),
+            "the turn shows what the screen before it did not"
+        );
+        let barred = adjust_card(0.0);
+        let last = barred.limit();
+        let screen = barred.screen(last);
+        let end = barred.card_bottom(screen.drawn.start, barred.len() - 1) - screen.offset;
+        assert!(
+            (end - barred.room()).abs() < 0.01,
+            "with a bar up the list ends at the room's edge: {end}"
+        );
+    }
+
+    /// WITH A STATUS BAR UP, THE LAST SCREEN SHOWS THE LAST CARD WHOLE: the
+    /// strip the page keeps for the bar is the bar's, so the last screen ends
+    /// the list — its last card's closing padding and border — at the room's
+    /// edge, not past it under the bar. It let that padding fall in the kept
+    /// strip, so End with a bar up cut the last card by it on every page
+    /// (Terminal at 102x29: 14pt; Modified at 80x24: 18pt). CONTROL: with no
+    /// bar up, the end may sit in the strip, the last stop's controls in the
+    /// room.
+    #[test]
+    fn with_a_bar_up_the_last_screen_shows_the_last_card_whole() {
+        let mut plan = ScrollPlan::new(10.0);
+        for key in ["a", "b", "c", "d"] {
+            plan.card(80.0, vec![UiKey::new(key)]);
+        }
+        let group = plan.group(40.0, 24.0);
+        plan.row(group, 60.0, vec![UiKey::new("last")]);
+        plan.set_control_rows(vec![(0.0, 8.0, 36.0)]);
+        plan.set_ink(52.0);
+        plan.set_ink_top(8.0);
+        let end = |now: f32| {
+            let mut plan = plan.clone();
+            seat_room(&mut plan, 200.0, Overhang { now, kept: 44.0 });
+            let screen = plan.screen(plan.limit());
+            let at = plan.stop_top(screen.drawn.start, plan.len() - 1) - screen.offset;
+            (
+                plan.card_bottom(screen.drawn.start, plan.len() - 1) - screen.offset,
+                at + plan.controls_of(plan.len() - 1).1,
+                screen.height,
+            )
+        };
+        let (bottom, controls, height) = end(0.0);
+        assert!(
+            bottom <= 200.0 + 0.01,
+            "the last card whole in the room: {bottom}"
+        );
+        assert!(
+            height >= bottom - 0.01,
+            "drawn to its end: {height} {bottom}"
+        );
+        let (bottom, controls_free, _) = end(44.0);
+        assert!(bottom <= 244.0 + 0.01 && controls_free <= 200.0 + 0.01);
+        assert!(controls <= 200.0 + 0.01);
+    }
+
+    /// ONE BOUNDARY FOR WHAT A SCREEN SHOWS AND DRAWS AS SHOWN: a row whose
+    /// switch runs 3pt past the room's edge into the strip is the screen's
+    /// peek, live nowhere and fading from its top — the screen's live, full
+    /// strength part ends at that switch's top — so the screen that shows it
+    /// is the next (Page Down turns onto it, never past it) and nothing on
+    /// this one is painted whole over a part a press does not reach. It was
+    /// painted at 0.87 of full strength and more, live above the edge only,
+    /// and Page Down turned onto it again (Appearance's Selection color at
+    /// 102x29). CONTROLS: a card's row of buttons whole in the room stays
+    /// live though the card's next row runs past the edge; with nothing cut
+    /// the screen is live to the room's edge.
+    #[test]
+    fn a_control_over_the_rooms_edge_is_a_picture_from_its_top() {
+        let mut plan = ScrollPlan::new(10.0);
+        plan.card(200.0, vec![UiKey::new("first")]);
+        plan.card(60.0, vec![UiKey::new("row")]);
+        plan.set_control_spans(vec![(UiKey::new("row"), 12.0, 36.0)]);
+        plan.set_control_rows(vec![(0.0, 12.0, 36.0)]);
+        plan.card(60.0, vec![UiKey::new("after")]);
+        seat_room(
+            &mut plan,
+            255.0,
+            Overhang {
+                now: 44.0,
+                kept: 44.0,
+            },
+        );
+        // The row starts at 210, its switch at 222..258: 3pt past the room.
+        let screen = plan.screen(0);
+        assert_eq!(plan.shown(0), 0..1);
+        assert_eq!(
+            screen.live, 222.0,
+            "live and at full strength to the switch's top"
+        );
+        assert!(screen.fades);
+        assert!(!plan.draws_controls_live(1, 0), "the switch is a picture");
+        assert_eq!(plan.page_after(0), 1, "the next screen shows it");
+        // A card whose first row of buttons is whole in the room, its next
+        // row past the edge: the first row stays live.
+        let mut card = ScrollPlan::new(10.0);
+        card.card(150.0, vec![UiKey::new("lead")]);
+        card.card(140.0, vec![UiKey::new("one"), UiKey::new("two")]);
+        card.set_control_spans(vec![
+            (UiKey::new("one"), 20.0, 44.0),
+            (UiKey::new("two"), 72.0, 44.0),
+        ]);
+        card.set_control_rows(vec![(0.0, 20.0, 96.0)]);
+        card.card(60.0, Vec::new());
+        seat_room(
+            &mut card,
+            250.0,
+            Overhang {
+                now: 44.0,
+                kept: 44.0,
+            },
+        );
+        // The card starts at 160: its first row 180..224, its second
+        // 232..276, past the room.
+        assert_eq!(card.screen(0).live, 232.0);
+        assert!(card.draws_control_live(1, &UiKey::new("one"), 0));
+        assert!(!card.draws_control_live(1, &UiKey::new("two"), 0));
+        // The keyboard a turn holds on the stop: the control asked for where
+        // it is drawn live, else the first of the stop's that is — a wrapped
+        // segmented control's first line, its selected segment past the edge.
+        assert_eq!(
+            card.live_control(1, &UiKey::new("one"), 0),
+            Some(&UiKey::new("one"))
+        );
+        assert_eq!(
+            card.live_control(1, &UiKey::new("two"), 0),
+            Some(&UiKey::new("one"))
+        );
+        assert_eq!(card.live_control(2, &UiKey::new("two"), 0), None);
+        // Nothing cut: live to the room's edge.
+        let whole = cards(&[100.0, 100.0, 100.0], 230.0, 10.0);
+        assert_eq!(whole.screen(0).live, 230.0);
+    }
+
+    /// THE PEEK SEAT: a screen that is not the list's first, ending on a
+    /// whole card whose next card would show less than [`PEEK_MIN`] under
+    /// the edge, scrolls on by what that peek lacks where its first stop's
+    /// top padding holds that much — the next card then peeks in its border
+    /// and corners, the screen showing what it did — rather than end on the
+    /// card over a band of blank with nothing of the next in view (Window at
+    /// 150x48 under SESSION, Appearance at 167x36 under TEXT & CONTRAST).
+    /// CONTROLS: the list's first screen starts at the page's top; a first
+    /// stop with less padding over it than the peek lacks keeps its seat.
+    #[test]
+    fn a_screen_that_ends_on_a_whole_card_scrolls_on_to_peek_the_next() {
+        let plan = |padding: f32| {
+            let mut plan = ScrollPlan::new(12.0);
+            for key in ["a", "b", "c", "d", "e", "f"] {
+                plan.card(136.0, vec![UiKey::new(key)]);
+                plan.set_control_rows(vec![(0.0, padding, 136.0 - 2.0 * padding)]);
+                plan.set_ink(136.0 - padding);
+                plan.set_ink_top(padding);
+            }
+            seat_room(&mut plan, 300.0, Overhang::NONE);
+            plan
+        };
+        // Seated at b: b 0..136, c 148..284, d from 296 — 4pt of it under
+        // the edge, 12pt short of its least peek, inside b's 12pt padding.
+        let padded = plan(12.0);
+        let screen = padded.screen(1);
+        assert_eq!(screen.offset, 12.0, "scrolled on into b's padding");
+        assert!(screen.drawn.contains(&3), "d peeks in");
+        assert_eq!(
+            padded.card_top(screen.drawn.start, 3) - screen.offset,
+            300.0 - PEEK_MIN,
+            "PEEK_MIN of d under the edge"
+        );
+        assert_eq!(padded.shown(1), 1..3, "b and c shown whole, as seated");
+        assert_eq!(padded.page_after(1), 3);
+        // CONTROL: the list's first screen starts at the page's top.
+        assert_eq!(padded.screen(0).offset, 0.0);
+        // CONTROL: 8pt of padding over b holds no 12pt nudge.
+        let flush = plan(8.0);
+        assert_eq!(flush.screen(1).offset, 0.0);
+        assert!(!flush.screen(1).drawn.contains(&3));
+    }
+
+    /// A WHOLE ROW BEATS A KEPT CAPTION: a screen scrolled a few points into
+    /// a group's card — a press's nudge, the last screen's end — whose first
+    /// row the list's top leaves whole draws the card's caption scrolling
+    /// with it, not kept over that row: kept, it came down over the row and
+    /// cut it, and the edge rule took the row's cut control, name and all
+    /// (Cursor & Motion's last screen at 102x29: EFFECT POLICY over an empty
+    /// card). CONTROL: scrolled past the row's words, the caption is kept
+    /// over the rows scrolling under it.
+    #[test]
+    fn a_kept_caption_never_comes_down_over_a_row_the_scroll_left_whole() {
+        let mut plan = ScrollPlan::new(10.0);
+        plan.card(100.0, vec![UiKey::new("before")]);
+        let group = plan.group(54.0, 40.0);
+        plan.set_caption(group, 14.0, 36.0);
+        for key in ["a", "b", "c", "d"] {
+            plan.row(group, 44.0, vec![UiKey::new(key)]);
+            plan.set_control_rows(vec![(0.0, 4.0, 36.0)]);
+            plan.set_ink(40.0);
+            plan.set_ink_top(4.0);
+        }
+        seat_room(&mut plan, 200.0, Overhang::NONE);
+        // Seated at the group's first row, its caption over it; a press
+        // nudges the list 16pt: the row's top is 24pt under the list's top.
+        let seated = plan.stop_screen(1);
+        assert_eq!((seated.offset, seated.drawn.start), (0.0, 1));
+        let nudged = plan.nudged(seated.clone(), 16.0, false);
+        assert!(
+            nudged.caption.is_none_or(|caption| !caption.kept),
+            "the caption scrolls with its card: {nudged:?}"
+        );
+        assert_eq!(
+            plan.shown_on(&nudged.drawn, nudged.offset, nudged.caption)
+                .start,
+            1,
+            "the row the nudge left whole is shown"
+        );
+        // CONTROL: 48pt on, the row's words are over the list's top; the
+        // caption is kept over the rows under it.
+        let past = plan.nudged(seated, 48.0, false);
+        assert!(past.caption.is_some_and(|caption| caption.kept), "{past:?}");
     }
 }

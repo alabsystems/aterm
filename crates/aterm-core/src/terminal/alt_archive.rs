@@ -53,6 +53,7 @@ pub const ALT_ARCHIVE_ROW_OVERHEAD: usize = size_of::<ArchivedRow>() + 2 * size_
 
 /// Retained-row charge for `len` text bytes: the fixed overhead plus text rounded up to 16
 /// bytes (an accounting policy, not an allocator model).
+#[inline]
 #[must_use]
 pub const fn alt_archive_row_charge(len: usize) -> usize {
     len.next_multiple_of(16) + ALT_ARCHIVE_ROW_OVERHEAD
@@ -85,6 +86,7 @@ pub enum AltArchiveGapKind {
 
 impl AltArchiveGapKind {
     /// Lowercase wire name (`jump`, `resize`, `leave`, `reset`, `restore`).
+    #[inline]
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -97,6 +99,7 @@ impl AltArchiveGapKind {
     }
 
     /// Inverse of [`as_str`](Self::as_str); `None` for any other word.
+    #[inline]
     #[must_use]
     pub fn parse(word: &str) -> Option<Self> {
         Some(match word {
@@ -136,6 +139,7 @@ pub struct AltArchiveQuery {
 
 impl AltArchiveQuery {
     /// Oldest-first page of at most `max_rows` rows after `since`.
+    #[inline]
     #[must_use]
     pub const fn oldest(since: u64, max_rows: usize) -> Self {
         Self {
@@ -146,6 +150,7 @@ impl AltArchiveQuery {
     }
 
     /// The newest `max_rows` rows after `since`.
+    #[inline]
     #[must_use]
     pub const fn newest(since: u64, max_rows: usize) -> Self {
         Self {
@@ -200,6 +205,7 @@ pub struct AltArchiveRead {
 impl AltArchiveRead {
     /// Index of the last row this read returned (`last` when it returned
     /// none): the exclusive `since` of the next page or poll.
+    #[inline]
     #[must_use]
     pub fn page_last(&self) -> u64 {
         match self.rows.len() {
@@ -235,6 +241,7 @@ pub struct AltArchiveFence {
 impl AltArchiveFence {
     /// The fence without the differ's fingerprint: what the retained rows
     /// depend on.
+    #[inline]
     const fn rows_part(self) -> Self {
         Self { differ: 0, ..self }
     }
@@ -292,6 +299,7 @@ pub struct AltArchiveCarry {
 
 impl AltArchiveCarry {
     /// The newest index this carry names (`first - 1` plus its rows).
+    #[inline]
     #[must_use]
     pub fn last(&self) -> u64 {
         (self.first + self.rows.len() as u64).saturating_sub(1)
@@ -325,6 +333,7 @@ struct ArchivedRow {
 
 impl ArchivedRow {
     /// This row's charge against the retained-row budget.
+    #[inline]
     fn cost(&self) -> usize {
         alt_archive_row_charge(self.text.len())
     }
@@ -344,6 +353,7 @@ struct Frame {
 }
 
 impl Frame {
+    #[inline]
     fn rows(&self) -> usize {
         self.text.len()
     }
@@ -365,11 +375,13 @@ impl Frame {
             .extend(self.text.iter().map(|s| is_content_text(s)));
     }
 
+    #[inline]
     fn blank(&self, i: usize) -> bool {
         self.text[i].is_empty()
     }
 
     /// Whether every row is blank (a cleared screen).
+    #[inline]
     fn all_blank(&self) -> bool {
         self.text.iter().all(String::is_empty)
     }
@@ -412,6 +424,7 @@ pub struct AltArchiveBudget {
 
 impl AltArchiveBudget {
     /// A pool of `total` bytes, no share smaller than `min_share` (clamped to `total`).
+    #[inline]
     #[must_use]
     pub fn new(total: usize, min_share: usize) -> Arc<Self> {
         Arc::new(Self {
@@ -435,13 +448,15 @@ impl AltArchiveBudget {
     }
 
     /// Bytes this pool divides between its archives.
+    #[inline]
     #[must_use]
     #[cfg(test)]
-    pub fn total(&self) -> usize {
+    pub const fn total(&self) -> usize {
         self.total
     }
 
     /// Archives currently drawing on this pool: joined, enabled and holding rows.
+    #[inline]
     #[must_use]
     pub fn live(&self) -> usize {
         self.live.load(Ordering::Relaxed)
@@ -450,6 +465,7 @@ impl AltArchiveBudget {
     /// What one archive may retain right now: `total / live`, floored at
     /// `min_share`. With nothing live yet (the archive asking is about
     /// to be the first), the whole total.
+    #[inline]
     #[must_use]
     pub fn share(&self) -> usize {
         (self.total / self.live().max(1)).max(self.min_share)
@@ -465,13 +481,15 @@ struct BudgetShare {
 }
 
 impl BudgetShare {
-    fn new(pool: Arc<AltArchiveBudget>) -> Self {
+    #[inline]
+    const fn new(pool: Arc<AltArchiveBudget>) -> Self {
         Self {
             pool,
             counted: false,
         }
     }
 
+    #[inline]
     fn set_counted(&mut self, counted: bool) {
         if counted == self.counted {
             return;
@@ -603,45 +621,52 @@ impl AltArchive {
     // ----------------------------------------------------------------- reads
 
     /// Newest archived index (0 when nothing was ever archived).
+    #[inline]
     #[must_use]
     pub fn last(&self) -> u64 {
         self.first + self.rows.len() as u64 - 1
     }
 
     /// Oldest retained index (`last + 1` when empty).
+    #[inline]
     #[must_use]
-    pub fn oldest(&self) -> u64 {
+    pub const fn oldest(&self) -> u64 {
         self.first
     }
 
     /// Retained row count.
+    #[inline]
     #[must_use]
     pub fn len(&self) -> usize {
         self.rows.len()
     }
 
     /// Whether no rows are retained.
+    #[inline]
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.rows.is_empty()
     }
 
     /// Bytes charged against the budget.
+    #[inline]
     #[must_use]
     #[cfg(test)]
-    pub fn bytes(&self) -> usize {
+    pub const fn bytes(&self) -> usize {
         self.bytes
     }
 
     /// This archive's own byte budget (0 = off), before any shared pool.
+    #[inline]
     #[must_use]
     #[cfg(test)]
-    pub fn budget(&self) -> usize {
+    pub const fn budget(&self) -> usize {
         self.budget
     }
 
     /// What this archive may retain right now: its own budget, capped by its pool share
     /// ([`Self::share_budget`]); it moves as sessions open and close.
+    #[inline]
     #[must_use]
     pub fn effective_budget(&self) -> usize {
         match &self.share {
@@ -651,6 +676,7 @@ impl AltArchive {
     }
 
     /// The shared budget this archive draws on, if any.
+    #[inline]
     #[must_use]
     #[cfg(test)]
     pub fn shared_budget(&self) -> Option<&Arc<AltArchiveBudget>> {
@@ -658,49 +684,57 @@ impl AltArchive {
     }
 
     /// Rows ever evicted or wiped.
+    #[inline]
     #[must_use]
-    pub fn lost(&self) -> u64 {
+    pub const fn lost(&self) -> u64 {
         self.lost
     }
 
     /// Baseline generation (see [`AltArchiveRead::epoch`]).
+    #[inline]
     #[must_use]
-    pub fn epoch(&self) -> u32 {
+    pub const fn epoch(&self) -> u32 {
         self.epoch
     }
 
     /// Host-assigned origin (0 until set).
+    #[inline]
     #[must_use]
-    pub fn origin(&self) -> u64 {
+    pub const fn origin(&self) -> u64 {
         self.origin
     }
 
     /// Archived rows re-shown at the top of the screen (the debt).
+    #[inline]
     #[must_use]
-    pub fn back(&self) -> usize {
+    pub const fn back(&self) -> usize {
         self.debt
     }
 
     /// Index of the archived row shown at the top of the scrolling region when
     /// [`back`](Self::back) is nonzero (0 otherwise).
+    #[inline]
     #[must_use]
-    pub fn back_at(&self) -> u64 {
+    pub const fn back_at(&self) -> u64 {
         if self.debt > 0 { self.debt_at } else { 0 }
     }
 
     /// Whether the archive is recording.
+    #[inline]
     #[must_use]
     #[cfg(test)]
-    pub fn enabled(&self) -> bool {
+    pub const fn enabled(&self) -> bool {
         self.enabled
     }
 
     /// The retained gaps, oldest first.
+    #[inline]
     pub fn gaps(&self) -> impl Iterator<Item = AltArchiveGap> + '_ {
         self.gaps.iter().copied()
     }
 
     /// The text of the retained row with index `index`, if any.
+    #[inline]
     #[must_use]
     pub fn row(&self, index: u64) -> Option<&str> {
         let off = usize::try_from(index.checked_sub(self.first)?).ok()?;
@@ -759,6 +793,7 @@ impl AltArchive {
     /// Set the host-assigned origin, unique per process that started an archive (e.g.
     /// `pid << 32 ^ launch nanos`), so another archive's indices are never mistaken for this
     /// one's. A carrying handoff keeps it ([`AltArchive::import`]).
+    #[inline]
     pub fn set_origin(&mut self, origin: u64) {
         self.origin = origin;
     }
@@ -1448,6 +1483,7 @@ impl AltArchive {
     /// The app left the alternate screen: flush the last frame's scrolling region and the rows
     /// it pushed out at the bottom, record the gap, drop the baseline. The caller commits the
     /// alt grid first, while it exists.
+    #[inline]
     pub fn leave(&mut self) {
         self.end_run(false, AltArchiveGapKind::Leave);
     }
@@ -1455,12 +1491,14 @@ impl AltArchive {
     /// [`leave`](Self::leave) for a screen no app is behind any more (a shell prompt arrived,
     /// or the host forced the primary screen): flush the whole last frame, chrome included,
     /// since the rows measured as chrome may be the shell's (a duplicate, never a loss).
+    #[inline]
     pub fn leave_whole(&mut self) {
         self.end_run(true, AltArchiveGapKind::Leave);
     }
 
     /// The app entered the alternate screen: a new baseline (no rows), and a
     /// new run — nothing archived before it is this screen's to re-show.
+    #[inline]
     pub fn enter(&mut self) {
         if self.enabled {
             self.new_run();
@@ -1469,6 +1507,7 @@ impl AltArchive {
 
     /// The grids were replaced wholesale (checkpoint restore): flush, gap,
     /// new baseline.
+    #[inline]
     pub fn restore(&mut self) {
         self.end_run(false, AltArchiveGapKind::Restore);
     }
@@ -1538,6 +1577,7 @@ impl AltArchive {
     // --------------------------------------------------- handoff carry
 
     /// Where the archive stands now (see [`AltArchiveFence`]).
+    #[inline]
     #[must_use]
     pub fn fence(&self) -> AltArchiveFence {
         AltArchiveFence {
@@ -1835,7 +1875,8 @@ struct Vote {
 
 impl Vote {
     /// More votes wins; a tie goes to the smaller move, then to the upward one.
-    fn beats(self, other: Self) -> bool {
+    #[inline]
+    const fn beats(self, other: Self) -> bool {
         self.votes > other.votes
             || (self.votes == other.votes
                 && (self.d.unsigned_abs() < other.d.unsigned_abs()
@@ -1860,6 +1901,7 @@ fn index_anchors(
     }
 }
 
+#[inline]
 fn row_hash(s: &str) -> u64 {
     let mut h = FxHasher::default();
     h.write(s.as_bytes());
@@ -1868,7 +1910,8 @@ fn row_hash(s: &str) -> u64 {
 }
 
 /// Box-drawing / rule chars (and space): a row made only of these never votes.
-fn is_rule_char(ch: char) -> bool {
+#[inline]
+const fn is_rule_char(ch: char) -> bool {
     matches!(
         ch,
         ' ' | '─'
@@ -1894,17 +1937,20 @@ fn is_rule_char(ch: char) -> bool {
 }
 
 /// What a row says: its chars with box/rule art and spaces removed.
+#[inline]
 fn said_text(s: &str) -> impl Iterator<Item = char> + '_ {
     s.chars().filter(|&ch| !is_rule_char(ch))
 }
 
 /// A row that says something: not blank, not only rules/box art.
+#[inline]
 fn is_content_text(s: &str) -> bool {
     s.chars().any(|ch| !is_rule_char(ch))
 }
 
 /// A row distinctive enough to vote: at least [`MIN_ANCHOR_CHARS`] visible chars
 /// after trimming, not only rules/box art. (Uniqueness is checked per frame.)
+#[inline]
 fn is_anchor_text(s: &str) -> bool {
     let mut n = 0;
     let mut non_rule = false;
@@ -2038,6 +2084,7 @@ struct DecModeMatcher {
 }
 
 impl DecModeMatcher {
+    #[inline]
     fn finish_param(&mut self) {
         match self.param {
             2026 => self.esu = true,
@@ -2049,12 +2096,14 @@ impl DecModeMatcher {
         self.param = 0;
     }
 
+    #[inline]
     fn reset(&mut self) {
         *self = Self::default();
     }
 
     /// What a completed `CSI ? … <final>` means for the hook, given the screen.
-    fn classify(&self, final_byte: u8, on_alt: bool) -> Option<HitKind> {
+    #[inline]
+    const fn classify(&self, final_byte: u8, on_alt: bool) -> Option<HitKind> {
         match (final_byte, on_alt) {
             (b'l', true) if self.alt != 0 => Some(HitKind::Exit),
             (b'l', true) if self.esu => Some(HitKind::Esu),
@@ -2217,12 +2266,14 @@ impl AltArchiveState {
 impl Terminal {
     /// The alt-screen scroll-off archive (read-only). Call
     /// [`AltArchive::read`] under the terminal lock and format afterwards.
+    #[inline]
     #[must_use]
-    pub fn alt_archive(&self) -> &AltArchive {
+    pub const fn alt_archive(&self) -> &AltArchive {
         &self.alt_archive.archive
     }
 
     /// Clone rows out of the alt-screen archive (see [`AltArchive::read`]).
+    #[inline]
     #[must_use]
     pub fn alt_archive_read(&self, q: AltArchiveQuery) -> AltArchiveRead {
         self.alt_archive.archive.read(q)
@@ -2230,12 +2281,14 @@ impl Terminal {
 
     /// Set the archive's origin: unique to this process, so indices are never compared across
     /// a restart or an archive-less handoff.
+    #[inline]
     pub fn set_alt_archive_origin(&mut self, origin: u64) {
         self.alt_archive.archive.set_origin(origin);
     }
 
     /// Draw on the process's shared archive budget ([`AltArchiveBudget::process`]) instead of
     /// a per-session one; dropping the terminal gives the share back.
+    #[inline]
     pub fn set_alt_archive_shared(&mut self, shared: bool) {
         self.alt_archive
             .archive
@@ -2244,6 +2297,7 @@ impl Terminal {
 
     /// Set the archive's byte budget; 0 turns it off and wipes it. A session
     /// sharing the process budget retains the smaller of this and its share.
+    #[inline]
     pub fn set_alt_archive_budget(&mut self, budget: usize) {
         let was = self.alt_archive.archive.enabled;
         self.alt_archive.archive.set_budget(budget);
@@ -2253,6 +2307,7 @@ impl Terminal {
     }
 
     /// Turn the archive on or off for this session. Off wipes it.
+    #[inline]
     pub fn set_alt_archive_enabled(&mut self, enabled: bool) {
         let was = self.alt_archive.archive.enabled;
         self.alt_archive.archive.set_enabled(enabled);
@@ -2322,6 +2377,7 @@ impl Terminal {
         self.advance_parser_raw(rest);
     }
 
+    #[inline]
     fn advance_parser_raw(&mut self, bytes: &[u8]) {
         if bytes.is_empty() {
             return;
@@ -2414,6 +2470,7 @@ impl Terminal {
     }
 
     /// Commit the active (alt) grid's rows; callers run only while the archive is enabled.
+    #[inline]
     fn alt_archive_commit(&mut self) {
         self.alt_archive.archive.commit_grid(&self.grid);
     }

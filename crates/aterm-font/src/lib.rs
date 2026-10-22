@@ -197,7 +197,8 @@ impl From<f32> for NormalizedCoordinate {
 impl NormalizedCoordinate {
     /// Returns the coordinate value as F2DOT14.
     #[inline]
-    pub fn get(self) -> i16 {
+    #[must_use]
+    pub const fn get(self) -> i16 {
         self.0
     }
 }
@@ -210,18 +211,21 @@ pub struct Tag(pub u32);
 impl Tag {
     /// Creates a `Tag` from bytes.
     #[inline]
+    #[must_use]
     pub const fn from_bytes(bytes: &[u8; 4]) -> Self {
         Tag(u32::from_be_bytes(*bytes))
     }
 
     /// Returns tag as 4-element byte array.
     #[inline]
+    #[must_use]
     pub const fn to_bytes(self) -> [u8; 4] {
         self.0.to_be_bytes()
     }
 
     /// Returns tag value as `u32` number.
     #[inline]
+    #[must_use]
     pub const fn as_u32(&self) -> u32 {
         self.0
     }
@@ -278,7 +282,7 @@ pub struct Rect {
 
 impl Rect {
     #[inline]
-    fn zero() -> Self {
+    const fn zero() -> Self {
         Self {
             x_min: 0,
             y_min: 0,
@@ -303,7 +307,7 @@ pub struct RectF {
 
 impl RectF {
     #[inline]
-    fn new() -> Self {
+    const fn new() -> Self {
         RectF {
             x_min: f32::MAX,
             y_min: f32::MAX,
@@ -313,7 +317,7 @@ impl RectF {
     }
 
     #[inline]
-    fn is_default(&self) -> bool {
+    const fn is_default(&self) -> bool {
         self.x_min == f32::MAX
             && self.y_min == f32::MAX
             && self.x_max == f32::MIN
@@ -359,18 +363,21 @@ pub struct Transform {
 impl Transform {
     /// Creates a new transform with the specified components.
     #[inline]
-    pub fn new(a: f32, b: f32, c: f32, d: f32, e: f32, f: f32) -> Self {
+    #[must_use]
+    pub const fn new(a: f32, b: f32, c: f32, d: f32, e: f32, f: f32) -> Self {
         Transform { a, b, c, d, e, f }
     }
 
     /// Creates a new translation transform.
     #[inline]
-    pub fn new_translate(tx: f32, ty: f32) -> Self {
+    #[must_use]
+    pub const fn new_translate(tx: f32, ty: f32) -> Self {
         Transform::new(1.0, 0.0, 0.0, 1.0, tx, ty)
     }
 
     /// Creates a new rotation transform; `angle` is in half-turns.
     #[inline]
+    #[must_use]
     pub fn new_rotate(angle: f32) -> Self {
         let cc = (angle * core::f32::consts::PI).cos();
         let ss = (angle * core::f32::consts::PI).sin();
@@ -380,6 +387,7 @@ impl Transform {
 
     /// Creates a new skew transform; the angles are in half-turns.
     #[inline]
+    #[must_use]
     pub fn new_skew(skew_x: f32, skew_y: f32) -> Self {
         let x = (skew_x * core::f32::consts::PI).tan();
         let y = (skew_y * core::f32::consts::PI).tan();
@@ -389,13 +397,15 @@ impl Transform {
 
     /// Creates a new scale transform.
     #[inline]
-    pub fn new_scale(sx: f32, sy: f32) -> Self {
+    #[must_use]
+    pub const fn new_scale(sx: f32, sy: f32) -> Self {
         Transform::new(sx, 0.0, 0.0, sy, 0.0, 0.0)
     }
 
     /// Combines two transforms with each other.
     #[inline]
-    pub fn combine(ts1: Self, ts2: Self) -> Self {
+    #[must_use]
+    pub const fn combine(ts1: Self, ts2: Self) -> Self {
         Transform {
             a: ts1.a * ts2.a + ts1.c * ts2.b,
             b: ts1.b * ts2.a + ts1.d * ts2.b,
@@ -416,7 +426,8 @@ impl Transform {
 
     /// Checks whether a transform is the identity transform.
     #[inline]
-    pub fn is_default(&self) -> bool {
+    #[must_use]
+    pub const fn is_default(&self) -> bool {
         // A direct float comparison is fine in our case.
         self.a == 1.0
             && self.b == 0.0
@@ -456,7 +467,8 @@ pub struct RgbaColor {
 impl RgbaColor {
     /// Creates a new `RgbaColor`.
     #[inline]
-    pub fn new(red: u8, green: u8, blue: u8, alpha: u8) -> Self {
+    #[must_use]
+    pub const fn new(red: u8, green: u8, blue: u8, alpha: u8) -> Self {
         Self {
             blue,
             green,
@@ -467,6 +479,7 @@ impl RgbaColor {
 
     /// Scales the alpha by `alpha` (0..=1); the cast saturates, and NaN
     /// gives 0.
+    #[inline]
     pub(crate) fn apply_alpha(&mut self, alpha: f32) {
         self.alpha = (((f32::from(self.alpha) / 255.0) * alpha) * 255.0) as u8;
     }
@@ -617,6 +630,7 @@ struct VarCoords {
 }
 
 impl Default for VarCoords {
+    #[inline]
     fn default() -> Self {
         Self {
             data: [NormalizedCoordinate::default(); MAX_VAR_COORDS],
@@ -739,6 +753,8 @@ impl<'a> RawFace<'a> {
     }
 
     /// Returns the raw data of a selected table.
+    #[inline]
+    #[must_use]
     pub fn table(&self, tag: Tag) -> Option<&'a [u8]> {
         let (_, table) = self
             .table_records
@@ -1032,13 +1048,15 @@ impl<'a> Face<'a> {
 
     /// Returns the parsed tables.
     #[inline]
-    pub fn tables(&self) -> &FaceTables<'a> {
+    #[must_use]
+    pub const fn tables(&self) -> &FaceTables<'a> {
         &self.tables
     }
 
     /// Returns the table directory this face was parsed from.
     #[inline]
-    pub fn raw_face(&self) -> &RawFace<'a> {
+    #[must_use]
+    pub const fn raw_face(&self) -> &RawFace<'a> {
         &self.raw_face
     }
 
@@ -1046,6 +1064,7 @@ impl<'a> Face<'a> {
     ///
     /// Returns `false` when `post` table is not present.
     #[inline]
+    #[must_use]
     pub fn is_monospaced(&self) -> bool {
         self.tables
             .post
@@ -1055,7 +1074,8 @@ impl<'a> Face<'a> {
 
     /// Checks that face is variable: it has a `fvar` table with an axis.
     #[inline]
-    pub fn is_variable(&self) -> bool {
+    #[must_use]
+    pub const fn is_variable(&self) -> bool {
         // `fvar::Table::parse` already checked that `axisCount` is non-zero.
         self.tables.fvar.is_some()
     }
@@ -1420,13 +1440,15 @@ impl<'a> Face<'a> {
 
     /// Returns face's units per EM, in 16..=16384.
     #[inline]
-    pub fn units_per_em(&self) -> u16 {
+    #[must_use]
+    pub const fn units_per_em(&self) -> u16 {
         self.tables.head.units_per_em
     }
 
     /// Returns a total number of glyphs in the face. Never zero.
     #[inline]
-    pub fn number_of_glyphs(&self) -> u16 {
+    #[must_use]
+    pub const fn number_of_glyphs(&self) -> u16 {
         self.tables.maxp.number_of_glyphs.get()
     }
 
@@ -1546,6 +1568,7 @@ impl<'a> Face<'a> {
     /// Returns glyph's vertical origin according to the
     /// [Vertical Origin Table](https://docs.microsoft.com/en-us/typography/opentype/spec/vorg),
     /// at the current instance.
+    #[inline]
     pub fn glyph_y_origin(&self, glyph_id: GlyphId) -> Option<i16> {
         let mut origin = self.tables.vorg.map(|vorg| vorg.glyph_y_origin(glyph_id))? as f32;
 
@@ -1597,6 +1620,7 @@ impl<'a> Face<'a> {
     /// (`glyf`: TrueType's quadratic points, composite components
     /// transformed; CFF: each segment's control and end points), and returns
     /// the bounding box [`Face::outline_glyph`] would.
+    #[inline]
     pub fn outline_glyph_points(
         &self,
         glyph_id: GlyphId,
@@ -1626,7 +1650,8 @@ impl<'a> Face<'a> {
 
     /// Returns a bounding box that large enough to enclose any glyph from the face.
     #[inline]
-    pub fn global_bounding_box(&self) -> Rect {
+    #[must_use]
+    pub const fn global_bounding_box(&self) -> Rect {
         self.tables.head.global_bbox
     }
 
@@ -1665,6 +1690,7 @@ impl<'a> Face<'a> {
 
     /// Returns `true` if the glyph can be painted from the `COLR`+`CPAL`
     /// tables.
+    #[inline]
     pub fn is_color_glyph(&self, glyph_id: GlyphId) -> bool {
         self.tables()
             .colr
@@ -1673,6 +1699,7 @@ impl<'a> Face<'a> {
     }
 
     /// Returns the number of palettes stored in the `COLR`+`CPAL` tables.
+    #[inline]
     pub fn color_palettes(&self) -> Option<core::num::NonZeroU16> {
         Some(self.tables().colr?.palettes.palettes())
     }
@@ -1762,6 +1789,7 @@ impl<'a> Face<'a> {
     /// Parses glyph's phantom points.
     ///
     /// Available only for variable fonts with the `gvar` table.
+    #[inline]
     pub fn glyph_phantom_points(&self, glyph_id: GlyphId) -> Option<PhantomPoints> {
         let glyf = self.tables.glyf?;
         let gvar = self.tables.gvar?;

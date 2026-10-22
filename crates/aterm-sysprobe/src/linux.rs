@@ -4,7 +4,10 @@
 //! Linux `/proc` and `/sys` parsers (pure functions over `&str` and `&[u8]`)
 //! and [`Root`] readers (std I/O under a configurable root directory). Both
 //! compile and run on every platform so fixture trees test the same code a
-//! Linux build runs on `/`.
+//! Linux build runs on `/`. The one figure no file holds, an NVIDIA card's
+//! busy percent, is asked of the root's injected [`NvidiaBusy`]: NVML on
+//! [`Root::system`] (the private `nvml` module, Linux only), nothing on a
+//! fixture tree.
 //!
 //! Every file is read through [`crate::with_bounded`] (one 4 KiB stack
 //! buffer), so every parser tolerates a text cut at 4 KiB — a torn last
@@ -25,7 +28,7 @@
 //! | `/sys/devices/cpu_*/cpus`, `cpuN/cpu_capacity` | [`layout_from`] | [`crate::cpu_layout`] |
 //! | `/proc/self/cgroup`, `cpu.max`, `memory.max` | [`cgroup_v2_path`], [`cpu_max_millicores`], [`memory_max`] | [`crate::capacity`] |
 //! | `/sys/class/thermal/thermal_zone*`, `thermal_throttle/*_count` | [`trip_kind`], [`throttle_level`] | [`crate::Probe::throttle`] |
-//! | `/sys/class/drm/card*/device/*` | [`Root::gpu`] | [`crate::gpu`] |
+//! | `/sys/class/drm/card*/device/*` | [`Root::gpu`] (an NVIDIA card's figure from NVML, through the root's [`NvidiaBusy`]) | [`crate::gpu`] |
 //! | `/proc/net/dev` | [`net_dev`] through [`links_under_into`] | [`crate::net_links_into`] |
 //! | `/sys/class/net/<if>/{flags,operstate,speed}` | [`hex_flags`], [`link_up`], [`speed_bps`] | [`crate::net_links_into`] |
 //! | `/proc/loadavg` | [`loadavg_tasks`] through [`Root::tasks`] | [`crate::pid_counts`] |
@@ -883,21 +886,48 @@ pub const STATUS_CAP: usize = 1 << 20;
 pub const MAX_CARDS: usize = 16;
 
 /// DRM drivers that drive a firmware framebuffer, not a GPU: a card of one
-/// is no GPU.
-const FRAMEBUFFER_DRIVERS: &[&str] = &["simpledrm", "efidrm", "vesadrm", "ofdrm", "vkms"];
+/// is no GPU. A card's `DRIVER=` is the name its device's driver registered
+/// on its bus, which for simpledrm is its platform driver's,
+/// `simple-framebuffer` (a DGX Spark's `card0`).
+const FRAMEBUFFER_DRIVERS: &[&str] = &[
+    "simpledrm",
+    "simple-framebuffer",
+    "efidrm",
+    "vesadrm",
+    "ofdrm",
+    "vkms",
+];
 
-/// Why a DRM driver publishes no device-wide busy figure in sysfs.
+/// Why a DRM driver publishes no device-wide busy figure [`Root::gpu`]
+/// reads (amdgpu's sysfs file and NVIDIA's NVML are read there).
 fn gpu_unread(driver: &str) -> Why {
     match driver {
         // The i915 and xe engine-busy counters are perf PMU events, readable
         // only with CAP_PERFMON (or perf_event_paranoid ≤ 0).
         "i915" | "xe" => Why::NeedsPrivilege("cap_perfmon"),
-        // NVIDIA's proprietary driver publishes its figures through NVML, a
-        // library this build does not load.
-        "nvidia" => Why::NotRead,
         _ => Why::Unsupported,
     }
 }
+
+/// Reads one NVIDIA card's device-wide busy percent (at most 100) by its PCI
+/// slot name (`000f:01:00.0`), or says why it cannot: the proprietary
+/// driver publishes no busy figure in sysfs, only through NVML. A [`Root`]
+/// carries one: [`Root::system`]'s asks NVML on Linux, every other root's is
+/// [`no_nvml`], which asks nothing.
+pub type NvidiaBusy = fn(&str) -> Result<u8, Why>;
+
+/// The inert [`NvidiaBusy`] of a fixture root (and of the system root off
+/// Linux): never asks NVML, and answers [`Why::NotRead`].
+pub fn no_nvml(_slot: &str) -> Result<u8, Why> {
+    Err(Why::NotRead)
+}
+
+/// [`Root::system`]'s [`NvidiaBusy`]: NVML on Linux.
+#[cfg(target_os = "linux")]
+const SYSTEM_NVIDIA: NvidiaBusy = crate::nvml::device_pct;
+/// [`Root::system`]'s [`NvidiaBusy`]: no NVIDIA driver to ask off Linux.
+#[cfg(not(target_os = "linux"))]
+const SYSTEM_NVIDIA: NvidiaBusy = no_nvml;
 
 /// Whether reading an awake card's sysfs figures leaves its runtime power
 /// management where it was, from its device's `power/runtime_status`,
@@ -927,23 +957,41 @@ fn owner(entry: &std::fs::DirEntry) -> Option<u32> {
 
 /// `/proc`, `/sys` and `/sys/fs/cgroup` under one root directory: `/` on a
 /// Linux machine ([`Root::system`]), a fixture tree in tests. Every reader
-/// is std file I/O, bounded, and compiles on every host.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// is std file I/O, bounded, and compiles on every host, but one: an NVIDIA
+/// card's busy figure, which only NVML gives, comes from the root's
+/// injected [`NvidiaBusy`] (NVML on the system root, [`no_nvml`] on any
+/// other), so a fixture tree never reaches the machine's own GPU.
+#[derive(Clone, Debug)]
 pub struct Root {
     base: PathBuf,
+    nvidia: NvidiaBusy,
 }
 
 impl Root {
-    /// The tree under `base`.
+    /// The tree under `base`, whose NVIDIA cards are not read ([`no_nvml`]).
     #[must_use]
     pub fn new(base: impl Into<PathBuf>) -> Self {
-        Self { base: base.into() }
+        Self {
+            base: base.into(),
+            nvidia: no_nvml,
+        }
     }
 
-    /// The machine's own tree, `/`.
+    /// The machine's own tree, `/`, its NVIDIA cards read through NVML.
     #[must_use]
     pub fn system() -> Self {
-        Self::new("/")
+        Self {
+            nvidia: SYSTEM_NVIDIA,
+            ..Self::new("/")
+        }
+    }
+
+    /// This root with `nvidia` reading its NVIDIA cards: the test arm a
+    /// fixture tree's NVIDIA card answers through.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn with_nvidia(self, nvidia: NvidiaBusy) -> Self {
+        Self { nvidia, ..self }
     }
 
     /// `rel` under the root.
@@ -1230,18 +1278,23 @@ impl Root {
 
     /// The GPU, device-wide, from the DRM cards (`/sys/class/drm/cardN`, at
     /// most [`MAX_CARDS`]); a firmware framebuffer (`simpledrm`) is no GPU.
-    /// Each card's driver comes from its device's `uevent` (`DRIVER=`).
+    /// Each card's driver comes from its device's `uevent` (`DRIVER=`), and
+    /// its PCI slot from the same file (`PCI_SLOT_NAME=`).
     ///
     /// Nothing here wakes a card or holds one awake:
     ///
     /// * A card whose `power/runtime_status` reads `suspended` is
     ///   [`Why::Asleep`] and is not read further.
-    /// * An awake amdgpu card answers `gpu_busy_percent` only where the read
-    ///   cannot move its runtime power management ([`pm_settled`]): before
-    ///   Linux's `get_if_active` sysfs change (6.8 LTS and older) that read
-    ///   takes a runtime-PM reference and re-arms amdgpu's 5 s autosuspend
-    ///   timer, so polling a hybrid laptop's dGPU once a second would keep
-    ///   it from ever suspending. Elsewhere it is [`Why::NotRead`].
+    /// * An awake amdgpu card answers `gpu_busy_percent`, and an awake
+    ///   NVIDIA card its NVML figure by its `PCI_SLOT_NAME` (the root's
+    ///   [`NvidiaBusy`]; a card with no slot name is [`Why::NotRead`]), only
+    ///   where the read cannot move its runtime power management
+    ///   ([`pm_settled`]). Before Linux's `get_if_active` sysfs change (6.8
+    ///   LTS and older) amdgpu's read takes a runtime-PM reference and
+    ///   re-arms its 5 s autosuspend timer, and NVML's handle lookup
+    ///   initialises the GPU, so polling a hybrid laptop's dGPU once a
+    ///   second would keep it from ever suspending. Elsewhere it is
+    ///   [`Why::NotRead`], and NVML is never asked.
     /// * Every other driver answers why it cannot ([`gpu_unread`]).
     ///
     /// The answer is the first card with a figure; else, when every card is
@@ -1254,20 +1307,23 @@ impl Root {
         let mut readings: Vec<GpuReading> = Vec::new();
         for (_, card) in self.numbered("sys/class/drm", "card", MAX_CARDS) {
             let dev = format!("sys/class/drm/{card}/device");
-            let driver = self
+            let (driver, slot) = self
                 .read(&format!("{dev}/uevent"), |t| {
-                    whole_lines(t)
-                        .find_map(|l| l.strip_prefix("DRIVER="))
-                        .map(str::to_owned)
+                    let field = |key: &str| {
+                        whole_lines(t)
+                            .find_map(|l| l.strip_prefix(key))
+                            .map(str::to_owned)
+                    };
+                    (field("DRIVER="), field("PCI_SLOT_NAME="))
                 })
-                .flatten()
-                .or_else(|| {
-                    std::fs::read_link(self.at(&format!("{dev}/driver")))
-                        .ok()?
-                        .file_name()?
-                        .to_str()
-                        .map(str::to_owned)
-                });
+                .unwrap_or_default();
+            let driver = driver.or_else(|| {
+                std::fs::read_link(self.at(&format!("{dev}/driver")))
+                    .ok()?
+                    .file_name()?
+                    .to_str()
+                    .map(str::to_owned)
+            });
             let Some(driver) = driver else {
                 continue;
             };
@@ -1279,30 +1335,30 @@ impl Root {
                     .unwrap_or_default()
             };
             let status = word("power/runtime_status");
-            let mut reading = GpuReading {
-                name: Some(driver.clone()),
-                ..GpuReading::default()
-            };
-            if status == "suspended" {
-                reading.unread = Some(Why::Asleep);
+            let busy = if status == "suspended" {
+                Err(Why::Asleep)
+            } else if driver != "amdgpu" && driver != "nvidia" {
+                Err(gpu_unread(&driver))
+            } else if !pm_settled(&status, &word("power/control"), &word("boot_vga")) {
+                Err(Why::NotRead)
             } else if driver == "amdgpu" {
-                if pm_settled(&status, &word("power/control"), &word("boot_vga")) {
-                    reading.device_pct = self
-                        .read(&format!("{dev}/gpu_busy_percent"), |t| {
-                            t.trim().parse::<u32>().ok()
-                        })
-                        .flatten()
-                        .map(|p| u8::try_from(p.min(100)).unwrap_or(100));
-                    if reading.device_pct.is_none() {
-                        reading.unread = Some(Why::Unsupported);
-                    }
-                } else {
-                    reading.unread = Some(Why::NotRead);
-                }
+                self.read(&format!("{dev}/gpu_busy_percent"), |t| {
+                    t.trim().parse::<u32>().ok()
+                })
+                .flatten()
+                .map(|p| u8::try_from(p.min(100)).unwrap_or(100))
+                .ok_or(Why::Unsupported)
             } else {
-                reading.unread = Some(gpu_unread(&driver));
-            }
-            readings.push(reading);
+                slot.as_deref()
+                    .map_or(Err(Why::NotRead), |slot| (self.nvidia)(slot))
+                    .map(|p| p.min(100))
+            };
+            readings.push(GpuReading {
+                device_pct: busy.ok(),
+                unread: busy.err(),
+                name: Some(driver),
+                ..GpuReading::default()
+            });
         }
         let asleep = |r: &GpuReading| r.unread == Some(Why::Asleep);
         let pick = readings

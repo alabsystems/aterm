@@ -27,8 +27,9 @@ pub fn current_time_ms() -> Option<u64> {
 ///
 /// The one rule behind every OSC 133 phase duration on [`CommandMark`] and
 /// `OutputBlock`.
+#[inline]
 #[must_use]
-pub(crate) fn elapsed_ms(start: Option<u64>, end: Option<u64>) -> Option<u64> {
+pub(crate) const fn elapsed_ms(start: Option<u64>, end: Option<u64>) -> Option<u64> {
     match (start, end) {
         // saturating_sub: exact under the `end >= start` guard (which the
         // verifier cannot chain into the arm's arithmetic).
@@ -116,23 +117,26 @@ impl CommandMark {
     }
 
     /// Check if this mark represents a completed command.
+    #[inline]
     #[must_use]
-    pub fn is_complete(&self) -> bool {
+    pub const fn is_complete(&self) -> bool {
         self.exit_code.is_some()
     }
 
     /// Check if the command succeeded (exit code 0).
+    #[inline]
     #[must_use]
-    pub fn succeeded(&self) -> bool {
-        self.exit_code == Some(0)
+    pub const fn succeeded(&self) -> bool {
+        matches!(self.exit_code, Some(0))
     }
 
     /// Calculate the command execution duration in milliseconds.
     ///
     /// Returns the time between command execution start (C) and completion (D).
     /// Returns `None` if timestamps are incomplete or inconsistent.
+    #[inline]
     #[must_use]
-    pub fn exec_duration_ms(&self) -> Option<u64> {
+    pub const fn exec_duration_ms(&self) -> Option<u64> {
         elapsed_ms(self.command_exec_start_time_ms, self.command_end_time_ms)
     }
 }
@@ -166,7 +170,9 @@ impl TerminalMark {
     /// * `id` - Unique identifier for this mark
     /// * `row` - Absolute row number (use `Grid::visible_to_absolute()` to convert)
     /// * `col` - Column position
-    pub fn new(id: u64, row: u64, col: u16) -> Self {
+    #[inline]
+    #[must_use]
+    pub const fn new(id: u64, row: u64, col: u16) -> Self {
         Self {
             id,
             row,
@@ -213,7 +219,9 @@ impl Annotation {
     /// * `row` - Absolute row number (use `Grid::visible_to_absolute()` to convert)
     /// * `col` - Column position
     /// * `message` - The annotation content
-    pub fn new(id: u64, row: u64, col: u16, message: String) -> Self {
+    #[inline]
+    #[must_use]
+    pub const fn new(id: u64, row: u64, col: u16, message: String) -> Self {
         Self {
             id,
             row,

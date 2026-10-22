@@ -42,17 +42,19 @@ impl Affine {
 
     /// The six coefficients.
     #[inline]
-    pub fn as_coeffs(self) -> [f64; 6] {
+    pub const fn as_coeffs(self) -> [f64; 6] {
         self.0
     }
 
     /// The determinant of the linear part.
-    pub fn determinant(self) -> f64 {
+    #[inline]
+    pub const fn determinant(self) -> f64 {
         self.0[0] * self.0[3] - self.0[1] * self.0[2]
     }
 
     /// The inverse transform. A singular transform's has non-finite
     /// coefficients.
+    #[inline]
     pub fn inverse(self) -> Affine {
         let inv_det = self.determinant().recip();
         Affine([
@@ -194,22 +196,22 @@ impl Rect {
     }
 
     #[inline]
-    pub fn width(&self) -> f64 {
+    pub const fn width(&self) -> f64 {
         self.x1 - self.x0
     }
 
     #[inline]
-    pub fn height(&self) -> f64 {
+    pub const fn height(&self) -> f64 {
         self.y1 - self.y0
     }
 
     #[inline]
-    pub fn origin(&self) -> Point {
+    pub const fn origin(&self) -> Point {
         Point::new(self.x0, self.y0)
     }
 
     #[inline]
-    pub fn size(&self) -> Size {
+    pub const fn size(&self) -> Size {
         Size::new(self.width(), self.height())
     }
 
@@ -221,20 +223,20 @@ impl Rect {
     }
 
     #[inline]
-    pub fn area(&self) -> f64 {
+    pub const fn area(&self) -> f64 {
         self.width() * self.height()
     }
 
     /// Whether the area is zero.
     #[inline]
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.area() == 0.0
     }
 
     /// Whether `point` is inside: the top and left edges are, the bottom and
     /// right ones are not.
     #[inline]
-    pub fn contains(&self, point: Point) -> bool {
+    pub const fn contains(&self, point: Point) -> bool {
         point.x >= self.x0 && point.x < self.x1 && point.y >= self.y0 && point.y < self.y1
     }
 

@@ -58,6 +58,7 @@ pub enum EventLoopError {
 }
 
 impl From<OsError> for EventLoopError {
+    #[inline]
     fn from(value: OsError) -> Self {
         Self::Os(value)
     }
@@ -66,14 +67,19 @@ impl From<OsError> for EventLoopError {
 impl NotSupportedError {
     #[inline]
     #[allow(dead_code)]
-    pub(crate) fn new() -> NotSupportedError {
+    pub(crate) const fn new() -> NotSupportedError {
         NotSupportedError { _marker: () }
     }
 }
 
 impl OsError {
+    #[inline]
     #[allow(dead_code)]
-    pub(crate) fn new(line: u32, file: &'static str, error: platform_impl::OsError) -> OsError {
+    pub(crate) const fn new(
+        line: u32,
+        file: &'static str,
+        error: platform_impl::OsError,
+    ) -> OsError {
         OsError { line, file, error }
     }
 }

@@ -159,31 +159,36 @@ impl Message {
         Ok(m)
     }
 
+    #[inline]
     #[must_use]
     pub fn with_body(mut self, body: Vec<Value>) -> Self {
         self.body = body;
         self
     }
 
+    #[inline]
     #[must_use]
-    pub fn with_flags(mut self, flags: u8) -> Self {
+    pub const fn with_flags(mut self, flags: u8) -> Self {
         self.flags = flags;
         self
     }
 
     /// The body's signature.
+    #[inline]
     #[must_use]
     pub fn signature(&self) -> String {
         sig::signature_of(&self.body.iter().map(Value::type_of).collect::<Vec<_>>())
     }
 
     /// Whether the sender of this message waits for an answer.
+    #[inline]
     #[must_use]
-    pub fn expects_reply(&self) -> bool {
-        self.kind == Kind::MethodCall && self.flags & flags::NO_REPLY_EXPECTED == 0
+    pub const fn expects_reply(&self) -> bool {
+        matches!(self.kind, Kind::MethodCall) && self.flags & flags::NO_REPLY_EXPECTED == 0
     }
 
     /// The body's first value as a string: an error's text, `Hello`'s name.
+    #[inline]
     #[must_use]
     pub fn first_str(&self) -> Option<&str> {
         self.body.first().and_then(Value::as_str)
@@ -394,6 +399,7 @@ fn required(m: &Message) -> std::result::Result<(), &'static str> {
 /// and the padding to the body's 8-byte boundary.
 #[cfg_attr(trust_verify, trust::requires(fields <= 67108864))]
 #[cfg_attr(trust_verify, trust::ensures(result >= 16 && result % 8 == 0))]
+#[inline]
 fn header_len(fields: usize) -> usize {
     pad_to(16 + fields, 8)
 }

@@ -58,7 +58,8 @@ pub enum ProgramStateWord {
 impl ProgramStateWord {
     /// Its wire word: `idle`, `working`, `blocked`, `done`, `error`.
     #[must_use]
-    pub fn as_str(self) -> &'static str {
+    #[inline]
+    pub const fn as_str(self) -> &'static str {
         match self {
             Self::Idle => "idle",
             Self::Working => "working",
@@ -68,6 +69,7 @@ impl ProgramStateWord {
         }
     }
 
+    #[inline]
     fn parse(word: &str) -> Option<Self> {
         Some(match word {
             "idle" => Self::Idle,
@@ -94,7 +96,8 @@ pub enum ProgramBlockedKind {
 impl ProgramBlockedKind {
     /// Its wire word: `permission`, `question`, `auth`.
     #[must_use]
-    pub fn as_str(self) -> &'static str {
+    #[inline]
+    pub const fn as_str(self) -> &'static str {
         match self {
             Self::Permission => "permission",
             Self::Question => "question",
@@ -102,6 +105,7 @@ impl ProgramBlockedKind {
         }
     }
 
+    #[inline]
     fn parse(word: &str) -> Option<Self> {
         Some(match word {
             "permission" => Self::Permission,
@@ -124,6 +128,7 @@ pub struct ProgramState {
 
 impl ProgramState {
     /// `state[:kind]`, as `status program_state=` prints it.
+    #[inline]
     #[must_use]
     pub fn wire(self) -> String {
         match self.kind {
@@ -174,7 +179,8 @@ impl ProgramStateReport {
 
     /// A full reset (RIS): no report stands. The turn count, and the state it
     /// judges the next report against, are kept (the module doc).
-    pub(super) fn reset(&mut self) {
+    #[inline]
+    pub(super) const fn reset(&mut self) {
         if self.state.is_some() {
             self.seq = self.seq.wrapping_add(1);
             self.state = None;
@@ -185,10 +191,10 @@ impl ProgramStateReport {
 /// Whether a report of `next` begins a turn after a report of `last` (`None`:
 /// no report taken yet): `next` is in a turn (`working`, `blocked`) and `last`
 /// was not.
-fn begins_a_turn(last: Option<ProgramStateWord>, next: ProgramStateWord) -> bool {
+#[inline]
+const fn begins_a_turn(last: Option<ProgramStateWord>, next: ProgramStateWord) -> bool {
     use ProgramStateWord as W;
-    let in_turn = |word: ProgramStateWord| matches!(word, W::Working | W::Blocked);
-    in_turn(next) && !last.is_some_and(in_turn)
+    matches!(next, W::Working | W::Blocked) && !matches!(last, Some(W::Working | W::Blocked))
 }
 
 /// The longest OSC 7501 body this reader looks at; anything longer is not a

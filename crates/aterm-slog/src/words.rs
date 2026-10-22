@@ -46,6 +46,7 @@ impl WallKind {
     ];
 
     /// The bare kind (`usage-session`), as `box=`/`wall=` print it.
+    #[inline]
     #[must_use]
     pub const fn name(self) -> &'static str {
         match self {
@@ -62,6 +63,7 @@ impl WallKind {
     }
 
     /// `wall:<kind>`, as `out=` and `need=` write it (`WallKind::wire()`).
+    #[inline]
     #[must_use]
     pub const fn wire(self) -> &'static str {
         match self {
@@ -87,6 +89,7 @@ impl WallKind {
 
     /// A usage window, a model bucket or spend: the walls the clause names
     /// `limit`.
+    #[inline]
     #[must_use]
     pub const fn is_limit(self) -> bool {
         matches!(
@@ -125,12 +128,14 @@ impl BoxWord {
     }
 
     /// The `box=` word.
+    #[inline]
     #[must_use]
     pub const fn word(self) -> &'static str {
         self.0
     }
 
     /// The kind without Bash's read-only verdict (`bash`).
+    #[inline]
     #[must_use]
     pub fn kind(self) -> &'static str {
         match self.0 {
@@ -140,6 +145,7 @@ impl BoxWord {
     }
 
     /// Whether this is the question dialog.
+    #[inline]
     #[must_use]
     pub fn is_question(self) -> bool {
         self.0 == "question"
@@ -263,6 +269,7 @@ pub enum Out {
 
 impl Out {
     /// The `out=` word (one of [`OUT_WORDS`]).
+    #[inline]
     #[must_use]
     pub const fn word(self) -> &'static str {
         match self {
@@ -312,6 +319,7 @@ impl Out {
     }
 
     /// The level whose nodes this outcome closes.
+    #[inline]
     #[must_use]
     pub const fn lvl(self) -> crate::vocab::Lvl {
         match self {
@@ -323,6 +331,7 @@ impl Out {
     }
 
     /// The outcome of a node closed because its parent closed (§2.3).
+    #[inline]
     #[must_use]
     pub const fn gone(lvl: crate::vocab::Lvl) -> Out {
         match lvl {

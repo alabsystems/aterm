@@ -31,6 +31,7 @@ pub enum FrontContent {
 
 impl FrontContent {
     #[must_use]
+    #[inline]
     pub const fn view(self) -> ViewId {
         match self {
             Self::Terminal { view, .. } | Self::Native { view, .. } => view,
@@ -38,6 +39,7 @@ impl FrontContent {
     }
 
     #[must_use]
+    #[inline]
     pub const fn native(self) -> Option<(AppInstanceId, ViewId)> {
         match self {
             Self::Native { instance, view } => Some((instance, view)),
@@ -51,6 +53,7 @@ impl FrontContent {
     /// a session it can no longer reach through the window) read it here rather
     /// than re-matching the enum.
     #[must_use]
+    #[inline]
     pub const fn terminal_session(self) -> Option<u64> {
         match self {
             Self::Terminal { session, .. } => Some(session),
@@ -59,11 +62,13 @@ impl FrontContent {
     }
 
     #[must_use]
+    #[inline]
     pub const fn is_terminal(self) -> bool {
         matches!(self, Self::Terminal { .. })
     }
 
     #[must_use]
+    #[inline]
     pub const fn is_native(self) -> bool {
         matches!(self, Self::Native { .. })
     }
@@ -102,11 +107,13 @@ pub enum WindowFocus {
 
 impl WindowFocus {
     #[must_use]
+    #[inline]
     pub const fn is_host(self) -> bool {
         matches!(self, Self::Host)
     }
 
     #[must_use]
+    #[inline]
     pub const fn focused_view(self) -> Option<ViewId> {
         match self {
             Self::Host => None,
@@ -129,6 +136,7 @@ pub enum ViewLifecycle {
 
 impl ViewLifecycle {
     #[must_use]
+    #[inline]
     pub const fn can_transition_to(self, next: Self) -> bool {
         matches!(
             (self, next),
@@ -140,15 +148,18 @@ impl ViewLifecycle {
     }
 
     #[must_use]
+    #[inline]
     pub const fn is_terminal_state(self) -> bool {
         matches!(self, Self::Closed)
     }
 
     #[must_use]
+    #[inline]
     pub const fn is_active(self) -> bool {
         matches!(self, Self::Mounted | Self::Suspended)
     }
 
+    #[inline]
     pub const fn transition(&mut self, next: Self) -> bool {
         let allowed = self.can_transition_to(next);
         if allowed {
@@ -160,6 +171,7 @@ impl ViewLifecycle {
 
 /// Encode a `(tab_id, view_id)` pair into 16 little-endian bytes.
 #[must_use]
+#[inline]
 pub const fn encode_tab_view_pair_le(tab_id: u64, view_id: u64) -> [u8; 16] {
     [
         tab_id as u8,
@@ -183,6 +195,7 @@ pub const fn encode_tab_view_pair_le(tab_id: u64, view_id: u64) -> [u8; 16] {
 
 /// Decode 16 little-endian bytes into a `(tab_id, view_id)` pair.
 #[must_use]
+#[inline]
 pub const fn decode_tab_view_pair_le(bytes: [u8; 16]) -> (u64, u64) {
     let tab_id = (bytes[0] as u64)
         | ((bytes[1] as u64) << 8)

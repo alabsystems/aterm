@@ -191,6 +191,7 @@ impl Terminal {
     /// build copies a shared index instead of taking it over. The bloom filter keeps stale
     /// bits from replaced rows (false-positive candidates only; saturation self-heals via
     /// `rebuild_bloom`).
+    #[inline]
     fn try_refresh_search_index(
         &mut self,
         key: &SearchKey,
@@ -387,7 +388,7 @@ impl Terminal {
     /// Introspection only.
     #[must_use]
     #[inline]
-    pub fn search_index_rebuilds(&self) -> u64 {
+    pub const fn search_index_rebuilds(&self) -> u64 {
         self.search_index_rebuilds
     }
 
@@ -395,7 +396,7 @@ impl Terminal {
     /// search_index_refreshes()` is the number of full rebuilds. Introspection only.
     #[must_use]
     #[inline]
-    pub fn search_index_refreshes(&self) -> u64 {
+    pub const fn search_index_refreshes(&self) -> u64 {
         self.search_index_refreshes
     }
 
@@ -403,6 +404,7 @@ impl Terminal {
     /// search (in flight or retained for `search_summary`). The whole slot goes: an in-place
     /// [`SearchIndex::release`](aterm_search::SearchIndex::release) would leave the key
     /// matching an emptied index, a false empty hit.
+    #[inline]
     pub fn take_search_index(&mut self) -> SearchDiscard {
         SearchDiscard {
             slot: self.search_slot.take(),
@@ -412,6 +414,7 @@ impl Terminal {
     }
 
     /// [`Self::take_search_index`], freed in this call.
+    #[inline]
     pub fn release_search_index(&mut self) {
         drop(self.take_search_index());
     }

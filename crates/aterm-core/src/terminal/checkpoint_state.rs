@@ -199,24 +199,28 @@ pub struct ColorRepr {
 
 impl ColorRepr {
     /// Whether nothing is overridden (the wire omits the whole projection).
+    #[inline]
     #[must_use]
     pub fn is_default(&self) -> bool {
         *self == Self::default()
     }
 
     /// Whether the carry holds a pushed XTPUSHCOLORS stack, in either shape.
+    #[inline]
     #[must_use]
     pub fn has_stack(&self) -> bool {
         !self.stack.is_empty() || !self.stack_overrides.is_empty()
     }
 
     /// Drop the pushed stack, in either shape.
+    #[inline]
     pub fn clear_stack(&mut self) {
         self.stack.clear();
         self.stack_overrides.clear();
     }
 
     /// The live slots' diff, without the stack.
+    #[inline]
     fn overrides(&self) -> ColorOverridesRepr {
         ColorOverridesRepr {
             palette: self.palette.clone(),
@@ -232,6 +236,7 @@ impl ColorRepr {
 impl ColorState {
     /// The palette entry the host configured at `index` (the theme palette, or
     /// xterm's default when the theme sets none).
+    #[inline]
     fn configured_palette_entry(&self, index: u8) -> Rgb {
         self.configured_palette
             .as_ref()
@@ -381,6 +386,7 @@ pub struct TitleRepr {
 
 impl TitleRepr {
     /// Whether nothing has been titled.
+    #[inline]
     #[must_use]
     pub fn is_default(&self) -> bool {
         *self == Self::default()
@@ -554,6 +560,7 @@ pub struct CwdReportRepr {
 }
 
 impl CwdReportRepr {
+    #[inline]
     fn capture(report: &super::shell::CwdReport) -> Self {
         Self {
             path: report.path.clone(),
@@ -561,6 +568,7 @@ impl CwdReportRepr {
         }
     }
 
+    #[inline]
     fn to_report(&self) -> Option<super::shell::CwdReport> {
         super::shell::CwdReport::of(self.path.as_deref(), self.host.as_deref())
     }
@@ -571,7 +579,8 @@ impl CwdReportRepr {
     clippy::trivially_copy_pass_by_ref,
     reason = "serde's skip_serializing_if hands the predicate a reference"
 )]
-fn is_zero_seq(n: &u64) -> bool {
+#[inline]
+const fn is_zero_seq(n: &u64) -> bool {
     *n == 0
 }
 
@@ -580,18 +589,21 @@ fn is_zero_seq(n: &u64) -> bool {
     clippy::trivially_copy_pass_by_ref,
     reason = "serde's skip_serializing_if hands the predicate a reference"
 )]
-fn is_false(b: &bool) -> bool {
+#[inline]
+const fn is_false(b: &bool) -> bool {
     !*b
 }
 
 impl ShellRepr {
     /// Whether this is a terminal that never saw a mark (the wire omits it).
+    #[inline]
     #[must_use]
     pub fn is_default(&self) -> bool {
         *self == Self::default()
     }
 }
 
+#[inline]
 fn bounded(text: Option<&str>, max: usize) -> Option<String> {
     text.filter(|t| t.len() <= max).map(str::to_owned)
 }
@@ -693,7 +705,8 @@ impl OutputBlockRepr {
     }
 }
 
-fn phase_to_wire(p: ShellIntegrationPhase) -> u8 {
+#[inline]
+const fn phase_to_wire(p: ShellIntegrationPhase) -> u8 {
     match p {
         ShellIntegrationPhase::None => 0,
         ShellIntegrationPhase::PromptStart => 1,
@@ -703,7 +716,8 @@ fn phase_to_wire(p: ShellIntegrationPhase) -> u8 {
     }
 }
 
-fn phase_from_wire(p: u8) -> ShellIntegrationPhase {
+#[inline]
+const fn phase_from_wire(p: u8) -> ShellIntegrationPhase {
     match p {
         1 => ShellIntegrationPhase::PromptStart,
         2 => ShellIntegrationPhase::CommandStart,
@@ -713,7 +727,8 @@ fn phase_from_wire(p: u8) -> ShellIntegrationPhase {
     }
 }
 
-fn state_to_wire(s: ShellState) -> u8 {
+#[inline]
+const fn state_to_wire(s: ShellState) -> u8 {
     match s {
         ShellState::ReceivingPrompt => 1,
         ShellState::EnteringCommand => 2,
@@ -722,7 +737,8 @@ fn state_to_wire(s: ShellState) -> u8 {
     }
 }
 
-fn state_from_wire(s: u8) -> ShellState {
+#[inline]
+const fn state_from_wire(s: u8) -> ShellState {
     match s {
         1 => ShellState::ReceivingPrompt,
         2 => ShellState::EnteringCommand,
@@ -757,6 +773,7 @@ impl Terminal {
     /// Write a program's colour diff over this terminal's configured colours
     /// (the stack excluded). Sets the slots only: [`Self::apply_color_repr`]
     /// adds the callbacks a handoff fires, `apply_config` its own change set.
+    #[inline]
     pub(super) fn apply_color_overrides(&mut self, overrides: &ColorOverridesRepr) {
         self.color.apply_overrides(overrides, true);
     }

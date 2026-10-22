@@ -79,13 +79,15 @@ impl Secret {
         Some(secret)
     }
 
+    #[inline]
     #[must_use]
     pub fn as_bytes(&self) -> &[u8] {
         &self.bytes[..self.len]
     }
 
+    #[inline]
     #[must_use]
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.len == 0
     }
 }
@@ -106,7 +108,8 @@ impl std::fmt::Debug for Secret {
     }
 }
 
-fn hex_digit(byte: u8) -> Option<u8> {
+#[inline]
+const fn hex_digit(byte: u8) -> Option<u8> {
     match byte {
         b'0'..=b'9' => Some(byte - b'0'),
         b'a'..=b'f' => Some(byte - b'a' + 10),
@@ -129,12 +132,14 @@ impl SecretUtf16 {
         })
     }
 
-    pub fn as_mut_units(&mut self) -> &mut [u16] {
+    #[inline]
+    pub const fn as_mut_units(&mut self) -> &mut [u16] {
         &mut self.units
     }
 
+    #[inline]
     #[must_use]
-    pub fn as_units(&self) -> &[u16] {
+    pub const fn as_units(&self) -> &[u16] {
         &self.units
     }
 }
@@ -203,6 +208,7 @@ impl WireBuffer {
         wire
     }
 
+    #[inline]
     #[must_use]
     pub fn as_bytes(&self) -> &[u8] {
         &self.bytes[..self.len]

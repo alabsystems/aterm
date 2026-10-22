@@ -84,7 +84,7 @@ allow-wildcard-paths = true
 deny = [
     { name = "ring", version = "<0.17.14", reason = "atpkg's load-bearing Ed25519 and OpenPGP RSA verify root (TOOLCHAIN-PACKAGE-MANAGER.md S8/S13): never allow it to drift below the audited, vendored floor on the verify path" },
     { name = "getrandom", wrappers = ["ring"], reason = "entropy comes from aterm_uds::rand; getrandom is its first-party facade (crates/aterm-getrandom), admitted only as ring's seed source" },
-    { name = "fastrand", wrappers = ["async-executor", "futures-lite", "phf_generator", "piper", "softbuffer"], reason = "entropy comes from aterm_uds::rand; the Linux stack's own uses (phf's table generator, the wayland async helpers, softbuffer) are the admitted parents" },
+    { name = "fastrand", wrappers = ["async-executor", "futures-lite", "phf_generator", "piper"], reason = "entropy comes from aterm_uds::rand; the Linux stack's own uses (phf's table generator, the wayland async helpers) are the admitted parents" },
     { name = "rand", reason = "entropy comes from aterm_uds::rand" },
     { name = "rand_core", reason = "entropy comes from aterm_uds::rand" },
     { name = "rand_chacha", reason = "entropy comes from aterm_uds::rand" },

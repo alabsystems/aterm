@@ -308,6 +308,68 @@ fn words_end_with(tail: Option<&str>, mark: Option<u64>, len: usize) -> bool {
         .is_some_and(|end| aterm_hash::fnv1a_64(end.as_bytes()) == mark)
 }
 
+/// THE WORDS `text` WITHOUT THE ROWS OF THE ACT `act` THEY OPEN ON: words read
+/// from the rows' top ([`TurnEndReading::opens_cut`]) whose first lines are,
+/// by their letters ([`said_letters`]: at any width, whatever a program's
+/// drawing does to spaces and marks), the end of the words of the act this
+/// policy typed last ([`TurnEndState::act_words`]) are that act's rows under
+/// its first one, not the worker's: they are dropped, the longest such run
+/// of whole lines with the blank lines under it. The owner's standing rules
+/// ride every act, and a rule holding `NEEDS YOU:` read as the worker's
+/// stood as a need nobody said (on agy, where a cut opens on a message's
+/// later rows; the first point reads the turn whole there, other points
+/// did not). `text` as it stands where its first line is no such end, where
+/// there is no act, and where the act has no letters: FAIL TOWARD A KEPT
+/// NEED.
+fn without_act_rows<'a>(text: &'a str, act: Option<&str>) -> &'a str {
+    let act = said_letters(act);
+    if act.is_empty() {
+        return text;
+    }
+    let mut letters = String::new();
+    let mut at = 0;
+    let mut cut = None;
+    for line in text.split_inclusive('\n') {
+        letters.extend(line.chars().filter(|c| c.is_alphanumeric()));
+        at += line.len();
+        if letters.len() > act.len() {
+            break;
+        }
+        if !letters.is_empty() && act.ends_with(&letters) {
+            cut = Some(at);
+        }
+    }
+    cut.map_or(text, |at| text[at..].trim_start_matches('\n'))
+}
+
+/// THE MARK OF A SCREEN'S LETTERS ([`TurnEndReading::screen_mark`]):
+/// FNV-1a/64 over the letters of every row given, in order, and nothing else
+/// — so a clock or a counter that ticks, a glyph that blinks and a row's
+/// spaces mark the same, and a row of words drawn or gone marks another.
+/// [`TurnEndReading::of_slept`] gives it the conversation's rows, those above
+/// the composer's caret row, so a footer's or a status line's words are none
+/// of it. What tells a screen that moved since a point from that point read
+/// again where the session's count says a turn was asked since
+/// ([`TurnEndState::submitted_since`]): a submission counted while the
+/// conversation still stands as it did is not drawn yet.
+#[must_use]
+pub fn screen_mark(rows: &[String]) -> u64 {
+    let mut letters = String::new();
+    for row in rows {
+        letters.extend(row.chars().filter(|c| c.is_alphabetic()));
+    }
+    aterm_hash::fnv1a_64(letters.as_bytes())
+}
+
+/// A REPLY STANDS WHOLE UNDER THE TURN `reading` ends: under the message that
+/// opened it ([`turn_opener`]), or with no message on the rows read at all
+/// (a reply taller than the window, its opener scrolled out of sight:
+/// [`TurnEndReading::message_drawn`]) and words read. A message drawn with
+/// no reply under it is a turn not answered yet, whatever was counted.
+fn reply_stands(reading: &TurnEndReading) -> bool {
+    turn_opener(reading).is_some() || (!reading.message_drawn && reading.said_tail.is_some())
+}
+
 /// THE MESSAGE THAT OPENED THE TURN `reading`'s last words end, hashed: the
 /// `❯` row Claude Code's answer closes ([`TurnEndReading::answered`]), else
 /// the message Gemini CLI, agy and Muse Code draw over the reply
@@ -11677,6 +11739,51 @@ impl Default for TurnEndTiming {
     }
 }
 
+/// THE LADDER'S DEVELOPMENT SEAM: a factor in `(0, 1]` the short back-off
+/// ladder ([`TurnEndTiming::short_backoff`] and
+/// [`TurnEndTiming::short_backoff_max`]) is scaled by in a development build
+/// (debug, or `dev-seams`), so a lab can wait the whole ladder out, 2 to 60
+/// min, in minutes ([`TurnEndTiming::for_build`]). A shipped build never reads
+/// it (`aterm_types::dev_seam!`).
+pub const LADDER_SCALE_SEAM: &str = "ATERM_DEV_LADDER_SCALE";
+
+impl TurnEndTiming {
+    /// The same timing, its short back-off ladder scaled by `factor`: its
+    /// first step and its cap, so each step still doubles the one before it
+    /// up to the cap. Nothing else moves: [`Self::min_work`] still says what a
+    /// short turn is, and the walls' ladders, the take window and the typing
+    /// budget's window keep their values.
+    #[must_use]
+    pub fn ladder_scaled(mut self, factor: f64) -> Self {
+        self.short_backoff = self.short_backoff.mul_f64(factor);
+        self.short_backoff_max = self.short_backoff_max.mul_f64(factor);
+        self
+    }
+
+    /// The factor [`LADDER_SCALE_SEAM`]'s value names: a finite number above
+    /// `0` and at most `1` (the seam only shortens the ladder); `None` for no
+    /// value, or one that is not such a factor.
+    #[must_use]
+    pub fn ladder_scale(raw: Option<&std::ffi::OsStr>) -> Option<f64> {
+        let f: f64 = raw?.to_str()?.trim().parse().ok()?;
+        (f.is_finite() && f > 0.0 && f <= 1.0).then_some(f)
+    }
+
+    /// The timing a session of this build starts from (`SessionSetup::new`,
+    /// read once at the loop's start, and written into its tape's header, so
+    /// a replay waits as the run did): the shipped one, its short back-off
+    /// ladder scaled by [`LADDER_SCALE_SEAM`]'s factor where a development
+    /// build is given one ([`Self::ladder_scale`], [`Self::ladder_scaled`]).
+    #[must_use]
+    pub fn for_build() -> Self {
+        let shipped = Self::default();
+        match Self::ladder_scale(aterm_types::dev_seam!(LADDER_SCALE_SEAM).as_deref()) {
+            Some(factor) => shipped.ladder_scaled(factor),
+            None => shipped,
+        }
+    }
+}
+
 /// The composer as the reading found it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Composer {
@@ -11956,6 +12063,21 @@ pub struct TurnEndReading {
     /// work may stand above them, so they land nothing
     /// ([`TurnEndState::observe`]). Set by the loop.
     pub said_cut: bool,
+    /// THE WORDS READ OPEN AT THE ROWS' TOP: the turn the last words end began
+    /// above the rows read (the program's reader's
+    /// [`aterm_phase::ScreenReader::turn_whole`] is `false`), so the first of
+    /// them ([`Self::turn_said`]'s, else [`Self::said_tail`]'s) may be the rows
+    /// of the message that opened it, its first row above them: on agy, whose
+    /// text bounds no message, a message's later rows read as its reply. Set
+    /// from the screen's rows, and again by the loop from the rows it read
+    /// whole. Where they open on the words of the act this policy typed last,
+    /// those rows name no need ([`without_act_rows`]). Only on a reader that
+    /// bounds no message ([`aterm_phase::ScreenReader::bounds_messages`]
+    /// `false`, agy alone): every other reader's words begin at the worker's
+    /// own mark under the message, never on its rows, and a first line of the
+    /// worker's own that repeats the act's last words is its own (the review
+    /// of 3a4586a01e, T3).
+    pub opens_cut: bool,
     /// THE WORKER'S OTHER WORDS IN THE SAME TURN: the messages before its
     /// last one, on the rows read, by the program's reader
     /// ([`aterm_phase::ScreenReader::turn_said_before`]: Claude Code's `⏺`
@@ -11988,6 +12110,23 @@ pub struct TurnEndReading {
     /// turn ended with no words under its message (a tool's box or row its
     /// last item), where [`Self::opened_by`] reads none.
     pub message_drawn: bool,
+    /// THE SESSION'S SUBMISSIONS AT THIS READ (`text --json`'s `"submits"`,
+    /// aterm-gui's `submit_count`, read after the rows): how many Enters the
+    /// host has written over something typed since the Enter before, whoever
+    /// typed them — a person at the window, this policy's acts, a lab's or an
+    /// orchestrator's prompt. THE PRIMARY EVIDENCE THAT A TURN WAS ASKED: a
+    /// count past the one the point judged last read says one was, whatever
+    /// its words and its opener; the same count says none was, and a turn
+    /// told then by its opener and words alone is the agent's own (a goal, a
+    /// queue: [`TurnEndState::submitted_since`]). `None`: a host that sends
+    /// none (the opener and the words tell alone, as before), or a reading
+    /// built from no read.
+    pub submits: Option<u64>,
+    /// THE MARK OF THE ROWS READ ([`screen_mark`]): what tells a screen that
+    /// moved since a point from that point read again, where a submission
+    /// counted since is not drawn yet ([`TurnEndState::submitted_since`]).
+    /// `None`: a reading built from no rows.
+    pub screen_mark: Option<u64>,
     /// For [`TurnEndState::observe`] only: the busy work since the previous
     /// point, `None` when no read saw the worker busy since (the same point
     /// read again).
@@ -12658,6 +12797,9 @@ impl TurnEndReading {
             composer,
             said_tail: reading.said_tail.clone(),
             said_cut: reading.said_tail.is_some() && !reading.program.reader().said_whole(rows),
+            opens_cut: reading.said_tail.is_some()
+                && !reading.program.reader().bounds_messages()
+                && !reading.program.reader().turn_whole(rows),
             turn_said: reading.program.reader().turn_said_before(rows),
             opened_by: reading
                 .program
@@ -12665,6 +12807,15 @@ impl TurnEndReading {
                 .turn_opened_by(rows)
                 .map(|t| crate::supervise::approvals::words_lead(&t)),
             message_drawn: reading.program.reader().message_drawn(rows),
+            // The host's count is the loop's to add ([`Self::submits`]).
+            submits: None,
+            screen_mark: Some(screen_mark(
+                reading
+                    .composer
+                    .as_ref()
+                    .and_then(|(caret, _)| rows.get(..*caret))
+                    .unwrap_or(rows),
+            )),
             worked: worked.map(|w| less(w, asleep.most)),
             worked_doubt: worked.map_or(Duration::ZERO, |w| {
                 less(w, asleep.least).saturating_sub(less(w, asleep.most))
@@ -12734,6 +12885,24 @@ impl TurnEndReading {
             && !self.survey
             && !matches!(self.composer, Composer::Absent | Composer::Unknown)
             && (!self.pending_input || stale_input)
+    }
+
+    /// AN ANSWERED POINT, where a turn's answer stands as the screen ends it:
+    /// idle or a question, authoritative, no survey or wall, nothing
+    /// unanswered, no person's Esc, and an empty composer — a draft is still
+    /// a draft. What an act's answer no read saw run
+    /// ([`TurnEndState::answered_unseen`]) and a turn of someone else's no
+    /// read saw run ([`TurnEndState::unseen_turn`]) are read at, and the
+    /// only point whose count and screen a later one is set against
+    /// ([`TurnEndState::submitted_since`]).
+    fn answered_point(&self) -> bool {
+        matches!(self.phase, Phase::Idle | Phase::Question)
+            && self.authoritative
+            && !self.survey
+            && self.wall.is_none()
+            && !self.pending_input
+            && !self.interrupted
+            && matches!(self.composer, Composer::Empty | Composer::Placeholder(_))
     }
 }
 
@@ -13460,6 +13629,30 @@ struct Awaited {
     /// is a turn another message than [`Self::opened`] (or [`Self::over`])
     /// opened since ([`TurnEndState::answered_unseen`]).
     submitted: bool,
+    /// THE SESSION'S SUBMISSIONS AT THE READ IT WAS DECIDED AT
+    /// ([`TurnEndReading::submits`]): its own Enter, counted since on rows
+    /// that moved since ([`Self::screen`]), is the act submitted and drawn
+    /// ([`Awaited::submitted_since`]). `None`: unknown (a host that counts
+    /// none, an act a loop before this one typed).
+    submits: Option<u64>,
+    /// THE MARK OF THE ROWS IT WAS DECIDED AT ([`TurnEndReading::screen_mark`]).
+    screen: Option<u64>,
+}
+
+impl Awaited {
+    /// WHETHER THE ACT WAS SUBMITTED AND DRAWN BY `reading`: the session's
+    /// count moved past the one its decision read ([`Self::submits`]) — its
+    /// own Enter reached the program — and the rows moved from the ones it
+    /// was decided at ([`Self::screen`]): a count moved over the very rows
+    /// it was typed at is an Enter the program has not answered yet. What
+    /// tells an act typed again with the same words, answered with the same
+    /// reply under the same opener, from the turn before it, which nothing
+    /// the screen draws does (P4 of `docs/measured/forever-lab-2026-10-20.md`).
+    fn submitted_since(&self, reading: &TurnEndReading) -> bool {
+        matches!((reading.submits, self.submits), (Some(now), Some(then)) if now > then)
+            && reading.screen_mark.is_some()
+            && reading.screen_mark != self.screen
+    }
 }
 
 /// What tells one left limit's notice from another's: its class and the
@@ -13957,6 +14150,25 @@ pub struct TurnEndState {
     /// ([`Self::unseen_turn`]). What tells a turn no read saw run, ended
     /// since, from the same turn read again.
     point_opener: Option<u64>,
+    /// THE SESSION'S SUBMISSIONS AS THE POINT JUDGED LAST READ THEM
+    /// ([`TurnEndReading::submits`]), at the last answered point
+    /// ([`TurnEndReading::answered_point`]) or the last point a turn was
+    /// judged at, answered or not (a draft over it, a wall under it): what a
+    /// count read since is set against ([`Self::submitted_since`]). `None`
+    /// where the harness's own keys moved the count since
+    /// ([`Self::keyed_by_harness`]: a relaunch's line, the host's turn), so
+    /// the next answered point is told by the opener and the words alone,
+    /// and counts again from there.
+    point_submits: Option<u64>,
+    /// THE ROWS THAT POINT STOOD ON, MARKED ([`TurnEndReading::screen_mark`]),
+    /// with [`Self::point_submits`]: a count moved past it on these very rows
+    /// is a submission the screen has not drawn yet.
+    point_screen: Option<u64>,
+    /// THAT POINT HELD A TASK ([`TurnEndReading::taskless`] false there),
+    /// with [`Self::point_submits`]: a screen read as no task yet since, with
+    /// nothing submitted, is that conversation redrawn
+    /// ([`Self::redrawn_fresh`]).
+    point_tasked: bool,
     /// THE POINT JUDGED LAST COULD STAND FOR A LANDING A RECORD NAMES
     /// ([`Self::record_landing_holds`]): its words a clean defense over a
     /// clean repository, no wall and nothing unanswered over them, no turn
@@ -13985,6 +14197,13 @@ pub struct TurnEndState {
     /// types again. `None` after any other act, and for a check the host
     /// typed ([`HostTurn::Check`]).
     cut_text: Option<String>,
+    /// THE WORDS OF THE ACT THIS POLICY TYPED LAST (a [`TurnEndAction::Type`]
+    /// or [`TurnEndAction::Accept`], its standing rules with it), until the
+    /// next act: what the first rows of words read from the rows' top may be
+    /// ([`TurnEndReading::opens_cut`], [`without_act_rows`]) — a relaunch
+    /// that resumes the conversation draws it again. `None` after a command
+    /// or a key, and before this state typed any.
+    act_words: Option<String>,
     /// A `/COMPACT` TYPED WHERE A FULL CONTEXT CUT THE DONE CHECK OR A LAND
     /// ACT ([`RULE_COMPACT`]): the continuation owed after it types that act
     /// again ([`Self::cut_text`]) in place of the continuation, under the
@@ -14278,11 +14497,15 @@ impl TurnEndState {
             point_mark: None,
             point_mark_len: 0,
             point_opener: None,
+            point_submits: None,
+            point_screen: None,
+            point_tasked: false,
             point_clean: false,
             last_prompt: None,
             cut_check: false,
             cut_land: false,
             cut_text: None,
+            act_words: None,
             compact_owes: None,
             managed: false,
             cut_reply: false,
@@ -14946,6 +15169,8 @@ impl TurnEndState {
             lead: None,
             opened: None,
             submitted: false,
+            submits: None,
+            screen: None,
         });
         true
     }
@@ -15087,6 +15312,19 @@ impl TurnEndState {
     /// kept the rung of the try's appearance (ATERM-KI-1016-1).
     pub(crate) fn take_gap(&mut self) -> bool {
         std::mem::take(&mut self.gap) && self.awaiting.is_none()
+    }
+
+    /// THE AGENT'S PROCESS WAS LAUNCHED SINCE THE BOOKS' NEWEST ROW (the
+    /// loop's `Session::launched_since_books`, P3 of
+    /// `docs/measured/forever-lab-2026-10-20.md`): the turn the loop before
+    /// this one read running and stopped before its end was the old
+    /// process's, so this loop's first point is no end of it — neither the
+    /// gap's ([`Self::take_gap`]) nor a person's turn's
+    /// ([`Self::seed_ran_turn`]). Both are dropped; the books' other seeds
+    /// stay for the first point to take up.
+    pub(crate) fn launched_since_books(&mut self) {
+        self.gap = false;
+        self.ran_turn_seed = None;
     }
 
     /// …AND WHEN (ATERM-KI-1016-1): that turn was read running `ran_ago`
@@ -19011,11 +19249,18 @@ impl TurnEndState {
                 }
                 // The reply is the whole turn: a need said in an earlier
                 // message of it stands beside its last words'.
+                // Words read from the rows' top open on the act's own rows
+                // where they open on its words ([`without_act_rows`]).
+                let act = self.act_words.clone().filter(|_| reading.opens_cut);
+                let opening =
+                    |t: &'_ str| -> String { without_act_rows(t, act.as_deref()).to_string() };
                 match reading.turn_said.as_deref() {
-                    Some(before) => {
-                        self.fold_needs(Some(&format!("{before}\n\n{}", tail.unwrap_or_default())))
-                    }
-                    None => self.fold_needs(tail),
+                    Some(before) => self.fold_needs(Some(&format!(
+                        "{}\n\n{}",
+                        opening(before),
+                        tail.unwrap_or_default()
+                    ))),
+                    None => self.fold_needs(tail.map(opening).as_deref()),
                 }
             }
         }
@@ -19049,6 +19294,30 @@ impl TurnEndState {
         self.point_mark_len = said_letters(reading.said_tail.as_deref()).len();
         if let Some(opener) = turn_opener(reading) {
             self.point_opener = Some(opener);
+        }
+        // The count and the conversation an answered point stood on, for the
+        // next to be set against ([`Self::submitted_since`]) — kept over a
+        // point whose count moved past them on the same conversation, no turn
+        // read run and no act judged: a submission not drawn yet, its turn
+        // still to come. And at ANY POINT A TURN WAS JUDGED AT, answered or
+        // not (a person's draft over its reply, a composer read as unknown, a
+        // person's Esc, a wall, a read no reader vouches for), as the opener
+        // and the words move there: the submission that asked that turn is
+        // spent on it. Kept to the answered point before it, the same turn
+        // read again once the draft was deleted was folded in a second time
+        // ([`Self::unseen_turn`]: the count past the point before the turn,
+        // the conversation drawn since, a reply standing) — a short turn
+        // more, its back-off a step longer (the review of `b9/resid3`).
+        let judged_turn = awaited.is_some() || reading.worked.is_some();
+        if reading.answered_point() || judged_turn {
+            let undrawn = self.submitted_since(reading) == Some(true)
+                && !self.drawn_since(reading)
+                && !judged_turn;
+            if !undrawn {
+                self.point_submits = reading.submits;
+                self.point_screen = reading.screen_mark;
+                self.point_tasked = !reading.taskless;
+            }
         }
         self.point_clean = (clean || (words_hold && seed_was_armed && self.landed()))
             && ok_to_leave
@@ -19409,15 +19678,7 @@ impl TurnEndState {
             return None;
         }
         let a = self.untaken().filter(|a| !a.met && !a.off_stood)?;
-        let answered_point = reading.worked.is_none()
-            && matches!(reading.phase, Phase::Idle | Phase::Question)
-            && reading.authoritative
-            && !reading.survey
-            && reading.wall.is_none()
-            && !reading.pending_input
-            && !reading.interrupted
-            && matches!(reading.composer, Composer::Empty | Composer::Placeholder(_));
-        if !answered_point {
+        if reading.worked.is_some() || !reading.answered_point() {
             return None;
         }
         let since = now.saturating_duration_since(a.at);
@@ -19450,22 +19711,100 @@ impl TurnEndState {
                         .is_some_and(|recorded| recorded + RECORD_SLACK >= a.typed)
             })
             .and_then(|t| t.ended);
+        // THE ACT'S OWN ENTER, COUNTED AND DRAWN ([`Awaited::submitted_since`]):
+        // its words answered under its own message are its answer even where
+        // the message it was typed under held the same words (an act typed
+        // again, answered the same).
+        let submitted = a.submitted_since(reading);
         let by_screen = reading
             .answered
-            .filter(|s| s.prompt == said && a.over.is_some_and(|o| o != said))
+            .filter(|s| s.prompt == said && (submitted || a.over.is_some_and(|o| o != said)))
             .map(|s| s.work.unwrap_or(since));
         let by_opener = a
             .lead
             .filter(|lead| {
                 reading.opened_by == Some(*lead)
                     && reading.said_tail.is_some()
-                    && a.opened.is_some_and(|o| o != *lead)
+                    && (submitted || a.opened.is_some_and(|o| o != *lead))
             })
             .map(|_| since);
         by_record
             .or(by_screen)
             .or(by_opener)
             .map(|work| work.min(since))
+    }
+
+    /// WHETHER A SUBMISSION WAS COUNTED SINCE THE POINT JUDGED LAST
+    /// ([`TurnEndReading::submits`] past [`Self::point_submits`]): `Some(true)`
+    /// where a turn was asked since — a person's prompt, an orchestrator's,
+    /// this policy's own act — whatever its words; `Some(false)` where none
+    /// was, so a turn read since is the agent's own (a goal, a queue) or none;
+    /// `None` where the host counts none, the count went back (a session
+    /// carried across a seamless update counts again from `0`), no answered
+    /// point read one yet, or the harness's own keys moved it since
+    /// ([`Self::keyed_by_harness`]): the opener and the words tell alone.
+    fn submitted_since(&self, reading: &TurnEndReading) -> Option<bool> {
+        match (reading.submits, self.point_submits) {
+            (Some(now), Some(then)) if now >= then => Some(now > then),
+            _ => None,
+        }
+    }
+
+    /// WHETHER THE CONVERSATION WAS DRAWN SINCE THE POINT JUDGED LAST: its
+    /// rows' letters moved ([`TurnEndReading::screen_mark`] against
+    /// [`Self::point_screen`]). A submission counted over the very rows that
+    /// point stood on is not drawn yet.
+    fn drawn_since(&self, reading: &TurnEndReading) -> bool {
+        reading.screen_mark.is_some() && reading.screen_mark != self.point_screen
+    }
+
+    /// THE HARNESS'S OWN KEYS MOVED THE SESSION'S COUNT (a relaunch's line
+    /// typed at the shell, the host's turn, [`Self::restarted`],
+    /// [`Self::host_typed`], [`Self::host_moved`]): the host counts every
+    /// Enter over something typed, whoever typed it, so a count read since
+    /// says nothing of whether a turn was asked. The count's baseline goes
+    /// ([`Self::point_submits`]): the next answered point is told by the
+    /// opener and the words alone ([`Self::unseen_turn`]), as where the
+    /// host counts none, and counts again from there. Before (the review of
+    /// `b9/resid3`), a landed Gemini CLI the live upgrade relaunched read
+    /// its resumed screen's redraw as a turn someone asked — the count past
+    /// the point's by the relaunch line, the letters moved — and Land's
+    /// nudge was typed into finished work; under Cruise a loop's restart
+    /// counted a short turn the agent never ran.
+    fn keyed_by_harness(&mut self) {
+        self.point_submits = None;
+        self.point_screen = None;
+        self.point_tasked = false;
+    }
+
+    /// THE HOST'S STEP AT AN IDLE POINT MOVED THE SESSION
+    /// ([`crate::supervise::HostStep::moved`]: the live upgrade ended the
+    /// agent and typed its relaunch line, a carry-on or none): its keys are
+    /// the harness's own ([`Self::keyed_by_harness`]).
+    pub fn host_moved(&mut self) {
+        self.keyed_by_harness();
+    }
+
+    /// A SCREEN READ AS NO TASK YET THAT IS THE CONVERSATION OF THE POINT
+    /// JUDGED LAST, REDRAWN: the reader took it for a launch card
+    /// ([`TurnEndReading::taskless`], `aterm_phase::Reading::fresh`), the
+    /// session's count `submits` is where that point left it
+    /// ([`Self::point_submits`]: nothing submitted since — no `/clear`, no
+    /// prompt, no relaunch the harness typed), and that point held a task
+    /// ([`Self::point_tasked`]). Nobody's keys cleared the conversation or
+    /// started a process, so the screen is the same conversation drawn
+    /// again, and the point's back-off stands. Measured on Gemini CLI
+    /// 0.46.0 (the forever lab's F1/F2 run of `b9/resid3`): a resize split
+    /// the message's band into fragments its reader takes for no band, the
+    /// screen read as the launch card, and the first point's back-off was
+    /// dropped (decided `Nothing`, no due) — under Cruise, a session left
+    /// idle for good with nobody to type. `false` where the host counts
+    /// none, the count moved, the harness's keys moved it, or that point
+    /// held no task.
+    #[must_use]
+    pub fn redrawn_fresh(&self, submits: Option<u64>) -> bool {
+        self.point_tasked
+            && matches!((submits, self.point_submits), (Some(now), Some(then)) if now == then)
     }
 
     /// A TURN OF SOMEONE ELSE'S THAT NO READ SAW RUN, ENDED SINCE THE POINT
@@ -19504,22 +19843,34 @@ impl TurnEndState {
     /// `b9/forever-gaps`, RV-1 and RV-1b: judged again, a short turn more,
     /// under Cruise a report a person scrolled to read left to them, under
     /// Land a landing undone).
+    ///
+    /// THE SUBMISSION TELLS FIRST ([`Self::submitted_since`]): where the
+    /// session's count moved past the point's, a turn was asked since, and
+    /// it is folded in once the conversation was drawn since
+    /// ([`Self::drawn_since`]) with a reply standing under its message
+    /// ([`reply_stands`]) — whatever its words and its opener: a prompt that
+    /// begins as the one before it (the same opener), one whose opener is
+    /// out of sight, one answered with the very words of the reply before
+    /// it (the trade-off of F1/F2 in `docs/measured/forever-lab-2026-10-20.md`
+    /// that the words rule above makes). A count that did not move says no
+    /// turn was asked: the opener and the words above tell alone, for a turn
+    /// the agent began itself, as they do where no count is read.
     fn unseen_turn(&self, reading: &TurnEndReading) -> bool {
-        self.awaiting.is_none()
+        let premises = self.awaiting.is_none()
             && self.wall.is_none()
             && reading.since_limit.is_none()
             && reading.auto_continue.is_none()
             && reading.worked.is_none()
             && self.point_at.is_some()
             && !reading.taskless
-            && matches!(reading.phase, Phase::Idle | Phase::Question)
-            && reading.authoritative
-            && !reading.survey
-            && reading.wall.is_none()
-            && !reading.pending_input
-            && !reading.interrupted
-            && matches!(reading.composer, Composer::Empty | Composer::Placeholder(_))
-            && turn_opener(reading).is_some_and(|o| self.point_opener.is_some_and(|last| last != o))
+            && reading.answered_point();
+        if !premises {
+            return false;
+        }
+        if self.submitted_since(reading) == Some(true) {
+            return self.drawn_since(reading) && reply_stands(reading);
+        }
+        turn_opener(reading).is_some_and(|o| self.point_opener.is_some_and(|last| last != o))
             && !words_end_with(
                 reading.said_tail.as_deref(),
                 self.point_mark,
@@ -19878,6 +20229,8 @@ impl TurnEndState {
             },
             opened: reading.opened_by,
             submitted: matches!(action, TurnEndAction::Submit { .. }),
+            submits: reading.submits,
+            screen: reading.screen_mark,
         });
         let typed_rule = match action {
             TurnEndAction::Type { rule_id, .. } => Some(*rule_id),
@@ -19922,6 +20275,14 @@ impl TurnEndState {
         // ([`Self::cut_text`]).
         let typed_text = match action {
             TurnEndAction::Type { text, .. } => Some(text.clone()),
+            _ => None,
+        };
+        // The act's own words, what a cut reading may open on
+        // ([`Self::act_words`]): a suggestion accepted is typed as its words.
+        self.act_words = match action {
+            TurnEndAction::Type { text, .. } | TurnEndAction::Accept { text, .. } => {
+                Some(text.clone())
+            }
             _ => None,
         };
         // LAND'S OWN WORDS a wall's continuation typed under its rule
@@ -20119,6 +20480,8 @@ impl TurnEndState {
     /// never is; a [`HostTurn::Check`]'s is the done check's yield, judged as
     /// any (a claim ends nothing). No budget is spent.
     pub fn host_typed(&mut self, now: Instant, kind: HostTurn) {
+        // Its keys, and a relaunch's before them, are the harness's own.
+        self.keyed_by_harness();
         self.fallback_unasked = false;
         self.checking = false;
         self.seeded_check = None;
@@ -20156,6 +20519,8 @@ impl TurnEndState {
             lead: None,
             opened: None,
             submitted: false,
+            submits: None,
+            screen: None,
         });
     }
 }
@@ -20200,6 +20565,9 @@ impl TurnEndState {
     /// process's start-up ([`Self::account_startup`]): its work answers
     /// nothing of the move, told or not.
     pub fn restarted(&mut self, why: &Restart, made: bool, reading: &TurnEndReading, now: Instant) {
+        // The relaunch's line, typed at the shell (or part of it, for one
+        // that failed), is the harness's own keys.
+        self.keyed_by_harness();
         if made && !matches!(why, Restart::Account { .. }) {
             self.account_startup = self.account.is_some();
         }

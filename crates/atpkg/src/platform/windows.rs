@@ -227,6 +227,17 @@ pub fn universal_control_disable() -> bool {
     false
 }
 
+/// Rosetta 2 is a macOS install: Windows has no runtime to find
+/// ([`crate::machine::ROSETTA_APPLIES`] keeps this from being asked).
+pub fn rosetta_present(_runtime: &Path) -> Result<bool, String> {
+    Ok(false)
+}
+
+/// Rosetta 2 is a macOS install; nothing runs here.
+pub fn rosetta_install(_within: std::time::Duration) -> Result<(), String> {
+    Err("Rosetta 2 is a macOS install".to_string())
+}
+
 /// Shared-directory creation. On Windows POSIX modes do not apply, so this is just
 /// `create_dir_all`; the per-directory ACL governs access, exactly as it does for
 /// `ensure_private_dir`.

@@ -30,17 +30,31 @@
 //!    Win+Shift+Left back (1.50);
 //! 8. close: Alt+F4, exit status 0, no panic;
 //! 9. launch at 150 %: a second `aterm-gui` started on the scaled monitor at
-//!    1.50 and 144 dpi, closed the same way.
+//!    1.50 and 144 dpi, closed the same way. With `--cpu`, before it closes,
+//!    its window is lifted until 120 client rows are past the screen's top
+//!    edge, PowerShell clears its screen and prints a line there, and the
+//!    window is moved back down onto the screen ([`Run::exposed`]): the rows
+//!    that come back, which Windows did not draw, must be painted.
 //!
 //! The monitor's scaling is put back to 100 % at the end. Exit 0 every row
 //! passed, 1 a row failed, 3 NOT RUN. Report and screenshots:
-//! `$LAB_STATE/windows/`. WARP only: the VM has no GPU, so a real GPU's
+//! `$LAB_STATE/windows/`.
+//!
+//! `--cpu` runs the same rows on aterm's CPU presenter (`aterm-gui --cpu`,
+//! the cursor still and the stats Deck off, as the Linux lane's `--cpu` rows
+//! run): the launch row requires `backend=cpu`, and the launch, type, IME,
+//! resize, DPI and monitor rows each hold the frame aterm presented
+//! (`image`) to the window's own pixels, which the desk helper reads back
+//! from its DC (`readback`: `BitBlt` into a bitmap, then `GetDIBits`). WARP only: the VM has no GPU, so a real GPU's
 //! driver, and real x86_64 hardware, are m6's to run.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use crate::linux_proof::{drew_on_gpu, field, present_summary, reply};
+use crate::linux_proof::{
+    WestonView, bands_held, compare_rgb, drew_on_gpu, field, held_at, parse_ppm, present_summary,
+    reply,
+};
 use crate::paths::paths;
 use crate::windows::{self, GPU_ID, Layout, Up, lane_lock, not_run, run_on_desktop, task_name};
 use crate::windows_desk::{
@@ -53,6 +67,28 @@ use crate::{Fail, LAB, Res};
 /// How long something that must happen may take: a hang detector, never a
 /// latency budget.
 const WITHIN: Duration = Duration::from_secs(60);
+
+/// How many client rows [`Run::exposed`] lifts past the screen's top edge:
+/// PowerShell's first three lines at 150 %.
+const LIFT: i32 = 120;
+
+/// What [`Run::exposed`] has PowerShell do while the window's top rows are
+/// past the screen's edge: clear the screen and print [`EXPOSED_ECHO`] on its
+/// first line, which no key typed shows.
+pub const EXPOSED_TYPED: &str = "Clear-Host; Write-Output ('ROWS-' + 6*7)";
+pub const EXPOSED_ECHO: &str = "ROWS-42";
+
+/// The `r` part of a `w`-pixel-wide image of `n`-byte pixels: its pixels, width
+/// and height.
+fn crop(px: &[u8], w: usize, n: usize, r: desk::Rect) -> (Vec<u8>, usize, usize) {
+    let col = |v: i32| usize::try_from(v).unwrap_or(0);
+    let (l, t, rr, b) = (col(r.l), col(r.t), col(r.r), col(r.b));
+    let mut out = Vec::with_capacity((rr - l) * (b - t) * n);
+    for y in t..b {
+        out.extend_from_slice(&px[(y * w + l) * n..(y * w + rr) * n]);
+    }
+    (out, rr - l, b - t)
+}
 
 /// What the IME row types around the composition, and what PowerShell
 /// prints only when the IME's committed text (`日本`, from `nihon`) reached it.
@@ -308,10 +344,21 @@ struct Session<'a> {
     pid: u32,
 }
 
+/// The config a `--cpu` run's instance takes: the cursor still (no blink,
+/// no trail) and the stats Deck off, so the frame `image` photographs is the
+/// one the window keeps showing, as the Linux lane's `--cpu` rows hold it.
+fn cpu_config() -> String {
+    format!(
+        "cursor_blink = false\ncursor_trail = false\n{}{}",
+        crate::instance::CONFIG_OFF,
+        crate::linux_proof::DECK_OFF
+    )
+}
+
 impl<'a> Session<'a> {
-    /// Start instance `n` of `arch` in the runner's desktop and wait until
-    /// it answers `ready`.
-    fn launch(up: &'a Up, arch: Arch, n: u32) -> Result<Session<'a>, String> {
+    /// Start instance `n` of `arch` in the runner's desktop (on the CPU
+    /// presenter with `cpu`) and wait until it answers `ready`.
+    fn launch(up: &'a Up, arch: Arch, n: u32, cpu: bool) -> Result<Session<'a>, String> {
         let dir = instance_dir(arch, n);
         let task = task_name(&format!("window-{}-{n}", arch.name()));
         // A previous run's pid and exit files must be gone before this one
@@ -326,15 +373,19 @@ impl<'a> Session<'a> {
                 cleared.tail(3)
             ));
         }
-        let config = aterm_codec::base64::encode(crate::instance::CONFIG_OFF.as_bytes())
-            .map_err(|e| format!("base64: {e:?}"))?;
-        let started = run_on_desktop(
-            up,
-            &task,
-            &helper_line(&["launch", &bin_dir(arch), &dir, &config]),
-            Desktop::Started,
-            false,
-        );
+        let config = if cpu {
+            cpu_config()
+        } else {
+            crate::instance::CONFIG_OFF.to_string()
+        };
+        let config =
+            aterm_codec::base64::encode(config.as_bytes()).map_err(|e| format!("base64: {e:?}"))?;
+        let bin = bin_dir(arch);
+        let mut words = vec!["launch", &bin, &dir, &config];
+        if cpu {
+            words.push("--cpu");
+        }
+        let started = run_on_desktop(up, &task, &helper_line(&words), Desktop::Started, false);
         if !started.ok() {
             return Err(format!("its task did not start: {}", started.tail(5)));
         }
@@ -515,6 +566,39 @@ fn count(r: &str, key: &str) -> Option<u64> {
     field(r, key)?.parse().ok()
 }
 
+/// `frames` from `metrics` (every successful present; `n_present` counts
+/// only output-to-present samples), the presents it dropped and why the last
+/// one was, and the surface `dims` names, as the row's evidence: `?` for what
+/// aterm did not answer.
+fn presents(s: &Session<'_>) -> String {
+    let metrics = s.ctl(&["metrics"]).ok();
+    let read = |key: &str| {
+        metrics
+            .as_deref()
+            .and_then(|m| field(m, key))
+            .map_or_else(|| "?".to_string(), str::to_string)
+    };
+    let n = read("frames");
+    let drops = format!(
+        "present_drops={} last {} parked={}",
+        read("present_drops"),
+        read("last_present_drop_reason"),
+        read("last_present_drop_parked")
+    );
+    let surface = s
+        .ctl(&["dims"])
+        .ok()
+        .and_then(|d| {
+            Some(format!(
+                "{}x{}",
+                field(&d, "surface_w")?,
+                field(&d, "surface_h")?
+            ))
+        })
+        .unwrap_or_else(|| "?".to_string());
+    format!("frames={n} {drops} surface={surface}")
+}
+
 /// How long [`Watch`] watches: the IME row ends well within it.
 const WATCH_MS: u32 = 120_000;
 
@@ -611,11 +695,19 @@ struct Run<'a> {
     results: PathBuf,
     /// Whether the IME row runs [`Watch`].
     watch: bool,
+    /// `--cpu`: the instances present on the CPU, and the rows hold the
+    /// window's pixels to the presented frame ([`Run::held`]).
+    cpu: bool,
 }
 
 impl Run<'_> {
     fn l(&self) -> &Layout {
         &self.up.layout
+    }
+
+    /// What this run's files are named after: `window`, or `window-cpu`.
+    fn tag(&self) -> &'static str {
+        if self.cpu { "window-cpu" } else { "window" }
     }
 
     fn shot(&self, what: &str, device: Option<&str>) -> String {
@@ -626,9 +718,224 @@ impl Run<'_> {
             self.l(),
             &self
                 .results
-                .join(format!("{}-window-{what}.png", self.arch.name())),
+                .join(format!("{}-{}-{what}.png", self.arch.name(), self.tag())),
             device,
         )
+    }
+
+    /// With `--cpu`, `detail` and then what [`Run::held`] says of the
+    /// window's pixels now; `detail` alone without it. A hold that fails
+    /// says how many frames aterm has presented and at what surface size
+    /// ([`presents`]), read once now and once a second later, which tells a
+    /// window aterm stopped presenting to from one it presents wrong.
+    fn and_held(&self, s: &Session<'_>, what: &str, detail: String) -> Result<String, String> {
+        if !self.cpu {
+            return Ok(detail);
+        }
+        let held = self.held(s, what).map_err(|why| {
+            let now = presents(s);
+            std::thread::sleep(Duration::from_secs(1));
+            format!("{why}; then {now}, a second later {}", presents(s))
+        })?;
+        Ok(format!("{detail}; {held}"))
+    }
+
+    /// The frame aterm presented (`image`, kept as
+    /// `<arch>-window-cpu-<what>-frame.png`, apart from the row's screenshot)
+    /// held to the window's own pixels, read back from its DC by the desk
+    /// helper (`readback`, kept as `<arch>-window-cpu-<what>-window.ppm`):
+    /// equal exactly when the frame is the client area's size, else the frame
+    /// at `dims`' offset and each band pixel the frame's nearest, as the
+    /// Linux lane holds a window the window system sized. What the row's
+    /// detail says of it.
+    ///
+    /// Windows draws no window pixel outside the virtual screen: what the
+    /// readback finds there is what the window held when that pixel was last
+    /// on the screen, or white when it never was, not what aterm presented
+    /// since. So a client area that reaches past the screen's edge is held on
+    /// the part that is on it, and the detail names the part that is not.
+    fn held(&self, s: &Session<'_>, what: &str) -> Result<String, String> {
+        let stem = format!("{}-{}-{what}", self.arch.name(), self.tag());
+        let image = s.ctl(&["image", &format!("{stem}-frame.png")])?;
+        let guest_png = image
+            .split_whitespace()
+            .nth(3)
+            .ok_or_else(|| format!("`image` answered {image}"))?
+            .to_string();
+        let guest_ppm = format!("{}\\{stem}-window.ppm", s.dir);
+        let text = desk(
+            self.up,
+            &["readback", &s.pid.to_string(), ATERM_CLASS, &guest_ppm],
+        )?;
+        let place = desk::parse_place(&text)
+            .ok_or_else(|| format!("desk.ps1 readback answered {}", text.trim()))?;
+        let client = place.client;
+        let png = self.results.join(format!("{stem}-frame.png"));
+        let ppm = self.results.join(format!("{stem}-window.ppm"));
+        for (from, to) in [(&guest_png, &png), (&guest_ppm, &ppm)] {
+            let got = self.up.ssh.get(&from.replace('\\', "/"), to);
+            if !got.ok() {
+                return Err(format!("{from} not copied out: {}", got.tail(2)));
+            }
+        }
+        let presented = std::fs::read(&png)
+            .ok()
+            .and_then(|b| aterm_png::decode_rgba8(&b, 8192))
+            .ok_or_else(|| format!("{}: not a PNG this lab decodes", png.display()))?;
+        let window = std::fs::read(&ppm)
+            .ok()
+            .and_then(|b| parse_ppm(&b))
+            .ok_or_else(|| format!("{}: not a PPM this lab reads", ppm.display()))?;
+        let (w, h) = (presented.1, presented.2);
+        let (cw, ch) = (window.1, window.2);
+        if (cw, ch) != client {
+            return Err(format!(
+                "the readback is {cw}x{ch}, its client area {}x{}",
+                client.0, client.1
+            ));
+        }
+        let files = format!("frame {}, window {}", png.display(), ppm.display());
+        let seen = place.on_screen().ok_or_else(|| {
+            format!(
+                "the window's client area ({cw}x{ch} at {:?}) is off the virtual screen {:?}",
+                place.at, place.screen
+            )
+        })?;
+        let whole = desk::Rect {
+            l: 0,
+            t: 0,
+            r: i32::try_from(cw).unwrap_or(i32::MAX),
+            b: i32::try_from(ch).unwrap_or(i32::MAX),
+        };
+        if (cw, ch) == (w, h) && seen == whole {
+            compare_rgb(&presented.0, w, h, &window, 0..0)
+                .map_err(|why| format!("{why} ({files})"))?;
+            return Ok(format!(
+                "the window's {cw}x{ch} client pixels (GetDIBits) equal the presented frame exactly"
+            ));
+        }
+        if (cw, ch) == (w, h) {
+            let (rgba, vw, vh) = crop(&presented.0, w, 4, seen);
+            let (rgb, _, _) = crop(&window.0, cw, 3, seen);
+            compare_rgb(&rgba, vw, vh, &(rgb, vw, vh), 0..0).map_err(|why| {
+                format!("on the screen's part {seen:?} of the client area: {why} ({files})")
+            })?;
+            return Ok(format!(
+                "the window's {vw}x{vh} client pixels on the virtual screen (columns {}..{}, rows \
+                 {}..{} of {cw}x{ch}; Windows draws none past its edge {:?}) equal the presented \
+                 frame's exactly",
+                seen.l, seen.r, seen.t, seen.b, place.screen
+            ));
+        }
+        if seen != whole {
+            return Err(format!(
+                "the window's client area is {cw}x{ch}, the frame {w}x{h}, and only {seen:?} of \
+                 the client area is on the virtual screen {:?}: not held ({files})",
+                place.screen
+            ));
+        }
+        let d = s.ctl(&["dims"])?;
+        let num = |k: &str| field(&d, k).and_then(|v| v.parse::<i64>().ok());
+        if (num("surface_w"), num("surface_h")) != (i64::try_from(cw).ok(), i64::try_from(ch).ok())
+        {
+            return Err(format!(
+                "the window's client area is {cw}x{ch}, the frame {w}x{h}, and `dims` names another \
+                 surface: {d} ({files})"
+            ));
+        }
+        let (ox, oy) = (num("offset_x").unwrap_or(0), num("offset_y").unwrap_or(0));
+        let rgba = (
+            window
+                .0
+                .as_chunks::<3>()
+                .0
+                .iter()
+                .flat_map(|p| [p[0], p[1], p[2], 0xff])
+                .collect::<Vec<u8>>(),
+            cw,
+            ch,
+        );
+        let view = WestonView {
+            x: 0,
+            y: 0,
+            width: cw,
+            height: ch,
+            format: "XRGB8888".into(),
+        };
+        held_at(&rgba, &presented, ox, oy, 0..0).map_err(|why| format!("{why} ({files})"))?;
+        let n = bands_held(&rgba, &presented, &view, (ox, oy))
+            .map_err(|why| format!("{why} ({files})"))?;
+        Ok(format!(
+            "the window's {cw}x{ch} client pixels (GetDIBits) hold the presented {w}x{h} frame \
+             exactly at ({ox},{oy}), and its {n} band pixels each the frame's nearest"
+        ))
+    }
+
+    /// Where `s`'s window's client area is ([`desk::Place`]), after moving it
+    /// (`move`, so the client area's top is at screen row `n`) or widening it
+    /// (`grow`, by `n` pixels) when asked to.
+    fn place(&self, s: &Session<'_>, change: Option<(&str, i32)>) -> Result<desk::Place, String> {
+        let pid = s.pid.to_string();
+        let n = change.map(|(_, n)| n.to_string());
+        let args = match (change, &n) {
+            (Some((verb, _)), Some(n)) => vec![verb, &pid, ATERM_CLASS, n],
+            _ => vec!["place", &pid, ATERM_CLASS],
+        };
+        let text = desk(self.up, &args)?;
+        desk::parse_place(&text)
+            .ok_or_else(|| format!("desk.ps1 {} answered {}", args[0], text.trim()))
+    }
+
+    /// What aterm presented while rows of its window were past the screen's
+    /// edge, painted once they come back. The window is lifted until its top
+    /// [`LIFT`] client rows are above the virtual screen's top edge; there
+    /// PowerShell clears the screen and prints [`EXPOSED_ECHO`] on those rows
+    /// ([`EXPOSED_TYPED`], sent through `aterm-ctl`), which Windows does not
+    /// draw, and the rows still on the screen are held. Then the window is
+    /// moved back down until all of it is on the screen and held whole:
+    /// Windows invalidates the rows that come back and erases them with the
+    /// class's theme brush, and aterm must paint them although its frame has
+    /// not changed since (`RedrawRequested` with the window owing a repaint,
+    /// then the presenter's copy of the update rectangle). Rows that only
+    /// moved, or that hold the theme's background, would come back right
+    /// without aterm: the erase paints the background, and a row drawn before
+    /// it went past the edge keeps its pixels.
+    fn exposed(&self, s: &Session<'_>, what: &str) -> Result<String, String> {
+        let at = self.place(s, None)?;
+        let ch = i32::try_from(at.client.1).map_err(|_| format!("{at:?}: no height"))?;
+        if ch <= LIFT || ch > at.screen.height() {
+            return Err(format!(
+                "the client area ({}x{ch} at {:?}) does not fit the virtual screen {:?} with {LIFT} \
+                 rows lifted",
+                at.client.0, at.at, at.screen
+            ));
+        }
+        let lifted = self.place(s, Some(("lift", LIFT)))?;
+        if lifted.on_screen().map(|r| (r.t, r.b)) != Some((LIFT, ch)) {
+            return Err(format!(
+                "lifted, the client area is not {LIFT} rows above the screen: {lifted:?}"
+            ));
+        }
+        s.ctl(&["send", EXPOSED_TYPED])?;
+        s.ctl(&["key", "enter"])?;
+        s.ctl(&["await", "match", EXPOSED_ECHO, "timeout=60000"])?;
+        std::thread::sleep(Duration::from_secs(1));
+        let above = self.held(s, &format!("{what}-cut"))?;
+        let top = (at.screen.b - ch).min(at.at.1).max(at.screen.t);
+        let back = self.place(s, Some(("move", top)))?;
+        if back.on_screen().map(|r| (r.t, r.b)) != Some((0, ch)) {
+            return Err(format!(
+                "moved back down, the client area is still cut: {back:?}"
+            ));
+        }
+        std::thread::sleep(Duration::from_secs(1));
+        let whole = self.held(s, &format!("{what}-exposed"))?;
+        Ok(format!(
+            "lifted from {:?} to {:?}, {LIFT} rows past the screen's top, where PowerShell cleared \
+             the screen and printed {EXPOSED_ECHO}: {above}; moved back to {:?}, all on the screen: \
+             {whole}",
+            at.at, lifted.at, back.at
+        ))
     }
 
     fn scale(&self, steps: i32) -> Result<Monitor, String> {
@@ -677,21 +984,27 @@ impl Run<'_> {
                 dims.scale, dims.geometry
             ));
         }
-        let metrics = within("a frame on the GPU", || {
+        let backend = if self.cpu { "cpu" } else { "gpu" };
+        let metrics = within(&format!("a frame with backend={backend}"), || {
             let m = s.ctl(&["metrics"])?;
-            if field(&m, "backend") == Some("gpu") {
+            if field(&m, "backend") == Some(backend) {
                 Ok(m)
             } else {
                 Err(format!("backend={}", field(&m, "backend").unwrap_or("?")))
             }
         })?;
-        let stderr = s.stderr();
-        let device = drew_on_gpu(&stderr, field(&metrics, "backend"))?
-            .unwrap_or("(no device line)")
-            .to_string();
-        if !device.contains(WARP) {
-            return Err(format!("drew on {device}, not on WARP ({WARP})"));
-        }
+        let device = if self.cpu {
+            "the CPU (backend=cpu)".to_string()
+        } else {
+            let stderr = s.stderr();
+            let device = drew_on_gpu(&stderr, field(&metrics, "backend"))?
+                .unwrap_or("(no device line)")
+                .to_string();
+            if !device.contains(WARP) {
+                return Err(format!("drew on {device}, not on WARP ({WARP})"));
+            }
+            device
+        };
         Ok(format!(
             "pid {} (machine {}, {}), window class {ATERM_CLASS} {}x{} client at {} dpi, per-monitor aware, geometry=window, \
              {}; drew on {device}",
@@ -718,10 +1031,14 @@ impl Run<'_> {
                 "n_input {before} -> {after}: aterm counted no input"
             ));
         }
-        Ok(format!(
-            "clicked into, `{TYPED}` typed on the USB keyboard, {} echoed; n_input {before} -> {after}",
-            crate::linux_proof::ECHO
-        ))
+        self.and_held(
+            s,
+            "typed",
+            format!(
+                "clicked into, `{TYPED}` typed on the USB keyboard, {} echoed; n_input {before} -> {after}",
+                crate::linux_proof::ECHO
+            ),
+        )
     }
 
     /// aterm's composition as `chrome`'s `ime` line shows it (its text and
@@ -865,7 +1182,7 @@ impl Run<'_> {
         };
         type_text(self.l(), IME_AFTER)?;
         s.ctl(&["await", "match", IME_ECHO, "timeout=60000"])?;
-        Ok(format!(
+        self.and_held(s, "ime", format!(
             "{switched} Microsoft IME (layout {JAPANESE}), IME {opened} (conversion mode {}), `{IME_READING}` composed \
              key by key ({} in aterm), converted (Space, {IME_CONVERTED:?}) and committed (Enter) into PowerShell's line, \
              which printed {IME_ECHO}; {back} English ({ENGLISH}); {composing}; {converted}",
@@ -909,7 +1226,7 @@ impl Run<'_> {
         }
         let echo = self.shell_width(s, WIDTH_TAGS[0], after.cols)?;
         let w2 = s.window()?;
-        Ok(format!(
+        let detail = format!(
             "right edge dragged {DRAG} px left: window {}x{} -> {}x{}, grid {}x{} -> {}x{}, resizes {resizes_before} -> \
              {resizes}, render=ok; PowerShell's [Console]::WindowWidth printed {echo}; {}",
             w.client.0,
@@ -921,7 +1238,8 @@ impl Run<'_> {
             after.cols,
             after.rows,
             self.shot("resized", Some(GPU_ID))
-        ))
+        );
+        self.and_held(s, "resized", detail)
     }
 
     fn dpi_change(&self, s: &Session<'_>) -> Result<String, String> {
@@ -949,7 +1267,7 @@ impl Run<'_> {
             return Err(format!("after the change `status` says {status}"));
         }
         let echo = self.shell_width(s, WIDTH_TAGS[1], after.cols)?;
-        Ok(format!(
+        let detail = format!(
             "primary monitor's scaling to step {SCALED} ({} dpi) while running: {} -> {}; window {} -> {} dpi, \
              client {}x{} -> {}x{}; render=ok; typed after it, [Console]::WindowWidth printed {echo}; {}",
             m.dpi,
@@ -962,7 +1280,8 @@ impl Run<'_> {
             w.client.0,
             w.client.1,
             self.shot("dpi-150", Some(GPU_ID))
-        ))
+        );
+        self.and_held(s, "dpi-150", detail)
     }
 
     fn second_monitor(&self, s: &Session<'_>) -> Result<String, String> {
@@ -986,6 +1305,7 @@ impl Run<'_> {
         })?;
         let right = self.shell_width(s, WIDTH_TAGS[2], d2.cols)?;
         let there = self.shot("second-monitor", None);
+        let there = self.and_held(s, "second-monitor", there)?;
         chord(self.l(), &["meta_l", "shift", "left"])?;
         // Windows gives a window that straddles two monitors the DPI of the
         // one it overlaps most, which need not hold its centre.
@@ -1006,9 +1326,10 @@ impl Run<'_> {
             return Err(format!("after the moves `status` says {status}"));
         }
         let left = self.shell_width(s, WIDTH_TAGS[3], d3.cols)?;
+        let back = self.and_held(s, "back", String::new())?;
         Ok(format!(
             "Win+Shift+Right: window at ({},{}) on {} at {} dpi, {}, [Console]::WindowWidth printed {right}; \
-             Win+Shift+Left: back at {} dpi, {}, printed {left}; render=ok; {there}",
+             Win+Shift+Left: back at {} dpi, {}, printed {left}{back}; render=ok; {there}",
             w2.rect.l,
             w2.rect.t,
             second.name,
@@ -1054,7 +1375,8 @@ fn arch_rows(
     results: &Path,
 ) -> Vec<Row> {
     let mut rows: Vec<Row> = Vec::new();
-    let name = |what: &str| format!("{} window {what}", arch.name());
+    let tag = if ask.cpu { "window --cpu" } else { "window" };
+    let name = |what: &str| format!("{} {tag} {what}", arch.name());
     let mut env = guest::cargo_env(arch);
     env.extend(windows::build_facts(repo));
     let build = ["cargo", "build", "-p", "aterm-gui", "-p", "aterm-ctl"].map(String::from);
@@ -1080,6 +1402,7 @@ fn arch_rows(
         display: display.clone(),
         results: results.to_path_buf(),
         watch: ask.watch,
+        cpu: ask.cpu,
     };
     let mut push = |row: &str, verdict: Result<String, String>| {
         let ok = verdict.is_ok();
@@ -1098,7 +1421,7 @@ fn arch_rows(
         arch.name()
     );
     let mut left: &[&str] = &ROWS;
-    match Session::launch(up, arch, 1) {
+    match Session::launch(up, arch, 1, ask.cpu) {
         Err(e) => {
             push(ROWS[0], Err(e));
             left = &ROWS[1..];
@@ -1108,6 +1431,7 @@ fn arch_rows(
                 &|s| {
                     run.launch(s, "1.00", display.primary.dpi)
                         .map(|d| format!("{d}; {}", run.shot("launch", Some(GPU_ID))))
+                        .and_then(|d| run.and_held(s, "launch", d))
                 },
                 &|s| run.typed(s),
                 &|s| run.ime(s),
@@ -1127,10 +1451,16 @@ fn arch_rows(
             s.end();
             if !failed {
                 // Launched on the monitor already at 150 %.
-                let at150 = Session::launch(up, arch, 2).and_then(|s2| {
+                let at150 = Session::launch(up, arch, 2, ask.cpu).and_then(|s2| {
                     let verdict = run.launch(&s2, "1.50", 144).and_then(|d| {
                         let shot = run.shot("launch-150", Some(GPU_ID));
-                        run.close(&s2).map(|c| format!("{d}; {shot}; {c}"))
+                        let d = run.and_held(&s2, "launch-150", format!("{d}; {shot}"))?;
+                        let d = if run.cpu {
+                            format!("{d}; {}", run.exposed(&s2, "launch-150")?)
+                        } else {
+                            d
+                        };
+                        run.close(&s2).map(|c| format!("{d}; {c}"))
                     });
                     s2.end();
                     verdict
@@ -1155,11 +1485,15 @@ struct Ask {
     arches: Vec<Arch>,
     /// `--watch`: the IME row's input watched ([`Watch`]), its log kept.
     watch: bool,
+    /// `--cpu`: the rows on aterm's CPU presenter, each holding the window's
+    /// pixels to the presented frame ([`Run::held`]).
+    cpu: bool,
 }
 
 fn parse_args(args: &[String]) -> Result<Ask, Fail> {
     let mut arches = Vec::new();
     let mut watch = false;
+    let mut cpu = false;
     let mut i = 0;
     while let Some(a) = args.get(i) {
         match a.as_str() {
@@ -1174,6 +1508,10 @@ fn parse_args(args: &[String]) -> Result<Ask, Fail> {
                 watch = true;
                 i += 1;
             }
+            "--cpu" => {
+                cpu = true;
+                i += 1;
+            }
             other => {
                 return Err(Fail::usage(format!(
                     "windows window: unknown argument '{other}' ({LAB} windows help)"
@@ -1184,10 +1522,10 @@ fn parse_args(args: &[String]) -> Result<Ask, Fail> {
     if arches.is_empty() {
         arches = vec![Arch::Aarch64, Arch::X86_64];
     }
-    Ok(Ask { arches, watch })
+    Ok(Ask { arches, watch, cpu })
 }
 
-/// `windows window [--arch A]... [--watch]`.
+/// `windows window [--arch A]... [--watch] [--cpu]`.
 ///
 /// # Errors
 /// A usage error, or the lane could not be brought up (NOT RUN).
@@ -1255,7 +1593,11 @@ pub fn cmd_window(args: &[String]) -> Res {
         report.push('\n');
     }
     print!("{report}");
-    let path = results.join("window.txt");
+    let path = results.join(if ask.cpu {
+        "window-cpu.txt"
+    } else {
+        "window.txt"
+    });
     let _ = std::fs::write(&path, &report);
     println!(
         "windows: {} rows, {failed} failed, {:.0} s, tree {tree}; report {}",
@@ -1269,6 +1611,44 @@ pub fn cmd_window(args: &[String]) -> Res {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The launch at 150 %'s readback, small: a frame whose last rows are
+    /// past the screen's edge, read back white there.
+    #[test]
+    fn a_hold_on_the_screens_part_ignores_the_rows_past_its_edge_and_no_others() {
+        let (w, h) = (3, 4);
+        let frame: Vec<u8> = (0..w * h)
+            .flat_map(|i| [i as u8, 0x10, 0x20, 0xff])
+            .collect();
+        let mut window: Vec<u8> = frame
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .flat_map(|p| [p[0], p[1], p[2]])
+            .collect();
+        // The last row past the edge, white.
+        window[3 * w * 3..].fill(0xff);
+        let place =
+            desk::parse_place("readback client=3x4 at=10,7 screen=0,0,100,10").expect("a place");
+        let seen = place.on_screen().expect("on the screen");
+        assert_eq!((seen.t, seen.b, seen.l, seen.r), (0, 3, 0, 3));
+        let (rgba, vw, vh) = crop(&frame, w, 4, seen);
+        let (rgb, _, _) = crop(&window, w, 3, seen);
+        assert_eq!((vw, vh), (3, 3));
+        assert_eq!(compare_rgb(&rgba, vw, vh, &(rgb, vw, vh), 0..0), Ok(()));
+        // The whole client area is not held: the white row differs.
+        assert!(compare_rgb(&frame, w, h, &(window.clone(), w, h), 0..0).is_err());
+        // A pixel wrong on the screen's part still fails.
+        window[w * 3 + 1] ^= 1;
+        let (rgb, _, _) = crop(&window, w, 3, seen);
+        assert_eq!(
+            compare_rgb(&rgba, vw, vh, &(rgb, vw, vh), 0..0),
+            Err(
+                "1 of 9 pixels differ; first at (0,1): presented [03, 10, 20], server [03, 11, 20]"
+                    .into()
+            )
+        );
+    }
 
     #[test]
     fn dims_are_read_from_a_windowed_reply() {
@@ -1300,6 +1680,8 @@ mod tests {
         assert!(!typed.contains(IME_ECHO));
         // Without the IME the same keys print the reading, never the echo.
         assert!(format!("IME-{IME_READING}") != IME_ECHO);
+        // The exposure's line prints its echo; the line itself never holds it.
+        assert!(!EXPOSED_TYPED.contains(EXPOSED_ECHO));
         // A width's echo is its tag then digits, which no typed line holds,
         // and no tag is another's start.
         for (tag, typed) in WIDTH_TAGS.iter().zip(&widths) {
@@ -1324,14 +1706,24 @@ mod tests {
             parse_args(&[]).ok(),
             Some(Ask {
                 arches: vec![Arch::Aarch64, Arch::X86_64],
-                watch: false
+                watch: false,
+                cpu: false
             })
         );
         assert_eq!(
             parse_args(&["--arch".into(), "x86_64".into(), "--watch".into()]).ok(),
             Some(Ask {
                 arches: vec![Arch::X86_64],
-                watch: true
+                watch: true,
+                cpu: false
+            })
+        );
+        assert_eq!(
+            parse_args(&["--cpu".into()]).ok(),
+            Some(Ask {
+                arches: vec![Arch::Aarch64, Arch::X86_64],
+                watch: false,
+                cpu: true
             })
         );
         assert!(parse_args(&["--arch".into(), "mips".into()]).is_err());

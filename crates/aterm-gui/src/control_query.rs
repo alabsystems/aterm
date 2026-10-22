@@ -21,8 +21,8 @@ use aterm_core::search::{
 };
 use aterm_core::selection::SelectionType;
 use aterm_core::terminal::{
-    AbsRowText, BuiltSearch, RenderCell, SearchKey, SearchLayout, SearchRequest, SearchVerdict,
-    Terminal, UnderlineStyle, WrapFrame,
+    AbsRowAt, AbsRowText, BuiltSearch, RenderCell, SearchKey, SearchLayout, SearchRequest,
+    SearchVerdict, Terminal, UnderlineStyle, WrapFrame,
 };
 use aterm_search::MAX_SEARCH_MATCHES;
 use aterm_window::event_loop::EventLoopProxy;
@@ -481,27 +481,70 @@ pub(crate) fn cmd_cursor(term: &Arc<Mutex<Terminal>>) -> String {
 /// (its blank right-half spacer) when the cell is one; the marker joins the
 /// list, replacing a bare `none`, so a parser's vocabulary is ten tokens
 /// (pinned by `cell_attrs_carry_the_width_markers`).
+///
+/// `cell abs=<n> <c>` reads the cell of ABSOLUTE row `n` (B-2's one coordinate
+/// space, `line`'s and `search`'s): a history row, materialized as a
+/// scrolled-back viewport row is and resolved through the same colours and
+/// decorations, whatever the viewport shows, or a live row as `cell <r> <c>`
+/// reads it. A history row's cell carries no ` link=`. `ERR evicted` for a row
+/// older than retained history and `ERR out of range` for one past the live
+/// screen's end, as `line` says them. Why: a reader that walks a message up
+/// into the history (`line`) can tell its rows by how they are drawn, as it can
+/// on the screen (the window harness bounds agy's sent message by its cells).
 pub(crate) fn cmd_cell(term: &Arc<Mutex<Terminal>>, rest: &str) -> String {
     let mut it = rest.split_whitespace();
     let (Some(rs), Some(cs)) = (it.next(), it.next()) else {
-        return "ERR usage: cell <r> <c>\n".to_string();
+        return "ERR usage: cell <r> <c> | cell abs=<n> <c>\n".to_string();
     };
-    let (Ok(r), Ok(c)) = (rs.parse::<usize>(), cs.parse::<usize>()) else {
+    let abs = match rs.strip_prefix("abs=") {
+        Some(n) => match n.parse::<u64>() {
+            Ok(n) => Some(n),
+            Err(_) => return "ERR bad args\n".to_string(),
+        },
+        None => None,
+    };
+    let Ok(c) = cs.parse::<usize>() else {
         return "ERR bad args\n".to_string();
     };
     let t = term_lock(term);
-    // Bound by the GRID (per `dims`), not by row content: `render_row` trims
-    // trailing blanks, but every 0<=r<rows, 0<=c<cols is a real, readable cell.
-    if r >= t.rows() as usize || c >= t.cols() as usize {
-        return format!(
+    let out_of_range = || {
+        format!(
             "ERR out of range: rows 0-{}, cols 0-{}\n",
             t.rows().saturating_sub(1),
             t.cols().saturating_sub(1)
-        );
+        )
+    };
+    let at = match abs {
+        Some(n) => match t.abs_row_at(n) {
+            AbsRowAt::Screen { row } => CellRow::Screen(row),
+            AbsRowAt::History { rev_idx } => CellRow::History(rev_idx),
+            AbsRowAt::Evicted => return "ERR evicted\n".to_string(),
+            AbsRowAt::OutOfRange => return "ERR out of range\n".to_string(),
+        },
+        None => match rs.parse::<usize>() {
+            Ok(r) => CellRow::Screen(r),
+            Err(_) => return "ERR bad args\n".to_string(),
+        },
+    };
+    // Bound by the GRID (per `dims`), not by row content: `render_row` trims
+    // trailing blanks, but every 0<=r<rows, 0<=c<cols is a real, readable cell.
+    if c >= t.cols() as usize || matches!(at, CellRow::Screen(r) if r >= t.rows() as usize) {
+        return out_of_range();
     }
     // LIVE frame (offset-INDEPENDENT), matching the offset-independent `text`/
-    // `cell_grapheme` reads — never a scrolled-back row's colours on a live glyph.
-    let row = t.render_row_at_screen(r);
+    // `cell_grapheme` reads — never a scrolled-back row's colours on a live glyph;
+    // a history row its own materialized cells, whatever the viewport shows.
+    let (row, view) = match at {
+        CellRow::Screen(r) => (
+            t.render_row_at_screen(r),
+            t.grid().screen_row_view(r as u16),
+        ),
+        CellRow::History(rev_idx) => {
+            let mut row = Vec::new();
+            t.render_history_row_into(rev_idx, &mut row);
+            (row, t.grid().history_row_view(rev_idx))
+        }
+    };
     let (fg, bg) = match row.get(c) {
         Some(cell) => (cell.fg, cell.bg),
         // A blank in-grid cell is the engine's implicit `Cell::EMPTY`.
@@ -512,11 +555,10 @@ pub(crate) fn cmd_cell(term: &Arc<Mutex<Terminal>>, rest: &str) -> String {
             (blank.fg, blank.bg)
         }
     };
-    // ONE live row handle (offset-INDEPENDENT, the row `render_row_at_screen`
-    // and `cell_grapheme` resolve) for the grapheme, the attrs and the width
-    // markers.
+    // ONE row handle (the row `render_row_at_screen` and `cell_grapheme`
+    // resolve, or the history row rendered above) for the grapheme, the attrs
+    // and the width markers.
     let col = c as u16;
-    let view = t.grid().screen_row_view(r as u16);
     let cell = view.cell(col);
     // PROTECTED (DECSCA) shares a flag bit with WIDE_CONTINUATION;
     // `is_wide_continuation` disambiguates via the left neighbor, so a
@@ -559,14 +601,25 @@ pub(crate) fn cmd_cell(term: &Arc<Mutex<Terminal>>, rest: &str) -> String {
     // intelligence sees the link a human would click. Appended as a trailing
     // ` link=<url>` token only when present — positional fields 1-4 (grapheme,
     // fg, bg, attrs) are unchanged, so existing parsers keep working.
-    let link = t
-        .hyperlink_at(r as u16, c as u16)
-        .map(|u| format!(" link={}", pct_encode(u)))
-        .unwrap_or_default();
+    let link = match at {
+        CellRow::Screen(r) => t
+            .hyperlink_at(r as u16, c as u16)
+            .map(|u| format!(" link={}", pct_encode(u)))
+            .unwrap_or_default(),
+        CellRow::History(_) => String::new(),
+    };
     format!(
         "OK {grapheme_tok} {:02x}{:02x}{:02x} {:02x}{:02x}{:02x} {attrs}{link}\n",
         fg[0], fg[1], fg[2], bg[0], bg[1], bg[2],
     )
+}
+
+/// The row [`cmd_cell`] reads: a live screen row, or a history row by how far
+/// above the live screen (`cell abs=<n>`).
+#[derive(Clone, Copy)]
+enum CellRow {
+    Screen(usize),
+    History(usize),
 }
 
 /// The [`CellFlags`] of a live grid `cell`, read off the LIVE frame
@@ -2191,7 +2244,7 @@ pub(crate) fn cmd_cwd(term: &Arc<Mutex<Terminal>>) -> String {
 /// (`"launch":null`).
 #[cfg(test)]
 pub(crate) fn cmd_text_json_opt(term: &Arc<Mutex<Terminal>>, args: TextArgs) -> String {
-    cmd_text_json_read(term, &FrameSlot::default(), args, None, None, 0, None)
+    cmd_text_json_read(term, &FrameSlot::default(), args, None, None, 0, None, None)
 }
 
 /// [`cmd_text_json_opt`] as the dispatch answers it: `human_ms` (2026-09-25)
@@ -2211,7 +2264,9 @@ pub(crate) fn cmd_text_json_opt(term: &Arc<Mutex<Terminal>>, args: TextArgs) -> 
 /// `text --json` as the session's own verb serves it: [`cmd_text_json_read`]
 /// with the session's `human_ms` and `human_seq` — the count before the age,
 /// both before the screen, so a person's key after this is one the fence
-/// sees.
+/// sees — and its submission count ([`crate::submit_count`], `"submits"`,
+/// 2026-10-21), read AFTER the screen: a screen that shows the program's
+/// answer to a submission comes with a count that holds it.
 pub(crate) fn cmd_text_json_looked(
     term: &Arc<Mutex<Terminal>>,
     ctx: &crate::SessionCtx,
@@ -2227,14 +2282,23 @@ pub(crate) fn cmd_text_json_looked(
         ctx.human_input.unkeyed_ms(now_us),
         human_seq,
         Some(&ctx.launch),
+        Some(&ctx.output_echo),
     )
 }
 
 /// [`cmd_text_json_looked`]'s reply; `unkeyed_ms`
 /// ([`crate::human_input::HumanInputStamp::unkeyed_ms`], the review of LC-4)
 /// is how long the host has served a session no person keyed, written
-/// `"unkeyed_ms":N` LAST, and only beside a `"human_ms":null`: a never that
-/// says since when.
+/// `"unkeyed_ms":N` only beside a `"human_ms":null`: a never that says since
+/// when. `submits`, the session's input writes, gives `"submits":N` after
+/// everything else ([`crate::app_input::OutputEchoTracker::submits`]), read
+/// once the screen's hold is released; `None` (a test's read of a bare
+/// terminal) writes none.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the session's facts read beside one screen, each from its own leaf; a struct \
+              would only rename them at the one dispatch that passes them"
+)]
 pub(crate) fn cmd_text_json_read(
     term: &Arc<Mutex<Terminal>>,
     frame: &FrameSlot,
@@ -2243,6 +2307,7 @@ pub(crate) fn cmd_text_json_read(
     unkeyed_ms: Option<u64>,
     human_seq: u64,
     launch: Option<&crate::launch_witness::LaunchWitness>,
+    submits: Option<&crate::app_input::OutputEchoTracker>,
 ) -> String {
     // GATHER under ONE lock hold, SERIALIZE with the lock released — the shape the
     // styled frame already uses. Every field is read inside the single hold, so the
@@ -2283,6 +2348,9 @@ pub(crate) fn cmd_text_json_read(
             launch.map_or_else(|| "null".to_string(), |w| w.json(human_seq)),
         )
     };
+    // THE SUBMISSION COUNT AFTER THE SCREEN ([`crate::submit_count`]): every
+    // submission whose answer the rows show is counted by now.
+    let submits = submits.map(crate::app_input::OutputEchoTracker::submits);
     let rows_text: Vec<&str> = match &text {
         Some(text) => (first..end).map(|r| text.row(r)).collect(),
         None => display_rows.iter().map(String::as_str).collect(),
@@ -2354,6 +2422,9 @@ pub(crate) fn cmd_text_json_read(
         }
         if let (None, Some(ms)) = (human_ms, unkeyed_ms) {
             let _ = write!(out, ",\"unkeyed_ms\":{ms}");
+        }
+        if let Some(n) = submits {
+            let _ = write!(out, ",\"submits\":{n}");
         }
         out.push('}');
     }
@@ -4136,6 +4207,77 @@ mod tests {
         assert_eq!(attrs(lead.clone()).as_deref(), Some("wide"), "{lead}");
         assert_eq!(attrs(cont.clone()).as_deref(), Some("wide_cont"), "{cont}");
         assert_eq!(attrs(ascii.clone()).as_deref(), Some("none"), "{ascii}");
+    }
+
+    /// `cell abs=<n> <c>` READS A HISTORY ROW'S CELL AS IT READ ON THE SCREEN:
+    /// rows drawn in a style — a caret in bold `5c5cff`, a blank row of spaces
+    /// in that style, a blank row an erase drew under it with a background set,
+    /// a plain row — read the same, glyph, colours and attrs, at every column,
+    /// once scrolled into the history as `cell <r> <c>` read them on the
+    /// screen, and `abs=` of a live row is that row. NEGATIVE CONTROLS: the
+    /// plain row reads otherwise than the caret's, a row past the screen is
+    /// `ERR out of range`, and a row number that is no number `ERR bad args`.
+    #[test]
+    fn a_history_rows_cell_reads_as_it_did_on_the_screen() {
+        let term = Arc::new(Mutex::new(Terminal::new(5, 12)));
+        term.lock().unwrap().process(
+            b"\x1b[1;38;2;92;92;255m> Hi\x1b[0m\r\n\
+              \x1b[1;38;2;92;92;255m            \x1b[0m\r\n\
+              \x1b[1;38;2;92;92;255;48;2;1;2;3m\x1b[K\x1b[0m\r\n\
+              \x1b[38;2;208;208;208m  plain\x1b[0m\r\n",
+        );
+        let cols = 0..12;
+        let live: Vec<Vec<String>> = (0..4)
+            .map(|r| {
+                cols.clone()
+                    .map(|c| cmd_cell(&term, &format!("{r} {c}")))
+                    .collect()
+            })
+            .collect();
+        for (r, row) in live.iter().enumerate() {
+            for (c, cell) in row.iter().enumerate() {
+                assert!(cell.starts_with("OK "), "{r} {c}: {cell}");
+                assert_eq!(
+                    &cmd_cell(&term, &format!("abs={r} {c}")),
+                    cell,
+                    "a live row by its absolute number, {r} {c}"
+                );
+            }
+        }
+        term.lock()
+            .unwrap()
+            .process(b"a\r\nb\r\nc\r\nd\r\ne\r\nf\r\n");
+        assert!(
+            term.lock().unwrap().grid().scrollback_lines() >= 4,
+            "the rows are in the history"
+        );
+        for (r, row) in live.iter().enumerate() {
+            for (c, cell) in row.iter().enumerate() {
+                assert_eq!(
+                    &cmd_cell(&term, &format!("abs={r} {c}")),
+                    cell,
+                    "history row {r}, column {c}"
+                );
+            }
+        }
+        // Past the ring of the newest rows, into the stored lines.
+        let far: String = (0..6000).map(|i| format!("{i}\r\n")).collect();
+        term.lock().unwrap().process(far.as_bytes());
+        for (r, row) in live.iter().enumerate() {
+            for (c, cell) in row.iter().enumerate() {
+                assert_eq!(
+                    &cmd_cell(&term, &format!("abs={r} {c}")),
+                    cell,
+                    "stored history row {r}, column {c}"
+                );
+            }
+        }
+        assert!(live[0][0].starts_with("OK > 5c5cff "), "{}", live[0][0]);
+        assert!(live[0][0].ends_with(" bold\n"), "{}", live[0][0]);
+        assert_ne!(live[3][0], live[0][0], "the control: the plain row");
+        assert_eq!(cmd_cell(&term, "abs=100000 0"), "ERR out of range\n");
+        assert_eq!(cmd_cell(&term, "abs=x 0"), "ERR bad args\n");
+        assert!(cmd_cell(&term, "abs=0 12").starts_with("ERR out of range: rows"));
     }
 
     /// A cell past the grid is refused with the grid's size, so the caller
@@ -6134,6 +6276,7 @@ mod trim_tests {
             None,
             0,
             None,
+            None,
         );
         assert!(
             never.contains(",\"human_ms\":null,\"human_seq\":0,\"launch\":null}"),
@@ -6146,6 +6289,7 @@ mod trim_tests {
             Some(12_345),
             None,
             3,
+            None,
             None,
         );
         let gen_at = keyed.find("\"gen\":").expect("gen");
@@ -6160,6 +6304,7 @@ mod trim_tests {
             Some(7),
             None,
             9,
+            None,
             None,
         );
         assert!(
@@ -6180,6 +6325,7 @@ mod trim_tests {
             Some(5_000),
             0,
             None,
+            None,
         );
         assert!(
             served.ends_with(
@@ -6195,6 +6341,7 @@ mod trim_tests {
             Some(7),
             Some(5_000),
             0,
+            None,
             None,
         );
         assert!(!keyed.contains("unkeyed_ms"), "{keyed}");
@@ -6223,6 +6370,7 @@ mod trim_tests {
             None,
             9,
             Some(&w),
+            None,
         );
         assert!(
             at.ends_with(
@@ -6239,11 +6387,82 @@ mod trim_tests {
             None,
             10,
             Some(&w),
+            None,
         );
         assert!(
             moved.ends_with(",\"human_seq\":10,\"launch\":{\"why\":\"since\"}}\n"),
             "{moved}"
         );
+    }
+
+    /// `"submits"` (the session's submission count, `crate::submit_count`)
+    /// ends every reply the session's verb serves, after `trimmed`, `first`
+    /// and `unkeyed_ms`: written by the session's own input writes, a
+    /// control client's and a person's alike, and only an Enter over
+    /// something composed moves it. A read with no session writes none.
+    #[cfg(unix)]
+    #[test]
+    fn text_json_ends_with_the_sessions_submission_count() {
+        use crate::input::{EgressMode, InputEvent};
+        use aterm_types::keyboard::{Key, KeyEventType, Modifiers, NamedKey};
+        let term = term_with(24, &numbered(22));
+        let tracker = crate::app_input::OutputEchoTracker::default();
+        let read = |args: TextArgs| {
+            super::cmd_text_json_read(
+                &term,
+                &crate::frame_memo::FrameSlot::default(),
+                args,
+                None,
+                Some(5_000),
+                0,
+                None,
+                Some(&tracker),
+            )
+        };
+        let before = read(args("tail=5 trim"));
+        assert!(
+            before.ends_with(
+                ",\"launch\":null,\"trimmed\":2,\"first\":19,\"unkeyed_ms\":5000,\"submits\":0}\n"
+            ),
+            "{before}"
+        );
+        let mut pipe = [0; 2];
+        // SAFETY: pipe writes two fresh descriptors on success.
+        assert_eq!(unsafe { libc::pipe(pipe.as_mut_ptr()) }, 0, "pipe");
+        let sink = aterm_session::sink::SinkWriter::new(pipe[1]);
+        let modes = crate::mode_mirror_of(&term);
+        let enter = InputEvent::Key {
+            key: Key::Named(NamedKey::Enter),
+            mods: Modifiers::empty(),
+            base_layout: None,
+            layout_text: None,
+            event_type: KeyEventType::Press,
+        };
+        let write = |ev: &InputEvent| {
+            crate::app_input::tracked_egress(
+                &term,
+                &modes,
+                &sink,
+                &tracker,
+                ev,
+                EgressMode::Interactive,
+            )
+        };
+        // NEGATIVE CONTROL: an Enter over nothing composed.
+        write(&enter);
+        assert!(read(TextArgs::default()).ends_with(",\"submits\":0}\n"));
+        write(&InputEvent::KeySequence(b"keep going".to_vec()));
+        assert!(
+            read(TextArgs::default()).ends_with(",\"submits\":0}\n"),
+            "a draft is no submission"
+        );
+        write(&enter);
+        let after = read(TextArgs::default());
+        assert!(after.ends_with(",\"submits\":1}\n"), "{after}");
+        // A read with no session's tracker (the test spelling) writes none.
+        assert!(!cmd_text_json_opt(&term, TextArgs::default()).contains("submits"));
+        // SAFETY: the read end is this test's own, closed once.
+        unsafe { libc::close(pipe[0]) };
     }
 
     /// The shared framer: `OK <n>[ <verdict>][ trimmed=<k>]` + rows — the `turn`

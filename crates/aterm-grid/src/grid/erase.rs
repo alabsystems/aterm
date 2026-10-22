@@ -50,6 +50,7 @@ impl Grid {
     ///
     /// No-op when `cursor_template_bg_rgb` is `None` (indexed or default bg).
     /// Must be called after `extras.clear_range()` to repopulate the ring.
+    #[inline]
     pub(in crate::grid) fn fill_bce_rgb_range(&mut self, row: u16, col_start: u16, col_end: u16) {
         if let Some(bg_rgb) = self.storage.cursor_template_bg_rgb {
             let vis = self.storage.visible_rows;
@@ -70,6 +71,7 @@ impl Grid {
     /// ([`BlankedHalves`](crate::row::BlankedHalves)) the fill's ring bytes, as
     /// [`Self::fill_bce_rgb_range`] gives the span it vacated. Call it after the
     /// extras shift, which moves the ring with the cells.
+    #[inline]
     pub(in crate::grid) fn fill_bce_rgb_cols(&mut self, row: u16, cols: crate::row::BlankedHalves) {
         for col in cols.into_iter().flatten() {
             self.fill_bce_rgb_range(row, col, col.saturating_add(1));
@@ -79,6 +81,7 @@ impl Grid {
     /// Write BCE truecolor background for a range of full rows.
     ///
     /// No-op when `cursor_template_bg_rgb` is `None`.
+    #[inline]
     pub(in crate::grid) fn fill_bce_rgb_rows(&mut self, range: core::ops::Range<u16>) {
         self.fill_bce_rgb_rect(range, 0..self.storage.cols);
     }
@@ -86,6 +89,7 @@ impl Grid {
     /// Write BCE truecolor background for a rectangular area.
     ///
     /// No-op when `cursor_template_bg_rgb` is `None`.
+    #[inline]
     pub(in crate::grid) fn fill_bce_rgb_rect(
         &mut self,
         rows: core::ops::Range<u16>,
@@ -419,6 +423,7 @@ impl Grid {
     /// Erase from start of screen to cursor.
     ///
     /// REQUIRES: self.storage.cursor.row < self.storage.visible_rows
+    #[inline]
     pub fn erase_from_start_of_screen(&mut self) {
         // xterm `do_erase_display` case 1: `ClearAbove` ending in `ClearLeft` ->
         // `ClearInLine2` (`ResetWrap`), or `ClearScreen` on the bottom-right cell.

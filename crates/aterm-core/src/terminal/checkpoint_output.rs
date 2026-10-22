@@ -148,6 +148,7 @@ pub struct OutputStateRepr {
 
 impl OutputStateRepr {
     /// Whether none of it is set (the wire omits the whole projection).
+    #[inline]
     #[must_use]
     pub fn is_default(&self) -> bool {
         *self == Self::default()
@@ -159,7 +160,8 @@ impl OutputStateRepr {
     clippy::trivially_copy_pass_by_ref,
     reason = "serde's skip_serializing_if hands the predicate a reference"
 )]
-fn is_false(b: &bool) -> bool {
+#[inline]
+const fn is_false(b: &bool) -> bool {
     !*b
 }
 

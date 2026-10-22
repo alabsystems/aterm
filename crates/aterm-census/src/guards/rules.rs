@@ -29,6 +29,7 @@ const ENGINE_CRATES: &[&str] = &[
     "crates/aterm-messages/",
     "crates/aterm-slog/",
     "crates/aterm-restore/",
+    "crates/aterm-aos/",
     "crates/amacs/",
 ];
 
@@ -2583,11 +2584,18 @@ mod tests {
                 ("crates/aterm-scrollback/src/storage.rs", src),
                 ("crates/aterm-effects/src/file_feed.rs", src),
                 ("crates/aterm-gui/src/lib.rs", src),
+                ("crates/aterm-aos/src/log.rs", src),
+                ("crates/aterm-aos/tests/toy.rs", src),
             ],
         );
         assert_eq!(
             spots(&found),
             [
+                "crates/aterm-aos/src/log.rs:1",
+                "crates/aterm-aos/src/log.rs:2",
+                "crates/aterm-aos/src/log.rs:2",
+                "crates/aterm-aos/src/log.rs:4",
+                "crates/aterm-aos/src/log.rs:5",
                 "crates/aterm-grid/src/lib.rs:1",
                 "crates/aterm-grid/src/lib.rs:2",
                 "crates/aterm-grid/src/lib.rs:2",

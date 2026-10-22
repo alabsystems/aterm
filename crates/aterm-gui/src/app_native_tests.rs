@@ -908,12 +908,24 @@ fn control_settings_take_a_rows_words_and_refuse_with_every_option() {
     let mut app = App::headless_for_test();
     app.native_config_service =
         crate::native_config_service::VersionedConfigService::new(String::new()).unwrap();
+    // The switch's word for the value that is not its default, which a write
+    // saves: copy-on-select is off by default on Linux (the selection owns
+    // PRIMARY there) and on elsewhere.
+    let (switch_words, switch_saved) = if cfg!(target_os = "linux") {
+        ("On", "true")
+    } else {
+        ("Off", "false")
+    };
     for (key, words, saved) in [
         (crate::prefs::EDIT_MOTION, "Reduce", "reduced"),
         (crate::prefs::EDIT_MOTION, "Always animate", "full"),
         (crate::prefs::EDIT_MOTION, "reduced", "reduced"),
         (crate::prefs::EDIT_BIDI, "If asked", "explicit"),
-        (crate::prefs::EDIT_COPY_ON_SELECT, "Off", "false"),
+        (
+            crate::prefs::EDIT_COPY_ON_SELECT,
+            switch_words,
+            switch_saved,
+        ),
     ] {
         let reply = complete_control_field(&mut app, key, Some(words));
         assert_eq!(
@@ -10225,6 +10237,9 @@ fn the_harness_switch_writes_turn_every_switch_on() {
 /// Tab goes to the list's first control, Shift-Tab to its last, which the
 /// list scrolls into view. All the opening screen's focusable controls
 /// precede the list: Shift-Tab must reach it by wrapping past the end.
+/// Fourteen rows, not twelve: the sidebar holds two whole rows there, so
+/// Tab from the first starts on a raw step to another sidebar row (at
+/// twelve the second is cut through its words, a picture and no stop).
 #[test]
 fn tab_enters_a_settings_list_whose_screen_shows_no_control() {
     let preferences = crate::native_appearance::current_preferences();
@@ -10244,7 +10259,7 @@ fn tab_enters_a_settings_list_whose_screen_shows_no_control() {
         let wid = WindowId(0);
         if let Some(ws) = app.windows.get_mut(&wid) {
             ws.cols = 220;
-            ws.rows = 12;
+            ws.rows = 14;
         }
         assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::SoftwareUpdate));
         let (_, view) = app.active_native_view(wid).expect("active Settings view");

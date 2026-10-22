@@ -111,32 +111,38 @@ impl Attrs {
         (Self::STRIKE, 9, 29),
     ];
 
+    #[inline]
     #[must_use]
     pub const fn bits(self) -> u8 {
         self.0
     }
 
     /// The set these bits name; bits no attribute uses are dropped.
+    #[inline]
     #[must_use]
     pub const fn from_bits(bits: u8) -> Self {
         Self(bits & 0x3f)
     }
 
+    #[inline]
     #[must_use]
     pub const fn contains(self, other: Self) -> bool {
         self.0 & other.0 == other.0
     }
 
+    #[inline]
     #[must_use]
     pub const fn union(self, other: Self) -> Self {
         Self(self.0 | other.0)
     }
 
+    #[inline]
     #[must_use]
     pub const fn difference(self, other: Self) -> Self {
         Self(self.0 & !other.0)
     }
 
+    #[inline]
     #[must_use]
     pub const fn is_empty(self) -> bool {
         self.0 == 0
@@ -221,55 +227,64 @@ impl Cell {
 
     /// The base and the characters stored with it; empty for the right half of a wide
     /// cell.
+    #[inline]
     #[must_use]
     pub fn grapheme(&self) -> &str {
         &self.text
     }
 
     /// 1 or 2 columns; 0 for the right half of a wide cell.
+    #[inline]
     #[must_use]
-    pub fn width(&self) -> u8 {
+    pub const fn width(&self) -> u8 {
         self.width
     }
 
+    #[inline]
     #[must_use]
-    pub fn style(&self) -> Style {
+    pub const fn style(&self) -> Style {
         self.style
     }
 
     /// The right half of a wide cell.
+    #[inline]
     #[must_use]
-    pub fn is_continuation(&self) -> bool {
+    pub const fn is_continuation(&self) -> bool {
         self.width == 0
     }
 
     /// A blank in the default style: what the terminal's erase leaves.
+    #[inline]
     fn is_erased(&self) -> bool {
         self.width == 1 && self.text == " " && self.style == Style::default()
     }
 
     /// Columns writing the cell covers before the grid settles it: two for a narrowed
     /// cell, its width otherwise.
-    fn footprint(&self) -> usize {
+    #[inline]
+    const fn footprint(&self) -> usize {
         if self.narrowed {
             2
         } else {
-            usize::from(self.width)
+            self.width as usize
         }
     }
 
+    #[inline]
     fn base(&self) -> Option<char> {
         self.text.chars().next()
     }
 
     /// It stores [`MAX_JOINED`] characters after its base: the grid keeps no more.
+    #[inline]
     fn is_full(&self) -> bool {
         self.text.chars().count() > MAX_JOINED
     }
 }
 
-fn is_regional_indicator(c: char) -> bool {
-    ('\u{1F1E6}'..='\u{1F1FF}').contains(&c)
+#[inline]
+const fn is_regional_indicator(c: char) -> bool {
+    matches!(c, '\u{1F1E6}'..='\u{1F1FF}')
 }
 
 /// A frame: rows × cols cells, the cursor and its shape. See the module docs.
@@ -312,13 +327,15 @@ impl Screen {
         }
     }
 
+    #[inline]
     #[must_use]
-    pub fn size(&self) -> Size {
+    pub const fn size(&self) -> Size {
         self.size
     }
 
+    #[inline]
     #[must_use]
-    pub fn ambiguous(&self) -> AmbiguousWidth {
+    pub const fn ambiguous(&self) -> AmbiguousWidth {
         self.ambiguous
     }
 
@@ -363,45 +380,54 @@ impl Screen {
     }
 
     /// Where the cursor is shown; `None` hides it.
+    #[inline]
     #[must_use]
-    pub fn cursor(&self) -> Option<Pos> {
+    pub const fn cursor(&self) -> Option<Pos> {
         self.cursor
     }
 
     /// Show the cursor at `pos`, or hide it. A position outside the frame hides it.
+    #[inline]
     pub fn set_cursor(&mut self, pos: Option<Pos>) {
         self.cursor = pos.filter(|pos| pos.row < self.size.rows && pos.col < self.size.cols);
     }
 
+    #[inline]
     #[must_use]
-    pub fn cursor_shape(&self) -> CursorShape {
+    pub const fn cursor_shape(&self) -> CursorShape {
         self.shape
     }
 
-    pub fn set_cursor_shape(&mut self, shape: CursorShape) {
+    #[inline]
+    pub const fn set_cursor_shape(&mut self, shape: CursorShape) {
         self.shape = shape;
     }
 
-    fn cols(&self) -> usize {
-        usize::from(self.size.cols)
+    #[inline]
+    const fn cols(&self) -> usize {
+        self.size.cols as usize
     }
 
     /// Where `row`, `col` sits in `cells`. Every caller keeps `col` inside the row, so
     /// the sum never saturates.
-    fn index(&self, row: u16, col: usize) -> usize {
-        (usize::from(row) * usize::from(self.size.cols)).saturating_add(col)
+    #[inline]
+    const fn index(&self, row: u16, col: usize) -> usize {
+        (row as usize * self.size.cols as usize).saturating_add(col)
     }
 
+    #[inline]
     fn at(&mut self, row: u16, col: usize) -> &mut Cell {
         let index = self.index(row, col);
         &mut self.cells[index]
     }
 
+    #[inline]
     fn get(&self, row: u16, col: usize) -> &Cell {
         &self.cells[self.index(row, col)]
     }
 
     /// The first column of the cell covering `col`.
+    #[inline]
     fn head(&self, row: u16, col: usize) -> usize {
         if col > 0 && self.get(row, col).is_continuation() {
             col - 1

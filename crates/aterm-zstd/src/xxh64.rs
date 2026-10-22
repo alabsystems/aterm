@@ -20,6 +20,7 @@ const P5: u64 = 0x27D4_EB2F_1656_67C5;
 const STRIPE: usize = 32;
 
 /// XXH64 of `bytes` under `seed` in one call.
+#[inline]
 #[must_use]
 pub fn xxh64(seed: u64, bytes: &[u8]) -> u64 {
     let mut h = Xxh64::new(seed);
@@ -43,6 +44,7 @@ pub struct Xxh64 {
 
 impl Xxh64 {
     /// A hasher with nothing fed.
+    #[inline]
     #[must_use]
     pub const fn new(seed: u64) -> Self {
         Self {
@@ -126,6 +128,7 @@ impl Xxh64 {
         h ^ (h >> 32)
     }
 
+    #[inline]
     fn consume(&mut self, stripe: &[u8; STRIPE]) {
         let (lanes, _) = stripe.as_chunks::<8>();
         for (acc, lane) in self.acc.iter_mut().zip(lanes) {
@@ -134,13 +137,15 @@ impl Xxh64 {
     }
 }
 
-fn round(acc: u64, lane: u64) -> u64 {
+#[inline]
+const fn round(acc: u64, lane: u64) -> u64 {
     acc.wrapping_add(lane.wrapping_mul(P2))
         .rotate_left(31)
         .wrapping_mul(P1)
 }
 
-fn merge(acc: u64, v: u64) -> u64 {
+#[inline]
+const fn merge(acc: u64, v: u64) -> u64 {
     (acc ^ round(0, v)).wrapping_mul(P1).wrapping_add(P4)
 }
 

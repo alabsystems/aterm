@@ -30,6 +30,9 @@
 /// The animal roster's bake path: one species head to an exact-size RGBA tile,
 /// handed to the shared cat atlas through `CatBaker::host_tile`.
 pub mod animal_baker;
+/// The typing-momentum glow as an Aos task (schema, prebuilt code, the corrected
+/// contract) and `MomentumHost`, the live wrapper `CursorFx::momentum` holds.
+pub mod aos_momentum;
 /// `@generated` animal drawlists; regenerate with `targo --unverified run -p aterm-effects
 /// --example gen_animal_glyphs` (drift test `animal_glyphs_gen_matches_assets`).
 pub mod animal_glyphs_gen {

@@ -249,6 +249,56 @@ fn each_repository_chain_says_its_own_count_alone() {
     assert!(matches!(legs(&stale, &cx(), L4), Verdict::Pass(_)));
 }
 
+/// THE FIRST LOOK'S LINE (Claude Code 2.1.308's L4, 2026-10-22): the look
+/// that first saw the hold read the page at +128.0 s, its row saying it, and
+/// `status` at +128.1 s; the page's later reads drew the row with no state
+/// line. The line the first look read counts. NEGATIVE CONTROLS: a row drawn
+/// with no state line all through the hold fails, so does a state line on
+/// the screen that never says the leg, and so does a hold line read only
+/// before the land act.
+#[test]
+fn the_first_looks_state_line_counts_though_its_page_read_came_first() {
+    let head = "head=land-c: Window 2, tab 4";
+    let said = format!("{head}\nstate=not landed yet: 1 untracked file \u{b7} landing since 03:20");
+    // The row drawn with no state line from the hold's first `status` read on.
+    let mut bare = seen("repo", "1 untracked file", "x", false);
+    bare.window.page.truncate(2);
+    bare.window.page.push(j(40_000, head));
+    assert!(
+        matches!(legs(&bare, &cx(), L4), Verdict::Fail(_)),
+        "{:?}",
+        legs(&bare, &cx(), L4)
+    );
+    // The hold's words read 100 ms before `status` first read the hold.
+    let mut first = bare.clone();
+    first.window.page.insert(2, j(39_900, &said));
+    first.window.page_reads.push(T0 + 39_900);
+    first.window.page_reads.sort_unstable();
+    assert!(
+        matches!(legs(&first, &cx(), L4), Verdict::Pass(ref w) if w.contains("+39.9 s not landed yet")),
+        "{:?}",
+        legs(&first, &cx(), L4)
+    );
+    // NEGATIVE CONTROLS: the state line on the screen through the hold,
+    // never saying it; the hold's words read only before the land act.
+    let mut unsaid = bare.clone();
+    unsaid.window.page[2] = j(40_000, &format!("{head}\nstate=landing since 03:20"));
+    assert!(
+        matches!(legs(&unsaid, &cx(), L4), Verdict::Fail(_)),
+        "{:?}",
+        legs(&unsaid, &cx(), L4)
+    );
+    let mut before = unsaid;
+    before.window.page.insert(1, j(5_000, &said));
+    before.window.page_reads.push(T0 + 5_000);
+    before.window.page_reads.sort_unstable();
+    assert!(
+        matches!(legs(&before, &cx(), L4), Verdict::Fail(_)),
+        "{:?}",
+        legs(&before, &cx(), L4)
+    );
+}
+
 /// L6: the tall reply read whole, so its hold is its need alone.
 /// NEGATIVE CONTROL: a `cut` leg beside the need (a reply the loop could
 /// not read whole) fails it.

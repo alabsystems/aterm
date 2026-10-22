@@ -15,11 +15,13 @@ use self::content::{
 
 /// Used to check that serde(getter) attributes return the expected type.
 /// Not public API.
-pub fn constrain<T: ?Sized>(t: &T) -> &T {
+#[inline]
+pub const fn constrain<T: ?Sized>(t: &T) -> &T {
     t
 }
 
 /// Not public API.
+#[inline]
 pub fn serialize_tagged_newtype<S, T>(
     serializer: S,
     type_ident: &'static str,
@@ -522,7 +524,8 @@ mod content {
     }
 
     impl<E> ContentSerializer<E> {
-        pub fn new() -> Self {
+        #[inline]
+        pub const fn new() -> Self {
             ContentSerializer { error: PhantomData }
         }
     }

@@ -18,6 +18,7 @@ where
     T: Deserialize<'de>,
 {
     type Value = ();
+    #[inline]
     fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
     where
         D: Deserializer<'de>,

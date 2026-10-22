@@ -411,10 +411,9 @@ fn derive_from_sources(raw_sources: &[(String, String)]) -> Derived {
     // before touches are collected, since a deref-lazy cell may be touched in a
     // file read before its declaration.
     for (rel, text) in sources {
-        // Attribute calls with this module's segmentation, not
-        // `parse_source_fns`, which lacks the body-less-declaration guard: an
-        // `extern "C"` block's `fn foo(..) -> T;` would absorb the next fn's
-        // body.
+        // Attribute calls line by line through `enclosing_fns`, which skips a
+        // body-less declaration as `parse_source_fns` does: an `extern "C"`
+        // block's `fn foo(..) -> T;` read as a body would absorb the next fn's.
         let lines: Vec<&str> = text.lines().collect();
         let enclosing = enclosing_fns(&lines);
         let per_file = local.entry(rel.clone()).or_default();
@@ -880,7 +879,7 @@ fn enclosing_fns(lines: &[&str]) -> Vec<Option<String>> {
         // A fn declaration has no body (`extern "C" { fn f(..) -> T; }`, trait
         // signatures); treating one as a body would swallow lines down to the
         // next same-indent `}` and invent callers.
-        if is_bodyless_declaration(lines, i) {
+        if crate::is_bodyless_declaration(lines, i) {
             i += 1;
             continue;
         }
@@ -905,28 +904,6 @@ fn enclosing_fns(lines: &[&str]) -> Vec<Option<String>> {
         i = end + 1;
     }
     out
-}
-
-/// Whether the fn definition starting at `at` is a body-less declaration: its
-/// signature reaches a `;` before it ever reaches a `{`.
-fn is_bodyless_declaration(lines: &[&str], at: usize) -> bool {
-    // Only a `;` at bracket depth 0 ends a signature: `fn table() -> [f32; 256] {`
-    // has one inside its return type.
-    let mut depth = 0i32;
-    for line in lines.iter().skip(at).take(24) {
-        for b in crate::strip_line_comment(line).bytes() {
-            match b {
-                // Only `()` and `[]`: counting `<`/`>` would let the `>` of
-                // `->` decrement on every signature.
-                b'(' | b'[' => depth += 1,
-                b')' | b']' => depth -= 1,
-                b'{' if depth <= 0 => return false,
-                b';' if depth <= 0 => return true,
-                _ => {}
-            }
-        }
-    }
-    false
 }
 
 /// The text between the `(` at byte offset `at` and its matching `)`, as lines,

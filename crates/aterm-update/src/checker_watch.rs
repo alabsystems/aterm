@@ -54,6 +54,7 @@ pub enum CheckerPhase {
 }
 
 impl CheckerPhase {
+    #[inline]
     const fn tag(self) -> u64 {
         match self {
             Self::Starting => 1,
@@ -65,6 +66,7 @@ impl CheckerPhase {
         }
     }
 
+    #[inline]
     const fn from_tag(tag: u64) -> Self {
         match tag {
             2 => Self::Settings,
@@ -78,6 +80,7 @@ impl CheckerPhase {
 
     /// The phase's wire word, which `aterm ctl update status` prints; log lines use
     /// [`Self::words`].
+    #[inline]
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -92,6 +95,7 @@ impl CheckerPhase {
 
     /// The phase in a person's words, for log lines (as
     /// `aterm_gui::update_words::checker_stalled_body` says it).
+    #[inline]
     #[must_use]
     pub const fn words(self) -> &'static str {
         match self {
@@ -169,14 +173,17 @@ const PHASE_SHIFT: u32 = 40;
 const SECS_MASK: u64 = (1 << PHASE_SHIFT) - 1;
 const PHASE_MASK: u64 = 0xff;
 
+#[inline]
 const fn pack(generation: u64, phase: CheckerPhase, secs: u64) -> u64 {
     (generation << GEN_SHIFT) | (phase.tag() << PHASE_SHIFT) | (secs & SECS_MASK)
 }
 
+#[inline]
 const fn generation_of(word: u64) -> u64 {
     word >> GEN_SHIFT
 }
 
+#[inline]
 const fn phase_of(word: u64) -> CheckerPhase {
     CheckerPhase::from_tag((word >> PHASE_SHIFT) & PHASE_MASK)
 }
@@ -225,6 +232,7 @@ pub struct LaneHolder {
 impl CheckerBeat {
     /// The retired generation still holding this process's check lane, if the live
     /// checker is stuck behind one: a replacement cannot check until it lets go.
+    #[inline]
     #[must_use]
     pub fn blocked_by(&self) -> Option<LaneHolder> {
         self.lane
@@ -232,6 +240,7 @@ impl CheckerBeat {
     }
 
     /// Whether the live generation itself holds the check lane.
+    #[inline]
     #[must_use]
     pub fn holds_lane(&self) -> bool {
         self.lane
@@ -260,6 +269,7 @@ pub enum CheckerVerdict {
 
 /// The budget one stamp in `phase` is judged against: how long the loop may
 /// legitimately go before its next stamp from there.
+#[inline]
 #[must_use]
 pub fn phase_budget_secs(phase: CheckerPhase, max_interval_secs: u64) -> u64 {
     match phase {
@@ -278,6 +288,7 @@ pub fn phase_budget_secs(phase: CheckerPhase, max_interval_secs: u64) -> u64 {
 
 /// The running-second age past which a stamp in `phase` is a stall: twice the
 /// phase's budget plus [`STALL_SLACK`].
+#[inline]
 #[must_use]
 pub fn stall_threshold_secs(phase: CheckerPhase, max_interval_secs: u64) -> u64 {
     phase_budget_secs(phase, max_interval_secs)
@@ -287,6 +298,7 @@ pub fn stall_threshold_secs(phase: CheckerPhase, max_interval_secs: u64) -> u64 
 
 /// Judge `beat` at `now_secs`. A stamp from the future (impossible on one monotonic
 /// anchor) is fresh.
+#[inline]
 #[must_use]
 pub fn classify(beat: &CheckerBeat, now_secs: u64) -> CheckerVerdict {
     let age = now_secs.saturating_sub(beat.at_secs);

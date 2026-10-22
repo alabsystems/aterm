@@ -56,6 +56,7 @@ pub(crate) fn debug_string<T: fmt::Debug>(v: T) -> String {
 /// produces the same bytes with every operation provably in range, and
 /// `String::push` of an ASCII `char` appends the identical single byte that
 /// `push_str` of the table digit did.
+#[inline]
 pub(crate) fn push_hex4(out: &mut String, v: u16) {
     // One nibble as its lowercase hex digit. Behavior-identical to indexing
     // `b"0123456789abcdef"`: the `& 0xf` re-mask is identity at every call
@@ -63,7 +64,8 @@ pub(crate) fn push_hex4(out: &mut String, v: u16) {
     // gives this function a local, provable bound — `n <= 15`, so
     // `b'0' + n <= 63` and, under the `n >= 10` branch, `n - 10 <= 5` and
     // `b'a' + (n - 10) <= 102`: no add can overflow, no sub can underflow.
-    fn hex_digit(n: u16) -> char {
+    #[inline]
+    const fn hex_digit(n: u16) -> char {
         let n = (n & 0xf) as u8;
         // Trust gate: `wrapping_add`/`wrapping_sub` are identical to `+`/`-`
         // here — after `& 0xf`, `n <= 15`, and this branch requires `n >= 10`,
@@ -74,7 +76,7 @@ pub(crate) fn push_hex4(out: &mut String, v: u16) {
         } else {
             b'a'.wrapping_add(n.wrapping_sub(10))
         };
-        char::from(b)
+        b as char
     }
     out.push(hex_digit(v >> 12));
     out.push(hex_digit(v >> 8));

@@ -24,6 +24,7 @@ static LIVE_SHARES: AtomicUsize = AtomicUsize::new(0);
 
 /// Set the module-wide scrollback budget (bytes; `0` = unlimited), applied to each pane at
 /// its next touch.
+#[inline]
 pub fn set_global_scrollback_budget(bytes: usize) {
     GLOBAL_BUDGET_BYTES.store(bytes, Ordering::Relaxed);
 }
@@ -42,6 +43,7 @@ pub struct ScrollbackBudgetShare {
 
 impl ScrollbackBudgetShare {
     /// Register a pane with its configured per-pane budget (bytes).
+    #[inline]
     #[must_use]
     pub fn register(configured_bytes: usize) -> Self {
         LIVE_SHARES.fetch_add(1, Ordering::Relaxed);
@@ -53,18 +55,21 @@ impl ScrollbackBudgetShare {
 
     /// Change this pane's configured per-pane budget (bytes). The new
     /// effective value surfaces on the next [`Self::pending_effective`].
-    pub fn set_configured(&mut self, bytes: usize) {
+    #[inline]
+    pub const fn set_configured(&mut self, bytes: usize) {
         self.configured = bytes;
     }
 
     /// The pane's configured per-pane budget (bytes).
+    #[inline]
     #[must_use]
-    pub fn configured(&self) -> usize {
+    pub const fn configured(&self) -> usize {
         self.configured
     }
 
     /// Effective budget now: `min(configured, global / live_panes)`, floored at 1 byte
     /// (the `Scrollback` clamp); an unset global passes `configured` through.
+    #[inline]
     #[must_use]
     pub fn effective(&self) -> usize {
         let global = GLOBAL_BUDGET_BYTES.load(Ordering::Relaxed);
@@ -78,6 +83,7 @@ impl ScrollbackBudgetShare {
     /// Poll at the pane's mutation points: `Some(effective_bytes)` when the
     /// effective budget changed since last applied (forward it to
     /// `Terminal::set_memory_budget`), `None` otherwise.
+    #[inline]
     pub fn pending_effective(&mut self) -> Option<usize> {
         let effective = self.effective();
         if effective == self.applied {

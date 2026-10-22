@@ -21,7 +21,9 @@ use aterm_buffer::{Edit as SurfaceEdit, LineId, Seq, Surface, TxnOutcome, WriteC
 pub struct DocumentId(NonZeroU64);
 
 impl DocumentId {
-    pub fn get(self) -> u64 {
+    #[inline]
+    #[must_use]
+    pub const fn get(self) -> u64 {
         self.0.get()
     }
 }
@@ -121,14 +123,17 @@ struct Document {
 }
 
 impl Document {
+    #[inline]
     fn head(&self) -> Seq {
         self.surface.seq()
     }
 
+    #[inline]
     fn dirty(&self) -> bool {
         self.checkpoint_seq < self.head()
     }
 
+    #[inline]
     fn snapshot(&self) -> DocumentSnapshot {
         DocumentSnapshot {
             id: self.id,

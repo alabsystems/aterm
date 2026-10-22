@@ -4502,6 +4502,9 @@ pub mod fixtures {
     pub const BOX_RM_WORKFLOW: &str = include_str!("fixtures/claude-2.1.28x-box-rm-workflow.txt");
     /// Claude Code 2.1.280: the folder-trust dialog.
     pub const TRUST: &str = include_str!("fixtures/claude-2.1.280-trust.txt");
+    /// MEASURED on 2.1.308 in the lab (144x50, no seeded trust): the same
+    /// dialog, its `Security guide` row over the options.
+    pub const TRUST_2_1_308: &str = include_str!("fixtures/claude-2.1.308-trust.txt");
     /// MEASURED on 2.1.302 (each file's line): the folder-trust dialog in a
     /// pane 27 and 20 columns wide, its Select at the columns the held
     /// message's is drawn at (the cursor at 1, the labels at 3): `Yes, I
@@ -6064,6 +6067,30 @@ pub mod fixtures {
     /// One Escape after the tab, fullscreen: no row left of it.
     pub const USAGE_DISMISSED_FULLSCREEN_2_1_307: &str =
         include_str!("fixtures/claude-2.1.307-usage-dismissed-fullscreen.txt");
+    // THE SAME PANEL ON CLAUDE CODE 2.1.308, MEASURED 2026-10-21 in the lab
+    // (docs/measured/claude-code-2.1.308-2026-10-21.md), the same six
+    // screens at 120x50: the session's second `/usage` (the first drew
+    // `Error: Failed to load usage data` under a reset header the stub sent
+    // unexpanded), the debug log's banner on the first rows.
+    /// `/usage` typed, before the Enter, inline.
+    pub const USAGE_MENU_INLINE_2_1_308: &str =
+        include_str!("fixtures/claude-2.1.308-usage-menu-inline.txt");
+    /// The same on the fullscreen renderer.
+    pub const USAGE_MENU_FULLSCREEN_2_1_308: &str =
+        include_str!("fixtures/claude-2.1.308-usage-menu-fullscreen.txt");
+    /// 3 s after the Enter, inline: 42 % and 61 %, `Could not refresh usage
+    /// data`. NOT SETTLED.
+    pub const USAGE_HEADER_READINGS_INLINE_2_1_308: &str =
+        include_str!("fixtures/claude-2.1.308-usage-header-readings-inline.txt");
+    /// The same on the fullscreen renderer.
+    pub const USAGE_HEADER_READINGS_FULLSCREEN_2_1_308: &str =
+        include_str!("fixtures/claude-2.1.308-usage-header-readings-fullscreen.txt");
+    /// One Escape after the tab, inline: `⎿  Settings dialog dismissed`.
+    pub const USAGE_DISMISSED_INLINE_2_1_308: &str =
+        include_str!("fixtures/claude-2.1.308-usage-dismissed-inline.txt");
+    /// One Escape after the tab, fullscreen: no row left of it.
+    pub const USAGE_DISMISSED_FULLSCREEN_2_1_308: &str =
+        include_str!("fixtures/claude-2.1.308-usage-dismissed-fullscreen.txt");
     // CLAUDE CODE 2.1.307'S PERMISSION BOXES, MEASURED 2026-10-21 in the lab
     // at 144x50 (`lab tool`, `lab settings`), launched
     // `--permission-mode default` with harness approve=none, so each box
@@ -6118,6 +6145,48 @@ pub mod fixtures {
     /// the command one short row with no bar, the note at column two.
     pub const BOX_RM_MOUNTED_DRIVE_2_1_307: &str =
         include_str!("fixtures/claude-2.1.307-box-bash-rm-mounted-drive.txt");
+    // CLAUDE CODE 2.1.308'S BOXES, MEASURED 2026-10-21 in the lab
+    // (docs/measured/claude-code-2.1.308-2026-10-21.md) at 144x50, launched
+    // `--permission-mode default`, each standing until it was captured. The
+    // build's JavaScript is 2.1.307's to the byte but for its version and
+    // build stamps, and every box drew as 2.1.307's did.
+    /// `Bash command` for `touch x`: the tip row, `Create x`, four options.
+    pub const BOX_BASH_TOUCH_2_1_308: &str =
+        include_str!("fixtures/claude-2.1.308-box-bash-touch.txt");
+    /// `Create file` for `w.txt`: three options.
+    pub const BOX_WRITE_CREATE_2_1_308: &str =
+        include_str!("fixtures/claude-2.1.308-box-write-create.txt");
+    /// `Edit file` for `notes.txt`, after a Read.
+    pub const BOX_EDIT_2_1_308: &str = include_str!("fixtures/claude-2.1.308-box-edit.txt");
+    /// `touch y` under the ask rule `Bash(touch:*)`.
+    pub const BOX_BASH_ASK_RULE_2_1_308: &str =
+        include_str!("fixtures/claude-2.1.308-box-bash-ask-rule.txt");
+    /// `touch z` under a `PreToolUse` hook that answered `ask`.
+    pub const BOX_BASH_HOOK_ASK_2_1_308: &str =
+        include_str!("fixtures/claude-2.1.308-box-bash-hook-ask.txt");
+    /// ` Ready to code?` after `ExitPlanMode`.
+    pub const PLAN_READY_2_1_308: &str = include_str!("fixtures/claude-2.1.308-plan-ready.txt");
+    /// The too-many breaker over 65 command substitutions and an rm.
+    pub const BOX_RM_TOO_MANY_2_1_308: &str =
+        include_str!("fixtures/claude-2.1.308-box-bash-rm-too-many.txt");
+    /// The too-many breaker over `echo` and 65 `$(true)`, no rm.
+    pub const BOX_RM_TOO_MANY_NO_RM_2_1_308: &str =
+        include_str!("fixtures/claude-2.1.308-box-bash-rm-too-many-no-rm.txt");
+    /// The mounted-drive breaker, `rm -rf /Volumes/zz-lab-none`.
+    pub const BOX_RM_MOUNTED_DRIVE_2_1_308: &str =
+        include_str!("fixtures/claude-2.1.308-box-bash-rm-mounted-drive.txt");
+    /// The nested breaker over `X=1 if true; then echo` and 17 `${ echo a; }`
+    /// (no rm), measured 2026-10-22 in the review round's lab.
+    pub const BOX_RM_NESTED_2_1_308: &str =
+        include_str!("fixtures/claude-2.1.308-box-bash-rm-nested-unanalyzed.txt");
+    /// The same shape with 16, inside the budget: the statement-follows
+    /// note, no breaker.
+    pub const BOX_STATEMENT_FOLLOWS_16_2_1_308: &str =
+        include_str!("fixtures/claude-2.1.308-box-bash-statement-follows-16-subs.txt");
+    /// The too-many breaker over `echo` and 65 `$(true)` in a bypass
+    /// session, its auto-deny countdown under the note.
+    pub const BOX_RM_TOO_MANY_NO_RM_BYPASS_2_1_308: &str =
+        include_str!("fixtures/claude-2.1.308-box-bash-rm-too-many-no-rm-bypass.txt");
     /// ` Ready to code?`: the plan (its own `1.` step), a second rule, the
     /// options, and only `ctrl+g to edit in VS Code · <plan>` under them.
     pub const PLAN_READY: &str = include_str!("fixtures/claude-2.1.282-plan-ready.txt");
@@ -8259,13 +8328,17 @@ mod tests {
         assert!(crate::phase::is_glyph_row("✻ Running the whole suite…"));
     }
 
-    /// The 2.1.280 trust dialog (measured twice): `Accessing workspace:`, the
-    /// folder, UNNUMBERED options with the cursor on `No, exit`, chosen by
-    /// arrows and Enter, and an Esc that exits Claude Code. The old parser
-    /// read it as kind `other` with no options.
+    /// The 2.1.280 trust dialog (measured twice, and again on 2.1.308):
+    /// `Accessing workspace:`, the folder, UNNUMBERED options with the cursor
+    /// on `No, exit`, chosen by arrows and Enter, and an Esc that exits Claude
+    /// Code. The old parser read it as kind `other` with no options.
     #[test]
     fn the_trust_dialog_reads_its_folder_options_and_exit() {
-        for (text, folder) in [(TRUST, "/work1"), (TRUST_AFTER_RESUMES, "/lv/work2")] {
+        for (text, folder) in [
+            (TRUST, "/work1"),
+            (TRUST_AFTER_RESUMES, "/lv/work2"),
+            (TRUST_2_1_308, "/at.lab0/proj"),
+        ] {
             let r = screen(text);
             assert_eq!(crate::phase::worker_phase(&r), crate::phase::Phase::Prompt);
             let p = parse_prompt_v2(&r).expect("the dialog");
@@ -8298,8 +8371,9 @@ mod tests {
         }
     }
 
-    /// CLAUDE CODE 2.1.307'S BOXES MEASURED IN THE LAB (crates/aterm-lab,
-    /// 2026-10-21; docs/measured/claude-code-2.1.307-2026-10-21.md): each box
+    /// CLAUDE CODE 2.1.307'S AND 2.1.308'S BOXES MEASURED IN THE LAB
+    /// (crates/aterm-lab, 2026-10-21; docs/measured/claude-code-2.1.307-2026-10-21.md
+    /// and docs/measured/claude-code-2.1.308-2026-10-21.md): each box
     /// reads its kind, its subject, its options' roles with the cursor on
     /// `1. Yes`, and an Esc that refuses it, in both readers; the Bash box's
     /// auto-mode tip row is neither its command nor its description; the ask
@@ -8311,101 +8385,122 @@ mod tests {
     /// note). Plan mode's `Ready to code?` reads its three options.
     /// NEGATIVE CONTROLS: each screen cut above its box's title holds no box
     /// (the transcript's tool rows over it are none); the plain Bash box and
-    /// the nested shape inside the vendor's budget are no breaker.
+    /// the nested shape inside the vendor's budget are no breaker. 2.1.308's
+    /// boxes, drawn by the same JavaScript, read the same.
     #[test]
-    fn the_2_1_307_lab_boxes_read_as_measured() {
+    fn the_lab_boxes_read_as_measured() {
         use Role::{Deny, ModeSwitch, Once, Persist};
-        for (what, text, kind, subject, description, roles, review) in [
+        for (build, touch, write, edit, ask, hook) in [
             (
-                "bash",
+                "2.1.307",
                 BOX_BASH_TOUCH_2_1_307,
-                PromptKind::Bash,
-                "touch x",
-                "Create x",
-                &[Once, Persist, ModeSwitch, Deny][..],
-                None,
-            ),
-            (
-                "write",
                 BOX_WRITE_CREATE_2_1_307,
-                PromptKind::Write,
-                "w.txt",
-                "",
-                &[Once, ModeSwitch, Deny][..],
-                None,
-            ),
-            (
-                "edit",
                 BOX_EDIT_2_1_307,
-                PromptKind::Edit,
-                "notes.txt",
-                "",
-                &[Once, ModeSwitch, Deny][..],
-                None,
-            ),
-            (
-                "ask rule",
                 BOX_BASH_ASK_RULE_2_1_307,
-                PromptKind::Bash,
-                "touch y",
-                "Create y",
-                &[Once, Deny][..],
-                Some(ReviewKind::Rule),
+                BOX_BASH_HOOK_ASK_2_1_307,
             ),
             (
-                "hook",
-                BOX_BASH_HOOK_ASK_2_1_307,
-                PromptKind::Bash,
-                "touch z",
-                "Create z",
-                &[Once, Deny][..],
-                Some(ReviewKind::Hook),
+                "2.1.308",
+                BOX_BASH_TOUCH_2_1_308,
+                BOX_WRITE_CREATE_2_1_308,
+                BOX_EDIT_2_1_308,
+                BOX_BASH_ASK_RULE_2_1_308,
+                BOX_BASH_HOOK_ASK_2_1_308,
             ),
         ] {
-            let r = screen(text);
-            assert_eq!(
-                crate::phase::worker_phase(&r),
-                crate::phase::Phase::Prompt,
-                "{what}"
-            );
-            let p = parse_prompt_v2(&r).unwrap_or_else(|| panic!("{what}: the box"));
-            assert_eq!(p.kind, kind, "{what}");
-            if kind == PromptKind::Bash {
-                assert_eq!(p.command, subject, "{what}");
-                assert_eq!(p.description, description, "{what}");
-                assert!(
-                    p.readings().iter().all(|r| !r.contains("Tip:")),
-                    "{what}: {:?}",
-                    p.readings()
+            for (what, text, kind, subject, description, roles, review) in [
+                (
+                    "bash",
+                    touch,
+                    PromptKind::Bash,
+                    "touch x",
+                    "Create x",
+                    &[Once, Persist, ModeSwitch, Deny][..],
+                    None,
+                ),
+                (
+                    "write",
+                    write,
+                    PromptKind::Write,
+                    "w.txt",
+                    "",
+                    &[Once, ModeSwitch, Deny][..],
+                    None,
+                ),
+                (
+                    "edit",
+                    edit,
+                    PromptKind::Edit,
+                    "notes.txt",
+                    "",
+                    &[Once, ModeSwitch, Deny][..],
+                    None,
+                ),
+                (
+                    "ask rule",
+                    ask,
+                    PromptKind::Bash,
+                    "touch y",
+                    "Create y",
+                    &[Once, Deny][..],
+                    Some(ReviewKind::Rule),
+                ),
+                (
+                    "hook",
+                    hook,
+                    PromptKind::Bash,
+                    "touch z",
+                    "Create z",
+                    &[Once, Deny][..],
+                    Some(ReviewKind::Hook),
+                ),
+            ] {
+                let what = format!("{build} {what}");
+                let r = screen(text);
+                assert_eq!(
+                    crate::phase::worker_phase(&r),
+                    crate::phase::Phase::Prompt,
+                    "{what}"
                 );
-            } else {
-                assert_eq!(p.path.as_deref(), Some(subject), "{what}");
+                let p = parse_prompt_v2(&r).unwrap_or_else(|| panic!("{what}: the box"));
+                assert_eq!(p.kind, kind, "{what}");
+                if kind == PromptKind::Bash {
+                    assert_eq!(p.command, subject, "{what}");
+                    assert_eq!(p.description, description, "{what}");
+                    assert!(
+                        p.readings().iter().all(|r| !r.contains("Tip:")),
+                        "{what}: {:?}",
+                        p.readings()
+                    );
+                } else {
+                    assert_eq!(p.path.as_deref(), Some(subject), "{what}");
+                }
+                assert_eq!(
+                    p.options.iter().map(|o| o.role).collect::<Vec<_>>(),
+                    roles,
+                    "{what}: {:?}",
+                    p.options
+                );
+                assert_eq!(p.select, Select::Digits, "{what}");
+                let first = p.focused().expect("the cursor");
+                assert_eq!((first.n, first.label.as_str()), (Some(1), "Yes"), "{what}");
+                assert_eq!(
+                    p.cancel.as_ref().map(|c| c.effect),
+                    Some(CancelEffect::Reject),
+                    "{what}"
+                );
+                assert_eq!(p.owner_review().map(|o| o.kind), review, "{what}");
+                let v1 = parse_prompt(&r).unwrap_or_else(|| panic!("{what}: v1"));
+                assert_eq!(v1.command, subject, "{what}");
+                assert_eq!(
+                    v1.options.iter().map(|(n, _)| *n).collect::<Vec<_>>(),
+                    (1..=u8::try_from(roles.len()).expect("a few")).collect::<Vec<_>>(),
+                    "{what}"
+                );
+                let (top, _) = prompt_box_span(&r).expect("the span");
+                assert_eq!(parse_prompt_v2(&r[..top]), None, "{what}: cut above");
+                assert_eq!(parse_prompt(&r[..top]), None, "{what}: cut above, v1");
             }
-            assert_eq!(
-                p.options.iter().map(|o| o.role).collect::<Vec<_>>(),
-                roles,
-                "{what}: {:?}",
-                p.options
-            );
-            assert_eq!(p.select, Select::Digits, "{what}");
-            let first = p.focused().expect("the cursor");
-            assert_eq!((first.n, first.label.as_str()), (Some(1), "Yes"), "{what}");
-            assert_eq!(
-                p.cancel.as_ref().map(|c| c.effect),
-                Some(CancelEffect::Reject),
-                "{what}"
-            );
-            assert_eq!(p.owner_review().map(|o| o.kind), review, "{what}");
-            let v1 = parse_prompt(&r).unwrap_or_else(|| panic!("{what}: v1"));
-            assert_eq!(v1.command, subject, "{what}");
-            assert_eq!(
-                v1.options.iter().map(|(n, _)| *n).collect::<Vec<_>>(),
-                (1..=u8::try_from(roles.len()).expect("a few")).collect::<Vec<_>>(),
-                "{what}"
-            );
-            let (top, _) = prompt_box_span(&r).expect("the span");
-            assert_eq!(parse_prompt_v2(&r[..top]), None, "{what}: cut above");
-            assert_eq!(parse_prompt(&r[..top]), None, "{what}: cut above, v1");
         }
         // The rm breaker: its 2.1.307 notes read as the breaker of their kind,
         // over a command with an rm, with none (the vendor could not rule one
@@ -8448,6 +8543,41 @@ mod tests {
                 RmBreakerKind::MountedDrivePath,
                 "/Volumes/zz-lab-none",
             ),
+            (
+                "2.1.308 too many, rm",
+                BOX_RM_TOO_MANY_2_1_308,
+                None,
+                RmBreakerKind::TooManySubstitutions,
+                "65",
+            ),
+            (
+                "2.1.308 too many, no rm",
+                BOX_RM_TOO_MANY_NO_RM_2_1_308,
+                Some(no_rm_command.as_str()),
+                RmBreakerKind::TooManySubstitutions,
+                "65",
+            ),
+            (
+                "2.1.308 mounted drive",
+                BOX_RM_MOUNTED_DRIVE_2_1_308,
+                Some("rm -rf /Volumes/zz-lab-none"),
+                RmBreakerKind::MountedDrivePath,
+                "/Volumes/zz-lab-none",
+            ),
+            (
+                "2.1.308 too many, no rm, bypass",
+                BOX_RM_TOO_MANY_NO_RM_BYPASS_2_1_308,
+                Some(no_rm_command.as_str()),
+                RmBreakerKind::TooManySubstitutions,
+                "65",
+            ),
+            (
+                "2.1.308 nested, no rm",
+                BOX_RM_NESTED_2_1_308,
+                Some(nested_command.as_str()),
+                RmBreakerKind::NestedUnanalyzed,
+                "some nested commands or function substitutions could not be analyzed",
+            ),
         ] {
             let r = screen(text);
             assert_eq!(
@@ -8480,37 +8610,46 @@ mod tests {
         // NEGATIVE CONTROLS: the plain Bash box is no breaker, and neither is
         // the nested shape inside the vendor's budget (16 function
         // substitutions): its statement-follows note is a plain vendor note.
-        let plain = parse_prompt_v2(&screen(BOX_BASH_TOUCH_2_1_307)).expect("the box");
-        assert_eq!(plain.rm_breaker(), None);
-        let within = parse_prompt_v2(&screen(BOX_STATEMENT_FOLLOWS_16_2_1_307)).expect("the box");
-        assert_eq!(
-            within.command,
-            format!("X=1 if true; then echo{}; fi", " ${ echo a; }".repeat(16))
-        );
-        assert_eq!(within.notes.len(), 1, "{:?}", within.notes);
-        assert!(
-            within.notes[0].starts_with("statement directly follows another statement"),
-            "{:?}",
-            within.notes
-        );
-        assert_eq!(within.rm_breaker(), None);
-        let r = screen(PLAN_READY_2_1_307);
-        let p = parse_prompt_v2(&r).expect("the plan box");
-        assert_eq!(p.kind, PromptKind::PlanExit);
-        assert_eq!(
-            p.options
-                .iter()
-                .map(|o| o.label.as_str())
-                .collect::<Vec<_>>(),
-            [
-                "Yes, and use auto mode",
-                "Yes, manually approve edits",
-                "Tell Claude what to change"
-            ]
-        );
-        assert_eq!(p.focused().map(|o| o.n), Some(Some(1)));
-        let (top, _) = prompt_box_span(&r).expect("the span");
-        assert_eq!(parse_prompt_v2(&r[..top]), None, "plan: cut above");
+        for text in [BOX_BASH_TOUCH_2_1_307, BOX_BASH_TOUCH_2_1_308] {
+            let plain = parse_prompt_v2(&screen(text)).expect("the box");
+            assert_eq!(plain.rm_breaker(), None);
+        }
+        for text in [
+            BOX_STATEMENT_FOLLOWS_16_2_1_307,
+            BOX_STATEMENT_FOLLOWS_16_2_1_308,
+        ] {
+            let within = parse_prompt_v2(&screen(text)).expect("the box");
+            assert_eq!(
+                within.command,
+                format!("X=1 if true; then echo{}; fi", " ${ echo a; }".repeat(16))
+            );
+            assert_eq!(within.notes.len(), 1, "{:?}", within.notes);
+            assert!(
+                within.notes[0].starts_with("statement directly follows another statement"),
+                "{:?}",
+                within.notes
+            );
+            assert_eq!(within.rm_breaker(), None);
+        }
+        for text in [PLAN_READY_2_1_307, PLAN_READY_2_1_308] {
+            let r = screen(text);
+            let p = parse_prompt_v2(&r).expect("the plan box");
+            assert_eq!(p.kind, PromptKind::PlanExit);
+            assert_eq!(
+                p.options
+                    .iter()
+                    .map(|o| o.label.as_str())
+                    .collect::<Vec<_>>(),
+                [
+                    "Yes, and use auto mode",
+                    "Yes, manually approve edits",
+                    "Tell Claude what to change"
+                ]
+            );
+            assert_eq!(p.focused().map(|o| o.n), Some(Some(1)));
+            let (top, _) = prompt_box_span(&r).expect("the span");
+            assert_eq!(parse_prompt_v2(&r[..top]), None, "plan: cut above");
+        }
     }
 
     /// THE USAGE-LIMIT DIALOG (module header): the dialog Claude Code

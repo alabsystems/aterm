@@ -45,7 +45,9 @@ pub enum CharacterSet {
 
 impl CharacterSet {
     /// The character set for an SCS final byte, or `None` if unrecognized.
-    pub fn from_final_byte(byte: u8) -> Option<Self> {
+    #[inline]
+    #[must_use]
+    pub const fn from_final_byte(byte: u8) -> Option<Self> {
         match byte {
             b'B' | b'1' => Some(Self::Ascii), // '1' = Alternate ROM Standard (VT100)
             b'0' | b'2' => Some(Self::DecLineDrawing), // '2' = Alternate ROM Special Graphics (VT100)
@@ -68,7 +70,8 @@ impl CharacterSet {
     /// Translate a character using this character set. Only ASCII positions are remapped;
     /// U+0080 and above pass through.
     #[inline]
-    pub fn translate(&self, c: char) -> char {
+    #[must_use]
+    pub const fn translate(&self, c: char) -> char {
         if (c as u32) >= 0x80 {
             return c;
         }
@@ -94,7 +97,8 @@ impl CharacterSet {
     }
 
     /// Translate using DEC Special Graphics: 0x5F-0x7E become line-drawing and other symbols.
-    fn translate_dec_line_drawing(c: char) -> char {
+    #[inline]
+    const fn translate_dec_line_drawing(c: char) -> char {
         match c {
             '_' => ' ', // Blank (U+0020, per xterm; DEC spec says U+00A0)
             '`' => '◆', // Diamond
@@ -134,7 +138,8 @@ impl CharacterSet {
 
     /// Translate using DEC Supplemental. Only `$` (general currency sign) is remapped; apps rely
     /// on UTF-8 and rarely activate this set.
-    fn translate_dec_supplemental(c: char) -> char {
+    #[inline]
+    const fn translate_dec_supplemental(c: char) -> char {
         match c {
             '$' => '\u{00A4}', // Currency sign
             _ => c,
@@ -142,7 +147,8 @@ impl CharacterSet {
     }
 
     /// Translate using Dutch NRCS (final byte '4').
-    fn translate_dutch(c: char) -> char {
+    #[inline]
+    const fn translate_dutch(c: char) -> char {
         match c {
             '#' => '£',
             '@' => '¾',
@@ -158,7 +164,8 @@ impl CharacterSet {
     }
 
     /// Translate using Finnish NRCS (final byte 'C' or '5').
-    fn translate_finnish(c: char) -> char {
+    #[inline]
+    const fn translate_finnish(c: char) -> char {
         match c {
             '[' => 'Ä',
             '\\' => 'Ö',
@@ -174,7 +181,8 @@ impl CharacterSet {
     }
 
     /// Translate using French NRCS (final byte 'R').
-    fn translate_french(c: char) -> char {
+    #[inline]
+    const fn translate_french(c: char) -> char {
         match c {
             '#' => '£',
             '@' => 'à',
@@ -190,7 +198,8 @@ impl CharacterSet {
     }
 
     /// Translate using French Canadian NRCS (final byte 'Q').
-    fn translate_french_canadian(c: char) -> char {
+    #[inline]
+    const fn translate_french_canadian(c: char) -> char {
         match c {
             '@' => 'à',
             '[' => 'â',
@@ -207,7 +216,8 @@ impl CharacterSet {
     }
 
     /// Translate using German NRCS (final byte 'K').
-    fn translate_german(c: char) -> char {
+    #[inline]
+    const fn translate_german(c: char) -> char {
         match c {
             '@' => '§',
             '[' => 'Ä',
@@ -222,7 +232,8 @@ impl CharacterSet {
     }
 
     /// Translate using Italian NRCS (final byte 'Y').
-    fn translate_italian(c: char) -> char {
+    #[inline]
+    const fn translate_italian(c: char) -> char {
         match c {
             '#' => '£',
             '@' => '§',
@@ -239,7 +250,8 @@ impl CharacterSet {
     }
 
     /// Translate using Norwegian/Danish NRCS (final byte 'E', '6', or '`').
-    fn translate_norwegian_danish(c: char) -> char {
+    #[inline]
+    const fn translate_norwegian_danish(c: char) -> char {
         match c {
             '@' => 'Ä',
             '[' => 'Æ',
@@ -256,7 +268,8 @@ impl CharacterSet {
     }
 
     /// Translate using Spanish NRCS (final byte 'Z').
-    fn translate_spanish(c: char) -> char {
+    #[inline]
+    const fn translate_spanish(c: char) -> char {
         match c {
             '#' => '£',
             '@' => '§',
@@ -271,7 +284,8 @@ impl CharacterSet {
     }
 
     /// Translate using Swedish NRCS (final byte 'H' or '7').
-    fn translate_swedish(c: char) -> char {
+    #[inline]
+    const fn translate_swedish(c: char) -> char {
         match c {
             '@' => 'É',
             '[' => 'Ä',
@@ -288,7 +302,8 @@ impl CharacterSet {
     }
 
     /// Translate using Swiss NRCS (final byte '=').
-    fn translate_swiss(c: char) -> char {
+    #[inline]
+    const fn translate_swiss(c: char) -> char {
         match c {
             '#' => 'ù',
             '@' => 'à',
@@ -325,6 +340,7 @@ pub enum GlMapping {
 
 impl From<u8> for GlMapping {
     /// Decode from serialized index — used by session restore.
+    #[inline]
     fn from(index: u8) -> Self {
         match index {
             0 => Self::G0,
@@ -337,6 +353,7 @@ impl From<u8> for GlMapping {
 }
 
 impl From<GlMapping> for u8 {
+    #[inline]
     fn from(gl: GlMapping) -> Self {
         match gl {
             GlMapping::G0 => 0,
@@ -363,6 +380,7 @@ pub enum GrMapping {
 }
 
 impl From<u8> for GrMapping {
+    #[inline]
     fn from(index: u8) -> Self {
         match index {
             0 => Self::G1,
@@ -374,6 +392,7 @@ impl From<u8> for GrMapping {
 }
 
 impl From<GrMapping> for u8 {
+    #[inline]
     fn from(gr: GrMapping) -> Self {
         match gr {
             GrMapping::G1 => 0,
@@ -417,7 +436,9 @@ pub enum CharacterSet96 {
 
 impl CharacterSet96 {
     /// The 96-character set for an SCS final byte, or `None` if unrecognized.
-    pub fn from_final_byte(byte: u8) -> Option<Self> {
+    #[inline]
+    #[must_use]
+    pub const fn from_final_byte(byte: u8) -> Option<Self> {
         match byte {
             b'A' => Some(Self::IsoLatin1Supplemental),
             b'B' => Some(Self::IsoLatin2Supplemental),
@@ -430,6 +451,8 @@ impl CharacterSet96 {
 
     /// Translate a 96-character set offset (0-95, for positions 0xA0-0xFF) to a codepoint;
     /// U+FFFD for an out-of-range offset.
+    #[inline]
+    #[must_use]
     pub fn translate(&self, offset: u8) -> char {
         if offset >= 96 {
             return '\u{FFFD}';
@@ -549,7 +572,17 @@ pub struct CharacterSetState {
 }
 
 impl Default for CharacterSetState {
+    #[inline]
     fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl CharacterSetState {
+    /// Create a new character set state with defaults.
+    #[inline]
+    #[must_use]
+    pub const fn new() -> Self {
         Self {
             g0: CharacterSet::Ascii,
             // xterm resetCharsets() does initCharset(screen, 1, nrc_ASCII):
@@ -566,18 +599,12 @@ impl Default for CharacterSetState {
             g3_96: None,
         }
     }
-}
-
-impl CharacterSetState {
-    /// Create a new character set state with defaults.
-    pub fn new() -> Self {
-        Self::default()
-    }
 
     /// The effective character set: the single-shifted G-set if a shift is pending (the caller
     /// clears it with `clear_single_shift`), else the GL-mapped one.
+    #[inline]
     #[must_use]
-    pub fn effective_charset(&self) -> CharacterSet {
+    pub const fn effective_charset(&self) -> CharacterSet {
         match self.single_shift {
             SingleShift::Ss2 => self.g2,
             SingleShift::Ss3 => self.g3,
@@ -591,6 +618,7 @@ impl CharacterSetState {
     }
 
     /// Clear single shift after a character is printed.
+    #[inline]
     pub fn clear_single_shift(&mut self) {
         self.single_shift = SingleShift::None;
     }
@@ -599,28 +627,29 @@ impl CharacterSetState {
     /// pending), so bulk ASCII writes can skip translation.
     #[must_use]
     #[inline]
-    pub fn is_ascii_passthrough(&self) -> bool {
-        self.single_shift == SingleShift::None
-            && self.gl == GlMapping::G0
-            && self.g0 == CharacterSet::Ascii
+    pub const fn is_ascii_passthrough(&self) -> bool {
+        matches!(self.single_shift, SingleShift::None)
+            && matches!(self.gl, GlMapping::G0)
+            && matches!(self.g0, CharacterSet::Ascii)
     }
 
     /// Whether U+00A0-U+00FF pass through unchanged: the GR-mapped G-set has no 96-character
     /// designation and is ASCII. Otherwise they must go through `translate()`.
     #[must_use]
     #[inline]
-    pub fn gr_is_passthrough(&self) -> bool {
+    pub const fn gr_is_passthrough(&self) -> bool {
         let (cs94, cs96) = match self.gr {
             GrMapping::G1 => (self.g1, self.g1_96),
             GrMapping::G2 => (self.g2, self.g2_96),
             GrMapping::G3 => (self.g3, self.g3_96),
         };
-        cs96.is_none() && cs94 == CharacterSet::Ascii
+        cs96.is_none() && matches!(cs94, CharacterSet::Ascii)
     }
 
     /// The 96-character override of the active GL (or single-shifted) G-set, if any.
+    #[inline]
     #[must_use]
-    fn effective_96(&self) -> Option<CharacterSet96> {
+    const fn effective_96(&self) -> Option<CharacterSet96> {
         match self.single_shift {
             SingleShift::Ss2 => self.g2_96,
             SingleShift::Ss3 => self.g3_96,
@@ -690,6 +719,7 @@ impl CharacterSetState {
 
     /// Designate a character set to a G-set, clearing that G-set's 96-character override
     /// (94- and 96-character designations are mutually exclusive).
+    #[inline]
     pub fn designate(&mut self, g_set: u8, charset: CharacterSet) {
         match g_set {
             0 => self.g0 = charset,
@@ -710,6 +740,7 @@ impl CharacterSetState {
     }
 
     /// Designate a 96-character set to G1-G3; G0 cannot hold one (ISO 2022).
+    #[inline]
     pub fn designate_96(&mut self, g_set: u8, charset: CharacterSet96) {
         match g_set {
             0 => {} // G0 cannot hold 96-char sets
@@ -721,7 +752,8 @@ impl CharacterSetState {
     }
 
     /// Reset to default state.
+    #[inline]
     pub fn reset(&mut self) {
-        *self = Self::default();
+        *self = Self::new();
     }
 }

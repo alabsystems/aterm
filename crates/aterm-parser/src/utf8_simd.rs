@@ -26,6 +26,7 @@ pub(crate) const RUN_CAP: usize = 256;
 /// when `bytes` is empty, does not start on a multibyte lead, or begins with an
 /// invalid sequence, so the caller's scalar step always makes progress. Each
 /// loop accepts exactly what `decode_multibyte_char` accepts.
+#[inline]
 pub(crate) fn bulk_decode_run(bytes: &[u8], out: &mut ArrayVec<char, RUN_CAP>) -> usize {
     match bytes.first() {
         Some(&b0) if (0xE0..=0xEF).contains(&b0) => bulk_3byte(bytes, out),
@@ -36,6 +37,7 @@ pub(crate) fn bulk_decode_run(bytes: &[u8], out: &mut ArrayVec<char, RUN_CAP>) -
 }
 
 /// 3-byte run (BMP: CJK, Hangul, Greek, Cyrillic, ...).
+#[inline]
 fn bulk_3byte(bytes: &[u8], out: &mut ArrayVec<char, RUN_CAP>) -> usize {
     let mut i = 0usize;
     while !out.is_full() {
@@ -64,6 +66,7 @@ fn bulk_3byte(bytes: &[u8], out: &mut ArrayVec<char, RUN_CAP>) -> usize {
 }
 
 /// 2-byte run (U+0080..=U+07FF: Latin extensions, IPA, Greek, Cyrillic).
+#[inline]
 fn bulk_2byte(bytes: &[u8], out: &mut ArrayVec<char, RUN_CAP>) -> usize {
     let mut i = 0usize;
     while !out.is_full() {
@@ -89,6 +92,7 @@ fn bulk_2byte(bytes: &[u8], out: &mut ArrayVec<char, RUN_CAP>) -> usize {
 }
 
 /// 4-byte run (SMP: emoji, mathematical alphanumerics, historic scripts).
+#[inline]
 fn bulk_4byte(bytes: &[u8], out: &mut ArrayVec<char, RUN_CAP>) -> usize {
     let mut i = 0usize;
     while !out.is_full() {

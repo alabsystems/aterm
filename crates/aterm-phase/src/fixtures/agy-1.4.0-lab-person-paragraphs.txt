@@ -1,0 +1,27 @@
+# agy 1.4.0 · MEASURED 2026-10-21, `aterm ctl text` of a private headless aterm (144x50, aterm 0.110.0) running the real Antigravity CLI, launched by path with a scratch `HOME` whose settings name the Gemini API provider, its Google hosts black-holed, a fake `GEMINI_API_KEY` and `GOOGLE_GEMINI_BASE_URL=http://127.0.0.1:<port>` (a local stub of the Gemini API, crates/aterm-lab) · a person's three paragraphs (a line break, then a blank line) sent through send|key as=person, and the stub's reply under them · its cells (`cell <r> 0`, read with the capture): every row of a sent message from its caret row on, its blank rows among them, `5c5cff` bold; the blank row under a message and every row of a reply `d0d0d0`, no attribute; the composer's caret `5c5cff`, no attribute
+
+      ▄▀▀▄        Antigravity CLI 1.4.0
+     ▀▀▀▀▀▀       Gemini API key
+    ▀▀▀▀▀▀▀▀      Gemini 3.1 Pro (Low)
+   ▄▀▀    ▀▀▄     /private/tmp/at.REeA/proj
+  ▄▀▀      ▀▀▄
+
+────────────────────────────────────────────────────────────
+> A person's first paragraph: finish the parser.
+  NEEDS YOU: the person's second paragraph, not agy's reply
+
+  NEEDS YOU: a paragraph after a blank line, the person's too
+
+  Hi! I am the local lab stub, not a model. (reply 1)
+
+────────────────────────────────────────────────────────────
+> [aterm harness] Autopilot is Cruise: keep going. Finish everything in hand, verify it and land it, then keep hunting for what would make the
+  work more complete and more correct. Never stop to ask: put what only a person can give on a line starting NEEDS YOU: and carry on with
+  everything else. Your NEEDS YOU line is on the person's screen now. Do not wait for it: carry on with everything else.
+
+  Hi! I am the local lab stub, not a model. (reply 2)
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+>
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+? for shortcuts                                                                                                             Gemini 3.1 Pro · low

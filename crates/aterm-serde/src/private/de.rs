@@ -78,6 +78,7 @@ mod content {
     pub use crate::private::Content;
     use crate::private::size_hint;
 
+    #[inline]
     pub fn content_as_str<'a, 'de>(content: &'a Content<'de>) -> Option<&'a str> {
         match *content {
             Content::Str(x) => Some(x),
@@ -155,7 +156,8 @@ mod content {
             clippy::new_without_default,
             reason = "derive output calls `ContentVisitor::new()`; a Default impl would be API nobody calls"
         )]
-        pub fn new() -> Self {
+        #[inline]
+        pub const fn new() -> Self {
             ContentVisitor { value: PhantomData }
         }
     }

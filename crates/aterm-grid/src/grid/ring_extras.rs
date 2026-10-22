@@ -255,7 +255,7 @@ impl Grid {
     /// its budgeted bytes.
     #[must_use]
     #[inline]
-    pub fn history_link_bytes(&self) -> usize {
+    pub const fn history_link_bytes(&self) -> usize {
         self.storage
             .ring_extras
             .link_bytes()

@@ -102,6 +102,11 @@ pub struct Spec {
     pub ccsocks: String,
     /// The lab's state dir (`runs/`, `logs/`, `captures/`).
     pub state: String,
+    /// The root under which every checkout's default state dir sits
+    /// ([`crate::paths::state_root`], empty: this user's): fenced, so no jail
+    /// reads another checkout's runs, logs or results; the lab's own state
+    /// dir is reopened ([`render`]).
+    pub states: String,
     /// The user's temp dir (empty: this user's, `DARWIN_USER_TEMP_DIR`).
     pub user_tmp: String,
     /// The jail's mark (empty: a fresh one).
@@ -145,6 +150,7 @@ impl Spec {
             caller_home: p.caller_home.clone(),
             ccsocks: crate::protected::CCSOCKS.into(),
             state: p.state.to_string_lossy().into_owned(),
+            states: String::new(),
             user_tmp: String::new(),
             mark: mark.into(),
             lab_dirs: vec![
@@ -178,6 +184,20 @@ pub fn valid_mark(mark: &str) -> bool {
                 .chars()
                 .all(|c| c.is_ascii_alphanumeric() || "._-".contains(c))
     })
+}
+
+/// `path` as a literal in the profile's regular expressions: each character
+/// the expression syntax gives a meaning is escaped (a path the profile can
+/// quote holds no quote and no backslash: [`profile_safe`]).
+fn regex_literal(path: &str) -> String {
+    let mut out = String::with_capacity(path.len() + 8);
+    for c in path.chars() {
+        if ".[]{}()*+?^$|".contains(c) {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
 }
 
 fn parent(p: &str) -> String {
@@ -271,9 +291,21 @@ pub fn render(spec: &Spec) -> Result<String, String> {
     let rel = physical(Path::new(&format!("{tg}/release")))
         .to_string_lossy()
         .into_owned();
+    // Every checkout's default state dir sits under one root outside the homes (`crate::paths::state_root`), so the
+    // homes' fence does not cover it: its own fence keeps one checkout's lab out of another's runs, logs, tapes and
+    // results. The root itself stays open (the tape store's walk to a run passes through it: its entries' names are
+    // all it shows) and this lab's own state dir is reopened with the rest of what the lab trusts.
+    let states = if spec.states.is_empty() {
+        crate::paths::state_root(crate::sys::getuid())
+            .to_string_lossy()
+            .into_owned()
+    } else {
+        spec.states.clone()
+    };
     let mut quoted: Vec<&str> = vec![
         home,
         &spec.caller_home,
+        &states,
         &run,
         claude,
         &sockdir,
@@ -300,6 +332,21 @@ pub fn render(spec: &Spec) -> Result<String, String> {
     if homes.iter().any(|h| inside_protected(&run, h, cc)) {
         return Err(format!(
             "the lab's run directory may not sit inside the owner's data ({run})"
+        ));
+    }
+    // The harness's tape store (`aterm_agent::supervise::tape::store`) opens every directory from `/` down to the
+    // instance's state root (`<run>/scratch/state`), one no-follow open at a time, and keeps no tape when one is
+    // refused: the homes' read fence below refuses each of a run's ancestors inside a home. The fence stays whole
+    // (no directory of a home is reopened for the walk), so a run sits outside every home, as the default state dir
+    // does (`crate::paths::default_state`).
+    if let Some(h) = homes.iter().find(|h| {
+        let p = physical(Path::new(h));
+        Path::new(&run).starts_with(h) || Path::new(&run).starts_with(&p)
+    }) {
+        return Err(format!(
+            "the lab's run directory ({run}) sits inside the home {h}, whose contents the jail fences: the harness's \
+             tape store would be refused its way to the run. Leave LAB_STATE unset (the default is outside every \
+             home) or name a directory outside every home"
         ));
     }
     let deny_mach = |names: &[&str]| {
@@ -381,17 +428,20 @@ pub fn render(spec: &Spec) -> Result<String, String> {
     // What the lab trusts from OUTSIDE the jail, wherever LAB_STATE, the checkout and LAB_ATERM sit: the state dir
     // (runs/, whose env.sh it reads, logs/, captures/), its own program and source, the aterm its door runs (env.sh
     // records it), and both builds a later `up` may pick when LAB_ATERM is left off: this checkout's target/ itself (no
-    // link may be put there) and all of its debug/ and release/, as written and physical.
+    // link may be put there) and all of its debug/ and release/, as written and physical. The jail reads all of it but
+    // target/ itself (`trusted_read`): nothing in the jail lists the checkout's build folder now that no lab's state
+    // sits under it (MEASURED 2026-10-22: `lab selftest` passed without it, the walk from / to the state root
+    // included, docs/measured/breaker-transcript-and-zsh-2026-10-22.md), so its entry names stay the owner's.
     let mut trusted = vec![format!("(subpath \"{st}\")")];
     trusted.extend(spec.lab_dirs.iter().map(|d| format!("(subpath \"{d}\")")));
     if !spec.aterm.is_empty() {
         trusted.push(format!("(literal \"{}\")", spec.aterm));
     }
-    trusted.push(format!("(literal \"{tg_written}\")"));
     trusted.push(format!("(subpath \"{tg}/debug\")"));
     trusted.push(format!("(subpath \"{tg}/release\")"));
+    let mut target_itself = vec![format!("(literal \"{tg_written}\")")];
     if tg != tg_written {
-        trusted.push(format!("(literal \"{tg}\")"));
+        target_itself.push(format!("(literal \"{tg}\")"));
     }
     if dbg != format!("{tg}/debug") {
         trusted.push(format!("(subpath \"{dbg}\")"));
@@ -399,6 +449,8 @@ pub fn render(spec: &Spec) -> Result<String, String> {
     if rel != format!("{tg}/release") {
         trusted.push(format!("(subpath \"{rel}\")"));
     }
+    let trusted_read = trusted.clone();
+    trusted.extend(target_itself);
     let mut parents: Vec<String> = Vec::new();
     let mut roots: Vec<String> = vec![st.clone()];
     roots.extend(spec.lab_dirs.iter().cloned());
@@ -428,26 +480,6 @@ pub fn render(spec: &Spec) -> Result<String, String> {
             .iter()
             .map(|n| format!("(literal \"{run}/scratch/{n}\")")),
     );
-    // The harness's tape store (`aterm_agent::supervise::tape::store`) opens every directory from `/` down to the
-    // instance's state root (`<run>/scratch/state`), one no-follow open at a time, and keeps no tape when one is
-    // refused: a home's read fence refuses the run directory's ancestors inside it (the run sits in the checkout,
-    // in the account's home). Each of those directories is reopened alone.
-    let mut walk: Vec<String> = Vec::new();
-    for h in &homes {
-        if !Path::new(&run).starts_with(h) {
-            continue;
-        }
-        let mut p = run.clone();
-        loop {
-            walk.push(format!("(literal \"{p}\")"));
-            if p == *h || p == "/" {
-                break;
-            }
-            p = parent(&p);
-        }
-    }
-    walk.sort();
-    walk.dedup();
     let mut out = String::with_capacity(TEMPLATE.len() + 8192);
     for line in TEMPLATE.lines() {
         let piece = match line {
@@ -462,8 +494,10 @@ pub fn render(spec: &Spec) -> Result<String, String> {
                 .map(|h| format!("(deny file-read-data (subpath \"{h}\"))"))
                 .collect::<Vec<_>>()
                 .join("\n"),
-            "@RUN_WALK@" if walk.is_empty() => String::new(),
-            "@RUN_WALK@" => format!("(allow file-read-data {})", walk.join(" ")),
+            "@STATES_READ_DENY@" => format!(
+                "(deny file-read-data (regex #\"^{}/\"))",
+                regex_literal(states.trim_end_matches('/'))
+            ),
             "@HOME_WRITE_DENY@" => homes
                 .iter()
                 .map(|h| format!("(deny file-write* (subpath \"{h}\"))"))
@@ -471,6 +505,7 @@ pub fn render(spec: &Spec) -> Result<String, String> {
                 .join("\n"),
             _ => line
                 .replace("@TRUSTED_PARENTS@", &parents.join(" "))
+                .replace("@TRUSTED_READ@", &trusted_read.join(" "))
                 .replace("@TRUSTED@", &trusted.join(" "))
                 .replace("@SCRATCH_DIRS@", &scratch.join(" "))
                 .replace("@SOCKDIR@", &sockdir)
@@ -566,6 +601,7 @@ mod tests {
             caller_home: String::new(),
             ccsocks: "/private/tmp/cc-socks".into(),
             state: d.state.clone(),
+            states: String::new(),
             user_tmp: d.ut.clone(),
             mark: "lab.jail.t.0123456789abcdef".into(),
             lab_dirs: vec!["/L/bin".into(), "/L/src".into()],
@@ -628,6 +664,25 @@ mod tests {
         ] {
             assert!(trusted.contains(&want), "{want} in {trusted}");
         }
+        // The jail reads what the lab trusts, but no entry name of the
+        // checkout's target/ itself: its builds only. NEGATIVE CONTROL: the
+        // write rule above still names target/ itself.
+        let read = p
+            .lines()
+            .find(|l| l.starts_with("(allow file-read-data (subpath ") && l.contains("/L/bin"))
+            .expect("the trusted read rule");
+        for want in [
+            format!("(subpath \"{}\")", real(&d.state)),
+            "(literal \"/A/aterm\")".into(),
+            "(subpath \"/R/target/debug\")".into(),
+            "(subpath \"/R/target/release\")".into(),
+        ] {
+            assert!(read.contains(&want), "{want} in {read}");
+        }
+        assert!(
+            !read.contains("(literal \"/R/target\")"),
+            "target/ itself is not read: {read}"
+        );
         let parents = p
             .lines()
             .find(|l| l.starts_with("(deny file-write-unlink (literal \"/\")"))
@@ -1072,20 +1127,22 @@ mod tests {
         assert!(profile_of(&d, &none, "/x").is_err());
     }
 
-    /// THE HARNESS'S TAPE STORE WALKS THROUGH THE HOME FENCE TO ITS STATE
-    /// ROOT: a lab's run directory sits in the checkout, in the account's
-    /// home, and the tape store opens every directory from `/` down to
-    /// `<run>/scratch/state` (no-follow, one at a time). Under the profile,
-    /// applied, each of those opens goes through, while a sibling directory
-    /// of the walk, a file beside it and a protected entry of the home stay
-    /// shut. NEGATIVE CONTROL: the same profile without the walk's rule
-    /// refuses the home's own directory (the store then keeps no tape).
+    /// THE HARNESS'S TAPE STORE WALKS TO A RUN OUTSIDE EVERY HOME, AND THE
+    /// HOME FENCE STAYS WHOLE: the tape store opens every directory from `/`
+    /// down to `<run>/scratch/state` (no-follow, one at a time). Under the
+    /// profile, applied, with the run outside the home (where the default
+    /// state dir puts it), each of those opens goes through, while the home
+    /// itself, a directory and a file in it and a protected entry stay shut:
+    /// no rule reopens a directory of the home by its literal path. NEGATIVE
+    /// CONTROLS: the same profile without the home's fence opens the home (the
+    /// refusal is the fence's); a run inside the home is refused at render,
+    /// naming the home.
     #[test]
-    fn the_tape_store_walks_through_the_home_fence_to_the_run() {
+    fn the_tape_store_walks_to_a_run_outside_every_home_and_the_fence_stays_whole() {
         let d = dirs();
         let top = std::fs::canonicalize(&d.top).unwrap();
         let home = top.join("account");
-        let run = home.join("Developer/lab/runs/t");
+        let run = top.join("lab-state/runs/t");
         let state = run.join("scratch/state");
         for dir in [state.clone(), home.join("Developer/other")] {
             std::fs::create_dir_all(dir).unwrap();
@@ -1097,9 +1154,20 @@ mod tests {
         let mut s = spec(&d, "/x", "", &home.display().to_string());
         s.run = run.display().to_string();
         let profile = render(&s).unwrap();
+        let walk_rules: Vec<&str> = profile
+            .lines()
+            .filter(|l| l.starts_with("(allow file-read-data (literal"))
+            .collect();
+        assert!(walk_rules.is_empty(), "{walk_rules:?}");
+        for dir in [home.clone(), home.join("Developer")] {
+            let literal = format!("(literal \"{}\")", dir.display());
+            assert!(!profile.contains(&literal), "{literal} is reopened");
+        }
         let mut walk: Vec<std::path::PathBuf> = state.ancestors().map(Path::to_path_buf).collect();
         walk.reverse();
         let shut = [
+            home.clone(),
+            home.join("Developer"),
             home.join("Developer/other"),
             home.join("plain"),
             home.join(".ssh/id"),
@@ -1138,18 +1206,136 @@ mod tests {
                 .collect()
         };
         let mut want = vec!["ok"; walk.len()];
-        want.extend(["no"; 3]);
+        want.extend(["no"; 5]);
         assert_eq!(opens(&profile), want, "{walk:?} {shut:?}");
-        // NEGATIVE CONTROL: without the walk's rule the home's own directory is refused
-        let rule = format!("(literal \"{}\")", home.display());
-        let bare: String = profile
+        // NEGATIVE CONTROL: without the home's fence the home opens, so the refusal above is the fence's
+        let fence = format!("(deny file-read-data (subpath \"{}\"))", home.display());
+        let unfenced: String = profile
             .lines()
-            .filter(|l| !(l.starts_with("(allow file-read-data (literal") && l.contains(&rule)))
+            .filter(|l| *l != fence)
             .map(|l| format!("{l}\n"))
             .collect();
-        assert_ne!(bare, profile, "the walk's rule is in the profile");
-        let at = walk.iter().position(|p| *p == home).unwrap();
-        assert_eq!(opens(&bare)[at], "no");
+        assert_ne!(unfenced, profile, "the fence is in the profile");
+        assert_eq!(opens(&unfenced)[walk.len()], "ok");
+        // NEGATIVE CONTROL: a run inside the home is refused, never walked to
+        let inside = home.join("Developer/lab/runs/t");
+        std::fs::create_dir_all(inside.join("scratch/state")).unwrap();
+        s.run = inside.display().to_string();
+        let err = render(&s).unwrap_err();
+        assert!(
+            err.contains(&format!("sits inside the home {}", home.display())),
+            "{err}"
+        );
+    }
+
+    /// ANOTHER CHECKOUT'S LAB STATE IS FENCED, AND THE WALK TO THIS LAB'S RUN
+    /// STAYS OPEN: every checkout's default state dir sits under one root
+    /// outside the homes (`/private/tmp/at.lab-<uid>`), which the homes'
+    /// fence does not cover. Under the profile, applied, the tape store's
+    /// walk from `/` through the root and this lab's state dir down to
+    /// `<run>/scratch/state` opens, while a sibling checkout's state dir, its
+    /// log and its run's `env.sh` stay shut; the rule is a regular
+    /// expression below the root, so no literal reopens anything. NEGATIVE
+    /// CONTROL: the same profile without the root's fence opens the sibling's
+    /// state dir, log and record (the refusal is the fence's).
+    #[test]
+    fn another_checkouts_lab_state_is_fenced_and_the_walk_to_this_run_stays_open() {
+        let d = dirs();
+        let top = std::fs::canonicalize(&d.top).unwrap();
+        let home = top.join("account");
+        let states = top.join("at.lab-states");
+        let own = states.join("aterm-0123abcd");
+        let run = own.join("runs/t");
+        let other = states.join("other-89abcdef");
+        for dir in [
+            run.join("scratch/state"),
+            other.join("logs/t-1"),
+            other.join("runs/t"),
+            home.clone(),
+        ] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        for f in [other.join("logs/t-1/stub.log"), other.join("runs/t/env.sh")] {
+            std::fs::write(f, "another checkout's\n").unwrap();
+        }
+        let mut s = spec(&d, "/x", "", &home.display().to_string());
+        s.run = run.display().to_string();
+        s.state = own.display().to_string();
+        s.states = states.display().to_string();
+        let profile = render(&s).unwrap();
+        let fence = format!(
+            "(deny file-read-data (regex #\"^{}/\"))",
+            regex_literal(&states.display().to_string())
+        );
+        assert!(
+            profile.lines().any(|l| l == fence),
+            "{fence} in the profile"
+        );
+        assert!(
+            fence.contains("/at\\.lab-states/"),
+            "the root's dot is escaped: {fence}"
+        );
+        let walk_rules: Vec<&str> = profile
+            .lines()
+            .filter(|l| l.starts_with("(allow file-read-data (literal"))
+            .collect();
+        assert!(walk_rules.is_empty(), "{walk_rules:?}");
+        let mut walk: Vec<std::path::PathBuf> = run
+            .join("scratch/state")
+            .ancestors()
+            .map(Path::to_path_buf)
+            .collect();
+        walk.reverse();
+        assert!(walk.contains(&states) && walk.contains(&own));
+        let shut = [
+            other.clone(),
+            other.join("logs/t-1/stub.log"),
+            other.join("runs/t/env.sh"),
+        ];
+        let opens = |profile: &str| -> Vec<String> {
+            let file = top.join("states.sb");
+            std::fs::write(&file, profile).unwrap();
+            let mut cmd = aterm_uds::spawnfd::command("/usr/bin/sandbox-exec");
+            cmd.arg("-f")
+                .arg(&file)
+                .args([
+                    "/bin/sh",
+                    "-c",
+                    r#"for p in "$@"; do if (exec 3< "$p") 2>/dev/null; then echo ok; else echo no; fi; done"#,
+                    "sh",
+                ])
+                .args(walk.iter().chain(&shut))
+                .env_clear()
+                .env("PATH", "/usr/bin:/bin");
+            let out = aterm_uds::deadline::outputs_until(
+                &mut [&mut cmd],
+                std::time::Instant::now() + std::time::Duration::from_secs(60),
+                std::time::Duration::from_secs(60),
+            )
+            .pop()
+            .unwrap()
+            .expect("the walk ran");
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8_lossy(&out.stdout)
+                .lines()
+                .map(str::to_string)
+                .collect()
+        };
+        let mut want = vec!["ok"; walk.len()];
+        want.extend(["no"; 3]);
+        assert_eq!(opens(&profile), want, "{walk:?} {shut:?}");
+        // NEGATIVE CONTROL: without the root's fence the sibling's state opens
+        let unfenced: String = profile
+            .lines()
+            .filter(|l| *l != fence)
+            .map(|l| format!("{l}\n"))
+            .collect();
+        assert_ne!(unfenced, profile);
+        assert_eq!(opens(&unfenced)[walk.len()..], ["ok"; 3]);
     }
 
     #[test]

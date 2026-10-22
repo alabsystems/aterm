@@ -9,6 +9,7 @@ use aterm_render::Renderer;
 
 use crate::WebTerminal;
 
+#[inline]
 pub(crate) fn checked_grid_size(
     renderer: &Renderer,
     rows: u16,
@@ -22,11 +23,13 @@ pub(crate) fn checked_grid_size(
 }
 
 impl WebTerminal {
+    #[inline]
     pub(crate) fn checked_surface_size(&self) -> Result<(usize, usize), String> {
         self.render_face()
             .checked_frame_size(self.rows + self.band.committed(), self.cols)
     }
 
+    #[inline]
     pub(crate) fn checked_surface_geometry(
         &self,
         cell_w: usize,

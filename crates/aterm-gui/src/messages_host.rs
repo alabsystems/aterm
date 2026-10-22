@@ -416,7 +416,7 @@ fn open_path_external(path: &str) -> bool {
             .arg(&target)
             .status();
         #[cfg(target_os = "linux")]
-        let status = aterm_uds::spawnfd::command("xdg-open")
+        let status = crate::startup_token::for_a_press(aterm_uds::spawnfd::command("xdg-open"))
             .arg(&target)
             .status();
         #[cfg(windows)]
@@ -1919,6 +1919,38 @@ impl App {
         }
     }
 
+    /// `c-toolchain:` — the C toolchain's verdict ([`atpkg::cli::C_TOOLCHAIN_MARKER`]).
+    /// `missing` or `broken` files the one entry naming atpkg's fix
+    /// ([`toolchain_words::c_toolchain_entry`]; on macOS `aterm init --only base.clt`),
+    /// a fact for later and never on screen (docs/DESIGN-init-system-2026-10-20.md
+    /// §4.2), and ends the other cause's; the same verdict again is a duplicate. `ready`
+    /// ends both. The window runs no probe of its own: atpkg's pass did. A body this
+    /// build cannot read changes nothing.
+    pub(crate) fn note_c_toolchain(&mut self, body: &str) {
+        use toolchain_words::{CToolchain, c_toolchain_entry};
+        let (missing, broken) = (
+            c_toolchain_entry(CToolchain::Missing),
+            c_toolchain_entry(CToolchain::Broken),
+        );
+        match body.trim() {
+            atpkg::cli::C_TOOLCHAIN_MISSING => {
+                self.except_clear(&broken.key());
+                self.except(&missing);
+            }
+            atpkg::cli::C_TOOLCHAIN_BROKEN => {
+                self.except_clear(&missing.key());
+                self.except(&broken);
+            }
+            atpkg::cli::C_TOOLCHAIN_READY => {
+                self.except_clear(&missing.key());
+                self.except_clear(&broken.key());
+            }
+            other => {
+                aterm_log::info!("atpkg c-toolchain: a verdict this build cannot read: {other}");
+            }
+        }
+    }
+
     /// R25 — a pass opens (`net-starting:`). Only a FIRST
     /// RUN opens the row (`first_run`, the lane's verdict for the child that
     /// printed it: `crate::pass_is_first_run`); a routine pass's announcement
@@ -3247,14 +3279,16 @@ impl App {
 // ---------------------------------------------------------------------------
 
 /// Whether window `ws`'s band is on screen: a real OS window that is not
-/// occluded (minimized, fully covered). A headless window has no OS window,
-/// so its band never moves. `WindowEvent::Occluded` is not reported on
-/// Windows or Wayland (crates/aterm-window, the platform notes above `Occluded`),
-/// and X11 reports it only from `VisibilityNotify` — a window fully covered,
-/// not one iconified (unmapped) — so outside macOS a MINIMIZED window is
-/// asked directly (review 2026-09-24: it kept its 1 Hz text ticks, and its
-/// frames while focused or recorded). Wayland answers `None` (it cannot
-/// say); macOS reports minimizing as occlusion.
+/// occluded (minimized, on another workspace, fully covered). A headless
+/// window has no OS window, so its band never moves. `WindowEvent::Occluded`
+/// is not reported on Windows or Wayland (crates/aterm-window, the platform
+/// notes above `Occluded`), so on Windows a MINIMIZED window is asked directly
+/// (review 2026-09-24: it kept its 1 Hz text ticks, and its frames while
+/// focused or recorded); Wayland cannot say. macOS reports minimizing as
+/// occlusion, and so does X11: a window the window manager unmapped
+/// (iconified, or on another workspace) or marked `_NET_WM_STATE_HIDDEN`, as
+/// well as one `VisibilityNotify` says is fully covered, which a compositing
+/// window manager never lets it say.
 pub(crate) fn band_on_screen(ws: &crate::WindowState) -> bool {
     // A handoff boot's window is hidden until its first real present
     // (`pending_reveal`), and not yet occluded: nothing on it is seen
@@ -3267,11 +3301,10 @@ pub(crate) fn band_on_screen(ws: &crate::WindowState) -> bool {
             return shown;
         }
     }
-    // macOS reports minimizing as occlusion, and asking AppKit on every loop
-    // turn would buy nothing there.
-    let minimized = |w: &aterm_window::window::Window| {
-        cfg!(not(target_os = "macos")) && w.is_minimized() == Some(true)
-    };
+    // macOS and X11 report minimizing as occlusion, and asking on every loop
+    // turn would buy nothing there (on X11, a round trip to the server).
+    let minimized =
+        |w: &aterm_window::window::Window| cfg!(windows) && w.is_minimized() == Some(true);
     shown && ws.os_window.as_deref().is_some_and(|w| !minimized(w))
 }
 

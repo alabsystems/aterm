@@ -2751,6 +2751,7 @@ pub(crate) fn spawn_session(
             factory.fg_probe,
             factory.edge_image,
         );
+        factory.edge_inbox.push(id);
     }
     // The render debt the outgoing engine owed, judged from attach as the parent
     // would have judged it (`seed_adopted_render_debt`).

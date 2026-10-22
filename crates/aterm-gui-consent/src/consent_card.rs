@@ -311,6 +311,7 @@ pub enum NeedCause {
 
 impl NeedCause {
     /// The tab's session, when the cause names one.
+    #[inline]
     pub const fn session(self) -> Option<u64> {
         match self {
             Self::PromptObserved { session, .. } => session,
@@ -399,6 +400,7 @@ pub enum Marker {
 
 impl Marker {
     /// The recorded token.
+    #[inline]
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::NotNow => "not-now",
@@ -407,6 +409,7 @@ impl Marker {
     }
 
     /// Parse a marker's text; anything else is not a record this code wrote.
+    #[inline]
     pub fn parse(text: &str) -> Option<Self> {
         match text.trim() {
             "not-now" => Some(Self::NotNow),
@@ -499,11 +502,15 @@ pub struct AccessRecord {
 impl AccessRecord {
     /// The field-wise MAX of two records: no field ever moves backwards, so
     /// two processes writing at once cannot undo each other.
-    pub fn merged(self, other: Self) -> Self {
-        let max = |a: Option<u64>, b: Option<u64>| match (a, b) {
-            (Some(a), Some(b)) => Some(a.max(b)),
-            (a, b) => a.or(b),
-        };
+    #[inline]
+    pub const fn merged(self, other: Self) -> Self {
+        const fn max(a: Option<u64>, b: Option<u64>) -> Option<u64> {
+            match (a, b) {
+                (Some(a), Some(b)) => Some(if a >= b { a } else { b }),
+                (Some(a), None) | (None, Some(a)) => Some(a),
+                (None, None) => None,
+            }
+        }
         Self {
             asked_at: max(self.asked_at, other.asked_at),
             opened_at: max(self.opened_at, other.opened_at),

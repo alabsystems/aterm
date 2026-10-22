@@ -61,6 +61,7 @@ impl Scope {
     };
 
     /// Whether an apply run applies an item of `class`.
+    #[inline]
     #[must_use]
     pub fn applies(self, class: Class) -> bool {
         self.applies.contains(&class)
@@ -68,6 +69,7 @@ impl Scope {
 
     /// Whether an item that `requires` this may change anything here: an account item in
     /// the account's own shell, a console item there and at the console.
+    #[inline]
     #[must_use]
     pub const fn admits(self, requires: Requires) -> bool {
         match requires {
@@ -97,6 +99,7 @@ pub fn not_own_account(why: &str) -> String {
 
 impl Layer {
     /// The layer's name, as a report and `--only` spell it.
+    #[inline]
     #[must_use]
     pub const fn name(self) -> &'static str {
         match self {
@@ -249,21 +252,38 @@ impl Item for Aside<'_> {
 /// journaled.
 #[must_use]
 pub fn held_back<'a>(items: Vec<Box<dyn Item + 'a>>, why: &str) -> Vec<Box<dyn Item + 'a>> {
+    hold(items, why, false)
+}
+
+/// `items` a run leaves as they are now: each made its change once and something changed it
+/// since (the person, in what is theirs), so a later run that was not asked to make it again
+/// does not. Each is probed as usual, one already as wanted reads `Ok`, and one that would
+/// change reads `NotApplicable` with what it reads now and `why`: nothing is wrong and
+/// nothing is to do. Nothing is applied, refreshed or journaled.
+#[must_use]
+pub fn left_as_is<'a>(items: Vec<Box<dyn Item + 'a>>, why: &str) -> Vec<Box<dyn Item + 'a>> {
+    hold(items, why, true)
+}
+
+fn hold<'a>(items: Vec<Box<dyn Item + 'a>>, why: &str, as_is: bool) -> Vec<Box<dyn Item + 'a>> {
     items
         .into_iter()
         .map(|inner| {
             Box::new(HeldBack {
                 inner,
                 why: why.to_owned(),
+                as_is,
             }) as Box<dyn Item + 'a>
         })
         .collect()
 }
 
-/// An item whose change is held back ([`held_back`]).
+/// An item whose change is held back ([`held_back`]) or left as it is ([`left_as_is`]).
 struct HeldBack<'a> {
     inner: Box<dyn Item + 'a>,
     why: String,
+    /// [`left_as_is`]: a change reads `NotApplicable`, not `Blocked`.
+    as_is: bool,
 }
 
 impl Item for HeldBack<'_> {
@@ -287,6 +307,9 @@ impl Item for HeldBack<'_> {
     }
     fn probe(&self) -> Probe {
         match self.inner.probe() {
+            Probe::Change { from, .. } if self.as_is => Probe::NotApplicable {
+                why: format!("{from}; left as it is: {}", self.why),
+            },
             Probe::Change { from, .. } => Probe::Blocked {
                 why: format!("{from}; not changed: {}", self.why),
             },
@@ -651,6 +674,40 @@ mod tests {
         assert_eq!(rows[0].stood_aside, None);
         assert_eq!(rows[1].outcome, Outcome::Ok, "{rows:?}");
         assert_eq!(applied.load(Ordering::SeqCst), 0);
+        assert!(journal.lines.is_empty());
+    }
+
+    /// An item left as it is ([`left_as_is`]: it made its change once and was changed since)
+    /// is read: one already right is `Ok`, one that would change is `NotApplicable` naming
+    /// what it reads now and the reason, so nothing is wrong, and it is never applied,
+    /// refreshed or journaled. Negative control: the arm reading `Blocked` (as
+    /// [`held_back`]) fails the run's surface for a change nobody is to make.
+    #[test]
+    fn an_item_left_as_is_is_read_and_not_applicable_and_never_applied() {
+        let would = Placed::new("workstation.widgets", Class::Preference, Requires::Account);
+        let applied = Arc::clone(&would.applied);
+        let right = Placed {
+            probes: Mutex::new(vec![ok()]),
+            refresh: Some(false),
+            ..Placed::new("workstation.dock", Class::Preference, Requires::Account)
+        };
+        let refreshed = Arc::clone(&right.refreshed);
+        let items = left_as_is(
+            vec![Box::new(would), Box::new(right)],
+            "set once and changed since",
+        );
+        let mut journal = Counted::new(&refreshed);
+        let rows = crate::run(&items, Mode::Apply, &mut journal).unwrap();
+        assert_eq!(rows[0].outcome, Outcome::NotApplicable, "{rows:?}");
+        assert_eq!(
+            rows[0].why.as_deref(),
+            Some("a; left as it is: set once and changed since"),
+            "what it reads now, and why it stays"
+        );
+        assert_eq!(rows[0].stood_aside, None);
+        assert_eq!(rows[1].outcome, Outcome::Ok, "{rows:?}");
+        assert_eq!(applied.load(Ordering::SeqCst), 0);
+        assert_eq!(refreshed.load(Ordering::SeqCst), 0, "nor refreshed");
         assert!(journal.lines.is_empty());
     }
 

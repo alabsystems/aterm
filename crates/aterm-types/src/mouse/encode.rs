@@ -12,6 +12,7 @@ use super::types::MouseEncoding;
 
 /// Encode mouse coordinates in X10 format: `ESC [ M Cb Cx Cy`, 1-based and offset by 32.
 /// Coordinates past 223 (223 + 32 = 255) are clamped; SGR (mode 1006) has no such limit.
+#[inline]
 #[must_use]
 pub fn encode_x10(cb: u8, col: u16, row: u16) -> Vec<u8> {
     let cx = (col.saturating_add(1).min(223) as u8).saturating_add(32);
@@ -23,6 +24,7 @@ pub fn encode_x10(cb: u8, col: u16, row: u16) -> Vec<u8> {
 ///
 /// For coordinates <= 95, outputs a single byte (coord + 32).
 /// For coordinates 96-2015, outputs a 2-byte UTF-8 sequence.
+#[inline]
 #[allow(clippy::cast_possible_truncation)]
 fn encode_utf8_coord(coord: u16, output: &mut Vec<u8>) {
     let c = coord.saturating_add(32);
@@ -40,6 +42,7 @@ fn encode_utf8_coord(coord: u16, output: &mut Vec<u8>) {
 /// Encode mouse coordinates in UTF-8 format (mode 1005): `ESC [ M Cb Cx Cy` with every value
 /// after M UTF-8 encoded, the button code included (xterm), up to 2015. With modifier bits on
 /// a wheel (64+) or extra button (128+) code, cb+32 exceeds 127 and takes two bytes (#7498).
+#[inline]
 #[must_use]
 pub fn encode_utf8(cb: u8, col: u16, row: u16) -> Vec<u8> {
     let mut result = vec![0x1b, b'[', b'M'];
@@ -53,6 +56,7 @@ pub fn encode_utf8(cb: u8, col: u16, row: u16) -> Vec<u8> {
 /// Append `val` to `buf` as decimal digits, allocation-free: the encoders run once per pointer
 /// sample under DEC 1002/1003 tracking. Same idiom as `keyboard::encode::write_u32`.
 // Skip: pushes into a `Vec<u8>`, an absent std body (alloc class); the tests pin the bytes.
+#[inline]
 #[cfg_attr(trust_verify, trust::skip)]
 #[allow(clippy::cast_possible_truncation)]
 fn push_dec_u16(buf: &mut Vec<u8>, val: u16) {
@@ -83,6 +87,7 @@ fn push_dec_u16(buf: &mut Vec<u8>, val: u16) {
 ///
 /// Format: ESC [ < Cb ; Cx ; Cy M (press) or ESC [ < Cb ; Cx ; Cy m (release)
 /// Coordinates are 1-indexed decimal parameters, no offset needed.
+#[inline]
 #[must_use]
 // Skip: Vec push/extend — absent std bodies (alloc class).
 #[cfg_attr(trust_verify, trust::skip)]
@@ -103,6 +108,7 @@ pub fn encode_sgr(cb: u8, col: u16, row: u16, release: bool) -> Vec<u8> {
 ///
 /// Format: ESC [ Cb ; Cx ; Cy M
 /// Like SGR but without the '<' prefix; Cb is already offset by 32.
+#[inline]
 #[must_use]
 // Skip: Vec push/extend — absent std bodies (alloc class).
 #[cfg_attr(trust_verify, trust::skip)]
@@ -129,6 +135,7 @@ pub fn encode_urxvt(cb: u16, col: u16, row: u16) -> Vec<u8> {
 /// clamps it; the output form never changes. An app that enabled only mode 1000 parses the
 /// fixed 6-byte `ESC [ M Cb Cx Cy` frame, and an SGR report would reach it as typed garbage.
 /// An app that wants coordinates past 223 enables SGR (1006) or UTF-8 (1005).
+#[inline]
 #[must_use]
 pub fn encode_mouse(cb: u8, col: u16, row: u16, encoding: MouseEncoding, release: bool) -> Vec<u8> {
     // Release signalling is format-specific. The legacy forms (X10/UTF-8/urxvt) send button 3

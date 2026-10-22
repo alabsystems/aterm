@@ -1348,6 +1348,71 @@ impl PetWorld {
         )
     }
 
+    /// THE GROUND UNDER A CAT, THE HOST'S LABELS OVERHEAD. A body whose feet
+    /// are on `rect`'s last row, judged as
+    /// [`Self::under_text_clearance_past_caret`] on that row (its margin kept
+    /// off the row above), and on the rows over its feet only against what
+    /// protects them for now: a selection or a transient overlay, whose cells
+    /// a body drawn over them would hide. What protects those rows for good
+    /// (the host's chrome on a composer's rule over the line the cat walks:
+    /// a switch, a mark, the chips) is drawn in the text layer, over a body
+    /// under the glyphs, as text is ([`Self::ink_clearance`] counts it
+    /// inked), so it never refuses the cat its ground nor hides it. Judged by
+    /// the whole box, the escort waited short of a harness switch while the
+    /// caret ran forty cells on (2026-10-21, the owner's harness on).
+    #[inline]
+    #[must_use]
+    pub fn passing_under_text_clearance_past_caret(
+        &self,
+        rect: PetRect,
+        margin: f32,
+    ) -> Option<bool> {
+        self.stamp?;
+        if !rect.valid() || !margin.is_finite() || margin < 0.0 {
+            return Some(false);
+        }
+        let bottom = rect.row + rect.rows;
+        let feet_top = Self::feet_row_of(rect).row;
+        // The feet's own row, the margin kept inside it top and bottom (a
+        // stand judged on its feet stops at its ground).
+        let feet = PetRect::new(
+            feet_top + margin,
+            rect.col,
+            (bottom.min(feet_top + 1.0) - feet_top - 2.0 * margin).max(f32::EPSILON),
+            rect.cols,
+        );
+        let ground = self.under_text_clearance_past_caret(feet, margin);
+        if feet_top <= rect.row || ground == Some(false) {
+            return ground;
+        }
+        let over = PetRect::new(rect.row, rect.col, feet_top - rect.row, rect.cols);
+        let overhead = match self.window(over, margin) {
+            Window::Degenerate => Some(false),
+            Window::Outside => None,
+            Window::Cells(r0, c0, r1, c1) => Some(
+                !self.ground_split
+                    || self.blocked(&self.protected_prefix, r0, c0, r1, c1)
+                        == self.blocked(self.ground_prefixes().1, r0, c0, r1, c1),
+            ),
+        };
+        match (ground, overhead) {
+            (_, Some(false)) => Some(false),
+            (Some(true), Some(true)) => Some(true),
+            _ => None,
+        }
+    }
+
+    /// The part of `rect` on its feet's row: from the top of the cell row its
+    /// bottom edge lies in ([`Self::passing_under_text_clearance_past_caret`]).
+    #[inline]
+    #[must_use]
+    pub fn feet_row_of(rect: PetRect) -> PetRect {
+        let bottom = rect.row + rect.rows;
+        // A bottom edge a float's rounding past a row line is on that line.
+        let top = ((bottom - 1e-3).ceil() - 1.0).max(rect.row);
+        PetRect::new(top, rect.col, (bottom - top).max(f32::EPSILON), rect.cols)
+    }
+
     /// Whether a body can go from `from` to `to` without crossing anything
     /// that protects the ground for good: their swept box, with no margin,
     /// clear on the ground plane past the caret

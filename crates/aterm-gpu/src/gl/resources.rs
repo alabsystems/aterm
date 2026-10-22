@@ -8,7 +8,7 @@
 //! drawn into gets its framebuffer object on first use and keeps it, so a pass
 //! binds one name. The six [`TexelFormat`]s map onto GLES 3.0 internal formats
 //! except the BGRA pair, which GLES has no sized format for (the GL arm's
-//! swapchain is the EGL surface's own RGBA buffer).
+//! swapchain is the window surface's own RGBA buffer).
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};

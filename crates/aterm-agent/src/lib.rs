@@ -179,6 +179,7 @@ const MAX_LINE_BYTES: usize = 1 << 20; // 1 MiB
 /// alone allow a peer to make the client retain hundreds of gigabytes.
 const MAX_REPLY_BYTES: usize = 256 << 20; // 256 MiB
 
+#[inline]
 fn is_ok_reply(header: &str) -> bool {
     header == "OK" || header.starts_with("OK ")
 }
@@ -287,13 +288,15 @@ impl<S: Read + Write> RelayClient<S> {
     /// length-framed write — is refused before a byte is written
     /// (`PermissionDenied`). What a look that must have no hands runs on: the
     /// live upgrade's dry run and its watch (`harness::upgrade_drive`).
+    #[inline]
     #[must_use]
-    pub fn reads_only(mut self) -> Self {
+    pub const fn reads_only(mut self) -> Self {
         self.reads_only = true;
         self
     }
 
     /// Whether this connection may send `line` ([`Self::reads_only`]).
+    #[inline]
     fn may_send(&self, line: &str) -> std::io::Result<()> {
         if !self.reads_only || is_read_request(line) {
             return Ok(());
@@ -621,9 +624,12 @@ COMMANDS
                        data: `grep -rn open src` reads); a program named by a
                        path outside /bin and /usr/bin is unknown; a wrapper is
                        seen through (`xargs touch`, `env FOO=1 ./x.sh` are touch
-                       and ./x.sh), a `&` ends a segment like `;`, git needs a
-                       read-only subcommand and form (`git branch NAME`
-                       creates). Anywhere on the line, these refuse: git
+                       and ./x.sh), a shell keyword is one only where a command
+                       begins (`X=1 if …`, `2>/dev/null for …` and `env if …`
+                       run a program by that name), a `&` ends a segment like
+                       `;`, git needs a read-only subcommand and form (`git
+                       branch NAME` creates). Anywhere on the line, these
+                       refuse: git
                        push/reset/commit…, `git -c`, `git --output`,
                        `--ext-diff`, `git grep -O` in any spelling (`-nO`,
                        `--open`), `git <cmd> --help` (it runs the configured

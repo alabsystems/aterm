@@ -21,8 +21,8 @@ use crate::TwoGenTextCache;
 /// What the colour face shaped an emoji grapheme cluster to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ClusterShape {
-    /// One colour glyph: the face ligated the whole cluster.
-    Glyph(u16),
+    /// One colour glyph: colour-chain face `face` ligated the whole cluster.
+    Glyph { face: u8, gid: u16 },
     /// Several colour glyphs, composited: the id names a [`ClusterRun`].
     Run(u32),
 }
@@ -41,6 +41,9 @@ pub(crate) struct RunGlyph {
 /// The colour glyphs a cluster shaped to, laid out as the shaper placed them.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ClusterRun {
+    /// The colour-chain face whose glyph ids these are (the renderer's
+    /// `Renderer::color_pick` order); [`layout_run`] leaves it `0`, the head.
+    pub(crate) face: u8,
     pub(crate) glyphs: Box<[RunGlyph]>,
     /// The run's total advance.
     pub(crate) width: i32,
@@ -94,6 +97,7 @@ pub(crate) fn layout_run(
         pen = pen.checked_add(advance)?;
     }
     (run.len() >= 2 && pen > 0).then(|| ClusterRun {
+        face: 0,
         glyphs: run.into(),
         width: pen,
         em,
@@ -363,7 +367,7 @@ mod tests {
         let run = || layout_run(joined(2), colour, false).unwrap();
         let a = shapes.add_run(run()).unwrap();
         shapes.insert("a", Some(ClusterShape::Run(a)));
-        shapes.insert("g", Some(ClusterShape::Glyph(5)));
+        shapes.insert("g", Some(ClusterShape::Glyph { face: 0, gid: 5 }));
         let b = shapes.add_run(run()).unwrap();
         assert_ne!(a, b);
         shapes.insert("b", Some(ClusterShape::Run(b)));

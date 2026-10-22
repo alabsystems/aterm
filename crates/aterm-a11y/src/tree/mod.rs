@@ -245,6 +245,7 @@ impl State {
         self.update(update, is_host_focused, changes);
     }
 
+    #[inline]
     pub(crate) fn node_by_id(&self, id: NodeId) -> Option<Node<'_>> {
         self.nodes.get(&id).map(|node_state| Node {
             tree_state: self,
@@ -253,24 +254,33 @@ impl State {
         })
     }
 
-    pub(crate) fn root_id(&self) -> NodeId {
+    #[inline]
+    pub(crate) const fn root_id(&self) -> NodeId {
         NodeId(self.data.root)
     }
 
+    #[inline]
     pub(crate) fn root(&self) -> Node<'_> {
         self.node_by_id(self.root_id())
             .expect("the root is always in the tree")
     }
 
-    pub(crate) fn is_host_focused(&self) -> bool {
+    #[inline]
+    pub(crate) const fn is_host_focused(&self) -> bool {
         self.is_host_focused
     }
 
     /// The focused node, while the window has the focus.
-    pub(crate) fn focus_id(&self) -> Option<NodeId> {
-        self.is_host_focused.then_some(self.focus)
+    #[inline]
+    pub(crate) const fn focus_id(&self) -> Option<NodeId> {
+        if self.is_host_focused {
+            Some(self.focus)
+        } else {
+            None
+        }
     }
 
+    #[inline]
     pub(crate) fn focus(&self) -> Option<Node<'_>> {
         self.focus_id().and_then(|id| self.node_by_id(id))
     }
@@ -287,16 +297,19 @@ impl State {
         None
     }
 
+    #[inline]
     pub(crate) fn toolkit_name(&self) -> Option<&str> {
         self.data.toolkit_name.as_deref()
     }
 
+    #[inline]
     pub(crate) fn toolkit_version(&self) -> Option<&str> {
         self.data.toolkit_version.as_deref()
     }
 
     /// The model's id of `node_id`, if it is in the tree: what an action
     /// request names.
+    #[inline]
     pub(crate) fn locate_node(&self, node_id: NodeId) -> Option<LocalNodeId> {
         self.nodes.contains_key(&node_id).then_some(node_id.0)
     }
@@ -427,7 +440,8 @@ impl Tree {
         self.state.is_host_focused = self.next_state.is_host_focused;
     }
 
-    pub(crate) fn state(&self) -> &State {
+    #[inline]
+    pub(crate) const fn state(&self) -> &State {
         &self.state
     }
 }

@@ -39,6 +39,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use super::approval::{ApprovalCtx, QuestionPriority};
+use super::box_command::BoxCommand;
 use super::claude_settings::OwnerAsk;
 use super::git_config::WorkerEnv;
 use super::probe::{Answer, AskWire, ShellWire};
@@ -86,6 +87,9 @@ pub struct BoxFacts {
     pub question: Option<QuestionFacts>,
     /// A tool candidate from the agent's transcript.
     pub box_call: Option<String>,
+    /// The agent transcript's one pending Bash call, or why none was taken
+    /// ([`ApprovalCtx::box_command`]); `None`: not read.
+    pub box_command: Option<Result<BoxCommand, String>>,
     /// The `/login` picker is behind the loop's own `/login`
     /// ([`ApprovalCtx::login_carry`]).
     pub login_carry: bool,
@@ -135,6 +139,7 @@ pub const FIELDS: &[&str] = &[
     "screen_rows",
     "question",
     "box_call",
+    "box_command",
     "login_carry",
     "login_back",
     "login_renewed",
@@ -218,6 +223,7 @@ impl ApprovalCtx {
             }
         }
         ctx.box_call = facts.box_call.clone();
+        ctx.box_command = facts.box_command.clone();
         ctx.login_carry = facts.login_carry;
         ctx.login_back = facts.login_back;
         ctx.login_renewed = facts.login_renewed;
@@ -247,10 +253,18 @@ struct Wire {
     screen_rows: u64,
     question: Option<QuestionWire>,
     box_call: Option<String>,
+    box_command: Option<Answer<CommandWire>>,
     login_carry: bool,
     login_back: bool,
     login_renewed: bool,
     login_method: Option<String>,
+}
+
+/// The transcript's pending Bash call as a tape holds it: its id and command.
+#[derive(Serialize, Deserialize)]
+struct CommandWire {
+    id: String,
+    command: String,
 }
 
 /// The worker as a tape knows it: its digest (sixteen hex digits) and pid.
@@ -310,6 +324,13 @@ impl BoxFacts {
                 fell_back: q.fell_back,
             }),
             box_call: self.box_call.clone(),
+            box_command: self.box_command.as_ref().map(|c| match c {
+                Ok(c) => Answer::Ok(CommandWire {
+                    id: c.id.clone(),
+                    command: c.command.clone(),
+                }),
+                Err(why) => Answer::Err(why.clone()),
+            }),
             login_carry: self.login_carry,
             login_back: self.login_back,
             login_renewed: self.login_renewed,
@@ -411,6 +432,13 @@ impl BoxFacts {
                 })
                 .transpose()?,
             box_call: wire.box_call,
+            box_command: wire.box_command.map(|c| match c {
+                Answer::Ok(c) => Ok(BoxCommand {
+                    id: c.id,
+                    command: c.command,
+                }),
+                Answer::Err(why) => Err(why),
+            }),
             login_carry: wire.login_carry,
             login_back: wire.login_back,
             login_renewed: wire.login_renewed,

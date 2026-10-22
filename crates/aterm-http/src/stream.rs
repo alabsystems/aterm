@@ -54,6 +54,7 @@ pub trait Guard: Send + Sync + std::fmt::Debug {
 pub struct AlwaysAuthorized;
 
 impl Guard for AlwaysAuthorized {
+    #[inline]
     fn is_authorized(&self) -> bool {
         true
     }
@@ -128,6 +129,7 @@ impl Deadline {
     }
 
     /// This deadline with every socket call also capped at `idle`.
+    #[inline]
     #[must_use]
     pub const fn with_idle(mut self, idle: Duration) -> Self {
         self.idle = Some(idle);
@@ -135,6 +137,7 @@ impl Deadline {
     }
 
     /// The idle cap, if one is set.
+    #[inline]
     #[must_use]
     pub const fn idle(&self) -> Option<Duration> {
         self.idle

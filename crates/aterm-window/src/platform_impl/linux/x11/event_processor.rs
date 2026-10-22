@@ -14,6 +14,10 @@
 // and hot-plugged devices only update the scroll axes; `WindowEvent::AxisMotion`, which aterm
 // ignores, is not reported either.
 //
+// LOCAL PATCH (aterm), 2026-10-22: a window manager's `_NET_WM_SYNC_REQUEST` is noted on its
+// window, and the `ConfigureNotify` after it decides what the window waits for before it answers
+// (`sync_request.rs`).
+//
 // LOCAL PATCH (aterm), 2026-10-21 (X11-GONE): a request an event's handling makes that fails is
 // reported (`XConnection::report`), where upstream's `expect`s panicked: the connection can break
 // while an event is handled, and the loop's next look ends the run with the loss. The IME
@@ -117,7 +121,11 @@ pub struct EventProcessor {
     // delivered at near the same time.
     pub xfiltered_modifiers: VecDeque<u8>,
     pub xmodmap: util::ModifierKeymap,
-    pub is_composing: bool,
+    /// The window whose input context has a composition open: its preedit started and has
+    /// not ended. Its keys go to the input method's lookup (`xinput_key_input`), which gives
+    /// arrows, Home, End and the function keys no text, so a composition left open after it
+    /// ended keeps them dead: `end_composition`.
+    pub composing: Option<xproto::Window>,
 }
 
 impl EventProcessor {
@@ -126,7 +134,15 @@ impl EventProcessor {
         F: FnMut(&RootAEL, Event<T>),
     {
         self.process_xevent(xev, &mut callback);
+        self.process_ime(&mut callback);
+    }
 
+    /// Send the IME requests the windows queued (`ImeRequest`), then hand on what the input
+    /// method's callbacks queued (`ImeEvent`).
+    pub(super) fn process_ime<T: 'static, F>(&mut self, mut callback: F)
+    where
+        F: FnMut(&RootAEL, Event<T>),
+    {
         let window_target = Self::window_target_mut(&mut self.target);
 
         // Handle IME requests, unless the event's handling found the display gone: XIM speaks
@@ -154,23 +170,29 @@ impl EventProcessor {
 
         // Drain IME events.
         while let Ok((window, event)) = self.ime_event_receiver.try_recv() {
-            let window_id = mkwid(window as xproto::Window);
+            let window = window as xproto::Window;
+            let window_id = mkwid(window);
             let event = match event {
-                ImeEvent::Enabled => WindowEvent::Ime(Ime::Enabled),
+                // A new input context (made for the window, or remade when the input method
+                // was replaced) has no composition open.
+                ImeEvent::Enabled => {
+                    self.end_composition(window);
+                    WindowEvent::Ime(Ime::Enabled)
+                },
                 ImeEvent::Start => {
-                    self.is_composing = true;
+                    self.composing = Some(window);
                     WindowEvent::Ime(Ime::Preedit("".to_owned(), None))
                 },
-                ImeEvent::Update(text, position) if self.is_composing => {
+                ImeEvent::Update(text, position) if self.composing == Some(window) => {
                     WindowEvent::Ime(Ime::Preedit(text, Some((position, position))))
                 },
                 ImeEvent::End => {
-                    self.is_composing = false;
+                    self.end_composition(window);
                     // Issue empty preedit on `Done`.
                     WindowEvent::Ime(Ime::Preedit(String::new(), None))
                 },
                 ImeEvent::Disabled => {
-                    self.is_composing = false;
+                    self.end_composition(window);
                     WindowEvent::Ime(Ime::Disabled)
                 },
                 _ => continue,
@@ -178,6 +200,15 @@ impl EventProcessor {
 
             callback(&self.target, Event::WindowEvent { window_id, event });
         }
+    }
+
+    /// End `window`'s composition, if it has one open ([`Self::composing`]); whether it had.
+    fn end_composition(&mut self, window: xproto::Window) -> bool {
+        let open = self.composing == Some(window);
+        if open {
+            self.composing = None;
+        }
+        open
     }
 
     /// XFilterEvent tells us when an event has been discarded by the input method.
@@ -248,6 +279,7 @@ impl EventProcessor {
             },
             event_type::REPARENT_NOTIFY => self.reparent_notify(unsafe { &xev.reparent }),
             event_type::MAP_NOTIFY => self.map_notify(unsafe { &xev.map }, &mut callback),
+            event_type::UNMAP_NOTIFY => self.unmap_notify(unsafe { &xev.unmap }, &mut callback),
             event_type::DESTROY_NOTIFY => {
                 self.destroy_notify(unsafe { &xev.destroy_window }, &mut callback)
             },
@@ -464,6 +496,18 @@ impl EventProcessor {
             return;
         }
 
+        // The window manager is about to resize the window and waits for its counter to reach
+        // this serial: `data.l[2]` is its low half and `data.l[3]` its high (EWMH).
+        if xev.message_type == atoms[WM_PROTOCOLS] as c_ulong
+            && client_long(xev, 0) as xproto::Atom == atoms[_NET_WM_SYNC_REQUEST]
+        {
+            let low = u64::from(client_long(xev, 2) as u32);
+            let high = u64::from(client_long(xev, 3) as u32);
+            let value = ((high << 32) | low).cast_signed();
+            self.with_window(window, |window| window.sync_requested(value));
+            return;
+        }
+
         if client_long(xev, 0) as xproto::Atom == wt.net_wm_ping {
             let mut client_msg = ClientMessage::new32(
                 wt.root,
@@ -486,9 +530,16 @@ impl EventProcessor {
         }
 
         if xev.message_type == atoms[XdndEnter] as c_ulong {
+            if self.with_window(window, |_| ()).is_none() {
+                return;
+            }
             let source_window = client_long(xev, 0) as xproto::Window;
             let flags = client_long(xev, 1);
             let version = flags >> 24;
+            // A new drag: nothing of an earlier one is its data.
+            self.dnd.reset();
+            self.dnd.target_window = Some(window);
+            self.dnd.source_window = Some(source_window);
             self.dnd.version = Some(version);
             let has_more_types = flags - (flags & (c_long::MAX - 1)) == 1;
             if !has_more_types {
@@ -514,6 +565,9 @@ impl EventProcessor {
             // that here would be trivial.
 
             let source_window = client_long(xev, 0) as xproto::Window;
+            if !self.dnd.matches_drag(window, source_window) {
+                return;
+            }
 
             // Equivalent to `(x << shift) | y`
             // where `shift = mem::size_of::<c_short>() * 8`
@@ -546,41 +600,68 @@ impl EventProcessor {
                 return;
             }
 
-            self.dnd.source_window = Some(source_window);
-            if self.dnd.result.is_none() {
-                let time = if version >= 1 {
-                    client_long(xev, 3) as xproto::Timestamp
-                } else {
-                    // In version 0, time isn't specified
-                    aterm_x11::proto::CURRENT_TIME
-                };
+            let time = if version >= 1 {
+                client_long(xev, 3) as xproto::Timestamp
+            } else {
+                // In version 0, time isn't specified
+                aterm_x11::proto::CURRENT_TIME
+            };
+            // This results in the `SelectionNotify` event below, once per drag.
+            self.dnd.request(window, time);
 
-                // This results in the `SelectionNotify` event below
-                unsafe {
-                    self.dnd.convert_selection(window, time);
-                }
-            }
-
+            // Accepted until the data shows it names no local file (`selection_notify`), then
+            // refused: the source shows a no-drop cursor, not a copy that drops nothing.
+            let state = if self.dnd.refused() { DndState::Rejected } else { DndState::Accepted };
             unsafe {
                 self.dnd
-                    .send_status(window, source_window, DndState::Accepted)
+                    .send_status(window, source_window, state)
                     .or_report(&wt.xconn, "Failed to send `XdndStatus` message.");
             }
             return;
         }
 
         if xev.message_type == atoms[XdndDrop] as c_ulong {
-            let (source_window, state) = if let Some(source_window) = self.dnd.source_window {
-                if let Some(Ok(ref path_list)) = self.dnd.result {
-                    for path in path_list {
-                        let event = Event::WindowEvent {
-                            window_id,
-                            event: WindowEvent::DroppedFile(path.clone()),
-                        };
-                        callback(&self.target, event);
-                    }
+            let source = client_long(xev, 0) as xproto::Window;
+            if self.dnd.target_window.is_some() && !self.dnd.matches_drag(window, source) {
+                return;
+            }
+            if self.with_window(window, |_| ()).is_none() {
+                return;
+            }
+            if !self.dnd.type_list.as_ref().is_some_and(|types| types.contains(&atoms[TextUriList]))
+            {
+                self.dnd.result = Some(Vec::new());
+            }
+            if self.dnd.source_window.is_some() && self.dnd.result.is_none() {
+                // Dropped before its data came: ask (if no request is outstanding) and finish
+                // the drop when the answer comes (`selection_notify`).
+                let time = if self.dnd.version.unwrap_or(5) >= 1 {
+                    client_long(xev, 2) as xproto::Timestamp
+                } else {
+                    aterm_x11::proto::CURRENT_TIME
+                };
+                self.dnd.request(window, time);
+                if self.dnd.result.is_none() {
+                    self.dnd.dropped = true;
+                    return;
                 }
-                (source_window, DndState::Accepted)
+                // Allocation, creation or conversion failed synchronously. There will be no
+                // SelectionNotify to finish this drop: send the refusal below now.
+            }
+            let (source_window, state) = if let Some(source_window) = self.dnd.source_window {
+                // A drag whose data names no local file is refused, even where its source drops
+                // it anyway.
+                let path_list = self.dnd.result.take().unwrap_or_default();
+                for path in &path_list {
+                    let event = Event::WindowEvent {
+                        window_id,
+                        event: WindowEvent::DroppedFile(path.clone()),
+                    };
+                    callback(&self.target, event);
+                }
+                let state =
+                    if path_list.is_empty() { DndState::Rejected } else { DndState::Accepted };
+                (source_window, state)
             } else {
                 // `source_window` won't be part of our DND state if we already rejected the drop in
                 // our `XdndPosition` handler.
@@ -599,6 +680,9 @@ impl EventProcessor {
         }
 
         if xev.message_type == atoms[XdndLeave] as c_ulong {
+            if !self.dnd.matches_drag(window, client_long(xev, 0) as xproto::Window) {
+                return;
+            }
             self.dnd.reset();
             let event = Event::WindowEvent { window_id, event: WindowEvent::HoveredFileCancelled };
             callback(&self.target, event);
@@ -612,28 +696,86 @@ impl EventProcessor {
         let wt = Self::window_target(&self.target);
         let atoms = wt.xconn.atoms();
 
-        let window = xev.requestor as xproto::Window;
-        let window_id = mkwid(window);
+        let requestor = xev.requestor as xproto::Window;
+        let Some(window) = self.dnd.target_window else {
+            return;
+        };
 
-        if xev.property != atoms[XdndSelection] as c_ulong {
+        // The answer to this drag's request for its data (the property is `None` where the
+        // source refused it). Any other answers an earlier drag, which has ended.
+        if xev.selection != atoms[XdndSelection] as c_ulong
+            || xev.target != atoms[TextUriList] as c_ulong
+            || (xev.property != 0 && xev.property != atoms[XdndSelection] as c_ulong)
+            || !self.dnd.answers(requestor, xev.time as xproto::Timestamp)
+        {
             return;
         }
 
         // This is where we receive data from drag and drop
-        self.dnd.result = None;
-        if let Ok(mut data) = unsafe { self.dnd.read_data(window) } {
-            let parse_result = self.dnd.parse_data(&mut data);
-            if let Ok(ref path_list) = parse_result {
-                for path in path_list {
-                    let event = Event::WindowEvent {
-                        window_id,
-                        event: WindowEvent::HoveredFile(path.clone()),
-                    };
-                    callback(&self.target, event);
+        let data = if xev.property == atoms[XdndSelection] as c_ulong {
+            match self.dnd.take_data(requestor) {
+                Some(super::dnd::Answer::List(data)) => data,
+                Some(super::dnd::Answer::Incr) => {
+                    // The list comes in chunks (`property_notify`); taking the INCR property
+                    // asked for the first.
+                    self.dnd.begin_incr();
+                    return;
+                },
+                None => Vec::new(),
+            }
+        } else {
+            Vec::new()
+        };
+        self.dnd_data_came(window, &data, &mut callback);
+    }
+
+    /// The drag's data came to `window`, whole: hover its local files, or deliver and finish
+    /// the drop that came first; a drag whose data names none is refused.
+    fn dnd_data_came<T: 'static, F>(&mut self, window: xproto::Window, data: &[u8], mut callback: F)
+    where
+        F: FnMut(&RootAEL, Event<T>),
+    {
+        let wt = Self::window_target(&self.target);
+        let window_id = mkwid(window);
+        self.dnd.complete_request();
+        let path_list = super::dnd::local_paths(data);
+        if self.dnd.dropped {
+            // The drop came first: deliver it now and finish it.
+            for path in &path_list {
+                let event =
+                    Event::WindowEvent { window_id, event: WindowEvent::DroppedFile(path.clone()) };
+                callback(&self.target, event);
+            }
+            let state = if path_list.is_empty() { DndState::Rejected } else { DndState::Accepted };
+            if let Some(source_window) = self.dnd.source_window {
+                unsafe {
+                    self.dnd
+                        .send_finished(window, source_window, state)
+                        .or_report(&wt.xconn, "Failed to send `XdndFinished` message.");
                 }
             }
-            self.dnd.result = Some(parse_result);
+            self.dnd.reset();
+            return;
         }
+        for path in &path_list {
+            let event =
+                Event::WindowEvent { window_id, event: WindowEvent::HoveredFile(path.clone()) };
+            callback(&self.target, event);
+        }
+        if path_list.is_empty() {
+            // Nothing to drop (a web link, a trash or network item, a refused request): refuse
+            // the drag now, not at its next position, so the source's cursor says so while the
+            // pointer rests. A source takes an `XdndStatus` at any time (GTK and Qt update the
+            // drag's action from it).
+            if let Some(source_window) = self.dnd.source_window {
+                unsafe {
+                    self.dnd
+                        .send_status(window, source_window, DndState::Rejected)
+                        .or_report(&wt.xconn, "Failed to send `XdndStatus` message.");
+                }
+            }
+        }
+        self.dnd.result = Some(path_list);
     }
 
     fn configure_notify<T: 'static, F>(&self, xev: &XConfigureEvent, mut callback: F)
@@ -814,6 +956,10 @@ impl EventProcessor {
             }
         }
 
+        // Before `Resized`: the application presents its frame of the new size while it
+        // handles it, which is what a pending sync request then waits for.
+        window.sync_configured(resized);
+
         if resized {
             callback(&self.target, Event::WindowEvent {
                 window_id,
@@ -853,9 +999,43 @@ impl EventProcessor {
         let event = Event::WindowEvent { window_id, event: WindowEvent::Focused(focus) };
 
         callback(&self.target, event);
+
+        self.change_occlusion(window, |occlusion| occlusion.unmapped = false, &mut callback);
     }
 
-    fn destroy_notify<T: 'static, F>(&self, xev: &XDestroyWindowEvent, mut callback: F)
+    /// The window was unmapped: the window manager iconified it or moved it off the current
+    /// workspace (mutter unmaps both), or the application hid it. The server sends this only
+    /// for a window that was mapped.
+    fn unmap_notify<T: 'static, F>(&self, xev: &ffi::XUnmapEvent, callback: F)
+    where
+        F: FnMut(&RootAEL, Event<T>),
+    {
+        let window = xev.window as xproto::Window;
+        self.change_occlusion(window, |occlusion| occlusion.unmapped = true, callback);
+    }
+
+    /// Applies `change` to what hides `window` (`window::Occlusion`), and reports
+    /// `WindowEvent::Occluded` when that changes what the window last reported.
+    fn change_occlusion<T: 'static, F>(
+        &self,
+        window: xproto::Window,
+        change: impl FnOnce(&mut super::window::Occlusion),
+        mut callback: F,
+    ) where
+        F: FnMut(&RootAEL, Event<T>),
+    {
+        let Some(shown) = self.with_window(window, Arc::clone) else {
+            return;
+        };
+        let Some(occluded) = shown.shared_state_lock().occlusion.change(change) else {
+            return;
+        };
+        let event =
+            Event::WindowEvent { window_id: mkwid(window), event: WindowEvent::Occluded(occluded) };
+        callback(&self.target, event);
+    }
+
+    fn destroy_notify<T: 'static, F>(&mut self, xev: &XDestroyWindowEvent, mut callback: F)
     where
         F: FnMut(&RootAEL, Event<T>),
     {
@@ -863,6 +1043,9 @@ impl EventProcessor {
 
         let window = xev.window as xproto::Window;
         let window_id = mkwid(window);
+        if self.dnd.target_window == Some(window) || self.dnd.is_requestor(window) {
+            self.dnd.reset();
+        }
 
         // In the event that the window's been destroyed without being dropped first, we
         // cleanup again here.
@@ -879,7 +1062,7 @@ impl EventProcessor {
         callback(&self.target, Event::WindowEvent { window_id, event: WindowEvent::Destroyed });
     }
 
-    fn property_notify<T: 'static, F>(&mut self, xev: &XPropertyEvent, mut callback: F)
+    pub(super) fn property_notify<T: 'static, F>(&mut self, xev: &XPropertyEvent, mut callback: F)
     where
         F: FnMut(&RootAEL, Event<T>),
     {
@@ -890,6 +1073,31 @@ impl EventProcessor {
         if atom == atom::RESOURCE_MANAGER || atom == atoms[_XSETTINGS_SETTINGS] {
             self.process_dpi_change(&mut callback);
         }
+
+        // The window manager's state for one of the windows: `_NET_WM_STATE_HIDDEN` hides it
+        // (iconified, or on another workspace where the window manager says so).
+        if atom == atoms[_NET_WM_STATE] {
+            let window = xev.window as xproto::Window;
+            if let Some(hidden) = self.with_window(window, |shown| shown.is_minimized()) {
+                let hidden = hidden == Some(true);
+                self.change_occlusion(window, |occlusion| occlusion.hidden = hidden, &mut callback);
+            }
+        }
+
+        // The next chunk of a drag's data coming in ICCCM INCR chunks: taking it asks for the
+        // one after; an empty one ends the transfer.
+        let window = xev.window as xproto::Window;
+        if atom == atoms[XdndSelection]
+            && xev.state == c_int::from(aterm_x11::proto::event::property::NEW_VALUE)
+            && self.dnd.takes_chunk(window)
+        {
+            let chunk = self.dnd.take_chunk(window);
+            if let Some(data) = self.dnd.add_chunk(chunk) {
+                if let Some(target) = self.dnd.target_window {
+                    self.dnd_data_came(target, &data, &mut callback);
+                }
+            }
+        }
     }
 
     fn visibility_notify<T: 'static, F>(&self, xev: &XVisibilityEvent, mut callback: F)
@@ -898,11 +1106,8 @@ impl EventProcessor {
     {
         let xwindow = xev.window as xproto::Window;
 
-        let event = Event::WindowEvent {
-            window_id: mkwid(xwindow),
-            event: WindowEvent::Occluded(xev.state == ffi::VISIBILITY_FULLY_OBSCURED),
-        };
-        callback(&self.target, event);
+        let obscured = xev.state == ffi::VISIBILITY_FULLY_OBSCURED;
+        self.change_occlusion(xwindow, |occlusion| occlusion.obscured = obscured, &mut callback);
 
         self.with_window(xwindow, |window| {
             window.visibility_notify();
@@ -919,13 +1124,17 @@ impl EventProcessor {
             let window = xev.window as xproto::Window;
             let window_id = mkwid(window);
 
+            // The server holds nothing of what the window drew there: the redraw is dispatched
+            // as an exposure (`platform::x11::redraw_is_exposure`).
+            self.with_window(window, |window| window.shared_state_lock().exposed = true);
+
             let event = Event::WindowEvent { window_id, event: WindowEvent::RedrawRequested };
 
             callback(&self.target, event);
         }
     }
 
-    fn xinput_key_input<T: 'static, F>(
+    pub(super) fn xinput_key_input<T: 'static, F>(
         &mut self,
         xev: &mut XKeyEvent,
         state: ElementState,
@@ -940,6 +1149,9 @@ impl EventProcessor {
 
         let window_id = mkwid(window);
         let device_id = mkdid(util::VIRTUAL_CORE_KEYBOARD);
+        if state == ElementState::Pressed {
+            crate::platform::x11::note_user_time(xev.time as u32);
+        }
 
         let keycode = xev.keycode as _;
 
@@ -993,7 +1205,7 @@ impl EventProcessor {
             self.update_mods_from_core_event(window_id, xev.state as u16, &mut callback);
         }
 
-        if keycode != 0 && !self.is_composing {
+        if keycode != 0 && self.composing != Some(window) {
             // Don't alter the modifiers state from replaying.
             if replay {
                 self.send_synthic_modifier_from_core(window_id, xev.state as u16, &mut callback);
@@ -1037,7 +1249,7 @@ impl EventProcessor {
                 let event =
                     Event::WindowEvent { window_id, event: WindowEvent::Ime(Ime::Commit(written)) };
 
-                self.is_composing = false;
+                self.end_composition(window);
                 callback(&self.target, event);
             }
         }
@@ -1076,7 +1288,7 @@ impl EventProcessor {
         callback(&self.target, event);
     }
 
-    fn xinput2_button_input<T: 'static, F>(
+    pub(super) fn xinput2_button_input<T: 'static, F>(
         &self,
         event: &XIDeviceEvent,
         state: ElementState,
@@ -1090,6 +1302,9 @@ impl EventProcessor {
         // Deliver multi-touch events instead of emulated mouse events.
         if (event.flags & XI_POINTER_EMULATED) != 0 {
             return;
+        }
+        if state == ElementState::Pressed {
+            crate::platform::x11::note_user_time(event.time as u32);
         }
 
         let event = match event.detail as u32 {
@@ -1262,12 +1477,17 @@ impl EventProcessor {
         }
     }
 
-    fn xinput2_focused<T: 'static, F>(&mut self, xev: &XIFocusInEvent, mut callback: F)
+    pub(super) fn xinput2_focused<T: 'static, F>(&mut self, xev: &XIFocusInEvent, mut callback: F)
     where
         F: FnMut(&RootAEL, Event<T>),
     {
         let wt = Self::window_target(&self.target);
         let window = xev.event as xproto::Window;
+
+        // A keyboard grab's end gives back the focus a grab took, which this window kept.
+        if is_grab_focus_change(xev.mode) {
+            return;
+        }
 
         if let Some(ime) = wt.ime.as_ref() {
             ime.borrow_mut().focus(xev.event).or_report(&wt.xconn, "Failed to focus input context");
@@ -1284,6 +1504,7 @@ impl EventProcessor {
 
         if let Some(window) = self.with_window(window, Arc::clone) {
             window.shared_state_lock().has_focus = true;
+            window.focused();
         }
 
         let event = Event::WindowEvent { window_id, event: WindowEvent::Focused(true) };
@@ -1316,12 +1537,21 @@ impl EventProcessor {
         callback(&self.target, event);
     }
 
-    fn xinput2_unfocused<T: 'static, F>(&mut self, xev: &XIFocusOutEvent, mut callback: F)
-    where
+    pub(super) fn xinput2_unfocused<T: 'static, F>(
+        &mut self,
+        xev: &XIFocusOutEvent,
+        mut callback: F,
+    ) where
         F: FnMut(&RootAEL, Event<T>),
     {
         let wt = Self::window_target(&self.target);
         let window = xev.event as xproto::Window;
+
+        // A keyboard grab (a window manager's shortcut, a media key) takes the keyboard for a
+        // moment and leaves the focus where it was: not a focus change, as xterm treats it.
+        if is_grab_focus_change(xev.mode) {
+            return;
+        }
 
         if !self.window_exists(window) {
             return;
@@ -1331,6 +1561,15 @@ impl EventProcessor {
             ime.borrow_mut()
                 .unfocus(xev.event)
                 .or_report(&wt.xconn, "Failed to unfocus input context");
+        }
+
+        // The input context's focus loss ends its composition, and the input method need not
+        // say so: IBus ends one on a focus loss without a preedit-done. Left open, the window's
+        // arrows, Home, End and function keys would stay dead once it has the focus again,
+        // until its next preedit. The application drops its preedit too.
+        if self.end_composition(window) {
+            let event = WindowEvent::Ime(Ime::Preedit(String::new(), None));
+            callback(&self.target, Event::WindowEvent { window_id: mkwid(window), event });
         }
 
         if self.active_window.take() == Some(window) {
@@ -1706,6 +1945,13 @@ impl EventProcessor {
     {
         let wt = Self::window_target(&self.target);
         wt.xconn.reload_database().or_report(&wt.xconn, "failed to reload Xft database");
+        // The pointer cursor's theme or size changed (GNOME's Large Cursor): each window's
+        // cursor is loaded anew.
+        if wt.xconn.follow_cursor_settings() {
+            for window in wt.windows.borrow().values().filter_map(|w| w.upgrade()) {
+                window.reload_cursor();
+            }
+        }
 
         // In the future, it would be quite easy to emit monitor hotplug events.
         let prev_list = {
@@ -1769,4 +2015,19 @@ fn client_long(xev: &XClientMessageEvent, i: usize) -> c_long {
     // SAFETY: every member of the data union is plain bytes; a format-32 message's are
     // five longs, and any other format's are read as Xlib would.
     unsafe { xev.data.l[i] }
+}
+
+/// Whether an XI2 focus event's `mode` is a keyboard grab's start or end (`XINotifyGrab`,
+/// `XINotifyUngrab`, `XINotifyPassiveGrab`, `XINotifyPassiveUngrab`). On X11 every shortcut a
+/// window manager holds (Super+Space, Alt+Tab, each step of a volume knob) grabs the keyboard
+/// while its key is down, and the focused window gets FocusOut and then FocusIn, though the focus
+/// never moved. A focus that moves while the keyboard is grabbed (`XINotifyWhileGrabbed`, an
+/// Alt+Tab to another window) is a real change, as `XINotifyNormal` is.
+fn is_grab_focus_change(mode: c_int) -> bool {
+    /// XI2 focus modes (XI2.h).
+    const GRAB: c_int = 1;
+    const UNGRAB: c_int = 2;
+    const PASSIVE_GRAB: c_int = 4;
+    const PASSIVE_UNGRAB: c_int = 5;
+    matches!(mode, GRAB | UNGRAB | PASSIVE_GRAB | PASSIVE_UNGRAB)
 }

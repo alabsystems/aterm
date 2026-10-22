@@ -60,12 +60,14 @@ macro_rules! flags {
             $($(#[$cmeta])* pub const $konst: Self = Self($value);)*
 
             /// No flags set.
+            #[inline]
             #[must_use]
             pub const fn empty() -> Self {
                 Self(0)
             }
 
             /// The raw flag word, as the syscall takes it.
+            #[inline]
             #[must_use]
             pub const fn bits(self) -> $int {
                 self.0
@@ -74,12 +76,14 @@ macro_rules! flags {
 
         impl std::ops::BitOr for $name {
             type Output = Self;
+            #[inline]
             fn bitor(self, rhs: Self) -> Self {
                 Self(self.0 | rhs.0)
             }
         }
 
         impl std::ops::BitOrAssign for $name {
+            #[inline]
             fn bitor_assign(&mut self, rhs: Self) {
                 self.0 |= rhs.0;
             }

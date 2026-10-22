@@ -279,12 +279,43 @@ fn render_row(row: &Row) -> Result<String> {
     Ok(s)
 }
 
+/// Refuse an exposed set naming a tool the client lays no shim for
+/// ([`atpkg::store::shim_allowed`]: a shell, another command a shim must never intercept,
+/// or no tool name): a signed manifest never names one, so a pack cannot plant a core
+/// command on its users' PATH, and none ships a tool its users could not run (design S13).
+///
+/// # Errors
+///
+/// A refusal naming every such tool.
+pub fn check_exposes(program: &str, exposes: &[String]) -> Result<()> {
+    let refused: Vec<String> = exposes
+        .iter()
+        .filter(|e| !atpkg::store::shim_allowed(e))
+        .map(|e| format!("`{}`", e.escape_debug()))
+        .collect();
+    if refused.is_empty() {
+        return Ok(());
+    }
+    Err(Error::refused(format!(
+        "{program} exposes {}: no shim may carry {} (a shell, another core command, or no \
+         tool name; atpkg::store::shim_allowed), so a client would lay none and no manifest \
+         naming {} is signed — expose only tool names",
+        refused.join(", "),
+        if refused.len() == 1 {
+            "that name"
+        } else {
+            "those names"
+        },
+        if refused.len() == 1 { "it" } else { "them" },
+    )))
+}
+
 /// A fresh manifest: the header and this row.
 ///
 /// # Errors
 ///
-/// A refusal for a header or row value that is not plain, a record that is not one, or
-/// an empty `exposes`.
+/// A refusal for a header or row value that is not plain, a record that is not one, an
+/// empty `exposes`, or one naming a tool no shim may carry ([`check_exposes`]).
 pub fn fresh(header: &Header, row: &Row) -> Result<Doc> {
     plain("the program", &header.program)?;
     plain("the version", &header.version)?;
@@ -297,6 +328,7 @@ pub fn fresh(header: &Header, row: &Row) -> Result<Doc> {
     for e in &header.exposes {
         plain("an exposed tool", e)?;
     }
+    check_exposes(&header.program, &header.exposes)?;
     let exposes = header
         .exposes
         .iter()
@@ -329,11 +361,13 @@ fn tool_set<'a>(tools: impl IntoIterator<Item = &'a str>) -> std::collections::B
 ///
 /// A refusal when the base does not parse, is another schema, program, build or version,
 /// shims another set of tools than this pack's `header` (one build, one exposed set: a
-/// shim the appended target cannot serve would break there), already carries a row for
-/// this target, or already names this asset (two rows, one release asset: their uploads
-/// would replace each other).
+/// shim the appended target cannot serve would break there), names a tool no shim may
+/// carry ([`check_exposes`], so a base signed before that name was refused is never
+/// extended), already carries a row for this target, or already names this asset (two
+/// rows, one release asset: their uploads would replace each other).
 pub fn merge(base: Vec<u8>, header: &Header, row: &Row) -> Result<Doc> {
     let (program, build) = (header.program.as_str(), header.build);
+    check_exposes(program, &header.exposes)?;
     let text = std::str::from_utf8(&base)
         .map_err(|_| Error::refused("the merge base is not UTF-8 — not a manifest"))?;
     let doc: aterm_toml::Value = text

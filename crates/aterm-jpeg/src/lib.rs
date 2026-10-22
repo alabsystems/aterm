@@ -48,6 +48,7 @@ pub const EXTENSIONS: &[&str] = &["jpg", "jpeg", "jpe", "jfif"];
 /// `(rgba, width, height)`. Either side past `max_dimension` is refused
 /// before any pixel buffer is allocated. `None` for anything that is not a
 /// JPEG this crate reads (see the crate docs) or is too corrupt to frame.
+#[inline]
 #[must_use]
 pub fn decode_rgba8(bytes: &[u8], max_dimension: u32) -> Option<(Vec<u8>, usize, usize)> {
     let mut decoder = Decoder::new(bytes, max_dimension as usize)?;
@@ -56,8 +57,9 @@ pub fn decode_rgba8(bytes: &[u8], max_dimension: u32) -> Option<(Vec<u8>, usize,
 }
 
 /// Whether `bytes` start like a JPEG (the SOI marker and another marker).
+#[inline]
 #[must_use]
-pub fn sniff(bytes: &[u8]) -> bool {
+pub const fn sniff(bytes: &[u8]) -> bool {
     bytes.len() >= 3 && bytes[0] == 0xFF && bytes[1] == 0xD8 && bytes[2] == 0xFF
 }
 
@@ -592,22 +594,24 @@ impl<'a> Decoder<'a> {
         Some(color::orient(rgba, width, height, self.orientation))
     }
 
+    #[inline]
     fn color_model(&self) -> ColorModel {
         match self.components.len() {
             1 => ColorModel::Gray,
-            3 => {
-                let ids: Vec<u8> = self
-                    .components
-                    .iter()
-                    .map(|component| component.id)
-                    .collect();
-                match self.adobe_transform {
-                    Some(0) => ColorModel::Rgb,
-                    Some(_) => ColorModel::YCbCr,
-                    None if !self.jfif && ids == *b"RGB" => ColorModel::Rgb,
-                    None => ColorModel::YCbCr,
+            3 => match self.adobe_transform {
+                Some(0) => ColorModel::Rgb,
+                Some(_) => ColorModel::YCbCr,
+                None if !self.jfif
+                    && [
+                        self.components[0].id,
+                        self.components[1].id,
+                        self.components[2].id,
+                    ] == *b"RGB" =>
+                {
+                    ColorModel::Rgb
                 }
-            }
+                None => ColorModel::YCbCr,
+            },
             _ => match self.adobe_transform {
                 Some(2) => ColorModel::Ycck,
                 _ => ColorModel::Cmyk,
@@ -626,6 +630,7 @@ struct Scan {
 
 /// A coefficient times its quantizer, held to the range an 8-bit DCT
 /// coefficient can take so hostile values cannot overflow the transform.
+#[inline]
 fn dequantize(value: i32, quant: u16) -> i32 {
     value
         .saturating_mul(i32::from(quant))

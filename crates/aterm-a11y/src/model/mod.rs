@@ -143,7 +143,8 @@ pub enum Action {
 }
 
 impl Action {
-    fn mask(self) -> u32 {
+    #[inline]
+    const fn mask(self) -> u32 {
         1 << (self as u8)
     }
 }
@@ -713,12 +714,14 @@ enum ActionDomain {
 
 impl ActionContext {
     /// The host's stable view identity and current lifecycle generation.
+    #[inline]
     pub const fn new(owner: u64, generation: u64) -> Self {
         Self::native_review(owner, generation, 0)
     }
 
     /// One native review within a live view. Replacing or consuming that review
     /// retires its queued actions independently of ordinary presentation changes.
+    #[inline]
     pub const fn native_review(owner: u64, generation: u64, review_revision: u64) -> Self {
         Self {
             domain: ActionDomain::Native,
@@ -729,6 +732,7 @@ impl ActionContext {
     }
 
     /// A message's exact id and checked action-list revision, captured together.
+    #[inline]
     pub const fn message(owner: u64, generation: u64) -> Self {
         Self {
             domain: ActionDomain::Message,
@@ -739,6 +743,7 @@ impl ActionContext {
     }
 
     /// The message log's link, which does not authorize any individual row's action.
+    #[inline]
     pub const fn message_log() -> Self {
         Self {
             domain: ActionDomain::MessageLog,
@@ -749,6 +754,7 @@ impl ActionContext {
     }
 
     /// A tab's stable identity, independent of its current position in the strip.
+    #[inline]
     pub const fn tab(owner: u64) -> Self {
         Self {
             domain: ActionDomain::Tab,
@@ -759,11 +765,13 @@ impl ActionContext {
     }
 
     /// Stable owner identity, without truncation or hashing.
+    #[inline]
     pub const fn owner(self) -> u64 {
         self.owner
     }
 
     /// Native lifecycle generation or message action-list revision.
+    #[inline]
     pub const fn generation(self) -> u64 {
         self.generation
     }

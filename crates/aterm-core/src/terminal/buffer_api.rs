@@ -134,6 +134,7 @@ impl Terminal {
     }
 
     /// Get a reference to the tiered scrollback storage, if attached.
+    #[inline]
     #[must_use]
     pub fn scrollback(&self) -> Option<&crate::scrollback::ScrollbackStorage> {
         self.grid.scrollback()
@@ -143,6 +144,7 @@ impl Terminal {
     /// in (the scrollback twin of [`Self::main_grid`]). [`Self::scrollback`] reads the
     /// active grid, but while the alt screen is up the primary grid and its store are
     /// parked in `alt_grid`, so accounting and memory-pressure shedding read this.
+    #[inline]
     #[must_use]
     pub fn history_scrollback(&self) -> Option<&crate::scrollback::ScrollbackStorage> {
         self.main_grid().scrollback()
@@ -198,6 +200,7 @@ impl Terminal {
 
     /// Drain deferred scrollback rows into attached tiered storage for all
     /// grids, so byte accounting and watermarks reflect the full history.
+    #[inline]
     pub fn sync_scrollback_buffers(&mut self) {
         let _ = self.grid.scrollback_mut();
         if let Some(ref mut alt) = self.alt_grid {
@@ -278,6 +281,7 @@ impl Terminal {
     /// The retained scrollback line limit of the primary-content grid
     /// (`None` = unlimited). Getter twin of
     /// [`set_scrollback_line_limit`](Self::set_scrollback_line_limit).
+    #[inline]
     #[must_use]
     pub fn scrollback_line_limit(&self) -> Option<usize> {
         self.main_grid().scrollback_line_limit()
@@ -285,6 +289,7 @@ impl Terminal {
 
     /// Highest scrollback watermark pressure across the main and alternate
     /// grids' tiered stores' budget watermarks.
+    #[inline]
     #[must_use]
     pub fn scrollback_pressure_level(&self) -> crate::scrollback::WatermarkLevel {
         let mut level = self.grid.scrollback().map_or(
@@ -305,6 +310,7 @@ impl Terminal {
     /// (undecodable) store block, which may also stay in the line count as blank rows.
     /// Hosts surface it (`metrics`, `lines`); flood drops are also marked in band at
     /// each cut ([`Grid::truncated_lines`](aterm_grid::Grid::truncated_lines)).
+    #[inline]
     #[must_use]
     pub fn scrollback_truncated_lines(&self) -> u64 {
         let mut total = self.grid.truncated_lines();
@@ -320,6 +326,7 @@ impl Terminal {
     /// time from its top). Separate from
     /// [`scrollback_truncated_lines`](Self::scrollback_truncated_lines): no line was
     /// lost. Hosts poll this; the content is never marked.
+    #[inline]
     #[must_use]
     pub fn scrollback_image_rows_dropped(&self) -> u64 {
         let mut total = self.grid.image_rows_dropped_by_compression();
@@ -363,6 +370,7 @@ impl Terminal {
     /// rise and `SnapToLive` / `UserScrollTowardLive` on a fall
     /// (`Terminal::note_scroll_custody`). Recording here covers every caller,
     /// including the wheel's instant and glide paths.
+    #[inline]
     pub fn scroll_display(&mut self, delta: i32) {
         let before = self.grid.display_offset();
         self.grid.scroll_display(delta);
@@ -371,6 +379,7 @@ impl Terminal {
 
     /// Scroll to top of scrollback. Records `UserScroll` on a rise (see
     /// [`Self::scroll_display`]); nothing when already at the top.
+    #[inline]
     pub fn scroll_to_top(&mut self) {
         let before = self.grid.display_offset();
         self.grid.scroll_to_top();
@@ -382,6 +391,7 @@ impl Terminal {
     /// Not a custody recording site: the typing snap runs through here and
     /// records its own `TypingPress`. A non-typing return to live (End,
     /// `ScrollToBottom`, the paste and IME snaps) is [`Self::return_to_live`].
+    #[inline]
     pub fn scroll_to_bottom(&mut self) {
         self.grid.scroll_to_bottom();
     }
@@ -391,6 +401,7 @@ impl Terminal {
     /// [`crate::terminal::CustodyTransition::SnapToLive`] when the view moved.
     /// The highlight is left alone. Already at live it records nothing but
     /// still counts as a reader gesture ([`Self::reader_gesture_count`]).
+    #[inline]
     pub fn return_to_live(&mut self) {
         let before = self.grid.display_offset();
         self.grid.scroll_to_bottom();
@@ -404,6 +415,7 @@ impl Terminal {
     /// mark's `prompt_start_row`) sits at the top line, clamped to retained
     /// history: the primitive behind prompt-to-prompt navigation. Records
     /// custody like [`Self::scroll_display`].
+    #[inline]
     pub fn scroll_to_absolute_row(&mut self, target_abs_row: u64) {
         let before = self.grid.display_offset();
         self.grid.scroll_to_absolute_row(target_abs_row);
@@ -436,6 +448,7 @@ impl Terminal {
     /// first and sends them as input (aterm-gui on Windows, where the ConPTY
     /// resize guard must protect them: `aterm_pty`'s `resize_guard`); the
     /// replies stay for [`Self::take_response`].
+    #[inline]
     #[must_use]
     pub fn take_reports(&mut self) -> Option<Vec<u8>> {
         if self.transient.report_buffer.is_empty() {
@@ -450,6 +463,7 @@ impl Terminal {
     /// Drain the edge-triggered BEL flag: returns `true` if a (rate-limited)
     /// BEL fired since the last drain, then clears it. Lets a poll-based host
     /// react to a bell without wiring the synchronous `bell_callback`.
+    #[inline]
     pub fn drain_bell(&mut self) -> bool {
         let pending = self.transient.bell_pending;
         self.transient.bell_pending = false;
@@ -459,12 +473,14 @@ impl Terminal {
     /// Pop the oldest queued OSC app-event `(code, payload)`, or `None` when the
     /// queue is empty. Mirrors `take_response`'s drain contract for the
     /// structured OSC 52/7/133 payloads the host polls each frame.
+    #[inline]
     #[must_use]
     pub fn take_osc_event(&mut self) -> Option<(u32, String)> {
         self.transient.osc_events.pop_front()
     }
 
     /// Whether any OSC app-event is queued (cheap pre-check before draining).
+    #[inline]
     #[must_use]
     pub fn has_osc_events(&self) -> bool {
         !self.transient.osc_events.is_empty()
@@ -493,6 +509,7 @@ impl Terminal {
     ///     b"\x1b[200~hello\x1b[201~"
     /// );
     /// ```
+    #[inline]
     #[must_use]
     pub fn format_paste(&self, text: &str) -> Vec<u8> {
         self.format_paste_framed(text, self.modes.bracketed_paste)
@@ -511,6 +528,7 @@ impl Terminal {
     /// byte ([`paste_byte_kept`], one test per byte with no lookahead, so a
     /// block is one vector pass), so a cap-sized control-only clipboard costs
     /// one scan of its bytes and an ordinary paste one block.
+    #[inline]
     #[must_use]
     pub fn paste_sends_bytes(text: &str, bracketed: bool) -> bool {
         bracketed
@@ -1092,6 +1110,7 @@ pub struct HistoryShed {
 impl HistoryShed {
     /// Bytes the pass actually gave back — zero when the store was already
     /// under the target, which is the common case under a WARN-tier shed.
+    #[inline]
     #[must_use]
     pub const fn freed(self) -> usize {
         self.before.saturating_sub(self.after)

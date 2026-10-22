@@ -36,7 +36,8 @@ pub enum KittyAction {
 }
 
 impl KittyAction {
-    fn from_char(c: char) -> Option<Self> {
+    #[inline]
+    const fn from_char(c: char) -> Option<Self> {
         Some(match c {
             't' => Self::Transmit,
             'T' => Self::TransmitAndDisplay,
@@ -197,7 +198,8 @@ impl KittyCommand {
     /// How this command is read while a chunked load is in flight. Only a
     /// command that would continue a load can open one with `m=1`, and only
     /// when kitty accepts it as a first chunk (`handle_kitty_command`).
-    pub(crate) fn during_load(&self) -> DuringLoad {
+    #[inline]
+    pub(crate) const fn during_load(&self) -> DuringLoad {
         match self.action {
             KittyAction::Delete => DuringLoad::Ends,
             KittyAction::Display | KittyAction::Compose | KittyAction::Animate => {
@@ -207,7 +209,7 @@ impl KittyCommand {
             | KittyAction::TransmitAndDisplay
             | KittyAction::Query
             | KittyAction::Frame => {
-                if self.medium == KittyMedium::Direct {
+                if matches!(self.medium, KittyMedium::Direct) {
                     DuringLoad::Continues
                 } else {
                     DuringLoad::Ends
@@ -222,12 +224,21 @@ impl KittyCommand {
     /// format (`handle_add_command`, `handle_animation_frame_load_command` for `a=f`), then
     /// refuses zero-area raw pixels (`initialize_load_data`); any other command it aborts at the
     /// first chunk, holding no load and storing no image.
-    pub(crate) fn declares_loadable_size(&self) -> bool {
-        let within = |side: Option<u32>| side.is_none_or(|n| n <= MAX_KITTY_DIMENSION);
-        let has_area = |side: Option<u32>| side.is_some_and(|n| n >= 1);
-        within(self.width)
-            && within(self.height)
-            && (self.format == KittyFormat::Png || (has_area(self.width) && has_area(self.height)))
+    #[inline]
+    pub(crate) const fn declares_loadable_size(&self) -> bool {
+        let width_within = match self.width {
+            Some(n) => n <= MAX_KITTY_DIMENSION,
+            None => true,
+        };
+        let height_within = match self.height {
+            Some(n) => n <= MAX_KITTY_DIMENSION,
+            None => true,
+        };
+        let raw_has_area = matches!(
+            (self.width, self.height),
+            (Some(w), Some(h)) if w >= 1 && h >= 1
+        );
+        width_within && height_within && (matches!(self.format, KittyFormat::Png) || raw_has_area)
     }
 }
 
@@ -318,6 +329,7 @@ pub fn parse_kitty_command(apc: &[u8]) -> Option<KittyCommand> {
 
 /// Parse an id-like key (`i=`, `I=`, `p=`), where kitty reserves `0` for "not
 /// specified".
+#[inline]
 fn nonzero(value: &str) -> Option<u32> {
     value.parse().ok().filter(|&v| v != 0)
 }
@@ -364,6 +376,7 @@ pub fn compose_rgba(
 }
 
 /// Straight-alpha "source over" of one RGBA8 pixel onto another.
+#[inline]
 fn blend_over(dst: &mut [u8], src: &[u8]) {
     let sa = u32::from(src[3]);
     if sa == 255 {
@@ -386,6 +399,7 @@ fn blend_over(dst: &mut [u8], src: &[u8]) {
 /// Extract `(width, height)` in pixels from a PNG's IHDR header, or `None` if the bytes are not
 /// a PNG. Gives a PNG's cell footprint without a decode (the renderer decodes at draw time).
 #[must_use]
+#[inline]
 pub fn png_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
     const SIG: [u8; 8] = [0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
     // PNG: 8-byte signature, then the IHDR chunk

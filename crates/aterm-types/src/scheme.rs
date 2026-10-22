@@ -43,8 +43,9 @@ impl Appearance {
     /// The DEC color-scheme DSR parameter for this appearance (`1` = dark,
     /// `2` = light), as reported via DSR `CSI ? 996 n` → `CSI ? 997 ; Ps n` and
     /// the DEC mode 2031 push.
+    #[inline]
     #[must_use]
-    pub fn dsr_code(self) -> u8 {
+    pub const fn dsr_code(self) -> u8 {
         match self {
             Appearance::Dark => 1,
             Appearance::Light => 2,
@@ -154,14 +155,16 @@ pub struct ChromeColors {
 
 impl ChromeColors {
     /// Whether the theme authors no chrome colour.
+    #[inline]
     #[must_use]
     pub fn is_empty(&self) -> bool {
         *self == Self::default()
     }
 
     /// The slot a chrome key sets; `None` for a key that is not a chrome key.
+    #[inline]
     #[must_use]
-    pub fn slot(&self, key: ThemeKey) -> Option<Option<Rgb>> {
+    pub const fn slot(&self, key: ThemeKey) -> Option<Option<Rgb>> {
         match key {
             ThemeKey::AccentColor => Some(self.accent),
             ThemeKey::ActiveTabColor => Some(self.active_tab),
@@ -173,6 +176,7 @@ impl ChromeColors {
 
     /// The slot a chrome key sets, to write; `None` for a key that is not a
     /// chrome key.
+    #[inline]
     pub fn slot_mut(&mut self, key: ThemeKey) -> Option<&mut Option<Rgb>> {
         match key {
             ThemeKey::AccentColor => Some(&mut self.accent),
@@ -251,23 +255,33 @@ impl ColorScheme {
 
     /// Project the chrome to packed `0x00RRGGBB` [`ThemeParts`]. `cursor` falls back
     /// to the foreground and `selection` to [`Self::selection_band`] when unset.
+    #[inline]
     #[must_use]
-    pub fn to_theme_parts(&self) -> ThemeParts {
-        let pack = |c: Rgb| (u32::from(c.r) << 16) | (u32::from(c.g) << 8) | u32::from(c.b);
+    pub const fn to_theme_parts(&self) -> ThemeParts {
+        const fn pack(c: Rgb) -> u32 {
+            ((c.r as u32) << 16) | ((c.g as u32) << 8) | (c.b as u32)
+        }
+        let cursor = match self.cursor {
+            Some(c) => c,
+            None => self.foreground,
+        };
         ThemeParts {
             fg: pack(self.foreground),
             bg: pack(self.background),
-            cursor: pack(self.cursor.unwrap_or(self.foreground)),
+            cursor: pack(cursor),
             selection: pack(self.selection_band()),
         }
     }
 
     /// The selection band this scheme paints: its own `selection`, else one
     /// derived from its background and foreground ([`derived_selection`]).
+    #[inline]
     #[must_use]
-    pub fn selection_band(&self) -> Rgb {
-        self.selection
-            .unwrap_or_else(|| derived_selection(self.foreground, self.background))
+    pub const fn selection_band(&self) -> Rgb {
+        match self.selection {
+            Some(c) => c,
+            None => derived_selection(self.foreground, self.background),
+        }
     }
 }
 
@@ -281,16 +295,17 @@ pub const DERIVED_SELECTION_PERCENT: u16 = 22;
 /// [`DERIVED_SELECTION_PERCENT`] of the way toward `fg`, per sRGB channel,
 /// rounded. It sits on the background's side of the theme, so a light theme
 /// gets a light band, and it follows a background a config overrides.
+#[inline]
 #[must_use]
-pub fn derived_selection(fg: Rgb, bg: Rgb) -> Rgb {
-    let mix = |b: u8, f: u8| {
+pub const fn derived_selection(fg: Rgb, bg: Rgb) -> Rgb {
+    const fn mix(b: u8, f: u8) -> u8 {
         let toward = DERIVED_SELECTION_PERCENT;
         let away = 100 - toward;
         // At most 255 * 100 + 50, so it fits a u16, and the quotient is at
         // most 255.
-        let blended = (u16::from(b) * away + u16::from(f) * toward + 50) / 100;
-        u8::try_from(blended).unwrap_or(u8::MAX)
-    };
+        let blended = ((b as u16) * away + (f as u16) * toward + 50) / 100;
+        (blended & 0xFF) as u8
+    }
     Rgb::new(mix(bg.r, fg.r), mix(bg.g, fg.g), mix(bg.b, fg.b))
 }
 
@@ -1742,9 +1757,13 @@ pub struct ContrastRow {
 
 impl ContrastRow {
     /// Whether this pair is below its admission bar (never, with no bar).
+    #[inline]
     #[must_use]
-    pub fn below_minimum(&self) -> bool {
-        self.below.unwrap_or(false)
+    pub const fn below_minimum(&self) -> bool {
+        match self.below {
+            Some(b) => b,
+            None => false,
+        }
     }
 }
 
@@ -1967,6 +1986,7 @@ impl ThemeKey {
     /// This key's row of [`THEME_KEYS`]. Exhaustive, so a new key cannot
     /// compile without a row; the assertion under [`THEME_KEYS`] checks at
     /// compile time that each row sits where this says.
+    #[inline]
     #[must_use]
     pub const fn row(self) -> usize {
         match self {
@@ -2046,8 +2066,9 @@ pub enum ThemeValueType {
 
 impl ThemeValueType {
     /// The type's name in `aterm theme schema`.
+    #[inline]
     #[must_use]
-    pub fn label(self) -> &'static str {
+    pub const fn label(self) -> &'static str {
         match self {
             Self::Colour => "colour",
             Self::Text => "text",
@@ -2081,8 +2102,9 @@ pub enum ThemeKeyGroup {
 
 impl ThemeKeyGroup {
     /// The group's name in `aterm theme schema`.
+    #[inline]
     #[must_use]
-    pub fn label(self) -> &'static str {
+    pub const fn label(self) -> &'static str {
         match self {
             Self::Identity => "identity",
             Self::Colour => "colour",
@@ -2545,8 +2567,9 @@ pub const THEME_KEYS: [ThemeKeySpec; 30] = [
 ];
 
 /// The [`THEME_KEYS`] row for `key`.
+#[inline]
 #[must_use]
-pub fn theme_key_spec(key: ThemeKey) -> &'static ThemeKeySpec {
+pub const fn theme_key_spec(key: ThemeKey) -> &'static ThemeKeySpec {
     &THEME_KEYS[key.row()]
 }
 
@@ -2599,6 +2622,7 @@ pub struct ThemeKeyLines {
 impl ThemeKeyLines {
     /// The 1-based line `key` (slot `index`, for the palette) was set on, or
     /// `None` when the file leaves it out.
+    #[inline]
     #[must_use]
     pub fn line(&self, key: ThemeKey, index: Option<u8>) -> Option<usize> {
         if key == ThemeKey::Palette {
@@ -3179,7 +3203,8 @@ pub enum SelectorIssue {
     JunkSegment(String),
 }
 
-fn appearance_word(appearance: Appearance) -> &'static str {
+#[inline]
+const fn appearance_word(appearance: Appearance) -> &'static str {
     match appearance {
         Appearance::Dark => "dark",
         Appearance::Light => "light",

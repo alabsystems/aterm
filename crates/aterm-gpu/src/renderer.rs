@@ -4871,8 +4871,8 @@ pub struct GpuSurface {
     /// thread-pinned raw pointers, keeping `GpuSurface` on the attaching thread.
     #[cfg(target_os = "macos")]
     metal: Option<crate::metal::present::MetalWindowSurface>,
-    /// The GL arm's swapchain: an EGL window surface (the shipped Linux build;
-    /// raw EGL and window-system pointers, keeping `GpuSurface` on the
+    /// The GL arm's swapchain: a GLX or EGL window surface (the shipped Linux
+    /// build; raw GL and window-system handles, keeping `GpuSurface` on the
     /// attaching thread, as the Metal swapchain does), or a WebGL2 canvas.
     #[cfg(all(gl_arm, not(wgpu_arm)))]
     gl: Option<crate::gl::WindowSurface>,
@@ -4935,8 +4935,8 @@ impl GpuSurface {
         if self.metal.is_some() {
             return None;
         }
-        // A synchronized EGL swap (interval 1) queues behind the frame on
-        // glass; an unsynchronized one never waits.
+        // A synchronized GLX or EGL swap (interval 1) queues behind the frame
+        // on glass; an unsynchronized one never waits.
         #[cfg(all(gl_arm, not(wgpu_arm)))]
         if let Some(gl) = self.gl.as_ref() {
             return gl.synced().then_some(1);
@@ -6561,7 +6561,8 @@ pub struct GpuRenderer {
     #[cfg(gl_arm)]
     last_frame_arm_gl: bool,
     // The GL arm's injected-loss drill: `ATERM_GL_INJECT_LOSS=<n>` (parsed at
-    // construct). After the n-th successful GL present, the device's next
+    // construct). After the n-th successful GL present, a GLX device's next
+    // present reads a reset from its reset check, and an EGL device's next
     // `eglMakeCurrent` answers `EGL_CONTEXT_LOST`, so the latch, `device_lost`
     // and the frontend's CPU fallback run end to end. `None` normally.
     #[cfg(gl_arm)]
@@ -9637,8 +9638,9 @@ impl GpuRenderer {
     /// downgrade to the CPU backend.
     #[inline]
     pub fn device_lost(&self) -> bool {
-        // The GL arm's latch: EGL reported `EGL_CONTEXT_LOST` (in a browser,
-        // the WebGL2 context was lost).
+        // The GL arm's latch: EGL reported `EGL_CONTEXT_LOST`, a GLX context
+        // was reset or its window kept refusing its bind (in a browser, the
+        // WebGL2 context was lost).
         #[cfg(gl_arm)]
         if self
             .gl_arm
@@ -9654,15 +9656,22 @@ impl GpuRenderer {
     #[must_use]
     pub fn device_loss_reason(&self) -> Option<String> {
         #[cfg(gl_arm)]
-        if self
-            .gl_arm
-            .as_ref()
-            .is_some_and(|live| live.dev.shared().lost())
-        {
+        if let Some(live) = self.gl_arm.as_ref().filter(|live| live.dev.shared().lost()) {
             #[cfg(target_arch = "wasm32")]
-            return Some("webglcontextlost (the WebGL2 context was lost)".to_owned());
+            {
+                let _ = live;
+                return Some("webglcontextlost (the WebGL2 context was lost)".to_owned());
+            }
+            // The latch's own cause: an EGL or GL error, a GLX reset status,
+            // a GLX window GLX kept refusing.
             #[cfg(not(target_arch = "wasm32"))]
-            return Some("EGL_CONTEXT_LOST (the GL context was lost)".to_owned());
+            return Some(
+                live.dev
+                    .shared()
+                    .loss_reason()
+                    .unwrap_or("EGL_CONTEXT_LOST (the GL context was lost)")
+                    .to_owned(),
+            );
         }
         self.ctx.device_loss_reason()
     }
@@ -13809,7 +13818,8 @@ impl GpuRenderer {
                 .ok_or("no AppKit view layer to attach the Metal swapchain under")?;
             self.attach_metal_window_surface(parent, format, width, height)
         }
-        // The shipped Linux build: the GL arm's EGL window surface.
+        // The shipped Linux build: the GL arm's window surface (GLX on X11,
+        // EGL on Wayland).
         #[cfg(all(not(wgpu_arm), gl_arm))]
         {
             self.gl_create_window_surface(target, width, height)
@@ -25688,8 +25698,9 @@ impl<T> WindowTarget for T where T: aterm_objc::HasNsView + Send + Sync + 'stati
 /// A window a GPU backend can attach a swapchain to.
 ///
 /// On Linux that is the window's X11 or Wayland handles
-/// ([`aterm_types::native_window::HasNativeWindow`]): the GL arm makes its EGL
-/// window surface on them, and the wgpu-oracle arm hands wgpu the same handles
+/// ([`aterm_types::native_window::HasNativeWindow`]): the GL arm makes its
+/// window surface on them (a `GLXWindow` on X11, an EGL surface on Wayland),
+/// and the wgpu-oracle arm hands wgpu the same handles
 /// (`NativeSurfaceTarget`). Naming no handle crate keeps raw-window-handle out
 /// of the shipped Linux graph (docs/AUDIT-third-party-2026-10-15.md,
 /// winit-core step 6, the Linux half).

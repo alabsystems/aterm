@@ -70,6 +70,7 @@ pub enum Program {
 /// Each program's successor in declaration order, `None` after the last: an
 /// exhaustive match, so a variant added to [`Program`] does not compile until
 /// it is placed here, and the walk below holds [`Program::ALL`] to this chain.
+#[inline]
 const fn next_program(p: Program) -> Option<Program> {
     match p {
         Program::Claude => Some(Program::Codex),
@@ -111,6 +112,7 @@ impl Program {
     ];
 
     /// The lowercase word the CLI prints.
+    #[inline]
     #[must_use]
     pub const fn name(self) -> &'static str {
         match self {
@@ -129,6 +131,7 @@ impl Program {
     /// so a sentence that names it still reads) — the one display name
     /// there, so a message, a status line and a settings row name an agent
     /// alike. The primer and atpkg keep their own "Codex CLI".
+    #[inline]
     #[must_use]
     pub const fn product(self) -> &'static str {
         match self {
@@ -154,8 +157,9 @@ impl Program {
     /// is shown, never supervised, and codex-alab supervises itself, the
     /// window watching beside it. What has a `[harness.<agent>]` table is
     /// [`Program::harness_table`].
+    #[inline]
     #[must_use]
-    pub fn supervisable(self) -> bool {
+    pub const fn supervisable(self) -> bool {
         match self {
             Program::Claude | Program::Agy | Program::Muse | Program::Gemini => true,
             Program::Codex | Program::Generic => false,
@@ -167,8 +171,9 @@ impl Program {
     /// ([`Program::supervisable`]) and Codex, whose table codex-alab reads as
     /// its own policy (`harness policy`'s `agent-off`) while the window
     /// watches beside it. Never the generic reader.
+    #[inline]
     #[must_use]
-    pub fn harness_table(self) -> bool {
+    pub const fn harness_table(self) -> bool {
         match self {
             Program::Claude | Program::Codex | Program::Agy | Program::Muse | Program::Gemini => {
                 true
@@ -178,6 +183,7 @@ impl Program {
     }
 
     /// This program's reader.
+    #[inline]
     #[must_use]
     pub fn reader(self) -> &'static dyn ScreenReader {
         match self {
@@ -409,6 +415,22 @@ pub trait ScreenReader: Sync {
     /// reads_turn_whole`).
     fn bounds_messages(&self) -> bool {
         true
+    }
+    /// THE ROWS WHOSE CELLS BOUND THE LAST MESSAGE where its text does not
+    /// ([`Self::bounds_messages`] `false`): `(its caret row, the blank rows
+    /// under it to read, top down)` — a row drawn in the caret row's style
+    /// from column 0 is the message's own, and the first that is not ends
+    /// it ([`agy::message_blanks`], measured). `None` by default: the text
+    /// bounds every message.
+    fn message_blanks(&self, _rows: &[String]) -> Option<(usize, Vec<usize>)> {
+        None
+    }
+    /// `rows` with the blank rows `inner` that a read of the cells found to
+    /// be the message's own ([`Self::message_blanks`]) taken out of the
+    /// message whose caret row is `caret`, the rows under it keeping their
+    /// index ([`agy::fold_message`]). `rows` as they are by default.
+    fn fold_message(&self, rows: &[String], _caret: usize, _inner: &[usize]) -> Vec<String> {
+        rows.to_vec()
     }
     /// A MESSAGE STANDS ON `rows`: a person's message (or one typed for
     /// them) in the transcript, answered or not, with words under it or
@@ -819,10 +841,17 @@ impl ScreenReader for AgyReader {
     }
     /// agy draws a message's blank line as a blank row, the rows under it
     /// two columns in as a reply's, and every row of a message past its
-    /// first two columns in: nothing on its screen tells them from a reply's
-    /// ([`crate::agy`]'s A MESSAGE'S BLANK LINE).
+    /// first two columns in: nothing in its text tells them from a reply's
+    /// ([`crate::agy`]'s A MESSAGE'S BLANK LINE); its cells do.
     fn bounds_messages(&self) -> bool {
         false
+    }
+    /// Its cells do (measured): [`agy::message_blanks`].
+    fn message_blanks(&self, rows: &[String]) -> Option<(usize, Vec<usize>)> {
+        agy::message_blanks(rows)
+    }
+    fn fold_message(&self, rows: &[String], caret: usize, inner: &[usize]) -> Vec<String> {
+        agy::fold_message(rows, caret, inner)
     }
     fn interrupted(&self, rows: &[String]) -> bool {
         agy::interrupted(rows)

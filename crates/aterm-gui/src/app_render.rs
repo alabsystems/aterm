@@ -1317,28 +1317,6 @@ pub(crate) fn cursor_cat_presentation_enabled(
     collection_hello || (animate_cat && ordinary_kitty_cursor_enabled(cursor_trail_enabled, style))
 }
 
-/// The flying head's live drawn rect in grid pixels `(x0, x1, y0, y1)`, for
-/// the ambient word-cats' pixel yield. Pure:
-/// [`crate::word_decorations::WordDecorations::kitty_cursor_footprint`] takes
-/// `&self`, latches nothing and equals the emitter's own placement (debug
-/// asserted), so it may run before the word tick, where the yield box is needed.
-pub(crate) fn flying_head_footprint_px(
-    word_decos: &crate::word_decorations::WordDecorations,
-    geom: crate::word_decorations::EffectGeom,
-    cell: (u16, u16),
-    look: aterm_effects::kitty_registry::KittyLook,
-    bob: f32,
-) -> Option<(i32, i32, i32, i32)> {
-    let fp = word_decos.kitty_cursor_footprint(crate::word_decorations::KittyCursorLayout {
-        geom,
-        cursor: cell,
-        look,
-        bob,
-        lift: 0.0,
-    })?;
-    Some((fp.x, fp.x + i32::from(fp.w), fp.y, fp.y + i32::from(fp.h)))
-}
-
 /// Reserve what the host splices into the pane after the console observation,
 /// by what it is on the glass ([`aterm_effects::pet_world::PetReserve`]).
 /// Pure geometry: prediction expiry/reconciliation remains on its existing
@@ -1828,7 +1806,7 @@ pub(crate) fn route_v2_companion(
     geom: aterm_effects::word_decorations::EffectGeom,
     cat_frame: &mut crate::kitty_cursor::CatFrame,
     animate: bool,
-) -> f32 {
+) -> aterm_effects::pipeline::FlyingSeat {
     let cells: &[Vec<RenderCell>] = match ink {
         CompanionInk::Single => &ws.input_scratch.cells,
         CompanionInk::Composed => &ws.composed_focus_scratch.cells,
@@ -1845,7 +1823,161 @@ mod v2_companion_router_tests;
 #[path = "app_render_escort_caret_tests.rs"]
 mod escort_caret_tests;
 
-/// Emit the cursor-owned companion sprites for a single-grid frame.
+/// The cursor companion routed for one frame ([`route_v2_companion`]): the
+/// duty, the cat frame with the route's beats and seat lead on it, and the
+/// flying head's seat. Routed before the frame's word pass, so the ambient
+/// word-cats yield to the head where it is drawn ([`Self::on_glass`]), and
+/// emitted after it.
+#[derive(Clone, Copy)]
+pub(crate) struct RoutedCompanion {
+    pub(crate) duty: CompanionDuty,
+    pub(crate) cat_frame: crate::kitty_cursor::CatFrame,
+    pub(crate) seat: aterm_effects::pipeline::FlyingSeat,
+    placement: Option<aterm_effects::word_decorations::KittyCursorPlacement>,
+}
+
+impl RoutedCompanion {
+    /// What the ambient word-cats yield to this frame
+    /// ([`cursor_companion_on_glass`]): the flying head's prepared animated
+    /// draw rectangle, the pet by its live body.
+    pub(crate) fn on_glass(
+        &self,
+        cursor: Option<(u16, u16)>,
+        pet_body_px: Option<(i32, i32, i32, i32)>,
+    ) -> Option<aterm_effects::word_decorations::CompanionOnGlass> {
+        cursor_companion_on_glass(
+            self.duty,
+            cursor,
+            self.placement
+                .and_then(|placement| placement.drawn_footprint())
+                .map(|rect| {
+                    (
+                        rect.x,
+                        rect.x.saturating_add(i32::from(rect.w)),
+                        rect.y,
+                        rect.y.saturating_add(i32::from(rect.h)),
+                    )
+                }),
+            pet_body_px,
+        )
+    }
+}
+
+/// Prepare the exact animated head placement once. The word pass reads its
+/// rectangle and the emitter consumes the same value, so neither advances the
+/// follower a second time. Palette sampling keeps the logical target.
+fn prepare_routed_head(
+    ws: &mut WindowState,
+    geom: crate::word_decorations::EffectGeom,
+    duty: CompanionDuty,
+    cat_frame: crate::kitty_cursor::CatFrame,
+    seat: aterm_effects::pipeline::FlyingSeat,
+    now: Instant,
+) -> Option<aterm_effects::word_decorations::KittyCursorPlacement> {
+    let CompanionDuty::FlyingHead { cell } = duty else {
+        return None;
+    };
+    let layout = aterm_effects::word_decorations::KittyCursorLayout {
+        geom,
+        cursor: cell,
+        look: cat_frame.render_look(),
+        bob: cat_frame.bob,
+        lift: seat.lift,
+    };
+    let motion = ws.fx.companions_mut().cursor_cat.placement_frame(now);
+    ws.fx
+        .decos_mut()
+        .prepare_kitty_cursor_placement(layout, motion, cat_frame.pose)
+}
+
+/// Route the single grid's cursor companion for this frame
+/// ([`route_v2_companion`], called for every duty: the impulse is consumed
+/// even on an idle or pet frame). One body, one match ([`CompanionDuty`]): a
+/// seam that set both alphas cannot draw two companions.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the companion's custody inputs and the frame it routes"
+)]
+pub(crate) fn route_single_cursor_companion(
+    ws: &mut WindowState,
+    geom: crate::word_decorations::EffectGeom,
+    cursor: Option<(u16, u16)>,
+    pet: &aterm_effects::companion::CompanionFrame,
+    mut cat_frame: crate::kitty_cursor::CatFrame,
+    animate_head: bool,
+    kitty_alpha: u8,
+    now: Instant,
+) -> RoutedCompanion {
+    let duty = cursor_companion_duty(pet.on_glass, kitty_alpha, cursor);
+    let seat = route_v2_companion(
+        ws,
+        CompanionInk::Single,
+        duty,
+        now,
+        geom,
+        &mut cat_frame,
+        animate_head,
+    );
+    let placement = prepare_routed_head(ws, geom, duty, cat_frame, seat, now);
+    RoutedCompanion {
+        duty,
+        cat_frame,
+        seat,
+        placement,
+    }
+}
+
+/// Emit the cursor-owned companion sprites for a single-grid frame with no
+/// word pass between its route and its emission: [`route_single_cursor_companion`]
+/// then [`emit_routed_cursor_companion`]. A frame that runs the word pass
+/// routes first and emits after it.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one resolved companion frame carries geometry, palette, motion and custody inputs"
+)]
+pub(crate) fn emit_single_cursor_companion(
+    ws: &mut WindowState,
+    geom: crate::word_decorations::EffectGeom,
+    cursor: Option<(u16, u16)>,
+    pet: &aterm_effects::companion::CompanionFrame,
+    present: bool,
+    cat_frame: crate::kitty_cursor::CatFrame,
+    animate_head: bool,
+    kitty_alpha: u8,
+    now: Instant,
+    notes_reduced: bool,
+    default_bg: u32,
+    cursor_color: u32,
+    accent: u32,
+) -> u64 {
+    let routed = route_single_cursor_companion(
+        ws,
+        geom,
+        cursor,
+        pet,
+        cat_frame,
+        animate_head,
+        kitty_alpha,
+        now,
+    );
+    emit_routed_cursor_companion(
+        ws,
+        geom,
+        pet,
+        present,
+        routed,
+        kitty_alpha,
+        now,
+        notes_reduced,
+        default_bg,
+        cursor_color,
+        accent,
+    )
+}
+
+/// Emit the cursor-owned companion sprites for a single-grid frame, as
+/// routed ([`RoutedCompanion`]): the seat's lift rides the layout, where the
+/// follower glides it, and the route's beats and lead ride the frame copy.
 ///
 /// `WordDecorations` supplies the shared atlas and bakers, but Sparkle Words
 /// does not own this lifecycle. Keeping the emission in a config-free helper
@@ -1859,14 +1991,12 @@ mod escort_caret_tests;
     clippy::too_many_arguments,
     reason = "one resolved companion frame carries geometry, palette, motion and custody inputs"
 )]
-pub(crate) fn emit_single_cursor_companion(
+pub(crate) fn emit_routed_cursor_companion(
     ws: &mut WindowState,
     geom: crate::word_decorations::EffectGeom,
-    cursor: Option<(u16, u16)>,
     pet: &aterm_effects::companion::CompanionFrame,
     present: bool,
-    mut cat_frame: crate::kitty_cursor::CatFrame,
-    animate_head: bool,
+    routed: RoutedCompanion,
     kitty_alpha: u8,
     now: Instant,
     notes_reduced: bool,
@@ -1875,21 +2005,13 @@ pub(crate) fn emit_single_cursor_companion(
     accent: u32,
 ) -> u64 {
     let mut fp = 0;
-    // One body, one match ([`CompanionDuty`]): a seam that set both alphas
-    // cannot draw two companions.
-    let duty = cursor_companion_duty(pet.on_glass, kitty_alpha, cursor);
-    // The companion seam ([`route_v2_companion`]), before either body is drawn,
-    // so the impulse and the seat land on the frame copy the arms below emit
-    // (the seat's lift rides the layout, where the follower glides it).
-    let seat_lift = route_v2_companion(
-        ws,
-        CompanionInk::Single,
+    let RoutedCompanion {
         duty,
-        now,
-        geom,
-        &mut cat_frame,
-        animate_head,
-    );
+        cat_frame,
+        seat,
+        placement,
+    } = routed;
+    let seat_lift = seat.lift;
     if let CompanionDuty::Pet = duty {
         fp ^= emit_resident_pet(
             ws,
@@ -1914,12 +2036,7 @@ pub(crate) fn emit_single_cursor_companion(
             bob: cat_frame.bob,
             lift: seat_lift,
         };
-        let placement_frame = ws.fx.companions_mut().cursor_cat.placement_frame(now);
-        if let Some(placement) = ws
-            .fx
-            .decos_mut()
-            .resolve_kitty_cursor_placement(layout, placement_frame)
-        {
+        if let Some(placement) = placement {
             let colors = ws
                 .fx
                 .companions_mut()
@@ -4826,6 +4943,29 @@ pub(crate) struct ComposeDecoCtx<'a> {
     pub(crate) accent: u32,
     pub(crate) cursor_color: u32,
     pub(crate) now: Instant,
+}
+
+/// The focused pane's effect geometry for its cursor companion: the route's
+/// seat law and the word-cats' yield box read the same one. No focused pane
+/// is a geometry-less one (the route then seats nothing).
+fn composed_companion_geom(
+    ctx: &ComposeDecoCtx<'_>,
+    focus_place: Option<PanePlace>,
+) -> crate::word_decorations::EffectGeom {
+    focus_place.map_or(
+        crate::word_decorations::EffectGeom {
+            cell_w: 0,
+            cell_h: 0,
+            rows: 0,
+            cols: 0,
+        },
+        |place| crate::word_decorations::EffectGeom {
+            cell_w: ctx.cell_w as u16,
+            cell_h: ctx.cell_h as u16,
+            rows: place.rows,
+            cols: place.cols,
+        },
+    )
 }
 
 /// One wallpaper cover-scale generation for one window (see
@@ -12803,6 +12943,12 @@ impl App {
         // report it from the frame whose presentation was just acknowledged.
         self.report_native_ime_cursor_area(id, presented_plan);
 
+        // A native page this frame moved under a still pointer (a wheel, a
+        // page key, another page) is hovered where the pointer now is.
+        if !matches!(route, SuccessfulPresentRoute::Terminal) {
+            self.refresh_native_hover_for_frame(id);
+        }
+
         // A terminal sibling takes the anchor back when focus leaves a native
         // field. Mixed frames bypass the terminal-only reporters, and their
         // composite already includes pane offset, chrome rows and any IME caret
@@ -13315,6 +13461,39 @@ impl App {
 
     pub(crate) fn redraw_window(&mut self, id: WindowId) {
         self.redraw_window_with_layout(id, None, None);
+    }
+
+    /// A paint the window system asked for (`WindowEvent::RedrawRequested`)
+    /// owes a present even when the frame is unchanged, when the CPU surface
+    /// says the window holds pixels no present reached (on Windows, rows the
+    /// window gained after its last present, still in its update region):
+    /// winit validates the window once the event returns, and the early-out
+    /// would leave them as Windows left them. Raised as a recovery edge, as a
+    /// `Resized` raises one; the present then draws the owed region from the
+    /// retained frame.
+    ///
+    /// On X11 a paint the server asked for (`Expose`,
+    /// [`crate::platform::redraw_is_exposure`]) owes the whole window: the
+    /// server lost what it showed (a VT switch, a driver's video-memory purge,
+    /// a compositor's unredirection), and no cache here knows it. The raster
+    /// caches go, so the present repaints and copies in full, raised as the
+    /// same recovery edge.
+    pub(crate) fn note_owed_repaint(&mut self, id: WindowId) {
+        if crate::platform::redraw_is_exposure()
+            && let Some(ws) = self.windows.get_mut(&id)
+        {
+            ws.invalidate_raster_caches();
+            let _ = ws.present_retry.on_external_stimulus();
+            ws.present_retry.recovery_redraw_outstanding = true;
+            return;
+        }
+        if let Some(ws) = self.windows.get_mut(&id)
+            && let Some(PresentTarget::Cpu { surface }) = ws.present.as_ref()
+            && crate::present::CpuPresenter::owes_repaint(surface)
+        {
+            let _ = ws.present_retry.on_external_stimulus();
+            ws.present_retry.recovery_redraw_outstanding = true;
+        }
     }
 
     /// [`Self::redraw_window`] with `frame_started` (the word pass's rescan and
@@ -14506,12 +14685,6 @@ impl App {
             // the impulse slot. Single pane: its world is the window grid.
             ws.fx
                 .offer_pet_v2(&pet.pet, glow_geom, (0, 0), frame_started);
-            let pet_on_glass = pet.on_glass;
-            // The frame's one companion ([`CompanionDuty`]), read by both the
-            // word-cats' yield box and [`emit_single_cursor_companion`], so the
-            // avoided rect is the drawn sprite. The head escorts `escort` through a
-            // DECTCEM hide.
-            let companion_duty = cursor_companion_duty(pet_on_glass, kitty_alpha, escort);
             let glow_fp = glow_fp ^ if kitty_alpha > 0 { cat_frame.fp() } else { 0 };
             // (The cat's exit flourish is emitted after the `glow_halo` refill:
             // its light-theme arm is a source-over veil in that stream.)
@@ -14532,6 +14705,21 @@ impl App {
             // budget but not a master switch: clear the host channels and open the
             // shared frame before the optional word pass.
             ws.fx.open_words();
+            // The frame's one companion ([`CompanionDuty`]), routed before the
+            // word pass ([`route_single_cursor_companion`]): the word-cats' yield
+            // box is the head at the seat it is drawn at, and the emission below
+            // draws what was routed. The head escorts `escort` through a DECTCEM
+            // hide.
+            let routed = route_single_cursor_companion(
+                ws,
+                effect_geom,
+                escort,
+                &pet,
+                cat_frame,
+                animate_cat,
+                kitty_alpha,
+                frame_started,
+            );
             let mut deco_fp = if let Some(rs) = self.sparkle.as_ref() {
                 if deco_suspend {
                     // Alt-screen suppression or load shed: no decoration CPU while
@@ -14553,22 +14741,8 @@ impl App {
                     let tick_cfg = reduced_cfg.as_ref().unwrap_or(&rs.cfg);
                     // One companion per caret: the animal on screen claims its cell
                     // so the scanner does not peek a second cat there (the flying
-                    // head by its real rect, the pet by its live drawn body).
-                    let companion_at = cursor_companion_on_glass(
-                        companion_duty,
-                        escort,
-                        match companion_duty {
-                            CompanionDuty::FlyingHead { cell } => flying_head_footprint_px(
-                                ws.fx.decos(),
-                                effect_geom,
-                                cell,
-                                cat_frame.render_look(),
-                                cat_frame.bob,
-                            ),
-                            _ => None,
-                        },
-                        pet.body_px,
-                    );
+                    // head by its rect at its seat, the pet by its live drawn body).
+                    let companion_at = routed.on_glass(escort, pet.body_px);
                     // The grid's word pass
                     // ([`aterm_effects::pipeline::EffectsPipeline::word_grid`]):
                     // thaw, rescan the snapshot extracted under this hold when due
@@ -14737,16 +14911,14 @@ impl App {
                 // shared placement and atlas warm for the cursor companion below.
                 0
             };
-            deco_fp ^= emit_single_cursor_companion(
+            deco_fp ^= emit_routed_cursor_companion(
                 ws,
                 effect_geom,
-                escort,
                 &pet,
                 // The drawn present — the one caller allowed to spend a
                 // hello (both capture splices pass `false`).
                 true,
-                cat_frame,
-                animate_cat,
+                routed,
                 kitty_alpha,
                 frame_started,
                 !animate_cat,
@@ -15672,7 +15844,7 @@ impl App {
     /// Recover from a GPU device loss (driver install/update, TDR reset, eGPU
     /// unplug), latched on [`aterm_gpu::GpuRenderer::device_lost`]. Otherwise
     /// every `get_current_texture()` returns `Lost` and windows freeze. Downgrades
-    /// the whole app to the CPU softbuffer backend, the same fallback
+    /// the whole app to the CPU backend, the same fallback
     /// `attach_os_window` uses when GPU surface creation fails. Idempotent.
     fn recover_from_gpu_loss(
         &mut self,
@@ -15763,7 +15935,7 @@ impl App {
         self.use_gpu = false;
         metrics::set_backend_gpu(false);
         self.pin_backend_render_config_core();
-        // Rebuild each window's present target as a CPU softbuffer over the live
+        // Rebuild each window's present target as a CPU surface over the live
         // OS window, dropping the dead swapchain (mirrors `attach_os_window`'s CPU
         // arm). A window whose surface cannot be built yet stays targetless in the
         // bounded retry scheduler, which re-enters `ensure_cpu_present_target`.
@@ -15772,7 +15944,7 @@ impl App {
         for wid in wids {
             let window = self.windows.get(&wid).and_then(|ws| ws.os_window.clone());
             if let Some(window) = &window {
-                // Translucency is native window state, and CPU softbuffer is
+                // Translucency is native window state, and a CPU surface is
                 // opaque: remove any blur view, restore opacity and theme fill,
                 // and reassert the CPU colour-space contract before the first frame.
                 self.apprt.window_set_vibrancy(
@@ -16005,6 +16177,13 @@ impl App {
             hand_fx_prefetch(&mut ws.fx_prefetch_pending, &mut ws.input_scratch);
         }
         let result = self.present_input_scratch_inner(id, invert, overlay);
+        // Right after the swap, before the follow-up work: an X11 window manager
+        // holding a resize until the window draws its new size releases it now.
+        if matches!(result, Ok(Some(_)))
+            && let Some(window) = self.windows.get(&id).and_then(|ws| ws.os_window.as_ref())
+        {
+            self.apprt.window_frame_presented(window);
+        }
         if let Some(ws) = self.windows.get_mut(&id) {
             settle_fx_prefetch(
                 &mut ws.fx_prefetch_pending,
@@ -16280,13 +16459,13 @@ impl App {
             let fh = crate::visible_frame_height(raw_fh, ws.metrics.pad, ws.metrics.pad_top);
             // On a sub-row frame the present scratch is translated (band shifted,
             // incoming row in its strip); present those pixels, not the damage
-            // cache. Needs a softbuffer surface, so no headless test reaches it:
+            // cache. Needs a CPU surface, so no headless test reaches it:
             // `aterm-render`'s `incoming_row_apron` pins the accessor and
             // `cpu_present_needs_full_copy` the copy decision.
             let pixels = ws.cpu_cache.presented_pixels();
             let translated = ws.cpu_cache.last_translated();
             let translated_prev = ws.cpu_cache.presented_translated();
-            // Like the GPU blit: the softbuffer surface is the raw window size
+            // Like the GPU blit: the CPU surface is the raw window size
             // (`win_px`), the frame lands at the centred band offset, and the
             // sub-cell remainder bands take the live terminal background, so the
             // compositor never rescales. Headless / pre-attach uses the frame dims.
@@ -17580,6 +17759,10 @@ impl App {
             cell_h: ctx.cell_h,
         };
         let companion_focus_place = ctx.panes.get(ctx.focus_index).map(|(r, _)| place_of(r));
+        // The companion seam before the word pass
+        // ([`Self::route_composed_companion`]): the word-cats yield to the head
+        // at the seat it is drawn at.
+        let routed = self.route_composed_companion(wid, ctx, companion_focus_place);
         let Some(rs) = self.sparkle.as_ref() else {
             {
                 let Some(ws) = self.windows.get_mut(&wid) else {
@@ -17591,7 +17774,7 @@ impl App {
             }
             // The config-admission edge already cleared word episodes; the shared
             // renderer stays live so the cursor companion can use its atlas.
-            return self.compose_cursor_companion(wid, ctx, companion_focus_place);
+            return self.compose_cursor_companion(wid, ctx, companion_focus_place, routed);
         };
         let (deco_cfg, lexicon) = (&rs.cfg, rs.lexicon.as_ref());
         // Fold the MotionPolicy into the engine's `reduced_motion` seam as on the
@@ -17615,32 +17798,10 @@ impl App {
         ws.fx
             .retain_word_panes(|s| ctx.panes.iter().any(|(r, _)| r.session == s));
         // One companion per caret, in the focused pane's pixel space: the animal on
-        // glass claims its cell, the flying head its real rect and the pet its
-        // live body, at the caret they escort.
-        let companion_at = companion_focus_place.and_then(|place| {
-            let duty = cursor_companion_duty(ctx.pet.on_glass, ctx.kitty_alpha, ctx.escort_caret);
-            let geom = crate::word_decorations::EffectGeom {
-                cell_w: ctx.cell_w as u16,
-                cell_h: ctx.cell_h as u16,
-                rows: place.rows,
-                cols: place.cols,
-            };
-            cursor_companion_on_glass(
-                duty,
-                ctx.escort_caret,
-                match duty {
-                    CompanionDuty::FlyingHead { cell } => flying_head_footprint_px(
-                        ws.fx.decos(),
-                        geom,
-                        cell,
-                        ctx.cat_frame.render_look(),
-                        ctx.cat_frame.bob,
-                    ),
-                    _ => None,
-                },
-                ctx.pet.body_px,
-            )
-        });
+        // glass claims its cell, the flying head its rect at its seat and the pet
+        // its live body, at the caret they escort.
+        let companion_at =
+            companion_focus_place.and_then(|_| routed.on_glass(ctx.escort_caret, ctx.pet.body_px));
         let resize_quiet = ws.resize_sound_quiet(ctx.now);
         let (fx, focus_snapshot, background_snapshots) = (
             &mut ws.fx,
@@ -17732,7 +17893,7 @@ impl App {
             ws.pending_deco_birth = None;
         }
         let mut fp = out.fp;
-        fp ^= self.compose_cursor_companion(wid, ctx, companion_focus_place);
+        fp ^= self.compose_cursor_companion(wid, ctx, companion_focus_place, routed);
         fp ^= self.compose_typed_dog(wid, ctx, out.focus_place);
         fp
     }
@@ -17880,51 +18041,78 @@ impl App {
         fp
     }
 
+    /// Route a composed frame's cursor companion ([`route_v2_companion`]),
+    /// called for every duty (the impulse is consumed even on an idle or pet
+    /// frame) at the focused pane's geometry and snapshot, before the word
+    /// pass and before the pet or head is emitted. [`CompanionDuty`] is the
+    /// one-companion custody gate as a value, matched here and on the
+    /// single-pane path.
+    fn route_composed_companion(
+        &mut self,
+        wid: WindowId,
+        ctx: &ComposeDecoCtx<'_>,
+        focus_place: Option<PanePlace>,
+    ) -> RoutedCompanion {
+        let duty = cursor_companion_duty(ctx.pet.on_glass, ctx.kitty_alpha, ctx.escort_caret);
+        let mut cat_frame = ctx.cat_frame;
+        let router_geom = composed_companion_geom(ctx, focus_place);
+        let mut placement = None;
+        let seat = self.windows.get_mut(&wid).map_or_else(
+            aterm_effects::pipeline::FlyingSeat::default,
+            |ws| {
+                if let Some(place) = focus_place {
+                    ws.fx.decos_mut().bind_pane(
+                        ctx.focus,
+                        (
+                            i32::from(place.col_off) * ctx.cell_w as i32,
+                            i32::from(place.row_off) * ctx.cell_h as i32,
+                        ),
+                    );
+                }
+                let seat = route_v2_companion(
+                    ws,
+                    CompanionInk::Composed,
+                    duty,
+                    ctx.now,
+                    router_geom,
+                    &mut cat_frame,
+                    ctx.animate_cat,
+                );
+                placement = prepare_routed_head(ws, router_geom, duty, cat_frame, seat, ctx.now);
+                seat
+            },
+        );
+        RoutedCompanion {
+            duty,
+            cat_frame,
+            seat,
+            placement,
+        }
+    }
+
     /// The cursor companion on a composed frame: one per window, riding the
-    /// focused pane's caret. [`kitty_cursor::CursorCat`] holds no grid
-    /// coordinates and is fed by the keystream, which only reaches the focused
-    /// pane, so a background pane's companion could never be earned.
+    /// focused pane's caret, as routed ([`Self::route_composed_companion`]).
+    /// [`kitty_cursor::CursorCat`] holds no grid coordinates and is fed by the
+    /// keystream, which only reaches the focused pane, so a background pane's
+    /// companion could never be earned.
     fn compose_cursor_companion(
         &mut self,
         wid: WindowId,
         ctx: &ComposeDecoCtx<'_>,
         focus_place: Option<PanePlace>,
+        routed: RoutedCompanion,
     ) -> u64 {
         // The pet rides the focused pane like the flying kitty: emitted at that
         // pane's geometry into the pane staging channel, then placed by the
         // translate/crop law. Its brain was already ticked for this present, so
-        // this is pure emission. [`CompanionDuty`] is the one-companion custody
-        // gate as a value, matched here and on the single-pane path.
-        let duty = cursor_companion_duty(ctx.pet.on_glass, ctx.kitty_alpha, ctx.escort_caret);
-        // The companion seam ([`route_v2_companion`]), called for every duty (the
-        // impulse is consumed even on an idle or pet frame) at the focused pane's
-        // geometry and snapshot, before the pet or head is emitted.
-        let mut cat_frame = ctx.cat_frame;
-        let router_geom = focus_place.map_or(
-            crate::word_decorations::EffectGeom {
-                cell_w: 0,
-                cell_h: 0,
-                rows: 0,
-                cols: 0,
-            },
-            |place| crate::word_decorations::EffectGeom {
-                cell_w: ctx.cell_w as u16,
-                cell_h: ctx.cell_h as u16,
-                rows: place.rows,
-                cols: place.cols,
-            },
-        );
-        let seat_lift = self.windows.get_mut(&wid).map_or(0.0, |ws| {
-            route_v2_companion(
-                ws,
-                CompanionInk::Composed,
-                duty,
-                ctx.now,
-                router_geom,
-                &mut cat_frame,
-                ctx.animate_cat,
-            )
-        });
+        // this is pure emission.
+        let RoutedCompanion {
+            duty,
+            cat_frame,
+            seat,
+            placement,
+        } = routed;
+        let seat_lift = seat.lift;
         let cell = match duty {
             CompanionDuty::Pet => return self.compose_pet_companion(wid, ctx, focus_place),
             CompanionDuty::Idle => return 0,
@@ -17962,12 +18150,7 @@ impl App {
             bob: cat_frame.bob,
             lift: seat_lift,
         };
-        let placement_frame = ws.fx.companions_mut().cursor_cat.placement_frame(ctx.now);
-        let Some(placement) = ws
-            .fx
-            .decos_mut()
-            .resolve_kitty_cursor_placement(layout, placement_frame)
-        else {
+        let Some(placement) = placement else {
             return 0;
         };
         let colors = match ws.fx.companions_mut().cursor_cat.episode_colors() {

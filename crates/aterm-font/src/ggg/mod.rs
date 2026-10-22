@@ -40,6 +40,7 @@ pub struct RangeRecord {
 
 impl LazyArray16<'_, RangeRecord> {
     /// Returns a [`RangeRecord`] for a glyph.
+    #[inline]
     pub fn range(&self, glyph: GlyphId) -> Option<RangeRecord> {
         self.binary_search_by(|record| {
             if glyph < record.start {
@@ -84,6 +85,7 @@ pub enum Coverage<'a> {
 }
 
 impl<'a> FromSlice<'a> for Coverage<'a> {
+    #[inline]
     fn parse(data: &'a [u8]) -> Option<Self> {
         let mut s = Stream::new(data);
         match s.read::<u16>()? {
@@ -104,11 +106,13 @@ impl<'a> FromSlice<'a> for Coverage<'a> {
 
 impl<'a> Coverage<'a> {
     /// Checks that glyph is present.
+    #[inline]
     pub fn contains(&self, glyph: GlyphId) -> bool {
         self.get(glyph).is_some()
     }
 
     /// Returns the coverage index of the glyph or `None` if it is not covered.
+    #[inline]
     pub fn get(&self, glyph: GlyphId) -> Option<u16> {
         match self {
             Self::Format1 { glyphs } => glyphs.binary_search(&glyph).map(|p| p.0),
@@ -161,6 +165,7 @@ impl<'a> ClassDefinition<'a> {
     }
 
     /// Returns the glyph class of the glyph (zero if it is not defined).
+    #[inline]
     pub fn get(&self, glyph: GlyphId) -> Class {
         match self {
             Self::Format1 { start, classes } => glyph

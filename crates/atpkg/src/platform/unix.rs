@@ -333,6 +333,86 @@ pub fn universal_control_disable() -> bool {
     }
 }
 
+/// Whether Rosetta 2's runtime file is at `runtime` ([`crate::machine::ROSETTA_RUNTIME`]):
+/// one `stat`, which runs no x86_64 code. `Ok(false)` only when `stat` says nothing is
+/// there (`ENOENT`, or `ENOTDIR` for a missing parent), or what is there is not a file;
+/// `Err` with why when it could not say.
+pub fn rosetta_present(runtime: &Path) -> Result<bool, String> {
+    match fs::metadata(runtime) {
+        Ok(meta) => Ok(meta.is_file()),
+        Err(e)
+            if matches!(
+                e.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+            ) =>
+        {
+            Ok(false)
+        }
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+/// The one Rosetta 2 install, program and arguments: `softwareupdate`'s Rosetta verb, which
+/// installs it as the user who runs it, with no administrator password and no dialog
+/// (measured 2026-10-18 and 2026-10-21 on macOS 27.0.1: uid 501, `installAuth=NO` in
+/// `/var/log/install.log`, exit 0). The census's `machines-root-door` admits this array,
+/// whole and in this file alone, as the one spelling of `softwareupdate` outside
+/// aterm-machines (owner ruling R1, docs/DESIGN-machines-2026-10-16.md).
+#[cfg(target_os = "macos")]
+const ROSETTA_INSTALL: [&str; 3] = [
+    "/usr/sbin/softwareupdate",
+    "--install-rosetta",
+    "--agree-to-license",
+];
+
+/// Install Rosetta 2 ([`ROSETTA_INSTALL`]) as this user, never through `sudo`, and wait at
+/// most `within` (killed past it). `Ok` iff it exited 0; the caller reads the runtime back.
+/// Off macOS nothing runs.
+pub fn rosetta_install(within: std::time::Duration) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    {
+        let [program, args @ ..] = ROSETTA_INSTALL;
+        let mut cmd = aterm_uds::spawnfd::command(program);
+        cmd.args(args);
+        let Some(out) = crate::doctor::output_bounded_capturing(&mut cmd, within) else {
+            return Err(format!(
+                "`softwareupdate --install-rosetta` did not start, or ran past {} s and was \
+                 stopped",
+                within.as_secs()
+            ));
+        };
+        if out.status.success() {
+            return Ok(());
+        }
+        // Its own words: the last line it wrote to stderr, else to stdout (`softwareupdate`
+        // ends on the reason), at most 200 characters of it.
+        let last_line = |bytes: &[u8]| {
+            String::from_utf8_lossy(bytes)
+                .lines()
+                .map(str::trim)
+                .rfind(|l| !l.is_empty())
+                .map(|l| l.chars().take(200).collect::<String>())
+        };
+        let said = last_line(&out.stderr)
+            .or_else(|| last_line(&out.stdout))
+            .unwrap_or_default();
+        let code = out
+            .status
+            .code()
+            .map_or_else(|| "on a signal".to_string(), |c| c.to_string());
+        Err(if said.is_empty() {
+            format!("`softwareupdate --install-rosetta` exited {code}")
+        } else {
+            format!("`softwareupdate --install-rosetta` exited {code}: {said}")
+        })
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = within;
+        Err("Rosetta 2 is a macOS install".to_string())
+    }
+}
+
 /// [`bounded_stdout`], but keeping the child's SUCCESS bit instead of folding a nonzero
 /// exit into `None`: `defaults read` uses exit 1 with empty output to mean "this key is
 /// not set", a real answer the caller must tell apart from a read that did not happen.
@@ -875,6 +955,33 @@ pub fn exit_code_like(status: std::process::ExitStatus) -> std::process::ExitCod
 #[cfg(all(test, target_os = "macos"))]
 mod tests {
     use super::*;
+
+    /// The Rosetta 2 probe is a `stat`: a file is present; nothing there, a missing
+    /// parent, a parent that is a file, or a directory at the name is missing; a parent
+    /// the probe may not search is no answer at all.
+    #[test]
+    fn the_rosetta_probe_reads_a_file_and_never_guesses_an_unsearchable_one() {
+        let root = crate::testdir::dir("atpkg-rosetta-probe-");
+        let runtime = root.join("oah").join("libRosettaRuntime");
+        assert_eq!(rosetta_present(&runtime), Ok(false), "no parent");
+        fs::create_dir_all(runtime.parent().unwrap()).unwrap();
+        assert_eq!(rosetta_present(&runtime), Ok(false), "nothing there");
+        fs::create_dir(&runtime).unwrap();
+        assert_eq!(rosetta_present(&runtime), Ok(false), "a directory");
+        fs::remove_dir(&runtime).unwrap();
+        fs::write(&runtime, b"\xcf\xfa\xed\xfe").unwrap();
+        assert_eq!(rosetta_present(&runtime), Ok(true));
+        let under_a_file = runtime.join("libRosettaRuntime");
+        assert_eq!(rosetta_present(&under_a_file), Ok(false), "ENOTDIR");
+        // An unsearchable parent: `stat` cannot say (root reads through it, so skip there).
+        let oah = runtime.parent().unwrap();
+        fs::set_permissions(oah, Permissions::from_mode(0o000)).unwrap();
+        if our_uid() != 0 {
+            assert!(rosetta_present(&runtime).is_err(), "EACCES is no answer");
+        }
+        fs::set_permissions(oah, Permissions::from_mode(0o700)).unwrap();
+        let _ = fs::remove_dir_all(&root);
+    }
 
     /// A SHARED DIRECTORY ALREADY `0755` IS NOT REWRITTEN. `ensure_shared_dir` runs on
     /// every store-lock acquisition over a system prefix, and a same-mode `chmod(2)` still

@@ -32,13 +32,15 @@ impl ObjectPath {
         }
     }
 
+    #[inline]
     #[must_use]
     pub fn as_str(&self) -> &str {
         &self.0
     }
 
     /// The decoder's constructor, for a path it has just validated.
-    pub(crate) fn checked(path: String) -> Self {
+    #[inline]
+    pub(crate) const fn checked(path: String) -> Self {
         Self(path)
     }
 }
@@ -58,13 +60,15 @@ impl Signature {
         Ok(Self(sig))
     }
 
+    #[inline]
     #[must_use]
     pub fn as_str(&self) -> &str {
         &self.0
     }
 
     /// The decoder's constructor, for a signature it has just parsed.
-    pub(crate) fn checked(sig: String) -> Self {
+    #[inline]
+    pub(crate) const fn checked(sig: String) -> Self {
         Self(sig)
     }
 }
@@ -77,15 +81,18 @@ pub struct Array {
 }
 
 impl Array {
-    pub(crate) fn checked(elem: Type, items: Vec<Value>) -> Self {
+    #[inline]
+    pub(crate) const fn checked(elem: Type, items: Vec<Value>) -> Self {
         Self { elem, items }
     }
 
+    #[inline]
     #[must_use]
-    pub fn elem(&self) -> &Type {
+    pub const fn elem(&self) -> &Type {
         &self.elem
     }
 
+    #[inline]
     #[must_use]
     pub fn items(&self) -> &[Value] {
         &self.items
@@ -101,7 +108,8 @@ pub struct Dict {
 }
 
 impl Dict {
-    pub(crate) fn checked(key: Type, value: Type, entries: Vec<(Value, Value)>) -> Self {
+    #[inline]
+    pub(crate) const fn checked(key: Type, value: Type, entries: Vec<(Value, Value)>) -> Self {
         Self {
             key,
             value,
@@ -109,22 +117,26 @@ impl Dict {
         }
     }
 
+    #[inline]
     #[must_use]
-    pub fn key(&self) -> &Type {
+    pub const fn key(&self) -> &Type {
         &self.key
     }
 
+    #[inline]
     #[must_use]
-    pub fn value(&self) -> &Type {
+    pub const fn value(&self) -> &Type {
         &self.value
     }
 
+    #[inline]
     #[must_use]
     pub fn entries(&self) -> &[(Value, Value)] {
         &self.entries
     }
 
     /// The value under the first entry whose key is the string `key`.
+    #[inline]
     #[must_use]
     pub fn get(&self, key: &str) -> Option<&Value> {
         self.entries
@@ -159,6 +171,7 @@ pub enum Value {
 
 impl Value {
     /// A variant holding `inner`.
+    #[inline]
     #[must_use]
     pub fn variant(inner: Value) -> Self {
         Self::Variant(Box::new(inner))
@@ -210,6 +223,7 @@ impl Value {
     /// # Errors
     ///
     /// [`Error::Invalid`] unless `path` is an object path.
+    #[inline]
     pub fn path(path: &str) -> Result<Self> {
         ObjectPath::new(path).map(Self::Path)
     }
@@ -263,6 +277,7 @@ impl Value {
         }
     }
 
+    #[inline]
     #[must_use]
     pub fn as_str(&self) -> Option<&str> {
         match self {
@@ -273,8 +288,9 @@ impl Value {
         }
     }
 
+    #[inline]
     #[must_use]
-    pub fn as_bool(&self) -> Option<bool> {
+    pub const fn as_bool(&self) -> Option<bool> {
         if let Self::Bool(b) = self {
             Some(*b)
         } else {
@@ -282,8 +298,9 @@ impl Value {
         }
     }
 
+    #[inline]
     #[must_use]
-    pub fn as_i32(&self) -> Option<i32> {
+    pub const fn as_i32(&self) -> Option<i32> {
         if let Self::I32(v) = self {
             Some(*v)
         } else {
@@ -291,8 +308,9 @@ impl Value {
         }
     }
 
+    #[inline]
     #[must_use]
-    pub fn as_u32(&self) -> Option<u32> {
+    pub const fn as_u32(&self) -> Option<u32> {
         if let Self::U32(v) = self {
             Some(*v)
         } else {
@@ -300,8 +318,9 @@ impl Value {
         }
     }
 
+    #[inline]
     #[must_use]
-    pub fn as_f64(&self) -> Option<f64> {
+    pub const fn as_f64(&self) -> Option<f64> {
         if let Self::F64(v) = self {
             Some(*v)
         } else {
@@ -310,6 +329,7 @@ impl Value {
     }
 
     /// The value inside a variant.
+    #[inline]
     #[must_use]
     pub fn as_variant(&self) -> Option<&Value> {
         if let Self::Variant(v) = self {
@@ -319,6 +339,7 @@ impl Value {
         }
     }
 
+    #[inline]
     #[must_use]
     pub fn as_struct(&self) -> Option<&[Value]> {
         if let Self::Struct(fields) = self {
@@ -328,6 +349,7 @@ impl Value {
         }
     }
 
+    #[inline]
     #[must_use]
     pub fn as_array(&self) -> Option<&Array> {
         if let Self::Array(a) = self {
@@ -337,6 +359,7 @@ impl Value {
         }
     }
 
+    #[inline]
     #[must_use]
     pub fn as_dict(&self) -> Option<&Dict> {
         if let Self::Dict(d) = self {
@@ -350,6 +373,7 @@ impl Value {
 macro_rules! from_scalar {
     ($($t:ty => $v:ident),* $(,)?) => {$(
         impl From<$t> for Value {
+            #[inline]
             fn from(v: $t) -> Self {
                 Self::$v(v)
             }
@@ -361,6 +385,7 @@ from_scalar!(u8 => Byte, bool => Bool, i16 => I16, u16 => U16, i32 => I32, u32 =
     i64 => I64, u64 => U64, f64 => F64, String => Str, ObjectPath => Path, Signature => Sig);
 
 impl From<&str> for Value {
+    #[inline]
     fn from(s: &str) -> Self {
         Self::Str(s.to_owned())
     }

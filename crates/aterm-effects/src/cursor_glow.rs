@@ -745,6 +745,17 @@ pub struct CursorGlow {
     /// [`Self::MAX_SPARKS`]. The emitter clears it on entry.
     comet_runs: Vec<Vec<CometSample>>,
     comet_run: Vec<CometSample>,
+    /// Whether each sample of `comet_runs` (and of `comet_run`) was laid by
+    /// typing, sample for sample: a jump's samples keep their own path in a
+    /// bed that would draw a typing run as a fixed wedge
+    /// ([`bed::BedShape::leap_path`]), so `Length`, which cuts a jump's
+    /// path, shows under the letters it crosses. Pooled as `comet_runs` is.
+    comet_typing: Vec<Vec<bool>>,
+    comet_run_typing: Vec<bool>,
+    /// Each live jump's laid path this frame, `(born, row, first col, last
+    /// col)`, its faded tail cells included: the extent a jump's bed wedge
+    /// reaches back over ([`bed::BedShape::leap_path`]). Pooled.
+    leap_spans: Vec<(Instant, u16, u16, u16)>,
     /// Reused by [`Self::emit_water`] for the deduplicated curved wake spine
     /// and its analytically derived falling beads. Keeping this resident makes
     /// the fluid path allocation-free after its first growth.

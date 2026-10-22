@@ -72,20 +72,23 @@ impl Shell {
     }
 
     /// Whether the compositor offers xdg-decoration.
-    pub fn has_decorations(&self) -> bool {
+    #[inline]
+    pub const fn has_decorations(&self) -> bool {
         self.decorations.is_some()
     }
 
     /// The `xdg_wm_base`, for a caller that makes its toplevels' objects
     /// itself (the winit fork's windows, whose configure it hears in order
     /// with their scale); live while the shell is.
-    pub fn wm_base(&self) -> Proxy {
+    #[inline]
+    pub const fn wm_base(&self) -> Proxy {
         self.wm_base
     }
 
     /// The `zxdg_decoration_manager_v1`, when the compositor offers one; live
     /// while the shell is.
-    pub fn decoration_manager(&self) -> Option<Proxy> {
+    #[inline]
+    pub const fn decoration_manager(&self) -> Option<Proxy> {
         self.decorations
     }
 }
@@ -428,7 +431,8 @@ impl<'s> Toplevel<'s> {
     }
 
     /// The `xdg_toplevel`, for the requests this helper does not wrap.
-    pub fn toplevel(&self) -> Proxy {
+    #[inline]
+    pub const fn toplevel(&self) -> Proxy {
         self.toplevel
     }
 }

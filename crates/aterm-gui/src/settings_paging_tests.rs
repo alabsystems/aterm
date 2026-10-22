@@ -367,13 +367,17 @@ fn page_keys_turn_over_exactly_what_a_screen_showed_whole() {
 }
 
 /// NO SCREEN ENDS ON BLANK GROUND UNDER A CARD IT CUTS: on every route, every
-/// screen with stops after it, at 60x20, 80x24, 102x29 and 150x48 (with no
-/// settings changed and with many), the card the list's bottom edge cuts is
-/// drawn on to the page's bottom — its room and the strip kept for a status
-/// bar — with no band of blank over 8pt under it; a screen that ends on a
-/// whole card instead ends on that card's boundary, the gap and less than
+/// screen with stops after it, at 60x20, 80x24, 102x29, 150x48 and 167x36
+/// (with no settings changed and with many), the card the list's bottom edge
+/// cuts is drawn on to the page's bottom — its room and the strip kept for a
+/// status bar — with no band of blank over 8pt under it; a screen that ends on
+/// a whole card instead ends on that card's boundary, the gap and less than
 /// [`scroll::PEEK_MIN`] of the next card under it, and the next screen starts
-/// with the next card. A list that ends on whole stops
+/// with the next card — the list's first screen only: any later one scrolls
+/// on into its first card's padding until the next card peeks in (the peek
+/// seat), where it ended on a whole card over up to 26pt of blank with
+/// nothing of the next in view (Window at 150x48 under SESSION, Appearance at
+/// 167x36 under TEXT & CONTRAST). A list that ends on whole stops
 /// ([`scroll::ListFoot::Whole`], Themes' chooser beside the demo) cuts no
 /// card and ends on its last whole stop, less than the next stop's height
 /// over the page's bottom. Judged from the paint. The hard edge used to cut a
@@ -393,6 +397,7 @@ fn no_screen_ends_on_blank_under_a_card_it_cuts() {
                 (584.0, 348.0),
                 (738.0, 418.0),
                 (1_074.0, 684.0),
+                (1_193.0, 516.0),
             ] {
                 let cx = view_cx_at(width, height);
                 let (mut runtime, instance, view) = paging_view(source, route);
@@ -488,6 +493,24 @@ fn no_screen_ends_on_blank_under_a_card_it_cuts() {
                     } else if band > plan.gap() + scroll::PEEK_MIN + 0.5 {
                         faults.push(format!(
                             "{context}: ends {band}pt above the page's bottom on a whole card"
+                        ));
+                    } else if top > 0
+                        && band > plan.gap() + 0.5
+                        && plan
+                            .peek_lack(top)
+                            .is_some_and(|(lacks, padding)| lacks <= padding + 0.01)
+                    {
+                        // THE PEEK SEAT: a screen that is not the list's
+                        // first scrolls on into its first card's padding
+                        // until the next card peeks in — where that padding
+                        // holds what the peek lacks: past it the scroll would
+                        // cut the first stop's words or controls, and the
+                        // screen ends on its card's boundary (Appearance at
+                        // 60x20: 1.5pt short of the gap's end, 14.5pt of
+                        // peek lacking under a row's 4pt of padding).
+                        faults.push(format!(
+                            "{context}: ends {band}pt above the page's bottom on a whole card, \
+                             nothing of the next in view"
                         ));
                     }
                 }
@@ -1416,7 +1439,9 @@ fn a_shared_note_heads_no_control_on_any_page() {
 /// consent note ("Saved for a copy of aterm that has its package tool.") the
 /// hard edge cuts away. That screen counts the switch, and Page Down turns to
 /// the note — never to the switch again (it did while the note was joined to
-/// it as one stop).
+/// it as one stop). Its own note is the line under its name where the name's
+/// line cannot hold its tags (Helvetica Neue's measures); where it can
+/// (Cantarell's), the row has no such line, and is drawn whole alone.
 #[test]
 fn packages_without_its_tool_turns_past_the_reroute_switch_it_drew_whole() {
     let mut service = crate::packages_screen::PackagesService::new();
@@ -1438,7 +1463,10 @@ fn packages_without_its_tool_turns_past_the_reroute_switch_it_drew_whole() {
     let (mut runtime, instance, view) = paging_view("", SettingsRoute::Packages);
     assert!(runtime.replace_settings_packages(service.state(false, true, false), 3));
     let switch = "settings/control/reroute.announce";
-    let note = "packages/detail/reroute.announce";
+    // The switch's row with its note: the row and the line under it, held
+    // together, where it has that line; else the row.
+    let row = "packages/switch-row/reroute.announce";
+    let noted = "packages/switch-row/reroute.announce/with-note";
     let whole = |runtime: &NativeRuntime| {
         let compiled = compile_settings_view(runtime, instance, view, &cx);
         let state = messages_view_state(runtime, view);
@@ -1455,7 +1483,12 @@ fn packages_without_its_tool_turns_past_the_reroute_switch_it_drew_whole() {
                     && node.rect.bottom() <= list.bottom() + 0.5
             })
         };
-        (top, plan.limit(), drawn_whole(switch) && drawn_whole(note))
+        let row = if compiled.paint.iter().any(|node| node.key.as_str() == noted) {
+            noted
+        } else {
+            row
+        };
+        (top, plan.limit(), drawn_whole(switch) && drawn_whole(row))
     };
     let mut before = whole(&runtime);
     let mut drew_it = false;
@@ -1777,99 +1810,114 @@ fn walk_screens(
 #[test]
 fn every_stop_of_a_short_window_is_whole_by_page_and_by_wheel() {
     at_each_text_scale(&[1.0, 2.0], "short windows", |scale| {
-        let mut report = Vec::new();
-        let mut faults = 0usize;
-        for source in ["", "theme = \"GitHub Light\"\n"] {
-            for route in SettingsRoute::ALL {
-                if route == SettingsRoute::Messages {
-                    continue;
+        let report = std::sync::Mutex::new(Vec::new());
+        let faults = std::sync::atomic::AtomicUsize::new(0);
+        // Each short window of each page in each theme, spread over a few
+        // threads at the rung's text size.
+        let windows = ["", "theme = \"GitHub Light\"\n"]
+            .into_iter()
+            .flat_map(|source| {
+                SettingsRoute::ALL
+                    .into_iter()
+                    .filter(|route| *route != SettingsRoute::Messages)
+                    .flat_map(move |route| {
+                        SHORT_SIZES.map(|(width, height)| (source, route, width, height))
+                    })
+            })
+            .collect::<Vec<_>>();
+        on_workers(
+            &windows,
+            "short windows",
+            |&(source, route, width, height)| {
+                let context = format!(
+                    "{route:?} {width}x{height} {scale}x{}",
+                    if source.is_empty() { "" } else { " light" }
+                );
+                let cx = view_cx_at(width, height);
+                // Tab Control with tabs open, as the narrow sweep's fleet
+                // has them: its rows are listed a line at a time.
+                let (mut runtime, instance, view) = if route == SettingsRoute::Tabs {
+                    let (mut runtime, instance, view) =
+                        super::narrow::every_page_runtime_over(source);
+                    runtime
+                        .dispatch(
+                            instance,
+                            view,
+                            AppEvent::Action(ActionInvocation {
+                                id: route_action(route),
+                                value: None,
+                            }),
+                        )
+                        .unwrap();
+                    (runtime, instance, view)
+                } else {
+                    paging_view(source, route)
+                };
+                let _ = compile_settings_view(&runtime, instance, view, &cx);
+                let Some(plan) = messages_view_state(&runtime, view).scroll_plan() else {
+                    return;
+                };
+                let n = plan.len();
+                let name = |stop: usize| {
+                    plan.identities(stop)
+                        .next()
+                        .map_or_else(|| format!("#{stop}"), |key| key.as_str().to_string())
+                };
+                // From the list's top, as a person scrolls down it.
+                {
+                    let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+                        unreachable!();
+                    };
+                    state.page_scroll = 0;
+                    state.page_reveal = None;
                 }
-                for (width, height) in SHORT_SIZES {
-                    let context = format!(
-                        "{route:?} {width}x{height} {scale}x{}",
-                        if source.is_empty() { "" } else { " light" }
+                let wheel =
+                    walk_screens(&mut runtime, instance, view, &cx, &AppEvent::ScrollLines(1));
+                {
+                    let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+                        unreachable!();
+                    };
+                    state.page_scroll = 0;
+                    state.page_reveal = None;
+                }
+                let page =
+                    walk_screens(&mut runtime, instance, view, &cx, &AppEvent::ScrollPage(1));
+                let never = |walk: &Walk| {
+                    (0..n)
+                        .filter(|stop| plan.paints(*stop) && !walk.whole.contains(stop))
+                        .map(name)
+                        .collect::<Vec<_>>()
+                };
+                let (by_wheel, by_page) = (never(&wheel), never(&page));
+                // A group's caption a walk draws, on no screen whole.
+                let unread = |walk: &Walk| {
+                    walk.captions
+                        .iter()
+                        .filter(|(_, whole)| !**whole)
+                        .map(|(caption, _)| caption.clone())
+                        .collect::<Vec<_>>()
+                };
+                let mut captions = unread(&wheel);
+                captions.extend(unread(&page));
+                captions.sort();
+                captions.dedup();
+                let mut audit = wheel.faults;
+                audit.extend(page.faults);
+                audit.sort();
+                audit.dedup();
+                if !by_wheel.is_empty()
+                    || !by_page.is_empty()
+                    || !captions.is_empty()
+                    || !audit.is_empty()
+                {
+                    faults.fetch_add(
+                        by_wheel.len() + by_page.len() + captions.len() + audit.len(),
+                        std::sync::atomic::Ordering::Relaxed,
                     );
-                    let cx = view_cx_at(width, height);
-                    // Tab Control with tabs open, as the narrow sweep's fleet
-                    // has them: its rows are listed a line at a time.
-                    let (mut runtime, instance, view) = if route == SettingsRoute::Tabs {
-                        let (mut runtime, instance, view) =
-                            super::narrow::every_page_runtime_over(source);
-                        runtime
-                            .dispatch(
-                                instance,
-                                view,
-                                AppEvent::Action(ActionInvocation {
-                                    id: route_action(route),
-                                    value: None,
-                                }),
-                            )
-                            .unwrap();
-                        (runtime, instance, view)
-                    } else {
-                        paging_view(source, route)
-                    };
-                    let _ = compile_settings_view(&runtime, instance, view, &cx);
-                    let Some(plan) = messages_view_state(&runtime, view).scroll_plan() else {
-                        continue;
-                    };
-                    let n = plan.len();
-                    let name = |stop: usize| {
-                        plan.identities(stop)
-                            .next()
-                            .map_or_else(|| format!("#{stop}"), |key| key.as_str().to_string())
-                    };
-                    // From the list's top, as a person scrolls down it.
-                    {
-                        let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view)
-                        else {
-                            unreachable!();
-                        };
-                        state.page_scroll = 0;
-                        state.page_reveal = None;
-                    }
-                    let wheel =
-                        walk_screens(&mut runtime, instance, view, &cx, &AppEvent::ScrollLines(1));
-                    {
-                        let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view)
-                        else {
-                            unreachable!();
-                        };
-                        state.page_scroll = 0;
-                        state.page_reveal = None;
-                    }
-                    let page =
-                        walk_screens(&mut runtime, instance, view, &cx, &AppEvent::ScrollPage(1));
-                    let never = |walk: &Walk| {
-                        (0..n)
-                            .filter(|stop| plan.paints(*stop) && !walk.whole.contains(stop))
-                            .map(name)
-                            .collect::<Vec<_>>()
-                    };
-                    let (by_wheel, by_page) = (never(&wheel), never(&page));
-                    // A group's caption a walk draws, on no screen whole.
-                    let unread = |walk: &Walk| {
-                        walk.captions
-                            .iter()
-                            .filter(|(_, whole)| !**whole)
-                            .map(|(caption, _)| caption.clone())
-                            .collect::<Vec<_>>()
-                    };
-                    let mut captions = unread(&wheel);
-                    captions.extend(unread(&page));
-                    captions.sort();
-                    captions.dedup();
-                    let mut audit = wheel.faults;
-                    audit.extend(page.faults);
-                    audit.sort();
-                    audit.dedup();
-                    if !by_wheel.is_empty()
-                        || !by_page.is_empty()
-                        || !captions.is_empty()
-                        || !audit.is_empty()
-                    {
-                        faults += by_wheel.len() + by_page.len() + captions.len() + audit.len();
-                        report.push(format!(
+                    report
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .push(format!(
                             "{context}: {n} stops; never whole by wheel {}/{n} {by_wheel:?}; \
                              by Page Down {}/{n} {by_page:?}; captions never whole {captions:?}; \
                              audit {} {:#?}",
@@ -1878,10 +1926,13 @@ fn every_stop_of_a_short_window_is_whole_by_page_and_by_wheel() {
                             audit.len(),
                             audit.iter().take(6).collect::<Vec<_>>()
                         ));
-                    }
                 }
-            }
-        }
+            },
+        );
+        let faults = faults.into_inner();
+        let report = report
+            .into_inner()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         assert!(
             faults == 0,
             "{faults} faults at {scale}x:\n{}",
@@ -1917,122 +1968,135 @@ fn every_stop_of_a_short_window_is_whole_by_page_and_by_wheel() {
 #[test]
 fn a_page_turn_takes_the_keyboard_onto_its_screen() {
     at_each_text_scale(&[1.0, 2.0], "page focus", |scale| {
-        let mut faults = Vec::new();
-        let (mut turns, mut held) = (0usize, 0usize);
-        for (route, source) in SettingsRoute::ALL
+        let faults = std::sync::Mutex::new(Vec::new());
+        let (turns, held) = (
+            std::sync::atomic::AtomicUsize::new(0),
+            std::sync::atomic::AtomicUsize::new(0),
+        );
+        // Each window of each page, as published and changed, spread over a
+        // few threads at the rung's text size.
+        let windows = SettingsRoute::ALL
             .into_iter()
+            .filter(|route| !matches!(route, SettingsRoute::Messages | SettingsRoute::Themes))
             .flat_map(|route| [(route, ""), (route, CHANGED)])
-        {
-            if matches!(route, SettingsRoute::Messages | SettingsRoute::Themes) {
-                continue;
+            .flat_map(|(route, source)| {
+                SHORT_SIZES
+                    .into_iter()
+                    .chain(PAGING_SIZES)
+                    .chain([(178.0, 348.0)])
+                    .map(move |(width, height)| (route, source, width, height))
+            })
+            .collect::<Vec<_>>();
+        on_workers(&windows, "page focus", |&(route, source, width, height)| {
+            let context = format!(
+                "{route:?} {width}x{height} {scale}x{}",
+                if source.is_empty() { "" } else { " changed" }
+            );
+            let cx = view_cx_at(width, height);
+            let (mut runtime, instance, view) = paging_view(source, route);
+            let _ = compile_settings_view(&runtime, instance, view, &cx);
+            let Some(plan) = messages_view_state(&runtime, view).scroll_plan() else {
+                return;
+            };
+            if plan.limit() == 0 {
+                return;
             }
-            for (width, height) in SHORT_SIZES
-                .into_iter()
-                .chain(PAGING_SIZES)
-                .chain([(178.0, 348.0)])
+            let Some(first) = plan
+                .controls()
+                .find(|(stop, _)| plan.shown(0).contains(stop))
+                .map(|(_, key)| key.clone())
+            else {
+                return;
+            };
             {
-                let context = format!(
-                    "{route:?} {width}x{height} {scale}x{}",
-                    if source.is_empty() { "" } else { " changed" }
-                );
-                let cx = view_cx_at(width, height);
-                let (mut runtime, instance, view) = paging_view(source, route);
-                let _ = compile_settings_view(&runtime, instance, view, &cx);
-                let Some(plan) = messages_view_state(&runtime, view).scroll_plan() else {
-                    continue;
+                let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+                    unreachable!();
                 };
-                if plan.limit() == 0 {
-                    continue;
-                }
-                let Some(first) = plan
-                    .controls()
-                    .find(|(stop, _)| plan.shown(0).contains(stop))
-                    .map(|(_, key)| key.clone())
-                else {
-                    continue;
-                };
-                {
-                    let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
-                        unreachable!();
-                    };
-                    state.common.last_focus = Some(first);
-                    state.common.focus_visible = true;
-                }
-                let _ = compile_settings_view(&runtime, instance, view, &cx);
-                for direction in [1, -1] {
-                    let mut before = None;
-                    let mut moved_from = messages_view_state(&runtime, view)
-                        .common
-                        .last_focus
-                        .clone();
-                    for _ in 0..4 * (plan.limit() + 2) {
-                        runtime
-                            .dispatch(instance, view, AppEvent::ScrollPage(direction))
-                            .unwrap();
-                        let compiled = compile_settings_view(&runtime, instance, view, &cx);
-                        let state = messages_view_state(&runtime, view);
-                        let plan = state.scroll_plan().expect("a list");
-                        let top = state.page_scroll.min(plan.limit());
-                        let place = (top, (plan.screen(top).offset * 100.0).round() as i64);
-                        if before == Some(place) {
-                            break;
-                        }
-                        before = Some(place);
-                        turns += 1;
-                        let shown = plan.shown(top);
-                        let focus = state.common.last_focus.clone();
-                        let stop = focus.as_ref().and_then(|key| plan.stop_of(key));
-                        let whole_control = plan
-                            .controls()
-                            .any(|(stop, _)| plan.shows_landing(stop, top));
-                        let live_control = plan
-                            .controls()
-                            .any(|(stop, _)| plan.draws_controls_live(stop, top));
-                        let live = focus
-                            .as_ref()
-                            .is_some_and(|key| compiled.semantic(key).is_some());
-                        // Where the keyboard moved, onto the screen's first
-                        // control shown whole with its words, by either key,
-                        // a stop its edge cuts only in its padding among
-                        // them.
-                        let landing = plan
-                            .controls()
-                            .find(|(stop, _)| plan.shows_landing(*stop, top))
-                            .map(|(_, key)| key.clone());
-                        if focus != moved_from
-                            && stop.is_some_and(|stop| plan.shows_landing(stop, top))
-                            && focus != landing
-                        {
-                            faults.push(format!(
+                state.common.last_focus = Some(first);
+                state.common.focus_visible = true;
+            }
+            let _ = compile_settings_view(&runtime, instance, view, &cx);
+            for direction in [1, -1] {
+                let mut before = None;
+                let mut moved_from = messages_view_state(&runtime, view)
+                    .common
+                    .last_focus
+                    .clone();
+                for _ in 0..4 * (plan.limit() + 2) {
+                    runtime
+                        .dispatch(instance, view, AppEvent::ScrollPage(direction))
+                        .unwrap();
+                    let compiled = compile_settings_view(&runtime, instance, view, &cx);
+                    let state = messages_view_state(&runtime, view);
+                    let plan = state.scroll_plan().expect("a list");
+                    let top = state.page_scroll.min(plan.limit());
+                    let place = (top, (plan.screen(top).offset * 100.0).round() as i64);
+                    if before == Some(place) {
+                        break;
+                    }
+                    before = Some(place);
+                    turns.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let shown = plan.shown(top);
+                    let focus = state.common.last_focus.clone();
+                    let stop = focus.as_ref().and_then(|key| plan.stop_of(key));
+                    let whole_control = plan
+                        .controls()
+                        .any(|(stop, _)| plan.shows_landing(stop, top));
+                    let live_control = plan
+                        .controls()
+                        .any(|(stop, _)| plan.draws_controls_live(stop, top));
+                    let live = focus
+                        .as_ref()
+                        .is_some_and(|key| compiled.semantic(key).is_some());
+                    // Where the keyboard moved, onto the screen's first
+                    // control shown whole with its words, by either key,
+                    // a stop its edge cuts only in its padding among
+                    // them.
+                    let landing = plan
+                        .controls()
+                        .find(|(stop, _)| plan.shows_landing(*stop, top))
+                        .map(|(_, key)| key.clone());
+                    if focus != moved_from
+                        && stop.is_some_and(|stop| plan.shows_landing(stop, top))
+                        && focus != landing
+                    {
+                        faults
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .push(format!(
                                 "{context}: Page {} to {top} put the keyboard on {:?}, not the \
                                  screen's first control shown whole, {:?}",
                                 if direction > 0 { "Down" } else { "Up" },
                                 focus.as_ref().map(UiKey::as_str),
                                 landing.as_ref().map(UiKey::as_str)
                             ));
+                    }
+                    moved_from.clone_from(&focus);
+                    match stop {
+                        Some(stop) if plan.shows_landing(stop, top) => {}
+                        Some(stop)
+                            if !whole_control && plan.draws_controls_live(stop, top) && live =>
+                        {
+                            held.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         }
-                        moved_from.clone_from(&focus);
-                        match stop {
-                            Some(stop) if plan.shows_landing(stop, top) => {}
-                            Some(stop)
-                                if !whole_control
-                                    && plan.draws_controls_live(stop, top)
-                                    && live =>
-                            {
-                                held += 1;
-                            }
-                            _ if !whole_control && !live_control => {}
-                            _ => faults.push(format!(
+                        _ if !whole_control && !live_control => {}
+                        _ => faults
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .push(format!(
                                 "{context}: Page {} to {top} shows {shown:?}; the keyboard on \
                                  {:?} (stop {stop:?}, live {live})",
                                 if direction > 0 { "Down" } else { "Up" },
                                 focus.map(|key| key.as_str().to_string())
                             )),
-                        }
                     }
                 }
             }
-        }
+        });
+        let (turns, held) = (turns.into_inner(), held.into_inner());
+        let faults = faults
+            .into_inner()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         assert!(
             turns > 0 && held > 0,
             "{scale}x: {turns} turns, {held} held"
@@ -2362,4 +2426,253 @@ fn manuals_explanation_is_set_on_lines_of_its_own_height() {
             );
         }
     });
+}
+
+/// END REACHES THE LIST'S END BEFORE ANY RENDER HAS MEASURED IT: a
+/// navigation, an aterm.toml change and a focus move each take away the
+/// bound the last render measured, and an End that comes before the next
+/// render — a headless instance driven over ctl, a real window's key before
+/// its frame — lands that render on the list's last screen, as an End after
+/// a render does. The reducer guessed the bound meanwhile (the page's field
+/// count, or none for a page of cards), lower than the real one wherever a
+/// list holds stops that are not fields: the first End stopped at Background
+/// material on Appearance, moved nothing on Top Settings, and stopped short
+/// on Text & Fonts, Harness, Packages and Software Update.
+#[test]
+fn end_reaches_the_lists_end_before_a_render_has_measured_it() {
+    let mut ended = 0usize;
+    let mut faults = Vec::new();
+    for route in SettingsRoute::ALL {
+        if route == SettingsRoute::Messages {
+            continue;
+        }
+        for (width, height) in [(584.0, 348.0), (738.0, 418.0)] {
+            let cx = view_cx_at(width, height);
+            for trigger in ["navigate", "aterm.toml", "focus"] {
+                let from = if route == SettingsRoute::About {
+                    SettingsRoute::Terminal
+                } else {
+                    SettingsRoute::About
+                };
+                let (mut runtime, instance, view) =
+                    paging_view(CHANGED, if trigger == "navigate" { from } else { route });
+                let _ = compile_settings_view(&runtime, instance, view, &cx);
+                match trigger {
+                    "navigate" => {
+                        let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view)
+                        else {
+                            unreachable!();
+                        };
+                        state.navigate(route);
+                    }
+                    "aterm.toml" => {
+                        let mut service = VersionedConfigService::new(CHANGED.to_string())
+                            .expect("valid fixture");
+                        let snapshot = service
+                            .replace_external(
+                                CHANGED.replace("window_padding = 20.0", "window_padding = 22.0"),
+                            )
+                            .expect("valid edit");
+                        runtime
+                            .dispatch(instance, view, AppEvent::ConfigChanged(snapshot))
+                            .unwrap();
+                    }
+                    _ => {
+                        runtime
+                            .dispatch(instance, view, AppEvent::FocusChanged(None))
+                            .unwrap();
+                    }
+                }
+                // End, with no render since the trigger.
+                runtime
+                    .dispatch(
+                        instance,
+                        view,
+                        AppEvent::TextInput(TextInputEvent::End { extend: false }),
+                    )
+                    .unwrap();
+                let _ = compile_settings_view(&runtime, instance, view, &cx);
+                let state = messages_view_state(&runtime, view);
+                let Some(plan) = state.scroll_plan() else {
+                    continue;
+                };
+                if plan.limit() == 0 {
+                    continue;
+                }
+                ended += 1;
+                let top = state.page_scroll.min(plan.limit());
+                if top != plan.limit() {
+                    faults.push(format!(
+                        "{route:?} {width}x{height} after {trigger}: End drew screen {top}, \
+                         the list's last is {}",
+                        plan.limit()
+                    ));
+                }
+            }
+        }
+    }
+    assert!(
+        faults.is_empty(),
+        "{} faults:\n{}",
+        faults.len(),
+        faults.join("\n")
+    );
+    assert!(ended > 0, "the sweep ends scrolling lists");
+}
+
+/// NO PAGE DOWN ONLY MOVES THE LIST: on every route at 80x24, 102x29 and
+/// 150x48 — Cursor Styles with Beam saved too — each Page Down from the
+/// list's top to its end, the turn onto the last screen included, shows a
+/// stop the screen before did not show whole, or draws the list's end the
+/// screen before did not. The bound stood a stop past the screen that drew
+/// the last stop whole, its note in the strip under the room, and the last
+/// turn moved the Adjust card 4pt and drew nothing new (Cursor Styles at
+/// 150x48 with Beam saved).
+#[test]
+fn no_page_down_only_moves_the_list() {
+    let mut turned = 0usize;
+    let mut faults = Vec::new();
+    for source in ["", "cursor_trail_style = \"beam\"\n", CHANGED] {
+        for route in SettingsRoute::ALL {
+            if route == SettingsRoute::Messages {
+                continue;
+            }
+            for (width, height) in PAGING_SIZES {
+                let cx = view_cx_at(width, height);
+                let (mut runtime, instance, view) = paging_view(source, route);
+                let Some((mut before, plan)) = screen_now(&runtime, instance, view, &cx) else {
+                    continue;
+                };
+                if plan.limit() == 0 {
+                    continue;
+                }
+                // Where the list's end is drawn: its last stop's band's
+                // bottom on the painted list, or nowhere.
+                let end_drawn = |runtime: &NativeRuntime| {
+                    let compiled = compile_settings_view(runtime, instance, view, &cx);
+                    let state = messages_view_state(runtime, view);
+                    let plan = state.scroll_plan()?;
+                    let top = state.page_scroll.min(plan.limit());
+                    let list = painted_list(&compiled, &plan, top)?;
+                    let band = plan.drawn_bands(top).pop()?;
+                    (band.stop + 1 == plan.len() && band.at + band.height <= list.height + 0.5)
+                        .then_some(())
+                };
+                let mut end_before = end_drawn(&runtime);
+                for _ in 0..4 * (plan.limit() + 2) {
+                    runtime
+                        .dispatch(instance, view, AppEvent::ScrollPage(1))
+                        .unwrap();
+                    let (now, _) = screen_now(&runtime, instance, view, &cx).expect("a list");
+                    if now.place() == before.place() {
+                        break;
+                    }
+                    turned += 1;
+                    let end_now = end_drawn(&runtime);
+                    let new = now.whole.difference(&before.whole).count() > 0;
+                    if !new && !(end_now.is_some() && end_before.is_none()) {
+                        faults.push(format!(
+                            "{route:?} {width}x{height}{}: Page Down from {} to {} shows {:?} \
+                             after {:?}, nothing new",
+                            if source.is_empty() { "" } else { " (changed)" },
+                            before.top,
+                            now.top,
+                            now.whole,
+                            before.whole
+                        ));
+                    }
+                    before = now;
+                    end_before = end_now;
+                }
+            }
+        }
+    }
+    assert!(
+        faults.is_empty(),
+        "{} faults:\n{}",
+        faults.len(),
+        faults.join("\n")
+    );
+    assert!(turned > 0, "the sweep turns pages");
+}
+
+/// A NOTE IS NEVER LEFT ALONE AT THE TOP BY THE WHEEL, AND NO SCREEN DRAWS A
+/// CAPTION TWICE: on Settings ▸ Harness (supervision off, as the lab's), AI
+/// CLIs and Tab Control at 80x24, 102x29 and 150x48, a wheel turned a notch
+/// at a time from the list's top never seats a screen at a note on the rows
+/// over it that its row shows with it — the wheel at Harness 102x29 left the
+/// Gemini row's shared note alone under SUPERVISION · CONTINUED, its rows
+/// scrolled away — and no screen paints two captions that read alike: the
+/// pages cut a tall group into continued cards, each with a heading of its
+/// own, under the one the list keeps (two SUPERVISION · CONTINUED headings on
+/// one screen).
+#[test]
+fn the_wheel_leaves_no_note_alone_and_no_screen_draws_a_caption_twice() {
+    let mut notches = 0usize;
+    let mut passed_over = 0usize;
+    let mut faults = Vec::new();
+    for source in ["[harness]\nenabled = false\n", ""] {
+        for route in [
+            SettingsRoute::Harness,
+            SettingsRoute::Ai,
+            SettingsRoute::Tabs,
+        ] {
+            for (width, height) in PAGING_SIZES {
+                let cx = view_cx_at(width, height);
+                let (mut runtime, instance, view) = paging_view(source, route);
+                let _ = compile_settings_view(&runtime, instance, view, &cx);
+                let Some(plan) = messages_view_state(&runtime, view).scroll_plan() else {
+                    continue;
+                };
+                passed_over += (0..plan.len())
+                    .filter(|stop| plan.passes_over(*stop))
+                    .count();
+                for _ in 0..4 * (plan.len() + 2) {
+                    let compiled = compile_settings_view(&runtime, instance, view, &cx);
+                    let state = messages_view_state(&runtime, view);
+                    let plan = state.scroll_plan().expect("a list");
+                    let top = state.page_scroll.min(plan.limit());
+                    let context = format!("{route:?} {width}x{height} screen {top}");
+                    if plan.passes_over(top) {
+                        faults.push(format!("{context}: seated at a note its row shows"));
+                    }
+                    let mut captions: Vec<String> = compiled
+                        .paint
+                        .iter()
+                        .filter(|node| {
+                            let key = node.key.as_str();
+                            (key.ends_with("/heading") || key.contains("/heading/"))
+                                && !node.clip.is_empty()
+                        })
+                        .filter_map(|node| match &node.content {
+                            UiContent::Text(spec) => Some(spec.text.clone()),
+                            _ => None,
+                        })
+                        .collect();
+                    captions.sort();
+                    if captions.windows(2).any(|pair| pair[0] == pair[1]) {
+                        faults.push(format!("{context}: captions drawn twice: {captions:?}"));
+                    }
+                    if top >= plan.limit() {
+                        break;
+                    }
+                    notches += 1;
+                    runtime
+                        .dispatch(instance, view, AppEvent::ScrollLines(1))
+                        .unwrap();
+                }
+            }
+        }
+    }
+    assert!(
+        faults.is_empty(),
+        "{} faults:\n{}",
+        faults.len(),
+        faults.join("\n")
+    );
+    assert!(notches > 0, "the wheel turns");
+    assert!(
+        passed_over > 0,
+        "some page holds a note the wheel passes over"
+    );
 }

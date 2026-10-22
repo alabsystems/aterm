@@ -70,6 +70,7 @@ impl VtLevel {
     /// Get the DA2 (Secondary Device Attributes) parameter for this level.
     ///
     /// This is the first parameter in the response to `CSI > c`.
+    #[inline]
     #[must_use]
     pub const fn da2_param(self) -> u8 {
         self as u8
@@ -78,6 +79,7 @@ impl VtLevel {
     /// Get the DECSCL (Set Conformance Level) parameter for this level.
     ///
     /// Used in `CSI Ps ; Ps " p` sequence.
+    #[inline]
     #[must_use]
     pub const fn decscl_param(self) -> u8 {
         match self {
@@ -90,6 +92,7 @@ impl VtLevel {
     }
 
     /// Create from DECSCL parameter value.
+    #[inline]
     #[must_use]
     pub const fn from_decscl_param(param: u8) -> Option<Self> {
         match param {
@@ -103,6 +106,7 @@ impl VtLevel {
     }
 
     /// Human-readable name of this terminal level.
+    #[inline]
     #[must_use]
     pub const fn name(self) -> &'static str {
         match self {

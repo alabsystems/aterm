@@ -1205,7 +1205,7 @@ fn rc_wiring_reads_each_state() {
     );
     // Wired by a real pass, so the ledger entry the opt-out state needs is the one the
     // pass writes, not a shape this test invented.
-    let pass = crate::hooks::pass_at(&l, &home, crate::hooks::RcWiring::HonorOptOut);
+    let pass = crate::hooks::pass_at(&l, &home, crate::hooks::RcWiring::HonorOptOut, None);
     assert_eq!(pass.rc(), [(".zshrc", crate::hooks::RcOutcome::Appended)]);
     assert_eq!(
         crate::hooks::rc_wiring(&home),
@@ -1252,6 +1252,78 @@ fn rc_wiring_reads_each_state() {
         crate::hooks::rc_wiring(&home),
         vec![(".bash_login", RcState::SourcedElsewhere)]
     );
+    let _ = std::fs::remove_dir_all(&l.prefix);
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// (6b) the login shell's absent rc (design init-system §4.2, `base.shell.rc`), as the pass
+/// treats it: on a fresh home it is a change the next pass or `aterm pkg repair` makes, and
+/// the manual PATH note gives way to it; once a pass created it and the person deleted it,
+/// a kept opt-out that names repair. NEGATIVE CONTROL: with no login rc (a login shell atpkg
+/// does not wire) the absent file is no row, and the PATH note stands.
+#[cfg(unix)]
+#[test]
+fn the_login_shell_s_absent_rc_is_a_change_then_a_kept_opt_out() {
+    let l = layout("login-rc");
+    let home = synthetic_home("login-rc");
+    std::fs::create_dir_all(home.join(".aterm/shell.d")).unwrap();
+    let now = crate::flow::rfc3339_to_unix("2026-10-21T00:00:00Z").unwrap();
+    let path = std::env::join_paths([l.bin_dir()]).unwrap();
+    let report = |login_rc: Option<&'static str>| {
+        let mut out: Vec<u8> = Vec::new();
+        let _ = run_with(
+            &l,
+            Some(&home),
+            Some(&path),
+            now,
+            None,
+            "doctor",
+            &Probes {
+                login_rc,
+                ..Probes::default()
+            },
+            Detail::Everything,
+            &mut out,
+            &mut std::io::sink(),
+        );
+        String::from_utf8_lossy(&out).into_owned()
+    };
+    let coming = "~/.zshrc does not exist, and your login shell reads it";
+    let none_note = "sources ~/.aterm/shell.d, so a shell outside aterm";
+
+    let fresh = report(Some(".zshrc"));
+    assert!(fresh.contains(coming), "{fresh}");
+    assert!(fresh.contains("`aterm pkg repair`, creates it"), "{fresh}");
+    assert!(
+        !fresh.contains(none_note),
+        "a pass is about to wire it: {fresh}"
+    );
+    let control = report(None);
+    assert!(!control.contains(coming), "{control}");
+    assert!(control.contains(none_note), "{control}");
+
+    let pass = crate::hooks::pass_at(
+        &l,
+        &home,
+        crate::hooks::RcWiring::HonorOptOut,
+        Some(".zshrc"),
+    );
+    assert_eq!(pass.rc(), [(".zshrc", crate::hooks::RcOutcome::Created)]);
+    let wired = report(Some(".zshrc"));
+    assert!(
+        wired.contains("~/.zshrc sources ~/.aterm/shell.d"),
+        "{wired}"
+    );
+    assert!(!wired.contains(coming), "{wired}");
+
+    std::fs::remove_file(home.join(".zshrc")).unwrap();
+    let opted_out = report(Some(".zshrc"));
+    assert!(
+        opted_out.contains("~/.zshrc: you deleted the one atpkg made for your login shell")
+            && opted_out.contains("`aterm pkg repair` makes it again"),
+        "{opted_out}"
+    );
+    assert!(!opted_out.contains(coming), "{opted_out}");
     let _ = std::fs::remove_dir_all(&l.prefix);
     let _ = std::fs::remove_dir_all(&home);
 }
@@ -1693,6 +1765,68 @@ fn a_kept_autocompact_offer_holds_the_window_back_in_the_report() {
         "{row}"
     );
     assert!(!report.contains("warn — claude:"), "{report}");
+    let _ = std::fs::remove_dir_all(&l.prefix);
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// (10h) `agents_auto_prime = false` gates the Claude Code defaults
+/// (`base.agents.claude-defaults`, docs/DESIGN-init-system-2026-10-20.md §4.2): no window
+/// adds one, so an unset key is an `ok` saying it stays unset, never the warn promising the
+/// window's write. NEGATIVE CONTROL: the same file with the setting on is that warn.
+#[test]
+fn agents_auto_prime_off_reads_an_unset_claude_default_as_staying_unset() {
+    let home = synthetic_home("claude-unprimed");
+    let claude = home.join(".claude");
+    std::fs::create_dir_all(&claude).unwrap();
+    std::fs::write(claude.join("settings.json"), r#"{"model": "opus"}"#).unwrap();
+    let l = layout("claude-unprimed");
+    let v283 = crate::vendor_direct::Version::parse("2.1.283")
+        .unwrap()
+        .build_id();
+    install(&l, "claude", v283);
+    let now = crate::flow::rfc3339_to_unix("2026-09-28T00:00:00Z").unwrap();
+    let path = std::env::join_paths([l.bin_dir()]).unwrap();
+    let report = |auto_prime: bool| {
+        let mut out: Vec<u8> = Vec::new();
+        let _ = run_with(
+            &l,
+            Some(&home),
+            Some(&path),
+            now,
+            None,
+            "doctor",
+            &Probes {
+                claude_defaults: probe_claude_settings(&home),
+                claude_auto_prime: auto_prime,
+                ..Probes::default()
+            },
+            Detail::Everything,
+            &mut out,
+            &mut std::io::sink(),
+        );
+        String::from_utf8_lossy(&out).into_owned()
+    };
+    let off = report(false);
+    let rows: Vec<&str> = off
+        .lines()
+        .filter(|line| line.contains("in ~/.claude/settings.json") || line.contains("stays so"))
+        .collect();
+    assert_eq!(rows.len(), CLAUDE_DEFAULTS.len(), "a row per key: {off}");
+    for row in rows {
+        assert!(
+            row.starts_with("doctor: ok — claude:")
+                && row.contains("is unset and stays so — agents_auto_prime = false"),
+            "{row}"
+        );
+    }
+    assert!(!off.contains("an aterm window adds"), "{off}");
+
+    let on = report(true);
+    assert_eq!(
+        on.matches("an aterm window adds").count(),
+        CLAUDE_DEFAULTS.len(),
+        "{on}"
+    );
     let _ = std::fs::remove_dir_all(&l.prefix);
     let _ = std::fs::remove_dir_all(&home);
 }
@@ -3845,6 +3979,172 @@ fn doctor_reads_a_downloaded_newer_index_off_the_last_pass() {
     );
     let (_, out, _) = run(false);
     assert!(!out.contains("not the newest"), "{out}");
+    let _ = std::fs::remove_dir_all(&l.prefix);
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// A shim an older atpkg laid under a name no shim may carry now (design S13: `pwsh`
+/// joined the deny-list) is said as its own row, relay class, which the shim sweep removes
+/// (`aterm pkg repair`), never as a broken shim that fails the report when its build goes.
+/// The controls: the same shim under a tool name is an ordinary shim, broken once its build
+/// is gone; a link under a refused name that forwards outside the store is no such row, and
+/// gets no advice to remove it.
+#[cfg(unix)]
+#[test]
+fn a_shim_laid_under_a_now_refused_name_is_named_and_never_a_broken_shim() {
+    let l = layout("refused-laid");
+    let home = synthetic_home("refused-laid");
+    let path = on_bin(&l);
+    install(&l, "ay", 18);
+    // What an older atpkg laid for an `exposes` naming `pwsh`: the same wrapper, forwarding
+    // into the store, under the shell's name.
+    let ids = |rows: &[ItemReport]| -> Vec<String> { rows.iter().map(|r| r.id.clone()).collect() };
+    std::fs::copy(l.shim(&tool("ay")), l.bin_dir().join("pwsh")).unwrap();
+    std::fs::copy(l.shim(&tool("ay")), l.bin_dir().join("ay-old")).unwrap();
+    std::fs::set_permissions(
+        l.bin_dir().join("pwsh"),
+        std::fs::Permissions::from_mode(0o755),
+    )
+    .unwrap();
+    std::fs::set_permissions(
+        l.bin_dir().join("ay-old"),
+        std::fs::Permissions::from_mode(0o755),
+    )
+    .unwrap();
+    // A person's own link under a refused name, to a file outside the store.
+    let theirs = home.join("my-csh");
+    std::fs::write(&theirs, b"#!/bin/sh\n").unwrap();
+    std::os::unix::fs::symlink(&theirs, l.bin_dir().join("csh")).unwrap();
+    let rows = report_with(&l, Some(&home), Some(&path), 0, None, &Probes::default());
+    let row = rows
+        .iter()
+        .find(|r| r.id == "base.pkg.refused.shim@pwsh")
+        .unwrap_or_else(|| panic!("{:?}", ids(&rows)));
+    assert!(!row.fails_surface());
+    assert_eq!(row.class, Some(Class::Relay), "a pass removes it");
+    let explain = row.explain.as_ref().expect("explained");
+    assert!(
+        explain.why.contains("a name no shim may carry"),
+        "{}",
+        explain.why
+    );
+    assert_eq!(explain.remedy, Remedy::Repair);
+    assert!(!ids(&rows).contains(&"base.pkg.shims@pwsh".to_string()));
+    assert!(
+        !ids(&rows).iter().any(|id| id.ends_with("@csh")),
+        "a link outside the store is no refused-name shim: {:?}",
+        ids(&rows)
+    );
+
+    // The build goes: the tool-named copy is a broken shim that fails the report; the
+    // shell-named one is still only its own row.
+    std::fs::remove_dir_all(l.build_dir("ay", 18)).unwrap();
+    let rows = report_with(&l, Some(&home), Some(&path), 0, None, &Probes::default());
+    let failing: Vec<&str> = rows
+        .iter()
+        .filter(|r| r.fails_surface())
+        .map(|r| r.id.as_str())
+        .collect();
+    assert!(failing.contains(&"base.pkg.shims@ay-old"), "{failing:?}");
+    assert!(
+        !failing.iter().any(|id| id.ends_with("@pwsh")),
+        "{failing:?}"
+    );
+    assert!(ids(&rows).contains(&"base.pkg.refused.shim@pwsh".to_string()));
+
+    // The sweep removes it, and only it.
+    assert_eq!(
+        crate::activate::remove_refused_name_shims(&l, None),
+        vec!["pwsh".to_string()]
+    );
+    let rows = report_with(&l, Some(&home), Some(&path), 0, None, &Probes::default());
+    assert!(
+        !ids(&rows).iter().any(|id| id.starts_with(c::REFUSED_SHIM)),
+        "{:?}",
+        ids(&rows)
+    );
+    assert!(std::fs::symlink_metadata(l.bin_dir().join("csh")).is_ok());
+    let _ = std::fs::remove_dir_all(&l.prefix);
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// (4b) says the refused names of the build `current` names (design S13), as a note:
+/// each name escaped, the uncounted rest as a number, class person, never failing and never
+/// a planned change. A staged build's entry says nothing until it is current; an unreadable
+/// record is said as unread, never as "none refused"; a store with no active build has no
+/// row at all.
+#[test]
+fn the_refused_row_says_the_current_builds_names_escaped_and_counted() {
+    let l = layout("refused-row");
+    let home = synthetic_home("refused-row");
+    let path = on_bin(&l);
+    let rows = || report_with(&l, Some(&home), Some(&path), 0, None, &Probes::default());
+    let refused = |rows: &[ItemReport]| -> Vec<ItemReport> {
+        rows.iter()
+            .filter(|r| c::is(&r.id, c::REFUSED))
+            .cloned()
+            .collect()
+    };
+    assert_eq!(refused(&rows()), vec![], "no active build, no row");
+
+    install(&l, "ay", 18);
+    let ok = refused(&rows());
+    assert_eq!(ok.len(), 1, "{ok:?}");
+    assert_eq!(
+        (ok[0].id.as_str(), ok[0].outcome),
+        (c::REFUSED, Outcome::Ok)
+    );
+
+    // A build staged beside the live one: its entry is not the live build's.
+    install_build_tree(&l, "ay", 19);
+    crate::status::record_refused_shims(&l, "ay", 19, &["fish".to_string()]).unwrap();
+    let staged = refused(&rows());
+    assert_eq!(
+        staged.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
+        vec![c::REFUSED],
+        "{staged:?}"
+    );
+
+    // The live build's: the first name a control byte, eighteen names in all.
+    let names: Vec<String> = std::iter::once("pw\u{7}sh".to_string())
+        .chain((0..17).map(|i| format!("a/{i}")))
+        .collect();
+    crate::status::record_refused_shims(&l, "ay", 18, &names).unwrap();
+    let said = refused(&rows());
+    assert_eq!(said.len(), 1, "{said:?}");
+    let row = &said[0];
+    assert_eq!(row.id, "base.pkg.refused@ay");
+    assert_eq!(row.outcome, Outcome::NotApplicable, "a note: {row:?}");
+    assert_eq!(row.class, Some(Class::Person));
+    assert!(!row.fails_surface());
+    let why = &row.explain.as_ref().expect("explained").why;
+    assert!(
+        why.starts_with("ay build 18 exposes `pw\\u{7}sh`, `a/0`, "),
+        "the control byte is escaped: {why}"
+    );
+    assert!(
+        why.contains("`a/14`, 2 more, names no shim may carry"),
+        "{} shown, the rest counted: {why}",
+        crate::status::MAX_REFUSED_RECORDED
+    );
+    assert!(!why.contains("fish"), "{why}");
+
+    // The record cannot be read: unknown, never "none refused".
+    std::fs::write(l.status(), "this is = = not toml").unwrap();
+    let unread = refused(&rows());
+    assert_eq!(unread.len(), 1, "{unread:?}");
+    assert_eq!(unread[0].id, c::REFUSED);
+    assert!(
+        !matches!(unread[0].outcome, Outcome::Ok | Outcome::NotApplicable),
+        "{unread:?}"
+    );
+    assert!(
+        unread[0]
+            .explain
+            .as_ref()
+            .is_some_and(|e| e.why.contains("status.toml could not be read")),
+        "{unread:?}"
+    );
     let _ = std::fs::remove_dir_all(&l.prefix);
     let _ = std::fs::remove_dir_all(&home);
 }

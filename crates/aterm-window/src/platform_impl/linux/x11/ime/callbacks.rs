@@ -126,7 +126,8 @@ unsafe fn replace_im(inner: *mut ImeInner) -> Result<(), ReplaceImError> {
 
     let mut new_contexts = HashMap::new();
     for (window, old_context) in unsafe { (*inner).contexts.iter() } {
-        let spot = old_context.as_ref().map(|old_context| old_context.ic_spot);
+        // Only the focused window's context is told its spot (`Ime::send_xim_spot`).
+        let spot = unsafe { (*inner).spot_for_new_context(*window) };
 
         // Check if the IME was allowed on that context.
         let is_allowed =
@@ -159,8 +160,17 @@ unsafe fn replace_im(inner: *mut ImeInner) -> Result<(), ReplaceImError> {
         (*inner).contexts = new_contexts;
         (*inner).is_destroyed = false;
         (*inner).is_fallback = is_fallback;
+        let _ = (*inner).refocus();
+        // A composition in an old context ended with it, unannounced (an IBus restart).
+        (*inner).announce_contexts(false);
     }
     Ok(())
+}
+
+/// [`replace_im`], as the input method's instantiate and destroy callbacks run it, for a test.
+#[cfg(test)]
+pub(crate) unsafe fn replace_im_for_test(inner: *mut ImeInner) -> bool {
+    unsafe { replace_im(inner) }.is_ok()
 }
 
 pub unsafe extern "C" fn xim_instantiate_callback(
@@ -210,6 +220,9 @@ pub unsafe extern "C" fn xim_destroy_callback(
                     panic!("Failed to open fallback input method: {err:?}");
                 },
             }
+        } else {
+            // The fallback went too: no context is left, nor any composition in one.
+            unsafe { (*inner).announce_contexts(true) };
         }
     }
 }

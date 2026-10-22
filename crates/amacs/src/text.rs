@@ -87,11 +87,15 @@ impl From<&str> for TextRope {
 }
 
 impl TextRope {
+    #[inline]
+    #[must_use]
     pub fn len(&self) -> usize {
         bytes(&self.root)
     }
 
     /// Whether the rope holds no bytes.
+    #[inline]
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
@@ -339,6 +343,7 @@ fn split(node: Arc<Node>, offset: usize) -> (Arc<Node>, Arc<Node>) {
     }
 }
 
+#[inline]
 fn bytes(node: &Node) -> usize {
     match node {
         Node::Empty => 0,
@@ -347,14 +352,16 @@ fn bytes(node: &Node) -> usize {
     }
 }
 
-fn newlines(node: &Node) -> usize {
+#[inline]
+const fn newlines(node: &Node) -> usize {
     match node {
         Node::Empty => 0,
         Node::Leaf { newlines, .. } | Node::Branch { newlines, .. } => *newlines,
     }
 }
 
-fn height(node: &Node) -> u8 {
+#[inline]
+const fn height(node: &Node) -> u8 {
     match node {
         Node::Empty => 0,
         Node::Leaf { .. } => 1,

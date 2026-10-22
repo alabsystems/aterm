@@ -54,6 +54,7 @@ impl Com {
     /// A non-null `raw` is a live interface pointer whose one reference the
     /// caller hands over: a creation's or a `QueryInterface`'s result that
     /// nothing else releases.
+    #[inline]
     pub unsafe fn from_raw(raw: *mut c_void) -> Option<Self> {
         NonNull::new(raw).map(Self)
     }
@@ -71,6 +72,7 @@ impl Com {
     ///
     /// `T` is exactly such a value: a non-null interface pointer owning one
     /// reference, whose drop does nothing but release it.
+    #[inline]
     pub unsafe fn from_interface<T>(interface: T) -> Self {
         const { assert!(size_of::<T>() == size_of::<NonNull<c_void>>()) };
         const { assert!(needs_drop::<T>(), "an owned interface releases on drop") };
@@ -84,8 +86,9 @@ impl Com {
     }
 
     /// The interface pointer, still owned by `self`.
+    #[inline]
     #[must_use]
-    pub fn as_raw(&self) -> *mut c_void {
+    pub const fn as_raw(&self) -> *mut c_void {
         self.0.as_ptr()
     }
 
@@ -94,8 +97,9 @@ impl Com {
     /// # Safety
     ///
     /// The object's vtable begins with `V`'s slots, in order.
+    #[inline]
     #[must_use]
-    pub unsafe fn vtable<V>(&self) -> &V {
+    pub const unsafe fn vtable<V>(&self) -> &V {
         // SAFETY: every COM object begins with its vtable pointer, which
         // lives as long as the reference `self` holds; the caller vouches
         // for `V`.
@@ -133,7 +137,8 @@ impl Drop for Com {
 pub type StepError = (&'static str, HRESULT);
 
 /// `Err((step, hr))` when `hr` is a failure.
-pub fn check(hr: HRESULT, step: &'static str) -> Result<(), StepError> {
+#[inline]
+pub const fn check(hr: HRESULT, step: &'static str) -> Result<(), StepError> {
     if hr < 0 { Err((step, hr)) } else { Ok(()) }
 }
 

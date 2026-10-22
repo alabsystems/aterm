@@ -433,17 +433,24 @@ pub fn legs(seen: &Seen, cx: &Ctx<'_>, want: Legs) -> Verdict {
         }
     }
     // The state line, where its row is on the page's screen.
-    // Read this leg only once status has observed it: the page may have
-    // been on screen before the yield, then off screen while the leg stood.
-    // An unchanged row actually read during the hold still counts.
-    let page_from = held.first().map_or(until, |(t, _)| t.saturating_sub(1));
-    let page_reads = observed(&w.page, &w.page_reads, page_from, until);
-    let lines: Vec<(i64, &str)> = page_reads
-        .iter()
-        .filter_map(|(t, p)| Some((*t, page_field(p, "state")?)))
+    // A line that says the hold counts from the land act on: no state line
+    // says `not landed yet: ` before the act's yield, so the page read of
+    // the look that first saw the hold on `status`, stamped a moment before
+    // that `status` read (Claude Code 2.1.308's L4, 2026-10-22: +128.0 s
+    // against +128.1 s), still counts.
+    let lines: Vec<(i64, &str)> = observed(&w.page, &w.page_reads, t1, until)
+        .into_iter()
+        .filter_map(|(t, p)| Some((t, page_field(p, "state")?)))
         .filter(|(_, l)| l.starts_with("not landed yet: "))
         .collect();
     let line = lines.iter().find(|(_, l)| says(l, want.line));
+    // Whether the row was on the screen is read only once status has
+    // observed the leg: the page may have been on screen before the yield,
+    // then off screen while the leg stood. An unchanged row actually read
+    // during the hold still counts. A row cut off by the screen's bottom
+    // edge reads `-` (`surfaces::page_of`).
+    let page_from = held.first().map_or(until, |(t, _)| t.saturating_sub(1));
+    let page_reads = observed(&w.page, &w.page_reads, page_from, until);
     let on_page = page_reads.iter().any(|(_, p)| *p != "-");
     if line.is_none() && !lines.is_empty() {
         bad.push(format!(

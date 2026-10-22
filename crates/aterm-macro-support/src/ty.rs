@@ -121,6 +121,7 @@ pub enum Bound {
 }
 
 /// Reads `tokens` (one type, as written) as a [`Ty`].
+#[inline]
 #[must_use]
 pub fn parse_type(tokens: &[TokenTree]) -> Ty {
     let mut p = Reader { toks: tokens, i: 0 };
@@ -134,23 +135,28 @@ struct Reader<'a> {
 }
 
 impl<'a> Reader<'a> {
+    #[inline]
     fn peek(&self) -> Option<&'a TokenTree> {
         self.toks.get(self.i)
     }
 
+    #[inline]
     fn peek_punct(&self, ch: char) -> bool {
         self.peek().is_some_and(|tt| is_punct(tt, ch))
     }
 
+    #[inline]
     fn peek_keyword(&self, word: &str) -> bool {
         self.peek().is_some_and(|tt| is_keyword(tt, word))
     }
 
+    #[inline]
     fn peek_colon2(&self) -> bool {
         matches!(self.toks.get(self.i), Some(TokenTree::Punct(p)) if p.as_char() == ':' && p.spacing() == Spacing::Joint)
             && matches!(self.toks.get(self.i + 1), Some(tt) if is_punct(tt, ':'))
     }
 
+    #[inline]
     fn peek_arrow(&self) -> bool {
         matches!(self.toks.get(self.i), Some(TokenTree::Punct(p)) if p.as_char() == '-' && p.spacing() == Spacing::Joint)
             && matches!(self.toks.get(self.i + 1), Some(tt) if is_punct(tt, '>'))

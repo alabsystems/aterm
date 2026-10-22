@@ -92,6 +92,7 @@ impl Json {
         }
     }
 
+    #[inline]
     #[must_use]
     pub fn as_str(&self) -> Option<&str> {
         match self {
@@ -100,6 +101,7 @@ impl Json {
         }
     }
 
+    #[inline]
     #[must_use]
     pub fn as_array(&self) -> Option<&[Self]> {
         match self {
@@ -108,13 +110,15 @@ impl Json {
         }
     }
 
-    pub fn as_array_mut(&mut self) -> Option<&mut Vec<Self>> {
+    #[inline]
+    pub const fn as_array_mut(&mut self) -> Option<&mut Vec<Self>> {
         match self {
             Self::Array(items) => Some(items),
             _ => None,
         }
     }
 
+    #[inline]
     #[must_use]
     pub fn as_object(&self) -> Option<&[(String, Self)]> {
         match self {
@@ -123,7 +127,8 @@ impl Json {
         }
     }
 
-    pub fn as_object_mut(&mut self) -> Option<&mut Vec<(String, Self)>> {
+    #[inline]
+    pub const fn as_object_mut(&mut self) -> Option<&mut Vec<(String, Self)>> {
         match self {
             Self::Object(members) => Some(members),
             _ => None,
@@ -446,7 +451,8 @@ impl Parser<'_> {
 }
 
 /// The length of the UTF-8 sequence that starts with `lead`.
-fn utf8_len(lead: u8) -> usize {
+#[inline]
+const fn utf8_len(lead: u8) -> usize {
     match lead {
         0x00..=0x7F => 1,
         0xC0..=0xDF => 2,

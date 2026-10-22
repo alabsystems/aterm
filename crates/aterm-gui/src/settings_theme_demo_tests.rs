@@ -667,7 +667,7 @@ fn a_windows_demo_is_a_windows_11_window() {
     assert_eq!((maximize - minimize, close - maximize), (40.0, 40.0));
     assert_eq!(cy, (DEMO_RECT.y + layout.strip_h * 0.5).round());
     let plus = layout.new_tab.expect("the + follows the tabs");
-    assert!(layout.tabs_x + layout.tab_w * 2.0 < plus && plus + 10.0 < minimize - 5.0);
+    assert!(layout.tabs_x + layout.tab_w + layout.quiet_w < plus && plus + 10.0 < minimize - 5.0);
     for (scheme, ink) in [
         ("Dracula", [0xff, 0xff, 0xff]),
         ("Default Light", [0, 0, 0]),
@@ -751,8 +751,11 @@ fn a_windows_demo_strip_fits_every_width() {
                 plus + 5.0 < first_glyph,
                 "{width}: the + before the caption"
             );
-            assert!(layout.tabs_x + layout.tab_w * 2.0 <= plus - 10.0, "{width}");
-            assert!(layout.tab_w <= 168.0, "{width}");
+            assert!(
+                layout.tabs_x + layout.tab_w + layout.quiet_w <= plus - 10.0,
+                "{width}"
+            );
+            assert!(layout.tab_w <= 168.0 && layout.quiet_w <= 168.0, "{width}");
         } else {
             assert!(layout.new_tab.is_none(), "{width}");
         }
@@ -858,4 +861,113 @@ fn the_demo_tab_strip_paints_chrome_tokens() {
     assert_eq!(seam, authored.seam, "border_color is the seam");
     let (tab, _, seam) = paint(none, DemoFrame::Windows);
     assert_eq!((tab, seam), (derived.active, derived.seam));
+}
+
+/// A DEMO TAB SAYS A WHOLE TITLE OR NONE (audit r14 PV5): both tabs used to
+/// get one equal width, so at 2x text (or a narrow window) the selected tab
+/// painted "zsh —…" beside a whole "targo test". In either frame, at 1x and
+/// 2x text, from a sliver of a window to the widest demo, every title a tab
+/// paints is one of its authored titles, whole, never an ellipsis, inside
+/// its own tab; the quiet tab gives way first, so wherever the selected tab
+/// shows a title the longest one it can hold. NEGATIVE CONTROL: at 30
+/// columns and at 102 columns with 2x text, half the strip is too narrow for
+/// "zsh — aterm", so an equal split would cut it.
+#[test]
+fn a_demo_tab_says_a_whole_title_or_none() {
+    use crate::native_appearance::{AppearancePreferences, install_preferences};
+    let none = aterm_messages::tokens::AuthoredChrome::NONE;
+    let spec = demo_spec("Dracula", none);
+    let mut long_titles = 0;
+    for scale in [1.0_f32, 2.0] {
+        let _ = install_preferences(AppearancePreferences {
+            text_scale: scale,
+            ..AppearancePreferences::default()
+        });
+        for frame in [DemoFrame::Dots, DemoFrame::Windows] {
+            let [selected, quiet] = frame.titles();
+            for width in (40..=900).step_by(13) {
+                let rect = crate::native_ui::LogicalRect::new(10.0, 6.0, width as f32, 220.0);
+                let layout = DemoStripLayout::of(rect, frame);
+                let mut prims = Vec::new();
+                spec.paint_demo_frame(
+                    &mut prims,
+                    rect,
+                    aterm_render::Theme::default(),
+                    demo_roles(),
+                    frame,
+                );
+                let strip_bottom = rect.y + layout.strip_h;
+                for prim in &prims {
+                    let DrawPrim::Text {
+                        s,
+                        x,
+                        px,
+                        face,
+                        baseline,
+                        ..
+                    } = prim
+                    else {
+                        continue;
+                    };
+                    if *baseline > strip_bottom {
+                        continue;
+                    }
+                    assert!(!s.contains('…'), "{frame:?} {width} at {scale}x: {s:?}");
+                    let selected_tab = *x < layout.tabs_x + layout.tab_w;
+                    let (titles, right) = if selected_tab {
+                        (selected, layout.tabs_x + layout.tab_w)
+                    } else {
+                        (quiet, layout.tabs_x + layout.tab_w + layout.quiet_w)
+                    };
+                    assert!(
+                        titles.contains(&s.as_str()),
+                        "{frame:?} {width} at {scale}x: {s:?} is not one of {titles:?}"
+                    );
+                    let ends = x + crate::tray_raster::ui_text_width_for(*face, s, *px);
+                    assert!(
+                        ends <= right - 8.0,
+                        "{frame:?} {width} at {scale}x: {s:?} ends at {ends:.1}, its tab at {right:.1}"
+                    );
+                    if selected_tab && s == selected[0] {
+                        long_titles += 1;
+                    }
+                }
+            }
+        }
+    }
+    let _ = install_preferences(AppearancePreferences::default());
+    assert!(
+        long_titles > 40,
+        "the long title is kept wherever it fits: {long_titles}"
+    );
+
+    // NEGATIVE CONTROL: where the cut was seen, an equal split cannot hold
+    // the selected title, and the selected tab still says a whole one.
+    // The demo widths the audit measured: 30x24 at 1x (a 69-pt tab each) and
+    // 102x29 at 2x (a 119-pt one).
+    for (scale, demo_width) in [(1.0_f32, 202.0_f32), (2.0, 302.0)] {
+        let _ = install_preferences(AppearancePreferences {
+            text_scale: scale,
+            ..AppearancePreferences::default()
+        });
+        let px = crate::type_scale::TypeStep::Caption
+            .px(13.75)
+            .scaled(scale)
+            .get();
+        let title =
+            crate::tray_raster::ui_text_width_for(TextFace::Ui, DemoFrame::Dots.titles()[0][0], px);
+        let fits_or_cut = |width: f32| {
+            let rect = crate::native_ui::LogicalRect::new(0.0, 0.0, width, 200.0);
+            let room = rect.right() - 12.0 - (rect.x + 52.0);
+            let layout = DemoStripLayout::of(rect, DemoFrame::Dots);
+            (room / 2.0 - 20.0 < title, layout.titles[0])
+        };
+        let (equal_cuts, kept) = fits_or_cut(demo_width);
+        assert!(equal_cuts, "{scale}x: an equal split cuts the title");
+        assert!(
+            kept.is_some_and(|title| DemoFrame::Dots.titles()[0].contains(&title)),
+            "{scale}x: the selected tab still says a whole title: {kept:?}"
+        );
+    }
+    let _ = install_preferences(AppearancePreferences::default());
 }

@@ -593,6 +593,22 @@ fn safe_line(line: &str) -> String {
     line.chars().filter(|c| !c.is_control()).take(120).collect()
 }
 
+/// WHETHER A CLEAN DISK HEALS `e` (sim item S7): the device refused a write
+/// for want of room (`ENOSPC`, a quota) or by an I/O error (`EIO`) — what
+/// the same write may not meet once space is freed or the device recovers,
+/// with nothing in the state dir to repair. Every other error stands until a
+/// person repairs the dir, and a try at every attach meets it again: a file
+/// that does not read (`InvalidData`: damaged, a link or a file planted where
+/// a directory goes), a permission, a name the dir does not hold. The
+/// recovery an unclean stop owes waits only for the first kind
+/// (`Bridge::recover`); the second is said and survived.
+pub(crate) fn a_clean_disk_heals(e: &io::Error) -> bool {
+    matches!(
+        e.kind(),
+        io::ErrorKind::StorageFull | io::ErrorKind::QuotaExceeded
+    ) || e.raw_os_error() == Some(libc::EIO)
+}
+
 /// Whether a durable write really flushes (`F_FULLFSYNC` on macOS): always, but in
 /// this crate's own unit tests. No test can see a flush — only its count
 /// ([`FileOps::fsyncs`], counted either way) and the kill points around it
@@ -933,6 +949,29 @@ pub struct StateDir {
     /// The current OPEN record this open successfully published durably.
     /// Retain its identity: a visible record alone may follow a failed flush.
     run_fence: std::sync::Mutex<Option<std::fs::File>>,
+    /// THE DURABLE REPLACES THIS OPEN DID NOT FINISH (sim item S7), by name:
+    /// each whose rename was made and whose directory flush then failed. What
+    /// reads at such a name is not known to be on the media, so a write a
+    /// file already holding its value would skip is made again
+    /// ([`StateDir::on_the_media`]: a TOFU pin, [`StateDir::pin`]; the
+    /// mirror's floor, [`StateDir::logfloor_admitted`]; the run record has
+    /// its own fence, [`StateDir::begin_run`]). The name's next durable
+    /// replace that finishes clears it.
+    undurable: std::sync::Mutex<std::collections::BTreeSet<String>>,
+    /// Whether this open wrote `logfloor` durably itself (sim item S7): a
+    /// floor it did not write may be one a predecessor's failed flush left
+    /// in the page cache, so it is written again before a batch is sent past
+    /// it ([`StateDir::raise_logfloor`]), once per open, as the pin's version
+    /// fence is ([`StateDir::ensure_logpin_durable`]) and the run record's
+    /// ([`StateDir::begin_run`]).
+    floor_admitted: std::sync::atomic::AtomicBool,
+    /// THE QUARANTINE COPIES THIS OPEN TRIED, BY SOURCE, whose source it has
+    /// not yet unlinked (sim item S7): source path -> successful exclusive
+    /// publication and its retained file handle. A try of
+    /// [`StateDir::move_into_quarantine`] after one whose
+    /// unlink failed takes that copy for the file's, so the recovery tried
+    /// again at each attach moves each file once.
+    quarantine_tried: std::sync::Mutex<BTreeMap<String, QuarantineCopy>>,
     /// TEST-ONLY: what this dir's writers did to the filesystem ([`FileOps`]).
     #[cfg(test)]
     ops: std::sync::Mutex<FileOps>,
@@ -946,6 +985,11 @@ pub struct StateDir {
     /// TEST-ONLY: a raw directory open/flush error, before legacy tolerance.
     #[cfg(test)]
     dir_flush_refusal: std::sync::Mutex<Option<(PathBuf, aterm_durable::Flush, io::ErrorKind)>>,
+    /// TEST-ONLY: the quarantine's one-copy rule off — every try of a move
+    /// publishes a copy of each file again ([`StateDir::copy_on_every_try`]),
+    /// the simulation's negative control (`Mutant::CopyOnEveryTry`).
+    #[cfg(test)]
+    copy_on_every_try: std::sync::atomic::AtomicBool,
 }
 
 /// The filesystem operations one [`StateDir`] made, by kind (counted only in a
@@ -1494,6 +1538,14 @@ pub(crate) struct SetAside {
     pub to: String,
 }
 
+/// A copy this open exclusively published, retained through any later failure.
+/// Keeping its handle prevents a removed/recreated name from inheriting custody.
+#[derive(Debug)]
+struct QuarantineCopy {
+    name: String,
+    file: std::fs::File,
+}
+
 /// Where [`StateDir::set_aside_torn`] keeps what it moves aside, inside the dir.
 pub const QUARANTINE: &str = "quarantine";
 
@@ -1593,6 +1645,9 @@ impl StateDir {
             unflushed: std::sync::Mutex::default(),
             logpin_fence: std::sync::Mutex::default(),
             run_fence: std::sync::Mutex::default(),
+            undurable: std::sync::Mutex::default(),
+            floor_admitted: std::sync::atomic::AtomicBool::new(false),
+            quarantine_tried: std::sync::Mutex::default(),
             #[cfg(test)]
             ops: std::sync::Mutex::default(),
             #[cfg(test)]
@@ -1601,7 +1656,19 @@ impl StateDir {
             refused: std::sync::Mutex::default(),
             #[cfg(test)]
             dir_flush_refusal: std::sync::Mutex::default(),
+            #[cfg(test)]
+            copy_on_every_try: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    /// TEST-ONLY: switch the quarantine's one-copy rule off (`true`) or back
+    /// on ([`StateDir::move_into_quarantine`]): as before sim item S7's
+    /// review, a try after one whose unlink failed publishes every copy again
+    /// under the next suffix.
+    #[cfg(test)]
+    pub(crate) fn copy_on_every_try(&self, on: bool) {
+        self.copy_on_every_try
+            .store(on, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// TEST-ONLY: every filesystem operation this dir has counted so far.
@@ -1687,7 +1754,7 @@ impl StateDir {
         let w = crate::fx::Write::Remove { path };
         self.disk.before(w)?;
         std::fs::remove_file(path)?;
-        self.disk.after(w);
+        self.disk.after(w)?;
         Ok(())
     }
 
@@ -1930,14 +1997,46 @@ impl StateDir {
     }
 
     /// RAISE `logfloor` to `top`, DURABLY — never lower it: a floor at or
-    /// above `top` already is kept as it is, and nothing is written. Answers
-    /// the floor the media now holds.
+    /// above `top` already is kept, and nothing is written, once this open
+    /// has written the floor durably itself ([`StateDir::logfloor_admitted`]).
+    /// Before that, or after a write of it whose flush failed, a floor that
+    /// reads at or above `top` is written again as it is: the page cache may
+    /// hold it and the media not (a durable replace whose rename was made and
+    /// whose directory flush failed, here or in a killed predecessor), and a
+    /// batch sent past it would be lost from the count with the next power
+    /// cut (ruling Q13; sim item S7). Answers the floor the media now holds.
     ///
     /// # Errors
     ///
     /// The floor's read ([`StateDir::logfloor`]: one that does not read is
     /// never written over), the write's or a flush's.
     pub(crate) fn raise_logfloor(&self, top: u64) -> io::Result<u64> {
+        let admitted = self.logfloor_admitted();
+        match self.logfloor()? {
+            Some(floor) if floor >= top && admitted => Ok(floor),
+            floor => {
+                let top = floor.map_or(top, |floor| floor.max(top));
+                let bytes = format!("{top}\n");
+                self.replace_bytes_as_with(
+                    LOGFLOOR,
+                    bytes.as_bytes(),
+                    Some(aterm_durable::Flush::Durable),
+                    0o666,
+                    std::convert::identity,
+                )?;
+                self.floor_admitted
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok(top)
+            }
+        }
+    }
+
+    /// TEST-ONLY: [`StateDir::raise_logfloor`] as it was before sim item S7 —
+    /// a floor that reads at or above `top` is kept and nothing written,
+    /// whoever wrote it and whatever its flush did: the simulation's negative
+    /// control (`sim::world::Mutant::TrustTheFloorThatReads`).
+    #[cfg(test)]
+    pub(crate) fn raise_logfloor_trusting_what_reads(&self, top: u64) -> io::Result<u64> {
         match self.logfloor()? {
             Some(floor) if floor >= top => Ok(floor),
             _ => {
@@ -1945,6 +2044,15 @@ impl StateDir {
                 Ok(top)
             }
         }
+    }
+
+    /// Whether the floor that reads is on the media as far as this open can
+    /// say: it wrote it durably itself, and no write of it failed since
+    /// ([`StateDir::raise_logfloor`]).
+    pub(crate) fn logfloor_admitted(&self) -> bool {
+        self.floor_admitted
+            .load(std::sync::atomic::Ordering::SeqCst)
+            && self.on_the_media(LOGFLOOR)
     }
 
     /// RULING Q6 AND Q13 ACROSS A POWER CUT: AFTER AN UNCLEAN STOP IN AN
@@ -2279,6 +2387,21 @@ impl StateDir {
         self.replace(name, value, true, 0o666)
     }
 
+    /// Whether what reads at `name` is on the media as far as this open knows:
+    /// `false` after a durable replace of it whose rename was made and whose
+    /// flush failed, until one finishes. A file this
+    /// open never wrote reads as on the media: a predecessor's failed flush
+    /// is not seen by this bookkeeping alone. The run and mirror floor
+    /// separately require first admission in every open
+    /// ([`StateDir::begin_run`], [`StateDir::raise_logfloor`]).
+    pub(crate) fn on_the_media(&self, name: &str) -> bool {
+        !self
+            .undurable
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(name)
+    }
+
     /// The one replace behind [`StateDir::write`] and [`StateDir::write_durable`]:
     /// `value` and its newline. `mode` is subject to the umask: 0o666
     /// (`File::create`'s) for every file but the ones holding a record's bytes,
@@ -2356,26 +2479,41 @@ impl StateDir {
             let _ = std::fs::remove_file(&tmp);
             return staged;
         }
+        // After the rename, even a failed publication leaves visible bytes.
+        // Every such failure must revoke this open's durable admission and
+        // retain the write for a clean stop, including an injected kill point.
+        let finished = (|| {
+            if durable {
+                self.kill_point(IncStep::Renamed)?;
+                finish_dir(self.directory_flush_result(parent, aterm_durable::Flush::Durable))?;
+            }
+            self.disk.after(w)
+        })();
         if durable {
-            self.kill_point(IncStep::Renamed)?;
-            finish_dir(self.directory_flush_result(parent, aterm_durable::Flush::Durable))?;
+            let mut undurable = self.undurable.lock().unwrap_or_else(|e| e.into_inner());
+            if finished.is_ok() {
+                undurable.remove(name);
+            } else {
+                undurable.insert(name.to_string());
+            }
         }
-        self.disk.after(w);
         // A file of a [`TornKind`] left unflushed is one a clean stop flushes
         // ([`StateDir::end_run_clean`]), and so is the mirror's pin, so a pin
         // found damaged after a clean stop is a bug's, never a power cut's; a
-        // durable replace has flushed it. An ordered one (none of these
-        // kinds is written so: only the clean stop's record) is the media's
-        // only once a later flush is, so it settles nothing.
+        // durable replace has flushed it — only once it has returned `Ok`: one
+        // whose directory flush failed after its rename is unflushed, and a
+        // clean stop must flush it as any other (sim item S7). An ordered one
+        // (none of these kinds is written so: only the clean stop's record) is
+        // the media's only once a later flush is, so it settles nothing.
         if TornKind::of(name).is_some() || name == LOGPIN {
             let mut unflushed = self.unflushed.lock().unwrap_or_else(|e| e.into_inner());
-            if durable {
+            if durable && finished.is_ok() {
                 unflushed.remove(name);
             } else {
                 unflushed.insert(name.to_string());
             }
         }
-        Ok(())
+        finished
     }
 
     /// Take this state dir for one bridge's life: an exclusive `flock` on
@@ -2868,7 +3006,7 @@ impl StateDir {
             ));
         }
         file.write_all(line.as_bytes())?;
-        self.disk.after(w);
+        self.disk.after(w)?;
         Ok(())
     }
 
@@ -2961,8 +3099,18 @@ impl StateDir {
     /// landed behind its sender's later posts wherever the log had lost the
     /// record on its own (finding F2). A record that did NOT land is dropped
     /// durably ([`StateDir::drop_in_flight`]).
-    pub(crate) fn clear_in_flight(&self, seq: u64) {
-        let _ = self.unlink(&format!("inflight/{seq}"));
+    ///
+    /// # Errors
+    ///
+    /// The unlink's, other than a missing entry: the entry stands, and its
+    /// record must not be delivered while it does (`Bridge::settle_landed`,
+    /// sim item S7) — after a move that took the record, the next attach would
+    /// publish it again.
+    pub(crate) fn clear_in_flight(&self, seq: u64) -> io::Result<()> {
+        match self.unlink(&format!("inflight/{seq}")) {
+            Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e),
+            _ => Ok(()),
+        }
     }
 
     /// DROP the in-flight record at `seq` FOR GOOD: it provably did not land — the
@@ -3026,15 +3174,22 @@ impl StateDir {
         if !file.metadata()?.is_file() {
             return Ok(false);
         }
+        self.flush_opened(&file, flush)?;
+        self.disk.after(w)?;
+        Ok(true)
+    }
+
+    /// Flush an already admitted descriptor; callers retain their own disk
+    /// doors and path policy, and no path is reopened here.
+    fn flush_opened(&self, file: &std::fs::File, flush: aterm_durable::Flush) -> io::Result<()> {
         self.count(|ops| match flush {
             aterm_durable::Flush::Durable => ops.fsyncs += 1,
             aterm_durable::Flush::Ordered => ops.barriers += 1,
         });
         if flushes_media() {
-            flush.file(&file)?;
+            flush.file(file)?;
         }
-        self.disk.after(w);
-        Ok(true)
+        Ok(())
     }
 
     /// [`StateDir::flush_dir`] with `flush`: on the media on return, or
@@ -3057,7 +3212,7 @@ impl StateDir {
             aterm_durable::Flush::Ordered => ops.barriers += 1,
         });
         finish(self.directory_flush_result(dir, flush))?;
-        self.disk.after(w);
+        self.disk.after(w)?;
         Ok(())
     }
 
@@ -3436,9 +3591,21 @@ impl StateDir {
     /// `.<n>` added past a name taken, never over another), DURABLY, mode 0600;
     /// then its own name unlinked and each directory it left flushed — so a
     /// power cut at any step leaves it in one place or both, never in none. The
-    /// quarantine's own entry is flushed when it is made, and one that is not a
+    /// quarantine's own entry is flushed before every move, including a retry
+    /// after its creation's fence failed, and one that is not a
     /// real directory (a link or file planted at the name) refuses the move,
     /// moving nothing. Answers `(from, to)` per file, in the order given.
+    ///
+    /// ONE COPY PER FILE, HOWEVER OFTEN THIS OPEN TRIES IT (sim item S7): a try
+    /// that published its copies and then failed to unlink a source leaves
+    /// both, and the next try (the recovery is tried again at each attach,
+    /// `Bridge::recover`) takes the copy this open named for that file
+    /// ([`StateDir::quarantine_tried`]) for its own while it holds exactly
+    /// the file's bytes ([`StateDir::quarantined_copy_of`]), rather than
+    /// publish another under the next suffix. A later open — a bridge killed
+    /// between a copy and its unlink — publishes one more, as before: nothing
+    /// on the dir tells a copy of this file from one of an earlier file at
+    /// the same path whose bytes read the same (two cut to nothing).
     fn move_into_quarantine(
         &self,
         files: &[(String, Vec<u8>)],
@@ -3461,27 +3628,65 @@ impl StateDir {
             }
             Err(e) if e.kind() == io::ErrorKind::NotFound => {
                 std::fs::create_dir_all(&quarantine)?;
-                self.flush_dir(&self.root)?;
             }
             Err(e) => return Err(e),
         }
+        // A failed first fence can leave the directory visible. Its parent
+        // publication is required even on a retry that finds it already here.
+        self.flush_dir_as(&self.root, aterm_durable::Flush::Durable)?;
+        #[cfg(test)]
+        let one_copy = !self
+            .copy_on_every_try
+            .load(std::sync::atomic::Ordering::SeqCst);
+        #[cfg(not(test))]
+        let one_copy = true;
         let mut moved = Vec::new();
         for (from, bytes) in files {
-            let base = format!("{QUARANTINE}/{prefix}{}", from.replace('/', "."));
-            let mut to = base.clone();
-            let mut n = 0u32;
-            loop {
-                match self.publish_quarantine_file(&to, bytes) {
-                    Ok(()) => break,
-                    Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
-                        n = n
-                            .checked_add(1)
-                            .ok_or_else(|| io::Error::other("quarantine suffix space exhausted"))?;
-                        to = format!("{base}.{n}");
-                    }
-                    Err(e) => return Err(e),
+            // ONE COPY PER FILE (sim item S7): the copy an earlier try of
+            // THIS open published for this file, its source then left (an
+            // unlink that failed), is the file's copy while it still holds
+            // exactly its bytes — put on the media first — rather than one
+            // more under the next suffix at every try. Only this open's own:
+            // a file a later boot tore again is another file, whatever its
+            // bytes (two cut to nothing read the same).
+            let tried = self
+                .quarantine_tried
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(from)
+                .map(|copy| -> io::Result<QuarantineCopy> {
+                    Ok(QuarantineCopy {
+                        name: copy.name.clone(),
+                        file: copy.file.try_clone()?,
+                    })
+                })
+                .transpose()?;
+            let reused = match tried {
+                Some(copy) if one_copy && self.quarantined_copy_of(&copy, bytes)? => {
+                    Some(copy.name)
                 }
-            }
+                _ => None,
+            };
+            let to = match reused {
+                Some(name) => name,
+                None => {
+                    let base = format!("{QUARANTINE}/{prefix}{}", from.replace('/', "."));
+                    let mut to = base.clone();
+                    let mut n = 0u32;
+                    loop {
+                        match self.publish_quarantine_file(from, &to, bytes) {
+                            Ok(()) => break to,
+                            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+                                n = n.checked_add(1).ok_or_else(|| {
+                                    io::Error::other("quarantine suffix space exhausted")
+                                })?;
+                                to = format!("{base}.{n}");
+                            }
+                            Err(e) => return Err(e),
+                        }
+                    }
+                }
+            };
             moved.push(SetAside {
                 from: from.clone(),
                 to,
@@ -3494,6 +3699,10 @@ impl StateDir {
                 Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e),
                 _ => {}
             }
+            self.quarantine_tried
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(from);
             dirs.insert(path.parent().unwrap_or(&self.root).to_path_buf());
         }
         for dir in dirs {
@@ -3502,11 +3711,69 @@ impl StateDir {
         Ok(moved)
     }
 
-    /// Publish exact evidence bytes without replacing any occupant: stage and
-    /// flush an owned temp, then link it exclusively at `name`. A collision is
-    /// the link's `AlreadyExists`, even if it appeared after staging. Every other
-    /// error is returned before the sweep can unlink any source.
-    fn publish_quarantine_file(&self, name: &str, bytes: &[u8]) -> io::Result<()> {
+    /// Whether the proven copy still names the held regular file with these
+    /// bytes. Flush that same handle, then require its directory publication
+    /// and current name before permitting a source unlink. Missing or replaced
+    /// proof is false; I/O uncertainty is an error. The bridge lock excludes
+    /// cooperating publishers, not arbitrary external mutations after a check.
+    fn quarantined_copy_of(&self, copy: &QuarantineCopy, bytes: &[u8]) -> io::Result<bool> {
+        use std::os::unix::fs::{FileExt as _, MetadataExt as _, OpenOptionsExt as _};
+        let path = self.path(&copy.name);
+        let file = match std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(crate::enable::LOCK_OPEN_FLAGS)
+            .open(&path)
+        {
+            Ok(file) => file,
+            Err(e)
+                if e.kind() == io::ErrorKind::NotFound || e.raw_os_error() == Some(libc::ELOOP) =>
+            {
+                return Ok(false)
+            }
+            Err(e) => return Err(e),
+        };
+        let meta = file.metadata()?;
+        let owned = copy.file.metadata()?;
+        if !meta.is_file()
+            || meta.len() != bytes.len() as u64
+            || (meta.dev(), meta.ino()) != (owned.dev(), owned.ino())
+            || !self.quarantine_copy_current(copy)?
+        {
+            return Ok(false);
+        }
+        let mut held = vec![0; bytes.len()];
+        file.read_exact_at(&mut held, 0)?;
+        if held != bytes {
+            return Ok(false);
+        }
+        let flush = aterm_durable::Flush::Durable;
+        let w = crate::fx::Write::Flush { path: &path, flush };
+        self.disk.before(w)?;
+        self.flush_opened(&file, flush)?;
+        self.disk.after(w)?;
+        self.flush_dir_as(path.parent().unwrap_or(&self.root), flush)?;
+        self.quarantine_copy_current(copy)
+    }
+
+    fn quarantine_copy_current(&self, copy: &QuarantineCopy) -> io::Result<bool> {
+        use std::os::unix::fs::MetadataExt as _;
+        let current = match std::fs::symlink_metadata(self.path(&copy.name)) {
+            Ok(current) => current,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(false),
+            Err(e) => return Err(e),
+        };
+        let held = copy.file.metadata()?;
+        Ok(current.is_file()
+            && held.is_file()
+            && (current.dev(), current.ino()) == (held.dev(), held.ino()))
+    }
+
+    /// Publish exact evidence bytes exclusively. Custody is recorded only after
+    /// hard_link succeeds, before temp cleanup or the required directory fence
+    /// can fail; an occupied same-byte name is never adopted on a retry.
+    fn publish_quarantine_file(&self, from: &str, name: &str, bytes: &[u8]) -> io::Result<()> {
+        #[cfg(test)]
+        self.refused_by_a_test(name)?;
         let target = self.path(name);
         let parent = target.parent().unwrap_or(&self.root);
         let w = crate::fx::Write::Replace {
@@ -3526,9 +3793,20 @@ impl StateDir {
                 )]
                 file.sync_all()?;
             }
-            drop(file);
             std::fs::hard_link(&tmp, &target)
         })();
+        if staged.is_ok() {
+            self.quarantine_tried
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(
+                    from.to_string(),
+                    QuarantineCopy {
+                        name: name.to_string(),
+                        file,
+                    },
+                );
+        }
         let cleaned = std::fs::remove_file(&tmp);
         cleaned?;
         staged?;
@@ -3536,9 +3814,9 @@ impl StateDir {
             ops.replaces += 1;
             ops.fsyncs += 1;
         });
-        sync_dir(parent)?;
+        self.directory_flush_result(parent, aterm_durable::Flush::Durable)?;
         self.count(|ops| ops.fsyncs += 1);
-        self.disk.after(w);
+        self.disk.after(w)?;
         Ok(())
     }
 
@@ -4245,6 +4523,33 @@ impl StateDir {
             .collect()
     }
 
+    /// THE TOFU PINS ON THE MEDIA BEFORE A ROUTE STANDS ON ONE (sim item S7):
+    /// where this open's last durable write of `pins` was renamed in and its
+    /// directory flush failed ([`StateDir::on_the_media`]), the table is
+    /// written again durably, as it reads; otherwise nothing is written. A
+    /// first sight the page cache holds and the media may not is one the next
+    /// boot takes back, and then the sid's next first sight is one a second
+    /// claimant may win. The router calls it before it routes on a pin it read
+    /// (`Bridge::pinned_node_for`), and so does [`StateDir::pin`] where the
+    /// sid is pinned already.
+    ///
+    /// # Errors
+    ///
+    /// The table's read (one that fails writes nothing over it) or the
+    /// rewrite's: the route waits, as for a first sight's failed write.
+    pub(crate) fn settle_pins(&self) -> io::Result<()> {
+        if self.on_the_media("pins") {
+            return Ok(());
+        }
+        let text = match std::fs::read_to_string(self.path("pins")) {
+            Ok(text) => text,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(e),
+        };
+        let lines: Vec<&str> = text.lines().filter(|l| l.contains(' ')).collect();
+        self.write_durable("pins", &lines.join("\n"))
+    }
+
     /// The pin file's lines in first-sight order, the order [`PINS_KEEP`] evicts in.
     fn pin_lines(&self) -> Vec<String> {
         self.read("pins")
@@ -4275,6 +4580,7 @@ impl StateDir {
             .find(|(s, _)| *s == sid)
             .map(|(_, n)| n.to_string())
         {
+            self.settle_pins()?;
             return Ok(have);
         }
         lines.push(format!("{sid} {node}"));
@@ -5128,8 +5434,8 @@ mod tests {
                 "uncertain publication fate must not discard its journal"
             );
         }
-        st.clear_in_flight(late.pin.seq);
-        st.clear_in_flight(early.pin.seq);
+        st.clear_in_flight(late.pin.seq).unwrap();
+        st.clear_in_flight(early.pin.seq).unwrap();
         assert!(st.in_flight().unwrap().is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -6965,9 +7271,13 @@ mod tests {
                 // A second cut at a name the quarantine holds keeps both.
                 std::fs::write(root.join("inflight/8"), b"").expect("torn again");
                 assert_eq!(
-                    st.publish_quarantine_file("quarantine/inflight.8", b"replacement")
-                        .expect_err("the actual publication cannot replace an occupant")
-                        .kind(),
+                    st.publish_quarantine_file(
+                        "inflight/8",
+                        "quarantine/inflight.8",
+                        b"replacement",
+                    )
+                    .expect_err("the actual publication cannot replace an occupant")
+                    .kind(),
                     io::ErrorKind::AlreadyExists
                 );
                 assert_eq!(
@@ -7040,6 +7350,233 @@ mod tests {
             0,
             "nothing written through the link"
         );
+    }
+
+    /// **A SWEEP TRIED AGAIN AFTER ITS UNLINKS FAILED MOVES EACH FILE ONCE**
+    /// (sim item S7's review). Three torn entries, a same-byte occupied
+    /// destination, a failed pre-link publish, and then a failed post-link
+    /// fence: only the successful exclusive copy may be reused. An owned
+    /// read-only source directory then refuses three unlinks; after restoring
+    /// its mode, a sweep moves each file once. The quarantine then holds one
+    /// copy of each — the first try's, taken by the later ones for theirs —
+    /// not a copy per try under the next suffix. A different file at the
+    /// name is never taken for a copy: a third entry whose name a person's
+    /// file of other bytes holds goes to the next suffix; and a later boot's
+    /// file at the same path, torn to the very same bytes, is another file,
+    /// with a copy of its own.
+    #[cfg(unix)]
+    #[test]
+    fn a_sweep_tried_again_after_its_unlinks_failed_moves_each_file_once() {
+        use std::os::unix::fs::PermissionsExt as _;
+        assert_ne!(
+            aterm_uds::peer::our_uid(),
+            0,
+            "chmod refusal needs an unprivileged uid"
+        );
+        struct RestoreMode(PathBuf, std::fs::Permissions);
+        impl Drop for RestoreMode {
+            fn drop(&mut self) {
+                let _ = std::fs::set_permissions(&self.0, self.1.clone());
+            }
+        }
+        // Neither a new nor an already-visible quarantine permits copying
+        // before its parent's required fence. Clearing the refusal allows
+        // the same open to finish; no source was lost during either failure.
+        for kind in [io::ErrorKind::PermissionDenied, io::ErrorKind::Unsupported] {
+            let dir = aterm_tempfile::Builder::new()
+                .prefix("sweep-again-parent")
+                .tempdir_in("/tmp")
+                .expect("scratch");
+            let root = dir.path();
+            let st = StateDir::open(root).unwrap();
+            st.set_inc_seam(in_boot(1));
+            st.begin_run().unwrap();
+            std::fs::create_dir_all(root.join("inflight")).unwrap();
+            std::fs::write(root.join("inflight/7"), b"torn 7").unwrap();
+            st.set_inc_seam(in_boot(2));
+            st.refuse_directory_flush(Some((root, aterm_durable::Flush::Durable, kind)));
+            let before = st.ops();
+            for _ in 0..2 {
+                assert_eq!(st.set_aside_torn().unwrap_err().kind(), kind);
+                assert!(root.join(QUARANTINE).is_dir());
+                assert_eq!(std::fs::read_dir(root.join(QUARANTINE)).unwrap().count(), 0);
+                assert_eq!(std::fs::read(root.join("inflight/7")).unwrap(), b"torn 7");
+                assert_eq!(st.ops().replaces, before.replaces, "no copy published");
+            }
+            assert!(
+                st.ops().fsyncs > before.fsyncs,
+                "the root fence was attempted"
+            );
+            st.refuse_directory_flush(None);
+            let moved = st.set_aside_torn().unwrap();
+            assert_eq!(moved.len(), 1);
+            assert_eq!(moved[0].to, "quarantine/inflight.7");
+            assert_eq!(std::fs::read(root.join(&moved[0].to)).unwrap(), b"torn 7");
+            assert!(!root.join("inflight/7").exists());
+        }
+        let dir = aterm_tempfile::Builder::new()
+            .prefix("sweep-again")
+            .tempdir_in("/tmp")
+            .expect("scratch");
+        let root = dir.path();
+        let st = StateDir::open(root).expect("open");
+        st.set_inc_seam(in_boot(1));
+        st.begin_run()
+            .expect("a run in boot 1, never stopped cleanly");
+        std::fs::create_dir_all(root.join("inflight")).expect("its dir");
+        for seq in [7, 8, 9] {
+            std::fs::write(root.join(format!("inflight/{seq}")), format!("torn {seq}"))
+                .expect("torn");
+        }
+        std::fs::create_dir_all(root.join(QUARANTINE)).expect("the quarantine");
+        std::fs::write(root.join("quarantine/inflight.7"), b"torn 7")
+            .expect("a person's same-byte occupant");
+        st.set_inc_seam(in_boot(2));
+        st.refuse_writes_of(Some("quarantine/inflight.7"));
+        assert!(
+            st.set_aside_torn().is_err(),
+            "the first publish failed before its link"
+        );
+        st.refuse_writes_of(None);
+        assert_eq!(std::fs::read(root.join("inflight/7")).unwrap(), b"torn 7");
+        st.refuse_directory_flush(Some((
+            root.join(QUARANTINE).as_path(),
+            aterm_durable::Flush::Durable,
+            io::ErrorKind::Other,
+        )));
+        assert!(
+            st.set_aside_torn().is_err(),
+            "exclusive link made, its fence failed"
+        );
+        st.refuse_directory_flush(None);
+        assert_eq!(
+            std::fs::read(root.join("quarantine/inflight.7.1")).unwrap(),
+            b"torn 7"
+        );
+        assert!(
+            root.join("inflight/7").exists(),
+            "no source unlinked after the failed fence"
+        );
+        std::fs::write(root.join("quarantine/inflight.9"), b"a person's own file")
+            .expect("a file of other bytes at the name");
+        st.set_inc_seam(in_boot(2));
+        let mode = |m: u32| {
+            std::fs::set_permissions(root.join("inflight"), std::fs::Permissions::from_mode(m))
+                .expect("chmod");
+        };
+        let _restore = RestoreMode(
+            root.join("inflight"),
+            std::fs::metadata(root.join("inflight"))
+                .unwrap()
+                .permissions(),
+        );
+        mode(0o555);
+        for attempt in 0..3 {
+            let refused = st.set_aside_torn().expect_err("the unlinks fail");
+            assert_eq!(
+                refused.kind(),
+                io::ErrorKind::PermissionDenied,
+                "try {attempt}"
+            );
+        }
+        mode(0o755);
+        let moved = st.set_aside_torn().expect("the sweep, its dir writable");
+        let to: Vec<&str> = moved.iter().map(|m| m.to.as_str()).collect();
+        assert_eq!(
+            to,
+            [
+                "quarantine/inflight.7.1",
+                "quarantine/inflight.8",
+                "quarantine/inflight.9.1"
+            ]
+        );
+        let mut held: Vec<String> = std::fs::read_dir(root.join(QUARANTINE))
+            .expect("list")
+            .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
+            .collect();
+        held.sort();
+        assert_eq!(
+            held,
+            [
+                "inflight.7",
+                "inflight.7.1",
+                "inflight.8",
+                "inflight.9",
+                "inflight.9.1"
+            ],
+            "one copy of each torn file, and the person's file kept"
+        );
+        assert_eq!(
+            std::fs::read(root.join("quarantine/inflight.9")).expect("kept"),
+            b"a person's own file"
+        );
+        assert_eq!(
+            std::fs::read(root.join("quarantine/inflight.7")).unwrap(),
+            b"torn 7",
+            "same-byte occupant kept, not adopted"
+        );
+        assert_eq!(st.quarantined_torn().expect("count"), Some(5));
+        for seq in [7, 8, 9] {
+            assert!(
+                !root.join(format!("inflight/{seq}")).exists(),
+                "{seq} moved"
+            );
+        }
+        // A LATER BOOT'S FILE AT THE SAME PATH, TORN TO THE SAME BYTES, is
+        // another file: its own copy, under the next suffix.
+        st.begin_run()
+            .expect("a run in boot 2, never stopped cleanly");
+        std::fs::write(root.join("inflight/7"), "torn 7").expect("torn again");
+        st.set_inc_seam(in_boot(3));
+        let again = st.set_aside_torn().expect("boot 3's sweep");
+        let to: Vec<&str> = again.iter().map(|m| m.to.as_str()).collect();
+        assert_eq!(
+            to,
+            ["quarantine/inflight.7.2"],
+            "another file, another copy"
+        );
+        assert_eq!(st.quarantined_torn().expect("count"), Some(6));
+        // Removed/recreated same-byte names never inherit a retained copy's
+        // identity. A missing name is republished; an occupied replacement
+        // is preserved and a new exclusive suffix receives this source.
+        for replaced in [false, true] {
+            let dir = aterm_tempfile::Builder::new()
+                .prefix("sweep-again-identity")
+                .tempdir_in("/tmp")
+                .expect("scratch");
+            let root = dir.path();
+            let st = StateDir::open(root).unwrap();
+            st.set_inc_seam(in_boot(1));
+            st.begin_run().unwrap();
+            std::fs::create_dir_all(root.join("inflight")).unwrap();
+            std::fs::write(root.join("inflight/7"), b"torn 7").unwrap();
+            st.set_inc_seam(in_boot(2));
+            let quarantine = root.join(QUARANTINE);
+            st.refuse_directory_flush(Some((
+                quarantine.as_path(),
+                aterm_durable::Flush::Durable,
+                io::ErrorKind::Other,
+            )));
+            assert!(st.set_aside_torn().is_err());
+            st.refuse_directory_flush(None);
+            let copy = quarantine.join("inflight.7");
+            std::fs::remove_file(&copy).unwrap();
+            if replaced {
+                std::fs::write(&copy, b"torn 7").unwrap();
+            }
+            let moved = st.set_aside_torn().unwrap();
+            assert_eq!(moved.len(), 1);
+            assert_eq!(
+                moved[0].to,
+                if replaced {
+                    "quarantine/inflight.7.1"
+                } else {
+                    "quarantine/inflight.7"
+                }
+            );
+            assert_eq!(std::fs::read(&copy).unwrap(), b"torn 7");
+            assert!(!root.join("inflight/7").exists());
+        }
     }
 
     /// Neither a sweep nor a clean close follows a planted source parent.

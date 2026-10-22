@@ -115,6 +115,7 @@ impl SelectorParam {
     ///
     /// Totality: every input combination is decidable without panicking.
     #[must_use]
+    #[inline]
     pub fn matches(&self, actual: &str) -> bool {
         match self {
             Self::Wildcard => !actual.is_empty(),
@@ -161,7 +162,8 @@ pub struct SequenceSelector {
 impl SequenceSelector {
     /// The universal matcher (matches every dispatched sequence).
     #[must_use]
-    pub fn catch_all() -> Self {
+    #[inline]
+    pub const fn catch_all() -> Self {
         Self {
             function: FunctionKind::Wildcard,
             major: None,
@@ -183,6 +185,7 @@ impl SequenceSelector {
     /// Returns [`SelectorParseError`] if the input cannot be classified as
     /// a catch-all or a function-major selector. The engine keeps such a rule
     /// but never matches it.
+    #[inline]
     pub fn parse(src: &str) -> Result<Self, SelectorParseError> {
         parse_compiled(expand_alias(src))
     }
@@ -234,7 +237,8 @@ impl SequenceSelector {
     /// same key share a bucket in the compiled engine (see
     /// [`crate::engine`]).
     #[must_use]
-    pub fn bucket_key(&self) -> BucketKey {
+    #[inline]
+    pub const fn bucket_key(&self) -> BucketKey {
         BucketKey {
             function: self.function,
             major: self.major,
@@ -274,6 +278,7 @@ pub struct DispatchedSequence {
 impl DispatchedSequence {
     /// Convenience constructor for OSC sequences.
     #[must_use]
+    #[inline]
     pub fn osc(major: u32, params: impl IntoIterator<Item = String>) -> Self {
         Self {
             function: FunctionKind::Osc,
@@ -286,6 +291,7 @@ impl DispatchedSequence {
     /// Convenience constructor for CSI sequences. `final_byte` is the CSI
     /// dispatch byte (e.g. `'t'`).
     #[must_use]
+    #[inline]
     pub fn csi(
         major: Option<u32>,
         final_byte: char,
@@ -303,6 +309,7 @@ impl DispatchedSequence {
     /// string carries the intermediate bytes plus the final byte, e.g.
     /// `"2000p"`.
     #[must_use]
+    #[inline]
     pub fn dcs(intermediate_final: impl Into<String>) -> Self {
         Self {
             function: FunctionKind::Dcs,
@@ -475,6 +482,7 @@ fn parse_dcs_body(major_tok: &str, rest: &str) -> Result<SequenceSelector, Selec
     })
 }
 
+#[inline]
 fn split_major(tok: &str) -> (&str, Option<&str>) {
     match tok.split_once(';') {
         Some((major, rest)) => (major, Some(rest)),
@@ -515,11 +523,13 @@ fn compile_param(raw: &str) -> SelectorParam {
     }
 }
 
+#[inline]
 fn parse_major(tok: &str) -> Result<u32, SelectorParseError> {
     tok.parse::<u32>()
         .map_err(|_| SelectorParseError::BadMajor(tok.to_owned()))
 }
 
+#[inline]
 fn parse_major_or_wildcard(tok: &str) -> Result<Option<u32>, SelectorParseError> {
     if tok == "*" || tok.is_empty() {
         Ok(None)
@@ -528,18 +538,16 @@ fn parse_major_or_wildcard(tok: &str) -> Result<Option<u32>, SelectorParseError>
     }
 }
 
-fn is_csi_final_byte(tok: &str) -> bool {
+#[inline]
+const fn is_csi_final_byte(tok: &str) -> bool {
     // A CSI final byte is a single printable non-digit character.
-    let mut chars = tok.chars();
-    let Some(c) = chars.next() else {
-        return false;
-    };
-    if chars.next().is_some() {
-        return false;
-    }
-    c.is_ascii_alphabetic() || matches!(c, '@' | '`' | '~' | '^')
+    matches!(
+        tok.as_bytes(),
+        [b'A'..=b'Z' | b'a'..=b'z' | b'@' | b'`' | b'~' | b'^']
+    )
 }
 
+#[inline]
 fn non_empty_string(s: &str) -> Option<String> {
     let trimmed = s.trim();
     if trimmed.is_empty() {

@@ -53,6 +53,7 @@ const SHELL_MAJORS: [u32; 2] = [133, 633];
 const SHELL_SUBCOMMANDS: usize = 26;
 
 /// The shell-integration gate verdict for one `(major, subcommand)`, live.
+#[inline]
 #[must_use]
 fn shell_verdict(engine: Option<&PolicyEngine>, command: u32, subcommand: &str) -> BridgeDecision {
     policy_bridge::engine_decision(
@@ -64,6 +65,7 @@ fn shell_verdict(engine: Option<&PolicyEngine>, command: u32, subcommand: &str) 
 
 /// Table coordinates for a `(major, subcommand)` pair, or `None` when the pair
 /// is outside the compiled range and must be evaluated live.
+#[inline]
 fn shell_slot(command: u32, subcommand: &str) -> Option<(usize, usize)> {
     let major = SHELL_MAJORS.iter().position(|&m| m == command)?;
     let &[byte] = subcommand.as_bytes() else {
@@ -78,6 +80,7 @@ fn shell_slot(command: u32, subcommand: &str) -> Option<(usize, usize)> {
 /// The XTWINOPS gate verdict for one `Ps`, evaluated live: used by
 /// [`PolicyState`] at install time and on the out-of-range fallback, and by
 /// `window_auth`'s tests.
+#[inline]
 #[must_use]
 pub(super) fn xtwinops_verdict(engine: Option<&PolicyEngine>, ps: u16) -> BridgeDecision {
     policy_bridge::engine_decision_deny_by_default_capability(
@@ -129,16 +132,19 @@ impl PolicyGates {
 
     /// Verdict for the response sink; see [`BridgeDecision::resolve`] for how
     /// callers fold it with their legacy boolean.
+    #[inline]
     pub(super) const fn response_sink(self) -> BridgeDecision {
         self.response_sink
     }
 
     /// Verdict for the OSC 52 clipboard *set* (and *clear*) gate.
+    #[inline]
     pub(super) const fn osc52_set(self) -> BridgeDecision {
         self.osc52_set
     }
 
     /// Verdict for the OSC 52 clipboard *query* gate.
+    #[inline]
     pub(super) const fn osc52_query(self) -> BridgeDecision {
         self.osc52_query
     }
@@ -168,6 +174,7 @@ pub(super) struct PolicyState {
 
 impl PolicyState {
     /// No policy installed — the pre-`apply_policy_engine` default.
+    #[inline]
     pub(super) fn new() -> Self {
         Self {
             engine: None,
@@ -190,6 +197,7 @@ impl PolicyState {
     /// OSC 133 / OSC 633 gate verdict for this dispatch: a table read for the
     /// `(major, subcommand-letter)` pairs shell integration uses, a live
     /// evaluation otherwise.
+    #[inline]
     pub(super) fn shell_integration_gate(&self, command: u32, params: &[&[u8]]) -> BridgeDecision {
         let subcommand = super::shell_integration_auth::probe_subcommand(params);
         shell_slot(command, subcommand).map_or_else(
@@ -200,6 +208,7 @@ impl PolicyState {
 
     /// XTWINOPS verdict for `ps`: a table read inside the compiled range, a
     /// live evaluation outside it (see [`XTWINOPS_MAX_PS`]).
+    #[inline]
     pub(super) fn xtwinops_gate(&self, ps: u16) -> BridgeDecision {
         self.xtwinops
             .get(usize::from(ps))
@@ -215,6 +224,7 @@ impl PolicyState {
     }
 
     /// The compiled gate table.
+    #[inline]
     pub(super) const fn gates(&self) -> PolicyGates {
         self.gates
     }
@@ -223,6 +233,7 @@ impl PolicyState {
     /// (the caller uses its legacy limiter). Bucket state is the one thing a
     /// dispatch mutates in the engine, and [`PolicyEngine::evaluate`] never
     /// reads it, so this is safe to expose without `&mut PolicyEngine`.
+    #[inline]
     pub(super) fn rate_limit_try_consume<T: TimeSource>(
         &mut self,
         id: &str,
@@ -237,6 +248,7 @@ impl PolicyState {
     /// Debit the [`RESPONSE_LIMIT_ID`] bucket through its pre-resolved slot: the same answer as
     /// [`Self::rate_limit_try_consume`] for that id. `None` means no engine is installed, and
     /// `send_response` uses its legacy limiter.
+    #[inline]
     pub(super) fn response_rate_limit_try_consume<T: TimeSource>(
         &mut self,
         amount: u64,
@@ -247,6 +259,7 @@ impl PolicyState {
     }
 
     /// Look up a rate-limit configuration in the installed policy.
+    #[inline]
     pub(super) fn rate_limit_config(&self, id: &str) -> Option<&RateLimit> {
         self.engine.as_ref()?.rate_limit_config(id)
     }
@@ -274,6 +287,7 @@ fn compile_shell(
 }
 
 impl Default for PolicyState {
+    #[inline]
     fn default() -> Self {
         Self::new()
     }

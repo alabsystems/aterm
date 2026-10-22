@@ -37,6 +37,7 @@ pub struct StyleResolveOpts {
 }
 
 impl Default for StyleResolveOpts {
+    #[inline]
     fn default() -> Self {
         Self {
             bold_is_bright: true,
@@ -77,6 +78,7 @@ struct PairFloor {
 impl PairFloor {
     /// `fg` floored against `bg`; `inks` are the theme's default foreground
     /// and background.
+    #[inline]
     fn apply(self, fg: Rgb, bg: Rgb, inks: [Rgb; 2]) -> Rgb {
         if self.on_page {
             floor_contrast(fg, bg, self.min)
@@ -94,7 +96,7 @@ impl PairFloor {
 /// seam in the picture, not make anything legible.
 #[must_use]
 #[inline]
-pub(crate) fn is_shape_glyph(ch: char) -> bool {
+pub(crate) const fn is_shape_glyph(ch: char) -> bool {
     matches!(ch, '\u{2500}'..='\u{259F}' | '\u{E0A0}'..='\u{E0D7}')
 }
 
@@ -219,6 +221,7 @@ pub fn floor_contrast(fg: Rgb, bg: Rgb, min: f32) -> Rgb {
 }
 
 /// WCAG relative luminance on this module's transfer tables.
+#[inline]
 fn wcag_luminance(c: Rgb) -> f32 {
     let tables = transfer_tables();
     0.2126 * tables.to_linear[usize::from(c.r)]
@@ -227,14 +230,16 @@ fn wcag_luminance(c: Rgb) -> f32 {
 }
 
 /// The WCAG contrast ratio of two relative luminances.
-fn wcag_contrast(a: f32, b: f32) -> f32 {
+#[inline]
+const fn wcag_contrast(a: f32, b: f32) -> f32 {
     (a.max(b) + 0.05) / (a.min(b) + 0.05)
 }
 
 /// The pole a background of luminance `lb` contrasts with more: black (`0`)
 /// or white (`255`). contrast(black, bg) = (L+0.05)/0.05 beats
 /// contrast(white, bg) = 1.05/(L+0.05) iff (L+0.05)² >= 0.05·1.05.
-fn pole_of(lb: f32) -> u8 {
+#[inline]
+const fn pole_of(lb: f32) -> u8 {
     if (lb + 0.05) * (lb + 0.05) >= 0.05 * 1.05 {
         0
     } else {
@@ -242,7 +247,8 @@ fn pole_of(lb: f32) -> u8 {
     }
 }
 
-fn grey(v: u8) -> Rgb {
+#[inline]
+const fn grey(v: u8) -> Rgb {
     Rgb { r: v, g: v, b: v }
 }
 
@@ -335,6 +341,7 @@ pub fn floor_contrast_on_colour(fg: Rgb, bg: Rgb, min: f32, inks: [Rgb; 2]) -> R
 /// HashMap. Prefer [`resolve_colors_raw_opts`] with pre-resolved RGB values
 /// from `grid.fg_rgb_at()` / `grid.bg_rgb_at()` to include ring buffer lookups.
 #[must_use]
+#[inline]
 pub fn resolve_colors(
     cell: &Cell,
     extra: Option<&CellExtra>,
@@ -362,6 +369,7 @@ pub fn resolve_colors(
 /// render extraction path ([`render_row`](super::Terminal::render_row)) passes
 /// the terminal's configured policy.
 #[must_use]
+#[inline]
 #[allow(
     clippy::too_many_arguments,
     reason = "one call site per frame path; a params struct would just relocate the arity"
@@ -588,6 +596,7 @@ impl TransferTables {
     }
 }
 
+#[inline]
 fn transfer_tables() -> &'static TransferTables {
     static TABLES: OnceLock<TransferTables> = OnceLock::new();
     TABLES.get_or_init(TransferTables::new)
@@ -639,6 +648,7 @@ fn linear_to_srgb_with(tables: &TransferTables, l: f32) -> u8 {
 /// `contrast(dim_toward_bg(fg, bg, t), bg) <= contrast(fg, bg)` for all
 /// `fg`, `bg`, and `t ∈ [0, 1]`.
 #[must_use]
+#[inline]
 pub fn dim_toward_bg(fg: Rgb, bg: Rgb, opacity: f32) -> Rgb {
     dim_toward_bg_with(fg, bg, opacity, FAINT_SRGB_BLEND)
 }
@@ -799,6 +809,7 @@ fn faint_mix(lf: f32, lb: f32, opacity: f32, start: f32) -> f32 {
 /// Handles the three-tier resolution: default -> indexed palette -> RGB.
 /// The `fg_rgb` and `bg_rgb` parameters are pre-resolved from the unified
 /// grid lookup (ring buffer + HashMap) or from CellExtra directly.
+#[inline]
 fn raw_resolve(
     colors: PackedColors,
     fg_rgb: Option<[u8; 3]>,

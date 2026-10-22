@@ -120,18 +120,21 @@ impl ReplayEngine {
 
     /// Drop the active grid's resize undo, so the next resize lands as it would
     /// on an engine without the undo (`cast drift`'s undo-less replays).
+    #[inline]
     pub fn drop_resize_undo(&mut self) {
         self.term.grid_mut().drop_resize_undo();
     }
 
     /// The replayed engine, for reading.
     #[must_use]
-    pub fn terminal(&self) -> &Terminal {
+    #[inline]
+    pub const fn terminal(&self) -> &Terminal {
         &self.term
     }
 
     /// The replayed engine, handed over.
     #[must_use]
+    #[inline]
     pub fn into_terminal(self) -> Terminal {
         self.term
     }

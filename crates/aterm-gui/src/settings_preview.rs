@@ -792,11 +792,31 @@ impl DemoFrame {
         }
     }
 
-    /// The two tabs' labels, the selected one first.
-    pub(crate) const fn labels(self) -> [&'static str; 2] {
+    /// The two tabs' titles, the selected one first, each a ladder of whole
+    /// titles longest first: a tab with too little room for one says the
+    /// next ([`DemoStripLayout::of`]), never a cut word.
+    pub(crate) const fn titles(self) -> [&'static [&'static str]; 2] {
         match self {
-            Self::Windows => ["PowerShell", "Command Prompt"],
-            Self::Dots => ["zsh — aterm", "targo test"],
+            Self::Windows => [&["PowerShell", "pwsh"], &["Command Prompt", "cmd"]],
+            Self::Dots => [&["zsh — aterm", "zsh"], &["targo test", "targo"]],
+        }
+    }
+
+    /// The faces the two tabs' titles paint in: Windows sets its selected
+    /// title semibold.
+    pub(crate) const fn faces(self) -> [TextFace; 2] {
+        match self {
+            Self::Windows => [TextFace::UiBold, TextFace::Ui],
+            Self::Dots => [TextFace::Ui, TextFace::Ui],
+        }
+    }
+
+    /// The room each tab keeps beside its title: its leading inset and its
+    /// trailing one, the selected Windows tab's resident `✕` included.
+    const fn title_padding(self) -> [f32; 2] {
+        match self {
+            Self::Windows => [34.0, 20.0],
+            Self::Dots => [20.0, 20.0],
         }
     }
 }
@@ -822,8 +842,15 @@ pub(crate) struct DemoStripLayout {
     pub(crate) tab_top: f32,
     /// The selected tab's left edge; the quiet tab follows it at `tab_w`.
     pub(crate) tabs_x: f32,
-    /// Each tab's width; under 24 pt the tabs are not drawn.
+    /// The selected tab's width; under 24 pt the tabs are not drawn.
     pub(crate) tab_w: f32,
+    /// The quiet tab's width.
+    pub(crate) quiet_w: f32,
+    /// The title each tab says, the selected one first: the longest of its
+    /// [`DemoFrame::titles`] its tab holds whole, or none.
+    pub(crate) titles: [Option<&'static str>; 2],
+    /// The titles' size.
+    pub(crate) title_px: f32,
     /// A Windows frame's caption glyph centres, minimize, maximize and close,
     /// and the strip's middle they share; `None` on the dots frame, or a
     /// window too narrow for its buttons.
@@ -836,17 +863,71 @@ impl DemoStripLayout {
     /// The least tab the strip draws.
     pub(crate) const MIN_TAB_W: f32 = 24.0;
 
+    /// The most a tab grows to, at the text size.
+    fn max_tab_w() -> f32 {
+        168.0 * crate::native_appearance::text_scale().max(1.0)
+    }
+
+    /// THE TWO TABS IN `room`, FROM THEIR MEASURED TITLES: the selected
+    /// tab's title stays whole longest — the quiet tab says its shorter title
+    /// first, then the selected one its — and the tabs split the room evenly
+    /// wherever both titles fit their halves, the selected one taking what
+    /// its title needs from the quiet one where not. A tab whose shortest
+    /// title does not fit says none. Returns the two widths and titles.
+    fn tabs(frame: DemoFrame, room: f32, px: f32) -> ([f32; 2], [Option<&'static str>; 2]) {
+        let half = (room / 2.0).floor().clamp(0.0, Self::max_tab_w());
+        let (faces, padding) = (frame.faces(), frame.title_padding());
+        let need = |tab: usize, title: &str| {
+            (crate::tray_raster::ui_text_width_for(faces[tab], title, px) + padding[tab]).ceil()
+        };
+        let [selected, quiet] = frame.titles();
+        // The quiet tab gives way first, through every one of its titles,
+        // while the selected one says its longest; then the selected one
+        // shortens beside the quiet one's shortest; then the selected tab
+        // alone says a title.
+        let mut ladder: Vec<(Option<&'static str>, Option<&'static str>)> = Vec::new();
+        for (index, &title) in selected.iter().enumerate() {
+            let from = if index == 0 { 0 } else { quiet.len() - 1 };
+            ladder.extend(
+                quiet[from..]
+                    .iter()
+                    .map(|&other| (Some(title), Some(other))),
+            );
+        }
+        ladder.extend(selected.iter().map(|&title| (Some(title), None)));
+        for (s, q) in ladder {
+            let selected_need = s.map_or(Self::MIN_TAB_W, |title| need(0, title));
+            let quiet_need = q.map_or(Self::MIN_TAB_W, |title| need(1, title));
+            if selected_need + quiet_need > room {
+                continue;
+            }
+            let selected_w = half.clamp(
+                selected_need,
+                (room - quiet_need).min(Self::max_tab_w().max(selected_need)),
+            );
+            let quiet_w = (room - selected_w).min(Self::max_tab_w().max(quiet_need));
+            return ([selected_w, quiet_w], [s, q]);
+        }
+        ([half, half], [None, None])
+    }
+
     pub(crate) fn of(rect: LogicalRect, frame: DemoFrame) -> Self {
         let top = rect.y;
         let strip_h = DEMO_STRIP_HEIGHT.min(rect.height);
+        let title_px = header_caption().get();
         match frame {
             DemoFrame::Dots => {
                 let tabs_x = rect.x + 52.0;
+                let ([tab_w, quiet_w], titles) =
+                    Self::tabs(frame, (rect.right() - 12.0 - tabs_x).max(0.0), title_px);
                 Self {
                     strip_h,
                     tab_top: top + 5.0,
                     tabs_x,
-                    tab_w: ((rect.right() - 12.0 - tabs_x) / 2.0).clamp(0.0, 168.0),
+                    tab_w,
+                    quiet_w,
+                    titles,
+                    title_px,
                     caption: None,
                     new_tab: None,
                 }
@@ -865,17 +946,22 @@ impl DemoStripLayout {
                     )
                 });
                 let tabs_end = caption.map_or(rect.right(), |_| rect.right() - buttons - 8.0);
-                let tab_w = ((tabs_end - DEMO_NEW_TAB_W - tabs_x) / 2.0)
-                    .floor()
-                    .clamp(0.0, 168.0);
+                let ([tab_w, quiet_w], titles) = Self::tabs(
+                    frame,
+                    (tabs_end - DEMO_NEW_TAB_W - tabs_x).floor().max(0.0),
+                    title_px,
+                );
                 Self {
                     strip_h,
                     tab_top: top + 6.0,
                     tabs_x,
                     tab_w,
+                    quiet_w,
+                    titles,
+                    title_px,
                     caption,
                     new_tab: (tab_w >= Self::MIN_TAB_W)
-                        .then_some(tabs_x + tab_w * 2.0 + DEMO_NEW_TAB_W * 0.5),
+                        .then_some(tabs_x + tab_w + quiet_w + DEMO_NEW_TAB_W * 0.5),
                 }
             }
         }
@@ -889,6 +975,45 @@ impl DemoStripLayout {
     /// The optical centre of the tab labels' row: their caps' middle.
     pub(crate) fn label_cy(&self, rect: LogicalRect) -> f32 {
         self.tab_top + (self.tab_h(rect) - 2.0) * 0.5
+    }
+}
+
+/// How a tried cursor style came to the preview, which decides how it is
+/// kept: the hint the header paints and the spoken value says is what that
+/// source's gesture really does, never a key that would act on something else.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum StyleTrial {
+    /// The keyboard is on the row being tried: Return activates that row, so
+    /// Return saves it.
+    Keyboard,
+    /// The pointer is over the row being tried: a click on it saves it, while
+    /// Return acts on whatever has the keyboard (another row, a button, or
+    /// nothing).
+    Pointer,
+    /// The preview kept the style it was trying while the keyboard is on its
+    /// own Pause/Play control: nothing pressed here saves it.
+    Kept,
+}
+
+impl StyleTrial {
+    /// The header's hint for keeping the tried style, where a gesture keeps it.
+    pub(crate) fn save_hint(self) -> Option<&'static str> {
+        match self {
+            Self::Keyboard => Some("Return to save"),
+            Self::Pointer => Some("Click to save"),
+            Self::Kept => None,
+        }
+    }
+
+    /// The spoken value's words for an unsaved, tried style. Escape goes back
+    /// from every source ([`crate::native_settings`]'s cancel clears the
+    /// hover, the kept style and the row).
+    pub(crate) fn spoken(self) -> &'static str {
+        match self {
+            Self::Keyboard => "not saved; Return saves, Escape goes back",
+            Self::Pointer => "not saved; click saves, Escape goes back",
+            Self::Kept => "not saved; Escape goes back",
+        }
     }
 }
 
@@ -922,9 +1047,11 @@ pub(crate) struct SettingsPreviewSpec {
     /// badge says `Sample:` instead of `Theme:`.
     pub(crate) theme_sample: bool,
     /// The focused cursor style is being TRIED, not saved (a Cursor Styles
-    /// row the pointer or the keyboard rests on that nobody chose): the badge
-    /// says `Trying:` and the spoken value says it is not saved.
-    pub(crate) style_trial: bool,
+    /// row the pointer or the keyboard rests on that nobody chose), and how
+    /// it came here: the badge says `Trying:`, the spoken value says it is
+    /// not saved, and both say how to keep it in the words of what that
+    /// source's gesture really does ([`StyleTrial`]).
+    pub(crate) style_trial: Option<StyleTrial>,
     /// The focused row's own verdict when it changes nothing now, in the
     /// words the row shows (`Inactive: dark themes only`, `Inactive: Bloom
     /// Off`): the header says it in place of a live state, so the row and the
@@ -952,8 +1079,13 @@ pub(crate) struct SettingsPreviewSpec {
     /// with its trail lit ([`CURSOR_SCENE_PAUSE_MS`]) and arms no cadence.
     pub(crate) paused: bool,
     /// Keyboard focus is on this preview (a Pause/Play control while it
-    /// loops): paint draws the focus ring the standard controls draw.
+    /// loops). Interaction state, set only by the tree's one interaction
+    /// pass ([`crate::native_ui::UiTree::apply_interaction`]), as every
+    /// control's is: the semantic tree says it focused from the same bit.
     pub(crate) focused: bool,
+    /// The focus came from the keyboard ([`Self::focused`] too): paint draws
+    /// the focus ring the standard controls draw, and a pointer's focus none.
+    pub(crate) focus_visible: bool,
     /// Why `reduced_motion` holds, for the badge and the spoken summary.
     pub(crate) pause: PreviewPause,
     /// The Themes demo's playback; read only by [`PreviewScene::ThemeDemo`].
@@ -962,6 +1094,21 @@ pub(crate) struct SettingsPreviewSpec {
     /// tab does: the Wallpaper page's preview, and the Appearance color
     /// sample while one is set. `None` draws the theme background.
     pub(crate) wallpaper: Option<crate::widget::SpecimenWallpaper>,
+    /// The width the host lays this preview out at, which its header wraps
+    /// to ([`Self::header_layout`]): every height it answers
+    /// ([`Self::minimum_height`], [`Self::whole_rows_at_most`], ...) buys the
+    /// header that width needs, so the specimen keeps its whole rows under
+    /// it. `None`: a host that never narrows it, whose header is measured
+    /// on one line. Paint always lays the header out at the rect it is given.
+    pub(crate) measure_width: Option<f32>,
+    /// The candidate's font slots whose names a resolver did not find, each
+    /// with the name, as the host's one verdict says it
+    /// (`SettingsViewState::font_refusal`: the terminal's font generation or
+    /// the preview's font worker, whichever answered): with the worker's own
+    /// status ([`Self::unresolved_slots`]) the header's value, its state and
+    /// the font pill say "not found" together, never "loading" for a name a
+    /// resolver already refused.
+    pub(crate) refused_fonts: Vec<(&'static str, String)>,
 }
 
 impl Default for SettingsPreviewSpec {
@@ -983,7 +1130,7 @@ impl Default for SettingsPreviewSpec {
             focused_value: crate::prefs::DEFAULT_CURSOR_TRAIL_STYLE.to_string(),
             focused_label: String::new(),
             theme_sample: false,
-            style_trial: false,
+            style_trial: None,
             focused_effect: None,
             font_status: "host-prepared renderer snapshot unavailable".to_string(),
             font_ready_epoch: 0,
@@ -997,9 +1144,12 @@ impl Default for SettingsPreviewSpec {
             reduced_motion: false,
             paused: false,
             focused: false,
+            focus_visible: false,
             pause: PreviewPause::Unspecified,
             demo: ThemeDemoSpec::default(),
             wallpaper: None,
+            measure_width: None,
+            refused_fonts: Vec::new(),
         }
     }
 }
@@ -1103,11 +1253,6 @@ impl SettingsPreviewSpec {
         self
     }
 
-    pub(crate) fn with_focus_ring(mut self, focused: bool) -> Self {
-        self.focused = focused;
-        self
-    }
-
     /// Why the preview moves or holds still, in the paint audit's words:
     /// while motion is reduced, the cause the badge and spoken summary name
     /// ([`PreviewPause::audit`]), never a second opinion; otherwise why it
@@ -1177,10 +1322,41 @@ impl SettingsPreviewSpec {
         self
     }
 
-    /// Mark the focused cursor style as tried, not saved.
-    pub(crate) fn with_style_trial(mut self, trial: bool) -> Self {
+    /// The font slots a resolver did not find ([`Self::refused_fonts`]).
+    pub(crate) fn with_refused_fonts(mut self, refused: Vec<(&'static str, String)>) -> Self {
+        self.refused_fonts = refused;
+        self
+    }
+
+    /// THE FONT VERDICT: every candidate slot whose name no resolver found,
+    /// with the name — the host's verdict ([`Self::refused_fonts`]) and the
+    /// preview font worker's own status, the host's first.
+    fn unresolved_slots(&self) -> Vec<(&'static str, String)> {
+        let mut slots = self.refused_fonts.clone();
+        for (slot, family) in crate::tray_raster::unresolved_slots(&self.font_status) {
+            if slots.iter().all(|(known, _)| *known != slot) {
+                slots.push((slot, family));
+            }
+        }
+        slots
+    }
+
+    /// The width the host lays this preview out at ([`Self::measure_width`]).
+    pub(crate) fn with_measure_width(mut self, width: f32) -> Self {
+        self.measure_width = Some(width);
+        self
+    }
+
+    /// Mark the focused cursor style as tried, not saved, and by what.
+    pub(crate) fn with_style_trial(mut self, trial: Option<StyleTrial>) -> Self {
         self.style_trial = trial;
         self
+    }
+
+    /// The focused cursor style is being tried ([`Self::style_trial`]).
+    fn trying_style(&self) -> Option<StyleTrial> {
+        self.style_trial
+            .filter(|_| self.focused_key == crate::prefs::EDIT_CURSOR_TRAIL_STYLE)
     }
 
     /// The focused row's verdict when it changes nothing now, in the row's
@@ -1288,6 +1464,7 @@ impl SettingsPreviewSpec {
             reduced_motion: self.reduced_motion,
             paused: self.paused,
             focused: self.focused,
+            focus_visible: self.focus_visible,
             pause: self.pause,
             demo: ThemeDemoSpec {
                 phase_ms: self.demo.phase_ms % crate::settings_theme_demo::DEMO_LOOP_MS,
@@ -1305,6 +1482,8 @@ impl SettingsPreviewSpec {
                 wallpaper.dim = finite_or(wallpaper.dim, 0.0).clamp(0.0, 1.0);
                 wallpaper
             }),
+            measure_width: self.measure_width.filter(|width| width.is_finite()),
+            refused_fonts: self.refused_fonts.clone(),
         }
     }
 
@@ -1340,6 +1519,7 @@ impl SettingsPreviewSpec {
         // Focusing the card (to pause it) is the same demonstration.
         let mut probe = self.clone().with_phase(0);
         probe.focused = false;
+        probe.focus_visible = false;
         Some(probe.paint_fingerprint())
     }
 
@@ -1441,8 +1621,9 @@ impl SettingsPreviewSpec {
             _ => return None,
         };
         let status = self.font_status.to_ascii_lowercase();
+        let unresolved = self.unresolved_slots();
         // Everything past the loading arm is a warning: the font failed.
-        let state = if status.contains("unresolved") {
+        let state = if !unresolved.is_empty() || status.contains("unresolved") {
             // A name no resolver found, in the words its row uses.
             "Not found"
         } else if status.contains("unavailable") || status.contains("fallback active") {
@@ -1465,19 +1646,18 @@ impl SettingsPreviewSpec {
         // A font that failed is named by its own slot, whichever row has
         // focus: an emoji font that is not installed says Emoji.
         let candidate = &self.font_candidate;
-        let failed =
-            crate::tray_raster::first_unresolved_slot(&self.font_status).and_then(|slot| {
-                let (label, family) = match slot {
-                    "regular" => ("Regular", candidate.regular.as_deref()),
-                    "bold" => ("Bold", candidate.bold.as_deref()),
-                    "italic" => ("Italic", candidate.italic.as_deref()),
-                    "bold italic" => ("Bold Italic", candidate.bold_italic.as_deref()),
-                    "symbol" => ("Symbols", candidate.symbol.as_deref()),
-                    "emoji" => ("Emoji", candidate.emoji.as_deref()),
-                    _ => ("Fallback", candidate.fallback.first().map(String::as_str)),
-                };
-                Some((label, family_words(family?)))
-            });
+        let failed = unresolved.first().map(|(slot, _)| *slot).and_then(|slot| {
+            let (label, family) = match slot {
+                "regular" => ("Regular", candidate.regular.as_deref()),
+                "bold" => ("Bold", candidate.bold.as_deref()),
+                "italic" => ("Italic", candidate.italic.as_deref()),
+                "bold italic" => ("Bold Italic", candidate.bold_italic.as_deref()),
+                "symbol" => ("Symbols", candidate.symbol.as_deref()),
+                "emoji" => ("Emoji", candidate.emoji.as_deref()),
+                _ => ("Fallback", candidate.fallback.first().map(String::as_str)),
+            };
+            Some((label, family_words(family?)))
+        });
         if let Some((label, family)) = failed {
             return Some((format!("{state} · {label}: {family}"), true));
         }
@@ -1629,9 +1809,10 @@ impl SettingsPreviewSpec {
             }
             PreviewScene::Typography => {
                 // A family no resolver found is not what the sample shows.
-                let regular_missing = spec.font_status.to_ascii_lowercase().contains("unresolved")
-                    && crate::tray_raster::first_unresolved_slot(&spec.font_status)
-                        == Some("regular");
+                let regular_missing = spec
+                    .unresolved_slots()
+                    .first()
+                    .is_some_and(|(slot, _)| *slot == "regular");
                 // The sample's letters are the display layer's when one is
                 // on (`drawn_family`), else the font's.
                 let drawn = spec.font_candidate.drawn_family();
@@ -1694,16 +1875,15 @@ impl SettingsPreviewSpec {
                         PreviewAnimation::None => String::new(),
                     }
                 };
-                // A tried style is said to be unsaved, as a theme sample is.
-                let lead = if spec.style_trial
-                    && spec.focused_key == crate::prefs::EDIT_CURSOR_TRAIL_STYLE
-                {
-                    format!(
-                        "Cursor preview, trying {} (not saved; Return saves, Escape goes back)",
-                        spec.cursor.trail_style_label()
-                    )
-                } else {
-                    "Cursor preview".to_string()
+                // A tried style is said to be unsaved, as a theme sample is,
+                // with how to keep it from where it came.
+                let lead = match spec.trying_style() {
+                    Some(trial) => format!(
+                        "Cursor preview, trying {} ({})",
+                        spec.cursor.trail_style_label(),
+                        trial.spoken()
+                    ),
+                    None => "Cursor preview".to_string(),
                 };
                 // The focused row's verdict when it changes nothing now.
                 let idle = spec
@@ -1754,7 +1934,7 @@ impl SettingsPreviewSpec {
             crate::prefs::EDIT_EMOJI_FONT => "emoji",
             _ => return None,
         };
-        (crate::tray_raster::first_unresolved_slot(&self.font_status) == Some(slot)).then_some(slot)
+        (self.unresolved_slots().first().map(|(first, _)| *first) == Some(slot)).then_some(slot)
     }
 
     /// The family a focused font row has chosen, as the specimen draws it:
@@ -2077,6 +2257,8 @@ impl SettingsPreviewSpec {
         self.theme_sample.hash(&mut hash);
         self.style_trial.hash(&mut hash);
         self.focused_effect.hash(&mut hash);
+        // The font verdict decides the header's value and the pill's words.
+        self.refused_fonts.hash(&mut hash);
         // `PreviewTerminalTheme` is `Copy`, so the normalized candidate is a
         // stack value.
         self.terminal_theme
@@ -2116,7 +2298,7 @@ impl SettingsPreviewSpec {
         // The held frame and its glyph, and the focus ring a looping card
         // draws, are pixels.
         self.holds_pause().hash(&mut hash);
-        (self.focused && self.pause_control()).hash(&mut hash);
+        (self.focus_visible && self.pause_control()).hash(&mut hash);
         self.wallpaper
             .as_ref()
             .map(|wallpaper| {
@@ -2163,6 +2345,290 @@ impl SettingsPreviewSpec {
         hash.finish() | 1
     }
 
+    /// The header's height at the width the host lays the preview out at
+    /// ([`Self::measure_width`]; one line where it names none).
+    fn header_height(&self) -> f32 {
+        self.header_layout(self.measure_width.unwrap_or(f32::INFINITY))
+            .height
+    }
+
+    /// What the header can say, most first, each a whole statement: the
+    /// candidate and its state, with how to keep a tried style; without the
+    /// hint; without the state words (the state's colour and the Pause/Play
+    /// glyph still say it); the value alone, where its subject does not say
+    /// it is unsaved. Nothing is ever cut to make a rung.
+    fn header_rungs(&self) -> Vec<String> {
+        let candidate = self.candidate_badge();
+        if candidate.trim().is_empty() {
+            return vec![self.live_state()];
+        }
+        let full = self.with_state_badge(candidate.clone());
+        let mut rungs = Vec::with_capacity(4);
+        if let Some(hint) = self.trying_style().and_then(StyleTrial::save_hint) {
+            rungs.push(format!("{full} · {hint}"));
+        }
+        rungs.push(full);
+        rungs.push(candidate);
+        if !self.candidate_is_unsaved()
+            && let Some((_, value)) = self.candidate_parts()
+        {
+            rungs.push(value);
+        }
+        rungs.dedup();
+        rungs
+    }
+
+    /// THE HEADER, LAID OUT FOR `width`: the most it can say on one line,
+    /// whole words ([`Self::header_rungs`]), the scene label beside it where
+    /// there is room for both (the label goes first: the page already names
+    /// the preview); where not even its least statement fits one line, that
+    /// statement wrapped at word joins onto as many lines as it needs (a
+    /// word wider than a line breaks with a hyphen, as every Settings label
+    /// does), the header as tall as its lines. Never a word cut, never a
+    /// separator before a cut. [`Self::header_in`] fits it to a card's
+    /// height.
+    pub(crate) fn header_layout(&self, width: f32) -> PreviewHeader {
+        let px = header_caption().get();
+        let measure =
+            |text: &str| crate::tray_raster::ui_text_width_for(TextFace::UiBold, text, px);
+        let control_reserve = if self.pause_control() {
+            PAUSE_GLYPH_W + 6.0
+        } else {
+            0.0
+        };
+        let available = (width - PREVIEW_INSET * 2.0 - control_reserve).max(0.0);
+        let fits = |text: &str| measure(text) <= available + crate::native_ui::TEXT_FIT_SLACK;
+        let rungs = self.header_rungs();
+        let scene_width = measure(self.scene.badge_label());
+        let (scene, lines, says) = match rungs.iter().find(|rung| fits(rung)) {
+            Some(rung) => (
+                scene_width + 8.0 + measure(rung) <= available + crate::native_ui::TEXT_FIT_SLACK,
+                vec![rung.clone()],
+                rung.clone(),
+            ),
+            None => {
+                let least = rungs.last().cloned().unwrap_or_default();
+                (
+                    false,
+                    crate::native_settings::wrap_to_box(&least, available, &measure),
+                    least,
+                )
+            }
+        };
+        let height = header_first_line(self.scene, px)
+            + lines.len().saturating_sub(1) as f32 * header_line_pitch(px);
+        PreviewHeader {
+            scene,
+            lines,
+            says,
+            cut: false,
+            available,
+            px,
+            height,
+        }
+    }
+
+    /// [`Self::header_layout`] in a card `rect`: every line its statement
+    /// needs, as a host that sized the card for its width gives it room
+    /// for, the terminal body taking what is left. THE HEADER NEVER TAKES
+    /// ITS SPECIMEN'S LEAST ROW: the specimen is the preview's point, the
+    /// header its caption, so where a card a host held under
+    /// [`Self::minimum_height`] (Cursor Styles' 64-pt preview at 22×24 with
+    /// 2× text) holds a wrapped statement's lines but no specimen row under
+    /// them, the header gives its words up whole — never a cut word — and
+    /// keeps its first band for the Pause/Play glyph; the page's own words
+    /// (the list's checked row, the row being edited) and the spoken value
+    /// still say the statement. Only a card too short for even that band and
+    /// one row keeps the lines that fit, the last one cut.
+    pub(crate) fn header_in(&self, rect: LogicalRect) -> PreviewHeader {
+        let mut header = self.header_layout(rect.width);
+        let (first, pitch) = (
+            header_first_line(self.scene, header.px),
+            header_line_pitch(header.px),
+        );
+        let body = self.least_body();
+        if header.height + body > rect.height + 0.01 && first + body <= rect.height + 0.01 {
+            header.lines.clear();
+            header.says.clear();
+            header.scene = false;
+            header.height = first;
+            return header;
+        }
+        let room = ((rect.height - 4.0 - first).max(0.0) / pitch).floor() as usize + 1;
+        if header.lines.len() > room {
+            header.lines.truncate(room);
+            if let Some(last) = header.lines.pop() {
+                header.lines.push(bounded_badge_width(
+                    &format!("{last} …"),
+                    header.available,
+                    header.px,
+                    TextFace::UiBold,
+                ));
+            }
+            header.cut = true;
+            header.height = first + room.saturating_sub(1) as f32 * pitch;
+        }
+        header
+    }
+
+    /// The least a card keeps under its header for the specimen to paint
+    /// one whole row ([`Self::paint`]'s `whole_rows`): the body's 5-pt gap
+    /// and its inset, and one row of the scene's terminal (a text
+    /// specimen's with its 4-pt foot, a color specimen's least body over its
+    /// swatches). A Themes demo has no header.
+    fn least_body(&self) -> f32 {
+        let row = self.typography_row_height();
+        5.0 + PREVIEW_INSET
+            + match self.scene {
+                PreviewScene::CursorMotion | PreviewScene::Wallpaper => row,
+                PreviewScene::Typography => row + 4.0,
+                PreviewScene::Appearance => appearance_terminal_floor(row),
+                PreviewScene::ThemeDemo => 0.0,
+            }
+    }
+
+    /// THE WORDS THIS PREVIEW PAINTS ITSELF, drawn in `rect`, for the fit
+    /// audit ([`crate::native_ui`]'s `text_fit_audit`): the header's
+    /// statement (or the demo window's tab titles) and the font pill's, each
+    /// laid out by the function its painter calls, so a cut word in any of
+    /// them is an overflow the audit sees.
+    pub(crate) fn text_runs(&self, rect: LogicalRect) -> Vec<PreviewTextRun> {
+        let spec = self.normalized();
+        if rect.width <= 2.0 || rect.height <= 2.0 {
+            return Vec::new();
+        }
+        if spec.scene == PreviewScene::ThemeDemo {
+            let frame = DemoFrame::PLATFORM;
+            let layout = DemoStripLayout::of(rect, frame);
+            if layout.tab_w < DemoStripLayout::MIN_TAB_W {
+                return Vec::new();
+            }
+            let (faces, padding) = (frame.faces(), frame.title_padding());
+            return layout
+                .titles
+                .iter()
+                .zip([layout.tab_w, layout.quiet_w])
+                .enumerate()
+                .filter_map(|(tab, (title, width))| {
+                    title.map(|title| PreviewTextRun {
+                        says: title.to_string(),
+                        painted: title.to_string(),
+                        required: crate::tray_raster::ui_text_width_for(
+                            faces[tab],
+                            title,
+                            layout.title_px,
+                        ),
+                        available: width - padding[tab],
+                    })
+                })
+                .collect();
+        }
+        let header = spec.header_in(rect);
+        let width =
+            |text: &str| crate::tray_raster::ui_text_width_for(TextFace::UiBold, text, header.px);
+        let widest = header
+            .lines
+            .iter()
+            .map(|line| width(line))
+            .fold(0.0_f32, f32::max);
+        // A header that gave its words up to the specimen paints none.
+        let mut runs = Vec::new();
+        if !header.lines.is_empty() {
+            runs.push(PreviewTextRun {
+                painted: if header.cut {
+                    header.lines.join(" ")
+                } else {
+                    header.says.clone()
+                },
+                says: header.says.clone(),
+                required: if header.scene {
+                    width(spec.scene.badge_label()) + 8.0 + widest
+                } else {
+                    widest
+                },
+                available: header.available,
+            });
+        }
+        let terminal = spec.terminal_rect(rect);
+        if spec.scene == PreviewScene::Typography
+            && spec.shows_font_pill(terminal)
+            && let Some(pill) =
+                spec.pill_layout(terminal.width, crate::native_appearance::text_scale())
+            && terminal.height >= pill.height + 8.0
+        {
+            runs.push(PreviewTextRun {
+                required: pill
+                    .lines
+                    .iter()
+                    .map(|line| {
+                        crate::tray_raster::ui_text_width_for(TextFace::UiBold, line, pill.px)
+                    })
+                    .fold(0.0_f32, f32::max),
+                says: pill.says.clone(),
+                painted: pill.says,
+                available: pill.budget,
+            });
+        }
+        runs
+    }
+
+    /// The font pill in a terminal body `terminal_width` wide, at
+    /// `text_scale` ([`PillLayout`]); `None` while the font is ready.
+    fn pill_layout(&self, terminal_width: f32, text_scale: f32) -> Option<PillLayout> {
+        let (label, warning) = self.font_candidate_pill()?;
+        let px = TypeStep::Caption.px(11.5).scaled(text_scale).get();
+        // The terminal has a 5pt outer inset and the pill 8pt of text
+        // padding on each side.
+        let budget = (terminal_width - 26.0).max(0.0);
+        let measure =
+            |text: &str| crate::tray_raster::ui_text_width_for(TextFace::UiBold, text, px);
+        let mut rungs = vec![label.clone()];
+        if let Some((head, _)) = label.split_once(": ") {
+            rungs.push(head.to_string());
+        }
+        if let Some((head, _)) = label.split_once(" · ") {
+            rungs.push(head.to_string());
+        }
+        rungs.dedup();
+        let (lines, says) = match rungs
+            .iter()
+            .find(|rung| measure(rung) <= budget + crate::native_ui::TEXT_FIT_SLACK)
+        {
+            Some(rung) => (vec![rung.clone()], rung.clone()),
+            None => {
+                let least = rungs.last().cloned().unwrap_or_default();
+                (
+                    crate::native_settings::wrap_to_box(&least, budget, &measure),
+                    least,
+                )
+            }
+        };
+        let height = font_candidate_pill_height(text_scale)
+            + lines.len().saturating_sub(1) as f32 * (px * 1.3).ceil();
+        Some(PillLayout {
+            lines,
+            says,
+            warning,
+            px,
+            budget,
+            height,
+        })
+    }
+
+    /// Whether a text specimen in `terminal` shows its font pill: while a
+    /// font loads or fails, where the pill's band leaves a whole row, or it
+    /// warns that the font failed and its band fits.
+    fn shows_font_pill(&self, terminal: LogicalRect) -> bool {
+        let Some(pill) = self.pill_layout(terminal.width, crate::native_appearance::text_scale())
+        else {
+            return false;
+        };
+        let pill_band = pill.height + 10.0;
+        let row = self.typography_row_height();
+        let with_pill = ((terminal.height - pill_band).max(0.0) / row).floor() as usize;
+        with_pill > 0 || (pill.warning && terminal.height >= pill_band)
+    }
+
     /// Typography keeps the candidate's exact size. Buy the five core
     /// specimen rows and a separate font-status band instead of painting a
     /// badge over glyphs; a card taller than that fills with the specimen's
@@ -2190,18 +2656,18 @@ impl SettingsPreviewSpec {
         floor.max(match self.scene {
             PreviewScene::Typography => self.typography_height(1),
             PreviewScene::CursorMotion => {
-                (preview_header_height(&spec) + 15.0 + spec.typography_row_height())
+                (spec.header_height() + 15.0 + spec.typography_row_height())
                     .max(crate::native_settings::scaled_control_height())
             }
             PreviewScene::Appearance => {
-                preview_header_height(&spec)
+                spec.header_height()
                     + 15.0
                     + appearance_terminal_floor(spec.typography_row_height())
             }
             PreviewScene::ThemeDemo => spec.demo_height(6),
             // Two rows of the session over the picture.
             PreviewScene::Wallpaper => {
-                preview_header_height(&spec) + 15.0 + 2.0 * spec.typography_row_height()
+                spec.header_height() + 15.0 + 2.0 * spec.typography_row_height()
             }
         })
     }
@@ -2263,8 +2729,7 @@ impl SettingsPreviewSpec {
             let spec = self.normalized();
             let row = spec.typography_row_height();
             let at = |rows: usize| {
-                (preview_header_height(&spec) + 15.0 + appearance_terminal_floor(rows as f32 * row))
-                    .ceil()
+                (spec.header_height() + 15.0 + appearance_terminal_floor(rows as f32 * row)).ceil()
             };
             (1..=APPEARANCE_SPECIMEN_ROWS)
                 .rev()
@@ -2285,7 +2750,7 @@ impl SettingsPreviewSpec {
         let fitted = match self.scene {
             PreviewScene::Appearance => self.color_sample_height_at_most(height).unwrap_or(height),
             PreviewScene::CursorMotion => {
-                let fixed = preview_header_height(&spec) + 15.0;
+                let fixed = spec.header_height() + 15.0;
                 let rows = ((height - fixed) / row).floor().max(1.0);
                 (fixed + rows * row).ceil()
             }
@@ -2301,14 +2766,19 @@ impl SettingsPreviewSpec {
         fitted.min(height.max(least)).max(least)
     }
 
-    /// A typography preview's height with `rows` whole specimen rows.
+    /// A typography preview's height with `rows` whole specimen rows, its
+    /// header and its font pill's band as the measured width needs them.
     fn typography_height(&self, rows: usize) -> f32 {
         let spec = self.normalized();
-        preview_header_height(&spec)
-            + 15.0
-            + rows as f32 * spec.typography_row_height()
-            + font_candidate_pill_height(crate::native_appearance::text_scale())
-            + 10.0
+        let text_scale = crate::native_appearance::text_scale();
+        let terminal_width = spec
+            .measure_width
+            .map_or(f32::INFINITY, |width| width - PREVIEW_INSET * 2.0);
+        let pill = spec.pill_layout(terminal_width, text_scale).map_or_else(
+            || font_candidate_pill_height(text_scale),
+            |pill| pill.height,
+        );
+        spec.header_height() + 15.0 + rows as f32 * spec.typography_row_height() + pill + 10.0
     }
 
     fn variation_requests(&self) -> Vec<(u32, f32)> {
@@ -2581,7 +3051,7 @@ impl SettingsPreviewSpec {
     /// The terminal body of a preview drawn in `rect`: under its header,
     /// inside its inset ([`Self::paint`] draws the specimen there).
     pub(crate) fn terminal_rect(&self, rect: LogicalRect) -> LogicalRect {
-        let header_h = preview_header_height(&self.normalized());
+        let header_h = self.normalized().header_in(rect).height;
         LogicalRect::new(
             rect.x + PREVIEW_INSET,
             rect.y + header_h + 5.0,
@@ -2753,20 +3223,13 @@ impl SettingsPreviewSpec {
         });
 
         let inset = PREVIEW_INSET;
-        let header_h = preview_header_height(&spec);
-        let caption_size = TypeStep::Caption
-            .px(13.75)
-            .scaled(crate::native_appearance::text_scale());
+        let header = spec.header_in(rect);
+        let caption_size = header_caption();
+        let first_line = header_first_line(spec.scene, header.px);
         let caption_y =
-            crate::tray_raster::row_baseline(rect.y + 4.0, header_h, caption_size.get());
-        let scene_badge = spec.scene.badge_label();
-        let scene_width = crate::tray_raster::ui_text_width_for(
-            TextFace::UiBold,
-            scene_badge,
-            caption_size.get(),
-        );
+            crate::tray_raster::row_baseline(rect.y + 4.0, first_line, caption_size.get());
         // A looping preview is its own Pause/Play control: its glyph sits at
-        // the header's right edge and the state badge yields that slot.
+        // the header's right edge and the state yields that slot.
         let control_reserve = if spec.pause_control() {
             PAUSE_GLYPH_W + 6.0
         } else {
@@ -2777,11 +3240,11 @@ impl SettingsPreviewSpec {
                 prims,
                 rect.right() - inset - PAUSE_GLYPH_W,
                 rect.y + 4.0,
-                header_h,
+                first_line,
                 spec.holds_pause(),
                 roles.text_secondary,
             );
-            if spec.focused {
+            if spec.focus_visible {
                 prims.push(DrawPrim::Stroke {
                     x: rect.x + 1.0,
                     y: rect.y + 1.0,
@@ -2793,68 +3256,13 @@ impl SettingsPreviewSpec {
                 });
             }
         }
-        let available = (rect.width - inset * 2.0 - control_reserve).max(0.0);
-        let measure = |s: &str| {
-            crate::tray_raster::ui_text_width_for(TextFace::UiBold, s, caption_size.get())
-        };
-        let with_state = |candidate: String| spec.with_state_badge(candidate);
-        // The whole badge wherever the header holds it; a long one shortens
-        // its subject first, so the value being tried stays readable.
-        // A tried style says how to keep it while the header has room.
-        let mut state =
-            if spec.style_trial && spec.focused_key == crate::prefs::EDIT_CURSOR_TRAIL_STYLE {
-                format!("{} · Return to save", with_state(spec.candidate_badge()))
-            } else {
-                with_state(spec.candidate_badge())
-            };
-        let mut state_width = measure(&state);
-        if scene_width + 8.0 + state_width > available {
-            state = with_state(spec.candidate_badge());
-            state_width = measure(&state);
-        }
-        if scene_width + 8.0 + state_width > available {
-            state = with_state(spec.bounded_candidate_badge(30));
-            state_width = measure(&state);
-        }
-        if scene_width + 8.0 + state_width > available {
-            // A still sample's compact state IS its candidate, so the
-            // candidate is said once, not twice.
-            state = compact_header_state(&spec);
-            state_width = measure(&state);
-        }
-        if state_width > available {
-            let compact = spec.compact_state_badge();
-            state = if compact == spec.candidate_badge() {
-                spec.bounded_candidate_badge(24)
-            } else {
-                bounded_badge(&compact, 24)
-            };
-            state_width = measure(&state);
-        }
-        if state_width > available
-            && !spec.candidate_is_unsaved()
-            && let Some((_, value)) = spec.candidate_parts()
-            && spec.compact_state_badge() == spec.candidate_badge()
-        {
-            // The subject goes before any of the value does.
-            state = value;
-            state_width = measure(&state);
-        }
-        if state_width > available {
-            // Character caps are only a first pass (proportional glyphs and Dynamic Type
-            // make pixel width unknowable): fit the real UI-bold measure, UTF-8 safe.
-            state = bounded_badge_width(&state, available, caption_size.get());
-            state_width =
-                crate::tray_raster::ui_text_width_for(TextFace::UiBold, &state, caption_size.get());
-        }
-        let show_scene = scene_width + 8.0 + state_width <= available;
-        if show_scene {
+        if header.scene {
             // The scene badge wears the theme accent; the state badge keeps its quieter
             // semantic colour.
             prims.push(text_prim(
                 rect.x + inset,
                 caption_y,
-                scene_badge.to_string(),
+                spec.scene.badge_label().to_string(),
                 caption_size,
                 TextWeight::Regular,
                 TextFace::UiBold,
@@ -2862,22 +3270,36 @@ impl SettingsPreviewSpec {
                 rgba(roles.accent_ink, 255),
             ));
         }
-        prims.push(text_prim(
-            header_state_x(rect, inset, control_reserve, state_width),
-            caption_y,
-            state,
-            caption_size,
-            TextWeight::Regular,
-            TextFace::UiBold,
-            rgba(
-                if spec.reads_live() {
-                    roles.success
-                } else {
-                    roles.text_secondary
-                },
-                255,
-            ),
-        ));
+        let state_ink = rgba(
+            if spec.reads_live() {
+                roles.success
+            } else {
+                roles.text_secondary
+            },
+            255,
+        );
+        let pitch = header_line_pitch(header.px);
+        let single = header.lines.len() == 1;
+        for (index, line) in header.lines.iter().enumerate() {
+            let line_width =
+                crate::tray_raster::ui_text_width_for(TextFace::UiBold, line, header.px);
+            // One line sits at the right, by the control; a wrapped statement
+            // reads down from the left inset.
+            let x = if single {
+                header_state_x(rect, inset, control_reserve, line_width)
+            } else {
+                rect.x + inset
+            };
+            prims.push(text_prim(
+                x,
+                caption_y + index as f32 * pitch,
+                line.clone(),
+                caption_size,
+                TextWeight::Regular,
+                TextFace::UiBold,
+                state_ink,
+            ));
+        }
 
         let terminal = spec.terminal_rect(rect);
         let terminal_theme = spec
@@ -2900,7 +3322,10 @@ impl SettingsPreviewSpec {
         // band would leave no whole row it yields to the glyphs, which are
         // the proof, unless it is warning that the font failed.
         let row = spec.typography_row_height();
-        let pill_band = font_candidate_pill_height(crate::native_appearance::text_scale()) + 10.0;
+        let pill_band = spec
+            .pill_layout(terminal.width, crate::native_appearance::text_scale())
+            .map_or(0.0, |pill| pill.height)
+            + 10.0;
         let mut shows_pill = false;
         let whole_rows = match spec.scene {
             // The demo painted above and returned; it never reaches here.
@@ -2913,10 +3338,7 @@ impl SettingsPreviewSpec {
             PreviewScene::Typography => {
                 let with_pill = ((terminal.height - pill_band).max(0.0) / row).floor() as usize;
                 let bare = ((terminal.height - 4.0).max(0.0) / row).floor() as usize;
-                let pill = spec.font_candidate_pill();
-                let warning = pill.as_ref().is_some_and(|(_, warning)| *warning);
-                shows_pill =
-                    pill.is_some() && (with_pill > 0 || (warning && terminal.height >= pill_band));
+                shows_pill = spec.shows_font_pill(terminal);
                 if shows_pill { with_pill } else { bare }.min(TYPOGRAPHY_SPECIMEN_ROWS)
             }
             PreviewScene::CursorMotion => {
@@ -3001,19 +3423,51 @@ impl SettingsPreviewSpec {
         }
     }
 
+    /// The facts the cursor scene draws its trail in, for the knob law
+    /// (`GlowStyle::reads_knob`): its terminal's ground, its cursor shape,
+    /// the landing ring and the classic face as the spec holds them, and its
+    /// one jump — the Tab's completion — over the letters it prints.
+    pub(crate) fn scene_knob_context(&self) -> aterm_effects::cursor_glow::KnobContext {
+        let dark = self
+            .terminal_theme
+            .is_none_or(|theme| theme_bg_is_dark(theme.bg));
+        aterm_effects::cursor_glow::KnobContext {
+            dark,
+            bar: matches!(self.cursor.style, PreviewCursorStyle::Bar),
+            ring: self.cursor.ring,
+            classic_tinted: self.cursor.color.chosen()
+                || GlowStyle::style_names_classic_mono(self.cursor.effective_trail_style_raw()),
+            over_text: true,
+        }
+    }
+
     /// Why the focused row changes nothing in this preview: its own verdict
-    /// ([`Self::focused_effect`]), else a Trail length the cursor scene's
-    /// Tab cannot show, since it only cuts a jump longer than itself.
+    /// ([`Self::focused_effect`]), else a knob the cursor scene cannot show
+    /// for this style by the knob law in the scene's own facts
+    /// ([`Self::scene_knob_context`]: Fire's Trail length, which only blank
+    /// cells show, where the scene's completion crosses letters), else a
+    /// Trail length the Tab cannot show, since it only cuts a jump longer
+    /// than itself.
     fn focused_idle(&self) -> Option<String> {
         if let Some(effect) = &self.focused_effect {
             return Some(effect.clone());
         }
+        if self.scene != PreviewScene::CursorMotion
+            || self.focused_key != crate::prefs::EDIT_CURSOR_TRAIL_LENGTH
+            || self.animation() != PreviewAnimation::Continuous
+        {
+            return None;
+        }
+        let ctx = self.scene_knob_context();
+        let shows =
+            self.cursor.resolved_trail_style().style.is_none_or(|glow| {
+                glow.reads_knob(aterm_effects::cursor_glow::TrailKnob::Length, ctx)
+            });
+        if !shows {
+            return Some("Shown over blank cells only".to_string());
+        }
         let jump = CURSOR_SCENE_TAB.1 - CURSOR_SCENE_TAB.0;
-        (self.scene == PreviewScene::CursorMotion
-            && self.focused_key == crate::prefs::EDIT_CURSOR_TRAIL_LENGTH
-            && self.animation() == PreviewAnimation::Continuous
-            && self.cursor.length >= jump)
-            .then(|| format!("Covers this {jump}-cell jump"))
+        (self.cursor.length >= jump).then(|| format!("Covers this {jump}-cell jump"))
     }
 
     /// The header's state reads as live: the scene plays and the focused row
@@ -3074,7 +3528,7 @@ impl SettingsPreviewSpec {
         let subject = match key {
             crate::prefs::EDIT_THEME if self.theme_sample => "Sample",
             crate::prefs::EDIT_THEME => "Theme",
-            crate::prefs::EDIT_CURSOR_TRAIL_STYLE if self.style_trial => "Trying",
+            crate::prefs::EDIT_CURSOR_TRAIL_STYLE if self.style_trial.is_some() => "Trying",
             crate::prefs::EDIT_WINDOW_THEME => "Window appearance",
             crate::prefs::EDIT_CURSOR_TRAIL_STYLE => "Style",
             crate::prefs::EDIT_CURSOR_STYLE => "Shape",
@@ -3172,7 +3626,7 @@ impl SettingsPreviewSpec {
     /// The focused value is shown unsaved: a theme sample or a tried style.
     fn candidate_is_unsaved(&self) -> bool {
         (self.theme_sample && self.focused_key == crate::prefs::EDIT_THEME)
-            || (self.style_trial && self.focused_key == crate::prefs::EDIT_CURSOR_TRAIL_STYLE)
+            || self.trying_style().is_some()
     }
 
     fn candidate_badge(&self) -> String {
@@ -3180,65 +3634,6 @@ impl SettingsPreviewSpec {
             || friendly_preview_value(&self.focused_value),
             |(subject, value)| format!("{subject}: {value}"),
         )
-    }
-
-    /// [`Self::candidate_badge`] in at most `max` graphemes, shortening the
-    /// subject first so the value being tried stays readable.
-    fn bounded_candidate_badge(&self, max: usize) -> String {
-        match self.candidate_parts() {
-            Some((subject, value)) => {
-                let full = format!("{subject}: {value}");
-                if full.graphemes().count() <= max {
-                    return full;
-                }
-                let value_len = value.graphemes().count();
-                if subject.graphemes().count() + 2 + value_len <= max {
-                    return format!("{subject}: {value}");
-                }
-                // A subject that says the value is unsaved ("Trying",
-                // "Sample") is the point of the badge: it stays whole and the
-                // value is cut instead.
-                if self.candidate_is_unsaved() {
-                    let room = max.saturating_sub(subject.graphemes().count() + 2);
-                    return format!("{subject}: {}", bounded_badge(&value, room.max(1)));
-                }
-                // ": " and the "…" a shortened subject ends in come out of
-                // the subject's share, never the value's; a subject with no
-                // readable share left goes, and only a value too long to fit
-                // at all is cut.
-                let room = max.saturating_sub(value_len + 3);
-                if room >= 4 {
-                    format!("{}: {value}", bounded_badge(&subject, room))
-                } else if value_len <= max {
-                    value.to_string()
-                } else {
-                    bounded_badge(&value, max)
-                }
-            }
-            None => bounded_badge(&friendly_preview_value(&self.focused_value), max),
-        }
-    }
-
-    /// Compact, user-facing glance label for narrow preview headers.
-    fn compact_state_badge(&self) -> String {
-        if self.reduction_suppresses_motion() {
-            self.pause.badge()
-        } else if self.holds_pause() {
-            PreviewPause::Viewer.badge()
-        } else if let Some(effect) = self.focused_idle() {
-            effect
-        } else {
-            match self.animation() {
-                PreviewAnimation::None => self.candidate_badge(),
-                PreviewAnimation::BlinkEdge { .. } => "Live blink".to_string(),
-                PreviewAnimation::Continuous if !self.cursor.has_resolved_trail() => {
-                    "Typing glow · Live".to_string()
-                }
-                PreviewAnimation::Continuous => {
-                    format!("{} · Live", self.cursor.trail_style_label())
-                }
-            }
-        }
     }
 }
 
@@ -3257,18 +3652,51 @@ const TYPOGRAPHY_SPECIMEN_ROWS: usize = 10;
 /// bottom ([`SettingsPreviewSpec::terminal_rect`]).
 const PREVIEW_INSET: f32 = 10.0;
 
-fn preview_header_height(spec: &SettingsPreviewSpec) -> f32 {
-    if spec.scene == PreviewScene::Typography {
-        27.0_f32.max(
-            TypeStep::Caption
-                .px(13.75)
-                .scaled(crate::native_appearance::text_scale())
-                .get()
-                + 8.0,
-        )
+/// The preview header's type: the Caption step at the Settings text scale.
+fn header_caption() -> crate::type_scale::StepPx {
+    TypeStep::Caption
+        .px(13.75)
+        .scaled(crate::native_appearance::text_scale())
+}
+
+/// The header's first line: 27 pt, the band every scene's header has had
+/// and every host's least height counts on; a text specimen's grows with a
+/// large text size to the caption and its padding, since its band sits over
+/// its own glyphs.
+fn header_first_line(scene: PreviewScene, px: f32) -> f32 {
+    if scene == PreviewScene::Typography {
+        27.0_f32.max(px + 8.0)
     } else {
         27.0
     }
+}
+
+/// The pitch of each further header line.
+fn header_line_pitch(px: f32) -> f32 {
+    (px * 1.3).ceil()
+}
+
+/// A preview header laid out for one width
+/// ([`SettingsPreviewSpec::header_layout`]): what it says, whole words, on
+/// which lines, and how tall it is.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct PreviewHeader {
+    /// The scene label leads the first line.
+    pub(crate) scene: bool,
+    /// The state's lines, top to bottom.
+    pub(crate) lines: Vec<String>,
+    /// What the lines say together: the statement the header chose.
+    pub(crate) says: String,
+    /// Its last line had to be cut: the card is too short for every line
+    /// its statement needs (the painter's last resort for a pathological
+    /// value, which the fit audit reports).
+    pub(crate) cut: bool,
+    /// The room each line has, left of the Pause/Play control's slot.
+    pub(crate) available: f32,
+    /// The caption's size.
+    pub(crate) px: f32,
+    /// The header band's height, down to the terminal body's gap.
+    pub(crate) height: f32,
 }
 
 fn font_candidate_pill_height(text_scale: f32) -> f32 {
@@ -3297,29 +3725,22 @@ fn paint_font_candidate_pill_at_scale(
     roles: Roles,
     text_scale: f32,
 ) {
-    let Some((label, warning)) = spec.font_candidate_pill() else {
+    let Some(pill) = spec.pill_layout(terminal.width, text_scale) else {
         return;
     };
     let text_size = TypeStep::Caption.px(11.5).scaled(text_scale);
-    let pill_h = font_candidate_pill_height(text_scale);
+    let pill_h = pill.height;
     if terminal.height < pill_h + 8.0 {
         // A pill squeezed under its own text height cuts its label in half;
         // the header still names the font.
         return;
     }
-    // The terminal has a 5pt outer inset and the pill has 8pt text padding on
-    // both sides: the label fits that exact pixel budget, whole wherever the
-    // specimen is wide enough.
-    let budget = (terminal.width - 26.0).max(0.0);
-    let label = if crate::tray_raster::ui_text_width_for(TextFace::UiBold, &label, text_size.get())
-        <= budget
-    {
-        label
-    } else {
-        bounded_badge_width(&label, budget, text_size.get())
-    };
-    let text_width =
-        crate::tray_raster::ui_text_width_for(TextFace::UiBold, &label, text_size.get());
+    let warning = pill.warning;
+    let text_width = pill
+        .lines
+        .iter()
+        .map(|line| crate::tray_raster::ui_text_width_for(TextFace::UiBold, line, pill.px))
+        .fold(0.0_f32, f32::max);
     let pill_w = (text_width + 16.0)
         .min((terminal.width - 10.0).max(1.0))
         .max(1.0);
@@ -3342,15 +3763,54 @@ fn paint_font_candidate_pill_at_scale(
         width: 1.0,
         color: rgba(if warning { roles.danger } else { roles.accent }, 230),
     });
-    prims.push(text_prim(
-        x + 8.0,
-        crate::tray_raster::row_baseline(y, pill_h, text_size.get()),
-        label,
-        text_size,
-        TextWeight::Regular,
-        TextFace::UiBold,
-        rgba(roles.text_primary, 255),
-    ));
+    let first = crate::tray_raster::row_baseline(
+        y,
+        font_candidate_pill_height(text_scale),
+        text_size.get(),
+    );
+    let pitch = (pill.px * 1.3).ceil();
+    for (index, line) in pill.lines.into_iter().enumerate() {
+        prims.push(text_prim(
+            x + 8.0,
+            first + index as f32 * pitch,
+            line,
+            text_size,
+            TextWeight::Regular,
+            TextFace::UiBold,
+            rgba(roles.text_primary, 255),
+        ));
+    }
+}
+
+/// The font pill laid out in a terminal body ([`SettingsPreviewSpec::pill_layout`]).
+#[derive(Clone, Debug, PartialEq)]
+struct PillLayout {
+    /// Its words, top to bottom: the first of its whole statements that fits
+    /// one line (`Not found · Regular: Menlo`, then `Not found · Regular`,
+    /// then `Not found`), else the last wrapped at word joins (a word wider
+    /// than the pill broken with a hyphen, as every Settings label is).
+    lines: Vec<String>,
+    /// The statement those lines say.
+    says: String,
+    /// It warns that the font failed.
+    warning: bool,
+    /// The caption's size.
+    px: f32,
+    /// The room a line has.
+    budget: f32,
+    /// The pill's height: one line's, and a line pitch for each further one.
+    height: f32,
+}
+
+/// One run of words a preview paints itself, as the fit audit measures it
+/// ([`SettingsPreviewSpec::text_runs`]): what it set out to say, what it
+/// painted, how wide that is and how much room it had.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct PreviewTextRun {
+    pub(crate) says: String,
+    pub(crate) painted: String,
+    pub(crate) required: f32,
+    pub(crate) available: f32,
 }
 
 /// Paint the window-control signature for the platform this binary targets and
@@ -4143,10 +4603,13 @@ const CURSOR_SCENE_HOLD_MS: u64 = 15 * MOTION_STEP_MS;
 const CURSOR_SCENE_CYCLE_MS: u64 = CURSOR_SCENE_KEYS * KEY_MS + CURSOR_SCENE_HOLD_MS;
 const _: () = assert!(CURSOR_SCENE_CYCLE_MS.is_multiple_of(MOTION_STEP_MS));
 
-/// The step a viewer-paused cursor scene holds: the second key after the Tab
-/// lands, so the typed trail and the Tab's jump light are both warm on the one
-/// still frame (`a_paused_preview_holds_the_trail_mid_line`).
-const CURSOR_SCENE_PAUSE_MS: u64 = (CURSOR_SCENE_TAB.0 as u64 + 3) * KEY_MS;
+/// The step a viewer-paused cursor scene holds: one step after the Tab lands,
+/// so the typed trail and the jump the Tab drew are both warm on the one still
+/// frame (`a_paused_preview_holds_the_trail_mid_line`), and a viewer who
+/// paused the loop still sees what Trail length and Ring on jumps do to it.
+/// Two keys after the Tab, a jump's light (Comet's, at the 260 ms default
+/// duration) had already faded, and the still frame showed no jump knob.
+const CURSOR_SCENE_PAUSE_MS: u64 = (CURSOR_SCENE_TAB.0 as u64 + 1) * KEY_MS + MOTION_STEP_MS;
 const _: () = assert!(CURSOR_SCENE_PAUSE_MS < CURSOR_SCENE_KEYS * KEY_MS);
 
 /// Cycles the scene's engines play before the one shown, so the shown one
@@ -5160,7 +5623,7 @@ fn paint_demo_dots_strip(
     }
     let (tabs_x, tab_w, tab_top) = (layout.tabs_x, layout.tab_w, layout.tab_top);
     let tab_h = layout.tab_h(rect);
-    let [selected, quiet] = DemoFrame::Dots.labels();
+    let [selected, quiet] = layout.titles;
     if tab_w >= DemoStripLayout::MIN_TAB_W {
         prims.push(DrawPrim::Panel {
             x: tabs_x,
@@ -5179,17 +5642,15 @@ fn paint_demo_dots_strip(
             fill: rgba(strip.active, 255),
         });
         let baseline = crate::tray_raster::row_baseline(tab_top, tab_h - 2.0, caption.get());
-        for (x, label, ink) in [
+        for (x, title, ink) in [
             (tabs_x + 10.0, selected, strip.active_ink),
             (tabs_x + tab_w + 11.0, quiet, strip.inactive_ink),
         ] {
-            let room = (tab_w - 20.0).max(0.0);
-            let label = bounded_badge_width(label, room, caption.get());
-            if !label.is_empty() {
+            if let Some(title) = title {
                 prims.push(text_prim(
                     x,
                     baseline,
-                    label,
+                    title.to_string(),
                     caption,
                     TextWeight::Regular,
                     TextFace::Ui,
@@ -5296,31 +5757,19 @@ fn paint_demo_windows_strip(
         }
         prims.push(DrawPrim::ClipPop);
         let baseline = crate::tray_raster::row_baseline(tab_top, layout.tab_h(rect) - 2.0, px);
-        let [selected, quiet] = DemoFrame::Windows.labels();
-        // The selected title stops clear of its `✕`.
+        let [selected, quiet] = layout.titles;
+        let [selected_face, quiet_face] = DemoFrame::Windows.faces();
+        // The selected title stops clear of its `✕` ([`DemoFrame::title_padding`]).
         let close_cx = tabs_x + tab_w - 14.0;
-        for (x, label, room, face, ink) in [
-            (
-                tabs_x + 10.0,
-                selected,
-                tab_w - 34.0,
-                TextFace::UiBold,
-                strip.active_ink,
-            ),
-            (
-                tabs_x + tab_w + 10.0,
-                quiet,
-                tab_w - 20.0,
-                TextFace::Ui,
-                strip.inactive_ink,
-            ),
+        for (x, title, face, ink) in [
+            (tabs_x + 10.0, selected, selected_face, strip.active_ink),
+            (tabs_x + tab_w + 10.0, quiet, quiet_face, strip.inactive_ink),
         ] {
-            let label = bounded_badge_width(label, room.max(0.0), px);
-            if !label.is_empty() {
+            if let Some(title) = title {
                 prims.push(text_prim(
                     x,
                     baseline,
-                    label,
+                    title.to_string(),
                     caption,
                     TextWeight::Regular,
                     face,
@@ -5466,47 +5915,25 @@ fn finite_or(value: f32, fallback: f32) -> f32 {
     if value.is_finite() { value } else { fallback }
 }
 
-/// The right-hand header badge once the full `candidate · state` line does
-/// not fit: the candidate (shortened) and the compact glance. A static
-/// preview's glance IS the candidate, so it is said once, never
-/// `Theme: Nord · Theme: Nord`.
-fn compact_header_state(spec: &SettingsPreviewSpec) -> String {
-    let glance = spec.compact_state_badge();
-    if glance == spec.candidate_badge() {
-        spec.bounded_candidate_badge(30)
-    } else {
-        format!("{} · {glance}", spec.bounded_candidate_badge(20))
-    }
-}
-
-fn bounded_badge(value: &str, max_graphemes: usize) -> String {
-    let mut end = 0;
-    for (count, (offset, grapheme)) in value.grapheme_indices().enumerate() {
-        if count == max_graphemes {
-            return format!("{}…", value[..end].trim_end());
-        }
-        end = offset + grapheme.len();
-    }
-    value.to_string()
-}
-
-fn bounded_badge_width(value: &str, max_width: f32, px: f32) -> String {
+/// `value` cut to `max_width` with an ellipsis, measured in the `face` it
+/// paints in: the painter's last resort for a pathological line, which no
+/// ordinary value reaches (a preview's words take whole-word rungs first).
+fn bounded_badge_width(value: &str, max_width: f32, px: f32, face: TextFace) -> String {
     if max_width <= 0.0 {
         return String::new();
     }
-    if crate::tray_raster::ui_text_width_for(TextFace::UiBold, value, px) <= max_width {
+    if crate::tray_raster::ui_text_width_for(face, value, px) <= max_width {
         return value.to_string();
     }
     let ellipsis = "…";
-    let ellipsis_width = crate::tray_raster::ui_text_width_for(TextFace::UiBold, ellipsis, px);
+    let ellipsis_width = crate::tray_raster::ui_text_width_for(face, ellipsis, px);
     if ellipsis_width > max_width {
         return String::new();
     }
     let mut end = 0;
     for (offset, grapheme) in value.grapheme_indices() {
         let next = offset + grapheme.len();
-        if crate::tray_raster::ui_text_width_for(TextFace::UiBold, &value[..next], px)
-            + ellipsis_width
+        if crate::tray_raster::ui_text_width_for(face, &value[..next], px) + ellipsis_width
             > max_width
         {
             break;
@@ -5954,7 +6381,7 @@ mod tests {
             SettingsPreviewSpec::default()
                 .with_phase(900)
                 .with_focus(crate::prefs::EDIT_CURSOR_TRAIL_STYLE, "sparkle")
-                .with_style_trial(true),
+                .with_style_trial(Some(StyleTrial::Keyboard)),
         ];
         let mut checked = 0;
         for scale in [1.0_f32, 2.0] {
@@ -6025,6 +6452,283 @@ mod tests {
         assert_eq!(checked, 18);
     }
 
+    /// A PREVIEW HEADER PAINTS EVERY WORD IT CHOOSES, AT EVERY WIDTH (audit
+    /// r14 PV3/PV4): the header used to be one fixed line whose words were
+    /// cut to fit ("Rainbow kitty…", "Automatic (SF Mo…", "Comet ·…", "Dim
+    /// selection when unfoc…: Off"), and the audit never saw it. For the
+    /// trail style, a tried style, a font family, a theme sample, a long
+    /// subject and a count, from a 96-pt tile to a wide page, at 1x, 1.5x and
+    /// 2x text, in a card its host sized for that width: no painted word is
+    /// cut, every line fits its room, the value being previewed is painted
+    /// whole, and the fit audit reports nothing. NEGATIVE CONTROL: a single
+    /// word too long for every line in a card too short for its lines is cut
+    /// by the last resort, and the audit reports it.
+    #[test]
+    fn a_preview_header_paints_every_word_it_chooses_at_every_width() {
+        use crate::native_appearance::{AppearancePreferences, install_preferences};
+        let _ = compiled(SettingsPreviewSpec::default());
+        let roles = Roles::from_theme(Theme::default());
+        let comet = CursorPreviewSpec {
+            trail_style: PreviewTrailStyle::Comet,
+            trail_style_raw: Arc::from("comet"),
+            ..CursorPreviewSpec::default()
+        };
+        let specs: Vec<(&str, SettingsPreviewSpec)> = vec![
+            (
+                "Rainbow kitty",
+                SettingsPreviewSpec::cursor(rainbow_cursor("rainbow kitty pet"))
+                    .with_focus(crate::prefs::EDIT_CURSOR_TRAIL_STYLE, "rainbow kitty pet"),
+            ),
+            (
+                "Rainbow underline",
+                SettingsPreviewSpec::cursor(rainbow_cursor("rainbow kitty underline"))
+                    .with_focus(
+                        crate::prefs::EDIT_CURSOR_TRAIL_STYLE,
+                        "rainbow kitty underline",
+                    )
+                    .with_style_trial(Some(StyleTrial::Pointer)),
+            ),
+            (
+                "Comet",
+                SettingsPreviewSpec::cursor(comet.clone())
+                    .with_focus(crate::prefs::EDIT_CURSOR_TRAIL_STYLE, "comet"),
+            ),
+            (
+                "1 cell",
+                SettingsPreviewSpec::cursor(CursorPreviewSpec { length: 1, ..comet })
+                    .with_focus(crate::prefs::EDIT_CURSOR_TRAIL_LENGTH, "1")
+                    .with_focus_label("Trail length"),
+            ),
+            (
+                "Automatic (SF Mono)",
+                SettingsPreviewSpec::typography(13.0)
+                    .with_focus(crate::prefs::EDIT_FONT_FAMILY, "Automatic (SF Mono)"),
+            ),
+            (
+                "Catppuccin Mocha",
+                SettingsPreviewSpec::appearance(13.0)
+                    .with_focus(crate::prefs::EDIT_THEME, "Catppuccin Mocha")
+                    .with_theme_sample(true),
+            ),
+            (
+                "Off",
+                SettingsPreviewSpec::appearance(13.0)
+                    .with_focus(crate::prefs::EDIT_SELECTION_INACTIVE, "false")
+                    .with_focus_label("Dim selection when unfocused"),
+            ),
+        ];
+        let squash = |text: &str| text.replace("-", "").split_whitespace().collect::<String>();
+        let mut checked = 0;
+        for scale in [1.0_f32, 1.5, 2.0] {
+            let _ = install_preferences(AppearancePreferences {
+                text_scale: scale,
+                ..AppearancePreferences::default()
+            });
+            for (value, spec) in &specs {
+                for width in [
+                    96.0_f32, 122.0, 146.0, 150.0, 206.0, 254.0, 320.0, 420.0, 720.0,
+                ] {
+                    let spec = spec.clone().with_measure_width(width);
+                    let height = spec.minimum_height(48.0);
+                    let rect = LogicalRect::new(10.0, 10.0, width, height);
+                    let mut prims = Vec::new();
+                    spec.paint(&mut prims, rect, Theme::default(), roles);
+                    let header_bottom = spec.terminal_rect(rect).y;
+                    let words = prims
+                        .iter()
+                        .filter_map(|prim| match prim {
+                            DrawPrim::Text {
+                                s,
+                                x,
+                                px,
+                                face,
+                                baseline,
+                                ..
+                            } if *baseline <= header_bottom => Some((s.clone(), *x, *px, *face)),
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>();
+                    let context = format!("{value} at {width}pt, {scale}x");
+                    assert!(!words.is_empty(), "{context}: the header says something");
+                    for (text, x, px, face) in &words {
+                        assert!(!text.contains('…'), "{context}: {text:?} is cut");
+                        let right = x + crate::tray_raster::ui_text_width_for(*face, text, *px);
+                        assert!(
+                            right <= rect.right() - PREVIEW_INSET + 0.5,
+                            "{context}: {text:?} runs to {right:.1}"
+                        );
+                    }
+                    let said = squash(
+                        &words
+                            .iter()
+                            .map(|(text, ..)| text.as_str())
+                            .collect::<Vec<_>>()
+                            .join(" "),
+                    );
+                    assert!(
+                        said.contains(&squash(value)),
+                        "{context}: the value is painted whole in {words:?}"
+                    );
+                    let preview = preview_node("preview", spec, height);
+                    let tree = UiTree::new(
+                        UiNode::new(
+                            "root",
+                            UiContent::Group(GroupSpec::unlabeled(SemanticRole::Application)),
+                        )
+                        .layout(Layout::column().padding(Insets::all(10.0)))
+                        .children(vec![
+                            preview.layout(
+                                Layout::default()
+                                    .width(Length::Fixed(width))
+                                    .height(Length::Fixed(height))
+                                    .clipped(),
+                            ),
+                        ]),
+                    )
+                    .compile(LogicalRect::new(0.0, 0.0, width + 40.0, height + 40.0))
+                    .expect("compiles");
+                    assert!(
+                        tree.fit_failures().is_empty(),
+                        "{context}: {:?}",
+                        tree.fit_failures()
+                    );
+                    checked += 1;
+                }
+            }
+        }
+        let _ = install_preferences(AppearancePreferences::default());
+        assert_eq!(checked, 3 * 7 * 9);
+
+        // NEGATIVE CONTROL: the last resort cuts, and the audit sees it, in a
+        // card too short for even the header's first band and one specimen
+        // row (a taller one gives the words up to the specimen whole:
+        // `a_preview_header_never_takes_its_specimens_least_row`).
+        let long = "Pneumonoultramicroscopicsilicovolcanoconiosis".repeat(4);
+        let pathological = SettingsPreviewSpec::cursor(CursorPreviewSpec::default())
+            .with_focus(crate::prefs::EDIT_CURSOR_TRAIL_STYLE, long.as_str());
+        let header = pathological.header_in(LogicalRect::new(0.0, 0.0, 122.0, 44.0));
+        assert!(header.cut, "{header:?}");
+        let tree = UiTree::new(
+            UiNode::new(
+                "root",
+                UiContent::Group(GroupSpec::unlabeled(SemanticRole::Application)),
+            )
+            .layout(Layout::column())
+            .children(vec![
+                preview_node("preview", pathological, 44.0).layout(
+                    Layout::default()
+                        .width(Length::Fixed(122.0))
+                        .height(Length::Fixed(44.0))
+                        .clipped(),
+                ),
+            ]),
+        )
+        .compile(LogicalRect::new(0.0, 0.0, 160.0, 100.0))
+        .expect("compiles");
+        assert!(
+            tree.fit_failures()
+                .iter()
+                .any(|line| line.contains("kind=settings-preview overflow=true")),
+            "{:?}",
+            tree.fit_failures()
+        );
+    }
+
+    /// A PREVIEW'S HEADER NEVER TAKES ITS SPECIMEN'S LEAST ROW (review of
+    /// audit r14 PV3/PV4): Cursor Styles at 22×24 with 2× text holds its
+    /// preview at 64 pt to keep a style row in view, and "Rainbow kitty",
+    /// wrapped onto two lines, took the whole card: the preview showed its
+    /// caption and no cursor. In every card from the header's first band and
+    /// one row up to the full header and one row, at 1x and 2x, for a cursor
+    /// and a text specimen, the specimen paints at least one whole row and
+    /// no header word is cut; where the lines do not fit beside that row the
+    /// header paints no words at all (the page and the spoken value still
+    /// say them), and the fit audit reports nothing. CONTROL: a card the
+    /// host sized at `minimum_height` paints the whole statement and the
+    /// row.
+    #[test]
+    fn a_preview_header_never_takes_its_specimens_least_row() {
+        use crate::native_appearance::{AppearancePreferences, install_preferences};
+        let _ = compiled(SettingsPreviewSpec::default());
+        let prepared = crate::tray_raster::prepare_semantic_font(
+            &crate::widget::SemanticFontCandidate::default(),
+        );
+        let roles = Roles::from_theme(Theme::default());
+        let specs = [
+            SettingsPreviewSpec::cursor(rainbow_cursor("rainbow kitty pet"))
+                .with_focus(crate::prefs::EDIT_CURSOR_TRAIL_STYLE, "rainbow kitty pet"),
+            SettingsPreviewSpec::typography(12.0)
+                .with_focus(crate::prefs::EDIT_FONT_FAMILY, "Automatic (SF Mono)"),
+        ];
+        let mut squeezed = 0;
+        for scale in [1.0_f32, 2.0] {
+            let _ = install_preferences(AppearancePreferences {
+                text_scale: scale,
+                ..AppearancePreferences::default()
+            });
+            for spec in &specs {
+                for width in [122.0_f32, 150.0, 206.0] {
+                    let spec = spec
+                        .clone()
+                        .with_prepared_font(prepared.clone())
+                        .with_measure_width(width);
+                    let full = spec.normalized().header_layout(width);
+                    let band = header_first_line(spec.scene, full.px);
+                    let body = spec.normalized().least_body();
+                    let least = (band + body).ceil();
+                    let most = spec.minimum_height(0.0).max(full.height + body).ceil();
+                    let mut height = least;
+                    while height <= most {
+                        let rect = LogicalRect::new(10.0, 10.0, width, height);
+                        let context =
+                            format!("{} at {width}x{height}, {scale}x", spec.semantic_label());
+                        let mut prims = Vec::new();
+                        spec.paint(&mut prims, rect, Theme::default(), roles);
+                        let rows = prims
+                            .iter()
+                            .find_map(|prim| match prim {
+                                DrawPrim::TerminalSpecimen { spec, .. } => Some(spec.input.rows),
+                                _ => None,
+                            })
+                            .unwrap_or(0);
+                        assert!(rows >= 1, "{context}: the specimen paints a row");
+                        let header_bottom = spec.terminal_rect(rect).y;
+                        let words: Vec<String> = prims
+                            .iter()
+                            .filter_map(|prim| match prim {
+                                DrawPrim::Text { s, baseline, .. }
+                                    if *baseline <= header_bottom
+                                        && s != spec.scene.badge_label() =>
+                                {
+                                    Some(s.clone())
+                                }
+                                _ => None,
+                            })
+                            .collect();
+                        assert!(
+                            words.iter().all(|word| !word.contains('…')),
+                            "{context}: {words:?}"
+                        );
+                        if full.lines.len() > 1 && full.height + body > height + 0.01 {
+                            assert!(words.is_empty(), "{context}: {words:?}");
+                            squeezed += 1;
+                        }
+                        if height >= spec.minimum_height(0.0) {
+                            assert_eq!(
+                                words.join(" "),
+                                full.lines.join(" "),
+                                "{context}: CONTROL, the whole statement"
+                            );
+                        }
+                        height += 4.0;
+                    }
+                }
+            }
+        }
+        let _ = install_preferences(AppearancePreferences::default());
+        assert!(squeezed > 0, "some card holds the lines but not the row");
+    }
+
     #[test]
     fn maximum_text_preview_badges_fit_by_ui_width_and_preserve_utf8() {
         // 286.5pt compact host, less page/card/header insets. Caption is
@@ -6036,7 +6740,7 @@ mod tests {
             "Theme: Aurora 👩‍💻 Observatory — a deliberately very long personal color theme",
             "Trail: hyper-dimensional rainbow kitties with an unusually long spelling",
         ] {
-            let fitted = bounded_badge_width(source, available, px);
+            let fitted = bounded_badge_width(source, available, px, TextFace::UiBold);
             assert!(std::str::from_utf8(fitted.as_bytes()).is_ok());
             assert!(fitted.ends_with('…'), "{source:?} => {fitted:?}");
             assert!(
@@ -6046,7 +6750,7 @@ mod tests {
             );
         }
         assert_eq!(
-            bounded_badge_width("Theme: Nord", available, px),
+            bounded_badge_width("Theme: Nord", available, px, TextFace::UiBold),
             "Theme: Nord"
         );
     }
@@ -6055,37 +6759,46 @@ mod tests {
     fn preview_badge_limits_preserve_complete_grapheme_clusters() {
         for (source, expected) in [("A👩‍💻WWWW", "A👩‍💻…"), ("AéWWWW", "Aé…"), ("A🇺🇳WWWW", "A🇺🇳…")]
         {
-            assert_eq!(bounded_badge(source, 2), expected);
             let px = 27.5;
-            let exact_width =
-                crate::tray_raster::ui_text_width_for(TextFace::UiBold, expected, px) + 0.01;
-            assert_eq!(
-                bounded_badge_width(source, exact_width, px),
-                expected,
-                "{source:?}"
-            );
+            for face in [TextFace::UiBold, TextFace::Ui] {
+                let exact_width = crate::tray_raster::ui_text_width_for(face, expected, px) + 0.01;
+                assert_eq!(
+                    bounded_badge_width(source, exact_width, px, face),
+                    expected,
+                    "{source:?} in {face:?}"
+                );
+            }
         }
     }
 
-    /// A shortened badge gives up its subject, never the value being tried.
+    /// A HEADER SHORT OF ROOM GIVES UP WHOLE STATEMENTS, NEVER A WORD: the
+    /// state first, then the subject, the value being tried kept whole; where
+    /// not even the value fits one line it wraps, and the header grows a
+    /// line. Every width says every word of what it chose.
     #[test]
-    fn a_shortened_badge_keeps_the_value_whole() {
+    fn a_shortened_header_keeps_the_value_whole() {
         let spec = SettingsPreviewSpec::cursor(CursorPreviewSpec::default())
             .with_focus(crate::prefs::EDIT_LOAD_ADAPTIVE_MOTION, "true")
             .with_focus_label("Reduce motion under heavy load");
-        for max in [20, 24, 30] {
-            let badge = spec.bounded_candidate_badge(max);
-            assert!(badge.ends_with(": On"), "{max}: {badge}");
-            assert!(badge.graphemes().count() <= max, "{max}: {badge}");
+        let wide = spec.header_layout(720.0);
+        assert_eq!(wide.lines.len(), 1);
+        assert!(wide.lines[0].starts_with("Reduce motion under heavy load: On"));
+        let mut saw = (false, false);
+        for width in (80..=720).step_by(8) {
+            let header = spec.header_layout(width as f32);
+            assert!(!header.cut, "{width}: {header:?}");
+            let said = header.lines.join(" ");
+            assert!(!said.contains('…'), "{width}: {said}");
+            assert!(
+                said.ends_with("On") || said.contains("On ·"),
+                "{width}: {said}"
+            );
+            saw.0 |= header.says == "On";
+            saw.1 |= header.says == "Reduce motion under heavy load: On";
         }
-        assert_eq!(
-            spec.bounded_candidate_badge(30),
-            "Reduce motion under heavy…: On"
-        );
-        // One that fits is whole.
-        assert_eq!(
-            spec.bounded_candidate_badge(40),
-            "Reduce motion under heavy load: On"
+        assert!(
+            saw.0 && saw.1,
+            "the ladder reaches the value alone: {saw:?}"
         );
     }
 
@@ -6124,9 +6837,11 @@ mod tests {
             header(720.0),
             "Font: Iosevka Term Extended Heavy Oblique · Text sample"
         );
-        // A narrow one shortens.
-        let narrow = header(320.0);
-        assert!(narrow.len() < header(720.0).len(), "{narrow}");
+        // A narrow one gives up whole statements, and still names the font.
+        let narrow = spec.header_layout(320.0);
+        let said = narrow.lines.join(" ");
+        assert!(said.len() < header(720.0).len(), "{said}");
+        assert!(said.contains(family) && !said.contains('…'), "{said}");
     }
 
     /// An unset font size reads with its unit on the number: "12 px
@@ -6143,6 +6858,7 @@ mod tests {
 
     #[test]
     fn narrow_large_type_font_candidate_pill_contains_its_unicode_text() {
+        let _ = compiled(SettingsPreviewSpec::default());
         let family = "Aurora 👩‍💻 Observatory élan 🇺🇳 — deliberately long candidate family";
         let mut spec = SettingsPreviewSpec::typography(14.0)
             .with_focus(crate::prefs::EDIT_FONT_FAMILY, family);
@@ -6164,26 +6880,39 @@ mod tests {
                 _ => None,
             })
             .expect("font candidate pill panel");
-        let text = prims
+        let texts = prims
             .iter()
-            .find_map(|prim| match prim {
-                DrawPrim::Text { x, s, px, face, .. } => Some((*x, s.as_str(), *px, *face)),
+            .filter_map(|prim| match prim {
+                DrawPrim::Text {
+                    x,
+                    baseline,
+                    s,
+                    px,
+                    face,
+                    ..
+                } => Some((*x, *baseline, s.as_str(), *px, *face)),
                 _ => None,
             })
-            .expect("font candidate pill text");
-        assert!(text.1.ends_with('…'), "{:?}", text.1);
-        assert!(std::str::from_utf8(text.1.as_bytes()).is_ok());
+            .collect::<Vec<_>>();
+        assert!(!texts.is_empty(), "font candidate pill text");
         assert!(panel.0 >= terminal.x);
         assert!(panel.1 >= terminal.y);
         assert!(panel.0 + panel.2 <= terminal.right() + 0.01);
         assert!(panel.1 + panel.3 <= terminal.bottom() + 0.01);
-        let text_right = text.0 + crate::tray_raster::ui_text_width_for(text.3, text.1, text.2);
-        assert!(
-            text_right <= panel.0 + panel.2 - 8.0 + 0.01,
-            "text {:?} ends at {text_right:.2} outside pill {:?}",
-            text.1,
-            panel
-        );
+        // Its words wrap inside the pill, whole: no word is cut.
+        for (x, baseline, text, px, face) in texts {
+            assert!(!text.contains('…'), "{text:?}");
+            assert!(std::str::from_utf8(text.as_bytes()).is_ok());
+            let text_right = x + crate::tray_raster::ui_text_width_for(face, text, px);
+            assert!(
+                text_right <= panel.0 + panel.2 - 8.0 + 0.01,
+                "text {text:?} ends at {text_right:.2} outside pill {panel:?}"
+            );
+            assert!(
+                baseline > panel.1 && baseline < panel.1 + panel.3,
+                "{text:?}"
+            );
+        }
     }
 
     #[test]
@@ -6191,12 +6920,12 @@ mod tests {
         let spec =
             SettingsPreviewSpec::appearance(24.0).with_focus(crate::prefs::EDIT_THEME, "Nord");
         assert_eq!(spec.animation(), PreviewAnimation::None);
-        let candidate = spec.bounded_candidate_badge(30);
-        assert_eq!(compact_header_state(&spec), candidate);
-        let moving = SettingsPreviewSpec::default().with_focus(crate::prefs::EDIT_THEME, "Nord");
-        if moving.animation() != PreviewAnimation::None {
-            let state = compact_header_state(&moving);
-            assert!(state.starts_with(&candidate) && state.len() > candidate.len());
+        for rung in spec.header_rungs() {
+            assert_eq!(rung.matches("Nord").count(), 1, "{rung}");
+        }
+        for width in [140.0_f32, 220.0, 420.0] {
+            let said = spec.header_layout(width).lines.join(" ");
+            assert_eq!(said.matches("Nord").count(), 1, "{width}: {said}");
         }
     }
 
@@ -6536,13 +7265,24 @@ mod tests {
         let spec = |trial: bool| {
             SettingsPreviewSpec::cursor(rainbow_cursor("rainbow dog pet"))
                 .with_focus(crate::prefs::EDIT_CURSOR_TRAIL_STYLE, "rainbow dog pet")
-                .with_style_trial(trial)
+                .with_style_trial(trial.then_some(StyleTrial::Keyboard))
         };
         let tried = spec(true);
         let badge = tried.with_state_badge(tried.candidate_badge());
         assert!(badge.starts_with("Trying: Rainbow dog"), "{badge}");
-        assert!(tried.bounded_candidate_badge(12).starts_with("Trying:"));
-        assert!(compact_header_state(&tried).starts_with("Trying:"));
+        assert!(
+            tried
+                .header_rungs()
+                .iter()
+                .all(|rung| rung.starts_with("Trying:"))
+        );
+        for width in [90.0_f32, 160.0, 260.0, 520.0] {
+            let header = tried.header_layout(width);
+            assert!(
+                header.lines[0].starts_with("Trying:"),
+                "{width}: {header:?}"
+            );
+        }
         assert!(tried.semantic_value().contains("not saved"));
         let saved = spec(false);
         let badge = saved.with_state_badge(saved.candidate_badge());
@@ -6569,7 +7309,11 @@ mod tests {
         let badge = spec.with_state_badge(spec.candidate_badge());
         assert_eq!(badge, "Bloom: On · Inactive: dark themes only");
         assert!(!spec.reads_live());
-        assert!(!compact_header_state(&spec).contains("Live"));
+        assert!(
+            spec.header_rungs()
+                .iter()
+                .all(|rung| !rung.contains("Live"))
+        );
         assert!(spec.semantic_value().contains("Inactive: dark themes only"));
         // Negative control: no verdict, a live trail.
         let live = SettingsPreviewSpec::cursor(comet())
@@ -7111,6 +7855,118 @@ mod tests {
             );
             assert!(*x >= rect.x && *x + *width <= rect.right() + 0.01);
             assert!(*y >= rect.y && *y + 6.0 <= rect.bottom() + 0.01);
+        }
+    }
+
+    /// A PREVIEW IN A LIST'S FADING STRIP FADES AS ONE PICTURE (audit r14
+    /// PV1/PV2): the card cut by Top Settings' bottom edge painted its
+    /// terminal frame unfaded over its fading panel — a hard-edged block the
+    /// width of the longest row, a notch at its right edge and a step under
+    /// its last row. Over a contrasting ground, a cursor and a colour preview
+    /// inside one fade: every pixel of the band reads the preview drawn whole
+    /// mixed toward the ground by the band's opacity at its row, frame and
+    /// panel alike, at 1x and 2x, so nothing in the preview stands out of
+    /// its fade.
+    #[test]
+    fn a_preview_in_a_fading_strip_fades_as_one_picture() {
+        let _ = compiled(SettingsPreviewSpec::appearance(14.0));
+        let prepared = crate::tray_raster::prepare_semantic_font(
+            &crate::widget::SemanticFontCandidate::default(),
+        );
+        assert!(prepared.is_ready());
+        let roles = Roles::from_theme(Theme::default());
+        let ground = [0x28, 0x1d, 0x4e, 255];
+        let lut = |c: u8| {
+            let c = f32::from(c) / 255.0;
+            if c <= 0.040_45 {
+                c / 12.92
+            } else {
+                ((c + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        let encode = |l: f32| {
+            let l = l.clamp(0.0, 1.0);
+            let e = if l <= 0.003_130_8 {
+                l * 12.92
+            } else {
+                1.055 * l.powf(1.0 / 2.4) - 0.055
+            };
+            (e * 255.0).round() as i32
+        };
+        for scene in ["cursor", "appearance"] {
+            for scale in [1.0_f32, 2.0] {
+                let spec = match scene {
+                    "cursor" => {
+                        SettingsPreviewSpec::cursor(CursorPreviewSpec::default()).with_phase(780)
+                    }
+                    _ => SettingsPreviewSpec::appearance(14.0),
+                }
+                .with_prepared_font(prepared.clone());
+                let rect = LogicalRect::new(20.0, 10.0, 420.0, 156.0);
+                let (top, bottom) = (rect.y + 60.0, rect.bottom());
+                let prims = |fade: bool| {
+                    let mut prims = vec![
+                        DrawPrim::Panel {
+                            x: 0.0,
+                            y: 0.0,
+                            w: 480.0,
+                            h: 180.0,
+                            radius: 0.0,
+                            fill: ground,
+                        },
+                        DrawPrim::ClipPush {
+                            x: rect.x,
+                            y: rect.y,
+                            w: rect.width,
+                            h: rect.height,
+                        },
+                    ];
+                    if fade {
+                        prims.push(DrawPrim::FadePush {
+                            y: top,
+                            h: bottom - top,
+                            from: 1.0,
+                            to: 0.0,
+                        });
+                    }
+                    spec.paint(&mut prims, rect, Theme::default(), roles);
+                    if fade {
+                        prims.push(DrawPrim::FadePop);
+                    }
+                    prims.push(DrawPrim::ClipPop);
+                    prims
+                };
+                let (whole, pw, _) =
+                    crate::tray_raster::rasterize_tray(&prims(false), 480, 180, scale, [0; 4]);
+                let (faded, _, _) =
+                    crate::tray_raster::rasterize_tray(&prims(true), 480, 180, scale, [0; 4]);
+                let (y0, y1) = ((top * scale).ceil() as u32, (bottom * scale) as u32);
+                let (x0, x1) = ((rect.x * scale) as u32, (rect.right() * scale) as u32);
+                let mut worst = (0, 0, 0);
+                for y in y0..y1 {
+                    let t =
+                        ((y as f32 + 0.5 - top * scale) / ((bottom - top) * scale)).clamp(0.0, 1.0);
+                    let opacity = (1.0 - t) * (1.0 - t);
+                    for x in x0..x1 {
+                        let i = ((y * pw + x) * 4) as usize;
+                        for k in 0..3 {
+                            let want = encode(
+                                lut(ground[k]) * (1.0 - opacity) + lut(whole[i + k]) * opacity,
+                            );
+                            let off = (i32::from(faded[i + k]) - want).abs();
+                            if off > worst.0 {
+                                worst = (off, x, y);
+                            }
+                        }
+                    }
+                }
+                assert!(
+                    worst.0 <= 2,
+                    "{scene} at {scale}x: the band is off its fade by {} at {:?}",
+                    worst.0,
+                    (worst.1, worst.2)
+                );
+            }
         }
     }
 
@@ -7741,12 +8597,20 @@ mod tests {
         assert!(differences(&base_pixels, &pixels(font.clone())) > 120);
         assert!(differences(&base_pixels, &pixels(reduced.clone())) > 120);
 
-        let bounds = |spec| {
+        let bounds = |spec: SettingsPreviewSpec| {
+            let control = spec.pause_control();
             let compiled = compiled(spec);
             let node = compiled
                 .semantic(&crate::native_ui::UiKey::new("preview"))
                 .expect("semantic preview");
-            assert_eq!(node.role, SemanticRole::Group);
+            assert_eq!(
+                node.role,
+                if control {
+                    SemanticRole::Button
+                } else {
+                    SemanticRole::Group
+                }
+            );
             assert!(node.label.contains("preview"));
             assert!(matches!(
                 node.value,
@@ -8241,40 +9105,63 @@ mod tests {
         );
     }
 
-    /// THE KNOBS THAT ACT ON A JUMP SHOW IN THE PREVIEW: the scene's Tab lands
-    /// a completion at once, licensed as a real Tab is, so for every style
-    /// whose engine reads Ring on jumps or Trail length (the knob law, on a
-    /// dark ground with the ring on) two values of the knob paint differently
-    /// after the Tab, as does Phaser's accent, which colours only its ring.
-    /// NEGATIVE CONTROL: between the Return's landing and the Tab, typing
-    /// alone, the same values paint alike.
+    /// The card's pixels with `spec` in a preview `height` tall, at 1x.
+    fn card_pixels(spec: SettingsPreviewSpec, height: f32) -> Vec<u8> {
+        let _ = compiled(SettingsPreviewSpec::default());
+        let prepared =
+            crate::tray_raster::prepared_semantic_font_for_direct_view_test(&spec.font_candidate);
+        let tree = UiTree::new(
+            UiNode::new(
+                "root",
+                UiContent::Group(GroupSpec::unlabeled(SemanticRole::Application)),
+            )
+            .layout(Layout::column().padding(Insets::all(10.0)))
+            .children(vec![preview_node(
+                "preview",
+                spec.with_prepared_font(prepared),
+                height,
+            )]),
+        )
+        .compile(VIEWPORT)
+        .expect("preview compiles");
+        raster_of(&tree.tray(Theme::default(), 13.0).prims)
+    }
+
+    /// How many pixels two frames show apart: some channel more than 32 off.
+    fn visibly_apart(left: &[u8], right: &[u8]) -> usize {
+        left.chunks(4)
+            .zip(right.chunks(4))
+            .filter(|(a, b)| a.iter().zip(b.iter()).any(|(x, y)| x.abs_diff(*y) > 32))
+            .count()
+    }
+
+    /// THE KNOBS THAT ACT ON THE SCENE'S JUMP SHOW, TO THE EYE (audit r14
+    /// PV7): the guard used to compare the engine's streams, which a
+    /// sub-visible change (a trail cell at alpha 1 or 2) satisfied while
+    /// Comet's Trail length and its Ring on jumps changed nothing anyone
+    /// could see. For every style and every knob the knob law says the scene
+    /// shows (`reads_knob` in the scene's own facts: a dark ground, the ring
+    /// on, the Tab's completion over the letters it prints) — Trail length,
+    /// Ring on jumps, Phaser's accent — two values paint at least a few dozen
+    /// pixels visibly apart after the Tab, in a tall card and in a one-row
+    /// card. NEGATIVE CONTROLS: typing alone, before the Tab, the two values
+    /// paint alike; and a knob the law says the scene does not show (Fire's
+    /// Trail length, which only blank cells show) paints alike after the Tab
+    /// too, which is what the header says.
     #[test]
-    fn the_jump_knobs_show_after_the_scenes_tab() {
-        use aterm_effects::cursor_glow::{KnobContext, TrailKnob};
+    fn the_jump_knobs_show_visibly_after_the_scenes_tab() {
+        use aterm_effects::cursor_glow::TrailKnob;
 
         let tab_ms = (CURSOR_SCENE_TAB.0 as u64 + 1) * KEY_MS;
-        let after: Vec<u64> = (0..6).map(|step| tab_ms + step * MOTION_STEP_MS).collect();
-        // Typing alone: past the Return's own landing at the cycle's start.
-        let before: Vec<u64> = (5..=CURSOR_SCENE_TAB.0 as u64)
-            .map(|key| key * KEY_MS)
-            .collect();
-        let frames = |cursor: CursorPreviewSpec, phases: &[u64]| -> Vec<String> {
-            phases
-                .iter()
-                .map(|&phase| {
-                    scene_streams(&played(
-                        &SettingsPreviewSpec::cursor(cursor.clone()).with_phase(phase),
-                        Theme::default(),
-                    ))
-                })
-                .collect()
+        let after: Vec<u64> = (0..4).map(|step| tab_ms + step * MOTION_STEP_MS).collect();
+        let before: Vec<u64> = vec![6 * KEY_MS, CURSOR_SCENE_TAB.0 as u64 * KEY_MS];
+        // A card that shows the prompt row alone, the blank row under it
+        // past its edge.
+        let one_row = {
+            let spec = SettingsPreviewSpec::cursor(CursorPreviewSpec::default()).normalized();
+            spec.header_layout(VIEWPORT.width - 20.0).height + 15.0 + spec.typography_row_height()
         };
-        let ctx = KnobContext {
-            dark: true,
-            bar: false,
-            ring: true,
-            classic_tinted: false,
-        };
+        let mut checked = 0;
         for &raw in crate::prefs::CURSOR_TRAIL_STYLES {
             let style = PreviewTrailStyle::parse(raw);
             let Some(glow) = crate::app_config::resolve_trail_style(raw).style else {
@@ -8286,10 +9173,10 @@ mod tests {
                 trail_style_raw: Arc::from(raw),
                 ..CursorPreviewSpec::default()
             };
-            let mut knobs: Vec<(&str, CursorPreviewSpec, CursorPreviewSpec)> = Vec::new();
-            if glow.reads_knob(TrailKnob::Ring, ctx) {
-                knobs.push((
-                    "ring",
+            let ctx = SettingsPreviewSpec::cursor(base.clone()).scene_knob_context();
+            let knobs: Vec<(TrailKnob, CursorPreviewSpec, CursorPreviewSpec)> = vec![
+                (
+                    TrailKnob::Ring,
                     CursorPreviewSpec {
                         ring: true,
                         ..base.clone()
@@ -8298,11 +9185,9 @@ mod tests {
                         ring: false,
                         ..base.clone()
                     },
-                ));
-            }
-            if glow.reads_knob(TrailKnob::Length, ctx) {
-                knobs.push((
-                    "length",
+                ),
+                (
+                    TrailKnob::Length,
                     CursorPreviewSpec {
                         length: 2,
                         ..base.clone()
@@ -8311,11 +9196,9 @@ mod tests {
                         length: 24,
                         ..base.clone()
                     },
-                ));
-            }
-            if glow == GlowStyle::Phaser {
-                knobs.push((
-                    "accent",
+                ),
+                (
+                    TrailKnob::Accent,
                     CursorPreviewSpec {
                         accent: Some(0x00FF_0000),
                         ..base.clone()
@@ -8324,21 +9207,81 @@ mod tests {
                         accent: Some(0x0000_FFFF),
                         ..base.clone()
                     },
-                ));
-            }
+                ),
+            ];
             for (knob, a, b) in knobs {
-                assert_ne!(
-                    frames(a.clone(), &after),
-                    frames(b.clone(), &after),
-                    "{raw}: {knob} shows after the Tab"
-                );
-                assert_eq!(
-                    frames(a, &before),
-                    frames(b, &before),
-                    "{raw}: {knob} is invisible while only typing"
-                );
+                let law = glow.reads_knob(knob, ctx);
+                // Accent is a knob of its own only where it is the ring's
+                // colour (Phaser); elsewhere it shares the trail's.
+                if knob == TrailKnob::Accent && glow != GlowStyle::Phaser {
+                    continue;
+                }
+                if !law && !(knob == TrailKnob::Length && glow == GlowStyle::Fire) {
+                    continue;
+                }
+                for height in [190.0_f32, one_row] {
+                    let frame = |cursor: &CursorPreviewSpec, phase: u64| {
+                        card_pixels(
+                            SettingsPreviewSpec::cursor(cursor.clone()).with_phase(phase),
+                            height,
+                        )
+                    };
+                    let apart = after
+                        .iter()
+                        .map(|&phase| visibly_apart(&frame(&a, phase), &frame(&b, phase)))
+                        .max()
+                        .unwrap_or(0);
+                    let apart16 = after
+                        .iter()
+                        .map(|&phase| {
+                            let (x, y) = (frame(&a, phase), frame(&b, phase));
+                            x.chunks(4)
+                                .zip(y.chunks(4))
+                                .filter(|(p, q)| {
+                                    p.iter().zip(q.iter()).any(|(m, n)| m.abs_diff(*n) > 16)
+                                })
+                                .count()
+                        })
+                        .max()
+                        .unwrap_or(0);
+                    let held = |cursor: &CursorPreviewSpec| {
+                        card_pixels(
+                            SettingsPreviewSpec::cursor(cursor.clone())
+                                .with_phase(300)
+                                .with_paused(true),
+                            height,
+                        )
+                    };
+                    let held_apart = visibly_apart(&held(&a), &held(&b));
+                    if law {
+                        assert!(
+                            apart >= 12 && apart16 >= 40,
+                            "{raw}: {knob:?} shows after the Tab in a {height}pt card: {apart} px \
+                             more than 32 levels apart, {apart16} more than 16"
+                        );
+                        assert!(
+                            held_apart >= 12,
+                            "{raw}: {knob:?} shows on the paused frame in a {height}pt card: \
+                             {held_apart} px"
+                        );
+                        for &phase in &before {
+                            assert_eq!(
+                                visibly_apart(&frame(&a, phase), &frame(&b, phase)),
+                                0,
+                                "{raw}: {knob:?} is invisible while only typing ({phase} ms)"
+                            );
+                        }
+                    } else {
+                        assert!(
+                            apart < 12,
+                            "{raw}: {knob:?} the law says the scene cannot show paints {apart} px apart"
+                        );
+                    }
+                    checked += 1;
+                }
             }
         }
+        assert!(checked >= 20, "{checked} knobs checked");
     }
 
     /// THE SCENE'S RETURN SCROLLS, as a terminal at its foot does: right after
@@ -8562,11 +9505,40 @@ mod tests {
         };
         let long = focused(24);
         assert_eq!(long.live_state(), "Covers this 6-cell jump");
-        assert_eq!(long.compact_state_badge(), "Covers this 6-cell jump");
+        assert!(
+            long.header_rungs()
+                .iter()
+                .all(|rung| !rung.contains("Live"))
+        );
         assert!(!long.reads_live());
         let cut = focused(3);
         assert!(cut.reads_live(), "{}", cut.live_state());
         assert!(!cut.live_state().contains("jump"));
+        // A count of one reads in the singular, in the header as on the row.
+        let one = focused(1).with_focus_label("Trail length");
+        assert!(
+            one.header_rungs()[0].starts_with("Trail length: 1 cell ·"),
+            "{:?}",
+            one.header_rungs()
+        );
+        // Fire's streak shows Trail length over blank cells only, and the
+        // scene's completion crosses letters: the header says so, at every
+        // length, by the knob law in the scene's own facts.
+        let fire = |length: usize| {
+            SettingsPreviewSpec::cursor(CursorPreviewSpec {
+                trail_style: PreviewTrailStyle::Fire,
+                trail_style_raw: Arc::from("fire"),
+                length,
+                ..CursorPreviewSpec::default()
+            })
+            .with_focus(crate::prefs::EDIT_CURSOR_TRAIL_LENGTH, length.to_string())
+            .with_phase(900)
+            .normalized()
+        };
+        for length in [2, 24] {
+            assert_eq!(fire(length).live_state(), "Shown over blank cells only");
+            assert!(!fire(length).reads_live());
+        }
     }
 
     /// THE FLYING KITTY IS EARNED, in the preview as in the terminal: the
@@ -8919,7 +9891,7 @@ mod tests {
                                 DrawPrim::TerminalSpecimen { y, spec, .. } => Some((*y, spec)),
                                 _ => None,
                             });
-                            let body = height - preview_header_height(&spec) - 15.0;
+                            let body = height - spec.header_height() - 15.0;
                             let row = spec.normalized().typography_row_height();
                             // The status band yields only to a whole row of
                             // glyphs it would otherwise leave no room for; a
@@ -9438,6 +10410,90 @@ mod tests {
     /// so. The card itself is the control: one full-size, keyboard-reachable
     /// target carrying the action, its motion state in the value, and the
     /// gesture in the description.
+    /// A LOOPING PREVIEW IS A CONTROL THE SEMANTIC TREE CAN SEE (audit r14
+    /// PV9): its focus comes from the tree's one interaction pass, as every
+    /// control's does, so with keyboard focus on it the tree has exactly one
+    /// focused node — the preview, a Button, enabled, focused and focus
+    /// visible — and paint rings it; focus from the pointer rings nothing;
+    /// focus elsewhere leaves it unfocused. NEGATIVE CONTROL: a preview with
+    /// nothing to pause (motion reduced) stays a plain Group with no state,
+    /// out of the focus order, and focus aimed at it sets nothing.
+    #[test]
+    fn a_looping_preview_is_a_focusable_button_in_the_semantic_tree() {
+        let key = crate::native_ui::UiKey::new("preview");
+        let tree = |spec: SettingsPreviewSpec, focus: Option<&str>, visible: bool| {
+            let prepared = crate::tray_raster::prepared_semantic_font_for_direct_view_test(
+                &spec.font_candidate,
+            );
+            let spec = spec.with_prepared_font(prepared);
+            let mut tree = UiTree::new(
+                UiNode::new(
+                    "root",
+                    UiContent::Group(GroupSpec::unlabeled(SemanticRole::Application)),
+                )
+                .layout(Layout::column().padding(Insets::all(10.0)))
+                .children(vec![
+                    preview_node("preview", spec, 190.0),
+                    UiNode::new(
+                        "other",
+                        UiContent::Button(crate::native_ui::Control::new(
+                            crate::native_ui::ButtonSpec::new("Other"),
+                            crate::native_ui::ActionId::new("other"),
+                        )),
+                    ),
+                ]),
+            );
+            let focus = focus.map(crate::native_ui::UiKey::new);
+            tree.apply_interaction(focus.as_ref(), None, None, visible);
+            tree.compile(VIEWPORT).expect("preview compiles")
+        };
+        let _ = compiled(SettingsPreviewSpec::default());
+        let looping = SettingsPreviewSpec::default().with_phase(300);
+        assert!(looping.pause_control());
+        let ringed = |compiled: &crate::native_ui::CompiledUi| {
+            compiled.paint.iter().any(|node| match &node.content {
+                UiContent::SettingsPreview(spec) => spec.focus_visible,
+                _ => false,
+            })
+        };
+
+        let focused = tree(looping.clone(), Some("preview"), true);
+        let focused_nodes: Vec<_> = focused
+            .semantics
+            .iter()
+            .filter(|node| node.state.is_some_and(|state| state.focused))
+            .map(|node| node.key.clone())
+            .collect();
+        assert_eq!(focused_nodes, vec![key.clone()], "exactly one focused node");
+        let node = focused.semantic(&key).expect("the preview");
+        assert_eq!(node.role, SemanticRole::Button);
+        let state = node.state.expect("a control states itself");
+        assert!(state.enabled && state.focused && state.focus_visible);
+        assert!(focused.focus_order.contains(&key));
+        assert!(ringed(&focused), "keyboard focus rings the card");
+
+        let pointer = tree(looping.clone(), Some("preview"), false);
+        let state = pointer.semantic(&key).and_then(|node| node.state);
+        assert!(state.is_some_and(|state| state.focused && !state.focus_visible));
+        assert!(!ringed(&pointer), "a pointer's focus rings nothing");
+
+        let elsewhere = tree(looping, Some("other"), true);
+        let state = elsewhere.semantic(&key).and_then(|node| node.state);
+        assert!(state.is_some_and(|state| state.enabled && !state.focused));
+        assert!(!ringed(&elsewhere));
+
+        let still = SettingsPreviewSpec::default()
+            .with_phase(300)
+            .with_reduced_motion(true);
+        assert!(!still.pause_control());
+        let still = tree(still, Some("preview"), true);
+        let node = still.semantic(&key).expect("the preview");
+        assert_eq!(node.role, SemanticRole::Group);
+        assert!(node.state.is_none() && node.action.is_none());
+        assert!(!still.focus_order.contains(&key));
+        assert!(!ringed(&still));
+    }
+
     #[test]
     fn pause_control_stills_the_looping_preview() {
         let live = SettingsPreviewSpec::default().with_phase(300);
@@ -9527,7 +10583,7 @@ mod tests {
     }
 
     /// A PAUSED PREVIEW HOLDS THE TRAIL MID-LINE: the scene plays to the step
-    /// the second key after the Tab lands ([`CURSOR_SCENE_PAUSE_MS`]) and
+    /// after the Tab lands ([`CURSOR_SCENE_PAUSE_MS`]) and
     /// stays there, whatever phase the host's clock hands it, with the typed
     /// command part-way and the style's light on it. NEGATIVE CONTROL: the
     /// still line a reduced-motion preview shows (the finished command, no

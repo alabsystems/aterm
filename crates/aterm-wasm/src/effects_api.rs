@@ -567,6 +567,7 @@ web_terminal_impl!(bind);
 
 /// The streak's polarity: the host's override if given, else the native classifier
 /// ([`aterm_render::theme_is_dark`]) applied to the `set_theme` background.
+#[inline]
 pub(crate) fn streak_is_dark(dark_theme: Option<bool>, theme_bg: u32) -> bool {
     dark_theme.unwrap_or_else(|| aterm_render::theme_is_dark(theme_bg))
 }

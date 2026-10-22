@@ -101,6 +101,7 @@ impl GlowQuad {
     /// A flat quad: one colour and one opacity across its width
     /// (`color2 == color`, `alpha2 == alpha`).
     #[must_use]
+    #[inline]
     pub const fn flat(row: u16, x: u16, y: u16, w: u16, h: u16, color: u32, alpha: u8) -> Self {
         Self {
             row,
@@ -122,8 +123,9 @@ impl GlowQuad {
     /// When exactly one of `alpha`/`alpha2` is `0`: a quad is additive or source-over at both
     /// ends.
     #[must_use]
+    #[inline]
     #[allow(clippy::too_many_arguments)]
-    pub fn gradient(
+    pub const fn gradient(
         row: u16,
         x: u16,
         y: u16,
@@ -134,9 +136,8 @@ impl GlowQuad {
         color2: u32,
         alpha2: u8,
     ) -> Self {
-        debug_assert_eq!(
-            alpha == 0,
-            alpha2 == 0,
+        debug_assert!(
+            (alpha == 0) == (alpha2 == 0),
             "a GlowQuad is additive at both ends or source-over at both ends"
         );
         Self {
@@ -154,6 +155,7 @@ impl GlowQuad {
 
     /// Whether the quad is flat (`color2 == color && alpha2 == alpha`).
     #[must_use]
+    #[inline]
     pub const fn is_flat(self) -> bool {
         self.color2 == self.color && self.alpha2 == self.alpha
     }
@@ -163,6 +165,7 @@ impl GlowQuad {
     /// left-flat twin.
     #[doc(hidden)]
     #[must_use]
+    #[inline]
     pub const fn damage_words(self) -> GlowQuadWords {
         let first = pack_u16x4(self.row, self.x, self.y, self.w);
         let second = self.h as u64 | (self.color as u64) << 16 | (self.alpha as u64) << 48;
@@ -200,6 +203,7 @@ impl GlowQuadWords {
 
     /// The live words as a slice.
     #[must_use]
+    #[inline]
     pub fn as_slice(&self) -> &[u64] {
         &self.words[..self.len as usize]
     }
@@ -209,6 +213,7 @@ impl IntoIterator for GlowQuadWords {
     type Item = u64;
     type IntoIter = std::iter::Take<std::array::IntoIter<u64, 3>>;
 
+    #[inline]
     fn into_iter(self) -> Self::IntoIter {
         self.words.into_iter().take(self.len as usize)
     }
@@ -278,6 +283,7 @@ impl RainHalo {
     /// Canonical lossless words used by cursor-effect fingerprints.
     #[doc(hidden)]
     #[must_use]
+    #[inline]
     pub const fn damage_words(self) -> [u64; 3] {
         let mode = match self.mode {
             HaloMode::Add => 0,
@@ -347,6 +353,7 @@ impl FirePatch {
     /// Canonical lossless words used by cursor-effect fingerprints.
     #[doc(hidden)]
     #[must_use]
+    #[inline]
     pub const fn damage_words(self) -> [u64; 4] {
         let mode = match self.mode {
             FireMode::Add => 0,
@@ -385,6 +392,7 @@ pub struct EffectStreamDamage {
 
 impl EffectStreamDamage {
     /// `clone_from` that keeps `rows`' capacity.
+    #[inline]
     fn refill_from(&mut self, source: &Self) {
         let Self {
             fingerprint,
@@ -400,6 +408,7 @@ impl EffectStreamDamage {
 
     /// Whether this metadata was built from its stream's final render payload.
     #[must_use]
+    #[inline]
     pub const fn is_valid(&self) -> bool {
         self.valid
     }
@@ -408,6 +417,7 @@ impl EffectStreamDamage {
     /// whose payload [`RenderInput::clone_damage_cache_from`] dropped. `None` without valid
     /// metadata (the payload was cloned and answers directly).
     #[must_use]
+    #[inline]
     pub const fn was_empty(&self) -> Option<bool> {
         if self.valid {
             Some(self.len == 0)
@@ -418,12 +428,17 @@ impl EffectStreamDamage {
 
     /// A content verdict, only when both sides carry trusted metadata.
     #[must_use]
-    pub fn same_content(&self, other: &Self) -> Option<bool> {
-        (self.valid && other.valid)
-            .then_some(self.len == other.len && self.fingerprint == other.fingerprint)
+    #[inline]
+    pub const fn same_content(&self, other: &Self) -> Option<bool> {
+        if self.valid && other.valid {
+            Some(self.len == other.len && self.fingerprint == other.fingerprint)
+        } else {
+            None
+        }
     }
 
     /// Mark the stream's rows into a renderer's dirty scratch; out-of-range bits are ignored.
+    #[inline]
     pub fn mark_rows(&self, dirty: &mut [bool]) {
         if !self.valid {
             return;
@@ -440,6 +455,7 @@ impl EffectStreamDamage {
         }
     }
 
+    #[inline]
     fn refresh<T>(
         &mut self,
         values: &[T],
@@ -477,20 +493,18 @@ impl EffectStreamFingerprint {
     const FIRST_MUL: u64 = 0x9e37_79b1_85eb_ca87;
     const SECOND_MUL: u64 = 0xc2b2_ae3d_27d4_eb4f;
 
-    fn new(len: usize) -> Self {
+    #[inline]
+    const fn new(len: usize) -> Self {
         let mut fingerprint = Self {
             first: Self::FIRST_SEED,
             second: Self::SECOND_SEED,
         };
-        fingerprint.write_pair(
-            u64::try_from(len).unwrap_or(u64::MAX),
-            0x6c65_6e67_7468_0001,
-        );
+        fingerprint.write_pair(len as u64, 0x6c65_6e67_7468_0001);
         fingerprint
     }
 
     #[inline]
-    fn write_pair(&mut self, first_word: u64, second_word: u64) {
+    const fn write_pair(&mut self, first_word: u64, second_word: u64) {
         // Both lanes consume both words; independent lanes let the multiplies issue together.
         self.first =
             (self.first ^ first_word ^ second_word.rotate_left(23)).wrapping_mul(Self::FIRST_MUL);
@@ -498,8 +512,9 @@ impl EffectStreamFingerprint {
             .wrapping_mul(Self::SECOND_MUL);
     }
 
-    fn finish(self) -> u128 {
-        (u128::from(self.first) << 64) | u128::from(self.second)
+    #[inline]
+    const fn finish(self) -> u128 {
+        ((self.first as u128) << 64) | (self.second as u128)
     }
 }
 
@@ -508,7 +523,8 @@ const fn pack_u16x4(a: u16, b: u16, c: u16, d: u16) -> u64 {
     a as u64 | (b as u64) << 16 | (c as u64) << 32 | (d as u64) << 48
 }
 
-fn hash_glow_quad(quad: &GlowQuad, hasher: &mut EffectStreamFingerprint) {
+#[inline]
+const fn hash_glow_quad(quad: &GlowQuad, hasher: &mut EffectStreamFingerprint) {
     let GlowQuadWords {
         words: [first, second, third],
         len,
@@ -520,13 +536,15 @@ fn hash_glow_quad(quad: &GlowQuad, hasher: &mut EffectStreamFingerprint) {
     }
 }
 
-fn hash_rain_halo(halo: &RainHalo, hasher: &mut EffectStreamFingerprint) {
+#[inline]
+const fn hash_rain_halo(halo: &RainHalo, hasher: &mut EffectStreamFingerprint) {
     let [first, second, third] = halo.damage_words();
     hasher.write_pair(first, second);
     hasher.write_pair(third, 0);
 }
 
-fn hash_fire_patch(patch: &FirePatch, hasher: &mut EffectStreamFingerprint) {
+#[inline]
+const fn hash_fire_patch(patch: &FirePatch, hasher: &mut EffectStreamFingerprint) {
     let [first, second, third, fourth] = patch.damage_words();
     hasher.write_pair(first, second);
     hasher.write_pair(third, fourth);
@@ -761,6 +779,7 @@ pub struct LineSizeSpan {
 impl LineSizeSpan {
     /// A run covering `start_col..end_col` (half-open) at `line_size`.
     #[must_use]
+    #[inline]
     pub const fn new(start_col: usize, end_col: usize, line_size: LineSize) -> Self {
         Self {
             start_col,
@@ -812,6 +831,7 @@ impl ChromeRaster {
 
     /// Whether cell column `col` keeps its own background.
     #[must_use]
+    #[inline]
     pub fn owns(&self, col: usize) -> bool {
         self.own
             .iter()
@@ -820,6 +840,7 @@ impl ChromeRaster {
 
     /// The icon cell column `col` draws in place of its glyph, if any.
     #[must_use]
+    #[inline]
     pub fn icon_at(&self, col: usize) -> Option<BandIcon> {
         self.icons
             .iter()
@@ -911,6 +932,7 @@ impl BandIcon {
     /// The icon that stands in for `ch`, the band's glyph; `None` for any
     /// character outside the set (it keeps its font glyph).
     #[must_use]
+    #[inline]
     pub const fn for_char(ch: char) -> Option<Self> {
         Some(match ch {
             '\u{2139}' => Self::Info,
@@ -932,6 +954,7 @@ impl BandIcon {
 
     /// The character this icon is drawn for (the one a text grid keeps).
     #[must_use]
+    #[inline]
     pub const fn ch(self) -> char {
         match self {
             Self::Info => '\u{2139}',
@@ -952,14 +975,21 @@ impl BandIcon {
 
     /// A small stable index (a glyph cache key carries it).
     #[must_use]
+    #[inline]
     pub const fn index(self) -> u32 {
         self as u32
     }
 
     /// The icon at `index` ([`Self::index`]).
     #[must_use]
-    pub fn from_index(index: u32) -> Option<Self> {
-        Self::ALL.get(usize::try_from(index).ok()?).copied()
+    #[inline]
+    pub const fn from_index(index: u32) -> Option<Self> {
+        let idx = index as usize;
+        if idx < Self::ALL.len() {
+            Some(Self::ALL[idx])
+        } else {
+            None
+        }
     }
 }
 
@@ -994,6 +1024,7 @@ pub struct DefaultBgSpan {
 impl DefaultBgSpan {
     /// Construct a pane-local live default-background interval.
     #[must_use]
+    #[inline]
     pub const fn new(start_col: usize, end_col: usize, default_bg: u32) -> Self {
         Self {
             start_col,
@@ -1020,6 +1051,7 @@ pub struct SelectionClip {
 impl SelectionClip {
     /// Construct a half-open frame-space selection rectangle.
     #[must_use]
+    #[inline]
     pub const fn new(row_start: usize, row_end: usize, col_start: usize, col_end: usize) -> Self {
         Self {
             row_start,
@@ -1037,7 +1069,8 @@ impl SelectionClip {
     }
 
     /// Shift the rectangle down when host chrome is prepended to a frame.
-    pub fn translate_rows_down(&mut self, rows: usize) {
+    #[inline]
+    pub const fn translate_rows_down(&mut self, rows: usize) {
         self.row_start = self.row_start.saturating_add(rows);
         self.row_end = self.row_end.saturating_add(rows);
     }
@@ -1587,12 +1620,14 @@ impl FullRefillCause {
 
     /// Dense index into a `[_; COUNT]` tally (the discriminant).
     #[must_use]
+    #[inline]
     pub const fn index(self) -> usize {
         self as usize
     }
 
     /// Stable snake_case wire label for metrics text and JSON (dashboards key off it).
     #[must_use]
+    #[inline]
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::BidiVisual => "bidi_visual",
@@ -1634,6 +1669,7 @@ pub enum FrameRefill {
 
 impl Clone for RenderInput {
     /// A deep copy of every field, `snapshot_seq` included.
+    #[inline]
     fn clone(&self) -> Self {
         let mut out = Self::empty();
         out.copy_from(self, true);
@@ -1641,6 +1677,7 @@ impl Clone for RenderInput {
     }
 
     /// Capacity-reusing in-place update, identical to `*self = source.clone()`.
+    #[inline]
     fn clone_from(&mut self, source: &Self) {
         self.copy_from(source, true);
     }
@@ -1763,6 +1800,7 @@ impl Eq for RenderInput {}
 
 /// [`RenderInput::visual_to_logical`] equality by meaning: a missing row and an empty one are
 /// both the identity.
+#[inline]
 fn visual_to_logical_eq(a: &[Vec<u16>], b: &[Vec<u16>]) -> bool {
     fn row(rows: &[Vec<u16>], r: usize) -> &[u16] {
         rows.get(r).map_or(&[][..], Vec::as_slice)
@@ -1817,6 +1855,7 @@ pub struct ApronRow {
 
 impl ApronRow {
     /// `clone_from` that keeps every Vec's capacity (a derived one allocates fresh Vecs).
+    #[inline]
     fn refill_from(&mut self, source: &Self) {
         let Self {
             present,
@@ -1835,6 +1874,7 @@ impl ApronRow {
     }
 
     /// Mark the apron absent, keeping every Vec's capacity for the next fill.
+    #[inline]
     pub fn clear(&mut self) {
         self.present = false;
         self.cells.clear();
@@ -1846,6 +1886,7 @@ impl ApronRow {
 }
 
 impl Default for RenderInput {
+    #[inline]
     fn default() -> Self {
         Self::empty()
     }
@@ -1868,6 +1909,7 @@ impl RenderInput {
     /// The pixel-resolution chrome raster of frame row `r`, if the host drew
     /// one ([`ChromeRaster`]).
     #[must_use]
+    #[inline]
     pub fn chrome_raster(&self, r: usize) -> Option<&ChromeRaster> {
         self.chrome_rasters.iter().find(|m| usize::from(m.row) == r)
     }
@@ -1876,6 +1918,7 @@ impl RenderInput {
     /// producer supplied compact metadata. A cached frame is never drawn again, only read by
     /// the dirty-row decision, so the metadata is a complete prior; input without metadata is
     /// cloned in full.
+    #[inline]
     pub fn clone_damage_cache_from(&mut self, source: &Self) {
         self.copy_from(source, false);
     }
@@ -2086,6 +2129,7 @@ impl RenderInput {
     /// ([`note_host_row_prepend`](Self::note_host_row_prepend)). In-place host mutators
     /// self-report through `snapshot_seq != shifted_fill_seq`, but calling it is always sound
     /// (the cost is a whole-grid content compare). Also resets the prepend bookkeeping.
+    #[inline]
     pub fn invalidate_row_revisions(&mut self) {
         self.row_rev_lane = 0;
         self.row_rev.clear();
@@ -2103,6 +2147,7 @@ impl RenderInput {
     /// Blessed, the lane gains `prepended` leading `0`s (unknown), so engine row `r` keeps its
     /// revision at index `r + row_shift`; unblessed, the lane is disowned. `row_shift`
     /// advances either way: it is the row count an un-splice removes.
+    #[inline]
     pub fn note_host_row_prepend(&mut self, prepended: usize, blessed: bool) {
         self.row_shift = self.row_shift.saturating_add(prepended);
         // A prepend slides every composed row, so a composed-row ledger no longer applies.
@@ -2120,7 +2165,8 @@ impl RenderInput {
     /// Bless this snapshot as a committed composed frame, so the next compose may retain rows
     /// nothing changed. Called by the compositor after its last cell write and `snapshot_seq`
     /// bump; a later host write bumps `snapshot_seq` alone and so revokes it.
-    pub fn bless_composed_fill(&mut self) {
+    #[inline]
+    pub const fn bless_composed_fill(&mut self) {
         self.composed_fill_seq = self.snapshot_seq;
     }
 
@@ -2128,7 +2174,8 @@ impl RenderInput {
     /// [`bless_composed_fill`](Self::bless_composed_fill) last blessed: `false` if never
     /// blessed, disowned by a fill or rebuild, or written by a host mutator.
     #[must_use]
-    pub fn composed_fill_intact(&self) -> bool {
+    #[inline]
+    pub const fn composed_fill_intact(&self) -> bool {
         self.composed_fill_seq != 0 && self.snapshot_seq == self.composed_fill_seq
     }
 
@@ -2136,6 +2183,7 @@ impl RenderInput {
     /// engine fill (possibly shifted by an earlier blessed prepend) with a lane covering every
     /// row. Read before the prepend mutates anything.
     #[must_use]
+    #[inline]
     pub fn host_prepend_blessing(&self) -> bool {
         self.row_rev_lane != 0
             && self.row_rev.len() == self.rows
@@ -2411,6 +2459,7 @@ impl RenderInput {
     /// unless BiDi reordered that row. A caret kept in logical columns is
     /// painted here, on the cell it names.
     #[must_use]
+    #[inline]
     pub fn visual_col(&self, frame_row: usize, logical: usize) -> usize {
         let map = self.visual_to_logical_row(frame_row);
         u16::try_from(logical)
@@ -2498,6 +2547,7 @@ impl RenderInput {
     /// the BiDi reorder permutes only the materialized prefix, so past it logical and painted
     /// columns agree.
     #[must_use]
+    #[inline]
     pub fn selection_row_span(&self, frame_row: usize) -> Option<(u16, u16)> {
         self.selection_row_keys(frame_row)
             .map(|key| (key.lo, key.hi))
@@ -2507,6 +2557,7 @@ impl RenderInput {
     /// The lossless per-row selection damage key: one [`SelectionRowKey`] per selection that
     /// reaches `frame_row`, with its colours. Damage diffs compare this; unlike
     /// [`Self::selection_row_span`] it never merges panes. Writes into `out` (cleared first).
+    #[inline]
     pub fn selection_row_key(&self, frame_row: usize, out: &mut Vec<SelectionRowKey>) {
         out.clear();
         out.extend(self.selection_row_keys(frame_row));
@@ -2515,6 +2566,7 @@ impl RenderInput {
     /// Every selection's [`SelectionRowKey`] on `frame_row`, in list order (the scalar
     /// selection alone when [`selections`](Self::selections) is empty): the one walk behind
     /// the row span and the row key.
+    #[inline]
     fn selection_row_keys(&self, frame_row: usize) -> impl Iterator<Item = SelectionRowKey> + '_ {
         let scalar = if self.selections.is_empty() {
             selection_row_span_of(
@@ -2592,6 +2644,7 @@ impl RenderInput {
     /// entry per column (re-sorted after a BiDi reorder or pane compose), so this
     /// binary-searches: the GPU atlas loops stay O(cols·log cols) on a dense row.
     #[must_use]
+    #[inline]
     pub fn cluster_at(&self, row: usize, col: usize) -> Option<&str> {
         let row = self.clusters.get(row)?;
         row.binary_search_by_key(&col, |(c, _)| *c)
@@ -2602,6 +2655,7 @@ impl RenderInput {
     /// The combining marks to overlay at viewport cell `(row, col)`, if any (binary search,
     /// as [`cluster_at`](Self::cluster_at)).
     #[must_use]
+    #[inline]
     pub fn combining_at(&self, row: usize, col: usize) -> Option<&[char]> {
         let row = self.combining.get(row)?;
         row.binary_search_by_key(&col, |(c, _)| *c)
@@ -2614,6 +2668,7 @@ impl RenderInput {
     /// spans) the frame-wide [`default_bg`](Self::default_bg). May be `COLOR_UNSET`, which
     /// renderers resolve against their theme.
     #[must_use]
+    #[inline]
     pub fn default_bg_at(&self, row: usize, col: usize) -> u32 {
         let Some(spans) = self.default_bg_spans.get(row) else {
             return self.default_bg;
@@ -2633,6 +2688,7 @@ impl RenderInput {
     /// The topmost inline-image layer covering viewport cell `(row, col)`, if
     /// any ([`images_at`](Self::images_at) has them all).
     #[must_use]
+    #[inline]
     pub fn image_at(&self, row: usize, col: usize) -> Option<&aterm_grid::ImageRef> {
         self.images_at(row, col).last().map(|(_, image)| image)
     }
@@ -2640,6 +2696,7 @@ impl RenderInput {
     /// Every inline-image layer covering viewport cell `(row, col)`, bottom
     /// first — the order both renderers draw them in.
     #[must_use]
+    #[inline]
     pub fn images_at(&self, row: usize, col: usize) -> &[(usize, aterm_grid::ImageRef)] {
         self.images
             .get(row)
@@ -2652,6 +2709,7 @@ impl RenderInput {
     /// [`line_size_spans`](Self::line_size_spans) row yields the uniform run `0..cols`; an
     /// out-of-range column falls back to it rather than panicking.
     #[must_use]
+    #[inline]
     pub fn line_size_run_at(&self, row: usize, col: usize) -> (LineSize, usize, usize) {
         let uniform = || {
             (
@@ -2688,6 +2746,7 @@ impl RenderInput {
     /// Whether an image layer at (`row`,`col`) is drawn over the text (`z_index >= 0`, the
     /// default) and so hides the glyph; a Kitty `z < 0` image draws behind it.
     #[must_use]
+    #[inline]
     pub fn image_hides_glyph_at(&self, row: usize, col: usize) -> bool {
         self.images_at(row, col)
             .iter()
@@ -2859,6 +2918,7 @@ impl RenderInput {
     /// Drop the grapheme cluster and combining marks of frame cell
     /// (`row`, `frame_col`): both renderers prefer them to the cell's `ch`, so a
     /// cell a prediction repaints would draw the old grapheme over the new one.
+    #[inline]
     fn drop_marks(&mut self, row: usize, frame_col: usize) {
         if let Some(clusters) = self.clusters.get_mut(row) {
             clusters.retain(|&(c, _)| c != frame_col);
@@ -3069,6 +3129,7 @@ impl RenderInput {
     /// that must paint a set of ghosts ALL OR NONE (a state chain of predictive
     /// editing: a part of a state is a frame no program draws).
     #[must_use]
+    #[inline]
     pub fn prediction_ghost_paintable(&self, row: usize, col: usize, cols: usize) -> bool {
         if col >= cols {
             return false;
@@ -3089,6 +3150,7 @@ impl RenderInput {
     ///
     /// `None` when the producer resolved no defaults ([`COLOR_UNSET`]): the
     /// sentinel is not a colour, and masking its high byte would read as black.
+    #[inline]
     fn implicit_blank_at(&self, row: usize, col: usize) -> Option<RenderCell> {
         let (fg, bg) = (self.default_fg, self.default_bg_at(row, col));
         if fg == COLOR_UNSET || bg == COLOR_UNSET {
@@ -3151,6 +3213,7 @@ fn walk_ime_preedit(
 /// (`set_ime_cursor_area`) here; the engine cursor still sits at the composition's start.
 /// `start_col` and `cols` are in the overlay's coordinate space (pane-local for a split leaf).
 #[must_use]
+#[inline]
 pub fn ime_preedit_caret_col(
     preedit: &str,
     caret_byte: Option<usize>,
@@ -3164,6 +3227,7 @@ pub fn ime_preedit_caret_col(
 /// The entries of one row's sparse image list (`RenderInput::images[row]`,
 /// ascending by column) that cover column `col`, bottom layer first.
 #[must_use]
+#[inline]
 pub fn images_in_row_at(
     row: &[(usize, aterm_grid::ImageRef)],
     col: usize,
@@ -3657,12 +3721,16 @@ pub enum SpanCell {
 /// on any theme), its background kept, inherited SGR and geometry dropped. The
 /// one ghost style ([`RenderInput::paint_prediction_ghost`],
 /// [`RenderInput::paint_prediction_span`]).
-fn ghost_cell(cell: RenderCell, ch: char) -> RenderCell {
+#[inline]
+const fn ghost_cell(cell: RenderCell, ch: char) -> RenderCell {
     let (fg, bg) = (cell.fg, cell.bg);
-    let dim = |f: u8, b: u8| f.midpoint(b);
     RenderCell {
         ch,
-        fg: [dim(fg[0], bg[0]), dim(fg[1], bg[1]), dim(fg[2], bg[2])],
+        fg: [
+            fg[0].midpoint(bg[0]),
+            fg[1].midpoint(bg[1]),
+            fg[2].midpoint(bg[2]),
+        ],
         wide: false,
         emoji_presentation: false,
         text_presentation: false,

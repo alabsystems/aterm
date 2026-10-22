@@ -130,7 +130,8 @@ pub enum SeedBasis {
 impl SeedBasis {
     /// The wire word.
     #[must_use]
-    pub fn word(self) -> &'static str {
+    #[inline]
+    pub const fn word(self) -> &'static str {
         match self {
             SeedBasis::Arg => "arg",
             SeedBasis::Toggle => "toggle",
@@ -237,7 +238,8 @@ pub enum Verdict {
 impl Verdict {
     /// The wire word.
     #[must_use]
-    pub fn word(self) -> &'static str {
+    #[inline]
+    pub const fn word(self) -> &'static str {
         match self {
             Verdict::Empty => "empty",
             Verdict::Clean => "clean",
@@ -264,7 +266,8 @@ pub enum Cut {
 impl Cut {
     /// The wire word.
     #[must_use]
-    pub fn word(self) -> &'static str {
+    #[inline]
+    pub const fn word(self) -> &'static str {
         match self {
             Cut::Quiescent => "quiescent",
             Cut::Racy => "racy",
@@ -297,18 +300,21 @@ pub struct Run {
 impl Run {
     /// Resizes in the run.
     #[must_use]
+    #[inline]
     pub fn len(&self) -> usize {
         self.geoms.len().saturating_sub(1)
     }
 
     /// Whether the run holds no resize (never, for a recorded run).
     #[must_use]
+    #[inline]
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
 
     /// Whether the run ends where it started.
     #[must_use]
+    #[inline]
     pub fn net_zero(&self) -> bool {
         self.geoms.first() == self.geoms.last()
     }

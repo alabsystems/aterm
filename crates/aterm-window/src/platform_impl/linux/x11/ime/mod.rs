@@ -19,6 +19,8 @@ use std::sync::Arc;
 use self::callbacks::*;
 use self::context::ImeContext;
 pub use self::context::ImeContextCreationError;
+#[cfg(test)]
+pub(crate) use self::context::{FOCUSES_SENT, SPOTS_SENT};
 use self::inner::{close_im, ImeInner};
 use self::input_method::PotentialInputMethods;
 use super::{ffi, util, XConnection, XError};
@@ -129,11 +131,18 @@ impl Ime {
                     &self.inner.xconn,
                     im,
                     window,
-                    None,
+                    self.inner.spot_for_new_context(window),
                     self.inner.event_sender.clone(),
                     with_ime,
                 )?
             };
+            // The focused window's context remade (`set_ime_allowed`) takes the focus its old
+            // one had: IBus composes only in a focused input context.
+            if self.inner.focused == Some(window) {
+                if let Err(error) = context.focus(&self.xconn) {
+                    self.xconn.report("Failed to focus input context", error);
+                }
+            }
 
             let event = if context.is_allowed() { ImeEvent::Enabled } else { ImeEvent::Disabled };
             self.inner.event_sender.send((window, event)).expect("Failed to send enabled event");
@@ -156,7 +165,17 @@ impl Ime {
         }
     }
 
+    /// Destroy `window`'s input context: the window is gone, and so is what was noted of it.
     pub fn remove_context(&mut self, window: ffi::Window) -> Result<bool, XError> {
+        self.inner.spots.remove(&window);
+        if self.inner.focused == Some(window) {
+            self.inner.focused = None;
+        }
+        self.destroy_context(window)
+    }
+
+    /// Destroy `window`'s input context, keeping its spot and focus for a new one.
+    fn destroy_context(&mut self, window: ffi::Window) -> Result<bool, XError> {
         if let Some(Some(context)) = self.inner.contexts.remove(&window) {
             unsafe {
                 self.inner.destroy_ic_if_necessary(context.ic)?;
@@ -167,11 +186,19 @@ impl Ime {
         }
     }
 
+    /// `window` gained the focus: its input context takes it, and the spot its caret moved to
+    /// while it had none, which was not sent (`Self::send_xim_spot`), goes out once, if the
+    /// context does not have it.
     pub fn focus(&mut self, window: ffi::Window) -> Result<bool, XError> {
+        self.inner.focused = Some(window);
         if self.is_destroyed() {
             return Ok(false);
         }
+        let spot = self.inner.spots.get(&window).copied();
         if let Some(&mut Some(ref mut context)) = self.inner.contexts.get_mut(&window) {
+            if let Some(spot) = spot {
+                context.set_spot(&self.xconn, spot.x, spot.y);
+            }
             context.focus(&self.xconn).map(|_| true)
         } else {
             Ok(false)
@@ -179,6 +206,9 @@ impl Ime {
     }
 
     pub fn unfocus(&mut self, window: ffi::Window) -> Result<bool, XError> {
+        if self.inner.focused == Some(window) {
+            self.inner.focused = None;
+        }
         if self.is_destroyed() {
             return Ok(false);
         }
@@ -189,8 +219,16 @@ impl Ime {
         }
     }
 
+    /// `window`'s caret moved to (`x`, `y`) (`ImeRequest::Position`). Its input context is told
+    /// only while the window has the focus, and only a spot it does not have
+    /// (`ImeContext::set_spot`). Setting the spot is a synchronous request to the input method
+    /// server (`XSetICValues` waits for its reply, with no timeout) made on the event loop's
+    /// thread, so a stalled ibus-x11 froze every window while any window's caret moved, an
+    /// unfocused one's too as its program wrote. An unfocused window's latest spot is sent when
+    /// it gains the focus (`Self::focus`).
     pub fn send_xim_spot(&mut self, window: ffi::Window, x: i16, y: i16) {
-        if self.is_destroyed() {
+        self.inner.spots.insert(window, ffi::XPoint { x, y });
+        if self.is_destroyed() || self.inner.focused != Some(window) {
             return;
         }
         if let Some(&mut Some(ref mut context)) = self.inner.contexts.get_mut(&window) {
@@ -210,7 +248,7 @@ impl Ime {
         }
 
         // Remove context for that window.
-        let _ = self.remove_context(window);
+        let _ = self.destroy_context(window);
 
         // Create new context supporting IME input.
         let _ = self.create_context(window, allowed);
@@ -224,6 +262,20 @@ impl Ime {
         } else {
             false
         }
+    }
+
+    /// Replace the input method as its instantiate and destroy callbacks do (an IBus restart),
+    /// for a test; whether the replacement opened.
+    #[cfg(test)]
+    pub(crate) fn replace_for_test(&mut self) -> bool {
+        // SAFETY: the boxed inner the callbacks are handed, alive and borrowed by nothing else.
+        unsafe { replace_im_for_test(&mut *self.inner) }
+    }
+
+    /// The sender the input method's callbacks queue their events on, for a test.
+    #[cfg(test)]
+    pub(crate) fn event_sender_for_test(&self) -> ImeEventSender {
+        self.inner.event_sender.clone()
     }
 }
 

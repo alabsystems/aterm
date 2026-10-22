@@ -122,6 +122,7 @@ impl Mul for Fixed {
 impl Div for Fixed {
     type Output = Self;
 
+    #[inline]
     fn div(self, other: Self) -> Self {
         let sign = (self.0 < 0) ^ (other.0 < 0);
         let au = self.0.unsigned_abs() as u64;
@@ -184,7 +185,7 @@ impl F26Dot6 {
     /// Converts a 26.6 fixed point value to a single precision floating
     /// point value.
     #[inline(always)]
-    pub fn to_f32(self) -> f32 {
+    pub const fn to_f32(self) -> f32 {
         const SCALE_FACTOR: f32 = 1.0 / 64.0;
         self.0 as f32 * SCALE_FACTOR
     }

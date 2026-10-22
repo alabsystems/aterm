@@ -53,8 +53,12 @@ astream-wire = { path = "../../vendor/astream/crates/astream-wire" }
 # a legacy relaxed mark by (`durability.rs`, "One boot, one reading"), and whether
 # the page cache holding the incarnation lease's unflushed write has run
 # throughout (`state.rs`, "The incarnation lease"). Zero dependencies; its one
-# cordoned unsafe module is the two Apple calls astream's own log already makes,
-# so aterm-link stays `forbid(unsafe_code)`.
+# cordoned unsafe module is four Apple FFI calls (astream claim `os.cordon`):
+# `fcntl(F_BARRIERFSYNC)`, `sysctlbyname`, a zero-wait `poll` (which this crate
+# reaches through astream-broker's client, only after a read or a write timeout
+# was refused `EINVAL`: `transport::connect` sets both on every dial) and
+# `signal(SIGHUP)`, whose handler only astream's revocation file installs and
+# aterm never does. So aterm-link stays `forbid(unsafe_code)`.
 astream-sys = { path = "../../vendor/astream/crates/astream-sys" }
 # The verb table (what the bridge may call) and the control-socket vocabulary.
 aterm-types = { workspace = true }
@@ -98,6 +102,9 @@ aterm-sysprobe = { workspace = true }
 [dev-dependencies]
 # The unit tests' derived models and hang detectors.
 aterm-spec = { workspace = true }
+# `fabric brief --json`'s schema and tier tests read its object back with the
+# workspace's own JSON reader; the crate itself writes JSON by hand.
+aterm-json = { workspace = true }
 # The models its tests drive (a model edit rebuilds only their tests).
 aterm-models-core = { workspace = true }
 aterm-models-session = { workspace = true }

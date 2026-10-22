@@ -774,6 +774,7 @@ fn a_marker_reads_as_a_sentence_on_a_terminal() {
         GROUP_ABORTED_MARKER,
         SHADOWED_MARKER,
         FOREIGN_MARKER,
+        C_TOOLCHAIN_MARKER,
         MANAGED_CURRENT_MARKER,
         MACHINE_STATE_MARKER,
         SEED_BUSY_MARKER,
@@ -1171,7 +1172,7 @@ fn repair_refuses_a_read_only_rc_and_a_linked_aterm_dir() {
         std::fs::write(store.join("zshrc"), mine).unwrap();
         std::os::unix::fs::symlink(store.join("zshrc"), &zshrc).unwrap();
         std::fs::set_permissions(&store, std::fs::Permissions::from_mode(0o555)).unwrap();
-        let ro = crate::hooks::pass_at(&layout, &home, RcWiring::Rewire);
+        let ro = crate::hooks::pass_at(&layout, &home, RcWiring::Rewire, None);
         std::fs::set_permissions(&store, std::fs::Permissions::from_mode(0o755)).unwrap();
         assert_eq!(ro.rc(), [(".zshrc", RcOutcome::WriteFailed)]);
         assert_eq!(std::fs::read_to_string(store.join("zshrc")).unwrap(), mine);
@@ -1182,7 +1183,7 @@ fn repair_refuses_a_read_only_rc_and_a_linked_aterm_dir() {
     std::fs::create_dir_all(refused.join("elsewhere")).unwrap();
     std::os::unix::fs::symlink(refused.join("elsewhere"), refused.join(".aterm")).unwrap();
     std::fs::write(refused.join(".zshrc"), mine).unwrap();
-    let pass = crate::hooks::pass_at(&layout, &refused, RcWiring::Rewire);
+    let pass = crate::hooks::pass_at(&layout, &refused, RcWiring::Rewire, None);
     assert_eq!(pass, HookPass::NotHardened);
     assert_eq!(
         std::fs::read_to_string(refused.join(".zshrc")).unwrap(),
@@ -1691,6 +1692,120 @@ fn machine_write_failure_is_explicit() {
     assert_eq!(
         entries,
         [crate::machine::UNIVERSAL_CONTROL_ENTRY.to_string()]
+    );
+}
+
+/// A Rosetta 2 install is a `machine-settings:` entry only when it landed; a failure is
+/// the failed line with atpkg's why, and an installed or inapplicable Mac says nothing.
+#[test]
+fn a_rosetta_install_is_an_entry_only_when_it_landed() {
+    use crate::machine::RosettaOutcome;
+    let mut entries: Vec<String> = Vec::new();
+    let failure = record_rosetta_outcome(
+        RosettaOutcome::Failed("softwareupdate exited 1: no network".into()),
+        &mut entries,
+    )
+    .expect("a failed install is reported even when the verb exits 0");
+    assert!(
+        failure.starts_with(MACHINE_APPLY_FAILED_PREFIX),
+        "{failure}"
+    );
+    assert!(failure.contains("no network"), "{failure}");
+    assert!(entries.is_empty());
+    for outcome in [
+        RosettaOutcome::NotApplicable,
+        RosettaOutcome::AlreadyPresent,
+    ] {
+        assert!(record_rosetta_outcome(outcome, &mut entries).is_none());
+        assert!(entries.is_empty());
+    }
+    let installed = record_rosetta_outcome(RosettaOutcome::Installed, &mut entries).unwrap();
+    assert!(!installed.starts_with(MACHINE_APPLY_FAILED_PREFIX));
+    assert!(installed.contains("rosetta = false"), "{installed}");
+    assert_eq!(entries, [crate::machine::ROSETTA_ENTRY.to_string()]);
+    assert_eq!(
+        machine_settings_line(&[
+            crate::machine::UNIVERSAL_CONTROL_ENTRY.to_string(),
+            crate::machine::ROSETTA_ENTRY.to_string(),
+        ]),
+        "machine-settings: universal-control disabled; rosetta installed"
+    );
+}
+
+/// Bare `machine`'s verdict names each half an apply would do, and says nothing is left
+/// in the words of what applies here; `nothing changed` blames the switches only when
+/// every setting that applies is switched off.
+#[test]
+fn the_machine_verdicts_name_what_is_left_and_why_nothing_changed() {
+    use crate::config::UniversalControlPolicy::Off;
+    use crate::machine::{HomePosture, MachineState, RosettaPosture, UcPosture};
+    let at = |universal_control, rosetta| MachineState {
+        universal_control,
+        policy: Off,
+        home: HomePosture::Account,
+        config_unreadable: false,
+        rosetta,
+        rosetta_wanted: true,
+    };
+    assert_eq!(
+        machine_read_verdict(&at(UcPosture::Default, RosettaPosture::Missing), None),
+        "next — aterm pkg machine apply (Universal Control off for this host; Rosetta 2 \
+         installed)"
+    );
+    assert_eq!(
+        machine_read_verdict(&at(UcPosture::Disabled, RosettaPosture::Missing), None),
+        "next — aterm pkg machine apply (Rosetta 2 installed)"
+    );
+    assert_eq!(
+        machine_read_verdict(&at(UcPosture::Disabled, RosettaPosture::Present), None),
+        "nothing to apply — Universal Control and Rosetta 2 are where [machine] wants them"
+    );
+    assert_eq!(
+        machine_read_verdict(
+            &at(UcPosture::Disabled, RosettaPosture::NotApplicable),
+            None
+        ),
+        "nothing to apply — Universal Control is where [machine] wants it",
+        "an Intel Mac's words are the ones before Rosetta 2"
+    );
+    let unread = machine_read_verdict(&at(UcPosture::Disabled, RosettaPosture::Unknown), None);
+    assert!(
+        unread.starts_with("nothing to apply — ") && !unread.contains("Rosetta 2 are where"),
+        "a runtime nobody could read is not vouched for: {unread}"
+    );
+    assert!(unread.contains("Rosetta 2 could not be read"), "{unread}");
+    assert_eq!(
+        machine_read_verdict(
+            &at(UcPosture::Default, RosettaPosture::Missing),
+            Some("HOME is /tmp/x".into())
+        ),
+        "not applied here — HOME is /tmp/x"
+    );
+    let left = MachineApply {
+        left_alone: vec!["universal_control = \"leave\"", "rosetta = false"],
+        ..MachineApply::default()
+    };
+    assert_eq!(
+        left.nothing_changed(),
+        "nothing changed — [machine] universal_control = \"leave\", rosetta = false"
+    );
+    let rosetta_on = MachineApply {
+        left_alone: vec!["universal_control = \"leave\""],
+        acts: true,
+        ..MachineApply::default()
+    };
+    assert_eq!(
+        rosetta_on.nothing_changed(),
+        "nothing changed — already applied",
+        "Rosetta 2 was already there: the switch is not the cause"
+    );
+    let failed = MachineApply {
+        failed: true,
+        ..rosetta_on
+    };
+    assert_eq!(
+        failed.nothing_changed(),
+        "nothing changed — a change did not land"
     );
 }
 
@@ -4405,6 +4520,7 @@ fn repair_says_an_rc_it_left_alone() {
         home: Some(home.to_path_buf()),
         exe: None,
         rustup_home: None,
+        login_rc: None,
         pass: crate::converge::repair::Pass::Repair,
     });
     let rows = super::repair_rows(
@@ -13531,6 +13647,52 @@ fn list_names_a_vendor_build_by_version() {
     );
 }
 
+/// THE VENDOR LANE NEVER WRITES THE RECORD for refused names (design S13): its landings run
+/// on rider threads beside the pass thread, which writes the program rows, and an unlocked
+/// rewrite there could lose one. Its `exposes` is the compiled table, which a shim may carry
+/// whole (`vendor_direct::table`'s test), so it has nothing to record. Measured with a
+/// record that a refused-names write would rewrite: an entry whose build left the store.
+#[cfg(unix)]
+#[test]
+fn a_vendor_landing_writes_no_refused_names_record() {
+    use crate::vendor_direct::lane::world::{self, Fake, native_exe};
+    use crate::vendor_direct::lane::{self, Verdict};
+    use crate::vendor_direct::policy::Policy;
+    let layout = world::layout("vendor-no-refused-write");
+    std::fs::create_dir_all(layout.build_dir("ay", 18)).unwrap();
+    crate::status::record_refused_shims(&layout, "ay", 18, &["pwsh".to_string()]).unwrap();
+    std::fs::remove_dir_all(layout.build_dir("ay", 18)).unwrap();
+    let f = Fake::default();
+    f.publish_claude("2.1.281", &native_exe("claude 2.1.281"));
+    let trust = world::trust();
+    let none = Policy::default();
+    let spec = crate::vendor_direct::spec("claude").unwrap();
+    let lane = lane::Lane {
+        layout: &layout,
+        fetcher: &f,
+        triple: world::triple(),
+        policy: &none,
+        trust: &trust,
+        legacy_index: None,
+        asked: false,
+        now: world::NOW,
+        download_turn: None,
+    };
+    let before = crate::status::counted::writes(&layout);
+    let outcome = lane::install_one(&lane, spec, false);
+    assert!(
+        matches!(outcome.verdict, Verdict::Installed { .. }),
+        "{:?}",
+        outcome.verdict
+    );
+    assert_eq!(
+        crate::status::counted::writes(&layout),
+        before,
+        "the lane wrote status.toml"
+    );
+    let _ = std::fs::remove_dir_all(&layout.prefix);
+}
+
 /// `atpkg rollback <vendor program>` builds no index fetcher: it moves to the newest
 /// retained vendor build no signed yank names, shims the table's exposes and records a row
 /// with the build's own root (so `atpkg verify` passes); with nothing retained, or only a
@@ -14197,4 +14359,120 @@ fn remove_amacs_refuses_naming_the_setting() {
     assert_eq!(run(&["uninstall", "amacs"]), ExitCode::from(1));
     assert_eq!(did_you_mean("remove"), Some("uninstall"));
     assert_eq!(did_you_mean("rm"), Some("uninstall"));
+}
+
+/// The `c-toolchain:` marker names what the window files (design init-system §4.2,
+/// `base.clt`): `missing` where no toolchain is installed, `broken` where one cannot build
+/// and an install fixes it (off macOS), `ready` wherever an install would fix nothing, no
+/// line where nothing was probed; and a terminal shows none of it.
+#[test]
+fn the_c_toolchain_marker_files_what_an_install_fixes_and_is_ready_elsewhere() {
+    use crate::prereq::CcVerdict;
+    let cc = std::path::PathBuf::from("/usr/bin/cc");
+    let said = |body: &str| Some(format!("atpkg: {C_TOOLCHAIN_MARKER}{body}"));
+    let (missing, ready) = (said(C_TOOLCHAIN_MISSING), said(C_TOOLCHAIN_READY));
+    assert_eq!(
+        super::c_toolchain_marker(&CcVerdict::NoDeveloperDir),
+        missing
+    );
+    assert_eq!(super::c_toolchain_marker(&CcVerdict::NoDriver), missing);
+    assert_eq!(
+        super::c_toolchain_marker(&CcVerdict::Ready { driver: cc.clone() }),
+        ready
+    );
+    let broken = CcVerdict::Broken {
+        driver: cc.clone(),
+        why: "fatal error: stdio.h: No such file or directory".into(),
+    };
+    assert_eq!(
+        super::c_toolchain_marker(&broken),
+        if cfg!(target_os = "macos") {
+            ready.clone()
+        } else {
+            said(C_TOOLCHAIN_BROKEN)
+        },
+        "a refusing compiler is filed only where an install fixes it, and never as missing"
+    );
+    assert_eq!(
+        super::c_toolchain_marker(&CcVerdict::Unanswered { driver: cc.clone() }),
+        ready
+    );
+    assert_eq!(
+        super::c_toolchain_marker(&CcVerdict::Unproven {
+            driver: cc,
+            why: "no temp".into()
+        }),
+        ready
+    );
+    assert_eq!(super::c_toolchain_marker(&CcVerdict::NotProbed), None);
+    assert_eq!(super::human_marker(missing.as_deref().unwrap()), None);
+}
+
+/// The seed's `c-toolchain:` line (design init-system §4.2), read without spawning
+/// anything: on macOS the install shim with no developer directory behind it is `missing`
+/// once the toolset is here to need the tools (a toolset that arrived over SSH is filed at
+/// the next launch; a first launch leaves the filing to the pass that lays the set down),
+/// and a developer directory holding a clang is `ready`, which ends the entry. Off macOS a
+/// found `cc` may still lack headers, so the seed says nothing at all.
+#[cfg(unix)]
+#[test]
+fn the_seed_reads_the_command_line_tools_without_running_anything() {
+    let root = crate::testdir::dir("atpkg-seed-cc-");
+    let shim = root.join("usr-bin");
+    let ran = root.join("ran");
+    for tool in ["cc", "xcrun"] {
+        let path = shim.join(tool);
+        std::fs::create_dir_all(&shim).unwrap();
+        std::fs::write(&path, format!("#!/bin/sh\ntouch '{}'\n", ran.display())).unwrap();
+        std::fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .unwrap();
+    }
+    let developer = root.join("CommandLineTools");
+    let host = crate::prereq::CcHost {
+        shim_dir: Some(shim.clone()),
+        xcode_select_link: root.join("no-link"),
+        default_developer_dir: developer.clone(),
+        bound: std::time::Duration::from_secs(60),
+        tmp_root: root.to_path_buf(),
+    };
+    let path = Some(shim.as_os_str());
+    let on_mac = |body: &str| {
+        cfg!(target_os = "macos").then(|| format!("atpkg: {C_TOOLCHAIN_MARKER}{body}"))
+    };
+    assert_eq!(
+        super::c_toolchain_seed_marker(path, &host, true),
+        on_mac(C_TOOLCHAIN_MISSING),
+        "no tools, a toolset here"
+    );
+    assert_eq!(
+        super::c_toolchain_seed_marker(path, &host, false),
+        None,
+        "no tools, no toolset yet: the first pass files it"
+    );
+    let clang = developer.join("usr/bin/clang");
+    std::fs::create_dir_all(clang.parent().unwrap()).unwrap();
+    std::fs::write(&clang, "").unwrap();
+    std::fs::set_permissions(&clang, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    for toolset in [true, false] {
+        assert_eq!(
+            super::c_toolchain_seed_marker(path, &host, toolset),
+            on_mac(C_TOOLCHAIN_READY),
+            "toolset {toolset}"
+        );
+    }
+    assert!(!ran.exists(), "nothing was spawned");
+}
+
+/// Only root holds a relay pass back (`sudo` keeps `$HOME`, and a root-owned rc would lock
+/// its owner out of it); any other uid lays its own tree.
+#[cfg(unix)]
+#[test]
+fn only_root_holds_a_relay_pass_back() {
+    assert_eq!(
+        super::relay_not_own_account_with(0),
+        Some("it runs as root")
+    );
+    for euid in [1, 501, 65534] {
+        assert_eq!(super::relay_not_own_account_with(euid), None, "{euid}");
+    }
 }

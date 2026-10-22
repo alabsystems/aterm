@@ -32,6 +32,7 @@ pub struct SignatureDefect {
     clippy::unreadable_literal,
     reason = "the published OkLab matrices, digit for digit"
 )]
+#[inline]
 #[must_use]
 // Skip: f64 arithmetic — the float-interval lane.
 #[cfg_attr(trust_verify, trust::skip)]
@@ -56,6 +57,7 @@ pub fn oklab(c: Rgb) -> (f64, f64, f64) {
 }
 
 /// `OkLCh` chroma and hue (degrees in `[0, 360)`) of an sRGB colour.
+#[inline]
 #[must_use]
 // Skip: f64 arithmetic — the float-interval lane.
 #[cfg_attr(trust_verify, trust::skip)]
@@ -65,6 +67,7 @@ pub fn chroma_hue(c: Rgb) -> (f64, f64) {
 }
 
 /// The Euclidean `OkLab` distance between two colours.
+#[inline]
 #[must_use]
 // Skip: f64 arithmetic — the float-interval lane.
 #[cfg_attr(trust_verify, trust::skip)]
@@ -75,6 +78,7 @@ pub fn oklab_distance(x: Rgb, y: Rgb) -> f64 {
 
 /// The angle between two hues, in `[0, 180]`.
 // Skip: f64 arithmetic — the float-interval lane.
+#[inline]
 #[cfg_attr(trust_verify, trust::skip)]
 fn hue_gap(x: f64, y: f64) -> f64 {
     let d = (x - y).rem_euclid(360.0);

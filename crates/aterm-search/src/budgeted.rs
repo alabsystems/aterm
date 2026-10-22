@@ -142,8 +142,9 @@ impl BudgetedSearch {
 
     /// Measure match columns under the terminal's `ambiguous_width` policy, as
     /// [`SearchIndex::set_ambiguous_width`] does. Set it before feeding rows.
+    #[inline]
     #[must_use]
-    pub fn with_ambiguous_width(mut self, ambiguous: AmbiguousWidth) -> Self {
+    pub const fn with_ambiguous_width(mut self, ambiguous: AmbiguousWidth) -> Self {
         self.ambiguous_width = ambiguous;
         self
     }
@@ -189,20 +190,23 @@ impl BudgetedSearch {
     }
 
     /// Rows consumed so far: the window-relative index of the next row.
+    #[inline]
     #[must_use]
-    pub fn rows_fed(&self) -> usize {
+    pub const fn rows_fed(&self) -> usize {
         self.rows_fed
     }
 
     /// Total rows in the search window.
+    #[inline]
     #[must_use]
-    pub fn total_rows(&self) -> usize {
+    pub const fn total_rows(&self) -> usize {
         self.total_rows
     }
 
     /// Whether every row in the window has been fed.
+    #[inline]
     #[must_use]
-    pub fn is_complete(&self) -> bool {
+    pub const fn is_complete(&self) -> bool {
         self.rows_fed >= self.total_rows
     }
 
@@ -228,8 +232,9 @@ impl BudgetedSearch {
     }
 
     /// Number of matches accumulated so far, so an owner can deliver each once.
+    #[inline]
     #[must_use]
-    pub fn result_count(&self) -> usize {
+    pub const fn result_count(&self) -> usize {
         self.matches.len()
     }
 

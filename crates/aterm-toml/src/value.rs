@@ -24,41 +24,48 @@ pub struct Map<K: Ord, V> {
 
 impl<K: Ord, V> Map<K, V> {
     /// An empty map.
+    #[inline]
     #[must_use]
-    pub fn new() -> Self {
+    pub const fn new() -> Self {
         Self {
             inner: BTreeMap::new(),
         }
     }
 
     /// Number of entries.
+    #[inline]
     #[must_use]
     pub fn len(&self) -> usize {
         self.inner.len()
     }
 
     /// Are there no entries?
+    #[inline]
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.inner.is_empty()
     }
 
     /// Insert, returning any previous value.
+    #[inline]
     pub fn insert(&mut self, key: K, value: V) -> Option<V> {
         self.inner.insert(key, value)
     }
 
     /// Entries in key order.
+    #[inline]
     pub fn iter(&self) -> btree_map::Iter<'_, K, V> {
         self.inner.iter()
     }
 
     /// Keys in order.
+    #[inline]
     pub fn keys(&self) -> btree_map::Keys<'_, K, V> {
         self.inner.keys()
     }
 
     /// Values in key order.
+    #[inline]
     pub fn values(&self) -> btree_map::Values<'_, K, V> {
         self.inner.values()
     }
@@ -66,11 +73,13 @@ impl<K: Ord, V> Map<K, V> {
 
 impl<K: Ord + core::borrow::Borrow<str>, V> Map<K, V> {
     /// The value for `key`.
+    #[inline]
     pub fn get(&self, key: &str) -> Option<&V> {
         self.inner.get(key)
     }
 
     /// Delete `key`.
+    #[inline]
     pub fn remove(&mut self, key: &str) -> Option<V> {
         self.inner.remove(key)
     }
@@ -176,11 +185,13 @@ impl<T: ?Sized + Index> Index for &T {
 
 impl Value {
     /// Look up a table key or an array index.
+    #[inline]
     pub fn get<I: Index>(&self, index: I) -> Option<&Value> {
         index.index_into(self)
     }
 
     /// The string, if this is one.
+    #[inline]
     #[must_use]
     pub fn as_str(&self) -> Option<&str> {
         match self {
@@ -190,8 +201,9 @@ impl Value {
     }
 
     /// The integer, if this is one.
+    #[inline]
     #[must_use]
-    pub fn as_integer(&self) -> Option<i64> {
+    pub const fn as_integer(&self) -> Option<i64> {
         match self {
             Value::Integer(v) => Some(*v),
             _ => None,
@@ -199,8 +211,9 @@ impl Value {
     }
 
     /// The float, if this is one.
+    #[inline]
     #[must_use]
-    pub fn as_float(&self) -> Option<f64> {
+    pub const fn as_float(&self) -> Option<f64> {
         match self {
             Value::Float(v) => Some(*v),
             _ => None,
@@ -208,8 +221,9 @@ impl Value {
     }
 
     /// The boolean, if this is one.
+    #[inline]
     #[must_use]
-    pub fn as_bool(&self) -> Option<bool> {
+    pub const fn as_bool(&self) -> Option<bool> {
         match self {
             Value::Boolean(v) => Some(*v),
             _ => None,
@@ -217,8 +231,9 @@ impl Value {
     }
 
     /// The array, if this is one.
+    #[inline]
     #[must_use]
-    pub fn as_array(&self) -> Option<&Vec<Value>> {
+    pub const fn as_array(&self) -> Option<&Vec<Value>> {
         match self {
             Value::Array(a) => Some(a),
             _ => None,
@@ -226,8 +241,9 @@ impl Value {
     }
 
     /// The table, if this is one.
+    #[inline]
     #[must_use]
-    pub fn as_table(&self) -> Option<&Table> {
+    pub const fn as_table(&self) -> Option<&Table> {
         match self {
             Value::Table(t) => Some(t),
             _ => None,
@@ -235,7 +251,8 @@ impl Value {
     }
 
     /// The table, mutably.
-    pub fn as_table_mut(&mut self) -> Option<&mut Table> {
+    #[inline]
+    pub const fn as_table_mut(&mut self) -> Option<&mut Table> {
         match self {
             Value::Table(t) => Some(t),
             _ => None,
@@ -243,8 +260,9 @@ impl Value {
     }
 
     /// A human-facing name for this value's kind.
+    #[inline]
     #[must_use]
-    pub fn type_str(&self) -> &'static str {
+    pub const fn type_str(&self) -> &'static str {
         match self {
             Value::String(_) => "string",
             Value::Integer(_) => "integer",

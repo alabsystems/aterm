@@ -73,36 +73,50 @@ fn make_archive(dir: &Path) -> PathBuf {
     make_archive_with(dir, b"#!/bin/true\nay", b"0000755\0")
 }
 
+/// One USTAR member: its header and its content, padded to the block.
+fn tar_entry(name: &str, content: &[u8], mode: &[u8; 8]) -> Vec<u8> {
+    let mut h = [0u8; 512];
+    let nb = name.as_bytes();
+    h[..nb.len()].copy_from_slice(nb);
+    h[100..108].copy_from_slice(mode);
+    h[108..116].copy_from_slice(b"0000000\0");
+    h[116..124].copy_from_slice(b"0000000\0");
+    h[124..136].copy_from_slice(format!("{:011o}\0", content.len()).as_bytes());
+    h[136..148].copy_from_slice(b"00000000000\0");
+    h[148..156].copy_from_slice(b"        ");
+    h[156] = b'0';
+    h[257..263].copy_from_slice(b"ustar\0");
+    h[263..265].copy_from_slice(b"00");
+    let sum: u32 = h.iter().map(|&b| u32::from(b)).sum();
+    h[148..156].copy_from_slice(format!("{sum:06o}\0 ").as_bytes());
+    let mut out = h.to_vec();
+    out.extend_from_slice(content);
+    out.resize(out.len() + (512 - content.len() % 512) % 512, 0);
+    out
+}
+
 /// As [`make_archive`], but with explicit `bin/ay` content and tar mode (the resolve-check
 /// tests ship a native-object magic with no exec bit, so the spawn fails).
 fn make_archive_with(dir: &Path, ay_content: &[u8], ay_mode: &[u8; 8]) -> PathBuf {
-    fn entry(name: &str, content: &[u8], mode: &[u8; 8]) -> Vec<u8> {
-        let mut h = [0u8; 512];
-        let nb = name.as_bytes();
-        h[..nb.len()].copy_from_slice(nb);
-        h[100..108].copy_from_slice(mode);
-        h[108..116].copy_from_slice(b"0000000\0");
-        h[116..124].copy_from_slice(b"0000000\0");
-        h[124..136].copy_from_slice(format!("{:011o}\0", content.len()).as_bytes());
-        h[136..148].copy_from_slice(b"00000000000\0");
-        h[148..156].copy_from_slice(b"        ");
-        h[156] = b'0';
-        h[257..263].copy_from_slice(b"ustar\0");
-        h[263..265].copy_from_slice(b"00");
-        let sum: u32 = h.iter().map(|&b| u32::from(b)).sum();
-        h[148..156].copy_from_slice(format!("{sum:06o}\0 ").as_bytes());
-        let mut out = h.to_vec();
-        out.extend_from_slice(content);
-        out.resize(out.len() + (512 - content.len() % 512) % 512, 0);
-        out
-    }
+    make_archive_of(dir, ay_content, ay_mode, &[])
+}
+
+/// As [`make_archive_with`], plus a `bin/<name>` executable for each of `extra`.
+fn make_archive_of(dir: &Path, ay_content: &[u8], ay_mode: &[u8; 8], extra: &[&str]) -> PathBuf {
     let mut tar = Vec::new();
-    tar.extend(entry(&bin_entry("ay"), ay_content, ay_mode));
-    tar.extend(entry(
+    tar.extend(tar_entry(&bin_entry("ay"), ay_content, ay_mode));
+    tar.extend(tar_entry(
         &bin_entry("git"),
         b"#!/bin/true\nnot-really-git",
         b"0000755\0",
     )); // sensitive → refused shim
+    for name in extra {
+        tar.extend(tar_entry(
+            &bin_entry(name),
+            format!("#!/bin/true\n{name}").as_bytes(),
+            b"0000755\0",
+        ));
+    }
     tar.resize(tar.len() + 1024, 0);
     let path = dir.join("ay-18.tar.zst");
     std::fs::write(&path, crate::extract::fixtures::zstd_bytes(&tar)).unwrap();
@@ -391,6 +405,353 @@ fn ay_installs_end_to_end_from_a_signed_release() {
         std::fs::read_link(layout.program_current("ay")).unwrap(),
         layout.build_dir("ay", 18)
     );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A shell is never shimmed (design S13): a signed manifest exposing `pwsh`, whose build
+/// ships `bin/pwsh`, lays no `bin/pwsh`, records the refusal, and `aterm pkg doctor`'s
+/// `base.pkg.refused` row names it. The control is the same release exposing `pwsh-lsp`,
+/// which its build ships too: that name is shimmed and no row names a refusal.
+#[test]
+fn a_manifest_exposing_pwsh_is_refused_a_shim_and_the_doctor_row_names_it() {
+    let installed = |label: &str, exposes: &str| {
+        let dir = scratch(label);
+        let archive = make_archive_of(
+            &dir,
+            b"#!/bin/true\nay",
+            b"0000755\0",
+            &["pwsh", "pwsh-lsp"],
+        );
+        let mut fake = fixture_from(&dir, "binary", archive, None);
+        let key = ("ay".to_string(), 18u64);
+        let (body, _) = fake.pkg.remove(&key).unwrap();
+        let body = String::from_utf8(body).unwrap();
+        let line = "exposes = [\"ay\", \"git\"]";
+        assert_eq!(body.matches(line).count(), 1, "the fixture's exposes line");
+        let body = body.replacen(line, &format!("exposes = {exposes}"), 1);
+        let sig = sign(&RELEASE_SEED, body.as_bytes());
+        fake.pkg.insert(key, (body.into_bytes(), sig));
+        let layout = layout(&dir);
+        let req = InstallRequest {
+            channel: "stable",
+            program: "ay",
+            triple: TRIPLE,
+            installed: None,
+        };
+        let report = install(&fake, &layout, &anchor(), &req, fl(0), 0).unwrap();
+        let home = dir.join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let path = std::env::join_paths([layout.bin_dir()]).unwrap();
+        let rows = crate::doctor::report_with(
+            &layout,
+            Some(&home),
+            Some(&path),
+            0,
+            None,
+            &crate::doctor::Probes::default(),
+        );
+        (dir, layout, report, rows)
+    };
+    let refused_rows = |rows: &[aterm_converge::ItemReport]| -> Vec<aterm_converge::ItemReport> {
+        rows.iter()
+            .filter(|r| crate::converge::is(&r.id, crate::converge::REFUSED))
+            .cloned()
+            .collect()
+    };
+
+    let (_dir, layout, report, rows) = installed("refused-pwsh", "[\"ay\", \"pwsh\"]");
+    assert_eq!(report.shimmed, vec!["ay".to_string()]);
+    assert_eq!(report.refused_shims, vec!["pwsh".to_string()]);
+    assert!(
+        layout.build_dir("ay", 18).join(bin_entry("pwsh")).is_file(),
+        "the build ships the shell: only the name keeps it off PATH"
+    );
+    assert!(
+        std::fs::symlink_metadata(layout.bin_dir().join("pwsh")).is_err(),
+        "no bin/pwsh"
+    );
+    assert_eq!(
+        crate::status::read(&layout)
+            .expect("recorded")
+            .refused_for("ay", 18),
+        Some(&crate::status::RefusedShims {
+            build: 18,
+            names: vec!["pwsh".to_string()],
+            count: 1,
+        })
+    );
+    let refused = refused_rows(&rows);
+    assert_eq!(refused.len(), 1, "{refused:?}");
+    let row = &refused[0];
+    assert_eq!(row.id, "base.pkg.refused@ay");
+    // A note: nothing on this machine changes a signed name, so it never leaves `aterm
+    // doctor` a planned change nobody applies.
+    assert_eq!(row.outcome, aterm_converge::Outcome::NotApplicable);
+    assert_eq!(row.class, Some(aterm_converge::Class::Person));
+    assert!(
+        !row.fails_surface(),
+        "a refused name never fails the doctor"
+    );
+    let why = &row.explain.as_ref().expect("explained").why;
+    assert!(
+        why.starts_with("ay build 18 exposes `pwsh`, a name no shim may carry"),
+        "{why}"
+    );
+
+    // A lookalike the case-insensitive volume answers for `pwsh` (LONG S) is refused the
+    // same way: no shim, recorded, said.
+    let (_dir, layout, report, rows) = installed("refused-lookalike", "[\"ay\", \"pw\\u017Fh\"]");
+    assert_eq!(report.shimmed, vec!["ay".to_string()]);
+    assert_eq!(report.refused_shims, vec!["pw\u{17F}h".to_string()]);
+    let laid: Vec<String> = std::fs::read_dir(layout.bin_dir())
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    assert!(
+        !laid.iter().any(|name| !name.is_ascii()),
+        "no lookalike shim: {laid:?}"
+    );
+    assert_eq!(
+        crate::status::read(&layout)
+            .expect("recorded")
+            .refused_for("ay", 18)
+            .map(|r| r.names.clone()),
+        Some(vec!["pw\u{17F}h".to_string()])
+    );
+    let refused = refused_rows(&rows);
+    assert_eq!(refused.len(), 1, "{refused:?}");
+    let why = &refused[0].explain.as_ref().expect("explained").why;
+    assert!(why.contains("`pw\u{17F}h`"), "{why}");
+
+    let (_dir, layout, report, rows) = installed("refused-control", "[\"ay\", \"pwsh-lsp\"]");
+    assert_eq!(
+        report.shimmed,
+        vec!["ay".to_string(), "pwsh-lsp".to_string()]
+    );
+    assert!(report.refused_shims.is_empty());
+    assert!(
+        layout.bin_dir().join("pwsh-lsp").exists(),
+        "the tool name is shimmed"
+    );
+    assert!(
+        crate::status::read(&layout).is_none_or(|s| s.refused_shims.is_empty()),
+        "nothing refused, nothing recorded"
+    );
+    let refused = refused_rows(&rows);
+    assert_eq!(refused.len(), 1, "{refused:?}");
+    assert_eq!(refused[0].id, crate::converge::REFUSED);
+    assert_eq!(refused[0].outcome, aterm_converge::Outcome::Ok);
+}
+
+/// The doctor's refused-name rows for `layout`, as (id, sentence).
+fn refused_said(layout: &Layout) -> Vec<(String, String)> {
+    let home = layout.prefix.with_file_name("refused-home");
+    std::fs::create_dir_all(&home).unwrap();
+    let path = std::env::join_paths([layout.bin_dir()]).unwrap();
+    crate::doctor::report_with(
+        layout,
+        Some(&home),
+        Some(&path),
+        0,
+        None,
+        &crate::doctor::Probes::default(),
+    )
+    .into_iter()
+    .filter(|r| crate::converge::is(&r.id, crate::converge::REFUSED))
+    .map(|r| (r.id, r.explain.map(|e| e.why).unwrap_or_default()))
+    .collect()
+}
+
+/// A GROUP MEMBER's refused names are recorded where it is staged, under its build and
+/// beside the live build's (design S13), and the doctor says the entry of the build
+/// `current` names: an aborted flip leaves the live build's names said, never the staged
+/// build's; the applied flip says the new build's. The ALab toolchain lands this way.
+#[test]
+fn a_group_member_records_its_refused_names_at_stage_and_the_doctor_says_the_current_builds() {
+    let staged = |label: &str, poisoned: bool| {
+        let dir = scratch(label);
+        let mut fake = group_fixture(&dir);
+        let key = ("ay".to_string(), 18u64);
+        let (body, _) = fake.pkg.remove(&key).unwrap();
+        let body = String::from_utf8(body).unwrap();
+        let line = "exposes = [\"ay\"]";
+        assert_eq!(body.matches(line).count(), 1, "the fixture's exposes line");
+        let body = body.replacen(line, "exposes = [\"ay\", \"pwsh\"]", 1);
+        let sig = sign(&RELEASE_SEED, body.as_bytes());
+        fake.pkg.insert(key, (body.into_bytes(), sig));
+        let layout = layout(&dir);
+        let installed = live_toolchain(&layout);
+        // ay@17's own landing refused `zsh`.
+        crate::status::record_refused_shims(&layout, "ay", 17, &["zsh".to_string()]).unwrap();
+        assert_eq!(
+            refused_said(&layout),
+            vec![(
+                "base.pkg.refused@ay".to_string(),
+                refused_sentence("ay build 17", "zsh")
+            )]
+        );
+        if poisoned {
+            poison(&dir.join("trust-4821.tar.zst"));
+        }
+        let report = quiet_pass(&fake, &layout, &installed, QUIET_T0, &|| {
+            Some(vec![PathBuf::from("/usr/bin/login")])
+        });
+        (dir, layout, report)
+    };
+
+    // trust's archive fails its digest after ay@18 staged: the group aborts, ay@17 stays.
+    let (_dir, layout, report) = staged("refused-group-abort", true);
+    let TxnOutcome::Aborted { failed, .. } = &report.groups[0].1 else {
+        panic!("a poisoned archive aborts: {:?}", report.groups[0].1);
+    };
+    assert_eq!(failed, "trust");
+    assert_eq!(crate::ops::active_builds(&layout).get("ay"), Some(&17));
+    let record = crate::status::read(&layout).expect("recorded");
+    assert_eq!(
+        record.refused_for("ay", 18).map(|r| r.names.clone()),
+        Some(vec!["pwsh".to_string()]),
+        "ay@18's names are recorded where it was staged"
+    );
+    assert_eq!(
+        record.refused_for("ay", 17).map(|r| r.names.clone()),
+        Some(vec!["zsh".to_string()]),
+        "the live build's entry is kept beside it"
+    );
+    assert_eq!(
+        refused_said(&layout),
+        vec![(
+            "base.pkg.refused@ay".to_string(),
+            refused_sentence("ay build 17", "zsh")
+        )],
+        "the live build's names, never the staged build's"
+    );
+
+    // The same tuple, quiet and whole: the flip lands, and the new build's names are said.
+    let (_dir, layout, report) = staged("refused-group-apply", false);
+    assert_eq!(
+        report.groups[0].1,
+        TxnOutcome::Applied(vec!["ay".into(), "trust".into()])
+    );
+    assert_eq!(crate::ops::active_builds(&layout).get("ay"), Some(&18));
+    assert!(
+        std::fs::symlink_metadata(layout.bin_dir().join("pwsh")).is_err(),
+        "no bin/pwsh"
+    );
+    assert_eq!(
+        refused_said(&layout),
+        vec![(
+            "base.pkg.refused@ay".to_string(),
+            refused_sentence("ay build 18", "pwsh")
+        )]
+    );
+}
+
+/// The doctor's sentence for one refused `name` of `build` ("ay build 18").
+fn refused_sentence(build: &str, name: &str) -> String {
+    format!(
+        "{build} exposes `{name}`, a name no shim may carry (a shell, another core command, or \
+         no tool name) \u{2014} it has no shim here, so typed in a shell it never runs ay's \
+         copy; its signed manifest names it, and nothing on this machine changes that"
+    )
+}
+
+/// What an older atpkg laid under `name` (a name no shim may carry now): a copy of `from`,
+/// a live shim, so it forwards where `from` does.
+fn lay_as_older_atpkg(layout: &Layout, from: &Path, name: &str) -> PathBuf {
+    let to = layout
+        .bin_dir()
+        .join(format!("{name}{}", crate::platform::SHIM_SUFFIX));
+    std::fs::copy(from, &to).unwrap();
+    to
+}
+
+/// A file a person keeps in `bin/` under a refused name, forwarding nowhere a shim reads.
+fn persons_own(layout: &Layout, name: &str) -> PathBuf {
+    let to = layout
+        .bin_dir()
+        .join(format!("{name}{}", crate::platform::SHIM_SUFFIX));
+    std::fs::write(&to, b"#!/bin/sh\necho mine\n").unwrap();
+    to
+}
+
+/// A SHIM AN OLDER ATPKG LAID under a name now refused (design S13: `pwsh` joined the list)
+/// never outlives its build's revocation: the tombstone pass, which tombstones only admitted
+/// names, removes it, so a yanked build's `bin/pwsh` stops running it too. The controls: a
+/// refused-name shim into another program's store, and a person's own file, are left.
+#[test]
+fn a_revocation_removes_a_shim_an_older_atpkg_laid_under_a_now_refused_name() {
+    let dir = scratch("refused-tomb");
+    let layout = layout(&dir);
+    seed_build(&layout, "ay", 17, true);
+    seed_build(&layout, "ny", 3, true);
+    let pwsh = lay_as_older_atpkg(&layout, &shim_of(&layout, "ay"), "pwsh");
+    let fish = lay_as_older_atpkg(&layout, &shim_of(&layout, "ny"), "fish");
+    let csh = persons_own(&layout, "csh");
+    assert!(
+        crate::platform::resolve_shim(&pwsh).is_some(),
+        "a live shim"
+    );
+    let fake = rollback_index(0, &["ay@18"]);
+    let req = InstallRequest {
+        channel: "stable",
+        program: "ay",
+        triple: TRIPLE,
+        installed: Some(17),
+    };
+    let err = install(&fake, &layout, &anchor(), &req, fl(0), 0).unwrap_err();
+    assert!(
+        matches!(err, FlowError::Tombstoned(ref p) if p == "ay"),
+        "{err:?}"
+    );
+    assert!(
+        crate::platform::resolve_shim(&shim_of(&layout, "ay")).is_none(),
+        "bin/ay is a tombstone"
+    );
+    assert!(
+        std::fs::symlink_metadata(&pwsh).is_err(),
+        "the revoked build's refused-name shim is gone"
+    );
+    assert!(
+        crate::platform::resolve_shim(&fish).is_some(),
+        "another program's is not this revocation's"
+    );
+    assert_eq!(
+        std::fs::read(&csh).unwrap(),
+        b"#!/bin/sh\necho mine\n",
+        "a person's own file is left"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// An upgrade's prune removes a shim an older atpkg laid under a name now refused into the
+/// program's store at another build (design S13), which the prune used to skip, so it kept
+/// the old build looking active and running. The controls: one into another program's
+/// store and a person's own file are left.
+#[test]
+fn an_upgrade_prunes_a_shim_an_older_atpkg_laid_under_a_now_refused_name() {
+    let dir = scratch("refused-prune");
+    let layout = layout(&dir);
+    seed_build(&layout, "ay", 17, true);
+    seed_build(&layout, "ny", 3, true);
+    let pwsh = lay_as_older_atpkg(&layout, &shim_of(&layout, "ay"), "pwsh");
+    let fish = lay_as_older_atpkg(&layout, &shim_of(&layout, "ny"), "fish");
+    let csh = persons_own(&layout, "csh");
+    let fake = fixture(&dir);
+    let req = InstallRequest {
+        channel: "stable",
+        program: "ay",
+        triple: TRIPLE,
+        installed: Some(17),
+    };
+    let report = install(&fake, &layout, &anchor(), &req, fl(0), 0).unwrap();
+    assert_eq!(report.build, 18);
+    assert!(
+        std::fs::symlink_metadata(&pwsh).is_err(),
+        "the old build's refused-name shim is pruned"
+    );
+    assert!(crate::platform::resolve_shim(&fish).is_some());
+    assert!(csh.is_file());
     let _ = std::fs::remove_dir_all(&dir);
 }
 

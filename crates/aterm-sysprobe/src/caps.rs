@@ -93,6 +93,7 @@ pub enum CapSource {
 
 impl CapSource {
     /// The wire word: `host`, `cgroup_limit`.
+    #[inline]
     #[must_use]
     pub const fn word(self) -> &'static str {
         match self {
@@ -175,6 +176,7 @@ impl Caps {
 
     /// Every row unavailable as [`Why::Unsupported`]: a platform with no
     /// readers here.
+    #[inline]
     #[must_use]
     pub const fn unsupported(os: &'static str) -> Self {
         let no = Cap::No(Why::Unsupported);
@@ -202,8 +204,9 @@ impl Caps {
 /// The GPU row from a reading ([`crate::gpu`]): `yes` when a device answered
 /// with its use or is known idle because it sleeps, else why not; no device
 /// at all is [`Why::Absent`].
+#[inline]
 #[must_use]
-pub fn gpu_cap(reading: Option<&crate::GpuReading>) -> Cap {
+pub const fn gpu_cap(reading: Option<&crate::GpuReading>) -> Cap {
     match reading {
         None => Cap::No(Why::Absent),
         Some(g) if g.device_pct.is_some() => Cap::Yes,

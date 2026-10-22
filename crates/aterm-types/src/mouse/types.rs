@@ -69,8 +69,9 @@ impl MouseButton {
     /// The xterm button code for the report's `Cb` byte: 0..=2 for buttons 1-3, and
     /// `128 + (button - 8)` for the thumb buttons 8 and 9 (the second extension block, above
     /// the wheel's 64..=67). Not 3 and 4: `Cb` 3 is the legacy release code.
+    #[inline]
     #[must_use]
-    pub fn code(self) -> u8 {
+    pub const fn code(self) -> u8 {
         match self {
             MouseButton::Left => 0,
             MouseButton::Middle => 1,
@@ -82,8 +83,9 @@ impl MouseButton {
 
     /// A dense 0-based index for per-button bookkeeping (bitsets, arrays). Not the wire code:
     /// `1 << (code & 7)` folds Back (128) onto Left's bit and Forward onto Middle's.
+    #[inline]
     #[must_use]
-    pub fn slot(self) -> u8 {
+    pub const fn slot(self) -> u8 {
         match self {
             MouseButton::Left => 0,
             MouseButton::Middle => 1,
@@ -115,8 +117,9 @@ impl WheelDir {
     /// The xterm wheel button code for the report's `Cb` byte: 64/65 for buttons 4/5
     /// (ctlseqs), and 66/67 for the horizontal pair, buttons 6/7, as Neovim, tmux and less
     /// read them.
+    #[inline]
     #[must_use]
-    pub fn code(self) -> u8 {
+    pub const fn code(self) -> u8 {
         match self {
             WheelDir::Up => 64,
             WheelDir::Down => 65,
@@ -129,8 +132,9 @@ impl WheelDir {
     /// for the horizontal axis. An `Option`, not a bool, so every vertical viewport
     /// (scrollback, the palette list, a native view) handles a horizontal flick explicitly,
     /// by doing nothing, rather than scrolling down.
+    #[inline]
     #[must_use]
-    pub fn vertical_up(self) -> Option<bool> {
+    pub const fn vertical_up(self) -> Option<bool> {
         match self {
             WheelDir::Up => Some(true),
             WheelDir::Down => Some(false),
@@ -139,8 +143,9 @@ impl WheelDir {
     }
 
     /// Whether this is the horizontal (tilt-wheel / two-finger-swipe) axis.
+    #[inline]
     #[must_use]
-    pub fn is_horizontal(self) -> bool {
+    pub const fn is_horizontal(self) -> bool {
         self.vertical_up().is_none()
     }
 }

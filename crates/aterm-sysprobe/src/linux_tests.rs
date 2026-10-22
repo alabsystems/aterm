@@ -524,9 +524,10 @@ fn the_throttle_reader_sees_zones_and_a_rise_in_the_counters() {
 /// A suspended card is asleep and its busy file is not believed, and it
 /// stands for the GPU only when every card sleeps: beside an awake iGPU
 /// nobody can read, the GPU is unknown, never 0 %. i915 needs
-/// `CAP_PERFMON`, NVIDIA's driver NVML, and a virtual GPU has no figure. A
-/// firmware framebuffer, a connector and a render node are no GPU.
-/// NEGATIVE CONTROL: no card at all is `None`.
+/// `CAP_PERFMON`, a fixture root's NVIDIA card is never read (its NVML arm
+/// is inert), and a virtual GPU has no figure. A firmware framebuffer, a
+/// connector and a render node are no GPU. NEGATIVE CONTROL: no card at
+/// all is `None`.
 #[test]
 fn the_gpu_reads_drm_sysfs_without_waking_a_sleeping_card() {
     let root = tree(&[
@@ -647,10 +648,184 @@ fn the_gpu_reads_drm_sysfs_without_waking_a_sleeping_card() {
     assert_eq!(only("virtio_gpu"), Some(Why::Unsupported));
     assert_eq!(only("amdgpu"), Some(Why::NotRead), "no PM files: not read");
     assert_eq!(only("simpledrm"), None, "a firmware framebuffer is no GPU");
+    assert_eq!(
+        only("simple-framebuffer"),
+        None,
+        "simpledrm, by its platform driver's name"
+    );
     let fb = tree(&[("sys/class/drm/card0/device/uevent", "DRIVER=simpledrm\n")]);
     assert_eq!(Root::new(fb.path()).gpu(), None);
     assert_eq!(Root::new(tree(&[]).path()).gpu(), None);
     assert_eq!(crate::caps::gpu_cap(None), Cap::No(Why::Absent));
+}
+
+/// An NVIDIA card as this desk's DGX Spark shows it (GB10, driver 580): the
+/// proprietary driver's DRM device, its PCI slot, runtime PM `auto` on the
+/// boot display. `card0` is the firmware framebuffer the board boots on.
+fn nvidia_card(control: &str, boot_vga: &str) -> aterm_tempfile::TempDir {
+    tree(&[
+        (
+            "sys/class/drm/card0/device/uevent",
+            "DRIVER=simple-framebuffer\nMODALIAS=platform:simple-framebuffer\n",
+        ),
+        (
+            "sys/class/drm/card1/device/uevent",
+            "DRIVER=nvidia\nPCI_CLASS=30000\nPCI_ID=10DE:2E12\n\
+             PCI_SUBSYS_ID=10DE:0000\nPCI_SLOT_NAME=000f:01:00.0\n",
+        ),
+        (
+            "sys/class/drm/card1/device/power/runtime_status",
+            "active\n",
+        ),
+        ("sys/class/drm/card1/device/power/control", control),
+        ("sys/class/drm/card1/device/boot_vga", boot_vga),
+    ])
+}
+
+/// An NVIDIA arm that answers 42 % for the fixture's slot.
+fn nvml_42(slot: &str) -> Result<u8, Why> {
+    assert_eq!(slot, "000f:01:00.0", "the card's PCI_SLOT_NAME");
+    Ok(42)
+}
+
+/// An NVIDIA arm that must not be asked: asking would wake a sleeping card.
+fn nvml_never(slot: &str) -> Result<u8, Why> {
+    panic!("NVML asked for {slot}, a card whose runtime PM a read could move");
+}
+
+/// A fixture NVIDIA card reads through its root's injected arm, by its PCI
+/// slot name, with the amdgpu card's power rule: only where the read
+/// cannot move runtime PM (the boot display, PM forbidden `on`, or PM
+/// `unsupported`). Each NVML failure is the arm's `Why`, never a 0 %, and
+/// a figure past 100 is 100. A hybrid laptop's NVIDIA dGPU (`auto`, not the
+/// boot display) and a suspended one never reach the arm (`nvml_never`
+/// panics), and a card without a PCI slot is not read. NEGATIVE CONTROL: a
+/// fixture root without an arm never reads one, even on this desk's own
+/// slot, where the real NVML would answer.
+#[test]
+fn an_nvidia_card_reads_through_the_roots_nvml_arm() {
+    let gpu = |root: &aterm_tempfile::TempDir, arm: linux::NvidiaBusy| {
+        let g = Root::new(root.path())
+            .with_nvidia(arm)
+            .gpu()
+            .expect("a GPU");
+        (g.device_pct, g.name, g.unread)
+    };
+    let nvidia = |pct, unread| (pct, Some("nvidia".to_owned()), unread);
+    let spark = nvidia_card("auto\n", "1\n");
+    assert_eq!(gpu(&spark, nvml_42), nvidia(Some(42), None));
+    let g = Root::new(spark.path())
+        .with_nvidia(nvml_42)
+        .gpu()
+        .expect("a GPU");
+    assert_eq!(crate::caps::gpu_cap(Some(&g)), Cap::Yes);
+    assert_eq!(gpu(&spark, |_| Ok(250)), nvidia(Some(100), None));
+    let failures: [(linux::NvidiaBusy, Why); 3] = [
+        (|_| Err(Why::Unsupported), Why::Unsupported),
+        (
+            |_| Err(Why::NeedsPrivilege("nvml")),
+            Why::NeedsPrivilege("nvml"),
+        ),
+        (|_| Err(Why::NotRead), Why::NotRead),
+    ];
+    for (arm, why) in failures {
+        assert_eq!(gpu(&spark, arm), nvidia(None, Some(why)));
+        let g = Root::new(spark.path())
+            .with_nvidia(arm)
+            .gpu()
+            .expect("a GPU");
+        assert_eq!(crate::caps::gpu_cap(Some(&g)), Cap::No(why));
+    }
+
+    // A hybrid laptop's dGPU under runtime PM is never asked; where PM
+    // cannot move, it is.
+    let laptop = nvidia_card("auto\n", "0\n");
+    assert_eq!(gpu(&laptop, nvml_never), nvidia(None, Some(Why::NotRead)));
+    write(
+        laptop.path(),
+        "sys/class/drm/card1/device/power/control",
+        "on\n",
+    );
+    assert_eq!(gpu(&laptop, nvml_42), nvidia(Some(42), None));
+    write(
+        laptop.path(),
+        "sys/class/drm/card1/device/power/control",
+        "auto\n",
+    );
+    write(
+        laptop.path(),
+        "sys/class/drm/card1/device/power/runtime_status",
+        "unsupported\n",
+    );
+    assert_eq!(gpu(&laptop, nvml_42), nvidia(Some(42), None));
+    // Suspended, even on the boot display: asleep, and not asked.
+    for (file, text) in [
+        ("power/runtime_status", "suspended\n"),
+        ("boot_vga", "1\n"),
+        ("power/control", "on\n"),
+    ] {
+        write(
+            laptop.path(),
+            &format!("sys/class/drm/card1/device/{file}"),
+            text,
+        );
+        assert_eq!(
+            gpu(&laptop, nvml_never),
+            nvidia(None, Some(Why::Asleep)),
+            "{file} {text:?}"
+        );
+    }
+
+    // The laptop's awake iGPU beside its NVIDIA dGPU under runtime PM: the
+    // dGPU is not asked, and the iGPU says why it cannot answer.
+    let hybrid = nvidia_card("auto\n", "0\n");
+    write(
+        hybrid.path(),
+        "sys/class/drm/card0/device/uevent",
+        "DRIVER=i915\n",
+    );
+    write(
+        hybrid.path(),
+        "sys/class/drm/card0/device/power/runtime_status",
+        "active\n",
+    );
+    write(hybrid.path(), "sys/class/drm/card0/device/boot_vga", "1\n");
+    assert_eq!(
+        gpu(&hybrid, nvml_never),
+        (
+            None,
+            Some("i915".to_owned()),
+            Some(Why::NeedsPrivilege("cap_perfmon"))
+        )
+    );
+    // With its PM forbidden, the dGPU answers and is picked over the iGPU.
+    write(
+        hybrid.path(),
+        "sys/class/drm/card1/device/power/control",
+        "on\n",
+    );
+    assert_eq!(gpu(&hybrid, nvml_42), nvidia(Some(42), None));
+
+    // A card without a PCI slot (a platform device) is not read.
+    let platform = tree(&[
+        ("sys/class/drm/card0/device/uevent", "DRIVER=nvidia\n"),
+        (
+            "sys/class/drm/card0/device/power/runtime_status",
+            "active\n",
+        ),
+        ("sys/class/drm/card0/device/power/control", "on\n"),
+    ]);
+    assert_eq!(gpu(&platform, nvml_never), nvidia(None, Some(Why::NotRead)));
+
+    // A fixture root's own arm is inert: this desk's slot, settled, reads
+    // nothing, though the system root's NVML would answer for it.
+    let g = Root::new(spark.path()).gpu().expect("a GPU");
+    assert_eq!(
+        (g.device_pct, g.unread),
+        (None, Some(Why::NotRead)),
+        "a fixture root never reaches NVML"
+    );
+    assert_eq!(linux::no_nvml("000f:01:00.0"), Err(Why::NotRead));
 }
 
 /// `status`'s anonymous memory, resident and swapped. NEGATIVE CONTROL: a

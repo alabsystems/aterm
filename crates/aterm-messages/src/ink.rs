@@ -354,6 +354,7 @@ fn lightness_floor(c: [u8; 3], bg: [u8; 3], target: f64, up: bool) -> [u8; 3] {
 impl BandInks {
     /// The palette's ink for one of the painter's word-ink slots: each maps
     /// 1:1 onto a [`BandInks`] ink.
+    #[inline]
     #[must_use]
     pub(crate) const fn slot(&self, ink: Ink) -> [u8; 3] {
         match ink {
@@ -563,6 +564,7 @@ pub const HOVER_RISE: f64 = 1.5;
 /// ties (the closest, `#cf0dcc`, differs by 2.4e-7); a tie would be dark, the
 /// side [`ensure_contrast`] picks on one. The one dark/light classifier for
 /// all chrome, the renderer's polarity, and theme admission.
+#[inline]
 #[must_use]
 pub fn bg_is_light(bg: [u8; 3]) -> bool {
     contrast(BLACK, bg) > contrast(WHITE, bg)
@@ -571,6 +573,7 @@ pub fn bg_is_light(bg: [u8; 3]) -> bool {
 /// Linear blend of two RGB triples: `a` toward `b` by `t` ∈ \[0,1\], the one
 /// blend every chrome surface derives its tones with, so no two surfaces
 /// drift apart by a rounding step.
+#[inline]
 #[must_use]
 #[allow(
     clippy::cast_possible_truncation,
@@ -590,6 +593,7 @@ pub fn mix3(a: [u8; 3], b: [u8; 3], t: f32) -> [u8; 3] {
 /// Public because [`ensure_contrast`] is a one-way ratchet (it can only push ink away
 /// from its surface) and the tab strip needs to know when it has overshot (a dimmed
 /// label the floor dragged past full strength is no longer a dim).
+#[inline]
 #[must_use]
 pub fn contrast(a: [u8; 3], b: [u8; 3]) -> f64 {
     let lum1 = rgb_luminance(a).clamp(0.0, 1.0);
@@ -606,7 +610,9 @@ pub fn contrast(a: [u8; 3], b: [u8; 3]) -> f64 {
 
 /// `aterm_types::Rgb`'s relative luminance per WCAG 2.0: unfused (see
 /// [`contrast`]).
+#[inline]
 fn rgb_luminance(c: [u8; 3]) -> f64 {
+    #[inline]
     fn linearize(c: u8) -> f64 {
         let c = f64::from(c) / 255.0;
         let l = if c <= 0.04045 {
@@ -686,6 +692,7 @@ pub fn ensure_contrast(c: [u8; 3], bg: [u8; 3], target: f64) -> [u8; 3] {
 
 /// Floor one OS-forced ink against the OS-forced surface it lands on, at 3:1.
 /// See `FORCED_INK_FLOOR` for why a palette the OS chose is floored at all.
+#[inline]
 #[must_use]
 pub fn forced_ink(ink: [u8; 3], on: [u8; 3]) -> [u8; 3] {
     ensure_contrast(ink, on, FORCED_INK_FLOOR)
@@ -734,6 +741,7 @@ pub fn warn_mark(ground: [u8; 3]) -> [u8; 3] {
 
 /// The ink on a hovered chip's `fill` ([`BandInks::capsule_hover`]): `value`,
 /// lifted toward its own end until it clears AA on the risen fill.
+#[inline]
 #[must_use]
 pub fn hover_ink(value: [u8; 3], fill: [u8; 3]) -> [u8; 3] {
     ensure_contrast(value, fill, 4.5)
@@ -879,8 +887,13 @@ pub(crate) fn floor_word(ink: [u8; 3], under: [u8; 3], near: [u8; 3]) -> [u8; 3]
 }
 
 /// The other end of the scale from `anchor`.
-fn opposite(anchor: [u8; 3]) -> [u8; 3] {
-    if anchor == BLACK { WHITE } else { BLACK }
+#[inline]
+const fn opposite(anchor: [u8; 3]) -> [u8; 3] {
+    if anchor[0] == BLACK[0] && anchor[1] == BLACK[1] && anchor[2] == BLACK[2] {
+        WHITE
+    } else {
+        BLACK
+    }
 }
 
 /// How far a busy row's comet may move off its track: every tone it draws
@@ -988,6 +1001,7 @@ pub(crate) fn hold_side(bg: [u8; 3], track: [u8; 3], anchor: [u8; 3], target: f6
 }
 
 /// `a` toward `b` by `t`/255 — integer, so every target mixes the same byte.
+#[inline]
 pub(crate) fn mix_u8(a: [u8; 3], b: [u8; 3], t: u8) -> [u8; 3] {
     let t = u32::from(t);
     let mix = |x: u8, y: u8| {

@@ -69,6 +69,7 @@ bitflags! {
 /// Lossless conversion to `keyboard::Modifiers`: both use the Kitty bit layout
 /// (Shift=1, Alt=2, Ctrl=4, Super=8).
 impl From<KeyModifiers> for crate::keyboard::Modifiers {
+    #[inline]
     fn from(m: KeyModifiers) -> Self {
         // Identical bit layouts, pinned by `bit_layout_matches_keyboard_modifiers`.
         crate::keyboard::Modifiers::from_bits_truncate(m.bits())
@@ -77,6 +78,7 @@ impl From<KeyModifiers> for crate::keyboard::Modifiers {
 
 /// Lossless conversion from `keyboard::Modifiers` to `input::KeyModifiers`.
 impl From<crate::keyboard::Modifiers> for KeyModifiers {
+    #[inline]
     fn from(m: crate::keyboard::Modifiers) -> Self {
         KeyModifiers::from_bits_truncate(m.bits())
     }
@@ -116,6 +118,7 @@ impl std::error::Error for KeyConversionError {}
 impl TryFrom<KeyCode> for crate::keyboard::Key {
     type Error = KeyConversionError;
 
+    #[inline]
     fn try_from(kc: KeyCode) -> Result<Self, Self::Error> {
         use crate::keyboard::{Key, NamedKey};
         Ok(match kc {
@@ -178,6 +181,7 @@ impl TryFrom<KeyCode> for crate::keyboard::Key {
 impl TryFrom<crate::keyboard::Key> for KeyCode {
     type Error = KeyConversionError;
 
+    #[inline]
     fn try_from(key: crate::keyboard::Key) -> Result<Self, Self::Error> {
         use crate::keyboard::{Key, NamedKey};
         match key {

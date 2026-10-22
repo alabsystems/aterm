@@ -27,6 +27,7 @@ use crate::gsub::{
 
 /// Applies the first of the lookup's subtables that applies at the current
 /// glyph.
+#[inline]
 pub(crate) fn apply_lookup(ctx: &mut ApplyContext, lookup: &SubstLookup) -> Option<()> {
     if !lookup.digest.may_have_glyph(ctx.buffer.cur(0).as_glyph()) {
         return None;
@@ -39,6 +40,7 @@ pub(crate) fn apply_lookup(ctx: &mut ApplyContext, lookup: &SubstLookup) -> Opti
     None
 }
 
+#[inline]
 fn apply_subtable(ctx: &mut ApplyContext, subtable: &SubstitutionSubtable) -> Option<()> {
     match subtable {
         SubstitutionSubtable::Single(t) => apply_single(ctx, t),
@@ -51,6 +53,7 @@ fn apply_subtable(ctx: &mut ApplyContext, subtable: &SubstitutionSubtable) -> Op
     }
 }
 
+#[inline]
 fn apply_single(ctx: &mut ApplyContext, table: &SingleSubstitution) -> Option<()> {
     let glyph = ctx.buffer.cur(0).as_glyph();
     let subst = match *table {

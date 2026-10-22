@@ -14,17 +14,20 @@ pub(super) struct Buf<'a> {
 }
 
 impl<'a> Buf<'a> {
-    pub fn new(bytes: &'a mut [u8]) -> Self {
+    #[inline]
+    pub const fn new(bytes: &'a mut [u8]) -> Self {
         Buf { bytes, offset: 0 }
     }
 
-    pub fn as_str(&self) -> &str {
-        let slice = &self.bytes[..self.offset];
+    #[inline]
+    pub const fn as_str(&self) -> &str {
+        let slice = self.bytes.split_at(self.offset).0;
         unsafe { str::from_utf8_unchecked(slice) }
     }
 }
 
 impl<'a> Write for Buf<'a> {
+    #[inline]
     fn write_str(&mut self, s: &str) -> fmt::Result {
         if self.offset + s.len() > self.bytes.len() {
             Err(fmt::Error)

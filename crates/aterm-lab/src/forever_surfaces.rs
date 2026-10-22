@@ -7,9 +7,10 @@
 //! wants each scenario holds it to beside its records ([`super::judge`]).
 //!
 //! The run lays its windows out before the chains' tabs ([`lay_windows`]): a
-//! window of its own for Settings ▸ Harness (`invoke NewWindow`, then `open
-//! app settings /harness` there; `inspect app/v1 tabs` names the page's view),
-//! then the chains' own (`invoke NewWindow` again), where every tab spawns,
+//! window of its own for Settings ▸ Harness (`invoke NewWindow`, the window
+//! waited for in `inspect app/v1 tabs`, then `open app settings /harness`
+//! there; the same list names the page's view), then the chains' own
+//! (`invoke NewWindow` again, waited for), where every tab spawns,
 //! `cruise-n` first (the page lists its rows on its first screen). A headless
 //! instance's frontmost window is the newest, so the chains' window is the one
 //! `person look` and the `toolbar-tabs` line read. Once every tab is open, one
@@ -683,15 +684,23 @@ pub fn page_rows(text: &str) -> Vec<(String, String)> {
 }
 
 /// The page's rows of the session labelled `tab`: `head=<its row>`, then its
-/// `state=` and `today=` rows where the page prints them.
+/// `state=` and `today=` rows where the page prints them. `None` where the
+/// row is not on the page's screen, and where only its top is: the text
+/// lists only what the page's screen shows, so a row whose head is drawn
+/// with no state row and nothing of the page after its own rows is cut off
+/// by the screen's bottom edge, and its state line is unread, never absent
+/// (r5's Gemini CLI L2: `land-b`'s head at the edge once the rows above it
+/// grew, `land-c` below it off the screen).
 #[must_use]
 pub fn page_of(rows: &[(String, String)], tab: &str) -> Option<String> {
     let head = format!("{tab}: ");
-    let (key, label) = rows.iter().find(|(k, l)| {
+    let at = rows.iter().position(|(k, l)| {
         k.strip_prefix("harness/session/")
             .is_some_and(|id| !id.is_empty() && id.bytes().all(|b| b.is_ascii_digit()))
             && l.starts_with(&head)
     })?;
+    let (key, label) = &rows[at];
+    let own = format!("{key}/");
     let mut out = vec![format!("head={label}")];
     for field in ["state", "today"] {
         let k = format!("{key}/{field}");
@@ -699,7 +708,11 @@ pub fn page_of(rows: &[(String, String)], tab: &str) -> Option<String> {
             out.push(format!("{field}={l}"));
         }
     }
-    Some(out.join("\n"))
+    let stated = out.len() > 1 && out[1].starts_with("state=");
+    let more_below = rows[at + 1..]
+        .iter()
+        .any(|(k, _)| k.starts_with("harness/") && !k.starts_with(&own));
+    (stated || more_below).then(|| out.join("\n"))
 }
 
 /// The page's today line (STATUS, §10.3.1; 4c puts landings first): its
@@ -2476,14 +2489,40 @@ fn windows_of(tabs: &str) -> (Vec<String>, Option<(String, String)>) {
     (windows, page)
 }
 
+/// The window an `invoke NewWindow` made: the first window of `inspect
+/// app/v1 tabs` (each `tabs()` read) that `before` does not hold, read again
+/// until one shows, for `within` at most. `invoke NewWindow` answers once the
+/// window's first shell is asked for; the shell spawns off the event loop and
+/// the window is made when it lands (aterm-gui's `MenuAction::NewWindow`), so
+/// a read right after the answer can come before the window does (on a loaded
+/// machine, `lab forever` on Gemini CLI, 2026-10-21: `no new window`). A wait
+/// for something that must happen: [`STEP_WAIT`] is its hang detector.
+fn new_window(
+    before: &[String],
+    within: Duration,
+    mut tabs: impl FnMut() -> String,
+) -> Option<String> {
+    let mut made = None;
+    let shown = wait_until(within, || {
+        made = windows_of(&tabs())
+            .0
+            .into_iter()
+            .find(|w| !before.contains(w));
+        made.is_some()
+    });
+    made.filter(|_| shown)
+}
+
 /// THE WINDOWS, LAID OUT BEFORE THE CHAINS' TABS: the Settings window
-/// (`invoke NewWindow`, `open app settings /harness` there, its view read off
-/// `inspect app/v1 tabs`), then the chains' own (`invoke NewWindow`), the
-/// newest, so a headless instance's frontmost: where every flagless `spawn`
-/// opens its tab.
+/// (`invoke NewWindow`, waited for in `inspect app/v1 tabs` ([`new_window`]),
+/// `open app settings /harness` there, its view read off `inspect app/v1
+/// tabs`), then the chains' own (`invoke NewWindow`, waited for), the newest,
+/// so a headless instance's frontmost: where every flagless `spawn` opens its
+/// tab.
 ///
 /// # Errors
-/// A step the instance refused, named.
+/// A step the instance refused, or a window it never made within
+/// [`STEP_WAIT`], named.
 pub fn lay_windows(door: &Door<'_>) -> Result<Desk, String> {
     let step = |args: &[&str]| -> Result<String, String> {
         let r = door.ctl(args)?;
@@ -2497,17 +2536,26 @@ pub fn lay_windows(door: &Door<'_>) -> Result<Desk, String> {
         }
         Ok(r.stdout)
     };
+    let tabs = || door.out(&["inspect", "app/v1", "tabs"]);
+    let (open, _) = windows_of(&tabs());
     step(&["invoke", "NewWindow"])?;
+    new_window(&open, STEP_WAIT, tabs).ok_or_else(|| {
+        format!(
+            "the Settings window: no new window in `inspect app/v1 tabs` within {} s",
+            STEP_WAIT.as_secs()
+        )
+    })?;
     step(&["open", "app", "settings", "/harness"])?;
-    let (before, page) = windows_of(&door.out(&["inspect", "app/v1", "tabs"]));
+    let (before, page) = windows_of(&tabs());
     let (page_window, page_view) =
         page.ok_or_else(|| "no Settings view in `inspect app/v1 tabs`".to_string())?;
     step(&["invoke", "NewWindow"])?;
-    let (after, _) = windows_of(&door.out(&["inspect", "app/v1", "tabs"]));
-    let chains_window = after
-        .into_iter()
-        .find(|w| !before.contains(w))
-        .ok_or_else(|| "the chains' window: no new window in `inspect app/v1 tabs`".to_string())?;
+    let chains_window = new_window(&before, STEP_WAIT, tabs).ok_or_else(|| {
+        format!(
+            "the chains' window: no new window in `inspect app/v1 tabs` within {} s",
+            STEP_WAIT.as_secs()
+        )
+    })?;
     Ok(Desk {
         page_window,
         page_view,

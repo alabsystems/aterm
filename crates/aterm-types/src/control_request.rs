@@ -27,6 +27,7 @@ pub struct Sid<'a>(&'a str);
 
 impl<'a> Sid<'a> {
     /// `s` as a session id, or `None` when it is not one.
+    #[inline]
     #[must_use]
     pub fn parse(s: &'a str) -> Option<Self> {
         let hex = s.strip_prefix("s-")?;
@@ -35,8 +36,9 @@ impl<'a> Sid<'a> {
     }
 
     /// The id as the wire and the rendezvous directory spell it.
+    #[inline]
     #[must_use]
-    pub fn as_str(&self) -> &'a str {
+    pub const fn as_str(&self) -> &'a str {
         self.0
     }
 }
@@ -59,6 +61,7 @@ pub enum Selector<'a> {
 
 impl<'a> Selector<'a> {
     /// Classify the body after the leading `@`.
+    #[inline]
     #[must_use]
     pub fn parse(body: &'a str) -> Self {
         if body == "." {
@@ -71,6 +74,7 @@ impl<'a> Selector<'a> {
     }
 
     /// Whether it names the connection's own session.
+    #[inline]
     #[must_use]
     pub const fn is_self(&self) -> bool {
         matches!(self, Self::SelfTok)
@@ -101,12 +105,14 @@ pub struct Spans {
 }
 
 /// Whether `b` separates words.
+#[inline]
 const fn is_separator(b: u8) -> bool {
     b == b' ' || b == b'\t'
 }
 
 /// The first index from `at` (below `end`) that is not a separator, or `end`.
-fn skip_separators(bytes: &[u8], mut at: usize, end: usize) -> usize {
+#[inline]
+const fn skip_separators(bytes: &[u8], mut at: usize, end: usize) -> usize {
     while at < end && is_separator(bytes[at]) {
         at += 1;
     }
@@ -114,7 +120,8 @@ fn skip_separators(bytes: &[u8], mut at: usize, end: usize) -> usize {
 }
 
 /// The first index from `at` (below `end`) that is a separator, or `end`.
-fn word_end(bytes: &[u8], mut at: usize, end: usize) -> usize {
+#[inline]
+const fn word_end(bytes: &[u8], mut at: usize, end: usize) -> usize {
     while at < end && !is_separator(bytes[at]) {
         at += 1;
     }
@@ -123,6 +130,7 @@ fn word_end(bytes: &[u8], mut at: usize, end: usize) -> usize {
 
 impl Spans {
     /// Read `line` by the grammar (see the module doc).
+    #[inline]
     #[must_use]
     pub fn of(line: &str) -> Self {
         let bytes = line.as_bytes();
@@ -147,6 +155,7 @@ impl Spans {
     }
 
     /// The [`Head`] these spans mark in `line`, the line they were read from.
+    #[inline]
     #[must_use]
     pub fn head<'a>(&self, line: &'a str) -> Head<'a> {
         Head {
@@ -161,6 +170,7 @@ impl Spans {
 }
 
 /// Read a request line: its selector, verb and rest (see the module doc).
+#[inline]
 #[must_use]
 pub fn head(line: &str) -> Head<'_> {
     Spans::of(line).head(line)
@@ -169,6 +179,7 @@ pub fn head(line: &str) -> Head<'_> {
 /// The words of `text` (a verb's rest) by the same separators, SP and HT, with
 /// none empty: how a verb whose rest is words reads them, so it splits them
 /// where every other stage does.
+#[inline]
 pub fn words(text: &str) -> impl Iterator<Item = &str> {
     text.split([' ', '\t']).filter(|word| !word.is_empty())
 }
@@ -178,6 +189,7 @@ pub fn words(text: &str) -> impl Iterator<Item = &str> {
 /// `Some` only when the first word is a single `@<sid>`. Self (`@`, `@.`), a
 /// local number, a list, `@*` (the instance's live target set) or no selector
 /// is `None`: only one stable id can live on another instance.
+#[inline]
 #[must_use]
 pub fn subscribe_target(rest: &str) -> Option<(Sid<'_>, &str)> {
     let bytes = rest.as_bytes();

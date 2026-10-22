@@ -30,6 +30,7 @@ pub enum Value {
 
 impl Value {
     /// The string, if this is one.
+    #[inline]
     #[must_use]
     pub fn as_str(&self) -> Option<&str> {
         match self {
@@ -39,14 +40,16 @@ impl Value {
     }
 
     /// Is this a string?
+    #[inline]
     #[must_use]
-    pub fn is_str(&self) -> bool {
+    pub const fn is_str(&self) -> bool {
         matches!(self, Value::String(_))
     }
 
     /// The integer, if this is one.
+    #[inline]
     #[must_use]
-    pub fn as_integer(&self) -> Option<i64> {
+    pub const fn as_integer(&self) -> Option<i64> {
         match self {
             Value::Integer(v) => Some(*v.value()),
             _ => None,
@@ -54,14 +57,16 @@ impl Value {
     }
 
     /// Is this an integer?
+    #[inline]
     #[must_use]
-    pub fn is_integer(&self) -> bool {
+    pub const fn is_integer(&self) -> bool {
         matches!(self, Value::Integer(_))
     }
 
     /// The float, if this is one.
+    #[inline]
     #[must_use]
-    pub fn as_float(&self) -> Option<f64> {
+    pub const fn as_float(&self) -> Option<f64> {
         match self {
             Value::Float(v) => Some(*v.value()),
             _ => None,
@@ -69,14 +74,16 @@ impl Value {
     }
 
     /// Is this a float?
+    #[inline]
     #[must_use]
-    pub fn is_float(&self) -> bool {
+    pub const fn is_float(&self) -> bool {
         matches!(self, Value::Float(_))
     }
 
     /// The boolean, if this is one.
+    #[inline]
     #[must_use]
-    pub fn as_bool(&self) -> Option<bool> {
+    pub const fn as_bool(&self) -> Option<bool> {
         match self {
             Value::Boolean(v) => Some(*v.value()),
             _ => None,
@@ -84,20 +91,23 @@ impl Value {
     }
 
     /// Is this a boolean?
+    #[inline]
     #[must_use]
-    pub fn is_bool(&self) -> bool {
+    pub const fn is_bool(&self) -> bool {
         matches!(self, Value::Boolean(_))
     }
 
     /// Is this a date-time?
+    #[inline]
     #[must_use]
-    pub fn is_datetime(&self) -> bool {
+    pub const fn is_datetime(&self) -> bool {
         matches!(self, Value::Datetime(_))
     }
 
     /// The array, if this is one.
+    #[inline]
     #[must_use]
-    pub fn as_array(&self) -> Option<&Array> {
+    pub const fn as_array(&self) -> Option<&Array> {
         match self {
             Value::Array(a) => Some(a),
             _ => None,
@@ -105,14 +115,16 @@ impl Value {
     }
 
     /// Is this an array?
+    #[inline]
     #[must_use]
-    pub fn is_array(&self) -> bool {
+    pub const fn is_array(&self) -> bool {
         matches!(self, Value::Array(_))
     }
 
     /// The inline table, if this is one.
+    #[inline]
     #[must_use]
-    pub fn as_inline_table(&self) -> Option<&InlineTable> {
+    pub const fn as_inline_table(&self) -> Option<&InlineTable> {
         match self {
             Value::InlineTable(t) => Some(t),
             _ => None,
@@ -120,8 +132,9 @@ impl Value {
     }
 
     /// Formatting around the value.
+    #[inline]
     #[must_use]
-    pub fn decor(&self) -> &Decor {
+    pub const fn decor(&self) -> &Decor {
         match self {
             Value::String(v) => v.decor(),
             Value::Integer(v) => v.decor(),
@@ -134,7 +147,8 @@ impl Value {
     }
 
     /// Mutable formatting around the value.
-    pub fn decor_mut(&mut self) -> &mut Decor {
+    #[inline]
+    pub const fn decor_mut(&mut self) -> &mut Decor {
         match self {
             Value::String(v) => v.decor_mut(),
             Value::Integer(v) => v.decor_mut(),
@@ -147,6 +161,7 @@ impl Value {
     }
 
     /// Byte range of the value token in the source, when it was parsed.
+    #[inline]
     #[must_use]
     pub fn span(&self) -> Option<Range<usize>> {
         match self {
@@ -161,8 +176,9 @@ impl Value {
     }
 
     /// A human-facing name for this value's kind, for error messages.
+    #[inline]
     #[must_use]
-    pub fn type_name(&self) -> &'static str {
+    pub const fn type_name(&self) -> &'static str {
         match self {
             Value::String(_) => "string",
             Value::Integer(_) => "integer",
@@ -239,40 +255,47 @@ pub struct Array {
 
 impl Array {
     /// An empty array.
+    #[inline]
     #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
     /// Number of elements.
+    #[inline]
     #[must_use]
-    pub fn len(&self) -> usize {
+    pub const fn len(&self) -> usize {
         self.values.len()
     }
 
     /// Are there no elements?
+    #[inline]
     #[must_use]
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.values.is_empty()
     }
 
     /// Elements in order.
+    #[inline]
     pub fn iter(&self) -> impl Iterator<Item = &Value> {
         self.values.iter()
     }
 
     /// The element at `index`.
+    #[inline]
     #[must_use]
     pub fn get(&self, index: usize) -> Option<&Value> {
         self.values.get(index)
     }
 
     /// Append an element.
+    #[inline]
     pub fn push(&mut self, value: impl Into<Value>) {
         self.values.push(value.into());
     }
 
     /// Byte range of `[` through `]` in the source, when it was parsed.
+    #[inline]
     #[must_use]
     pub fn span(&self) -> Option<Range<usize>> {
         self.span.clone()
@@ -311,24 +334,28 @@ pub struct InlineTable {
 
 impl InlineTable {
     /// An empty inline table.
+    #[inline]
     #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
     /// Number of direct entries.
+    #[inline]
     #[must_use]
-    pub fn len(&self) -> usize {
+    pub const fn len(&self) -> usize {
         self.items.len()
     }
 
     /// Has this table no direct entries?
+    #[inline]
     #[must_use]
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.items.len() == 0
     }
 
     /// The entry for `key`.
+    #[inline]
     #[must_use]
     pub fn get(&self, key: &str) -> Option<&Value> {
         self.items.get(key)?.as_value()

@@ -106,18 +106,21 @@ impl fmt::Display for RleCapacityError {
 impl<T> Run<T> {
     /// Construct a run of `length` consecutive cells with attribute `value`.
     #[must_use]
+    #[inline]
     pub const fn new(value: T, length: u32) -> Self {
         Self { value, length }
     }
 
     /// Return `true` iff this run has zero length.
     #[must_use]
+    #[inline]
     pub const fn is_empty(&self) -> bool {
         self.length == 0
     }
 
     /// Return `true` iff `offset < self.length`.
     #[must_use]
+    #[inline]
     pub const fn contains_offset(&self, offset: u32) -> bool {
         offset < self.length
     }
@@ -126,12 +129,14 @@ impl<T> Run<T> {
 impl RleCapacityError {
     /// Number of elements beyond `available` that were requested (`requested.saturating_sub(available)`).
     #[must_use]
+    #[inline]
     pub const fn overflow_amount(self) -> u32 {
         self.requested.saturating_sub(self.available)
     }
 
     /// Return `true` iff zero capacity remained (`available == 0`).
     #[must_use]
+    #[inline]
     pub const fn is_full(self) -> bool {
         self.available == 0
     }
@@ -139,12 +144,14 @@ impl RleCapacityError {
 
 /// Remaining elements before reaching `u32::MAX` (`u32::MAX - total_length`).
 #[must_use]
+#[inline]
 pub const fn remaining_rle_capacity(total_length: u32) -> u32 {
     u32::MAX - total_length
 }
 
 /// Clamp `count` to the remaining capacity at `total_length`.
 #[must_use]
+#[inline]
 pub const fn clamp_rle_extend_count(total_length: u32, count: u32) -> u32 {
     let avail = u32::MAX - total_length;
     if count > avail { avail } else { count }
@@ -155,6 +162,7 @@ pub const fn clamp_rle_extend_count(total_length: u32, count: u32) -> u32 {
 /// # Errors
 ///
 /// Returns [`RleCapacityError`] if `count > u32::MAX - total_length`.
+#[inline]
 pub const fn checked_rle_extend_total(
     total_length: u32,
     count: u32,
@@ -172,6 +180,7 @@ pub const fn checked_rle_extend_total(
 
 /// Clamp `[start, end)` to `[0, total_length)`, returning `None` when the clamped range is empty.
 #[must_use]
+#[inline]
 pub const fn clamp_rle_range(start: u32, end: u32, total_length: u32) -> Option<(u32, u32)> {
     if start >= end || start >= total_length {
         return None;
@@ -189,6 +198,7 @@ pub const fn clamp_rle_range(start: u32, end: u32, total_length: u32) -> Option<
 ///
 /// Returns `None` if `start_offset >= end_offset_exclusive` or `end_offset_exclusive > run_len`.
 #[must_use]
+#[inline]
 pub const fn single_run_split_lengths(
     run_len: u32,
     start_offset: u32,
@@ -205,6 +215,7 @@ pub const fn single_run_split_lengths(
 
 /// Compute `(prefix_len, 1, suffix_len)` when splitting a run of length `run_len` at `offset_in_run`.
 #[must_use]
+#[inline]
 pub const fn point_split_lengths(run_len: u32, offset_in_run: u32) -> Option<(u32, u32, u32)> {
     if offset_in_run >= run_len {
         return None;
@@ -217,6 +228,7 @@ pub const fn point_split_lengths(run_len: u32, offset_in_run: u32) -> Option<(u3
 /// Compute `(prefix_keep_in_start, suffix_keep_in_end)` when a range spans from `start_offset`
 /// in a run of length `start_run_len` through `end_offset_exclusive` in a run of length `end_run_len`.
 #[must_use]
+#[inline]
 pub const fn multi_run_edge_lengths(
     start_run_len: u32,
     start_offset: u32,
@@ -234,6 +246,7 @@ pub const fn multi_run_edge_lengths(
 
 /// Encode a `(style_id, length)` run pair into an 8-byte little-endian record.
 #[must_use]
+#[inline]
 pub const fn encode_run_pair_le(style_id: u32, length: u32) -> [u8; 8] {
     [
         style_id as u8,
@@ -249,6 +262,7 @@ pub const fn encode_run_pair_le(style_id: u32, length: u32) -> [u8; 8] {
 
 /// Decode an 8-byte little-endian `(style_id, length)` run pair.
 #[must_use]
+#[inline]
 pub const fn decode_run_pair_le(bytes: [u8; 8]) -> (u32, u32) {
     let style_id = (bytes[0] as u32)
         | ((bytes[1] as u32) << 8)
@@ -263,6 +277,7 @@ pub const fn decode_run_pair_le(bytes: [u8; 8]) -> (u32, u32) {
 
 /// Encode a 3-word RLE span record `(start_offset, run_len, style_id)` into 12 little-endian bytes.
 #[must_use]
+#[inline]
 pub const fn encode_rle_span_triple_le(start_offset: u32, run_len: u32, style_id: u32) -> [u8; 12] {
     [
         start_offset as u8,
@@ -282,6 +297,7 @@ pub const fn encode_rle_span_triple_le(start_offset: u32, run_len: u32, style_id
 
 /// Decode 12 little-endian bytes into a 3-word RLE span record `(start_offset, run_len, style_id)`.
 #[must_use]
+#[inline]
 pub const fn decode_rle_span_triple_le(bytes: [u8; 12]) -> (u32, u32, u32) {
     let start_offset = (bytes[0] as u32)
         | ((bytes[1] as u32) << 8)
@@ -301,6 +317,7 @@ pub const fn decode_rle_span_triple_le(bytes: [u8; 12]) -> (u32, u32, u32) {
 impl std::error::Error for RleCapacityError {}
 
 impl<T: Default> Default for Run<T> {
+    #[inline]
     fn default() -> Self {
         Self {
             value: T::default(),
@@ -333,6 +350,7 @@ pub struct Rle<T> {
 }
 
 impl<T: Copy + PartialEq + Default> Default for Rle<T> {
+    #[inline]
     fn default() -> Self {
         Self::new()
     }
@@ -341,7 +359,8 @@ impl<T: Copy + PartialEq + Default> Default for Rle<T> {
 impl<T: Copy + PartialEq + Default> Rle<T> {
     /// Create an empty RLE sequence.
     #[must_use]
-    pub fn new() -> Self {
+    #[inline]
+    pub const fn new() -> Self {
         Self {
             runs: Vec::new(),
             total_length: 0,
@@ -377,12 +396,12 @@ impl<T: Copy + PartialEq + Default> Rle<T> {
     /// Returns how many more elements can be added before reaching `u32::MAX`.
     #[must_use]
     #[inline]
-    pub fn remaining_capacity(&self) -> u32 {
+    pub const fn remaining_capacity(&self) -> u32 {
         u32::MAX - self.total_length
     }
 
     #[inline]
-    fn checked_run_length_sum(lhs: u32, rhs: u32) -> u32 {
+    const fn checked_run_length_sum(lhs: u32, rhs: u32) -> u32 {
         // `saturating_add` discharges the overflow obligation for the verifier;
         // `total_length <= u32::MAX` guarantees it never saturates.
         lhs.saturating_add(rhs)
@@ -391,21 +410,21 @@ impl<T: Copy + PartialEq + Default> Rle<T> {
     /// Get the total length of the sequence.
     #[must_use]
     #[inline]
-    pub fn len(&self) -> u32 {
+    pub const fn len(&self) -> u32 {
         self.total_length
     }
 
     /// Check if the sequence is empty.
     #[must_use]
     #[inline]
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.total_length == 0
     }
 
     /// Get the number of runs.
     #[must_use]
     #[inline]
-    pub fn run_count(&self) -> usize {
+    pub const fn run_count(&self) -> usize {
         self.runs.len()
     }
 
@@ -417,6 +436,7 @@ impl<T: Copy + PartialEq + Default> Rle<T> {
     }
 
     /// Clear the sequence.
+    #[inline]
     pub fn clear(&mut self) {
         self.runs.clear();
         self.total_length = 0;
@@ -426,6 +446,7 @@ impl<T: Copy + PartialEq + Default> Rle<T> {
     ///
     /// If the sequence is already at `u32::MAX` capacity, this is a silent
     /// no-op. Use [`try_push`](Self::try_push) to detect overflow.
+    #[inline]
     pub fn push(&mut self, value: T) {
         self.extend_with(value, 1);
     }
@@ -434,6 +455,7 @@ impl<T: Copy + PartialEq + Default> Rle<T> {
     ///
     /// Unlike [`push`](Self::push), this rejects the operation instead of
     /// silently dropping the element.
+    #[inline]
     pub fn try_push(&mut self, value: T) -> Result<(), RleCapacityError> {
         self.try_extend_with(value, 1)
     }
@@ -446,6 +468,7 @@ impl<T: Copy + PartialEq + Default> Rle<T> {
     ///
     /// Use [`try_extend_with`](Self::try_extend_with) to reject partial
     /// insertions.
+    #[inline]
     pub fn extend_with(&mut self, value: T, count: u32) {
         let count = count.min(self.remaining_capacity());
         self.extend_with_unclamped(value, count);
@@ -456,6 +479,7 @@ impl<T: Copy + PartialEq + Default> Rle<T> {
     ///
     /// Unlike [`extend_with`](Self::extend_with), this rejects the entire
     /// operation rather than silently clamping.
+    #[inline]
     pub fn try_extend_with(&mut self, value: T, count: u32) -> Result<(), RleCapacityError> {
         let available = self.remaining_capacity();
         if count > available {
@@ -469,6 +493,7 @@ impl<T: Copy + PartialEq + Default> Rle<T> {
     }
 
     /// Inner extend that assumes `count <= remaining_capacity()`.
+    #[inline]
     fn extend_with_unclamped(&mut self, value: T, count: u32) {
         if count == 0 {
             return;
@@ -490,6 +515,7 @@ impl<T: Copy + PartialEq + Default> Rle<T> {
     /// Get the value at `index`, or `None` if out of bounds (the
     /// non-panicking form of `Index`).
     #[must_use]
+    #[inline]
     pub fn get(&self, index: u32) -> Option<T> {
         if index >= self.total_length {
             return None;
@@ -604,6 +630,7 @@ impl<T: Copy + PartialEq + Default> Rle<T> {
     }
 
     /// Iterate over all values (expanded).
+    #[inline]
     pub fn iter(&self) -> RleIter<'_, T> {
         RleIter {
             runs: &self.runs,
@@ -622,6 +649,7 @@ impl<T: Copy + PartialEq + Default> Rle<T> {
 impl<T: Copy + PartialEq + Default> Index<u32> for Rle<T> {
     type Output = T;
 
+    #[inline]
     fn index(&self, index: u32) -> &Self::Output {
         // An out-of-range `index` maps to `runs.len()`, so the slice bounds
         // check panics; an explicit `expect` is one the verifier cannot
@@ -635,6 +663,7 @@ impl<'a, T: Copy + PartialEq + Default> IntoIterator for &'a Rle<T> {
     type Item = T;
     type IntoIter = RleIter<'a, T>;
 
+    #[inline]
     fn into_iter(self) -> Self::IntoIter {
         self.iter()
     }
@@ -650,6 +679,7 @@ pub struct RleIter<'a, T> {
 impl<T: Copy> Iterator for RleIter<'_, T> {
     type Item = T;
 
+    #[inline]
     fn next(&mut self) -> Option<Self::Item> {
         let run = *self.runs.get(self.run_idx)?;
         let value = run.value;
@@ -676,6 +706,7 @@ impl<T: Copy> Iterator for RleIter<'_, T> {
 impl<T: Copy> ExactSizeIterator for RleIter<'_, T> {}
 
 impl<T: Copy + PartialEq + Default> FromIterator<T> for Rle<T> {
+    #[inline]
     fn from_iter<I: IntoIterator<Item = T>>(iter: I) -> Self {
         Self::from_iter_inner(iter)
     }

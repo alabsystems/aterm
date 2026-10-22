@@ -257,15 +257,17 @@ fn a_dribbled_handshake_cannot_outlive_the_global_deadline() {
 
 #[test]
 fn a_record_dribbled_after_the_handshake_cannot_outlive_the_global_deadline() {
-    // At 50 ms a byte the record would take ~14 minutes; the 3 s deadline is
-    // the bound and the minute below the hang detector.
+    // At 50 ms a byte the record would take ~14 minutes; the 1.5 s deadline is
+    // the bound and the minute below the hang detector. The deadline also covers
+    // the handshake, which must finish inside it (`read_from_dribbler` expects it
+    // to): a debug rustls handshake on loopback takes milliseconds.
     let (_dribbling, outcome) = read_from_dribbler(
         Arc::new(aterm_http::AlwaysAuthorized),
-        Duration::from_secs(3),
+        Duration::from_millis(1500),
     );
     let result = outcome.recv_timeout(HANG_DETECTOR).unwrap_or_else(|_| {
         panic!(
-            "a TLS read was still waiting on a dribbled record {HANG_DETECTOR:?} into a 3 s \
+            "a TLS read was still waiting on a dribbled record {HANG_DETECTOR:?} into a 1.5 s \
              deadline"
         )
     });

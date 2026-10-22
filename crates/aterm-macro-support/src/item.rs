@@ -27,6 +27,7 @@ pub struct Lifetime {
 
 impl Lifetime {
     /// `'name` at `span`; `name` is written without the apostrophe.
+    #[inline]
     #[must_use]
     pub fn new(name: &str, span: Span) -> Self {
         Lifetime {
@@ -36,6 +37,7 @@ impl Lifetime {
     }
 
     /// The lifetime as written, apostrophe included.
+    #[inline]
     #[must_use]
     pub fn name(&self) -> String {
         format!("'{}", self.ident)
@@ -77,18 +79,21 @@ pub enum AttrArgs {
 
 impl Attribute {
     /// Whether the path is the single segment `name`.
+    #[inline]
     #[must_use]
     pub fn is(&self, name: &str) -> bool {
         self.path.len() == 1 && self.path[0].to_string() == name
     }
 
     /// The span of the `#`.
+    #[inline]
     #[must_use]
     pub fn first_span(&self) -> Span {
         self.pound.span()
     }
 
     /// The span of the `[...]`.
+    #[inline]
     #[must_use]
     pub fn last_span(&self) -> Span {
         self.bracket.span()
@@ -171,6 +176,7 @@ impl Generics {
     }
 
     /// Whether there are no parameters.
+    #[inline]
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.params.is_empty()
@@ -178,6 +184,7 @@ impl Generics {
 
     /// The parameter list for `impl<...>`: bounds kept, defaults dropped,
     /// lifetimes first. Empty when there are no parameters.
+    #[inline]
     #[must_use]
     pub fn impl_generics(&self) -> TokenStream {
         self.list(true)
@@ -185,6 +192,7 @@ impl Generics {
 
     /// The argument list for the type, `<'a, T, N>`. Empty when there are no
     /// parameters.
+    #[inline]
     #[must_use]
     pub fn ty_generics(&self) -> TokenStream {
         self.list(false)
@@ -302,6 +310,7 @@ pub struct Field {
 
 impl Field {
     /// The type as a stream.
+    #[inline]
     #[must_use]
     pub fn ty_stream(&self) -> TokenStream {
         self.ty.iter().cloned().collect()
@@ -321,6 +330,7 @@ pub enum Fields {
 
 impl Fields {
     /// The fields, in order; empty for a unit.
+    #[inline]
     #[must_use]
     pub fn iter(&self) -> &[Field] {
         match self {

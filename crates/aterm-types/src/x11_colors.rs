@@ -179,6 +179,7 @@ const X11_COLORS: &[(&str, [u8; 3])] = &[
 /// named colors, `None` otherwise. The lookup lowercases the input and uses
 /// binary search on the sorted table.
 // Skip: the table search closure drives absent std iterator bodies; a miss returns None.
+#[inline]
 #[cfg_attr(trust_verify, trust::skip)]
 pub(crate) fn lookup(name: &str) -> Option<Rgb> {
     // Fast reject: X11 names are 3-20 chars, all ASCII.

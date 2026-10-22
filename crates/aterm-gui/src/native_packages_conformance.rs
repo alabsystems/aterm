@@ -59,6 +59,7 @@ fn report_with_rows(outcome: &str, rows: &[(&str, &str)]) -> PackagesStatusRepor
         pass_seq: 0,
         stale_index_only_pass_seq: 0,
         programs,
+        refused_shims: Default::default(),
         extra: Default::default(),
     };
     PackagesStatusReport::from_parts(true, true, "fp".to_string(), Some(&status), &[])

@@ -1099,6 +1099,8 @@ struct TestBuses {
     refuse: usize,
     /// [`Buses::write_timeout`]'s answer.
     write_timeout: Option<Duration>,
+    /// [`Buses::rejoin_first`]'s answer.
+    rejoin_first: Duration,
 }
 
 impl TestBuses {
@@ -1113,6 +1115,7 @@ impl TestBuses {
             opened,
             refuse: 0,
             write_timeout: Some(super::WRITE),
+            rejoin_first: super::publisher::REJOIN_FIRST,
         }
     }
 }
@@ -1125,6 +1128,10 @@ impl Buses for TestBuses {
 
     fn write_timeout(&self) -> Option<Duration> {
         self.write_timeout
+    }
+
+    fn rejoin_first(&self) -> Duration {
+        self.rejoin_first
     }
 
     fn open(&mut self, address: &str) -> aterm_dbus::Result<Connection> {
@@ -1866,7 +1873,9 @@ fn a_join_that_fails_is_tried_again() {
 
 /// A status read that fails while the publisher waits to rejoin (at-spi2-core
 /// busy, or answering an error) keeps the wait going, longer, instead of
-/// ending the attempts until the next status signal.
+/// ending the attempts until the next status signal. The schedule starts at
+/// 100 ms here, not [`super::publisher::REJOIN_FIRST`]: the order of the
+/// attempts is the claim, and the real 1 s and 2 s were this test's 3 s.
 #[test]
 fn a_status_unanswered_during_the_backoff_keeps_it() {
     let (session_client, session_bus) = CtlStream::pair().unwrap();
@@ -1877,6 +1886,7 @@ fn a_status_unanswered_during_the_backoff_keeps_it() {
     let publisher = Publisher::start(
         TestBuses {
             refuse: 1,
+            rejoin_first: Duration::from_millis(100),
             ..TestBuses::new(session_client, [bus_client], opened_tx)
         },
         Some("aterm-test".into()),
@@ -1884,8 +1894,8 @@ fn a_status_unanswered_during_the_backoff_keeps_it() {
     let (tx, window_heard) = mpsc::channel();
     let adapter = publisher.adapter(Window(tx.clone()), Window(tx.clone()), Window(tx));
     let mut session = session_peer.join().unwrap();
-    // The first join fails; a second later the status read that would retry
-    // it is answered with an error.
+    // The first join fails; its first wait later the status read that would
+    // retry it is answered with an error.
     open_session(&mut session, true);
     opened.recv_timeout(HANG).unwrap();
     let get = session.expect_call("Get");
@@ -1897,7 +1907,7 @@ fn a_status_unanswered_during_the_backoff_keeps_it() {
     .unwrap();
     failed.sender = Some("org.freedesktop.DBus".into());
     session.write(failed);
-    // Two seconds after that, unprompted, the publisher asks again and joins.
+    // Twice that wait later, unprompted, the publisher asks again and joins.
     answer_status(&mut session, true);
     opened.recv_timeout(HANG).unwrap();
     let mut bus = bus_peer.join().unwrap();
@@ -1939,7 +1949,7 @@ fn a_failed_join_waits_twice_as_long_each_time_up_to_a_minute() {
     let mut waits = Vec::new();
     let mut last = None;
     for _ in 0..9 {
-        last = super::publisher::Rejoin::next(last, now);
+        last = super::publisher::Rejoin::next(last, now, super::publisher::REJOIN_FIRST);
         waits.push(last.unwrap().after.as_secs());
     }
     assert_eq!(waits, [1, 2, 4, 8, 16, 32, 60, 60, 60]);

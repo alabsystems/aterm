@@ -1,0 +1,26 @@
+# claude-code 2.1.308 · MEASURED 2026-10-22, `aterm ctl text` of a private headless aterm (144x50, aterm 0.111.0) running the real Claude Code, launched by path with a scratch `CLAUDE_CONFIG_DIR`, a fake `apiKeyHelper` key and `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>` (a local stub of the API, crates/aterm-lab) · default (manual) mode, `X=1 if true; then echo` and 17 function substitutions `${ echo a; }` then `; fi`, a command that names NO rm: a shell keyword right after an assignment (the vendor parser's keywordAfterPrefix) whose function substitutions overrun its budget of 16 draws the rm breaker's nestedSpansOverrun note `not ruled out — some nested commands or function substitutions could not be analyzed`; approve=none · the lab's random project dir is spelled /private/tmp/at.lab0 here
+ ▐▛███▛█   Claude Code v2.1.308
+▝▜██████▀  Opus 5.5 · API Usage Billing
+ ▝▝   ▝▝   /private/tmp/at.lab0/proj
+
+
+❯ toolstart
+
+⏺ Bash(X=1 if true; then echo ${ echo a; } ${ echo a; } ${ echo a; } ${ echo a; } ${ echo a; } ${ echo a; } ${ echo a; } ${ echo a; } ${ echo a;
+      } ${ echo a; } ${ echo…)
+  ⎿  Waiting…
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+ Bash command
+ Echo a
+╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+ │ X=1 if true; then echo ${ echo a; } ${ echo a; } ${ echo a; } ${ echo a; } ${ echo a; } ${ echo a; } ${ echo a; } ${ echo a; } ${ echo a; }
+ │ ${ echo a; } ${ echo a; } ${ echo a; } ${ echo a; } ${ echo a; } ${ echo a; } ${ echo a; } ${ echo a; }; fi
+╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+ │ Dangerous rm operation not ruled out — some nested commands or function substitutions could not be analyzed
+
+ Do you want to proceed?
+ ❯ 1. Yes
+   2. No
+
+ Esc to cancel · Tab to amend

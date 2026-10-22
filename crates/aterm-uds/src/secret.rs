@@ -31,20 +31,23 @@ impl Secret {
     }
 
     /// The bytes, for the one write that needs them.
+    #[inline]
     #[must_use]
-    pub fn expose(&self) -> &[u8] {
+    pub const fn expose(&self) -> &[u8] {
         &self.0
     }
 
     /// How many bytes.
+    #[inline]
     #[must_use]
-    pub fn len(&self) -> usize {
+    pub const fn len(&self) -> usize {
         self.0.len()
     }
 
     /// Whether there are none.
+    #[inline]
     #[must_use]
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.0.is_empty()
     }
 }

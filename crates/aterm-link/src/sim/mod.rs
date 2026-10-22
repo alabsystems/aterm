@@ -37,7 +37,11 @@
 //!   finding F1, which the bridge now survives by setting a torn file aside;
 //!   an unflushed unlink kept or lost: finding F2, a landed post's in-flight
 //!   entry brought back and republished behind its sender's later posts,
-//!   which the bridge now closes by retiring an earlier boot's entries);
+//!   which the bridge now closes by retiring an earlier boot's entries) —
+//!   and, in every other eight seeds, a device that FAILS WRITES (sim item
+//!   S7): `EIO` and `ENOSPC` on a write, a rename, a flush or an unlink, a
+//!   durable replace renamed with its flush failed, an append cut part-way,
+//!   a disk full for spells, until the settle phase's clean disk;
 //! * ATERM'S ENDPOINT ([`endpoint`]): a model of the verb lane's bridge plane
 //!   (`deliver` with its `off=` dedup, `outbox` and its retirements, receipts,
 //!   `hold`, `link log` with lane 3's `continues=`, the roster, a session's
@@ -482,9 +486,10 @@ impl Process {
         }
     }
 
-    /// The state dir is about to make `w`: refused for a dead process, and a
-    /// kill may land before it.
-    pub(crate) fn disk_before(&self, _w: Write<'_>) -> std::io::Result<()> {
+    /// The state dir is about to make `w`: refused for a dead process, a kill
+    /// may land before it, and the device may fail it with nothing made
+    /// ([`device`]'s write errors).
+    pub(crate) fn disk_before(&self, w: Write<'_>) -> std::io::Result<()> {
         if !self.alive() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::BrokenPipe,
@@ -492,13 +497,30 @@ impl Process {
             ));
         }
         self.step("disk-before");
+        if let Some(e) = self.core.device.fails_before(w) {
+            let what = self.core.device.describe(w);
+            self.core.note(format!(
+                "write error {} before {what}",
+                device::errno_name(&e)
+            ));
+            return Err(e);
+        }
         Ok(())
     }
 
-    /// The state dir made `w`: the device journals it, and a kill may land
-    /// after it.
-    pub(crate) fn disk_after(&self, w: Write<'_>) {
-        self.core.device.journal(w);
+    /// The state dir made `w`: the device journals what the media may hold
+    /// of it — and may fail its last step after its effect ([`device`]'s
+    /// write errors), which the dir returns — and a kill may land after it.
+    pub(crate) fn disk_after(&self, w: Write<'_>) -> std::io::Result<()> {
+        let made = self.core.device.made(w);
+        if let Err(e) = &made {
+            let what = self.core.device.describe(w);
+            self.core.note(format!(
+                "write error {} after {what}",
+                device::errno_name(e)
+            ));
+        }
         self.step("disk-after");
+        made
     }
 }

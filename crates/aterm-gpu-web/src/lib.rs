@@ -129,6 +129,7 @@ pub fn register_font(bytes: &[u8]) -> u32 {
     })
 }
 
+#[inline]
 fn registered_font(handle: u32) -> Result<std::sync::Arc<Vec<u8>>, String> {
     REGISTERED_FONTS.with(|cell| {
         cell.borrow()
@@ -282,6 +283,7 @@ struct GpuDisplayRowCache {
 /// The baseline moves through [`Terminal::rebase_colors`], so a program's OSC
 /// 10/11/12/17 colours survive a host theme change, as they survive a native
 /// reload; the palette and the selection foreground keep their current baseline.
+#[inline]
 fn apply_terminal_theme_colors(term: &mut Terminal, fg: u32, bg: u32, cursor: u32, selection: u32) {
     let mut base = term.color_baseline();
     base.foreground = theme_api::unpack(fg);
@@ -408,6 +410,7 @@ impl AtermGpuTerminal {
     /// Record the frame `build_frame` just produced as the one on glass. The
     /// epoch in `key` was latched before `take_damage`, which re-arms but never
     /// changes the epoch value, so an idle successor matches.
+    #[inline]
     fn record_presented_frame(&mut self, key: FrameGateKey) {
         self.last_frame_key = Some(key);
         self.last_present_frac = self.frame_scratch.scroll_frac_px;
@@ -444,6 +447,7 @@ impl AtermGpuTerminal {
     /// [`Terminal::cell_frame_damage_scoped_into`]: only damaged rows re-resolve
     /// under its continuity proof, else it refills fully. The effects pipeline
     /// closes only a session still open, so it does not re-take this one.
+    #[inline]
     fn refill_frame_scratch(&mut self) {
         let refill =
             self.term
@@ -458,12 +462,14 @@ impl AtermGpuTerminal {
 
     /// Record a visual change the engine's damage epoch cannot see (renderer-held
     /// or presentation state), reopening the frame gate for one frame.
+    #[inline]
     pub(crate) fn note_host_visual_change(&mut self) {
         self.host_visual_gen = self.host_visual_gen.wrapping_add(1);
     }
 
     /// Band host hook: the CPU face's cell, pad and grid-top metrics (the face
     /// the GPU renderer is built from, so both agree).
+    #[inline]
     pub(crate) fn band_metrics(&self) -> messages_api::BandMetrics {
         let (cell_w, cell_h) = self.cpu.cell_size();
         messages_api::BandMetrics {
@@ -476,6 +482,7 @@ impl AtermGpuTerminal {
 
     /// Set the band's gutters on the CPU face (read by spill and the offscreen
     /// path) and on the live GPU renderer's inner face.
+    #[inline]
     pub(crate) fn set_band_bleed(&mut self, bleed: Option<aterm_render::ChromeBleed>) {
         self.cpu.set_chrome_bleed(bleed);
         if let Some(gpu) = self.gpu.as_mut() {
@@ -485,6 +492,7 @@ impl AtermGpuTerminal {
 
     /// The band changed: reopen the frame gate for one frame and, when its row
     /// count moved, resize the swapchain to the new frame height.
+    #[inline]
     pub(crate) fn note_band_change(&mut self, rows_moved: bool) {
         self.note_host_visual_change();
         if rows_moved {
@@ -545,7 +553,8 @@ impl AtermGpuTerminal {
 impl AtermGpuTerminal {
     /// The CPU face: the GPU face wraps a copy of it and reads its floors,
     /// theme and opacity off it.
-    pub(crate) fn render_face(&self) -> &Renderer {
+    #[inline]
+    pub(crate) const fn render_face(&self) -> &Renderer {
         &self.cpu
     }
 
@@ -1223,6 +1232,7 @@ impl AtermGpuTerminal {
 
     /// Render-tick safety net (see `REFLOW_PUMP_GRACE_RENDERS`): after the grace
     /// window, one budgeted step per frame.
+    #[inline]
     fn pump_reflow_on_render_tick(&mut self) {
         if self.pending_reflow.is_none() {
             return;
@@ -1239,6 +1249,7 @@ impl AtermGpuTerminal {
 
     /// Output safety net (see `REFLOW_BACKLOG_MAX_LINES`), called by `process`:
     /// one budgeted step per call while staged output is past the cap.
+    #[inline]
     fn pump_reflow_on_output(&mut self) {
         if self.pending_reflow.is_some() && self.term.lazy_backlog_len() > REFLOW_BACKLOG_MAX_LINES
         {

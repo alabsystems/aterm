@@ -1022,7 +1022,7 @@ fn worker_files(rig: &Rig, begun_ms: i64) {
 /// runs its argv again, and the worker's `--session-id` — the id its first
 /// start wrote, which the start-time rule names for the process — is
 /// refused (`42`, relayed by the parent). The look owes it a relaunch as a
-/// crash is ([`ExitRecord::Crashed`]), and the attempt resumes that session
+/// crash is, kept as its own restart ([`ExitRecord::Restarted`]), and the attempt resumes that session
 /// by id: `gemini --model … --resume <id>`, never the `--session-id` nor the
 /// first prompt again, behind the worker's own trusted-folders file while it
 /// stands, and nothing typed after it (`done:resumed`, a quiet record).
@@ -1042,7 +1042,8 @@ fn a_workers_own_restart_is_finished_on_its_session_with_nothing_typed() {
     std::fs::write(&trust, "{}").expect("trust file");
     let snap = worker_snap(&rig, S1, &trust);
     let left = rig.look(&snap);
-    assert_eq!(left, ExitRecord::Crashed);
+    assert_eq!(left, ExitRecord::Restarted);
+    assert!(left.crashed(), "owed a relaunch as a crash is");
     // The host reads it as the restart it is before whose exit it decides
     // (`relaunch::restarted_itself`: a person's keys before it asked for it).
     assert!(look_at_exit(&rig.opts, &snap, &rig.kernel).restarted_itself);
@@ -1110,6 +1111,189 @@ fn a_workers_own_restart_is_finished_on_its_session_with_nothing_typed() {
         rig.attempt(&snap, &left, ExitCause::Exit).step,
         "ended:refused-start"
     );
+}
+
+/// The project's one session file as a start that took no turn writes it:
+/// [`S1`]'s header and the CLI's own `<session_context>`, begun 900 ms after
+/// the parent started (the measured folder-trust restart's file:
+/// `upgrade_gemini_tests::TURNLESS_SESSION`).
+fn turnless_files(rig: &Rig) {
+    std::fs::remove_dir_all(&rig.chats).expect("chats");
+    std::fs::create_dir_all(&rig.chats).expect("chats");
+    let begun = rig.kernel.started_ms + 900;
+    std::fs::write(
+        rig.chats
+            .join(format!("session-2026-10-18T06-40-{}.jsonl", &S1[..8])),
+        format!(
+            "{}\n{}\n",
+            header(S1, &rig.hash, begun),
+            context(begun, "ctx-t")
+        ),
+    )
+    .expect("session file");
+}
+
+/// A BARE LAUNCH'S OWN RESTART BEFORE ITS FIRST TURN IS RESUMED ON ITS
+/// SESSION, NOTHING TYPED AFTER IT (`upgrade_gemini_drive::resumes_turnless`;
+/// measured in the lab: Gemini CLI 0.46.0 writes its header at its UI's mount,
+/// before its folder-trust dialog is answered, so `Trust folder` restarts it
+/// onto its own `--session-id` with no turn in it — `42` — and `gemini
+/// --resume <id>` of that session comes up on it). The look owes it a relaunch
+/// as a crash is, and the attempt types `--resume <id>` alone (`done:resumed`,
+/// quiet), where before it was told `refused:no-turn` and the tab left at
+/// Gemini CLI's error. NEGATIVE CONTROLS: the same restart of a launch whose
+/// first prompt was never sent (`--prompt-interactive`: a resume would drop
+/// it), a crash (`1`) of a `--resume` launch whose session took no turn, and
+/// a bare worker launch's crash with no turn whose word is gone by the
+/// attempt, are told `refused:no-turn`, nothing typed.
+#[test]
+fn a_bare_restart_before_its_first_turn_is_resumed_on_its_session() {
+    let bare = |rig: &Rig| {
+        let mut snap = rig.snap(Some(S1));
+        snap.argv = vec![
+            NODE.to_string(),
+            SCRIPT.to_string(),
+            "--model".to_string(),
+            "gemini-3.5-flash".to_string(),
+            "--session-id".to_string(),
+            S1.to_string(),
+        ];
+        snap
+    };
+    let rig = Rig::new("restart-turnless", 42, true, false, Files::default());
+    turnless_files(&rig);
+    let snap = bare(&rig);
+    let left = rig.look(&snap);
+    assert_eq!(left, ExitRecord::Restarted);
+    assert!(look_at_exit(&rig.opts, &snap, &rig.kernel).restarted_itself);
+    let r = rig.attempt(&snap, &left, ExitCause::Exit);
+    assert_eq!(r.step, "done:resumed", "{r:?}\n{:#?}", rig.typed());
+    let typed = rig.typed();
+    assert_eq!(typed.len(), 1, "the line alone: {typed:#?}");
+    assert!(
+        typed[0].contains(&format!("'--model' 'gemini-3.5-flash' '--resume' '{S1}'"))
+            && !typed[0].contains("session-id"),
+        "{}",
+        typed[0]
+    );
+    assert!(rig.state().quiet);
+
+    // NEGATIVE CONTROL: its first prompt never sent.
+    let rig = Rig::new(
+        "restart-turnless-prompted",
+        42,
+        true,
+        false,
+        Files::default(),
+    );
+    turnless_files(&rig);
+    let mut snap = bare(&rig);
+    snap.argv.push("--prompt-interactive=fix it".to_string());
+    let left = rig.look(&snap);
+    assert_eq!(left, ExitRecord::Restarted, "still its own restart");
+    let r = rig.attempt(&snap, &left, ExitCause::Exit);
+    assert_eq!(r.step, "refused:no-turn", "{r:?}");
+    assert!(rig.typed().is_empty(), "{:#?}", rig.typed());
+
+    // NEGATIVE CONTROL: a crash whose session took no turn.
+    let rig = Rig::new(
+        "crash-turnless",
+        1,
+        true,
+        false,
+        Files {
+            no_turn: true,
+            ..Files::default()
+        },
+    );
+    let snap = rig.snap(Some(S1));
+    let left = rig.look(&snap);
+    assert_eq!(left, ExitRecord::Crashed);
+    let r = rig.attempt(&snap, &left, ExitCause::Exit);
+    assert_eq!(r.step, "refused:no-turn", "{r:?}");
+    assert!(rig.typed().is_empty(), "{:#?}", rig.typed());
+
+    // NEGATIVE CONTROL: a bare worker launch's crash whose session took no
+    // turn, its word gone by the attempt (another command's block newest):
+    // the crash the look read stands, never its own restart on a guess (the
+    // review of 3a4586a01e, R2).
+    let rig = Rig::new("crash-turnless-bare", 1, true, false, Files::default());
+    turnless_files(&rig);
+    let snap = bare(&rig);
+    let left = rig.look(&snap);
+    assert_eq!(left, ExitRecord::Crashed);
+    *rig.blocks2.lock().expect("blocks") = blocks(1, true, true);
+    let r = rig.attempt(&snap, &left, ExitCause::Exit);
+    assert_eq!(r.step, "refused:no-turn", "{r:?}");
+    assert!(rig.typed().is_empty(), "{:#?}", rig.typed());
+}
+
+/// WHAT THE LOOK READ AT A WORKER'S EXIT STANDS WHEN ITS WORD IS GONE BY THE
+/// ATTEMPT (`relaunch::ExitRecord::Restarted`; the review of 3a4586a01e, R2):
+/// its own restart (`42`) read at the look is kept as one, and resumed
+/// quietly (`done:resumed`) with another command's block newest by the
+/// attempt; a worker's crash (`1`) read at the look is continued after its
+/// line however the shell draws by then — the lane of 3a4586a01e read every
+/// `--session-id` launch's crash whose word was gone as its own restart,
+/// and typed no continuation. NEGATIVE CONTROLS: the crash with its word
+/// standing and a `--resume` launch's crash with its word gone are
+/// continued; a crash's record over a restart whose word still stands is
+/// told apart by that word (`done:resumed`), and over one whose word is gone
+/// stays the crash it says (continued: nothing is read as a restart on a
+/// guess).
+#[test]
+fn what_the_look_read_at_an_exit_stands_when_its_word_is_gone() {
+    for (name, status, worker, word_stays, record, want) in [
+        ("restart-word-gone", 42, true, false, None, "done:resumed"),
+        ("restart-word-stays", 42, true, true, None, "done:resumed"),
+        ("worker-crash-word-gone", 1, true, false, None, "continued"),
+        ("worker-crash-word-stays", 1, true, true, None, "continued"),
+        ("resume-crash-word-gone", 1, false, false, None, "continued"),
+        (
+            "crash-record-restart-word-stays",
+            42,
+            true,
+            true,
+            Some(ExitRecord::Crashed),
+            "done:resumed",
+        ),
+        (
+            "crash-record-restart-word-gone",
+            42,
+            true,
+            false,
+            Some(ExitRecord::Crashed),
+            "continued",
+        ),
+    ] {
+        let rig = Rig::new(name, status, true, false, Files::default());
+        let snap = if worker {
+            worker_files(&rig, 900);
+            worker_snap(&rig, S1, &rig.dir.join("gone.trust.json"))
+        } else {
+            rig.snap(Some(S1))
+        };
+        let looked = rig.look(&snap);
+        let read = if status == 42 {
+            ExitRecord::Restarted
+        } else {
+            ExitRecord::Crashed
+        };
+        assert_eq!(looked, read, "{name}: the look");
+        if !word_stays {
+            *rig.blocks2.lock().expect("blocks") = blocks(status, true, true);
+        }
+        let left = record.unwrap_or(looked);
+        let r = rig.attempt(&snap, &left, ExitCause::Exit);
+        assert_eq!(r.step, want, "{name}: {r:?}\n{:#?}", rig.typed());
+        assert_eq!(rig.lines(), 1, "{name}: {:#?}", rig.typed());
+        assert_eq!(
+            rig.continuations(),
+            usize::from(want == "continued"),
+            "{name}: {:#?}",
+            rig.typed()
+        );
+    }
 }
 
 /// A SESSION THE START-TIME RULE CANNOT NAME IS TOLD, NEVER TYPED
@@ -2189,42 +2373,61 @@ fn the_told_line_is_safe_to_run() {
 /// Tier-1 of `HarnessGeminiExitWitness` (aterm-models-harness
 /// `harness_gemini_exit_witness_model`): every look of the model — its child
 /// killed (`1`), its parent killed (`137`), a graceful way out (`0`), a
-/// refused start (`42`), a status the table names nothing for (`143`); its
-/// own header alone since its start, a second one (a `/clear`), its own never
-/// written and another launch's begun 30 s after it (a bare `gemini`), or an
-/// in-TUI `/resume`'s switch with a start's summary written after it; its
-/// resume safe or loading an empty duplicate; the shell's word drawn, not
-/// yet, or another command's block newest since — is replayed through the
-/// real `look_at_exit` and `exit_record` over a stand-in tab and the session
-/// files on disk, and keeps what the model's does; every attempt goes through
-/// the real `after_exit`, relaunches exactly where the model's `Decide` does,
-/// and types nothing where it does not. Negative controls: where the
-/// `Buggy = 1` model looks at the exit as Claude Code's (`LookAsClaude`),
-/// reads a refusal as a crash (`RefusalAsCrash`), reads its child's death as
-/// a refusal (`ChildDeathAsRefusal`), trusts a non-unique witness
+/// refused start (`42`), a status the table names nothing for (`143`), its
+/// own restart refused for its `--session-id` (`42` from a worker's launch,
+/// its first prompt attached or not); its own header alone since its start,
+/// a second one (a `/clear`), its own never written and another launch's
+/// begun 30 s after it (a bare `gemini`), or an in-TUI `/resume`'s switch
+/// with a start's summary written after it; its resume safe or loading an
+/// empty duplicate; its session holding a turn or none; the shell's word
+/// drawn, not yet, or another command's block newest since — is replayed
+/// through the real `look_at_exit` and `exit_record` over a stand-in tab and
+/// the session files on disk, and keeps what the model's does; every attempt
+/// goes through the real `after_exit`, relaunches exactly where the model's
+/// `Decide` does — a crash continued after its line, its own restart quiet
+/// (`done:resumed`) — and types nothing where it does not. Every exit is
+/// replayed on a worker's `--session-id` launch, prompted or not (whose `42`
+/// would be its own restart: the review of 3a4586a01e, R2, found the
+/// binding gave its crashes a `--resume` launch alone), and the exits no own
+/// restart can be once more on a `--resume` launch. Negative controls:
+/// where the `Buggy = 1` model looks at the exit as Claude Code's
+/// (`LookAsClaude`), reads a refusal as a crash (`RefusalAsCrash`), its
+/// child's death as a refusal (`ChildDeathAsRefusal`) or its own restart as a
+/// refusal (`RestartAsRefusal`), trusts a non-unique witness
 /// (`NonUniqueTrusted`), a late header (`LateHeaderTrusted`) or a file whose
-/// switch a summary follows (`SwitchHiddenBySummary`), or skips the
-/// pre-check (`PrecheckSkipped`), the real code decides otherwise — each
-/// caught on its own.
+/// switch a summary follows (`SwitchHiddenBySummary`), skips the pre-check
+/// (`PrecheckSkipped`), leaves its own bare restart that took no turn
+/// (`TurnlessRestartLeft`), resumes a session with no turn whatever ended it
+/// (`TurnlessResumed`), resumes a crash whose word is gone by the attempt as
+/// its own restart (`GoneWordReadAsRestart`), or continues after its own
+/// restart's line (`RestartContinued`), the real code decides otherwise —
+/// each caught on its own.
 #[test]
+#[allow(clippy::too_many_lines)]
 fn tier1_the_real_gemini_exit_read_conforms_to_the_model() {
     use std::collections::{BTreeMap, BTreeSet, VecDeque};
     let m = aterm_models_harness::harness_gemini_exit_witness_model();
     let buggy = aterm_spec::interp::with_buggy(&m, 1);
     // One rig, reset to each world in turn ([`Rig::reset`]).
     let mut rig = Rig::new("tier1", 0, true, false, Files::default());
-    let draw = |rig: &mut Rig, exit: i64, word: bool, later: bool, rule: i64, dup: bool| {
+    // A refused start (`exit` 3) is drawn as `42` on a `--resume` launch
+    // (an id it does not hold), and as `41` (no credential) on a worker's
+    // `--session-id` launch, whose `42` under a session the rule names is
+    // its own restart (`exit` 6) by the table itself.
+    let draw = |rig: &mut Rig, st: &BTreeMap<&'static str, i64>, resumed: bool| {
+        let (exit, rule) = (st["exit"], st["rule"]);
         let status = match exit {
             1 => 1,
             2 => 0,
-            3 => 42,
+            3 if !resumed => 41,
+            3 | 6 => 42,
             4 => 143,
             _ => 137,
         };
         rig.reset(
             status,
-            word,
-            later,
+            st["word"] == 1,
+            st["later"] == 1,
             Files {
                 second: rule == 1,
                 no_header: rule == 2,
@@ -2232,115 +2435,187 @@ fn tier1_the_real_gemini_exit_read_conforms_to_the_model() {
                 late: rule == 2,
                 switched: rule == 3,
                 summary: rule == 3,
-                dup,
+                dup: st["dup"] == 1,
+                no_turn: st["turnless"] == 1,
                 ..Files::default()
             },
-        )
+        );
     };
-    // What the host snapped while it ran: `gemini --resume S1`, named; a bare
-    // `gemini` whose own header was never written, named nothing.
-    let snapped = |rig: &Rig, rule: i64| {
-        if rule == 2 {
-            let mut snap = rig.snap(None);
-            snap.argv = vec![NODE.to_string(), SCRIPT.to_string()];
-            snap
+    // What the host snapped while it ran: a worker's `--session-id S1`
+    // launch (every worker's, `harness::worker`), its first prompt attached
+    // where the model's `prompt` says, named as the rule named it; with
+    // `resumed`, for an exit no own restart can be, `gemini --resume S1`
+    // (its prompt `-i …`, or none), named; a bare `gemini` whose own header
+    // was never written, named nothing.
+    let snapped = |rig: &Rig, st: &BTreeMap<&'static str, i64>, resumed: bool| {
+        let (rule, exit, prompt) = (st["rule"], st["exit"], st["prompt"] == 1);
+        let mut snap = rig.snap((rule != 2).then_some(S1));
+        let mut argv = vec![NODE.to_string(), SCRIPT.to_string()];
+        if rule == 2 && exit != 6 {
+            if prompt {
+                argv.push("--prompt-interactive=fix it".to_string());
+            }
+        } else if resumed && exit != 6 {
+            argv.extend(["--model", "gemini-3.5-flash", "--resume", S1].map(str::to_string));
+            if prompt {
+                argv.extend(["-i", "carry on", "fix it"].map(str::to_string));
+            }
         } else {
-            rig.snap(Some(S1))
+            argv.extend(["--model", "gemini-3.5-flash", "--session-id", S1].map(str::to_string));
+            if prompt {
+                argv.push("--prompt-interactive=fix it".to_string());
+            }
         }
+        snap.argv = argv;
+        snap
     };
     let kept = |kept: i64| match kept {
         1 => ExitRecord::Crashed,
         2 => ExitRecord::Removed,
         4 => ExitRecord::Refused,
+        5 => ExitRecord::Restarted,
         _ => ExitRecord::Unread,
     };
-    let mut seen = BTreeSet::new();
-    let mut attempted = BTreeSet::new();
-    let mut queue = VecDeque::from([m.init_state()]);
-    let (mut looks, mut attempts) = (0, 0);
+    let (mut looks, mut attempts, mut restarts, mut resumed_crashes) = (0, 0, 0, 0);
     let mut caught: BTreeMap<&str, usize> = BTreeMap::new();
-    while let Some(st) = queue.pop_front() {
-        if !seen.insert(st.clone()) {
-            continue;
-        }
-        for action in &m.actions {
-            let mut next = st.clone();
-            if m.fire(action.name, &mut next) {
-                queue.push_back(next);
-            }
-        }
-        if st["exit"] == 0 || st["decided"] > 0 {
-            continue;
-        }
-        let (word, later) = (st["word"] == 1, st["later"] == 1);
-        let (rule, dup) = (st["rule"], st["dup"] == 1);
-        if st["seen"] == 0 {
-            if !looked_once(&mut attempted, &st, "look") {
+    for resumed in [false, true] {
+        let mut seen = BTreeSet::new();
+        let mut attempted = BTreeSet::new();
+        let mut queue = VecDeque::from([m.init_state()]);
+        while let Some(st) = queue.pop_front() {
+            if !seen.insert(st.clone()) {
                 continue;
             }
-            looks += 1;
-            let look = if word && !later { "Look" } else { "LookGone" };
+            for action in &m.actions {
+                let mut next = st.clone();
+                if m.fire(action.name, &mut next) {
+                    queue.push_back(next);
+                }
+            }
+            // The `--resume` launch's pass replays the exits no own restart
+            // can be, the session named.
+            if st["exit"] == 0
+                || st["decided"] > 0
+                || (resumed && (st["exit"] == 6 || st["rule"] == 2))
+            {
+                continue;
+            }
+            let (word, later) = (st["word"] == 1, st["later"] == 1);
+            if st["seen"] == 0 {
+                if !looked_once(&mut attempted, &st, "look") {
+                    continue;
+                }
+                looks += 1;
+                let look = if word && !later { "Look" } else { "LookGone" };
+                let mut after = st.clone();
+                assert!(m.fire(look, &mut after), "{look} at {st:?}");
+                draw(&mut rig, &st, resumed);
+                let left = rig.look(&snapped(&rig, &st, resumed));
+                assert_eq!(
+                    left,
+                    kept(after["kept"]),
+                    "the look at {st:?} (resumed={resumed})"
+                );
+                for mutant in [
+                    "LookAsClaude",
+                    "RefusalAsCrash",
+                    "ChildDeathAsRefusal",
+                    "RestartAsRefusal",
+                ] {
+                    let mut wrong = st.clone();
+                    if buggy.fire(mutant, &mut wrong) && wrong["kept"] != after["kept"] {
+                        assert_ne!(left, kept(wrong["kept"]), "{mutant} at {st:?}");
+                        *caught.entry(mutant).or_default() += 1;
+                    }
+                }
+                continue;
+            }
+            if !looked_once(&mut attempted, &st, "attempt") {
+                continue;
+            }
+            attempts += 1;
             let mut after = st.clone();
-            assert!(m.fire(look, &mut after), "{look} at {st:?}");
-            draw(&mut rig, st["exit"], word, later, rule, dup);
-            let left = rig.look(&snapped(&rig, rule));
-            assert_eq!(left, kept(after["kept"]), "the look at {st:?}");
-            for mutant in ["LookAsClaude", "RefusalAsCrash", "ChildDeathAsRefusal"] {
+            assert!(m.fire("Decide", &mut after), "Decide at {st:?}");
+            draw(&mut rig, &st, resumed);
+            let r = rig.attempt(
+                &snapped(&rig, &st, resumed),
+                &kept(st["kept"]),
+                ExitCause::Exit,
+            );
+            let continued = r.step == "continued";
+            let relaunched = continued || r.step == "done:resumed";
+            assert_eq!(
+                relaunched,
+                after["decided"] == 1,
+                "the attempt at {st:?} (resumed={resumed}): {r:?}\n{:#?}",
+                rig.typed()
+            );
+            assert_eq!(
+                continued,
+                after["cont"] == 1,
+                "the continuation at {st:?} (resumed={resumed}): {r:?}"
+            );
+            if st["exit"] == 6 && relaunched {
+                restarts += 1;
+            }
+            if st["exit"] != 6 && st["later"] == 1 && continued {
+                resumed_crashes += 1;
+            }
+            if !relaunched {
+                assert_eq!(
+                    rig.lines(),
+                    0,
+                    "nothing typed at {st:?}: {:#?}",
+                    rig.typed()
+                );
+            }
+            for mutant in [
+                "NonUniqueTrusted",
+                "LateHeaderTrusted",
+                "SwitchHiddenBySummary",
+                "PrecheckSkipped",
+                "TurnlessRestartLeft",
+                "TurnlessResumed",
+            ] {
                 let mut wrong = st.clone();
-                if buggy.fire(mutant, &mut wrong) && wrong["kept"] != after["kept"] {
-                    assert_ne!(left, kept(wrong["kept"]), "{mutant} at {st:?}");
+                if buggy.fire(mutant, &mut wrong) && wrong["decided"] != after["decided"] {
+                    assert_ne!(relaunched, wrong["decided"] == 1, "{mutant} at {st:?}");
                     *caught.entry(mutant).or_default() += 1;
                 }
             }
-            continue;
-        }
-        if !looked_once(&mut attempted, &st, "attempt") {
-            continue;
-        }
-        attempts += 1;
-        let mut after = st.clone();
-        assert!(m.fire("Decide", &mut after), "Decide at {st:?}");
-        draw(&mut rig, st["exit"], word, later, rule, dup);
-        let r = rig.attempt(&snapped(&rig, rule), &kept(st["kept"]), ExitCause::Exit);
-        let relaunched = r.step == "continued";
-        assert_eq!(
-            relaunched,
-            after["decided"] == 1,
-            "the attempt at {st:?}: {r:?}"
-        );
-        if !relaunched {
-            assert_eq!(
-                rig.lines(),
-                0,
-                "nothing typed at {st:?}: {:#?}",
-                rig.typed()
-            );
-        }
-        for mutant in [
-            "NonUniqueTrusted",
-            "LateHeaderTrusted",
-            "SwitchHiddenBySummary",
-            "PrecheckSkipped",
-        ] {
-            let mut wrong = st.clone();
-            if buggy.fire(mutant, &mut wrong) && wrong["decided"] != after["decided"] {
-                assert_ne!(relaunched, wrong["decided"] == 1, "{mutant} at {st:?}");
-                *caught.entry(mutant).or_default() += 1;
+            for mutant in ["RestartContinued", "GoneWordReadAsRestart"] {
+                let mut wrong = st.clone();
+                if buggy.fire(mutant, &mut wrong)
+                    && (wrong["decided"], wrong["cont"]) != (after["decided"], after["cont"])
+                {
+                    assert_ne!(
+                        (relaunched, continued),
+                        (wrong["decided"] == 1, wrong["cont"] == 1),
+                        "{mutant} at {st:?} (resumed={resumed})"
+                    );
+                    *caught.entry(mutant).or_default() += 1;
+                }
             }
         }
     }
     assert!(
-        looks > 0 && attempts > 0,
-        "{looks} looks, {attempts} attempts"
+        looks > 0 && attempts > 0 && restarts > 0 && resumed_crashes > 0,
+        "{looks} looks, {attempts} attempts, {restarts} restarts resumed, \
+         {resumed_crashes} crashes continued past a word gone"
     );
     for mutant in [
         "LookAsClaude",
         "RefusalAsCrash",
         "ChildDeathAsRefusal",
+        "RestartAsRefusal",
         "NonUniqueTrusted",
         "LateHeaderTrusted",
         "SwitchHiddenBySummary",
         "PrecheckSkipped",
+        "TurnlessRestartLeft",
+        "TurnlessResumed",
+        "GoneWordReadAsRestart",
+        "RestartContinued",
     ] {
         assert!(
             caught.get(mutant).copied().unwrap_or(0) >= 1,
@@ -2353,7 +2628,7 @@ fn tier1_the_real_gemini_exit_read_conforms_to_the_model() {
 /// attempt) the bind replays: the real code sees only the exit, the files,
 /// the word and what the look kept.
 fn looked_once(
-    done: &mut std::collections::BTreeSet<(&'static str, [i64; 7])>,
+    done: &mut std::collections::BTreeSet<(&'static str, [i64; 9])>,
     st: &std::collections::BTreeMap<&'static str, i64>,
     what: &'static str,
 ) -> bool {
@@ -2363,6 +2638,8 @@ fn looked_once(
             st["exit"],
             st["rule"],
             st["dup"],
+            st["turnless"],
+            st["prompt"],
             st["word"],
             st["later"],
             st["kept"],

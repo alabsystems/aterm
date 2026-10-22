@@ -176,8 +176,9 @@ impl ColorPalette {
     }
 
     /// The RGB value for an indexed color: one load from the dense cache.
+    #[inline]
     #[must_use]
-    pub fn get(&self, index: u8) -> Rgb {
+    pub const fn get(&self, index: u8) -> Rgb {
         // `as usize`, not `usize::from`: Trust cannot see into the trait call and leaves the
         // bounds obligation unproved, while the primitive cast proves it.
         self.cache[index as usize]
@@ -224,6 +225,7 @@ impl ColorPalette {
     }
 
     /// Returns the number of customized (non-default) colors.
+    #[inline]
     #[must_use]
     pub fn overrides_count(&self) -> usize {
         self.overrides.len()
@@ -262,8 +264,9 @@ impl ColorPalette {
     }
 
     /// Get the default color for an index.
+    #[inline]
     #[must_use]
-    pub fn default_color(index: u8) -> Rgb {
+    pub const fn default_color(index: u8) -> Rgb {
         DEFAULT_COLOR_TABLE[index as usize]
     }
 

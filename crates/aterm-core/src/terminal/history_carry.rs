@@ -18,7 +18,8 @@ use crate::scrollback::Line;
 impl Terminal {
     /// The grid holding this terminal's history, mutably — the twin of
     /// [`Self::main_grid`].
-    pub(super) fn history_grid_mut(&mut self) -> &mut Grid {
+    #[inline]
+    pub(super) const fn history_grid_mut(&mut self) -> &mut Grid {
         if self.modes.alternate_screen
             && let Some(primary) = self.alt_grid.as_mut()
         {
@@ -29,6 +30,7 @@ impl Terminal {
 
     /// The fence a history export of this terminal is taken on
     /// ([`HistoryFence`]), over the grid that holds its history. A pure read.
+    #[inline]
     #[must_use]
     pub fn history_fence(&self) -> HistoryFence {
         self.main_grid().history_fence()
@@ -36,6 +38,7 @@ impl Terminal {
 
     /// Up to `max` history lines from absolute row `from`, while `fence`
     /// holds ([`Grid::history_lines_since_fence`]).
+    #[inline]
     pub fn history_lines_since_fence(
         &self,
         fence: &HistoryFence,
@@ -47,8 +50,9 @@ impl Terminal {
 
     /// The width the history grid wraps its lines at — what an import must be
     /// built for ([`OlderHistory::build`]).
+    #[inline]
     #[must_use]
-    pub fn history_cols(&self) -> u16 {
+    pub const fn history_cols(&self) -> u16 {
         self.main_grid().cols()
     }
 
@@ -58,6 +62,7 @@ impl Terminal {
     /// absolute row. The restore continues the source's numbering, so the
     /// reserve moves nothing and restored shell marks keep naming their lines.
     /// Returns the claim the import presents ([`OlderHistoryClaim`]).
+    #[inline]
     #[must_use]
     pub fn reserve_older_history_keys(&mut self, lines: u64) -> OlderHistoryClaim {
         self.history_grid_mut().reserve_older_history_keys(lines)
@@ -66,6 +71,7 @@ impl Terminal {
     /// Whether `claim` still admits an import: the history grid's scrollback
     /// has not been cleared since the reserve
     /// ([`Grid::older_history_claim_holds`]). A pure read.
+    #[inline]
     #[must_use]
     pub fn older_history_claim_holds(&self, claim: OlderHistoryClaim) -> bool {
         self.main_grid().older_history_claim_holds(claim)

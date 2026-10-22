@@ -1003,6 +1003,16 @@ const TAIL_ROWS: usize = 40;
 /// `seq`, its `first` and its rows.
 type ScreenKey = (u64, usize, Vec<String>);
 
+/// Where [`Session::message_cells`] reads the column-0 cell of a row of the
+/// rows read: by its grid row, the rows' first at grid row `.0` (`cell <r>
+/// 0`), or by its absolute row, the rows' first at absolute row `.0` (`cell
+/// abs=<n> 0`, a history row's too).
+#[derive(Clone, Copy, Debug)]
+enum CellsAt {
+    Grid(usize),
+    Abs(u64),
+}
+
 /// [`Session::read_once`]'s read of the screen ([`Session::read_shaped`]): the
 /// screen, the reader a tail that stands chose (`None` for a whole read), and
 /// the grid's rows above the screen where the read was whole (`None` for a
@@ -2410,6 +2420,11 @@ struct Looking {
     /// the same point at a moved seq carries the decision's verdicts there
     /// ([`Session::carry_point`]).
     handed_seq: Option<u64>,
+    /// The session's submissions and its conversation's mark as that point
+    /// was handed over at ([`submit_mark`]): a submission counted since, over
+    /// a conversation drawn since, is a turn asked there, whatever its key
+    /// says ([`submitted_over`]). `None` from a host that counts none.
+    handed_submit: Option<(u64, u64)>,
     /// What the reads since the last turn's end saw of the worker ([`Saw`]).
     /// Kept here, not in one wait's locals, so a busy spell read before a lost
     /// connection still counts after it.
@@ -3239,6 +3254,11 @@ pub struct Session<'a, C: Ctl> {
     /// and the row of it the cut went through, `None` for no cut: the same
     /// screen read again takes the verdict with no request.
     limit_cut: Option<(ScreenKey, Option<usize>)>,
+    /// The last screen whose last message was bounded by its cells
+    /// ([`Self::message_bounded_by_cells`]) — its `seq`, `first` and rows —
+    /// and the blank rows its cells made the message's own: the same screen
+    /// read again folds the same rows with no request.
+    message_fold: Option<(ScreenKey, Vec<usize>)>,
     /// The session's working directory as its `meta` last said it (`None`
     /// for `cwd=-` or unread; read fresh for every box that needs it).
     cwd: Option<PathBuf>,
@@ -3272,6 +3292,16 @@ pub struct Session<'a, C: Ctl> {
     /// is its seeds' (a relaunch's, a fault restart's, a reopened tab's), and
     /// a loop with no ledger knows of none and reads it as before.
     first_books: bool,
+    /// THE NEWEST ROW OF THE BOOKS THIS LOOP FOUND (unix ms,
+    /// [`approvals::last_row_ms`] over the session's ledger and the earlier
+    /// tabs' a cold restore noted, as [`Self::seed_from_ledger_text`] read
+    /// them): an agent process its host saw launched after it
+    /// ([`IdleHost::launch`]) is one no loop before this one watched — a
+    /// person who quit the agent and started it again, in a tab whose ledger
+    /// holds rows — and its first point that holds nothing of a conversation
+    /// is a launch's, as a first loop's is (`Self::unasked_launch`). `None`:
+    /// no row, or no ledger.
+    books_last_ms: Option<i64>,
     /// THE PERSON'S OWN EXCHANGES LEFT TO THEM and not closed since: the
     /// keys of the turns this loop, or an earlier one on the session or on a
     /// tab a cold restore noted, left (`approvals::open_left`; the review's
@@ -3439,6 +3469,14 @@ pub struct Session<'a, C: Ctl> {
     /// The remembered transcript candidate, without current-mount identity;
     /// a later screen mount spends it ([`Self::box_call`]).
     box_proved: Option<String>,
+    /// The rm breaker's too-many box: the transcript's one waiting Bash call
+    /// and when a read on this box's mount first found it
+    /// ([`Self::box_command`]). The settle runs from that sighting, so the
+    /// box decided again (a ticking countdown moved the screen past the
+    /// judged read and the press was skipped) takes the same call without
+    /// waiting the settle again. A later mount forgets it
+    /// ([`Self::spend_proved`]).
+    box_seen: Option<(super::policy::box_command::BoxCommand, Instant)>,
     /// Spent transcript candidates, newest last (at most [`SPENT_CALLS`]).
     /// Excluding a remembered candidate after a screen change avoids reuse;
     /// it does not bind any call to the current box.
@@ -3875,6 +3913,7 @@ impl<'a, C: Ctl> Session<'a, C> {
             transcript_over_seq: None,
             standing_read: wall_confirm::StandingRead::default(),
             limit_cut: None,
+            message_fold: None,
             cwd: None,
             trusted_cwd: None,
             worker_agent: None,
@@ -3883,6 +3922,7 @@ impl<'a, C: Ctl> Session<'a, C> {
             ledger: Ledger::off(),
             turn_end_seeded: false,
             first_books: false,
+            books_last_ms: None,
             left_keys: Vec::new(),
             repo_seen: None,
             left_at_wall_seq: None,
@@ -3918,6 +3958,7 @@ impl<'a, C: Ctl> Session<'a, C> {
             box_first_seen: None,
             stepper: approval_loop::StepperTrack::default(),
             box_proved: None,
+            box_seen: None,
             calls_spent: Vec::new(),
             claim: claim::Claim::Off,
             claim_said: Vec::new(),
@@ -4786,7 +4827,135 @@ impl<'a, C: Ctl> Session<'a, C> {
     /// whose they are ([`Self::limit_words_read_above`]).
     fn read_once(&mut self) -> Result<(Screen, Option<&'static dyn ScreenReader>), Fail> {
         let read = self.read_shaped()?;
-        self.limit_words_read_above(read.screen, read.read_by, read.above)
+        let (screen, read_by) =
+            self.limit_words_read_above(read.screen, read.read_by, read.above)?;
+        Ok((self.message_bounded_by_cells(screen, read_by), read_by))
+    }
+
+    /// THE LAST MESSAGE BOUNDED BY ITS CELLS where its text cannot bound it
+    /// (agy, whose message's blank line is a blank row like the one that
+    /// ends it, its later rows two columns in as a reply's:
+    /// [`ScreenReader::message_blanks`]). A person's paragraphs typed or
+    /// pasted into agy read as agy's reply otherwise — their `NEEDS YOU:`
+    /// a need it raised (lab r16o) — and aterm knows nothing of a message it
+    /// did not type but what the screen draws. agy draws every row of a sent
+    /// message from column 0 in its caret row's style, its blank rows among
+    /// them, and the blank row that ends it plain (MEASURED,
+    /// `aterm_phase::agy::fixtures::lab::PERSON_PARAGRAPHS`): the loop reads
+    /// the caret row's column-0 cell, then each blank row the text names,
+    /// top down, and the rows drawn in the caret row's style, up to the
+    /// first that is not, are taken out of the message
+    /// ([`ScreenReader::fold_message`]) before any reading — the reply, the
+    /// composer and every row under the message keep their grid rows. Only
+    /// a plain row found under them proves the styles tell the two apart:
+    /// with none, a cell that cannot be read, or a glyph that is not the
+    /// caret's or a blank (the screen moved under the reads), nothing is
+    /// folded and the screen reads as its text does. A read of the same
+    /// rows at the same `seq` folds the same rows with no request.
+    fn message_bounded_by_cells(
+        &mut self,
+        mut screen: Screen,
+        read_by: Option<&'static dyn ScreenReader>,
+    ) -> Screen {
+        let reader = read_by.unwrap_or_else(|| self.reader(&screen.rows));
+        let Some((caret, blanks)) = reader.message_blanks(&screen.rows) else {
+            return screen;
+        };
+        let key = (screen.seq, screen.first, screen.rows.clone());
+        let inner = match self.message_fold.take() {
+            Some((seen, inner)) if seen == key => inner,
+            _ => self.message_cells(CellsAt::Grid(screen.first), caret, &blanks),
+        };
+        if !inner.is_empty() {
+            screen.rows = reader.fold_message(&screen.rows, caret, &inner);
+        }
+        self.message_fold = Some((key, inner));
+        screen
+    }
+
+    /// The rows `screen` was read as before [`Self::message_bounded_by_cells`]
+    /// folded its last message: the rows its fold was kept for, where that
+    /// fold is this screen's (the same `seq` and `first`, the rows it folded
+    /// to `screen`'s); else `screen`'s own. What a read of the history above
+    /// holds against the grid read again ([`Self::rows_up_to_at`]), which
+    /// draws the message unfolded.
+    pub(super) fn rows_as_read(&self, screen: &Screen) -> Vec<String> {
+        if let Some(((seq, first, rows), inner)) = &self.message_fold
+            && (*seq, *first) == (screen.seq, screen.first)
+            && !inner.is_empty()
+        {
+            let reader = self.reader(rows);
+            let folded = reader
+                .message_blanks(rows)
+                .map(|(caret, _)| reader.fold_message(rows, caret, inner));
+            if folded.as_ref() == Some(&screen.rows) {
+                return rows.clone();
+            }
+        }
+        screen.rows.clone()
+    }
+
+    /// THE LAST MESSAGE OF ROWS READ UP INTO THE HISTORY BOUNDED BY ITS CELLS
+    /// ([`Self::message_bounded_by_cells`] over the grid and the history above
+    /// it): `rows`, the first of them absolute row `abs` (`None` on the
+    /// alternate screen's archive, whose rows have none), their message's
+    /// caret row and blank rows read where they are drawn (`cell abs=<n> 0`,
+    /// a history row's as it was drawn), and the blank rows drawn in the
+    /// caret row's style taken out of the message
+    /// ([`ScreenReader::fold_message`]). A person's message that scrolled up
+    /// out of the grid under a long reply is bounded so too: read as text,
+    /// its later paragraphs were the reply's top, and their `NEEDS YOU:` the
+    /// worker's need (the review of 3a4586a01e, T1). `rows` as they are
+    /// where nothing bounds them, as [`Self::message_cells`] says.
+    pub(super) fn rows_bounded_by_cells(
+        &mut self,
+        rows: Vec<String>,
+        reader: &'static dyn ScreenReader,
+        abs: Option<u64>,
+    ) -> Vec<String> {
+        let (Some(abs), Some((caret, blanks))) = (abs, reader.message_blanks(&rows)) else {
+            return rows;
+        };
+        let inner = self.message_cells(CellsAt::Abs(abs), caret, &blanks);
+        if inner.is_empty() {
+            return rows;
+        }
+        reader.fold_message(&rows, caret, &inner)
+    }
+
+    /// The blank rows of [`Self::message_bounded_by_cells`] drawn in the
+    /// caret row's style, top down, up to the first that is not — empty
+    /// where no row under them is plain, or a cell does not read as the
+    /// caret's or a blank. Each row's column-0 cell is read where `at`
+    /// says.
+    fn message_cells(&mut self, at: CellsAt, caret: usize, blanks: &[usize]) -> Vec<usize> {
+        let mut drawn = |row: usize| {
+            let at = match at {
+                CellsAt::Grid(first) => (first + row).to_string(),
+                CellsAt::Abs(abs) => format!("abs={}", abs.saturating_add(row as u64)),
+            };
+            match self.call(&["cell", &at, "0"]) {
+                Ok(r) if r.ok() => crate::supervise::screen::cell_drawn(&r.stdout),
+                _ => None,
+            }
+        };
+        let own = match drawn(caret) {
+            Some((glyph, style)) if glyph == ">" => style,
+            _ => return Vec::new(),
+        };
+        let mut inner = Vec::new();
+        for &row in blanks {
+            match drawn(row) {
+                Some((glyph, style)) if glyph == "%20" || glyph.is_empty() => {
+                    if style != own {
+                        return inner;
+                    }
+                    inner.push(row);
+                }
+                _ => return Vec::new(),
+            }
+        }
+        Vec::new()
     }
 
     /// THE ROWS ABOVE A LIMIT'S WORDS, read where the screen cannot tell
@@ -5058,7 +5227,11 @@ impl<'a, C: Ctl> Session<'a, C> {
     /// ending and a box drawn where the footer was both latch it at once,
     /// however the screen above animates. That wait watches the live zone of
     /// the read that armed it (`rows <a> <b>`, [`live_rows`]), never a footer
-    /// above it (a dead process's footer never leaves). A busy read without
+    /// above it (a dead process's footer never leaves). The read right after
+    /// that latch may be a repaint caught midway: one with no composer yet, or
+    /// an idle one whose composer frame is not whole
+    /// ([`aterm_phase::phase::composer_frame_torn`]), is read again after the
+    /// short settle. A busy read without
     /// the footer in its live zone waits for the next content change and a
     /// short settle ([`SETTLE_MS`], at most [`SETTLE_CAP`]); a turn's first
     /// wait is the footer leaving (armed before any read, over every row,
@@ -5234,6 +5407,26 @@ impl<'a, C: Ctl> Session<'a, C> {
                 phase = Phase::Idle;
             }
             if phase != Phase::Busy && !writing {
+                // A READ TORN MID-REPAINT IS NO POINT. The footer this wait saw leave latches
+                // at the first batch it is off the screen, and a reply growing under the window
+                // is repainted row by row with its footer last: a read there shows the composer
+                // frame and no busy footer, idle to every reader, while the reply still streams
+                // (Claude Code 2.1.307, `r7-both` L6: `- check 65 passed` of 80 judged a point,
+                // the reply's `NEEDS YOU:` above it never read). An idle read straight after
+                // that latch whose frame is not whole
+                // ([`aterm_phase::phase::composer_frame_torn`]) is read once more after the
+                // short settle, as a read with no composer yet is (`writing`), and that read
+                // decides.
+                if phase == Phase::Idle
+                    && footer_seen
+                    && matches!(next, Next::Gone(_))
+                    && aterm_phase::phase::composer_frame_torn(&screen.rows)
+                    && self.fx.mono() < deadline
+                {
+                    next = Next::Settle;
+                    footer_seen = false;
+                    continue;
+                }
                 return Ok(Turn {
                     phase,
                     screen,
@@ -5739,6 +5932,13 @@ impl<'a, C: Ctl> Session<'a, C> {
         // noted, and Off did not stand since its last worker.
         self.first_books =
             !lifted_off && earlier.is_empty() && body.lines().all(|l| l.trim().is_empty());
+        // …and the newest row of those books, past which an agent process
+        // launched is none a loop before this one watched
+        // ([`Self::books_last_ms`]).
+        self.books_last_ms = std::iter::once(body)
+            .chain(ledgers.iter().map(|(_, b)| b.as_str()))
+            .filter_map(approvals::last_row_ms)
+            .max();
         let own_journal = self.fx.read_text(&approvals::journal_beside(path));
         // A person's own exchange an earlier loop left to them, on this tab
         // or one a cold restore reopened it from: still theirs while it is
@@ -6254,6 +6454,7 @@ impl<'a, C: Ctl> Session<'a, C> {
             gone_first: true,
             handed: None,
             handed_seq: None,
+            handed_submit: None,
             moved: Saw::default(),
             survey: Survey::Closed,
             read_back: None,
@@ -6612,7 +6813,9 @@ impl<'a, C: Ctl> Session<'a, C> {
                 h == turn_key
                     .get_or_insert_with(|| self.review_key(&turn))
                     .as_str()
-            }) {
+            })
+            && !submitted_over(state.handed_submit, &turn.screen)
+        {
             // The point already handed over, still showing: the screen
             // moved (a footer tick, a banner) and nothing the point is made
             // of did. Nothing is pressed or reported, and what the decision
@@ -6738,6 +6941,7 @@ impl<'a, C: Ctl> Session<'a, C> {
             state.approved.clear();
             state.handed = Some(self.review_key(&point));
             state.handed_seq = Some(point.screen.seq);
+            state.handed_submit = submit_mark(&point.screen);
             if review.unattended() {
                 // A wall the policy acts on, or waits out, raises nothing:
                 // nobody is needed there. Nor does one whose point raised
@@ -8478,7 +8682,9 @@ impl<C: Ctl> Session<'_, C> {
             *seq = last.seq;
             let then = self.turn_of(last);
             let key = seen_key.get_or_insert_with(|| self.review_key(seen));
-            if point_key(self.reader(&then.screen.rows), &then) != *key {
+            if point_key(self.reader(&then.screen.rows), &then) != *key
+                || submitted_over(submit_mark(&seen.screen), &then.screen)
+            {
                 return Ok(true);
             }
         }
@@ -8495,7 +8701,8 @@ impl<C: Ctl> Session<'_, C> {
         *seq = screen.seq;
         let now = self.turn_of(screen);
         let key = seen_key.get_or_insert_with(|| self.review_key(seen));
-        Ok(point_key(self.reader(&now.screen.rows), &now) != *key)
+        Ok(point_key(self.reader(&now.screen.rows), &now) != *key
+            || submitted_over(submit_mark(&seen.screen), &now.screen))
     }
 
     /// The words an `await agent` on `seen` waits for (every verdict but the
@@ -8825,6 +9032,12 @@ impl<C: Ctl> Session<'_, C> {
             if let Some(step) = &step {
                 if !step.repeat {
                     review.note(&format!("HOST seq={} {}", point.screen.seq, step.line));
+                }
+                // A step that moved the session typed the harness's own keys
+                // (the relaunch's line, its carry-on): the count says nothing
+                // of a turn asked since ([`TurnEndState::host_moved`]).
+                if step.moved {
+                    self.turn_end.host_moved();
                 }
                 // A turn the host typed is awaited as the policy's own acts
                 // are, and its answer is no work of the worker's.
@@ -9375,6 +9588,36 @@ fn said_line(reader: &dyn ScreenReader, rows: &[String], width: Option<usize>) -
         .unwrap_or(1)
         .clamp(1, lines.len());
     lines[lines.len() - wrapped..].join(" ")
+}
+
+/// THE SESSION'S SUBMISSIONS AT `screen` ([`Screen::submits`]) and the mark
+/// of its conversation there: the letters of every row up to the last thing
+/// said ([`last_said_index`], the rows [`point_key`] reads its last few of),
+/// so a footer, a status row or a composer is none of it
+/// ([`crate::supervise::policy::turn_end::screen_mark`]). `None` from a host
+/// that counts none.
+fn submit_mark(screen: &Screen) -> Option<(u64, u64)> {
+    let rows = &screen.rows;
+    let upto = last_said_index(rows).map_or(0, |k| k + 1);
+    screen.submits.map(|n| {
+        (
+            n,
+            super::policy::turn_end::screen_mark(&rows[..upto.min(rows.len())]),
+        )
+    })
+}
+
+/// A TURN ASKED SINCE A POINT WHOSE KEY CANNOT SEE IT: the session's count
+/// at `now` past the one the point was read at (`then`, [`submit_mark`]),
+/// and its conversation drawn since — a prompt answered at once with the
+/// very rows the point's key reads (the same words typed again and answered
+/// the same, the turn before scrolled above them). The look judges it as a
+/// new point; the policy folds it in once
+/// ([`crate::supervise::policy::turn_end::TurnEndReading::submits`]). A
+/// count that moved over the same conversation is a submission not drawn
+/// yet; no count is no evidence.
+fn submitted_over(then: Option<(u64, u64)>, now: &Screen) -> bool {
+    matches!((then, submit_mark(now)), (Some((n0, m0)), Some((n, m))) if n > n0 && m != m0)
 }
 
 /// What makes two review points the same one — never the seq, which any

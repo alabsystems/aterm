@@ -10,6 +10,7 @@
 use std::sync::OnceLock;
 
 /// `C(u)/2 * cos((2x + 1) u pi / 16)`, indexed `[u][x]`.
+#[inline]
 fn basis() -> &'static [[f32; 8]; 8] {
     static BASIS: OnceLock<[[f32; 8]; 8]> = OnceLock::new();
     BASIS.get_or_init(|| {
@@ -78,6 +79,7 @@ pub(crate) fn idct_block(coefficients: &[i32; 64], out: &mut [u8], stride: usize
     }
 }
 
+#[inline]
 fn clamp_sample(value: f32) -> u8 {
     (value + 128.0).round().clamp(0.0, 255.0) as u8
 }

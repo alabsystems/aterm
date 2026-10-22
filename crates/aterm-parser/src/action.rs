@@ -160,6 +160,7 @@ pub trait ActionSink {
     /// - `subparam_mask`: Bitmask where bit `i` is set if `params[i]` is a subparameter
     ///
     /// Default implementation calls `csi_dispatch`, ignoring subparam info.
+    #[inline]
     fn csi_dispatch_with_subparams(
         &mut self,
         params: &Provenance<[u16], Pty>,
@@ -173,11 +174,13 @@ pub trait ActionSink {
     /// An escape sequence has been parsed.
     ///
     /// Default: no-op.
+    #[inline]
     fn esc_dispatch(&mut self, _intermediates: &Provenance<[u8], Pty>, _final_byte: u8) {}
 
     /// An OSC sequence has been parsed.
     ///
     /// Default: no-op.
+    #[inline]
     fn osc_dispatch(&mut self, _params: &Provenance<[&[u8]], Pty>) {}
 
     /// An OSC sequence has been parsed, with terminator type.
@@ -188,6 +191,7 @@ pub trait ActionSink {
     /// terminator in their response (#7548).
     ///
     /// Default delegates to `osc_dispatch` for backward compatibility.
+    #[inline]
     fn osc_dispatch_with_terminator(
         &mut self,
         params: &Provenance<[&[u8]], Pty>,
@@ -199,6 +203,7 @@ pub trait ActionSink {
     /// Start of a DCS sequence.
     ///
     /// Default: no-op.
+    #[inline]
     fn dcs_hook(
         &mut self,
         _params: &Provenance<[u16], Pty>,
@@ -210,12 +215,14 @@ pub trait ActionSink {
     /// Data byte within a DCS sequence.
     ///
     /// Default: no-op.
+    #[inline]
     fn dcs_put(&mut self, _byte: u8) {}
 
     /// Bulk data bytes within a DCS sequence.
     ///
     /// Default falls back to per-byte `dcs_put`. Implementations can
     /// override for better throughput on Sixel, tmux passthrough, etc.
+    #[inline]
     fn dcs_put_bulk(&mut self, data: &Provenance<[u8], Pty>) {
         for &b in data.as_ref() {
             self.dcs_put(b);
@@ -233,6 +240,7 @@ pub trait ActionSink {
     /// byte, before whatever it dispatches.
     ///
     /// Default: no-op.
+    #[inline]
     fn dcs_unhook(&mut self, _canceled: bool) {}
 
     /// Start of an APC (Application Program Command) sequence.
@@ -241,11 +249,13 @@ pub trait ActionSink {
     /// until ST (ESC \ or 0x9C) is received.
     ///
     /// Default: no-op.
+    #[inline]
     fn apc_start(&mut self) {}
 
     /// Data byte within an APC sequence.
     ///
     /// Default: no-op.
+    #[inline]
     fn apc_put(&mut self, _byte: u8) {}
 
     /// Bulk data bytes within an APC sequence.
@@ -253,6 +263,7 @@ pub trait ActionSink {
     /// Default falls back to per-byte `apc_put`. Implementations can
     /// override for better throughput on Kitty graphics payloads, which
     /// stream multi-MB base64 through this path (kitten icat, chafa, timg).
+    #[inline]
     fn apc_put_bulk(&mut self, data: &Provenance<[u8], Pty>) {
         for &b in data.as_ref() {
             self.apc_put(b);
@@ -267,6 +278,7 @@ pub trait ActionSink {
     /// of acting on it, as [`dcs_unhook`](Self::dcs_unhook) does for a DCS.
     ///
     /// Default: no-op.
+    #[inline]
     fn apc_end(&mut self, _canceled: bool) {}
 }
 
@@ -275,16 +287,28 @@ pub trait ActionSink {
 pub struct NullSink;
 
 impl ActionSink for NullSink {
+    #[inline]
     fn print(&mut self, _: char) {}
+    #[inline]
     fn print_ascii_bulk(&mut self, _: &Provenance<[u8], Pty>) {}
+    #[inline]
     fn execute(&mut self, _: u8) {}
+    #[inline]
     fn csi_dispatch(&mut self, _: &Provenance<[u16], Pty>, _: &Provenance<[u8], Pty>, _: u8) {}
+    #[inline]
     fn esc_dispatch(&mut self, _: &Provenance<[u8], Pty>, _: u8) {}
+    #[inline]
     fn osc_dispatch(&mut self, _: &Provenance<[&[u8]], Pty>) {}
+    #[inline]
     fn dcs_hook(&mut self, _: &Provenance<[u16], Pty>, _: &Provenance<[u8], Pty>, _: u8) {}
+    #[inline]
     fn dcs_put(&mut self, _: u8) {}
+    #[inline]
     fn dcs_unhook(&mut self, _: bool) {}
+    #[inline]
     fn apc_start(&mut self) {}
+    #[inline]
     fn apc_put(&mut self, _: u8) {}
+    #[inline]
     fn apc_end(&mut self, _: bool) {}
 }

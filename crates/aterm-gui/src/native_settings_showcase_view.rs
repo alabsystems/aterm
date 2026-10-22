@@ -2109,17 +2109,11 @@ fn list_blocks_for(
     let showcase = &state.showcase;
     let slab = slab_column(state, width, narrow);
     let mut blocks: Vec<(UiNode, f32, Option<String>)> = Vec::new();
+    let reach = showcase.reach_for(query);
     let attention: Vec<&AttentionRow> = showcase
         .attention
         .iter()
-        .filter(|row| {
-            query.is_empty()
-                || crate::native_config_language::candidate_match_score(
-                    &row.id.to_lowercase(),
-                    query,
-                )
-                .is_some()
-        })
+        .filter(|row| super::attention_row_matches(row, query, reach))
         .collect();
     if !attention.is_empty() {
         blocks.push(section_heading(

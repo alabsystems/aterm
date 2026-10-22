@@ -9,8 +9,9 @@
 //! each capped at [`OUTPUT_CAP`], and a kill requested at its cap. A bounded read
 //! also refuses streams that have not answered by then; it never joins a
 //! reader still blocked on a descendant's pipe. The Agents rows' and
-//! the menu bar's document tabs (`App::run_cli_plan`) and the fleet glance's
-//! reader (`fleet_glance::ChildRunner`) are its callers.
+//! the menu bar's document tabs (`App::run_cli_plan`), the fleet glance's
+//! reader (`fleet_glance::ChildRunner`) and the Overview's read of the
+//! fabric's log (`overview_fabric::ChildRunner`) are its callers.
 
 use std::io::Read;
 use std::path::Path;

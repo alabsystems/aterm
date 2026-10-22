@@ -686,7 +686,8 @@ fn an_open_vault_lets_in_every_machine_that_asks_with_no_password() {
     let listed = || client::requests(&admin, None).expect("requests");
     let mut settled = client::Settled::default();
     let approval = Approval::Open;
-    assert!(settled.due(held(&admin), &listed(), approval));
+    let source = client::config(&admin).expect("config").expect("configured");
+    assert!(settled.due(&source, held(&admin), &listed(), approval));
     let done = client::auto_approve(&admin).expect("approve");
     let mut approved = done.approved.clone();
     approved.sort_unstable();
@@ -717,13 +718,13 @@ fn an_open_vault_lets_in_every_machine_that_asks_with_no_password() {
     // The approved requests stay queued: the new version judges them once, as members,
     // publishes nothing, and the approver rests.
     let seq = held(&admin);
-    assert!(settled.due(seq, &listed(), approval));
+    assert!(settled.due(&source, seq, &listed(), approval));
     let again = client::auto_approve(&admin).expect("approve");
     assert!(again.approved.is_empty() && again.code_only.is_empty());
     assert_eq!(again.seq, None);
     assert_eq!(held(&admin), seq);
     settled.settle(again.judged);
-    assert!(!settled.due(held(&admin), &listed(), approval));
+    assert!(!settled.due(&source, held(&admin), &listed(), approval));
 
     // Letting a machine go puts its key on a `code-only` line, so the request mb joined
     // with, still queued, does not let it straight back in, nor does asking again.
@@ -1244,13 +1245,14 @@ fn the_approver_judges_a_corrected_request_at_once_and_rests_once_all_are_judged
         .expect("join"),
         JoinOutcome::Pending { .. }
     ));
-    assert!(settled.due(held(&admin), &listed(), Approval::Password));
+    let source = client::config(&admin).expect("config").expect("configured");
+    assert!(settled.due(&source, held(&admin), &listed(), Approval::Password));
     let refused = client::auto_approve(&admin).expect("approve");
     assert!(refused.approved.is_empty());
     assert_eq!(refused.judged.len(), 1);
     settled.settle(refused.judged);
     assert!(
-        !settled.due(held(&admin), &listed(), Approval::Password),
+        !settled.due(&source, held(&admin), &listed(), Approval::Password),
         "a refused proof is not judged again"
     );
 
@@ -1259,7 +1261,7 @@ fn the_approver_judges_a_corrected_request_at_once_and_rests_once_all_are_judged
     join_with(&machine, &pinned, "mb", Some(password.as_slice())).expect("join");
     assert_eq!(held(&admin), 1, "nothing was published since");
     assert!(
-        settled.due(held(&admin), &listed(), Approval::Password),
+        settled.due(&source, held(&admin), &listed(), Approval::Password),
         "the corrected request is judged"
     );
     let approved = client::auto_approve(&admin).expect("approve");
@@ -1272,7 +1274,7 @@ fn the_approver_judges_a_corrected_request_at_once_and_rests_once_all_are_judged
     // finding mb a machine, and then the approver rests.
     assert!(listed().iter().any(|request| request.host == "mb"));
     assert!(
-        settled.due(held(&admin), &listed(), Approval::Password),
+        settled.due(&source, held(&admin), &listed(), Approval::Password),
         "a new version is judged afresh"
     );
     let member = client::auto_approve(&admin).expect("approve");
@@ -1280,9 +1282,49 @@ fn the_approver_judges_a_corrected_request_at_once_and_rests_once_all_are_judged
     assert_eq!(member.seq, None);
     settled.settle(member.judged);
     assert!(
-        !settled.due(held(&admin), &listed(), Approval::Password),
+        !settled.due(&source, held(&admin), &listed(), Approval::Password),
         "nothing is left to judge"
     );
+
+    // Another open vault at the same sequence can receive the identical request (including
+    // a proof of the old vault's password). Its judgment cannot inherit this vault's rest.
+    let other = Lab::new("other");
+    let other_admin = other.home("other-admin");
+    let created = client::create(&other_admin, &other.url, None, Some("other-admin"))
+        .expect("create other vault");
+    let opened = client::admin_open(&other_admin).expect("open other vault");
+    let mut doc = opened.doc.clone();
+    doc.set_open(true).expect("open admission");
+    doc.set_entry(&Audience::Everyone, "token", b"inert-other")
+        .expect("other token");
+    client::admin_publish(&other_admin, &opened, &doc).expect("publish other seq2");
+    let other_source = client::config(&other_admin)
+        .expect("config")
+        .expect("configured");
+    assert_eq!(held(&other_admin), held(&admin));
+    let request = listed().pop().expect("held member request");
+    let line = format!(
+        "{} {} {} proof={}",
+        request.recipient,
+        request.host,
+        request.code,
+        request.proof.as_deref().expect("its original proof")
+    );
+    transport::post_join(&other.url, &line).expect("same request to other open vault");
+    let waiting = client::requests(&other_admin, None).expect("other queue");
+    assert_eq!(waiting.len(), 1);
+    assert_eq!(waiting[0].recipient, request.recipient);
+    assert_eq!(waiting[0].host, request.host);
+    assert_eq!(waiting[0].proof, request.proof);
+    assert!(!settled.due(&source, held(&admin), &listed(), Approval::Open));
+    assert!(settled.due(&other_source, held(&other_admin), &waiting, Approval::Open));
+    let admitted = client::auto_approve(&other_admin).expect("other approves independently");
+    assert_eq!(admitted.approved, ["mb"]);
+    settled.settle(admitted.judged);
+    assert!(!settled.due(&other_source, 2, &waiting, Approval::Open));
+    join_unattended(&machine, &format!("{}#{}", other.url, created.signer), "mb")
+        .expect("same machine joins other vault");
+    assert_eq!(read(&machine, "token").as_deref(), Some("inert-other"));
 }
 
 #[test]

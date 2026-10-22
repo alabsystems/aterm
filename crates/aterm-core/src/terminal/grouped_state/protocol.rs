@@ -38,7 +38,8 @@ pub(in crate::terminal) struct DcsState {
 }
 
 impl DcsState {
-    pub(in crate::terminal) fn new() -> Self {
+    #[inline]
+    pub(in crate::terminal) const fn new() -> Self {
         Self {
             dcs_type: DcsType::None,
             data: Vec::new(),
@@ -48,6 +49,7 @@ impl DcsState {
     }
 
     /// Reset the in-progress sequence, its buffer and the byte counts.
+    #[inline]
     pub(in crate::terminal) fn reset(&mut self) {
         self.dcs_type = DcsType::None;
         self.data.clear();
@@ -67,6 +69,7 @@ pub(in crate::terminal) struct SixelState {
 }
 
 impl SixelState {
+    #[inline]
     pub(in crate::terminal) fn new() -> Self {
         Self {
             decoder: crate::sixel::SixelDecoder::default(),
@@ -76,6 +79,7 @@ impl SixelState {
     }
 
     /// Reset the decoder, the pending image and the ID counter.
+    #[inline]
     pub(in crate::terminal) fn reset(&mut self) {
         *self = Self::new();
     }

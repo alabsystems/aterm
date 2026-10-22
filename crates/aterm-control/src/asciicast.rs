@@ -47,7 +47,8 @@ pub enum CastEvent<D> {
 impl<D> CastEvent<D> {
     /// The event's timestamp.
     #[must_use]
-    pub fn t(&self) -> f64 {
+    #[inline]
+    pub const fn t(&self) -> f64 {
         match self {
             CastEvent::Output { t, .. } | CastEvent::Resize { t, .. } => *t,
         }
@@ -116,7 +117,8 @@ impl CastHeader {
     /// rows hand-back for no key and 0, and the newest law this aterm knows for
     /// a value only a newer one writes.
     #[must_use]
-    pub fn laws_named(value: Option<u64>) -> &'static [ResizeLaw] {
+    #[inline]
+    pub const fn laws_named(value: Option<u64>) -> &'static [ResizeLaw] {
         match value {
             None | Some(0) => &[ResizeLaw::Undo],
             Some(value) => match ResizeLaw::from_header(value) {

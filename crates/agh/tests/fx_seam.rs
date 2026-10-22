@@ -1131,12 +1131,40 @@ fn a_finished_sink_writes_no_record_after_the_exit() {
 #[test]
 fn a_sink_never_writes_a_tape_a_replay_would_refuse_for_its_size() {
     let dir = scratch("fx");
+    let header = header(&["release", "list", "o/r"]);
+    let head = tape::render(&header, &[]);
+    let header_size = u64::try_from(head.len()).expect("a header fits u64");
+    let short = tape_path(dir.path(), "short-header");
+    let refused = match TapeSink::create_within(&short, &header, header_size - 1) {
+        Ok(_) => panic!("a header larger than the bound must be refused"),
+        Err(error) => error,
+    };
+    assert_eq!(
+        (refused.kind, refused.sub.clone()),
+        (Kind::CouldNotRun, Sub::Local)
+    );
+    assert!(!short.exists(), "refused before creating the file");
+
+    let exact = tape_path(dir.path(), "exact-header");
+    let sink =
+        TapeSink::create_within(&exact, &header, header_size).expect("the header fits exactly");
+    assert_eq!(std::fs::read(&exact).expect("the tape"), head.as_bytes());
+    assert_eq!(sink.failed(), None);
+    sink.finish().expect("the header at the bound is durable");
+    assert_eq!(
+        tape::parse(&std::fs::read_to_string(&exact).expect("the tape")).expect("a tape"),
+        (header.clone(), Vec::new())
+    );
+
     let path = tape_path(dir.path(), "big");
-    let sink = TapeSink::create(&path, &header(&["release", "list", "o/r"])).expect("a sink");
+    // The bound a test can reach in kilobytes (`TapeSink::create_within`; `create`'s is
+    // `TAPE_MAX`, the most a replay reads).
+    const MAX: u64 = 16 << 10;
+    let sink = TapeSink::create_within(&path, &header, MAX).expect("a sink");
     sink.append(&EffectRecord::Mono(1));
     // Each control byte is written `\x01`, four bytes: this one record would take the file
-    // past `TAPE_MAX`.
-    let quarter = usize::try_from(tape::TAPE_MAX / 4).expect("fits") + 1;
+    // past the bound, though its own bytes are a quarter of it.
+    let quarter = usize::try_from(MAX / 4).expect("fits") + 1;
     sink.append(&EffectRecord::Emit {
         door: DOOR_STDOUT.to_string(),
         bytes: vec![1; quarter],
@@ -1144,7 +1172,7 @@ fn a_sink_never_writes_a_tape_a_replay_would_refuse_for_its_size() {
     assert!(sink.failed().is_some());
     sink.append(&EffectRecord::Mono(2));
     let size = std::fs::metadata(&path).expect("the tape").len();
-    assert!(size <= tape::TAPE_MAX, "{size}");
+    assert!(size <= MAX, "{size}");
     let text = std::fs::read_to_string(&path).expect("the tape");
     assert_eq!(
         tape::parse(&text).expect("a tape").1,

@@ -5,7 +5,8 @@
 //! `defaults` client; the recovery journal contains only the keys this profile owns.
 
 use aterm_json::{Value, json};
-use aterm_machines::init::WorkstationGroup;
+use aterm_machines::init::{Hold, Workstation, WorkstationGroup};
+use aterm_machines::port::{Cmd, System};
 use aterm_machines::{model::PValue, plist};
 use aterm_types::macos_setup::{Selection, Setting};
 
@@ -270,6 +271,25 @@ pub fn apply_on_first_run() -> Result<Option<Report>, String> {
 }
 
 fn apply_on_first_run_at(root: &Path) -> Result<Option<Report>, String> {
+    let sys = aterm_machines::port::Live::new();
+    apply_on_first_run_with(
+        root,
+        &sys,
+        &mut NativeHost::new(),
+        &aterm_types::version::build_id(),
+        std::time::SystemTime::now(),
+    )
+}
+
+/// [`apply_on_first_run_at`] on `sys` and `host`, as `build` at `now`: what each tick of
+/// the System State worker runs.
+fn apply_on_first_run_with(
+    root: &Path,
+    sys: &dyn System,
+    host: &mut dyn Host,
+    build: &str,
+    now: std::time::SystemTime,
+) -> Result<Option<Report>, String> {
     if first_run_complete(root)? {
         return Ok(None);
     }
@@ -281,15 +301,14 @@ fn apply_on_first_run_at(root: &Path) -> Result<Option<Report>, String> {
         authorize_automatic_setup_at(root, selected)?;
         return Ok(None);
     }
-    let sys = aterm_machines::port::Live::new();
     let accounts_selected =
         selected.contains(Setting::Messages) || selected.contains(Setting::FaceTime);
     let accessibility = if accounts_selected {
-        aterm_machines::init_accounts::accessibility_ready(&sys).ok()
+        aterm_machines::init_accounts::accessibility_ready(sys).ok()
     } else {
         None
     };
-    if !automatic_retry_due(root, accessibility)? {
+    if !automatic_retry_due(root, accessibility, now)? {
         return Ok(None);
     }
     write_json(
@@ -303,7 +322,7 @@ fn apply_on_first_run_at(root: &Path) -> Result<Option<Report>, String> {
         && !consent
             .try_exists()
             .map_err(|e| format!("{}: {e}", consent.display()))?
-        && aterm_machines::init_accounts::accessibility_needed_selected(&sys, selected)
+        && aterm_machines::init_accounts::accessibility_needed_selected(sys, selected)
             .unwrap_or(false)
     {
         // Record the request before showing native consent. Crashes and the
@@ -312,11 +331,12 @@ fn apply_on_first_run_at(root: &Path) -> Result<Option<Report>, String> {
             &consent,
             &json!({ "profile": PROFILE, "state": "requested" }),
         )?;
-        if let Err(detail) = aterm_machines::init_accounts::request_accessibility(&sys) {
+        if let Err(detail) = aterm_machines::init_accounts::request_accessibility(sys) {
             request_failure = Some(detail);
         }
     }
-    let mut report = execute(&mut NativeHost::selected(selected), root, Action::Apply)?;
+    host.select(selected);
+    let mut report = automatic_pass(host, root, build, now)?;
     if report.needs_attention()
         && let Some(detail) = request_failure
     {
@@ -462,7 +482,11 @@ fn first_run_complete_with_flush(
 // A permission refusal should not reopen account settings on each launch. An
 // explicit --apply always retries; automatic setup retries after a short crash
 // cooldown, or immediately when Accessibility permission changed.
-fn automatic_retry_due(root: &Path, accessibility: Option<bool>) -> Result<bool, String> {
+fn automatic_retry_due(
+    root: &Path,
+    accessibility: Option<bool>,
+    now: std::time::SystemTime,
+) -> Result<bool, String> {
     let path = root.join("automatic-attempt.json");
     let bytes = match std::fs::read(&path) {
         Ok(bytes) => bytes,
@@ -477,11 +501,209 @@ fn automatic_retry_due(root: &Path, accessibility: Option<bool>) -> Result<bool,
     if marker["accessibility_ready"].as_bool() != accessibility {
         return Ok(true);
     }
-    let age = std::fs::metadata(&path)
-        .and_then(|m| m.modified())
-        .map_err(|e| format!("{}: {e}", path.display()))?
-        .elapsed();
+    let age = now.duration_since(
+        std::fs::metadata(&path)
+            .and_then(|m| m.modified())
+            .map_err(|e| format!("{}: {e}", path.display()))?,
+    );
     Ok(age.map_or(true, |age| age >= std::time::Duration::from_secs(60)))
+}
+
+/// What a held item's row says once its automatic tries are spent ([`Host::hold`]).
+const HELD: &str = "aterm tried this by itself and it did not take, so it will not try again on its own; Apply in System State, or run aterm doctor --apply, to try again";
+
+/// What it says between its first automatic try and its last ([`SECOND_TRY_AFTER`]).
+const WAITING: &str = "aterm tried this by itself and it did not take; it tries once more on its own ten minutes later; Apply in System State, or run aterm doctor --apply, to try now";
+
+/// What a setting says that an automatic pass of this run found as wanted, and that has
+/// changed since: the person's change, which setup leaves alone.
+const SETTLED: &str = "aterm set this once in this setup and it has changed since, so setup leaves it; Apply in System State, or run aterm doctor --apply, to set it again";
+
+/// How many times an automatic pass of one build makes a change that does not verify.
+const TRIES: u32 = 2;
+
+/// How long after a try that did not verify the next one may come: a failure that clears
+/// by itself (an app slow to quit, a read that timed out) gets its second try, and one
+/// that stands disrupts the person twice, not every minute.
+const SECOND_TRY_AFTER: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+
+/// How many builds' failed tries the record keeps: two aterm builds taking turns on one
+/// state root (an installed app and a dev bundle, an update beside its predecessor) each
+/// spend their own tries, and neither re-arms the other's.
+const HELD_BUILDS: usize = 16;
+
+/// The record of what this run's automatic passes did by themselves ([`automatic_pass`]).
+const HELD_RECORD: &str = "automatic-held.json";
+
+/// One unattended pass. An item an earlier automatic pass of this setup run found as
+/// wanted, made or not, is left as it is, so a change the person made since is theirs.
+/// An item whose automatic change did not verify is made at most [`TRIES`] times per
+/// build, the second [`SECOND_TRY_AFTER`] the first, and held in between and after. A
+/// retry on the worker's timer then makes no change it made before. A new run (System
+/// State's Apply, a restart of the plan) starts afresh; an explicit `doctor --apply`
+/// holds nothing.
+fn automatic_pass(
+    host: &mut dyn Host,
+    root: &Path,
+    build: &str,
+    now: std::time::SystemTime,
+) -> Result<Report, String> {
+    let revision = initial::revision_at(root)?;
+    let now = now
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| since.as_secs());
+    let mut record = Automatic::load(root, revision)?;
+    host.hold(&record.holds(build, now));
+    let pass = execute_pass(host, root, Action::Apply)?;
+    if record.add(build, now, &pass) {
+        record.save(root, revision)?;
+    }
+    Ok(pass.report)
+}
+
+/// What one setup run's automatic passes did ([`HELD_RECORD`]).
+#[derive(Debug, Default, PartialEq, Eq)]
+struct Automatic {
+    /// The items an automatic pass found as wanted, by its change or as they were.
+    settled: Vec<String>,
+    /// The tries whose change did not verify, per item and build.
+    failed: Vec<Failed>,
+}
+
+/// One item's tries in one build that did not verify.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Failed {
+    item: String,
+    build: String,
+    tries: u32,
+    /// The last try, in seconds since the epoch.
+    at: u64,
+}
+
+impl Automatic {
+    /// The record of setup run `revision`; an empty one for another run.
+    fn load(root: &Path, revision: u64) -> Result<Self, String> {
+        let path = root.join(HELD_RECORD);
+        let bytes = match std::fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Self::default()),
+            Err(e) => return Err(format!("{}: {e}", path.display())),
+        };
+        let record: Value = aterm_json::from_slice(&bytes)
+            .map_err(|e| format!("held automatic setup items: {e}"))?;
+        if record["profile"].as_str() != Some(PROFILE) {
+            return Err("unrecognized held automatic setup profile".into());
+        }
+        if record["revision"].as_u64() != Some(revision) {
+            return Ok(Self::default());
+        }
+        let bad = || "held automatic setup items are unreadable".to_owned();
+        let settled = record["settled"]
+            .as_array()
+            .ok_or_else(bad)?
+            .iter()
+            .map(|item| item.as_str().map(str::to_owned).ok_or_else(bad))
+            .collect::<Result<_, _>>()?;
+        let failed = record["failed"]
+            .as_array()
+            .ok_or_else(bad)?
+            .iter()
+            .map(|entry| {
+                Ok(Failed {
+                    item: entry["item"].as_str().ok_or_else(bad)?.to_owned(),
+                    build: entry["build"].as_str().ok_or_else(bad)?.to_owned(),
+                    tries: entry["tries"]
+                        .as_u64()
+                        .and_then(|tries| u32::try_from(tries).ok())
+                        .ok_or_else(bad)?,
+                    at: entry["at"].as_u64().ok_or_else(bad)?,
+                })
+            })
+            .collect::<Result<_, String>>()?;
+        Ok(Self { settled, failed })
+    }
+
+    fn save(&self, root: &Path, revision: u64) -> Result<(), String> {
+        let failed: Vec<Value> = self
+            .failed
+            .iter()
+            .map(|f| json!({ "item": f.item, "build": f.build, "tries": f.tries, "at": f.at }))
+            .collect();
+        write_json(
+            &root.join(HELD_RECORD),
+            &json!({
+                "profile": PROFILE, "revision": revision,
+                "settled": self.settled, "failed": failed,
+            }),
+        )
+    }
+
+    /// What a pass of `build` at `now` leaves alone, and how.
+    fn holds(&self, build: &str, now: u64) -> Vec<(String, Hold)> {
+        let mut holds: Vec<(String, Hold)> = self
+            .settled
+            .iter()
+            .map(|item| (item.clone(), Hold::AsIs(SETTLED.into())))
+            .collect();
+        for failed in self.failed.iter().filter(|f| f.build == build) {
+            let why = if failed.tries >= TRIES {
+                HELD
+            } else if now < failed.at.saturating_add(SECOND_TRY_AFTER.as_secs()) {
+                WAITING
+            } else {
+                continue;
+            };
+            holds.push((failed.item.clone(), Hold::Back(why.into())));
+        }
+        holds
+    }
+
+    /// Add what a pass of `build` at `now` did; whether the record changed.
+    fn add(&mut self, build: &str, now: u64, pass: &Pass) -> bool {
+        let before = (self.settled.len(), self.failed.clone());
+        for item in &pass.settled {
+            if !self.settled.contains(item) {
+                self.settled.push(item.clone());
+            }
+        }
+        for item in &pass.unverified {
+            match self
+                .failed
+                .iter_mut()
+                .find(|f| f.item == *item && f.build == build)
+            {
+                Some(failed) => {
+                    failed.tries = failed.tries.saturating_add(1);
+                    failed.at = now;
+                }
+                None => self.failed.push(Failed {
+                    item: item.clone(),
+                    build: build.to_owned(),
+                    tries: 1,
+                    at: now,
+                }),
+            }
+        }
+        let settled = &self.settled;
+        self.failed.retain(|f| !settled.contains(&f.item));
+        // The builds that tried last keep their record.
+        let mut builds: Vec<(u64, &str)> = Vec::new();
+        for failed in &self.failed {
+            match builds.iter_mut().find(|(_, build)| *build == failed.build) {
+                Some((at, _)) => *at = (*at).max(failed.at),
+                None => builds.push((failed.at, failed.build.as_str())),
+            }
+        }
+        if builds.len() > HELD_BUILDS {
+            builds.sort_by_key(|(at, _)| std::cmp::Reverse(*at));
+            let kept: Vec<String> = builds[..HELD_BUILDS]
+                .iter()
+                .map(|(_, build)| (*build).to_owned())
+                .collect();
+            self.failed.retain(|f| kept.contains(&f.build));
+        }
+        (self.settled.len(), &self.failed) != (before.0, &before.1)
+    }
 }
 
 fn state_root() -> Result<PathBuf, String> {
@@ -717,47 +939,112 @@ trait Host {
     fn selection(&self) -> Selection {
         Selection::all().workstation()
     }
+    /// Make later passes run the settings `selected` checks (its workstation part).
+    fn select(&mut self, selected: Selection);
     fn read(&mut self, target: &Target) -> Result<Option<PValue>, String>;
     fn write(&mut self, target: &Target, value: Option<&PValue>) -> Result<(), String>;
     fn preference_changes(&mut self) -> Result<Vec<Saved>, String>;
-    fn attempted_preferences(&mut self) -> Vec<Saved>;
+    /// The items whose change the apply passes since the last call reached, in run order.
+    fn attempts(&mut self) -> Vec<Attempt>;
+    /// The items the apply passes since the last call left as wanted: already so, made
+    /// so, or not applicable here.
+    fn settled(&mut self) -> Vec<String>;
+    /// Leave `items` alone in later passes, each as its [`Hold`] says: nothing of one is
+    /// changed, backed up, relaunched or journaled.
+    fn hold(&mut self, items: &[(String, Hold)]);
+    /// Record a change in the run's converge journal before it is made (design §3.3 of
+    /// docs/DESIGN-init-system-2026-10-20.md). The caller says what a refusal means.
+    fn journal(
+        &mut self,
+        id: &str,
+        from: &str,
+        to: &str,
+        revert: Option<&str>,
+    ) -> Result<(), String>;
     fn restart(&mut self, name: &str) -> Result<(), String>;
     fn workstation(&mut self, group: WorkstationGroup, apply: bool) -> Result<Vec<Row>, String>;
     fn restore_runtime(&mut self, saved: &[Saved]) -> Vec<Row>;
 }
 
+/// One item whose change an apply pass reached.
+#[derive(Clone)]
+struct Attempt {
+    /// The shared item's id (`init.dock@<user>`).
+    item: String,
+    /// Whether its read-back verified the change.
+    verified: bool,
+    /// The before-images of the preference keys it was about to change.
+    preferences: Vec<Saved>,
+}
+
+/// The shared items of one group's pass: [`aterm_machines::init::prepare_workstation_selected`]
+/// on a Mac, a test's own items in a test.
+type Prepare =
+    Box<dyn FnMut(&dyn System, WorkstationGroup, Selection) -> Result<Workstation, String>>;
+
+/// The `defaults` client every preference read and write of the doctor's own runs.
+const DEFAULTS: &str = "/usr/bin/defaults";
+
+/// The doctor's host: the shared engine's items, and the doctor's own reads, writes,
+/// relaunches and journal lines, all on one [`System`].
 struct NativeHost {
+    sys: Box<dyn System>,
+    prepare: Prepare,
     selected: Selection,
     domains: BTreeMap<(String, bool), plist::Entries>,
-    prepared: Option<aterm_machines::init::Workstation>,
-    attempted: Vec<Saved>,
+    prepared: Option<Workstation>,
+    attempts: Vec<Attempt>,
+    settled: Vec<String>,
+    held: Vec<(String, Hold)>,
 }
 
 impl NativeHost {
+    /// The profile on this Mac.
     fn new() -> Self {
-        Self::selected(Selection::all().workstation())
+        Self::over(
+            Box::new(aterm_machines::port::Live::new()),
+            Box::new(aterm_machines::init::prepare_workstation_selected),
+        )
     }
 
+    /// The settings `selected` checks, on this Mac.
     fn selected(selected: Selection) -> Self {
+        let mut host = Self::new();
+        host.selected = selected.workstation();
+        host
+    }
+
+    /// The profile on `sys`, its items from `prepare`.
+    fn over(sys: Box<dyn System>, prepare: Prepare) -> Self {
         Self {
-            selected: selected.workstation(),
+            sys,
+            prepare,
+            selected: Selection::all().workstation(),
             domains: BTreeMap::new(),
             prepared: None,
-            attempted: Vec::new(),
+            attempts: Vec::new(),
+            settled: Vec::new(),
+            held: Vec::new(),
         }
+    }
+
+    /// `group`'s pass, leaving alone what this host holds.
+    fn prepare(&mut self, group: WorkstationGroup) -> Result<Workstation, String> {
+        let mut prepared = (self.prepare)(self.sys.as_ref(), group, self.selected)?;
+        prepared.hold(&self.held);
+        Ok(prepared)
     }
 
     fn entries(&mut self, domain: &str, host: bool) -> Result<&plist::Entries, String> {
         let cache_key = (domain.to_owned(), host);
         if !self.domains.contains_key(&cache_key) {
-            let mut args = Vec::new();
+            let mut export = Cmd::new(DEFAULTS);
             if host {
-                args.push("-currentHost".into());
+                export = export.arg("-currentHost");
             }
-            args.extend(["export".into(), domain.into(), "-".into()]);
-            let out = tool("/usr/bin/defaults", &args)?;
-            self.domains
-                .insert(cache_key.clone(), plist::parse_domain(&out)?);
+            let export = export.args(["export", domain, "-"]);
+            let entries = aterm_machines::items::defaults::read_domain(self.sys.as_ref(), &export)?;
+            self.domains.insert(cache_key.clone(), entries);
         }
         self.domains
             .get(&cache_key)
@@ -769,20 +1056,35 @@ impl Host for NativeHost {
     fn selection(&self) -> Selection {
         self.selected
     }
-    fn attempted_preferences(&mut self) -> Vec<Saved> {
-        std::mem::take(&mut self.attempted)
+    fn select(&mut self, selected: Selection) {
+        self.selected = selected.workstation();
+        self.prepared = None;
+    }
+    fn attempts(&mut self) -> Vec<Attempt> {
+        std::mem::take(&mut self.attempts)
+    }
+    fn settled(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.settled)
+    }
+    fn hold(&mut self, items: &[(String, Hold)]) {
+        self.held = items.to_vec();
+    }
+    fn journal(
+        &mut self,
+        id: &str,
+        from: &str,
+        to: &str,
+        revert: Option<&str>,
+    ) -> Result<(), String> {
+        // The journal the shared items write through: one run, one record.
+        self.sys.journal()?.before_change(id, from, to, revert)
     }
     fn preference_changes(&mut self) -> Result<Vec<Saved>, String> {
         use aterm_machines::items::defaults::Scope;
         use aterm_machines::model::Read;
-        let sys = aterm_machines::port::Live::new();
-        let mut prepared = aterm_machines::init::prepare_workstation_selected(
-            &sys,
-            WorkstationGroup::Preferences,
-            self.selected,
-        )?;
+        let mut prepared = self.prepare(WorkstationGroup::Preferences)?;
         let changes = prepared
-            .preference_changes(&sys)?
+            .preference_changes(self.sys.as_ref())?
             .into_iter()
             .map(|(target, read)| {
                 if target.scope == Scope::System {
@@ -818,80 +1120,95 @@ impl Host for NativeHost {
     }
 
     fn write(&mut self, target: &Target, value: Option<&PValue>) -> Result<(), String> {
-        let mut args = Vec::new();
-        if target.host {
-            args.push("-currentHost".into());
-        }
-        args.extend([
-            if value.is_some() { "write" } else { "delete" }.into(),
-            target.domain.clone(),
-            target.key.clone(),
-        ]);
-        if let Some(value) = value {
-            args.push(plist::fragment(value));
-        }
         // A timed-out or failed client may already have changed cfprefsd's
         // value. Rollback must reread the machine, never the before-image cache.
         self.domains.remove(&(target.domain.clone(), target.host));
-        tool("/usr/bin/defaults", &args)?;
-        Ok(())
+        let verb = if value.is_some() { "write" } else { "delete" };
+        let failed = |why: String| format!("{DEFAULTS} {verb} {}: {why}", target.describe());
+        let ran = self
+            .sys
+            .run(&defaults_cmd(target, value))
+            .map_err(|e| failed(e.to_string()))?;
+        if ran.success() {
+            Ok(())
+        } else {
+            Err(failed(ran.describe()))
+        }
     }
 
     fn restart(&mut self, name: &str) -> Result<(), String> {
         let uid = aterm_uds::peer::our_uid().to_string();
         // An absent process needs no restart. killall's only expected failure is 1.
-        let out = tool_output("/usr/bin/killall", &["-u".into(), uid, name.into()])?;
-        if out.status.success() || out.status.code() == Some(1) {
-            Ok(())
-        } else {
-            Err(format!(
-                "restart {name}: {}",
-                String::from_utf8_lossy(&out.stderr).trim()
-            ))
+        // The caller journals the relaunch first (`refresh`).
+        let killall = Cmd::new("/usr/bin/killall").args(["-u", uid.as_str(), name]);
+        match self.sys.run(&killall) {
+            Ok(ran) if ran.success() || ran.status == Some(1) => Ok(()),
+            Ok(ran) => Err(format!("restart {name}: {}", ran.describe())),
+            Err(e) => Err(format!("restart {name}: {e}")),
         }
     }
 
     fn workstation(&mut self, group: WorkstationGroup, apply: bool) -> Result<Vec<Row>, String> {
         use aterm_machines::model::{Mode, Outcome};
         let mode = if apply { Mode::Apply } else { Mode::Plan };
-        let sys = aterm_machines::port::Live::new();
-        let prepared = if group == WorkstationGroup::Preferences {
-            match self.prepared.take() {
-                Some(prepared) => prepared,
-                None => {
-                    aterm_machines::init::prepare_workstation_selected(&sys, group, self.selected)?
-                }
-            }
+        let prepared = if group == WorkstationGroup::Preferences
+            && let Some(prepared) = self.prepared.take()
+        {
+            prepared
         } else {
-            aterm_machines::init::prepare_workstation_selected(&sys, group, self.selected)?
+            self.prepare(group)?
         };
         self.domains.clear();
-        let rows = if apply && group == WorkstationGroup::Preferences {
+        let rows = if apply {
             use aterm_machines::items::defaults::Scope;
             use aterm_machines::model::Read;
-            let result = prepared.run_recording(&sys, mode)?;
-            self.attempted = result
-                .attempted_preferences
+            let result = prepared.run_recording(self.sys.as_ref(), mode)?;
+            let attempts = result
+                .attempts
                 .into_iter()
-                .map(|(target, read)| {
-                    let value = match read {
-                        Read::Absent => None,
-                        Read::Value(value) => Some(value),
-                        Read::Unusable(why) => return Err(why),
-                    };
-                    Ok(Saved {
-                        target: Target {
-                            domain: target.domain,
-                            key: target.key,
-                            host: target.scope == Scope::Host,
-                        },
-                        value,
+                .map(|attempt| {
+                    let preferences = attempt
+                        .preferences
+                        .into_iter()
+                        .map(|(target, read)| {
+                            let value = match read {
+                                Read::Absent => None,
+                                Read::Value(value) => Some(value),
+                                Read::Unusable(why) => return Err(why),
+                            };
+                            Ok(Saved {
+                                target: Target {
+                                    domain: target.domain,
+                                    key: target.key,
+                                    host: target.scope == Scope::Host,
+                                },
+                                value,
+                            })
+                        })
+                        .collect::<Result<Vec<_>, String>>()?;
+                    Ok(Attempt {
+                        item: attempt.id,
+                        verified: attempt.verified,
+                        preferences,
                     })
                 })
                 .collect::<Result<Vec<_>, String>>()?;
+            self.attempts.extend(attempts);
+            self.settled.extend(
+                result
+                    .rows
+                    .iter()
+                    .filter(|row| {
+                        matches!(
+                            row.outcome,
+                            Outcome::Ok | Outcome::Changed | Outcome::NotApplicable
+                        )
+                    })
+                    .map(|row| row.id.clone()),
+            );
             result.rows
         } else {
-            prepared.run(&sys, mode)?
+            prepared.run(self.sys.as_ref(), mode)?
         };
         self.domains.clear();
         Ok({
@@ -919,7 +1236,6 @@ impl Host for NativeHost {
     }
 
     fn restore_runtime(&mut self, saved: &[Saved]) -> Vec<Row> {
-        use aterm_machines::port::System as _;
         let mut rows = Vec::new();
         if let Some(original) = saved.iter().find(|s| {
             !s.target.host
@@ -933,9 +1249,27 @@ impl Host for NativeHost {
                 _ => None,
             };
             if let Some(value) = value {
-                let sys = aterm_machines::port::Live::new();
-                let result = sys.set_natural_scrolling(value).and_then(|()| {
-                    if sys.natural_scrolling()? == value {
+                let shown = |natural: bool| {
+                    format!("natural scrolling {}", if natural { "on" } else { "off" })
+                };
+                let now = self
+                    .sys
+                    .natural_scrolling()
+                    .map_or_else(|_| "natural scrolling as this setup left it".into(), shown);
+                // A live setting has no command that undoes it; its saved preference
+                // (restored and journaled before this) is what a revert rewrites. A
+                // refused line does not keep the original from coming back.
+                let id = "doctor.restore.natural-scrolling";
+                if let Err(why) = self.journal(
+                    id,
+                    &now,
+                    &format!("{}, as before this setup", shown(value)),
+                    None,
+                ) {
+                    rows.push(journal_refused(&[format!("{id}: {why}")]));
+                }
+                let result = self.sys.set_natural_scrolling(value).and_then(|()| {
+                    if self.sys.natural_scrolling()? == value {
                         Ok(())
                     } else {
                         Err("the original scroll direction did not activate".into())
@@ -969,25 +1303,17 @@ impl Host for NativeHost {
     }
 }
 
-fn tool_output(program: &str, args: &[String]) -> Result<std::process::Output, String> {
-    let mut cmd = aterm_uds::spawnfd::command(program);
-    cmd.args(args).env("LC_ALL", "C");
-    aterm_uds::deadline::output_until(
-        &mut cmd,
-        std::time::Instant::now() + std::time::Duration::from_secs(60),
-    )
-    .map_err(|e| format!("{program}: {e}"))
-}
-
-fn tool(program: &str, args: &[String]) -> Result<Vec<u8>, String> {
-    let out = tool_output(program, args)?;
-    if out.status.success() {
-        Ok(out.stdout)
-    } else {
-        Err(format!(
-            "{program}: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        ))
+/// The row that says the journal refused the lines of changes made anyway: each puts back
+/// an original, or relaunches what reads one, and leaving it undone would keep aterm's
+/// own change in place.
+fn journal_refused(refused: &[String]) -> Row {
+    Row {
+        name: "Change journal".into(),
+        status: "error".into(),
+        detail: format!(
+            "the journal refused the record of what was put back or relaunched anyway: {}",
+            refused.join("; ")
+        ),
     }
 }
 
@@ -1052,10 +1378,26 @@ fn write_json(path: &Path, value: &Value) -> Result<(), String> {
     write_json_with_flush(path, value, durable_directory)
 }
 
+#[cfg(not(test))]
 fn durable_directory(directory: &Path) -> std::io::Result<()> {
     use aterm_machines::port::System as _;
     let sys = aterm_machines::port::Live::new();
     sys.durable_dir(directory)
+}
+
+/// [`durable_directory`] under this crate's own unit tests: a plain `fsync(2)`
+/// ([`aterm_durable::seam::durable_fsync`], which the counting seam records as durable)
+/// in place of `F_FULLFSYNC`. It is still a real flush of the same directory at the same
+/// point, so a test sees the same files, renames and errors; what it drops is the
+/// drive-cache barrier, which only orders the disk against a power loss and holds up
+/// most flushes, creates and renames on the volume while it runs
+/// (`docs/measured/flush-wait-2026-10-21.md`). A record's flush walks every ancestor of
+/// its directory, so the setup tests' fault sweeps made one full flush per ancestor per
+/// write: alone, `every_owned_write_boundary_recovers_the_same_revision_including_mismatched_prefixes`
+/// took 19.3 s wall for 0.39 s CPU, and the whole `--lib` run 14.1-14.2 s.
+#[cfg(test)]
+fn durable_directory(directory: &Path) -> std::io::Result<()> {
+    aterm_durable::seam::durable_fsync(&std::fs::File::open(directory)?)
 }
 
 fn flush_record_with(
@@ -1120,6 +1462,28 @@ fn append_workstation(
 }
 
 fn execute(host: &mut dyn Host, root: &Path, action: Action) -> Result<Report, String> {
+    execute_pass(host, root, action).map(|pass| pass.report)
+}
+
+/// A profile pass's report, the items whose change it reached without verifying, and
+/// the items it left as wanted.
+struct Pass {
+    report: Report,
+    unverified: Vec<String>,
+    settled: Vec<String>,
+}
+
+impl From<Report> for Pass {
+    fn from(report: Report) -> Self {
+        Self {
+            report,
+            unverified: Vec::new(),
+            settled: Vec::new(),
+        }
+    }
+}
+
+fn execute_pass(host: &mut dyn Host, root: &Path, action: Action) -> Result<Pass, String> {
     let backup = root.join("original-preferences.json");
     let mut report = Report {
         action,
@@ -1128,7 +1492,7 @@ fn execute(host: &mut dyn Host, root: &Path, action: Action) -> Result<Report, S
         backup,
     };
     if action == Action::Restore {
-        return restore(host, root, report);
+        return restore(host, root, report).map(Pass::from);
     }
     if host.selection().is_empty() {
         if action == Action::Apply {
@@ -1142,7 +1506,7 @@ fn execute(host: &mut dyn Host, root: &Path, action: Action) -> Result<Report, S
             status: "ok".into(),
             detail: "no settings selected; macOS was left unchanged".into(),
         });
-        return Ok(report);
+        return Ok(report.into());
     }
     let full_profile = host.selection().workstation() == Selection::all().workstation();
     // Subset passes leave the legacy full-profile activation obligation intact:
@@ -1163,7 +1527,7 @@ fn execute(host: &mut dyn Host, root: &Path, action: Action) -> Result<Report, S
             });
         }
         append_workstation(host, WorkstationGroup::All, false, &mut report);
-        return Ok(report);
+        return Ok(report.into());
     }
     let mut saved = load_backup(&report.backup)?;
     let before = if WorkstationGroup::Preferences
@@ -1200,21 +1564,67 @@ fn execute(host: &mut dyn Host, root: &Path, action: Action) -> Result<Report, S
         &json!({ "profile": PROFILE, "state": "pending" }),
     )?;
     append_workstation(host, WorkstationGroup::Preferences, true, &mut report);
-    if report.needs_attention() {
+    // Each item settles alone. One whose change did not verify puts back only its own
+    // keys; one that verified keeps its change, so the next pass finds it done instead
+    // of making it again. A row that changed nothing (blocked, deferred, unreadable,
+    // held) undoes nothing. Undoing every item for one failure made each retry re-apply
+    // the rest and relaunch their consumers: the pass never settled.
+    let attempts = host.attempts();
+    let mut settled = host.settled();
+    let mut unverified: Vec<String> = attempts
+        .iter()
+        .filter(|attempt| !attempt.verified)
+        .map(|attempt| attempt.item.clone())
+        .collect();
+    let rollback: Vec<Saved> = attempts
+        .into_iter()
+        .filter(|attempt| !attempt.verified)
+        .flat_map(|attempt| attempt.preferences)
+        .collect();
+    // An older pass's activation record, and the keys this rollback rewrote: an item
+    // that verified activated its own writes, and nothing else changed.
+    let mut reload = previous_activation;
+    if !rollback.is_empty() {
         let mut errors = Vec::new();
-        let attempted = host.attempted_preferences();
-        for previous in attempted.iter().rev() {
-            if let Err(error) = restore_one(host, &previous.target, previous.value.as_ref()) {
-                errors.push(format!("rollback {}: {error}", previous.target.describe()));
+        let mut restored = Vec::new();
+        let mut refused = Vec::new();
+        for previous in rollback.iter().rev() {
+            let wrote = match restore_one(
+                host,
+                &previous.target,
+                previous.value.as_ref(),
+                &mut refused,
+            ) {
+                Ok(wrote) => {
+                    if wrote {
+                        restored.push(previous.target.describe());
+                    }
+                    wrote
+                }
+                Err((wrote, error)) => {
+                    errors.push(format!("rollback {}: {error}", previous.target.describe()));
+                    wrote
+                }
+            };
+            if wrote && !reload.contains(&previous.target) {
+                reload.push(previous.target.clone());
             }
         }
-        for row in &mut report.rows {
-            if row.status == "applied" {
-                row.status = "unverified".into();
-                row.detail = "the preference pass failed; recovery results follow".into();
-            }
+        if !restored.is_empty() {
+            restored.reverse();
+            report.rows.push(Row {
+                name: "Preference rollback".into(),
+                status: "restored".into(),
+                detail: format!(
+                    "the value before this pass is back for what did not verify: {}",
+                    restored.join(", ")
+                ),
+            });
         }
-        report.rows.extend(host.restore_runtime(&attempted));
+        if !refused.is_empty() {
+            report.rows.push(journal_refused(&refused));
+        }
+        report.rows.extend(host.restore_runtime(&rollback));
         if !errors.is_empty() {
             report.rows.push(Row {
                 name: "Preference rollback".into(),
@@ -1222,43 +1632,100 @@ fn execute(host: &mut dyn Host, root: &Path, action: Action) -> Result<Report, S
                 detail: errors.join("; "),
             });
         }
-        if refresh(host, &activation.iter().collect::<Vec<_>>(), &mut report) && full_profile {
-            clear_pending_refresh(root)?;
-        }
-        return Ok(report);
     }
-    // The common desktop items already activate their own writes. An old
-    // doctor's recovery record may predate those items, so discharge it once.
-    if full_profile
-        && refresh(
-            host,
-            &previous_activation.iter().collect::<Vec<_>>(),
-            &mut report,
-        )
-    {
+    if refresh(host, &reload.iter().collect::<Vec<_>>(), &mut report) && full_profile {
         clear_pending_refresh(root)?;
     }
+    // Account sign-out does not wait on an unrelated preference: a held Dock would
+    // otherwise keep the selected accounts signed in until a person acted on the Dock.
     append_workstation(host, WorkstationGroup::Accounts, true, &mut report);
+    unverified.extend(
+        host.attempts()
+            .into_iter()
+            .filter(|attempt| !attempt.verified)
+            .map(|attempt| attempt.item),
+    );
+    settled.extend(host.settled());
     if !report.needs_attention() {
         write_json(
             &root.join("first-run.json"),
             &json!({ "profile": PROFILE, "state": "applied", "accounts_verified": true }),
         )?;
     }
-    Ok(report)
+    Ok(Pass {
+        report,
+        unverified,
+        settled,
+    })
 }
 
-fn restore_one(host: &mut dyn Host, target: &Target, value: Option<&PValue>) -> Result<(), String> {
-    let observed = host.read(target)?;
+/// Put `target` back to `value`, journaled before the write. `Ok(false)`: it already
+/// read `value`, and nothing was written; `Ok(true)`: it was rewritten and reads back.
+/// `Err((wrote, why))`: `wrote` says whether a write was made, which may have taken
+/// effect, so its consumer reloads either way. A journal that refuses the line does not
+/// stop the write, which puts an original back: refusing it would leave aterm's own
+/// change in place, and the backup it reads from is the record. The refusal goes to
+/// `refused` for the report.
+fn restore_one(
+    host: &mut dyn Host,
+    target: &Target,
+    value: Option<&PValue>,
+    refused: &mut Vec<String>,
+) -> Result<bool, (bool, String)> {
+    let observed = host.read(target).map_err(|why| (false, why))?;
     if same_optional(observed.as_ref(), value) {
-        return Ok(());
+        return Ok(false);
     }
-    host.write(target, value)?;
-    if same_optional(host.read(target)?.as_ref(), value) {
-        Ok(())
+    let id = restore_id(target);
+    if let Err(why) = host.journal(
+        &id,
+        &shown(target, observed.as_ref()),
+        &shown(target, value),
+        Some(&defaults_cmd(target, observed.as_ref()).display()),
+    ) {
+        refused.push(format!("{id}: {why}"));
+    }
+    host.write(target, value).map_err(|why| (true, why))?;
+    let back = host.read(target).map_err(|why| (true, why))?;
+    if same_optional(back.as_ref(), value) {
+        Ok(true)
     } else {
-        Err("macOS did not retain the original value".into())
+        Err((true, "macOS did not retain the original value".into()))
     }
+}
+
+/// The journal id of a restore of `target`.
+fn restore_id(target: &Target) -> String {
+    format!(
+        "doctor.restore.{}{}.{}",
+        if target.host { "currentHost." } else { "" },
+        target.domain,
+        target.key
+    )
+}
+
+/// The `defaults` command that sets `target` to `value`, or deletes it for `None`: what
+/// [`NativeHost::write`] runs, and so the revert of a restore that replaces `value`.
+fn defaults_cmd(target: &Target, value: Option<&PValue>) -> Cmd {
+    let mut cmd = Cmd::new(DEFAULTS);
+    if target.host {
+        cmd = cmd.arg("-currentHost");
+    }
+    match value {
+        Some(value) => cmd
+            .args(["write", target.domain.as_str(), target.key.as_str()])
+            .arg(plist::fragment(value)),
+        None => cmd.args(["delete", target.domain.as_str(), target.key.as_str()]),
+    }
+}
+
+/// `target` and the value it holds, as a journal line names it.
+fn shown(target: &Target, value: Option<&PValue>) -> String {
+    format!(
+        "{} = {}",
+        target.describe(),
+        value.map_or_else(|| "absent".into(), ToString::to_string)
+    )
 }
 
 fn same_optional(a: Option<&PValue>, b: Option<&PValue>) -> bool {
@@ -1311,19 +1778,23 @@ fn restore(host: &mut dyn Host, root: &Path, mut report: Report) -> Result<Repor
             detail: "no changed preferences were backed up".into(),
         });
     }
+    let mut refused = Vec::new();
     for item in saved.iter().rev() {
-        match restore_one(host, &item.target, item.value.as_ref()) {
-            Ok(()) => report.rows.push(Row {
+        match restore_one(host, &item.target, item.value.as_ref(), &mut refused) {
+            Ok(_) => report.rows.push(Row {
                 name: item.target.describe(),
                 status: "restored".into(),
                 detail: "original value restored".into(),
             }),
-            Err(detail) => report.rows.push(Row {
+            Err((_, detail)) => report.rows.push(Row {
                 name: item.target.describe(),
                 status: "error".into(),
                 detail,
             }),
         }
+    }
+    if !refused.is_empty() {
+        report.rows.push(journal_refused(&refused));
     }
     if refresh(host, &activation.iter().collect::<Vec<_>>(), &mut report) {
         clear_pending_refresh(root)?;
@@ -1388,8 +1859,12 @@ fn clear_pending_refresh(root: &Path) -> Result<(), String> {
     }
 }
 
+/// Relaunch the consumers of `targets`, each journaled first. Each relaunch makes a
+/// consumer read what is saved (an original put back, or an earlier pass's change), so a
+/// journal that refuses its line does not stop it; the refusal is reported.
 fn refresh(host: &mut dyn Host, targets: &[&Target], report: &mut Report) -> bool {
     let mut refreshed = true;
+    let mut refused = Vec::new();
     for (process, affected) in [
         (
             "Dock",
@@ -1408,7 +1883,20 @@ fn refresh(host: &mut dyn Host, targets: &[&Target], report: &mut Report) -> boo
                 .any(|t| t.domain == "com.apple.notificationcenterui"),
         ),
     ] {
-        if affected && let Err(detail) = host.restart(process) {
+        if !affected {
+            continue;
+        }
+        // A relaunch has nothing to undo: the line records that it was made, and why.
+        let id = format!("doctor.relaunch.{process}");
+        if let Err(why) = host.journal(
+            &id,
+            &format!("{process} running with the preferences it read at its start"),
+            &format!("{process} relaunched to read its saved preferences"),
+            None,
+        ) {
+            refused.push(format!("{id}: {why}"));
+        }
+        if let Err(detail) = host.restart(process) {
             refreshed = false;
             report.rows.push(Row {
                 name: format!("Reload {process}"),
@@ -1423,6 +1911,9 @@ fn refresh(host: &mut dyn Host, targets: &[&Target], report: &mut Report) -> boo
     {
         report.rows.push(Row { name: "Keyboard and trackpad activation".into(), status: "ok".into(), detail: "native preferences saved; log out and back in if an already connected device still uses its previous setting".into() });
     }
+    if !refused.is_empty() {
+        report.rows.push(journal_refused(&refused));
+    }
     refreshed
 }
 
@@ -1430,19 +1921,69 @@ fn refresh(host: &mut dyn Host, targets: &[&Target], report: &mut Report) -> boo
 mod tests {
     use super::*;
 
+    /// A doctor host whose shared items are the [`wanted`] keys, one item each (its id is
+    /// the key's [`Target::describe`]), and whose account group is one sign-out row. It
+    /// holds what it is told to as the shared engine does ([`Hold`]); the engine's own
+    /// hold is pinned in aterm-machines, and [`NativeHost`]'s by the tests over [`Inert`].
     #[derive(Default)]
     struct Fake {
         selected: Option<Selection>,
         preference_passes: usize,
         values: BTreeMap<Target, PValue>,
         writes: Vec<Target>,
+        /// The first item applied reports `error` after its write, once.
         fail_once: bool,
+        /// Items whose read-back never verifies: each apply writes and reports `error`,
+        /// as the Dock did when it wrote its own tiles back over the change.
+        failing: Vec<Target>,
+        /// Items whose consumer writes the value before the change back over it: each
+        /// apply writes, the key reads as it did, and the row reports `error`.
+        written_back: Vec<Target>,
+        /// Items that stand blocked (a grant not given, a read that does not answer):
+        /// their apply changes nothing and reports `blocked`.
+        blocked: Vec<Target>,
         accounts_blocked: bool,
+        /// The account sign-out's apply runs and its read-back never verifies.
+        accounts_fail: bool,
         fail_restart_once: bool,
+        /// The journal refuses every line of the doctor's own (`doctor.…`).
+        journal_refuses: bool,
+        /// An apply pass of the preference group panics, as a process that dies there.
+        dies_in_preferences: bool,
         restarts: Vec<String>,
         account_passes: usize,
-        attempted: Vec<Saved>,
+        attempts: Vec<Attempt>,
+        settled: Vec<String>,
+        held: Vec<(String, Hold)>,
+        /// Every journal line, write and relaunch, in order: `journal <id>`,
+        /// `refused <id>`, `write <target>`, `restart <process>`.
+        events: Vec<String>,
+        /// Each journal line's id, from, to and revert.
+        lines: Vec<(String, String, String, Option<String>)>,
         runtime_changed: bool,
+    }
+
+    impl Fake {
+        /// The item a wanted key belongs to, as the fake's rows and attempts name it.
+        fn item(target: &Target) -> String {
+            target.describe()
+        }
+
+        /// Writes and relaunches, the changes a pass makes outside aterm's own records.
+        fn changes(&self) -> usize {
+            self.events
+                .iter()
+                .filter(|event| event.starts_with("write ") || event.starts_with("restart "))
+                .count()
+        }
+
+        /// How a pass holds `item`, if it does.
+        fn hold_of(&self, item: &str) -> Option<Hold> {
+            self.held
+                .iter()
+                .find(|(held, _)| held == item)
+                .map(|(_, hold)| hold.clone())
+        }
     }
 
     pub(super) fn restore_without_effects(root: &Path) -> Result<Report, String> {
@@ -1455,6 +1996,300 @@ mod tests {
         assert!(host.restarts.is_empty());
         assert!(host.runtime_changed, "Restore reached runtime activation");
         result
+    }
+
+    /// The doctor of a selected Dock and widgets whose Dock change never verifies (the
+    /// Dock wrote its own tiles back over it), for the stage tests in `initial`: each
+    /// [`NeverVerifies::pass`] is what one worker retry runs, a minute after the last.
+    pub(super) struct NeverVerifies {
+        host: Fake,
+        now: std::time::SystemTime,
+    }
+
+    impl NeverVerifies {
+        pub(super) fn dock() -> Self {
+            Self {
+                host: Fake {
+                    failing: vec![wanted()[0].0.clone()],
+                    ..Fake::default()
+                },
+                now: std::time::SystemTime::now(),
+            }
+        }
+
+        /// What `apply_on_first_run_at` runs once the stage is due, a minute after the
+        /// last, past the crash cooldown.
+        pub(super) fn pass(&mut self, root: &Path) -> Result<Option<Report>, String> {
+            self.now += std::time::Duration::from_secs(61);
+            apply_on_first_run_with(
+                root,
+                &Inert::default(),
+                &mut self.host,
+                "1.0.0+gtest",
+                self.now,
+            )
+        }
+
+        /// Preference writes and relaunches so far.
+        pub(super) fn changes(&self) -> usize {
+            self.host.changes()
+        }
+
+        /// Relaunches so far.
+        pub(super) fn relaunches(&self) -> usize {
+            self.host.restarts.len()
+        }
+    }
+
+    /// A [`System`] that runs nothing: each command is recorded and refused, every file
+    /// operation is unsupported, and its journal keeps each line's id. A [`NativeHost`]
+    /// over it never reaches this Mac's preferences, processes or journal.
+    #[derive(Default)]
+    pub(super) struct Inert {
+        calls: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+        lines: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    /// [`Inert`]'s journal.
+    struct InertJournal(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
+
+    impl aterm_converge::Journal for InertJournal {
+        fn before_change(
+            &mut self,
+            id: &str,
+            _from: &str,
+            _to: &str,
+            _revert: Option<&str>,
+        ) -> Result<(), String> {
+            self.0.lock().unwrap().push(id.into());
+            Ok(())
+        }
+    }
+
+    mod inert {
+        use super::Inert;
+        use aterm_machines::port::{Cmd, Ran, RunFailed, Stat, System, User};
+        use std::io;
+        use std::path::Path;
+
+        fn unsupported<T>() -> io::Result<T> {
+            Err(io::ErrorKind::Unsupported.into())
+        }
+
+        impl System for Inert {
+            fn run(&self, cmd: &Cmd) -> Result<Ran, RunFailed> {
+                self.calls.lock().unwrap().push(cmd.display());
+                Err(RunFailed::Refused(
+                    "an inert test system runs nothing".into(),
+                ))
+            }
+            fn run_tty(&self, cmd: &Cmd) -> Result<Option<i32>, RunFailed> {
+                self.run(cmd).map(|ran| ran.status)
+            }
+            fn read_file(&self, _: &Path) -> io::Result<Vec<u8>> {
+                unsupported()
+            }
+            fn write_file(&self, _: &Path, _: &[u8], _: u32) -> io::Result<()> {
+                unsupported()
+            }
+            fn write_user_file(&self, _: &User, _: &Path, _: &[u8], _: u32) -> io::Result<()> {
+                unsupported()
+            }
+            fn remove(&self, _: &Path) -> io::Result<()> {
+                unsupported()
+            }
+            fn create_dir_all(&self, _: &Path, _: u32) -> io::Result<()> {
+                unsupported()
+            }
+            fn chown(&self, _: &Path, _: u32, _: u32) -> io::Result<()> {
+                unsupported()
+            }
+            fn stat(&self, _: &Path) -> io::Result<Stat> {
+                unsupported()
+            }
+            fn list_dir(&self, _: &Path) -> io::Result<Vec<String>> {
+                unsupported()
+            }
+            fn sha256(&self, _: &Path) -> io::Result<String> {
+                unsupported()
+            }
+            fn copy_file(&self, _: &Path, _: &Path, _: u32) -> io::Result<()> {
+                unsupported()
+            }
+            fn rename(&self, _: &Path, _: &Path) -> io::Result<()> {
+                unsupported()
+            }
+            fn euid(&self) -> u32 {
+                501
+            }
+            fn now(&self) -> u64 {
+                0
+            }
+            fn journal(&self) -> Result<Box<dyn aterm_converge::Journal + '_>, String> {
+                Ok(Box::new(super::InertJournal(std::sync::Arc::clone(
+                    &self.lines,
+                ))))
+            }
+        }
+    }
+
+    /// A shared item whose probes answer from a list (the last one repeats), counting its
+    /// applies; its clones share both, so a pass prepared anew sees the same item.
+    #[derive(Clone)]
+    struct Scripted {
+        id: &'static str,
+        probes: std::sync::Arc<std::sync::Mutex<Vec<aterm_machines::model::Probe>>>,
+        applies: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl Scripted {
+        /// `wanted[i]`: whether the `i`th probe reads as wanted.
+        fn new(id: &'static str, wanted: &[bool]) -> Self {
+            use aterm_machines::model::Probe;
+            let probes = wanted
+                .iter()
+                .map(|wanted| {
+                    if *wanted {
+                        Probe::Ok { now: "b".into() }
+                    } else {
+                        Probe::Change {
+                            from: "a".into(),
+                            to: "b".into(),
+                        }
+                    }
+                })
+                .collect();
+            Self {
+                id,
+                probes: std::sync::Arc::new(std::sync::Mutex::new(probes)),
+                applies: std::sync::Arc::default(),
+            }
+        }
+
+        fn applies(&self) -> usize {
+            self.applies.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    impl aterm_machines::items::Item for Scripted {
+        fn id(&self) -> String {
+            self.id.into()
+        }
+        fn family(&self) -> &'static str {
+            "test"
+        }
+        fn title(&self) -> String {
+            self.id.into()
+        }
+        fn probe(
+            &self,
+            _: &dyn System,
+            _: &aterm_machines::items::Ctx,
+        ) -> aterm_machines::model::Probe {
+            let mut probes = self.probes.lock().unwrap();
+            if probes.len() > 1 {
+                probes.remove(0)
+            } else {
+                probes[0].clone()
+            }
+        }
+        fn apply(&self, _: &dyn System, _: &aterm_machines::items::Ctx) -> Result<(), String> {
+            self.applies
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    /// The worker's own entry (`apply_on_first_run_with`, what each System State tick
+    /// runs) over the doctor's own host ([`NativeHost`], on an [`Inert`] system and the
+    /// test's shared items) holds what its record says: an item whose change never takes
+    /// is applied twice per build, ten minutes apart, and one that took and was changed
+    /// since is left as it is, while the host runs no command and journals only the
+    /// applies. Negative controls: `NativeHost::prepare` without its `hold`, or the entry
+    /// calling `execute` in place of `automatic_pass`, applies both on every tick.
+    #[test]
+    fn the_worker_holds_through_the_doctors_own_host() {
+        let root = aterm_tempfile::tempdir().expect("scratch");
+        let mut selected = Selection::none();
+        selected.set(Setting::Dock, true);
+        authorize_automatic_setup_at(root.path(), selected).unwrap();
+        let never = Scripted::new("init.test.never", &[false]);
+        let drifts = Scripted::new("init.test.drifts", &[false, true, false]);
+        let applies = || (never.applies(), drifts.applies());
+        let inert = Inert::default();
+        let (calls, lines) = (
+            std::sync::Arc::clone(&inert.calls),
+            std::sync::Arc::clone(&inert.lines),
+        );
+        let items = (never.clone(), drifts.clone());
+        let mut host = NativeHost::over(
+            Box::new(inert),
+            Box::new(move |_, group, _| {
+                Ok(Workstation::of(if group == WorkstationGroup::Preferences {
+                    vec![
+                        Box::new(items.0.clone()) as Box<dyn aterm_machines::items::Item>,
+                        Box::new(items.1.clone()),
+                    ]
+                } else {
+                    Vec::new()
+                }))
+            }),
+        );
+        let tick = |host: &mut NativeHost, minute: u64, build: &str| -> Report {
+            apply_on_first_run_with(root.path(), &Inert::default(), host, build, at(minute))
+                .expect("tick")
+                .expect("setup still runs")
+        };
+        let row = |report: &Report, name: &str| {
+            let row = report.rows.iter().find(|row| row.name == name).unwrap();
+            (row.status.clone(), row.detail.clone())
+        };
+        let first = tick(&mut host, 0, BUILD);
+        assert_eq!(
+            row(&first, "init.test.never").0,
+            "error",
+            "{}",
+            first.to_text()
+        );
+        assert_eq!(row(&first, "init.test.drifts").0, "applied");
+        assert_eq!(applies(), (1, 1));
+        let quiet = |host: &mut NativeHost, minutes: std::ops::Range<u64>, why: &str| {
+            for minute in minutes {
+                let report = tick(host, minute, BUILD);
+                assert_eq!(
+                    row(&report, "init.test.never"),
+                    ("blocked".into(), format!("a; not changed: {why}")),
+                    "minute {minute}"
+                );
+                assert_eq!(
+                    row(&report, "init.test.drifts"),
+                    ("ok".into(), format!("a; left as it is: {SETTLED}")),
+                    "minute {minute}"
+                );
+            }
+        };
+        quiet(&mut host, 1..10, WAITING);
+        assert_eq!(applies(), (1, 1));
+        tick(&mut host, 10, BUILD);
+        assert_eq!(applies(), (2, 1), "the second try");
+        quiet(&mut host, 11..20, HELD);
+        assert_eq!(applies(), (2, 1));
+        tick(&mut host, 21, "1.0.1+gbbbb");
+        assert_eq!(
+            applies(),
+            (3, 1),
+            "a new build's try, and the setting left as it is"
+        );
+        assert!(calls.lock().unwrap().is_empty(), "{:?}", calls.lock());
+        assert_eq!(
+            *lines.lock().unwrap(),
+            [
+                "init.test.never",
+                "init.test.drifts",
+                "init.test.never",
+                "init.test.never"
+            ]
+        );
     }
 
     fn wanted() -> Vec<(Target, PValue)> {
@@ -1474,8 +2309,33 @@ mod tests {
         fn selection(&self) -> Selection {
             self.selected.unwrap_or_default()
         }
-        fn attempted_preferences(&mut self) -> Vec<Saved> {
-            std::mem::take(&mut self.attempted)
+        fn select(&mut self, selected: Selection) {
+            self.selected = Some(selected.workstation());
+        }
+        fn attempts(&mut self) -> Vec<Attempt> {
+            std::mem::take(&mut self.attempts)
+        }
+        fn settled(&mut self) -> Vec<String> {
+            std::mem::take(&mut self.settled)
+        }
+        fn hold(&mut self, items: &[(String, Hold)]) {
+            self.held = items.to_vec();
+        }
+        fn journal(
+            &mut self,
+            id: &str,
+            from: &str,
+            to: &str,
+            revert: Option<&str>,
+        ) -> Result<(), String> {
+            if self.journal_refuses && id.starts_with("doctor.") {
+                self.events.push(format!("refused {id}"));
+                return Err("the journal is full".into());
+            }
+            self.events.push(format!("journal {id}"));
+            self.lines
+                .push((id.into(), from.into(), to.into(), revert.map(str::to_owned)));
+            Ok(())
         }
         fn restore_runtime(&mut self, _saved: &[Saved]) -> Vec<Row> {
             self.runtime_changed = false;
@@ -1486,6 +2346,7 @@ mod tests {
         }
         fn write(&mut self, target: &Target, value: Option<&PValue>) -> Result<(), String> {
             self.writes.push(target.clone());
+            self.events.push(format!("write {}", target.describe()));
             match value {
                 Some(value) => {
                     self.values.insert(target.clone(), value.clone());
@@ -1498,7 +2359,8 @@ mod tests {
         }
         fn preference_changes(&mut self) -> Result<Vec<Saved>, String> {
             self.preference_passes += 1;
-            self.attempted.clear();
+            self.attempts.clear();
+            self.settled.clear();
             Ok(wanted()
                 .into_iter()
                 .filter(|(target, _)| {
@@ -1509,6 +2371,8 @@ mod tests {
                             Setting::Widgets
                         })
                 })
+                // A held item changes nothing, so nothing of it is backed up.
+                .filter(|(target, _)| self.hold_of(&Self::item(target)).is_none())
                 .filter(|(t, v)| !self.values.get(t).is_some_and(|now| now.same(v)))
                 .map(|(target, _)| Saved {
                     value: self.values.get(&target).cloned(),
@@ -1518,6 +2382,7 @@ mod tests {
         }
         fn restart(&mut self, name: &str) -> Result<(), String> {
             self.restarts.push(name.into());
+            self.events.push(format!("restart {name}"));
             if self.fail_restart_once {
                 self.fail_restart_once = false;
                 return Err("injected restart failure".into());
@@ -1530,6 +2395,10 @@ mod tests {
             apply: bool,
         ) -> Result<Vec<Row>, String> {
             let mut rows = Vec::new();
+            assert!(
+                !(apply && group == WorkstationGroup::Preferences && self.dies_in_preferences),
+                "the process ends in its preference pass"
+            );
             if group != WorkstationGroup::Accounts {
                 for (target, value) in wanted() {
                     if !self
@@ -1544,23 +2413,59 @@ mod tests {
                     }
                     let correct = self.values.get(&target).is_some_and(|now| now.same(&value));
                     let mut status = if correct { "ok" } else { "drift" };
+                    let item = Self::item(&target);
+                    let mut detail = "injected shared item".to_owned();
                     if apply && !correct {
-                        self.attempted.push(Saved {
-                            target: target.clone(),
-                            value: self.values.get(&target).cloned(),
-                        });
-                        self.write(&target, Some(&value))?;
-                        self.runtime_changed = true;
-                        status = "applied";
-                        if self.fail_once {
-                            self.fail_once = false;
-                            status = "error";
+                        match self.hold_of(&item) {
+                            // The shared engine's holds: nothing of it runs.
+                            Some(Hold::Back(why)) => {
+                                status = "blocked";
+                                detail = why;
+                            }
+                            Some(Hold::AsIs(why)) => {
+                                status = "ok";
+                                detail = why;
+                            }
+                            None if self.blocked.contains(&target) => status = "blocked",
+                            None => {
+                                let before = self.values.get(&target).cloned();
+                                // The engine journals each item before its apply.
+                                self.events.push(format!("journal {item}"));
+                                self.write(&target, Some(&value))?;
+                                self.runtime_changed = true;
+                                let written_back = self.written_back.contains(&target);
+                                if written_back {
+                                    match &before {
+                                        Some(before) => {
+                                            self.values.insert(target.clone(), before.clone());
+                                        }
+                                        None => {
+                                            self.values.remove(&target);
+                                        }
+                                    }
+                                }
+                                let failed = std::mem::take(&mut self.fail_once)
+                                    || written_back
+                                    || self.failing.contains(&target);
+                                status = if failed { "error" } else { "applied" };
+                                self.attempts.push(Attempt {
+                                    item: item.clone(),
+                                    verified: !failed,
+                                    preferences: vec![Saved {
+                                        target: target.clone(),
+                                        value: before,
+                                    }],
+                                });
+                            }
                         }
+                    }
+                    if apply && matches!(status, "ok" | "applied") {
+                        self.settled.push(item);
                     }
                     rows.push(Row {
                         name: target.describe(),
                         status: status.into(),
-                        detail: "injected shared item".into(),
+                        detail,
                     });
                 }
             }
@@ -1570,15 +2475,43 @@ mod tests {
                     .is_empty()
             {
                 self.account_passes += 1;
-                rows.push(Row {
-                    name: "Account sign-out".into(),
-                    status: if self.accounts_blocked {
-                        "blocked"
-                    } else {
-                        "ok"
+                let item = "Account sign-out".to_owned();
+                let mut detail = "injected account result".to_owned();
+                let status = if self.accounts_blocked {
+                    "blocked"
+                } else if !self.accounts_fail {
+                    "ok"
+                } else if !apply {
+                    "drift"
+                } else {
+                    match self.hold_of(&item) {
+                        Some(Hold::Back(why)) => {
+                            detail = why;
+                            "blocked"
+                        }
+                        Some(Hold::AsIs(why)) => {
+                            detail = why;
+                            "ok"
+                        }
+                        None => {
+                            // The sign-out drives the app's own controls; it changes no key.
+                            self.events.push(format!("journal {item}"));
+                            self.attempts.push(Attempt {
+                                item: item.clone(),
+                                verified: false,
+                                preferences: Vec::new(),
+                            });
+                            "error"
+                        }
                     }
-                    .into(),
-                    detail: "injected account result".into(),
+                };
+                if apply && status == "ok" {
+                    self.settled.push(item.clone());
+                }
+                rows.push(Row {
+                    name: item,
+                    status: status.into(),
+                    detail,
                 });
             }
             Ok(rows)
@@ -1930,6 +2863,7 @@ mod tests {
     #[test]
     fn failed_shared_preference_apply_rolls_back_partial_mutations() {
         let root = aterm_tempfile::tempdir().expect("scratch");
+        let (dock, widgets) = (wanted()[0].0.clone(), wanted()[1].0.clone());
         let mut host = Fake {
             fail_once: true,
             ..Fake::default()
@@ -1937,21 +2871,481 @@ mod tests {
         let report = execute(&mut host, root.path(), Action::Apply).expect("failure report");
         assert!(report.needs_attention());
         assert!(
-            host.values.is_empty(),
+            !host.values.contains_key(&dock),
             "even a failed write may already have mutated a preference"
+        );
+        assert!(
+            host.values.contains_key(&widgets),
+            "the item that verified keeps its change"
         );
         assert!(
             !host.runtime_changed,
             "rollback must recover active settings as well as saved preferences"
         );
+        let restored: Vec<&Row> = report
+            .rows
+            .iter()
+            .filter(|row| row.status == "restored")
+            .collect();
+        assert_eq!(restored.len(), 1, "{}", report.to_text());
         assert!(
-            !report.rows.iter().any(|row| row.status == "restored"),
-            "recovery must not claim every runtime item was restored"
+            restored[0].detail.contains(&dock.describe())
+                && !restored[0].detail.contains(&widgets.describe()),
+            "recovery claims only what it put back: {}",
+            report.to_text()
         );
-        assert!(host.restarts.iter().any(|p| p == "Dock"));
-        assert_eq!(host.account_passes, 0);
+        assert_eq!(
+            report
+                .rows
+                .iter()
+                .find(|row| row.name == widgets.describe())
+                .map(|row| row.status.as_str()),
+            Some("applied"),
+            "a verified change is not relabelled"
+        );
+        assert_eq!(host.restarts, ["Dock"]);
+        // Sign-out does not wait on an unrelated preference that did not verify.
+        assert_eq!(host.account_passes, 1);
         assert!(!first_run_complete(root.path()).expect("failed pass remains pending"));
         assert!(report.backup.exists());
+    }
+
+    /// The worker's clock, `minutes` after a fixed start.
+    fn at(minutes: u64) -> std::time::SystemTime {
+        std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_800_000_000 + minutes * 60)
+    }
+
+    const BUILD: &str = "1.0.0+gaaaa";
+
+    /// The overnight loop of 2026-10-22: the Dock wrote its own tiles back over the
+    /// change, so the item's read-back failed on every attempt, and each retry of the
+    /// worker re-made the change, relaunched the Dock, rolled back and relaunched it
+    /// again, every minute for hours. An automatic pass now makes a change that does not
+    /// verify twice per build and setup run, the second ten minutes after the first:
+    /// every other retry holds the item, so it writes, journals and relaunches nothing,
+    /// while the item that verified stays applied. Negative control: a pass that holds
+    /// nothing (`host.hold(&[])` in `automatic_pass`) writes and relaunches on every retry.
+    #[test]
+    fn a_standing_failure_is_tried_twice_and_then_never_again_by_the_automatic_worker() {
+        let root = aterm_tempfile::tempdir().expect("scratch");
+        let (dock, widgets) = (wanted()[0].0.clone(), wanted()[1].0.clone());
+        let mut host = Fake {
+            failing: vec![dock.clone()],
+            accounts_fail: true,
+            ..Fake::default()
+        };
+        let first = automatic_pass(&mut host, root.path(), BUILD, at(0)).expect("first pass");
+        assert!(first.needs_attention());
+        assert!(
+            !host.values.contains_key(&dock),
+            "the failed change is undone"
+        );
+        assert!(host.values.contains_key(&widgets), "the verified one stays");
+        assert_eq!(host.restarts, ["Dock"], "{:?}", host.events);
+        let sign_outs = |host: &Fake| {
+            host.events
+                .iter()
+                .filter(|event| *event == "journal Account sign-out")
+                .count()
+        };
+        assert_eq!(sign_outs(&host), 1);
+        // Every retry it holds the two items: no write, relaunch or journal line.
+        let quiet = |host: &mut Fake, minutes: std::ops::Range<u64>, why: &str| {
+            let events = host.events.len();
+            for minute in minutes {
+                let report =
+                    automatic_pass(host, root.path(), BUILD, at(minute)).expect("retry pass");
+                assert!(report.needs_attention(), "minute {minute}");
+                for name in [dock.describe(), "Account sign-out".into()] {
+                    let row = report.rows.iter().find(|row| row.name == name).unwrap();
+                    assert_eq!(
+                        (row.status.as_str(), row.detail.as_str()),
+                        ("blocked", why),
+                        "minute {minute}"
+                    );
+                }
+            }
+            assert!(
+                host.events[events..].is_empty(),
+                "nothing changed, relaunched or journaled: {:?}",
+                &host.events[events..]
+            );
+        };
+        quiet(&mut host, 1..10, WAITING);
+        // Ten minutes after the first, the second try; then each is held for good.
+        automatic_pass(&mut host, root.path(), BUILD, at(10)).expect("second try");
+        assert_eq!(host.restarts, ["Dock", "Dock"]);
+        assert_eq!(sign_outs(&host), 2);
+        quiet(&mut host, 11..40, HELD);
+        assert!(host.values.contains_key(&widgets));
+        assert!(!first_run_complete(root.path()).unwrap());
+        // A new build may try each once more.
+        automatic_pass(&mut host, root.path(), "1.0.1+gbbbb", at(41)).expect("new build");
+        assert_eq!(host.restarts.len(), 3);
+        assert_eq!(sign_outs(&host), 3);
+        // The record is the run's: a new run (System State's Apply) holds nothing of it.
+        let record = Automatic::load(root.path(), 0).unwrap();
+        assert_eq!(record.settled, [widgets.describe()], "{record:?}");
+        assert_eq!(
+            record.failed.len(),
+            4,
+            "two items in two builds: {record:?}"
+        );
+        assert_eq!(
+            Automatic::load(root.path(), 1).unwrap(),
+            Automatic::default()
+        );
+        // An explicit apply is a person asking: its new host holds nothing.
+        host.held.clear();
+        execute(&mut host, root.path(), Action::Apply).expect("explicit apply");
+        assert_eq!(host.restarts.len(), 4);
+    }
+
+    /// Two aterm builds taking turns on one state root (the installed app and a dev
+    /// bundle, an update beside its predecessor) each spend their own tries: neither
+    /// re-arms the other's, so a change that never takes disrupts at most twice per
+    /// build. Negative control: a record of one build's tries, which the other build
+    /// reads as none, re-arms the item on every alternate pass.
+    #[test]
+    fn two_builds_taking_turns_each_spend_only_their_own_tries() {
+        let root = aterm_tempfile::tempdir().expect("scratch");
+        let mut host = Fake {
+            failing: vec![wanted()[0].0.clone()],
+            ..Fake::default()
+        };
+        let builds = ["1.0.0+gaaaa", "1.0.0+gbbbb"];
+        let turns = |host: &mut Fake, minutes: std::ops::Range<u64>| {
+            for (turn, minute) in minutes.enumerate() {
+                automatic_pass(host, root.path(), builds[turn % 2], at(minute)).expect("pass");
+            }
+        };
+        turns(&mut host, 0..8);
+        assert_eq!(host.restarts, ["Dock", "Dock"], "one try each");
+        turns(&mut host, 20..40);
+        assert_eq!(host.restarts.len(), 4, "a second try each, and no more");
+    }
+
+    /// The record keeps the [`HELD_BUILDS`] builds that tried last: a build past the
+    /// bound drops the one whose last try is oldest, not one that tried again since,
+    /// so a build still in use keeps its spent tries however many builds came between.
+    /// Negative control: keeping the builds whose last try is oldest (sorting ascending
+    /// in `Automatic::add`) drops the build that tried last and re-arms it.
+    #[test]
+    fn the_held_record_keeps_the_builds_that_tried_last() {
+        let failed = || Pass {
+            report: Report {
+                action: Action::Apply,
+                rows: Vec::new(),
+                manual_steps: Vec::new(),
+                backup: PathBuf::new(),
+            },
+            unverified: vec!["dock".to_owned()],
+            settled: Vec::new(),
+        };
+        let build = |n: usize| format!("1.0.{n}+g0000");
+        let mut record = Automatic::default();
+        let mut now = 0;
+        for n in 0..HELD_BUILDS {
+            now += 1;
+            assert!(record.add(&build(n), now, &failed()));
+        }
+        // Build 0 tries again last, spending its tries; then one build more comes.
+        now += 1;
+        record.add(&build(0), now, &failed());
+        now += 1;
+        record.add(&build(HELD_BUILDS), now, &failed());
+        let builds: Vec<&str> = record.failed.iter().map(|f| f.build.as_str()).collect();
+        assert_eq!(builds.len(), HELD_BUILDS, "{builds:?}");
+        assert!(!builds.contains(&build(1).as_str()), "{builds:?}");
+        assert_eq!(
+            record.holds(&build(0), now),
+            [("dock".to_owned(), Hold::Back(HELD.into()))],
+            "{builds:?}"
+        );
+        assert!(record.holds(&build(1), now).is_empty());
+    }
+
+    /// What an automatic pass found as wanted is left as it is afterwards: a setting it
+    /// made that the person changed since is not made again while setup waits on another
+    /// item, and its row needs nothing. Before, each retry re-applied it over the
+    /// person's change, relaunching its consumer, for as long as any row kept setup
+    /// pending. Once the rest verifies, setup completes with the person's value standing.
+    /// Negative control: holding only what failed (no `settled` holds in
+    /// `Automatic::holds`) writes the widgets key again on the next retry.
+    #[test]
+    fn a_setting_changed_after_setup_made_it_is_left_as_the_person_set_it() {
+        let root = aterm_tempfile::tempdir().expect("scratch");
+        let widgets = wanted()[1].0.clone();
+        let mut host = Fake {
+            failing: vec![wanted()[0].0.clone()],
+            ..Fake::default()
+        };
+        automatic_pass(&mut host, root.path(), BUILD, at(0)).expect("first pass");
+        assert!(host.values.contains_key(&widgets));
+        // The person shows their widgets again.
+        host.values.remove(&widgets);
+        for minute in 1..30 {
+            let report = automatic_pass(&mut host, root.path(), BUILD, at(minute)).expect("retry");
+            let row = report
+                .rows
+                .iter()
+                .find(|row| row.name == widgets.describe())
+                .unwrap();
+            assert_eq!(row.status, "ok", "minute {minute}: {}", report.to_text());
+            assert!(row.detail.ends_with(SETTLED), "{}", row.detail);
+        }
+        assert_eq!(
+            host.writes
+                .iter()
+                .filter(|target| **target == widgets)
+                .count(),
+            1,
+            "{:?}",
+            host.events
+        );
+        assert!(!host.values.contains_key(&widgets));
+        // The Dock takes on a new build's try, and setup completes as the person left it.
+        host.failing.clear();
+        let report = automatic_pass(&mut host, root.path(), "1.0.1+gbbbb", at(31)).expect("done");
+        assert!(!report.needs_attention(), "{}", report.to_text());
+        assert!(first_run_complete(root.path()).unwrap());
+        assert!(!host.values.contains_key(&widgets));
+    }
+
+    /// A failure that clears by itself (an app slow to quit, a read that timed out) gets
+    /// its second try ten minutes after the first, and unattended setup completes; the
+    /// retries in between change nothing. Negative control: one try per build
+    /// (`TRIES = 1`) leaves setup pending for good.
+    #[test]
+    fn a_failure_that_clears_gets_its_second_try_and_setup_completes() {
+        let root = aterm_tempfile::tempdir().expect("scratch");
+        let mut host = Fake {
+            fail_once: true,
+            ..Fake::default()
+        };
+        automatic_pass(&mut host, root.path(), BUILD, at(0)).expect("first pass");
+        assert!(!first_run_complete(root.path()).unwrap());
+        let changes = host.changes();
+        for minute in 1..10 {
+            automatic_pass(&mut host, root.path(), BUILD, at(minute)).expect("retry");
+        }
+        assert_eq!(host.changes(), changes, "{:?}", host.events);
+        let report = automatic_pass(&mut host, root.path(), BUILD, at(10)).expect("second try");
+        assert!(!report.needs_attention(), "{}", report.to_text());
+        assert!(first_run_complete(root.path()).unwrap());
+    }
+
+    /// A held retry changes nothing, so it leaves no activation record naming the held
+    /// item's keys: a pass that dies part way (a quit, a crash, an update relaunch) does
+    /// not make the next process relaunch the Dock for a key nobody wrote. Negative
+    /// control: backing up a held item's keys (the hold dropped from the fake's
+    /// `preference_changes`, as from `Workstation::preference_changes`, which
+    /// aterm-machines' `a_held_item_has_no_before_images` pins) leaves the Dock key there.
+    #[test]
+    fn a_held_retry_that_dies_part_way_leaves_nothing_to_relaunch() {
+        let root = aterm_tempfile::tempdir().expect("scratch");
+        let mut host = Fake {
+            failing: vec![wanted()[0].0.clone()],
+            ..Fake::default()
+        };
+        automatic_pass(&mut host, root.path(), BUILD, at(0)).expect("first pass");
+        assert_eq!(host.restarts, ["Dock"]);
+        host.dies_in_preferences = true;
+        let died = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            automatic_pass(&mut host, root.path(), BUILD, at(1))
+        }));
+        assert!(died.is_err(), "the pass died in its preference group");
+        assert!(
+            pending_refresh(root.path()).unwrap().is_empty(),
+            "{:?}",
+            pending_refresh(root.path())
+        );
+        host.dies_in_preferences = false;
+        automatic_pass(&mut host, root.path(), BUILD, at(2)).expect("the next process");
+        assert_eq!(host.restarts, ["Dock"], "{:?}", host.events);
+    }
+
+    /// A journal that refuses a line never keeps an original from coming back: a rollback
+    /// and a Restore put each value back and relaunch its consumer anyway, and the report
+    /// says the journal refused, since refusing would leave aterm's own change in place.
+    /// Negative control: returning on the refusal in `restore_one` (in `refresh`) leaves
+    /// the Dock key changed (the Dock not relaunched).
+    #[test]
+    fn a_refused_journal_line_never_keeps_an_original_from_coming_back() {
+        let root = aterm_tempfile::tempdir().expect("scratch");
+        let dock = wanted()[0].0.clone();
+        let mut host = Fake {
+            failing: vec![dock.clone()],
+            journal_refuses: true,
+            ..Fake::default()
+        };
+        let report = automatic_pass(&mut host, root.path(), BUILD, at(0)).expect("failed pass");
+        assert!(!host.values.contains_key(&dock), "rolled back anyway");
+        assert_eq!(host.restarts, ["Dock"], "relaunched anyway");
+        let refused = |report: &Report| {
+            report
+                .rows
+                .iter()
+                .filter(|row| row.name == "Change journal" && row.status == "error")
+                .map(|row| row.detail.clone())
+                .collect::<Vec<_>>()
+                .join("; ")
+        };
+        let said = refused(&report);
+        assert!(
+            said.contains(&restore_id(&dock)) && said.contains("doctor.relaunch.Dock"),
+            "{}",
+            report.to_text()
+        );
+        let report = execute(&mut host, root.path(), Action::Restore).expect("restore");
+        assert!(
+            host.values.is_empty(),
+            "every original is back: {:?}",
+            host.values
+        );
+        assert_eq!(host.restarts, ["Dock", "Dock"]);
+        assert!(
+            refused(&report).contains("doctor.restore.com.apple.WindowManager"),
+            "{}",
+            report.to_text()
+        );
+    }
+
+    /// A rollback relaunches only the consumers whose keys it rewrote: when the consumer
+    /// already wrote the original back over the change (as the Dock did), nothing is put
+    /// back and nothing is relaunched for it. Negative control: dropping the `wrote` gate
+    /// of the rollback in `execute_pass` relaunches the Dock for a key nobody rewrote.
+    #[test]
+    fn a_rollback_with_nothing_to_put_back_relaunches_nothing() {
+        let root = aterm_tempfile::tempdir().expect("scratch");
+        let dock = wanted()[0].0.clone();
+        let mut host = Fake {
+            written_back: vec![dock.clone()],
+            ..Fake::default()
+        };
+        let report = execute(&mut host, root.path(), Action::Apply).expect("failed pass");
+        assert!(report.needs_attention());
+        assert!(!host.values.contains_key(&dock));
+        assert!(host.restarts.is_empty(), "{:?}", host.events);
+        assert_eq!(
+            host.writes.iter().filter(|target| **target == dock).count(),
+            1,
+            "the apply's write, and no rollback write"
+        );
+    }
+
+    /// A standing row (a grant not given, a read that does not answer) changes nothing,
+    /// so it undoes nothing either: the item that verified keeps its change, and the next
+    /// pass finds it done instead of re-applying it and relaunching its consumer. The
+    /// whole-pass rollback this replaces undid every attempted item whenever any row
+    /// needed attention, so each retry re-applied them. Negative control: rolling back
+    /// every attempt (dropping the `!attempt.verified` filter of `rollback` in
+    /// `execute_pass`) undoes the widgets change and makes the second pass write again.
+    #[test]
+    fn one_failing_item_leaves_the_applied_ones_applied_and_the_next_pass_changes_nothing() {
+        let root = aterm_tempfile::tempdir().expect("scratch");
+        let (dock, widgets) = (wanted()[0].0.clone(), wanted()[1].0.clone());
+        let mut host = Fake {
+            blocked: vec![dock.clone()],
+            ..Fake::default()
+        };
+        let first = execute(&mut host, root.path(), Action::Apply).expect("first pass");
+        assert!(
+            first.needs_attention(),
+            "the blocked row still needs the person"
+        );
+        assert_eq!(
+            host.writes,
+            std::slice::from_ref(&widgets),
+            "{:?}",
+            host.events
+        );
+        assert!(host.values.contains_key(&widgets));
+        assert!(
+            host.restarts.is_empty(),
+            "nothing was rolled back to reload"
+        );
+        let changes = host.changes();
+        for _ in 0..3 {
+            let report = execute(&mut host, root.path(), Action::Apply).expect("next pass");
+            assert_eq!(
+                report
+                    .rows
+                    .iter()
+                    .find(|row| row.name == widgets.describe())
+                    .map(|row| row.status.as_str()),
+                Some("ok")
+            );
+        }
+        assert_eq!(host.changes(), changes, "{:?}", host.events);
+        assert!(host.values.contains_key(&widgets));
+        // Once the blocked condition lifts, the next pass applies just that item.
+        host.blocked.clear();
+        let report = execute(&mut host, root.path(), Action::Apply).expect("unblocked");
+        assert!(!report.needs_attention(), "{}", report.to_text());
+        assert_eq!(&host.writes[1..], [dock]);
+        assert!(first_run_complete(root.path()).unwrap());
+    }
+
+    /// Every change the doctor makes itself, a rollback's or a Restore's preference write
+    /// and each consumer relaunch, is journaled immediately before it is made, a write
+    /// naming the value it replaces and the one it writes, with the `defaults` command
+    /// that reverts it. Negative control: dropping the `host.journal` call of
+    /// `restore_one` (or of `refresh`) leaves a write (a relaunch) with no line before it.
+    #[test]
+    fn every_rollback_restore_write_and_relaunch_is_journaled_before_it_is_made() {
+        let root = aterm_tempfile::tempdir().expect("scratch");
+        let mut host = Fake {
+            fail_once: true,
+            ..Fake::default()
+        };
+        execute(&mut host, root.path(), Action::Apply).expect("failed pass");
+        execute(&mut host, root.path(), Action::Apply).expect("retry");
+        execute(&mut host, root.path(), Action::Restore).expect("restore");
+        assert!(host.restarts.len() >= 2, "{:?}", host.events);
+        assert!(host.writes.len() >= 4, "{:?}", host.events);
+        for (at, event) in host.events.iter().enumerate() {
+            let wanted = if let Some(target) = event.strip_prefix("write ") {
+                let target = wanted()
+                    .into_iter()
+                    .map(|(target, _)| target)
+                    .find(|t| t.describe() == target)
+                    .unwrap();
+                vec![Fake::item(&target), restore_id(&target)]
+            } else if let Some(process) = event.strip_prefix("restart ") {
+                vec![format!("doctor.relaunch.{process}")]
+            } else {
+                continue;
+            };
+            let line = at
+                .checked_sub(1)
+                .and_then(|before| host.events[before].strip_prefix("journal "));
+            assert!(
+                line.is_some_and(|id| wanted.iter().any(|want| want == id)),
+                "{event} at {at} has no journal line before it: {:?}",
+                host.events
+            );
+        }
+        let restores: Vec<_> = host
+            .lines
+            .iter()
+            .filter(|(id, ..)| id.starts_with("doctor.restore."))
+            .collect();
+        assert!(restores.len() >= 2, "{:?}", host.lines);
+        for (id, from, to, revert) in restores {
+            let revert = revert.as_deref().unwrap_or_default();
+            assert!(
+                revert.starts_with("/usr/bin/defaults write ")
+                    || revert.starts_with("/usr/bin/defaults delete "),
+                "{id}: {revert}"
+            );
+            // The values: aterm's (`true`, `false`), and the original put back (absent).
+            assert!(
+                from.ends_with(" = true") || from.ends_with(" = false"),
+                "{id}: {from}"
+            );
+            assert!(to.ends_with(" = absent"), "{id}: {to}");
+        }
     }
 
     #[test]
@@ -2062,7 +3456,8 @@ mod tests {
         let mut host = Fake::default();
         let target = wanted()[0].0.clone();
         host.values.insert(target.clone(), PValue::Bool(true));
-        restore_one(&mut host, &target, Some(&PValue::Int(1))).expect("typed original");
+        restore_one(&mut host, &target, Some(&PValue::Int(1)), &mut Vec::new())
+            .expect("typed original");
         assert_eq!(host.values[&target], PValue::Int(1));
         let root = aterm_tempfile::tempdir().expect("scratch");
         write_json(
@@ -2076,14 +3471,18 @@ mod tests {
     #[test]
     fn automatic_permission_retries_do_not_repeat_on_every_launch() {
         let root = aterm_tempfile::tempdir().expect("scratch");
-        assert!(automatic_retry_due(root.path(), Some(false)).expect("first attempt"));
+        let then = std::time::SystemTime::now();
+        assert!(automatic_retry_due(root.path(), Some(false), then).expect("first attempt"));
         write_json(
             &root.path().join("automatic-attempt.json"),
             &json!({"profile": PROFILE, "accessibility_ready": false}),
         )
         .expect("attempt");
-        assert!(!automatic_retry_due(root.path(), Some(false)).expect("same permission"));
-        assert!(automatic_retry_due(root.path(), Some(true)).expect("new permission"));
+        let now = std::time::SystemTime::now();
+        assert!(!automatic_retry_due(root.path(), Some(false), now).expect("same permission"));
+        assert!(automatic_retry_due(root.path(), Some(true), now).expect("new permission"));
+        let later = now + std::time::Duration::from_secs(61);
+        assert!(automatic_retry_due(root.path(), Some(false), later).expect("after cooldown"));
     }
 
     /// A real first run keeps its setup: HOME is the account's own home, as

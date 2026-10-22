@@ -29,13 +29,105 @@
 //! until the jail is empty and then ends, never outliving the lab it watches.
 //! A sampler by nature: the kernel offers no event for "a socket was opened
 //! by that tree".
+//!
+//! It also keeps the lab it watches from macOS's `tmp_cleaner`
+//! ([`keep_from_the_cleaner`]): the default state dir sits in `/private/tmp`
+//! ([`crate::paths::state_root`]), which that daemon clears daily of files
+//! nobody read, wrote or changed for three days and of empty directories
+//! nobody changed for as long. A lab left up that long would lose `env.sh`
+//! (its one record: `ps` and `down` would no longer see it, and this witness
+//! would end, leaving its jail running unwatched) and the scratch directories
+//! the profile pins (each, gone, a place a jailed process could put a link).
 
 use std::collections::BTreeSet;
 use std::io::Write as _;
+use std::os::unix::fs::MetadataExt as _;
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use crate::run::Run;
+
+/// How old every time of a live lab's file (a directory's modification time)
+/// may grow before [`keep_from_the_cleaner`] makes it new: a day, well inside
+/// the three days after which `tmp_cleaner` (`/usr/libexec/tmp_cleaner`, run
+/// daily by `com.apple.tmp_cleaner`) deletes a file whose access, change and
+/// modification times are all older, and an empty directory whose
+/// modification time is.
+const STALE: Duration = Duration::from_secs(24 * 3600);
+
+/// How often the witness looks for stale entries: hourly, and at its start.
+const KEEP_EVERY: Duration = Duration::from_secs(3600);
+
+/// Keep the live lab at `run_dir` (and its socket dir `sockdir`, when named)
+/// from `tmp_cleaner`, judging staleness as of `now` ([`STALE`]); returns how
+/// many entries it made new. Every regular file of the run dir outside its
+/// `scratch/` (the lab's own: `env.sh`, the profile, its program, its logs;
+/// none a jailed process may write) gets its access time made now, which
+/// moves its change time too, its modification time left as it is; the
+/// directories the profile pins (`scratch/` and its [`SCRATCH_DIRS`], the
+/// socket dir's `proj`) get their modification time made now, and the socket
+/// dir's `a.sock.token` its access time. What jailed code keeps in the
+/// scratch is its own and is left alone. No link is followed: the walk reads
+/// entries as they stand and [`crate::sys::touch_now`] sets an entry's own
+/// times, reaching it through no link.
+///
+/// [`SCRATCH_DIRS`]: crate::protected::SCRATCH_DIRS
+pub fn keep_from_the_cleaner(run_dir: &Path, sockdir: &str, now: SystemTime) -> usize {
+    use crate::sys::{Touch, touch_now};
+    let before = now
+        .checked_sub(STALE)
+        .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
+        .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX));
+    let file_stale = |m: &std::fs::Metadata| {
+        m.file_type().is_file() && m.atime() < before && m.mtime() < before && m.ctime() < before
+    };
+    let dir_stale = |m: &std::fs::Metadata| m.file_type().is_dir() && m.mtime() < before;
+    let mut made = 0;
+    let scratch = run_dir.join("scratch");
+    let mut todo = vec![(run_dir.to_path_buf(), 0usize)];
+    while let Some((dir, depth)) = todo.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for e in entries.flatten() {
+            let path = e.path();
+            let Ok(m) = std::fs::symlink_metadata(&path) else {
+                continue;
+            };
+            if m.file_type().is_dir() {
+                if path != scratch && depth < 8 {
+                    todo.push((path, depth + 1));
+                }
+            } else if file_stale(&m) && touch_now(&path, Touch::Accessed).unwrap_or(false) {
+                made += 1;
+            }
+        }
+    }
+    let mut pinned: Vec<(std::path::PathBuf, Touch)> = vec![(scratch.clone(), Touch::Modified)];
+    pinned.extend(
+        crate::protected::SCRATCH_DIRS
+            .iter()
+            .map(|n| (scratch.join(n), Touch::Modified)),
+    );
+    if !sockdir.is_empty() {
+        let sock = Path::new(sockdir);
+        pinned.push((sock.join("proj"), Touch::Modified));
+        pinned.push((sock.join("a.sock.token"), Touch::Accessed));
+    }
+    for (path, which) in pinned {
+        let Ok(m) = std::fs::symlink_metadata(&path) else {
+            continue;
+        };
+        let stale = match which {
+            Touch::Modified => dir_stale(&m),
+            Touch::Accessed => file_stale(&m),
+        };
+        if stale && touch_now(&path, which).unwrap_or(false) {
+            made += 1;
+        }
+    }
+    made
+}
 
 /// The `cmd[pid] proto kind endpoint[  EXTERNAL]` lines of `lsof -F pcPtn` output.
 #[must_use]
@@ -146,9 +238,14 @@ pub fn main(args: &[String]) -> i32 {
     let mut seen: BTreeSet<String> = BTreeSet::new();
     let mut ever: BTreeSet<i32> = BTreeSet::new();
     let mut runtime: BTreeSet<crate::runtime_dirs::Held> = BTreeSet::new();
+    let mut kept: Option<std::time::Instant> = None;
     // env.sh gone: the lab is down (or its `up` failed)
     while let Ok(text) = std::fs::read_to_string(dir.join("env.sh")) {
         let run = Run::parse(&text);
+        if kept.is_none_or(|t| t.elapsed() >= KEEP_EVERY) {
+            keep_from_the_cleaner(dir, &run.sockdir, SystemTime::now());
+            kept = Some(std::time::Instant::now());
+        }
         let m = members(&run, dir);
         if m.is_empty() && cut.load(std::sync::atomic::Ordering::SeqCst) {
             // The verb that owned the lab is gone and its jail is empty.
@@ -200,5 +297,148 @@ mod tests {
         assert!(e.contains(&"claude[2] TCP conn 160.79.104.10:443  EXTERNAL".to_string()));
         assert!(e.contains(&"claude[2] UDP listen [::1]:53".to_string()));
         assert!(e.contains(&"claude[2] UDP listen *:*".to_string()));
+    }
+
+    /// The empty directories under `top` that `tmp_cleaner`'s own test
+    /// (`find -dx . -fstype local ! -name . -type d -empty -mtime +3`) would
+    /// delete now.
+    fn cleaner_would_take(top: &Path) -> BTreeSet<std::path::PathBuf> {
+        let out = aterm_uds::spawnfd::command("/usr/bin/find")
+            .arg("-x")
+            .arg(top)
+            .args(["-type", "d", "-empty", "-mtime", "+3"])
+            .output()
+            .expect("find ran");
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .map(std::path::PathBuf::from)
+            .collect()
+    }
+
+    /// A LIVE LAB IS KEPT FROM macOS'S `tmp_cleaner`, which clears the
+    /// `/private/tmp` the default state dir sits in: with every entry's times
+    /// five days old (judged four days ahead, since a test cannot age a change
+    /// time), the run dir's own files outside `scratch/` (`env.sh`, the
+    /// profile, the lab's program) and the socket dir's token get their access
+    /// time made now, their modification time kept; the directories the
+    /// profile pins (`scratch/`, its `SCRATCH_DIRS`, the socket dir's `proj`)
+    /// get their modification time made now, so the cleaner's own `find`
+    /// would take none of them. NEGATIVE CONTROLS: a fresh lab is left alone
+    /// (nothing made new, no event for an agent watching a directory); a file
+    /// jailed code keeps in the scratch, a directory there no profile rule
+    /// pins (the cleaner would still take it) and the target of a link in the
+    /// run dir keep their old times.
+    #[test]
+    fn a_live_lab_is_kept_from_the_tmp_cleaner() {
+        use std::os::unix::fs::MetadataExt as _;
+        struct Top(std::path::PathBuf);
+        impl Drop for Top {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let top = Top(std::fs::canonicalize(std::env::temp_dir())
+            .unwrap()
+            .join(format!("lab-keep-{}", std::process::id())));
+        let _ = std::fs::remove_dir_all(&top.0);
+        let run = top.0.join("state/runs/t");
+        let sock = top.0.join("at.sock");
+        let scratch = run.join("scratch");
+        let mut dirs = vec![run.join("bin"), scratch.join("unpinned"), sock.join("proj")];
+        dirs.extend(
+            crate::protected::SCRATCH_DIRS
+                .iter()
+                .map(|n| scratch.join(n)),
+        );
+        for d in &dirs {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        let own = [
+            run.join("env.sh"),
+            run.join("jail.sb"),
+            run.join("bin/aterm-lab"),
+            sock.join("a.sock.token"),
+        ];
+        let jailed = scratch.join("home/agent.json");
+        let outside = top.0.join("outside");
+        for f in own.iter().chain([&jailed, &outside]) {
+            std::fs::write(f, "x\n").unwrap();
+        }
+        std::os::unix::fs::symlink(&outside, run.join("link")).unwrap();
+        let sockdir = sock.display().to_string();
+        // NEGATIVE CONTROL: a fresh lab is left alone
+        assert_eq!(keep_from_the_cleaner(&run, &sockdir, SystemTime::now()), 0);
+        let old = SystemTime::now() - Duration::from_secs(5 * 24 * 3600);
+        let old_s = i64::try_from(
+            old.duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+        )
+        .unwrap();
+        let times = std::fs::FileTimes::new()
+            .set_accessed(old)
+            .set_modified(old);
+        for f in own.iter().chain([&jailed, &outside]) {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(f)
+                .unwrap()
+                .set_times(times)
+                .unwrap();
+        }
+        for d in dirs.iter().chain([&scratch, &run]) {
+            std::fs::File::open(d).unwrap().set_times(times).unwrap();
+        }
+        let pinned: BTreeSet<std::path::PathBuf> = dirs
+            .iter()
+            .filter(|d| !d.ends_with("unpinned") && !d.ends_with("bin"))
+            .filter(|d| std::fs::read_dir(d).unwrap().next().is_none())
+            .cloned()
+            .collect();
+        assert!(
+            pinned.contains(&sock.join("proj")) && pinned.len() > 5,
+            "{pinned:?}"
+        );
+        let before = cleaner_would_take(&top.0);
+        assert!(
+            pinned.is_subset(&before) && before.contains(&scratch.join("unpinned")),
+            "{before:?}"
+        );
+        let start = SystemTime::now() - Duration::from_secs(2);
+        let start_s = i64::try_from(
+            start
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+        )
+        .unwrap();
+        let ahead = SystemTime::now() + Duration::from_secs(4 * 24 * 3600);
+        let made = keep_from_the_cleaner(&run, &sockdir, ahead);
+        let meta = |p: &Path| std::fs::symlink_metadata(p).unwrap();
+        for f in &own {
+            let m = meta(f);
+            assert!(m.atime() >= start_s, "{} accessed now", f.display());
+            assert_eq!(
+                m.mtime(),
+                old_s,
+                "{} keeps its modification time",
+                f.display()
+            );
+        }
+        for d in &pinned {
+            assert!(meta(d).mtime() >= start_s, "{} made new", d.display());
+        }
+        assert!(meta(&scratch).mtime() >= start_s);
+        let after = cleaner_would_take(&top.0);
+        assert!(pinned.is_disjoint(&after), "{after:?}");
+        assert!(made >= own.len() + pinned.len(), "{made}");
+        // NEGATIVE CONTROLS: the jail's own, an unpinned directory, a link's target
+        assert_eq!(
+            meta(&jailed).atime(),
+            old_s,
+            "the scratch's files are the jail's"
+        );
+        assert!(after.contains(&scratch.join("unpinned")), "{after:?}");
+        assert_eq!(meta(&outside).atime(), old_s, "no link is followed");
     }
 }

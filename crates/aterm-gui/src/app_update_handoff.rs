@@ -5256,13 +5256,9 @@ impl App {
         }
         #[cfg(target_os = "macos")]
         if self.workstation_setup.pending() {
-            // A deferral where the unix lanes spell one; elsewhere an admission
-            // refusal, which keeps the intent and spends no retry budget too.
-            const WHY: &str = "the Mac setup countdown is still open";
-            #[cfg(unix)]
-            return Err(crate::UpdateHandoffStartError::activity(WHY));
-            #[cfg(not(unix))]
-            return Err(crate::UpdateHandoffStartError::refused(WHY));
+            return Err(crate::UpdateHandoffStartError::activity(
+                "the Mac setup countdown is still open",
+            ));
         }
         #[cfg(target_os = "macos")]
         if self.askpass_sheet.is_some() {

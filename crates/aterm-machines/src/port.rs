@@ -446,6 +446,13 @@ pub trait System: Sync {
     /// [`RunFailed`] when the program could not be started.
     fn run_tty(&self, cmd: &Cmd) -> Result<Option<i32>, RunFailed>;
 
+    /// Whether this process has a controlling terminal a person can answer a prompt on
+    /// ([`Self::run_tty`]'s `sudo`): `/dev/tty` opens for reading and writing. `false` for
+    /// a backend with none.
+    fn has_tty(&self) -> bool {
+        false
+    }
+
     /// Run `cmd` to completion or its deadline, as [`System::run`] does, with `input` and a
     /// newline on its standard input: a pipe written and closed before the child starts,
     /// never a file, an argument or a variable (`enroll` feeds the admin's password to `ssh`
@@ -1191,6 +1198,14 @@ impl System for Live {
         secret::ask_tty(prompt, secret)
     }
 
+    fn has_tty(&self) -> bool {
+        std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open("/dev/tty")
+            .is_ok()
+    }
+
     fn read_file(&self, path: &Path) -> io::Result<Vec<u8>> {
         std::fs::read(path)
     }
@@ -1709,6 +1724,8 @@ mod fake {
         answers: Mutex<std::collections::VecDeque<Option<String>>>,
         /// Each [`System::run_fed`] run's key and the bytes it was fed ([`Fake::fed`]).
         fed: Mutex<Vec<(String, Vec<u8>)>>,
+        /// What [`System::has_tty`] answers: a person's terminal is there.
+        pub tty: bool,
     }
 
     #[derive(Clone)]
@@ -2301,6 +2318,10 @@ mod fake {
                     "fake: no answer scripted for `{prompt}`"
                 ))),
             }
+        }
+
+        fn has_tty(&self) -> bool {
+            self.tty
         }
 
         fn run_tty(&self, cmd: &Cmd) -> Result<Option<i32>, RunFailed> {

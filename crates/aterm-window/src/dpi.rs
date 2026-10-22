@@ -28,47 +28,56 @@
 /// A pixel coordinate type: a primitive number that converts through `f64`.
 pub trait Pixel: Copy + Into<f64> {
     fn from_f64(f: f64) -> Self;
+    #[inline]
     fn cast<P: Pixel>(self) -> P {
         P::from_f64(self.into())
     }
 }
 
 impl Pixel for u8 {
+    #[inline]
     fn from_f64(f: f64) -> Self {
         f.round() as u8
     }
 }
 impl Pixel for u16 {
+    #[inline]
     fn from_f64(f: f64) -> Self {
         f.round() as u16
     }
 }
 impl Pixel for u32 {
+    #[inline]
     fn from_f64(f: f64) -> Self {
         f.round() as u32
     }
 }
 impl Pixel for i8 {
+    #[inline]
     fn from_f64(f: f64) -> Self {
         f.round() as i8
     }
 }
 impl Pixel for i16 {
+    #[inline]
     fn from_f64(f: f64) -> Self {
         f.round() as i16
     }
 }
 impl Pixel for i32 {
+    #[inline]
     fn from_f64(f: f64) -> Self {
         f.round() as i32
     }
 }
 impl Pixel for f32 {
+    #[inline]
     fn from_f64(f: f64) -> Self {
         f as f32
     }
 }
 impl Pixel for f64 {
+    #[inline]
     fn from_f64(f: f64) -> Self {
         f
     }
@@ -118,12 +127,14 @@ impl<P: Pixel> LogicalPosition<P> {
 }
 
 impl<P: Pixel, X: Pixel> From<(X, X)> for LogicalPosition<P> {
+    #[inline]
     fn from((x, y): (X, X)) -> LogicalPosition<P> {
         LogicalPosition::new(x.cast(), y.cast())
     }
 }
 
 impl<P: Pixel, X: Pixel> From<LogicalPosition<P>> for (X, X) {
+    #[inline]
     fn from(p: LogicalPosition<P>) -> (X, X) {
         (p.x.cast(), p.y.cast())
     }
@@ -159,12 +170,14 @@ impl<P: Pixel> PhysicalPosition<P> {
 }
 
 impl<P: Pixel, X: Pixel> From<(X, X)> for PhysicalPosition<P> {
+    #[inline]
     fn from((x, y): (X, X)) -> PhysicalPosition<P> {
         PhysicalPosition::new(x.cast(), y.cast())
     }
 }
 
 impl<P: Pixel, X: Pixel> From<PhysicalPosition<P>> for (X, X) {
+    #[inline]
     fn from(p: PhysicalPosition<P>) -> (X, X) {
         (p.x.cast(), p.y.cast())
     }
@@ -200,12 +213,14 @@ impl<P: Pixel> LogicalSize<P> {
 }
 
 impl<P: Pixel, X: Pixel> From<(X, X)> for LogicalSize<P> {
+    #[inline]
     fn from((x, y): (X, X)) -> LogicalSize<P> {
         LogicalSize::new(x.cast(), y.cast())
     }
 }
 
 impl<P: Pixel, X: Pixel> From<LogicalSize<P>> for (X, X) {
+    #[inline]
     fn from(s: LogicalSize<P>) -> (X, X) {
         (s.width.cast(), s.height.cast())
     }
@@ -241,12 +256,14 @@ impl<P: Pixel> PhysicalSize<P> {
 }
 
 impl<P: Pixel, X: Pixel> From<(X, X)> for PhysicalSize<P> {
+    #[inline]
     fn from((x, y): (X, X)) -> PhysicalSize<P> {
         PhysicalSize::new(x.cast(), y.cast())
     }
 }
 
 impl<P: Pixel, X: Pixel> From<PhysicalSize<P>> for (X, X) {
+    #[inline]
     fn from(s: PhysicalSize<P>) -> (X, X) {
         (s.width.cast(), s.height.cast())
     }
@@ -260,10 +277,12 @@ pub enum Size {
 }
 
 impl Size {
+    #[inline]
     pub fn new<S: Into<Size>>(size: S) -> Size {
         size.into()
     }
 
+    #[inline]
     pub fn to_logical<P: Pixel>(&self, scale_factor: f64) -> LogicalSize<P> {
         match *self {
             Size::Physical(size) => size.to_logical(scale_factor),
@@ -271,6 +290,7 @@ impl Size {
         }
     }
 
+    #[inline]
     pub fn to_physical<P: Pixel>(&self, scale_factor: f64) -> PhysicalSize<P> {
         match *self {
             Size::Physical(size) => size.cast(),
@@ -278,6 +298,7 @@ impl Size {
         }
     }
 
+    #[inline]
     pub fn clamp<S: Into<Size>>(input: S, min: S, max: S, scale_factor: f64) -> Size {
         let (input, min, max) = (
             input.into().to_physical::<f64>(scale_factor),
@@ -314,10 +335,12 @@ pub enum Position {
 }
 
 impl Position {
+    #[inline]
     pub fn new<S: Into<Position>>(position: S) -> Position {
         position.into()
     }
 
+    #[inline]
     pub fn to_logical<P: Pixel>(&self, scale_factor: f64) -> LogicalPosition<P> {
         match *self {
             Position::Physical(position) => position.to_logical(scale_factor),
@@ -325,6 +348,7 @@ impl Position {
         }
     }
 
+    #[inline]
     pub fn to_physical<P: Pixel>(&self, scale_factor: f64) -> PhysicalPosition<P> {
         match *self {
             Position::Physical(position) => position.cast(),

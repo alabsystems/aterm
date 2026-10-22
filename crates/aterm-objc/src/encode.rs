@@ -206,12 +206,14 @@ impl Bool {
 }
 
 impl From<bool> for Bool {
+    #[inline]
     fn from(value: bool) -> Self {
         Self::new(value)
     }
 }
 
 impl From<Bool> for bool {
+    #[inline]
     fn from(value: Bool) -> Self {
         value.as_bool()
     }
@@ -365,6 +367,7 @@ pub struct CGPoint {
 
 impl CGPoint {
     /// Construct a `CGPoint` at `(x, y)`.
+    #[inline]
     #[must_use]
     pub const fn new(x: f64, y: f64) -> Self {
         Self { x, y }
@@ -381,6 +384,7 @@ pub struct CGSize {
 
 impl CGSize {
     /// Construct a `CGSize` of `(width, height)`.
+    #[inline]
     #[must_use]
     pub const fn new(width: f64, height: f64) -> Self {
         Self { width, height }
@@ -397,6 +401,7 @@ pub struct CGRect {
 
 impl CGRect {
     /// Construct a `CGRect` from `origin` and `size`.
+    #[inline]
     #[must_use]
     pub const fn new(origin: CGPoint, size: CGSize) -> Self {
         Self { origin, size }
@@ -432,24 +437,28 @@ pub struct NSRange {
 
 impl NSRange {
     /// Construct an `NSRange` with `(location, length)`.
+    #[inline]
     #[must_use]
     pub const fn new(location: usize, length: usize) -> Self {
         Self { location, length }
     }
 
     /// Return `true` when `length == 0`.
+    #[inline]
     #[must_use]
     pub const fn is_empty(self) -> bool {
         self.length == 0
     }
 
     /// Return `location.saturating_add(length)`.
+    #[inline]
     #[must_use]
     pub const fn end_saturating(self) -> usize {
         self.location.saturating_add(self.length)
     }
 
     /// Return `true` when `idx >= location` and `idx - location < length`.
+    #[inline]
     #[must_use]
     pub const fn contains_index(self, idx: usize) -> bool {
         if idx < self.location {
@@ -459,6 +468,7 @@ impl NSRange {
     }
 
     /// Encode this `NSRange` into 16 little-endian bytes (`location` as `u64`, `length` as `u64`).
+    #[inline]
     #[must_use]
     pub const fn encode_le(self) -> [u8; 16] {
         let loc = self.location as u64;
@@ -484,6 +494,7 @@ impl NSRange {
     }
 
     /// Decode 16 little-endian bytes into an `NSRange`.
+    #[inline]
     #[must_use]
     pub const fn decode_le(bytes: [u8; 16]) -> Self {
         let loc = (bytes[0] as u64)

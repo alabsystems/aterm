@@ -72,7 +72,8 @@ impl Part {
     pub(crate) const ALL: [Part; 4] = [Part::Top, Part::Left, Part::Right, Part::Bottom];
 
     /// Its position in [`Part::ALL`].
-    pub(crate) fn index(self) -> usize {
+    #[inline]
+    pub(crate) const fn index(self) -> usize {
         match self {
             Part::Top => 0,
             Part::Left => 1,
@@ -92,13 +93,19 @@ pub(crate) struct Rect {
 }
 
 /// `v` as an `i32`, saturating (a window is never that large).
-fn signed(v: u32) -> i32 {
-    i32::try_from(v).unwrap_or(i32::MAX)
+#[inline]
+const fn signed(v: u32) -> i32 {
+    if v > i32::MAX as u32 {
+        i32::MAX
+    } else {
+        v as i32
+    }
 }
 
 /// Where `part` sits beside a `width`×`height` window, relative to the window's surface
 /// (sctk-adwaita's `DecorationParts::new` and `resize`, without a header of its own).
-pub(crate) fn surface_rect(part: Part, width: u32, height: u32) -> Rect {
+#[inline]
+pub(crate) const fn surface_rect(part: Part, width: u32, height: u32) -> Rect {
     let b = BORDER_SIZE;
     let across = width.saturating_add(2 * b);
     match part {
@@ -111,7 +118,8 @@ pub(crate) fn surface_rect(part: Part, width: u32, height: u32) -> Rect {
 
 /// The part of `part` that takes the pointer, relative to the part: the [`RESIZE_HANDLE_SIZE`]
 /// px against the window, the top and bottom ones reaching as far past the sides.
-pub(crate) fn input_rect(part: Part, width: u32, height: u32) -> Rect {
+#[inline]
+pub(crate) const fn input_rect(part: Part, width: u32, height: u32) -> Rect {
     let (b, r) = (BORDER_SIZE, RESIZE_HANDLE_SIZE);
     let inset = signed(b - r);
     let across = width.saturating_add(2 * r);
@@ -127,6 +135,7 @@ pub(crate) fn input_rect(part: Part, width: u32, height: u32) -> Rect {
 /// `width`×`height` window: by a corner within [`RESIZE_HANDLE_CORNER_SIZE`] px of it along the
 /// edge, else by the edge (sctk-adwaita's `precise_location`).
 #[cfg(not(macos_platform))]
+#[inline]
 pub(crate) fn direction(part: Part, x: f64, y: f64, width: u32, height: u32) -> ResizeDirection {
     let left_corner_x = f64::from(BORDER_SIZE + RESIZE_HANDLE_CORNER_SIZE);
     let right_corner_x = f64::from((width + BORDER_SIZE).saturating_sub(RESIZE_HANDLE_CORNER_SIZE));
@@ -176,6 +185,7 @@ impl Pixmap {
     }
 }
 
+#[inline]
 fn shadow(pixel_dist: f32, scale: u32, active: bool) -> f32 {
     let (a, b, c) = if active { SHADOW_PARAMS_ACTIVE } else { SHADOW_PARAMS_INACTIVE };
 
@@ -183,12 +193,14 @@ fn shadow(pixel_dist: f32, scale: u32, active: bool) -> f32 {
 }
 
 /// The shadow's alpha at `dist` px from the window, as a premultiplied black pixel.
+#[inline]
 fn shadow_pixel(dist: f32, scale: u32, active: bool) -> [u8; 4] {
     let alpha = (shadow(dist, scale, active) * f32::from(u8::MAX)).round() as u8;
     [0, 0, 0, alpha]
 }
 
 /// A tiny-skia `Point::distance` (its `length`: f32, widened only where the square overflows).
+#[inline]
 fn distance(x: f32, y: f32) -> f32 {
     let mag2 = x * x + y * y;
     if mag2.is_finite() {
@@ -445,7 +457,8 @@ impl RenderedShadow {
 }
 
 /// `part`'s buffer size in px beside a `width`×`height` window at integer `scale`.
-pub(crate) fn buffer_size(part: Part, width: u32, height: u32, scale: u32) -> (usize, usize) {
+#[inline]
+pub(crate) const fn buffer_size(part: Part, width: u32, height: u32, scale: u32) -> (usize, usize) {
     let rect = surface_rect(part, width, height);
     ((rect.width * scale) as usize, (rect.height * scale) as usize)
 }
@@ -517,7 +530,8 @@ pub(crate) struct Look {
 
 /// `[x0, y0, x1, y1)` of the visible border on `part`'s buffer, px: the line against the
 /// window, reaching across the corners on the top and bottom parts.
-pub(crate) fn border_span(
+#[inline]
+pub(crate) const fn border_span(
     part: Part,
     width: u32,
     height: u32,

@@ -168,6 +168,24 @@ fn results_in(content: &J) -> usize {
         .count()
 }
 
+/// Whether a Gemini API request's conversation carries a function's result
+/// back: a content holds a `functionResponse` part (Gemini CLI's in a `user`
+/// content, agy's in a `model` one) — the newest, or one before a turn the
+/// agent sent of its own after it (agy's `Error: model output error: …` after
+/// an empty reply), so a scripted call is made once a conversation, never
+/// again at each retry.
+#[must_use]
+pub fn results_answered(body: &[u8]) -> bool {
+    let Ok(j) = J::parse_bytes(body) else {
+        return false;
+    };
+    j.get("contents")
+        .and_then(J::as_arr)
+        .unwrap_or_default()
+        .iter()
+        .any(|c| results_in(c) > 0)
+}
+
 /// The text between `<USER_REQUEST>` and `</USER_REQUEST>` (agy wraps the
 /// typed prompt so), else the text itself.
 #[must_use]
@@ -902,6 +920,18 @@ impl Stub {
         let mut mode = mode.to_string();
         if let Some(spec) = self.take_custom(&mode, Some(label)) {
             let spec = super::with_reply(spec, &gemini_users(body));
+            if let Some((name, input)) = super::scripted_call(&spec, results_answered(body)) {
+                let call = J::obj([
+                    (
+                        "functionCall",
+                        J::obj([("name", J::s(name.as_str())), ("args", input)]),
+                    ),
+                    ("thoughtSignature", J::s(SIGNATURE)),
+                ]);
+                let s = format!("{summary} custom tool:{name}");
+                let t = (method, path, blen, mode.as_str(), model, verb, in_tok);
+                return self.gemini_answer(t, &s, vec![(0.0, vec![call])], &[], out);
+            }
             let status = spec
                 .get("status")
                 .and_then(J::as_i64)

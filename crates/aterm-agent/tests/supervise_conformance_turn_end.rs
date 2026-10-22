@@ -182,9 +182,12 @@ fn reading(
             SAID.with(std::cell::Cell::get).to_string()
         }),
         said_cut: false,
+        opens_cut: false,
         turn_said: None,
         opened_by: None,
         message_drawn: false,
+        submits: None,
+        screen_mark: None,
         worked,
         rules: None,
         pending_input,

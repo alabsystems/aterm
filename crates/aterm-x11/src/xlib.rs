@@ -87,6 +87,7 @@ pub mod event_type {
     pub const EXPOSE: c_int = 12;
     pub const VISIBILITY_NOTIFY: c_int = 15;
     pub const DESTROY_NOTIFY: c_int = 17;
+    pub const UNMAP_NOTIFY: c_int = 18;
     pub const MAP_NOTIFY: c_int = 19;
     pub const REPARENT_NOTIFY: c_int = 21;
     pub const CONFIGURE_NOTIFY: c_int = 22;
@@ -270,6 +271,19 @@ pub struct XDestroyWindowEvent {
     pub window: Window,
 }
 
+/// `XUnmapEvent`.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct XUnmapEvent {
+    pub type_: c_int,
+    pub serial: c_ulong,
+    pub send_event: Bool,
+    pub display: *mut Display,
+    pub event: Window,
+    pub window: Window,
+    pub from_configure: Bool,
+}
+
 /// `XMapEvent`.
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
@@ -407,6 +421,7 @@ pub union XEvent {
     pub expose: XExposeEvent,
     pub visibility: XVisibilityEvent,
     pub destroy_window: XDestroyWindowEvent,
+    pub unmap: XUnmapEvent,
     pub map: XMapEvent,
     pub reparent: XReparentEvent,
     pub configure: XConfigureEvent,
@@ -915,6 +930,13 @@ aterm_dl::table! {
             unsafe extern "C" fn(*mut Display, *const XcursorImage) -> Cursor;
         XcursorLibraryLoadCursor = c"XcursorLibraryLoadCursor":
             unsafe extern "C" fn(*mut Display, *const c_char) -> Cursor;
+        XcursorSetTheme = c"XcursorSetTheme":
+            unsafe extern "C" fn(*mut Display, *const c_char) -> Bool;
+        XcursorGetTheme = c"XcursorGetTheme": unsafe extern "C" fn(*mut Display) -> *mut c_char;
+        XcursorSetDefaultSize = c"XcursorSetDefaultSize":
+            unsafe extern "C" fn(*mut Display, c_int) -> Bool;
+        XcursorGetDefaultSize = c"XcursorGetDefaultSize":
+            unsafe extern "C" fn(*mut Display) -> c_int;
     }
 }
 

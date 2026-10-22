@@ -133,6 +133,7 @@ pub enum Owed {
 
 impl Owed {
     /// How many marks it says.
+    #[inline]
     #[must_use]
     pub const fn count(self) -> u64 {
         match self {
@@ -141,6 +142,7 @@ impl Owed {
     }
 
     /// Whether it is the shared pool's.
+    #[inline]
     #[must_use]
     pub const fn is_shared(self) -> bool {
         matches!(self, Owed::Shared(_))

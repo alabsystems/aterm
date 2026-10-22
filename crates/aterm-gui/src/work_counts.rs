@@ -44,8 +44,8 @@ thread_local! {
     /// (`subscribe::prune_closed`): none while the roster journal stands.
     static WATCHES_PROBED: Cell<usize> = const { Cell::new(0) };
     /// Windows asked whether they are on screen
-    /// (`messages_host::band_on_screen`: off macOS, a round trip to the
-    /// window server).
+    /// (`messages_host::band_on_screen`: on Windows, a call into the window
+    /// system).
     static ON_SCREEN_ASKS: Cell<usize> = const { Cell::new(0) };
     /// Strip re-stamps a task's end asked for (`App::restamp_for_end`,
     /// design §11.2.3 item 7): one per end, one per look that quiets one.

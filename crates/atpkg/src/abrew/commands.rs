@@ -337,44 +337,232 @@ pub(super) fn cmd_search(api: &Api, rest: &[String]) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-fn print_formula_info(prefix: &Prefix, f: &Formula) {
-    println!("==> {}: stable {}", f.full_name, f.version);
+/// File count and bytes of a keg tree, brew's `Keg#abv` inputs.
+fn keg_abv(dir: &std::path::Path) -> String {
+    let mut count = 0usize;
+    let mut bytes = 0u64;
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(p) = stack.pop() {
+        let Ok(meta) = std::fs::symlink_metadata(&p) else {
+            continue;
+        };
+        if meta.is_dir() {
+            if let Ok(entries) = std::fs::read_dir(&p) {
+                stack.extend(entries.flatten().map(|e| e.path()));
+            }
+        } else {
+            count += 1;
+            bytes = bytes.saturating_add(meta.len());
+        }
+    }
+    format!(
+        "{count} file{}, {}",
+        if count == 1 { "" } else { "s" },
+        disk_usage_readable(bytes)
+    )
+}
+
+/// Brew's `From:` source for a formula record: the homebrew-core
+/// GitHub blob URL for core formulae; for tap formulae the local
+/// recipe path when the tap stands, else the conventional GitHub
+/// layout. Also returns the non-official tap name for `Tap:`.
+fn formula_source(prefix: &Prefix, f: &Formula) -> (String, Option<String>) {
+    let parts: Vec<&str> = f.full_name.split('/').collect();
+    if parts.len() == 3 {
+        let (user, repo) = (parts[0], parts[1]);
+        let official = user == "homebrew" && matches!(repo, "core" | "cask");
+        if !official {
+            if let Some(t) = tap::list(prefix)
+                .into_iter()
+                .find(|t| t.user == user && t.repo == repo)
+                && let Some(file) = tap::formula_file(&t, &f.name)
+            {
+                return (file.display().to_string(), Some(t.name()));
+            }
+            return (
+                format!(
+                    "https://github.com/{user}/homebrew-{repo}/blob/HEAD/Formula/{}.rb",
+                    f.name
+                ),
+                Some(format!("{user}/{repo}")),
+            );
+        }
+    }
+    (
+        format!(
+            "https://github.com/Homebrew/homebrew-core/blob/HEAD/Formula/{}/{}.rb",
+            core_shard(&f.name),
+            f.name
+        ),
+        None,
+    )
+}
+
+/// Plain `info` for one formula, in brew's section order: headline,
+/// desc/homepage/aliases, conflicts, status, From/Tap/License,
+/// Installed Versions, Dependencies, Caveats. (Brew's analytics
+/// tail stays behind abrew's explicit --analytics form.)
+fn print_formula_info(prefix: &Prefix, api: &Api, f: &Formula) {
+    let inst = prefix.installed_one(Kind::Formula, &f.name);
+    let outdated = inst
+        .as_ref()
+        .is_some_and(|i| version_cmp(&i.version, &f.version) == Ordering::Less);
+    let bottled = !f.bottle_files.is_empty();
+    let stable = if bottled {
+        format!("stable {} (bottled)", f.version)
+    } else {
+        format!("stable {}", f.version)
+    };
+    let spec = if outdated {
+        let linked = inst
+            .as_ref()
+            .and_then(|i| linked_keg_version(prefix, i))
+            .unwrap_or_else(|| inst.as_ref().map(|i| i.version.clone()).unwrap_or_default());
+        format!("{linked} → {stable}")
+    } else {
+        stable
+    };
+    println!(
+        "==> {}: {spec}{}",
+        f.full_name,
+        if f.keg_only { " [keg-only]" } else { "" }
+    );
     if !f.desc.is_empty() {
         println!("{}", f.desc);
     }
     if !f.homepage.is_empty() {
         println!("{}", f.homepage);
     }
+    if !f.aliases.is_empty() {
+        println!("Aliases: {}", f.aliases.join(", "));
+    }
+    if !f.oldnames.is_empty() {
+        println!("Old Names: {}", f.oldnames.join(", "));
+    }
+    if f.deprecate {
+        println!("Deprecated!");
+    } else if f.disable {
+        println!("Disabled!");
+    }
+    if !f.conflicts.is_empty() {
+        let mut names = f.conflicts.clone();
+        names.sort();
+        println!("Conflicts with:");
+        for name in names {
+            println!("  {name}");
+        }
+    }
+    match &inst {
+        Some(i) => {
+            let keg = prefix.keg(&f.name, &i.version);
+            let on_request = super::prefix::receipt_word(&keg, "installed_on_request").as_deref()
+                == Some("true");
+            println!(
+                "Installed ({})",
+                if on_request {
+                    "on request"
+                } else {
+                    "as dependency"
+                }
+            );
+        }
+        None => println!("Not installed"),
+    }
+    let (from, tap_name) = formula_source(prefix, f);
+    println!("From: {from}");
+    if let Some(tap_name) = tap_name {
+        println!("Tap: {tap_name}");
+    }
     if !f.license.is_empty() {
         println!("License: {}", f.license);
     }
-    match prefix.installed_one(Kind::Formula, &f.name) {
-        Some(i) => println!(
-            "Installed: {} ({}){}",
-            i.version,
-            i.versions.join(", "),
-            if prefix.is_pinned(&f.name) {
-                " [pinned]"
-            } else {
-                ""
+    if let Some(i) = &inst {
+        // Newest first; non-verbose brew keeps the newest and any linked keg.
+        let linked_version = linked_keg_version(prefix, i);
+        let mut rows: Vec<(String, String, bool)> = i
+            .versions
+            .iter()
+            .rev()
+            .enumerate()
+            .filter(|(idx, v)| *idx == 0 || linked_version.as_deref() == Some(v.as_str()))
+            .map(|(_, v)| {
+                let shown = if outdated && v == &i.version {
+                    format!("{v} → {}", f.version)
+                } else {
+                    v.clone()
+                };
+                (
+                    shown,
+                    keg_abv(&prefix.keg(&f.name, v)),
+                    linked_version.as_deref() == Some(v.as_str()),
+                )
+            })
+            .collect();
+        if !rows.is_empty() {
+            println!("==> Installed Versions");
+            let vw = rows.iter().map(|r| r.0.len()).max().unwrap_or(0);
+            let sw = rows.iter().map(|r| r.1.len() + 2).max().unwrap_or(0);
+            for (version, size, linked) in rows.drain(..) {
+                let size = format!("({size})");
+                if linked {
+                    println!(
+                        "{} {:<vw$} {:<sw$} [Linked]",
+                        f.full_name,
+                        version,
+                        size,
+                        vw = vw,
+                        sw = sw
+                    );
+                } else {
+                    println!("{} {:<vw$} {}", f.full_name, version, size, vw = vw);
+                }
             }
-        ),
-        None => println!("Not installed"),
+        }
+    }
+    let mut dep_lines = Vec::new();
+    if !bottled && !f.build_dependencies.is_empty() {
+        dep_lines.push(format!(
+            "Build ({}): {}",
+            f.build_dependencies.len(),
+            f.build_dependencies.join(", ")
+        ));
     }
     if !f.dependencies.is_empty() {
-        println!("Dependencies: {}", f.dependencies.join(", "));
+        dep_lines.push(format!(
+            "Required ({}): {}",
+            f.dependencies.len(),
+            f.dependencies.join(", ")
+        ));
     }
-    if f.keg_only {
-        println!("keg-only (not linked)");
-    }
-    if f.deprecate {
-        println!("Deprecated upstream");
-    }
-    if f.disable {
-        println!("Disabled upstream");
+    let closure = if inst.is_some() {
+        flat_dependencies(f, false, |n| api.formula(n).ok())
+    } else {
+        std::collections::BTreeSet::new()
+    };
+    if !dep_lines.is_empty() || !closure.is_empty() {
+        println!("==> Dependencies");
+        for line in dep_lines {
+            println!("{line}");
+        }
+        if !closure.is_empty() {
+            let installed_count = closure
+                .iter()
+                .filter(|d| prefix.installed_one(Kind::Formula, d).is_some())
+                .count();
+            let counts = if installed_count == closure.len() {
+                "all installed ✔".to_string()
+            } else {
+                format!(
+                    "{installed_count} installed ✔, {} missing ✘",
+                    closure.len() - installed_count
+                )
+            };
+            println!("Recursive Runtime ({}): {counts}", closure.len());
+        }
     }
     if !f.caveats.is_empty() {
-        println!("Caveats: {}", f.caveats.trim());
+        println!("==> Caveats");
+        println!("{}", f.caveats.trim());
     }
 }
 
@@ -906,22 +1094,15 @@ pub(super) fn cmd_info(prefix: &Prefix, api: &Api, args: &[String], rest: &[Stri
     // hide the good ones after it.
     let mut failures = 0;
     let mut printed = false;
-    for name in &names {
+    for (idx, name) in names.iter().enumerate() {
+        // Brew separates entries with a blank line.
+        if idx > 0 {
+            println!();
+        }
         if has_flag(rest, "--cask", "") {
             match api.cask(name) {
                 Ok(c) => {
-                    println!("==> {}: {}", c.token, c.version);
-                    if !c.name.is_empty() {
-                        println!("{}", c.name);
-                    }
-                    if !c.desc.is_empty() {
-                        println!("{}", c.desc);
-                    }
-                    println!("{}", c.homepage);
-                    match prefix.installed_one(Kind::Cask, &c.token) {
-                        Some(i) => println!("Installed: {}", i.version),
-                        None => println!("Not installed"),
-                    }
+                    print_cask_info(prefix, api, &c);
                     printed = true;
                 }
                 Err(_) => {
@@ -943,12 +1124,12 @@ pub(super) fn cmd_info(prefix: &Prefix, api: &Api, args: &[String], rest: &[Stri
         }
         match api.formula(name) {
             Ok(f) => {
-                print_formula_info(prefix, &f);
+                print_formula_info(prefix, api, &f);
                 printed = true;
             }
             Err(_) => match tap::lookup(prefix, name) {
                 Some(f) => {
-                    print_formula_info(prefix, &f);
+                    print_formula_info(prefix, api, &f);
                     printed = true;
                 }
                 None => {
@@ -984,20 +1165,7 @@ pub(super) fn cmd_info(prefix: &Prefix, api: &Api, args: &[String], rest: &[Stri
                     }
                     match api.cask(name) {
                         Ok(c) => {
-                            println!("==> {} ({})", c.token, c.version);
-                            if !c.name.is_empty() {
-                                println!("{}", c.name);
-                            }
-                            if !c.desc.is_empty() {
-                                println!("{}", c.desc);
-                            }
-                            if !c.homepage.is_empty() {
-                                println!("{}", c.homepage);
-                            }
-                            match prefix.installed_one(Kind::Cask, &c.token) {
-                                Some(i) => println!("Installed: {}", i.version),
-                                None => println!("Not installed"),
-                            }
+                            print_cask_info(prefix, api, &c);
                             printed = true;
                         }
                         Err(_) => {
@@ -1013,6 +1181,197 @@ pub(super) fn cmd_info(prefix: &Prefix, api: &Api, args: &[String], rest: &[Stri
         ExitCode::from(1)
     } else {
         ExitCode::SUCCESS
+    }
+}
+
+/// One artifact's `Artifacts` line: installed name (rename target
+/// or source basename) plus brew's english class name. `None` for
+/// artifact kinds brew does not list as ordinary.
+fn artifact_line(a: &super::formula::Artifact) -> Option<String> {
+    use super::formula::Artifact;
+    // Brew's `Relocated#summarize`: source as written, plus
+    // ` -> target` when renamed; the label is the artifact class's
+    // english name.
+    let (source, target, label): (&str, Option<&str>, &str) = match a {
+        Artifact::App(s, t) => (s, t.as_deref(), "App"),
+        Artifact::Binary(s, t) => (s, t.as_deref(), "Binary"),
+        Artifact::Font(s, t) => (s, t.as_deref(), "Font"),
+        Artifact::Pkg(s) => (s, None, "Pkg"),
+        Artifact::Manpage(s, t) => (s, t.as_deref(), "Manpage"),
+        Artifact::Suite(s, t) => (s, t.as_deref(), "App Suite"),
+        Artifact::KeyboardLayout(s, t) => (s, t.as_deref(), "Keyboard Layout"),
+        Artifact::ScreenSaver(s, t) => (s, t.as_deref(), "Screen Saver"),
+        Artifact::PrefPane(s, t) => (s, t.as_deref(), "Preference Pane"),
+        Artifact::Service(s, t) => (s, t.as_deref(), "Service"),
+        Artifact::Generic(s, t) => (s, t.as_deref(), "Generic Artifact"),
+        Artifact::Wrapper(name, _, _, t) => (name, t.as_deref(), "Command Wrapper"),
+        Artifact::Library(s, t, dir) => (s, t.as_deref(), library_label(dir)),
+        Artifact::Other(_) => return None,
+    };
+    // The API spells out a target even when it is just the source's
+    // basename; brew shows the arrow only for a real rename (its
+    // target_string stays empty then). Generic targets are full
+    // stated paths and always show.
+    let basename = source.rsplit('/').next().unwrap_or(source);
+    let shown = match target {
+        Some(t) if matches!(a, Artifact::Generic(..)) || t != basename => {
+            format!("{source} -> {t}")
+        }
+        _ => source.to_string(),
+    };
+    Some(format!("{shown} ({label})"))
+}
+
+/// English name for a `Library` artifact, from the fixed directory
+/// its stanza maps to.
+fn library_label(dir: &str) -> &'static str {
+    match dir {
+        "Library/QuickLook" => "Quick Look Plugin",
+        "Library/ColorPickers" => "Colorpicker",
+        "Library/Dictionaries" => "Dictionary",
+        "Library/Input Methods" => "Input Method",
+        "Library/Internet Plug-Ins" => "Internet Plugin",
+        "Library/Spotlight" => "Spotlight metadata importer",
+        "Library/Audio/Plug-Ins/Components" => "Audio Unit Plugin",
+        "Library/Audio/Plug-Ins/VST" => "VST Plugin",
+        "Library/Audio/Plug-Ins/VST3" => "VST3 Plugin",
+        "share/bash-completion/completions" => "Bash Completion",
+        "share/zsh/site-functions" => "Zsh Completion",
+        "share/fish/vendor_completions.d" => "Fish Completion",
+        _ => "Artifact",
+    }
+}
+
+/// Plain `info` for one cask, in brew's `Cask::Info` order: title,
+/// desc/homepage, status + staged path, From, Dependencies,
+/// Requirements, Artifacts. (Analytics stays behind --analytics.)
+fn print_cask_info(prefix: &Prefix, api: &Api, c: &super::formula::Cask) {
+    let inst = prefix.installed_one(Kind::Cask, &c.token);
+    let outdated = !c.auto_updates
+        && inst
+            .as_ref()
+            .is_some_and(|i| version_cmp(&i.version, &c.version) == Ordering::Less);
+    let version = if outdated {
+        format!(
+            "{} → {}",
+            inst.as_ref().map(|i| i.version.clone()).unwrap_or_default(),
+            c.version
+        )
+    } else {
+        c.version.clone()
+    };
+    println!(
+        "==> {}{}: {version}{}",
+        c.token,
+        if c.name.is_empty() {
+            String::new()
+        } else {
+            format!(" ({})", c.name)
+        },
+        if c.auto_updates {
+            " (auto_updates)"
+        } else {
+            ""
+        }
+    );
+    if !c.desc.is_empty() {
+        println!("{}", c.desc);
+    }
+    if !c.homepage.is_empty() {
+        println!("{}", c.homepage);
+    }
+    // Brew prints one DeprecateDisable line (deprecated wins); abrew
+    // parses no reason/date, so the bare form.
+    if c.deprecated {
+        println!("Deprecated!");
+    } else if c.disabled {
+        println!("Disabled!");
+    }
+    match &inst {
+        Some(i) => {
+            let dir = prefix.cask_dir(&c.token, &i.version);
+            let on_request = super::prefix::receipt_word(&dir, "installed_on_request").as_deref()
+                == Some("true");
+            println!(
+                "Installed ({})",
+                if on_request {
+                    "on request"
+                } else {
+                    "as dependency"
+                }
+            );
+            println!(
+                "{} ({})",
+                dir.display(),
+                disk_usage_readable(dir_disk_usage(&dir))
+            );
+        }
+        None => println!("Not installed"),
+    }
+    println!(
+        "From: https://github.com/Homebrew/homebrew-cask/blob/HEAD/Casks/{}/{}.rb",
+        cask_shard(&c.token),
+        c.token
+    );
+    if !c.depends_formula.is_empty() || !c.depends_cask.is_empty() {
+        let mut all: Vec<String> = c.depends_formula.clone();
+        all.extend(c.depends_cask.iter().map(|t| format!("{t} (cask)")));
+        println!("==> Dependencies");
+        println!("Required ({}): {}", all.len(), all.join(", "));
+        // Recursive closure: cask tokens plus each formula dep's closure.
+        let mut recursive: Vec<(String, bool)> = Vec::new();
+        for dep in &c.depends_formula {
+            recursive.push((
+                dep.clone(),
+                prefix.installed_one(Kind::Formula, dep).is_some(),
+            ));
+            if let Ok(df) = api.formula(dep) {
+                for sub in flat_dependencies(&df, false, |n| api.formula(n).ok()) {
+                    recursive.push((
+                        sub.clone(),
+                        prefix.installed_one(Kind::Formula, &sub).is_some(),
+                    ));
+                }
+            }
+        }
+        for dep in &c.depends_cask {
+            recursive.push((dep.clone(), prefix.installed_one(Kind::Cask, dep).is_some()));
+        }
+        recursive.sort();
+        recursive.dedup();
+        if !recursive.is_empty() {
+            let installed_count = recursive.iter().filter(|(_, ok)| *ok).count();
+            let counts = if installed_count == recursive.len() {
+                "all installed ✔".to_string()
+            } else {
+                format!(
+                    "{installed_count} installed ✔, {} missing ✘",
+                    recursive.len() - installed_count
+                )
+            };
+            println!("Recursive Runtime ({}): {counts}", recursive.len());
+        }
+    }
+    let mut required: Vec<String> = Vec::new();
+    if let Some(min) = &c.macos_min {
+        required.push(format!("macOS >= {min}"));
+    }
+    if let Some(exact) = &c.macos_exact {
+        required.push(format!("macOS == {exact}"));
+    }
+    if let Some(arch) = &c.arch {
+        required.push(arch.clone());
+    }
+    if !required.is_empty() {
+        println!("==> Requirements");
+        println!("Required: {}", required.join(", "));
+    }
+    let artifacts: Vec<String> = c.artifacts.iter().filter_map(artifact_line).collect();
+    if !artifacts.is_empty() {
+        println!("==> Artifacts");
+        for line in artifacts {
+            println!("{line}");
+        }
     }
 }
 
@@ -1860,6 +2219,19 @@ pub(super) fn cmd_install(
     }
 }
 
+/// Brew's `Utils::Text.to_sentence`: "a", "a and b", "a, b, and c".
+pub(super) fn to_sentence(items: &[String]) -> String {
+    match items {
+        [] => String::new(),
+        [one] => one.clone(),
+        [a, b] => format!("{a} and {b}"),
+        _ => {
+            let (last, head) = items.split_last().expect("non-empty");
+            format!("{}, and {last}", head.join(", "))
+        }
+    }
+}
+
 pub(super) fn cmd_uninstall(
     prefix: &Prefix,
     api: &Api,
@@ -1872,6 +2244,48 @@ pub(super) fn cmd_uninstall(
     }
     let ignore = has_flag(rest, "--ignore-dependencies", "");
     let dry = has_flag(rest, "--dry-run", "-n");
+    let force = has_flag(rest, "--force", "-f");
+    // Brew checks dependents for the whole batch before removing
+    // anything: one required keg refuses the command untouched.
+    // Only a positive answer refuses here; metadata that cannot be
+    // read falls through to the per-name check inside uninstall.
+    if !ignore && !dry && !has_flag(rest, "--cask", "") {
+        let removing: std::collections::BTreeSet<String> = names
+            .iter()
+            .map(|n| Formula::short_name(n).to_string())
+            .collect();
+        let mut reqs: Vec<String> = Vec::new();
+        let mut deps: Vec<String> = Vec::new();
+        for name in &names {
+            let short = Formula::short_name(name);
+            let Some(inst) = prefix.installed_one(Kind::Formula, short) else {
+                continue;
+            };
+            if let Ok(on) = install::dependents(api, prefix, short) {
+                let on: Vec<String> = on.into_iter().filter(|d| !removing.contains(d)).collect();
+                if !on.is_empty() {
+                    reqs.push(prefix.keg(short, &inst.version).display().to_string());
+                    for d in on {
+                        if !deps.contains(&d) {
+                            deps.push(d);
+                        }
+                    }
+                }
+            }
+        }
+        if !reqs.is_empty() {
+            eprintln!(
+                "Error: Refusing to uninstall {}\nbecause {} {} required by {}, which {} currently installed.\nYou can override this and force removal with:\n  brew uninstall --ignore-dependencies {}",
+                to_sentence(&reqs),
+                if reqs.len() == 1 { "it" } else { "they" },
+                if reqs.len() == 1 { "is" } else { "are" },
+                to_sentence(&deps),
+                if deps.len() == 1 { "is" } else { "are" },
+                names.join(" ")
+            );
+            return ExitCode::FAILURE;
+        }
+    }
     // Brew removes every removable name and fails the command if any
     // name could not be removed; a delegation-worthy member still
     // delegates whole, but only before any native removal.
@@ -1895,11 +2309,53 @@ pub(super) fn cmd_uninstall(
                 && prefix.installed_one(Kind::Formula, short).is_none()
                 && prefix.installed_one(Kind::Cask, short).is_some())
         {
-            cask::uninstall(prefix, short, dry)
+            // Brew's --force uninstalls a cask even when it is not
+            // installed (a silent no-op).
+            if force
+                && has_flag(rest, "--cask", "")
+                && prefix.installed_one(Kind::Cask, short).is_none()
+            {
+                Ok(())
+            } else {
+                cask::uninstall(prefix, short, dry)
+            }
         } else {
-            install::uninstall(api, prefix, name, ignore, dry).inspect(|_| {
-                if !dry {
-                    println!("Uninstalling {short}…");
+            // Brew's headline names the keg (or, under --force, the
+            // formula and the whole rack) before removal. A pinned
+            // formula gets no headline: brew refuses it first.
+            let pinned_refusal = !force && prefix.pinned_version(short).is_some();
+            if !dry
+                && !pinned_refusal
+                && let Some(inst) = prefix.installed_one(Kind::Formula, short)
+            {
+                if force {
+                    println!(
+                        "Uninstalling {short}... ({})",
+                        keg_abv(&prefix.cellar().join(short))
+                    );
+                } else {
+                    let targets = install::uninstall_versions(prefix, &inst, false);
+                    let keg = prefix.keg(short, &targets[0]);
+                    println!("Uninstalling {}... ({})", keg.display(), keg_abv(&keg));
+                }
+            }
+            install::uninstall(api, prefix, name, ignore, force, dry).inspect(|_| {
+                if !dry
+                    && !force
+                    && let Some(left) = prefix.installed_one(Kind::Formula, short)
+                    && !left.versions.is_empty()
+                {
+                    println!(
+                        "{short} {} {} still installed.",
+                        to_sentence(&left.versions),
+                        if left.versions.len() == 1 {
+                            "is"
+                        } else {
+                            "are"
+                        }
+                    );
+                    println!("To remove all versions, run:");
+                    println!("  brew uninstall --force {short}");
                 }
             })
         };
@@ -2061,7 +2517,10 @@ fn outdated_json_row(prefix: &Prefix, kind: Kind, name: &str, latest: &str) -> a
     map.insert(
         "pinned_version".to_string(),
         if pinned {
-            aterm_json::Value::String(installed.map(|i| i.version).unwrap_or_default())
+            prefix
+                .pinned_version(name)
+                .map(aterm_json::Value::String)
+                .unwrap_or(aterm_json::Value::Null)
         } else {
             aterm_json::Value::Null
         },
@@ -2100,13 +2559,12 @@ pub(super) fn cmd_outdated(prefix: &Prefix, api: &Api, rest: &[String]) -> ExitC
             return failed(&format!("abrew: no formula or cask named \"{name}\""));
         }
     }
-    let json = if has_flag(rest, "--json=v2", "") {
-        Some(true)
-    } else if has_flag(rest, "--json", "") || has_flag(rest, "--json=v1", "") {
-        Some(false)
-    } else {
-        None
-    };
+    // Current brew dropped outdated's v1 JSON: --json=v1 errors and
+    // bare --json is the v2 object.
+    if has_flag(rest, "--json=v1", "") {
+        return failed("abrew: outdated --json=v1 is no longer supported; use --json=v2");
+    }
+    let json = has_flag(rest, "--json", "") || has_flag(rest, "--json=v2", "");
     let mut collected: [Vec<(String, String, String)>; 2] = [Vec::new(), Vec::new()];
     for (slot, casks) in [(0usize, false), (1usize, true)] {
         if has_flag(rest, "--cask", "") && !casks {
@@ -2126,31 +2584,22 @@ pub(super) fn cmd_outdated(prefix: &Prefix, api: &Api, rest: &[String]) -> ExitC
         }
     }
     let any = collected.iter().any(|r| !r.is_empty());
-    if let Some(v2) = json {
+    if json {
         let rows_json = |rows: &[(String, String, String)], kind: Kind| {
             rows.iter()
                 .map(|(name, _, latest)| outdated_json_row(prefix, kind, name, latest))
                 .collect::<Vec<_>>()
         };
-        let value = if v2 {
-            let mut map = aterm_json::Map::new();
-            map.insert(
-                "formulae".to_string(),
-                aterm_json::Value::Array(rows_json(&collected[0], Kind::Formula)),
-            );
-            map.insert(
-                "casks".to_string(),
-                aterm_json::Value::Array(rows_json(&collected[1], Kind::Cask)),
-            );
-            aterm_json::Value::Object(map)
-        } else {
-            aterm_json::Value::Array(
-                rows_json(&collected[0], Kind::Formula)
-                    .into_iter()
-                    .chain(rows_json(&collected[1], Kind::Cask))
-                    .collect(),
-            )
-        };
+        let mut map = aterm_json::Map::new();
+        map.insert(
+            "formulae".to_string(),
+            aterm_json::Value::Array(rows_json(&collected[0], Kind::Formula)),
+        );
+        map.insert(
+            "casks".to_string(),
+            aterm_json::Value::Array(rows_json(&collected[1], Kind::Cask)),
+        );
+        let value = aterm_json::Value::Object(map);
         match aterm_json::to_string(&value) {
             Ok(text) => println!("{text}"),
             Err(e) => return failed(&format!("abrew: {e}")),
@@ -2454,7 +2903,134 @@ fn cmd_upgrade_casks(
     }
 }
 
+/// The update diff, brew's reporter-hub sections computed from the
+/// cached index (before) against the fresh one (after). A kind with
+/// no cached index contributes no new/deleted rows: a first update
+/// has nothing to diff against.
+struct UpdateReport {
+    new_formulae: Vec<(String, String)>,
+    new_casks: Vec<(String, String)>,
+    deleted_formulae: Vec<String>,
+    deleted_casks: Vec<String>,
+    outdated_formulae: Vec<String>,
+    outdated_casks: Vec<String>,
+}
+
+fn update_report(
+    old: Option<&[super::api::IndexRow]>,
+    new: &[super::api::IndexRow],
+    installed: &[Installed],
+    new_report: bool,
+) -> (Vec<(String, String)>, Vec<String>, Vec<String>) {
+    let installed_names: std::collections::BTreeSet<&str> =
+        installed.iter().map(|i| i.name.as_str()).collect();
+    let (mut added, mut deleted) = (Vec::new(), Vec::new());
+    if let Some(old) = old {
+        let old_names: std::collections::BTreeSet<&str> =
+            old.iter().map(|r| r.name.as_str()).collect();
+        let new_names: std::collections::BTreeSet<&str> =
+            new.iter().map(|r| r.name.as_str()).collect();
+        for row in new {
+            if !old_names.contains(row.name.as_str())
+                && !installed_names.contains(row.name.as_str())
+            {
+                added.push((row.name.clone(), row.desc.clone()));
+            }
+        }
+        for row in old {
+            if !new_names.contains(row.name.as_str()) && installed_names.contains(row.name.as_str())
+            {
+                deleted.push(row.name.clone());
+            }
+        }
+        added.sort();
+        deleted.sort();
+        // HOMEBREW_NO_UPDATE_REPORT_NEW suppresses only the New
+        // sections; deleted-installed still reports.
+        if !new_report {
+            added.clear();
+        }
+    }
+    let latest: std::collections::BTreeMap<&str, &super::api::IndexRow> =
+        new.iter().map(|r| (r.name.as_str(), r)).collect();
+    let mut outdated = Vec::new();
+    for inst in installed {
+        if let Some(row) = latest.get(inst.name.as_str())
+            && !row.auto_updates
+            && !row.version.is_empty()
+            && version_cmp(&inst.version, &row.version) == Ordering::Less
+        {
+            outdated.push(inst.name.clone());
+        }
+    }
+    outdated.sort();
+    (added, deleted, outdated)
+}
+
+/// Print the report in brew's section order; returns whether
+/// anything was printed.
+fn print_update_report(r: &UpdateReport) -> bool {
+    let mut printed = false;
+    let new_section = |title: &str, rows: &[(String, String)], printed: &mut bool| {
+        if rows.is_empty() {
+            return;
+        }
+        *printed = true;
+        println!("==> {title}");
+        for (name, desc) in rows {
+            if desc.is_empty() {
+                println!("{name}");
+            } else {
+                println!("{name}: {desc}");
+            }
+        }
+    };
+    let name_section = |title: &str, rows: &[String], printed: &mut bool| {
+        if rows.is_empty() {
+            return;
+        }
+        *printed = true;
+        println!("==> {title}");
+        for name in rows {
+            println!("{name}");
+        }
+    };
+    new_section("New Formulae", &r.new_formulae, &mut printed);
+    new_section("New Casks", &r.new_casks, &mut printed);
+    name_section(
+        "Deleted Installed Formulae",
+        &r.deleted_formulae,
+        &mut printed,
+    );
+    name_section("Deleted Installed Casks", &r.deleted_casks, &mut printed);
+    name_section("Outdated Formulae", &r.outdated_formulae, &mut printed);
+    name_section("Outdated Casks", &r.outdated_casks, &mut printed);
+    let (of, oc) = (r.outdated_formulae.len(), r.outdated_casks.len());
+    if of + oc > 0 {
+        let mut msg = String::new();
+        if of > 0 {
+            msg += &format!("{of} outdated formula{}", if of == 1 { "" } else { "e" });
+        }
+        if oc > 0 {
+            if !msg.is_empty() {
+                msg += " and ";
+            }
+            msg += &format!("{oc} outdated cask{}", if oc == 1 { "" } else { "s" });
+        }
+        let pronoun = if of + oc == 1 { "it" } else { "them" };
+        println!();
+        println!("You have {msg} installed.");
+        println!("You can upgrade {pronoun} with brew upgrade");
+        println!("or list {pronoun} with brew outdated.");
+    }
+    printed
+}
+
 pub(super) fn cmd_update(prefix: &Prefix, api: &Api) -> ExitCode {
+    // The cached indexes are the diff's before side; read them
+    // before any fetch can replace them.
+    let old_f = api.cached_index_rows(false);
+    let old_c = api.cached_index_rows(true);
     // A tap that cannot fast-forward (diverged, remote gone) must
     // not starve the whole update: brew reports the tap and still
     // refreshes everything else. Warn per tap, refresh the
@@ -2472,17 +3048,36 @@ pub(super) fn cmd_update(prefix: &Prefix, api: &Api) -> ExitCode {
     // Stage: fetch both indexes fresh first; only then invalidate the
     // per-package cache. A network failure above leaves the working
     // cache exactly as it was.
-    let staged = (api.index_fresh(false), api.index_fresh(true));
+    let staged = (api.index_rows_fresh(false), api.index_rows_fresh(true));
     if let (Ok(_), Ok(_)) = &staged {
         api.refresh_except(&["formula-index.json", "cask-index.json"]);
     }
     match staged {
         (Ok(f), Ok(c)) => {
-            println!(
-                "==> abrew data updated: {} formulae, {} casks",
-                f.len(),
-                c.len()
+            // Brew suppresses the New sections under
+            // HOMEBREW_NO_UPDATE_REPORT_NEW, and the new-cask report
+            // entirely when no cask is installed.
+            let report_new = std::env::var_os("HOMEBREW_NO_UPDATE_REPORT_NEW").is_none();
+            let inst_f = prefix.installed(Kind::Formula);
+            let inst_c = prefix.installed(Kind::Cask);
+            let (new_f, del_f, out_f) = update_report(old_f.as_deref(), &f, &inst_f, report_new);
+            let (new_c, del_c, out_c) = update_report(
+                old_c.as_deref(),
+                &c,
+                &inst_c,
+                report_new && !inst_c.is_empty(),
             );
+            let report = UpdateReport {
+                new_formulae: new_f,
+                new_casks: new_c,
+                deleted_formulae: del_f,
+                deleted_casks: del_c,
+                outdated_formulae: out_f,
+                outdated_casks: out_c,
+            };
+            if !print_update_report(&report) {
+                println!("Already up-to-date.");
+            }
             if tap_failures > 0 {
                 ExitCode::from(1)
             } else {
@@ -2543,11 +3138,51 @@ fn auto_cleanup_old_versions(
     api: &Api,
     dry: bool,
     scope: &[&str],
-) -> Result<usize, String> {
+) -> Result<(usize, u64), String> {
     if super::no_install_cleanup() {
-        return Ok(0);
+        return Ok((0, 0));
     }
     cleanup_old_versions(prefix, api, dry, scope)
+}
+
+/// Brew's `Formatter.disk_usage_readable`: 1000-based units, one
+/// decimal, trailing `.0` dropped.
+fn disk_usage_readable(bytes: u64) -> String {
+    let mut size = bytes as f64;
+    let mut unit = "B";
+    for next in ["KB", "MB", "GB"] {
+        if (size * 10.0).round() / 10.0 < 1000.0 {
+            break;
+        }
+        size /= 1000.0;
+        unit = next;
+    }
+    let rounded = (size * 10.0).round() / 10.0;
+    if rounded.fract() == 0.0 {
+        format!("{}{unit}", rounded as u64)
+    } else {
+        format!("{rounded:.1}{unit}")
+    }
+}
+
+/// Approximate on-disk size of a tree: sum of non-directory entry
+/// lengths (brew's `Pathname#disk_usage` in spirit).
+fn dir_disk_usage(path: &std::path::Path) -> u64 {
+    let mut total = 0u64;
+    let mut stack = vec![path.to_path_buf()];
+    while let Some(p) = stack.pop() {
+        let Ok(meta) = std::fs::symlink_metadata(&p) else {
+            continue;
+        };
+        if meta.is_dir() {
+            if let Ok(entries) = std::fs::read_dir(&p) {
+                stack.extend(entries.flatten().map(|e| e.path()));
+            }
+        } else {
+            total = total.saturating_add(meta.len());
+        }
+    }
+    total
 }
 
 fn cleanup_old_versions(
@@ -2555,8 +3190,9 @@ fn cleanup_old_versions(
     api: &Api,
     dry: bool,
     scope: &[&str],
-) -> Result<usize, String> {
+) -> Result<(usize, u64), String> {
     let mut removed = 0;
+    let mut freed = 0u64;
     for kind in [Kind::Formula, Kind::Cask] {
         for i in prefix.installed(kind) {
             // Only superseded versions are removed below; the current
@@ -2587,22 +3223,32 @@ fn cleanup_old_versions(
                     if !super::prefix::owned_receipt(&dir, kind, &i.name, v) {
                         continue;
                     }
+                    let usage = dir_disk_usage(&dir);
                     if dry {
-                        println!("Would remove {} ({v}) {}", i.name, dir.display());
+                        println!(
+                            "Would remove: {} ({})",
+                            dir.display(),
+                            disk_usage_readable(usage)
+                        );
                     } else {
+                        println!(
+                            "Removing: {}... ({})",
+                            dir.display(),
+                            disk_usage_readable(usage)
+                        );
                         // Drop prefix-level links into the version being
                         // removed so cleanup never leaves dangling links.
                         remove_links_into(prefix, &dir);
                         std::fs::remove_dir_all(&dir)
                             .map_err(|e| format!("abrew: cannot remove {}: {e}", dir.display()))?;
-                        println!("Removing {} ({v})", i.name);
                     }
+                    freed = freed.saturating_add(usage);
                     removed += 1;
                 }
             }
         }
     }
-    Ok(removed)
+    Ok((removed, freed))
 }
 
 /// Remove cached downloads (top-level bottle/cask files in the
@@ -2616,18 +3262,19 @@ fn prune_downloads(
     dry: bool,
     max_age: Option<std::time::Duration>,
     scope: &[&str],
-) -> Result<usize, String> {
+) -> Result<(usize, u64), String> {
     // Package names, versions and cask URL basenames may contain dashes.
     // Without cache ownership metadata, even a `<name>-` prefix cannot
     // authorize a named deletion. Keep the shared downloads instead.
     if !scope.is_empty() {
-        return Ok(0);
+        return Ok((0, 0));
     }
     let now = std::time::SystemTime::now();
     let mut removed = 0;
+    let mut freed = 0u64;
     let entries = match std::fs::read_dir(prefix.cache()) {
         Ok(entries) => entries,
-        Err(_) => return Ok(0),
+        Err(_) => return Ok((0, 0)),
     };
     for entry in entries.flatten() {
         if !entry
@@ -2648,16 +3295,26 @@ fn prune_downloads(
             }
         }
         let path = entry.path();
+        let usage = entry.metadata().map(|m| m.len()).unwrap_or(0);
         if dry {
-            println!("Would remove download {}", path.display());
+            println!(
+                "Would remove: {} ({})",
+                path.display(),
+                disk_usage_readable(usage)
+            );
         } else {
+            println!(
+                "Removing: {}... ({})",
+                path.display(),
+                disk_usage_readable(usage)
+            );
             std::fs::remove_file(&path)
                 .map_err(|e| format!("abrew: cannot remove {}: {e}", path.display()))?;
-            println!("Removing download {}", path.display());
         }
+        freed = freed.saturating_add(usage);
         removed += 1;
     }
-    Ok(removed)
+    Ok((removed, freed))
 }
 
 /// Parse every requested cache age before any native effect. The first
@@ -2768,13 +3425,28 @@ pub(super) fn cmd_cleanup(prefix: &Prefix, api: &Api, rest: &[String]) -> ExitCo
         }
     }
     let scope: Vec<&str> = named.iter().map(String::as_str).collect();
-    if let Err(error) = cleanup_old_versions(prefix, api, dry, &scope) {
-        return failed(&error);
+    let mut freed = match cleanup_old_versions(prefix, api, dry, &scope) {
+        Ok((_, bytes)) => bytes,
+        Err(error) => return failed(&error),
+    };
+    if let Some(max_age) = max_age {
+        match prune_downloads(prefix, dry, max_age, &scope) {
+            Ok((_, bytes)) => freed = freed.saturating_add(bytes),
+            Err(error) => return failed(&error),
+        }
     }
-    if let Some(max_age) = max_age
-        && let Err(error) = prune_downloads(prefix, dry, max_age, &scope)
-    {
-        return failed(&error);
+    if freed > 0 {
+        if dry {
+            println!(
+                "==> This operation would free approximately {} of disk space.",
+                disk_usage_readable(freed)
+            );
+        } else {
+            println!(
+                "==> This operation has freed approximately {} of disk space.",
+                disk_usage_readable(freed)
+            );
+        }
     }
     ExitCode::SUCCESS
 }
@@ -2891,7 +3563,7 @@ pub(super) fn cmd_autoremove(prefix: &Prefix, api: &Api, rest: &[String]) -> Exi
         } else {
             // Recheck ordinary dependency protection. Automatic pruning never
             // supplies the user's explicit --ignore-dependencies optout.
-            if let Err(e) = install::uninstall(api, prefix, &name, false, false) {
+            if let Err(e) = install::uninstall(api, prefix, &name, false, true, false) {
                 return from_install(prefix, &[], Err(e));
             }
             println!("Autoremoving {name}");
@@ -2911,6 +3583,7 @@ pub(super) fn cmd_link(
     if names.is_empty() {
         return usage("link needs a formula name");
     }
+    let dry_run = has_flag(rest, "--dry-run", "-n");
     for name in names {
         let short = Formula::short_name(&name);
         if !link {
@@ -2919,7 +3592,28 @@ pub(super) fn cmd_link(
             // only unlink can clear (install refuses them), so:
             // no keg AND nothing owned to remove is the error;
             // either one present proceeds.
-            let installed = prefix.installed_one(Kind::Formula, short).is_some();
+            let inst = prefix.installed_one(Kind::Formula, short);
+            if dry_run {
+                if inst.is_none() {
+                    return failed(&format!("abrew: {short} is not installed"));
+                }
+                match install::unlink_targets(prefix, short) {
+                    Ok(targets) => {
+                        println!("Would remove:");
+                        for t in targets {
+                            println!("{}", t.display());
+                        }
+                    }
+                    Err(e) => return failed(&e),
+                }
+                continue;
+            }
+            let installed = inst.is_some();
+            // Brew's headline names the keg path and the count.
+            let shown = match &inst {
+                Some(i) => prefix.keg(short, &i.version).display().to_string(),
+                None => short.to_string(),
+            };
             match install::unlink_keg(prefix, short) {
                 Ok(0) if !installed => {
                     // No keg and no receipt-proven links: maybe a
@@ -2928,11 +3622,11 @@ pub(super) fn cmd_link(
                         Ok(0) => {
                             return failed(&format!("abrew: {short} is not installed"));
                         }
-                        Ok(_) => println!("Unlinking {short}…"),
+                        Ok(n) => println!("Unlinking {shown}... {n} symlinks removed."),
                         Err(e) => return failed(&e),
                     }
                 }
-                Ok(_) => println!("Unlinking {short}…"),
+                Ok(n) => println!("Unlinking {shown}... {n} symlinks removed."),
                 Err(e) => return failed(&e),
             }
             continue;
@@ -2951,10 +3645,29 @@ pub(super) fn cmd_link(
                 "{short} is keg-only; refreshing opt only (link --force overrides in real brew)"
             );
         }
-        if let Err(e) = install::relink(prefix, &f) {
-            return from_install(prefix, args, Err(e));
+        let keg = prefix.keg(short, &inst.version);
+        if dry_run {
+            match install::link_destinations(prefix, &f) {
+                Ok(targets) => {
+                    println!("Would link:");
+                    for t in targets {
+                        println!("{}", t.display());
+                    }
+                }
+                Err(e) => return from_install(prefix, args, Err(e)),
+            }
+            continue;
         }
-        println!("Linking {} {}…", short, inst.version);
+        if !f.keg_only && install::is_linked(prefix, short, &inst.version) {
+            eprintln!("Warning: Already linked: {}", keg.display());
+            println!("To relink, run:");
+            println!("  brew unlink {short} && brew link {short}");
+            continue;
+        }
+        match install::relink(prefix, &f) {
+            Ok(n) => println!("Linking {}... {n} symlinks created.", keg.display()),
+            Err(e) => return from_install(prefix, args, Err(e)),
+        }
     }
     ExitCode::SUCCESS
 }
@@ -3238,6 +3951,26 @@ fn multiple_version_lines(rows: &[Installed]) -> Vec<String> {
         .collect()
 }
 
+/// Files under `root` in traversal order, brew's named-`list`
+/// find: `-not -type d -not -name .DS_Store`. Symlinks are listed,
+/// never followed; real directories are descended, not listed.
+fn list_files(root: &std::path::Path) -> Vec<std::path::PathBuf> {
+    fn walk(d: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        if let Ok(entries) = std::fs::read_dir(d) {
+            for e in entries.flatten() {
+                if e.file_type().is_ok_and(|t| t.is_dir()) {
+                    walk(&e.path(), out);
+                } else if e.file_name() != ".DS_Store" {
+                    out.push(e.path());
+                }
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(root, &mut out);
+    out
+}
+
 pub(super) fn cmd_list(prefix: &Prefix, rest: &[String]) -> ExitCode {
     if has_flag(rest, "--json", "") {
         return list_json(prefix, rest);
@@ -3300,47 +4033,47 @@ pub(super) fn cmd_list(prefix: &Prefix, rest: &[String]) -> ExitCode {
         }
         return ExitCode::SUCCESS;
     }
-    if let Some(name) = named.first() {
-        // `list <formula>`: the keg's files, brew-style.
-        let short = Formula::short_name(name);
-        let kind = if has_flag(rest, "--cask", "")
-            || (!has_flag(rest, "--formula", "")
-                && prefix.installed_one(Kind::Formula, short).is_none()
-                && prefix.installed_one(Kind::Cask, short).is_some())
-        {
-            Kind::Cask
-        } else {
-            Kind::Formula
-        };
-        let Some(inst) = prefix.installed_one(kind, short) else {
-            return failed(&format!("abrew: {short} is not installed"));
-        };
-        let dir = match kind {
-            Kind::Formula => prefix.keg(short, &inst.version),
-            Kind::Cask => prefix.cask_dir(short, &inst.version),
-        };
-        #[cfg(unix)]
-        let mut lister = long.then(LongLister::new);
-        #[cfg(not(unix))]
+    if !named.is_empty() {
+        // `list <name>…`: brew resolves every name to kegs/casks
+        // first (a bad name fails before anything prints), dedupes
+        // repeats, then finds files under every installed formula
+        // version and each cask's token directory. `-l` does not
+        // change the named form.
         let _ = long;
-        fn walk(d: &std::path::Path, emit: &mut impl FnMut(&std::path::Path)) {
-            if let Ok(entries) = std::fs::read_dir(d) {
-                for e in entries.flatten() {
-                    emit(&e.path());
-                    if e.file_type().is_ok_and(|t| t.is_dir()) {
-                        walk(&e.path(), emit);
+        let mut roots: Vec<std::path::PathBuf> = Vec::new();
+        let mut seen: Vec<(Kind, String)> = Vec::new();
+        for name in &named {
+            let short = Formula::short_name(name).to_string();
+            let kind = if has_flag(rest, "--cask", "")
+                || (!has_flag(rest, "--formula", "")
+                    && prefix.installed_one(Kind::Formula, &short).is_none()
+                    && prefix.installed_one(Kind::Cask, &short).is_some())
+            {
+                Kind::Cask
+            } else {
+                Kind::Formula
+            };
+            let Some(inst) = prefix.installed_one(kind, &short) else {
+                return failed(&format!("abrew: {short} is not installed"));
+            };
+            if seen.contains(&(kind, short.clone())) {
+                continue;
+            }
+            seen.push((kind, short.clone()));
+            match kind {
+                Kind::Formula => {
+                    for v in &inst.versions {
+                        roots.push(prefix.keg(&short, v));
                     }
                 }
+                Kind::Cask => roots.push(prefix.caskroom().join(&short)),
             }
         }
-        walk(&dir, &mut |path: &std::path::Path| {
-            #[cfg(unix)]
-            if let Some(lister) = &mut lister {
-                println!("{}", lister.line(path));
-                return;
+        for root in &roots {
+            for path in list_files(root) {
+                println!("{}", path.display());
             }
-            println!("{}", path.display());
-        });
+        }
         return ExitCode::SUCCESS;
     }
     for casks in [false, true] {
@@ -4584,7 +5317,7 @@ mod tests {
         std::fs::write(p.cache().join("api/formula-demo.json"), b"{}").unwrap();
         // Dry run removes nothing; age 0 matches everything; a huge
         // age matches nothing; api metadata is never touched.
-        assert_eq!(prune_downloads(&p, true, None, &[]).unwrap(), 1);
+        assert_eq!(prune_downloads(&p, true, None, &[]).unwrap().0, 1);
         assert!(p.cache().join("demo-1.bottle.tar.gz").exists());
         assert_eq!(
             prune_downloads(
@@ -4593,11 +5326,14 @@ mod tests {
                 Some(std::time::Duration::from_secs(999_999_999)),
                 &[]
             )
-            .unwrap(),
+            .unwrap()
+            .0,
             0
         );
         assert_eq!(
-            prune_downloads(&p, false, Some(std::time::Duration::ZERO), &[]).unwrap(),
+            prune_downloads(&p, false, Some(std::time::Duration::ZERO), &[])
+                .unwrap()
+                .0,
             1
         );
         assert!(!p.cache().join("demo-1.bottle.tar.gz").exists());
@@ -4625,7 +5361,7 @@ mod tests {
             (false, None, &["demo", "other"][..]),
             (false, None, &["oth"][..]),
         ] {
-            assert_eq!(prune_downloads(&p, dry, max_age, scope).unwrap(), 0);
+            assert_eq!(prune_downloads(&p, dry, max_age, scope).unwrap().0, 0);
             for (file, contents) in downloads {
                 assert_eq!(std::fs::read(p.cache().join(file)).unwrap(), contents);
             }
@@ -4633,14 +5369,14 @@ mod tests {
         // An unscoped dry run still reports every regular download and
         // removes nothing; unscoped pruning then removes those same files.
         assert_eq!(
-            prune_downloads(&p, true, None, &[]).unwrap(),
+            prune_downloads(&p, true, None, &[]).unwrap().0,
             downloads.len()
         );
         for (file, contents) in downloads {
             assert_eq!(std::fs::read(p.cache().join(file)).unwrap(), contents);
         }
         assert_eq!(
-            prune_downloads(&p, false, None, &[]).unwrap(),
+            prune_downloads(&p, false, None, &[]).unwrap().0,
             downloads.len()
         );
         for (file, _) in downloads {
@@ -5347,12 +6083,16 @@ mod tests {
             .unwrap();
         }
         assert_eq!(
-            cleanup_old_versions(&prefix, &Api::new(prefix.clone()), true, &["wget"]).unwrap(),
+            cleanup_old_versions(&prefix, &Api::new(prefix.clone()), true, &["wget"])
+                .unwrap()
+                .0,
             2
         );
         assert!(prefix.keg("wget", "1").is_dir());
         assert_eq!(
-            cleanup_old_versions(&prefix, &Api::new(prefix.clone()), false, &["wget"]).unwrap(),
+            cleanup_old_versions(&prefix, &Api::new(prefix.clone()), false, &["wget"])
+                .unwrap()
+                .0,
             2
         );
         for version in ["1", "3"] {
@@ -5455,6 +6195,136 @@ mod tests {
             1,
             "dep itself is installed"
         );
+    }
+
+    #[test]
+    fn disk_usage_readable_matches_brew_units() {
+        assert_eq!(disk_usage_readable(0), "0B");
+        assert_eq!(disk_usage_readable(999), "999B");
+        assert_eq!(disk_usage_readable(1_000), "1KB");
+        assert_eq!(disk_usage_readable(1_500), "1.5KB");
+        assert_eq!(disk_usage_readable(193_300), "193.3KB");
+        assert_eq!(disk_usage_readable(1_000_000), "1MB");
+        assert_eq!(disk_usage_readable(1_050_000), "1.1MB");
+        assert_eq!(disk_usage_readable(2_500_000_000), "2.5GB");
+    }
+
+    #[test]
+    fn to_sentence_joins_like_brew() {
+        let s = |v: &[&str]| to_sentence(&v.iter().map(|x| x.to_string()).collect::<Vec<_>>());
+        assert_eq!(s(&[]), "");
+        assert_eq!(s(&["a"]), "a");
+        assert_eq!(s(&["a", "b"]), "a and b");
+        assert_eq!(s(&["a", "b", "c"]), "a, b, and c");
+    }
+
+    #[test]
+    fn update_report_diffs_indexes_like_brew() {
+        use super::super::api::IndexRow;
+        let row = |name: &str, version: &str| IndexRow {
+            name: name.into(),
+            desc: format!("{name} desc"),
+            version: version.into(),
+            auto_updates: false,
+        };
+        let inst = |name: &str, version: &str| Installed {
+            kind: Kind::Formula,
+            name: name.into(),
+            version: version.into(),
+            versions: vec![version.into()],
+        };
+        let old = vec![row("gone", "1"), row("kept", "1"), row("old-inst", "1")];
+        let new = vec![row("kept", "2"), row("fresh", "1"), row("old-inst", "1")];
+        let installed = vec![inst("kept", "1"), inst("gone", "1")];
+        let (added, deleted, outdated) = update_report(Some(&old), &new, &installed, true);
+        assert_eq!(added, [("fresh".to_string(), "fresh desc".to_string())]);
+        assert_eq!(deleted, ["gone"]);
+        assert_eq!(outdated, ["kept"]);
+        // No cached index: no new/deleted, outdated still computed.
+        let (added, deleted, outdated) = update_report(None, &new, &installed, true);
+        assert!(added.is_empty() && deleted.is_empty());
+        assert_eq!(outdated, ["kept"]);
+        // NO_UPDATE_REPORT_NEW: new suppressed, deleted kept.
+        let (added, deleted, _) = update_report(Some(&old), &new, &installed, false);
+        assert!(added.is_empty());
+        assert_eq!(deleted, ["gone"]);
+        // auto_updates casks are never outdated in the report.
+        let mut auto = row("kept", "2");
+        auto.auto_updates = true;
+        let (_, _, outdated) = update_report(None, &[auto], &installed, true);
+        assert!(outdated.is_empty());
+    }
+
+    #[test]
+    fn list_files_excludes_directories_and_ds_store() {
+        let tmp = aterm_tempfile::tempdir().unwrap();
+        let root = tmp.path().join("keg");
+        std::fs::create_dir_all(root.join("bin")).unwrap();
+        std::fs::write(root.join("README"), b"r").unwrap();
+        std::fs::write(root.join(".DS_Store"), b"junk").unwrap();
+        std::fs::write(root.join("bin/tool"), b"t").unwrap();
+        std::fs::write(root.join("bin/.DS_Store"), b"junk").unwrap();
+        #[cfg(unix)]
+        super::super::prefix::symlink_file(&root.join("bin"), &root.join("binlink")).unwrap();
+        let mut got: Vec<String> = list_files(&root)
+            .iter()
+            .map(|p| {
+                p.strip_prefix(&root)
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        got.sort();
+        #[cfg(unix)]
+        assert_eq!(got, ["README", "bin/tool", "binlink"]);
+        #[cfg(not(unix))]
+        assert_eq!(got, ["README", "bin/tool"]);
+    }
+
+    #[test]
+    fn artifact_lines_use_brew_summarize_and_english_names() {
+        use super::super::formula::Artifact;
+        assert_eq!(
+            artifact_line(&Artifact::App("AltTab.app".into(), None)).as_deref(),
+            Some("AltTab.app (App)")
+        );
+        assert_eq!(
+            artifact_line(&Artifact::App("Foo.app".into(), Some("Bar.app".into()))).as_deref(),
+            Some("Foo.app -> Bar.app (App)")
+        );
+        assert_eq!(
+            artifact_line(&Artifact::Suite("SuiteDir".into(), None)).as_deref(),
+            Some("SuiteDir (App Suite)")
+        );
+        assert_eq!(
+            artifact_line(&Artifact::PrefPane("X.prefPane".into(), None)).as_deref(),
+            Some("X.prefPane (Preference Pane)")
+        );
+        assert_eq!(
+            artifact_line(&Artifact::Generic("f".into(), Some("/Library/X".into()))).as_deref(),
+            Some("f -> /Library/X (Generic Artifact)")
+        );
+        assert_eq!(
+            artifact_line(&Artifact::Wrapper(
+                "demo".into(),
+                "exe".into(),
+                vec![],
+                None
+            ))
+            .as_deref(),
+            Some("demo (Command Wrapper)")
+        );
+        assert_eq!(
+            artifact_line(&Artifact::Library(
+                "P.qlgenerator".into(),
+                None,
+                "Library/QuickLook".into()
+            ))
+            .as_deref(),
+            Some("P.qlgenerator (Quick Look Plugin)")
+        );
+        assert_eq!(artifact_line(&Artifact::Other("zap".into())), None);
     }
 
     #[test]

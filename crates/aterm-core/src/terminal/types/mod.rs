@@ -34,10 +34,12 @@ impl SgrPushMask {
     const OVERLINE: u16 = 1 << 9;
 
     /// Build a mask from XTPUSHSGR Ps parameter values.
-    pub fn from_params(params: &[u16]) -> Self {
+    #[inline]
+    pub const fn from_params(params: &[u16]) -> Self {
         let mut bits = 0u16;
-        for &p in params {
-            match p {
+        let mut i = 0;
+        while i < params.len() {
+            match params[i] {
                 1 | 2 => bits |= Self::BOLD, // dim is in the bold group per xterm
                 3 => bits |= Self::ITALIC,
                 4 | 21 => bits |= Self::UNDERLINE, // 21 = double underline
@@ -50,51 +52,65 @@ impl SgrPushMask {
                 53 => bits |= Self::OVERLINE,
                 _ => {} // Unknown Ps — ignore per xterm
             }
+            i += 1;
         }
         Self(bits)
     }
 
     /// The mask's bits, as a checkpoint carries them.
+    #[inline]
     pub const fn bits(self) -> u16 {
         self.0
     }
 
     /// A mask from carried bits; a bit no attribute group names is dropped.
+    #[inline]
     pub const fn from_bits(bits: u16) -> Self {
         Self(bits & Self::ALL.0)
     }
 
-    pub fn has_bold(self) -> bool {
+    #[inline]
+    pub const fn has_bold(self) -> bool {
         (self.0 & Self::BOLD) != 0
     }
-    pub fn has_italic(self) -> bool {
+    #[inline]
+    pub const fn has_italic(self) -> bool {
         (self.0 & Self::ITALIC) != 0
     }
-    pub fn has_underline(self) -> bool {
+    #[inline]
+    pub const fn has_underline(self) -> bool {
         (self.0 & Self::UNDERLINE) != 0
     }
-    pub fn has_blink(self) -> bool {
+    #[inline]
+    pub const fn has_blink(self) -> bool {
         (self.0 & Self::BLINK) != 0
     }
-    pub fn has_inverse(self) -> bool {
+    #[inline]
+    pub const fn has_inverse(self) -> bool {
         (self.0 & Self::INVERSE) != 0
     }
-    pub fn has_invisible(self) -> bool {
+    #[inline]
+    pub const fn has_invisible(self) -> bool {
         (self.0 & Self::INVISIBLE) != 0
     }
-    pub fn has_strikethrough(self) -> bool {
+    #[inline]
+    pub const fn has_strikethrough(self) -> bool {
         (self.0 & Self::STRIKETHROUGH) != 0
     }
-    pub fn has_foreground(self) -> bool {
+    #[inline]
+    pub const fn has_foreground(self) -> bool {
         (self.0 & Self::FOREGROUND) != 0
     }
-    pub fn has_background(self) -> bool {
+    #[inline]
+    pub const fn has_background(self) -> bool {
         (self.0 & Self::BACKGROUND) != 0
     }
-    pub fn has_overline(self) -> bool {
+    #[inline]
+    pub const fn has_overline(self) -> bool {
         (self.0 & Self::OVERLINE) != 0
     }
-    pub fn is_all(self) -> bool {
+    #[inline]
+    pub const fn is_all(self) -> bool {
         self.0 == Self::ALL.0
     }
 }

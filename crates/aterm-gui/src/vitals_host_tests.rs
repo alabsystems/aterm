@@ -2377,7 +2377,9 @@ fn the_thermal_state_maps_onto_the_portable_levels() {
 }
 
 /// The reader's thermal probe is the inert arm under test: no unit test asks
-/// AppKit.
+/// AppKit. Linux's level comes from the counter reader (thermal zones and
+/// throttle counters, [`counter_thermal`]), which asks no platform API, so
+/// there the snapshot may carry one all the same.
 #[test]
 fn the_test_reader_never_reads_the_thermal_state() {
     let mut reader = Reader::new(Arc::default());
@@ -2385,5 +2387,8 @@ fn the_test_reader_never_reads_the_thermal_state() {
         self_pid: std::process::id(),
         ..Request::default()
     });
-    assert!(snap.thermal.is_none());
+    assert!((reader.thermal)().is_none());
+    if !cfg!(target_os = "linux") {
+        assert!(snap.thermal.is_none());
+    }
 }

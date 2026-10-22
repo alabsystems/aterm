@@ -76,7 +76,8 @@ unsafe extern "C" {
     pub fn CGDataProviderCopyData(provider: CGDataProviderRef) -> CFDataRef;
 }
 
-fn check(error: CGError) -> Result<(), CGError> {
+#[inline]
+const fn check(error: CGError) -> Result<(), CGError> {
     if error == kCGErrorSuccess {
         Ok(())
     } else {
@@ -92,12 +93,14 @@ pub struct CGDisplay {
 }
 
 impl CGDisplay {
+    #[inline]
     #[must_use]
     pub const fn new(id: CGDirectDisplayID) -> Self {
         Self { id }
     }
 
     /// The main display: the one whose origin is the global origin.
+    #[inline]
     #[must_use]
     pub fn main() -> Self {
         // SAFETY: no arguments and no preconditions.
@@ -120,24 +123,28 @@ impl CGDisplay {
     }
 
     /// The bounds in the global display space (points, top-left origin).
+    #[inline]
     #[must_use]
     pub fn bounds(&self) -> CGRect {
         // SAFETY: a by-value ID; see the type's doc.
         unsafe { CGDisplayBounds(self.id) }
     }
 
+    #[inline]
     #[must_use]
     pub fn pixels_wide(&self) -> usize {
         // SAFETY: a by-value ID; see the type's doc.
         unsafe { CGDisplayPixelsWide(self.id) }
     }
 
+    #[inline]
     #[must_use]
     pub fn pixels_high(&self) -> usize {
         // SAFETY: a by-value ID; see the type's doc.
         unsafe { CGDisplayPixelsHigh(self.id) }
     }
 
+    #[inline]
     #[must_use]
     pub fn model_number(&self) -> u32 {
         // SAFETY: a by-value ID; see the type's doc.
@@ -145,12 +152,14 @@ impl CGDisplay {
     }
 
     /// Return the raw `CGDirectDisplayID`.
+    #[inline]
     #[must_use]
     pub const fn raw_id(self) -> CGDirectDisplayID {
         self.id
     }
 
     /// Encode display geometry (`id`, `width_px`, `height_px`, `model_number`) into 16 LE bytes.
+    #[inline]
     #[must_use]
     pub const fn encode_geometry_le(
         id: CGDirectDisplayID,
@@ -179,6 +188,7 @@ impl CGDisplay {
     }
 
     /// Decode 16 LE bytes into display geometry (`id`, `width_px`, `height_px`, `model_number`).
+    #[inline]
     #[must_use]
     pub const fn decode_geometry_le(bytes: [u8; 16]) -> (CGDirectDisplayID, u32, u32, u32) {
         let id = (bytes[0] as u32)
@@ -202,6 +212,7 @@ impl CGDisplay {
 }
 
 /// Return `true` when `error == kCGErrorSuccess`.
+#[inline]
 #[must_use]
 pub const fn is_cg_success(error: CGError) -> bool {
     error == kCGErrorSuccess

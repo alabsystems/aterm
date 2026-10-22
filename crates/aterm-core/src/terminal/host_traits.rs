@@ -12,36 +12,44 @@ use aterm_types::terminal_host::{
 use super::{BlockState, Terminal};
 
 impl TerminalHost for Terminal {
+    #[inline]
     fn process(&mut self, input: &[u8]) {
         Terminal::process(self, input);
     }
 
+    #[inline]
     fn resize(&mut self, rows: u16, cols: u16) {
         Terminal::resize(self, rows, cols);
     }
 
+    #[inline]
     fn size(&self) -> TerminalSize {
         TerminalSize::new(Terminal::grid(self).rows(), Terminal::grid(self).cols())
     }
 
+    #[inline]
     fn visible_content(&self) -> String {
         Terminal::visible_content(self)
     }
 
+    #[inline]
     fn current_working_directory(&self) -> Option<String> {
         Terminal::current_working_directory(self).map(ToOwned::to_owned)
     }
 
+    #[inline]
     fn scrollback_line_count(&self) -> usize {
         Terminal::grid(self).scrollback_lines()
     }
 
+    #[inline]
     fn scrollback_line(&self, index: usize) -> Option<String> {
         Terminal::grid(self)
             .get_history_line(index)
             .map(|line| line.to_string())
     }
 
+    #[inline]
     fn scrollback_line_from_end(&self, reverse_index: usize) -> Option<String> {
         Terminal::grid(self)
             .history_line_rev(reverse_index)
@@ -50,21 +58,25 @@ impl TerminalHost for Terminal {
 }
 
 impl TerminalBlockAccess for Terminal {
+    #[inline]
     fn blocks(&self) -> Vec<TerminalBlockSnapshot> {
         self.all_blocks().map(block_snapshot_from_output).collect()
     }
 
+    #[inline]
     fn block_command(&self, block_id: u64) -> Option<String> {
         let block = self.block_by_id(block_id)?;
         self.block_command(block)
     }
 
+    #[inline]
     fn block_output(&self, block_id: u64) -> Option<String> {
         let block = self.block_by_id(block_id)?;
         self.block_output(block)
     }
 }
 
+#[inline]
 fn block_snapshot_from_output(block: &crate::terminal::OutputBlock) -> TerminalBlockSnapshot {
     TerminalBlockSnapshot {
         id: block.id,
@@ -80,7 +92,8 @@ fn block_snapshot_from_output(block: &crate::terminal::OutputBlock) -> TerminalB
     }
 }
 
-fn block_state_from_core(state: BlockState) -> TerminalBlockState {
+#[inline]
+const fn block_state_from_core(state: BlockState) -> TerminalBlockState {
     match state {
         BlockState::PromptOnly => TerminalBlockState::PromptOnly,
         BlockState::EnteringCommand => TerminalBlockState::EnteringCommand,

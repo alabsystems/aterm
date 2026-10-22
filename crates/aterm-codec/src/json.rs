@@ -22,6 +22,7 @@
 
 /// `s` as a JSON string body (no quotes) — see the module docs.
 #[must_use]
+#[inline]
 pub fn escape(s: &str) -> String {
     let mut out = String::with_capacity(s.len().saturating_add(2));
     escape_into(&mut out, s);
@@ -79,6 +80,7 @@ pub fn escape_into(out: &mut String, s: &str) {
 }
 
 /// The length of the UTF-8 character a valid lead byte `b` (>= 0x80) starts.
+#[inline]
 const fn utf8_len(b: u8) -> usize {
     if b >= 0xf0 {
         4
@@ -90,6 +92,7 @@ const fn utf8_len(b: u8) -> usize {
 }
 
 /// `\uXXXX`, lowercase: every escaped scalar here is in the BMP.
+#[inline]
 fn push_u(out: &mut String, u: u32) {
     out.push_str("\\u");
     crate::hex::push_lower(out, &[(u >> 8) as u8, u as u8]);

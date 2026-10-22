@@ -40,6 +40,7 @@ pub struct Subtable12<'a> {
 
 impl<'a> Subtable12<'a> {
     /// Parses a subtable from raw data.
+    #[inline]
     pub fn parse(data: &'a [u8]) -> Option<Self> {
         let mut s = Stream::new(data);
         s.skip::<u16>(); // format
@@ -52,6 +53,7 @@ impl<'a> Subtable12<'a> {
     }
 
     /// Returns a glyph index for a code point.
+    #[inline]
     pub fn glyph_index(&self, code_point: u32) -> Option<GlyphId> {
         let (_, group) = self.groups.binary_search_by(|range| {
             use core::cmp::Ordering;

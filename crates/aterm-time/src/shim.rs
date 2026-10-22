@@ -41,6 +41,7 @@ mod js {
 ///
 /// Whole milliseconds are split from the fraction before scaling, so precision
 /// does not decay as the time origin ages.
+#[inline]
 fn duration_from_millis_f64(ms: f64) -> Duration {
     if !ms.is_finite() || ms <= 0.0 {
         return Duration::ZERO;
@@ -82,11 +83,13 @@ impl Instant {
     /// Read the monotonic clock.
     #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
     #[must_use]
+    #[inline]
     pub fn now() -> Self {
         Self::from_js_millis(js::performance_now())
     }
 
     /// Build from a raw JS millisecond reading: the seam the native tests drive.
+    #[inline]
     fn from_js_millis(ms: f64) -> Self {
         Self(duration_from_millis_f64(ms))
     }
@@ -94,39 +97,51 @@ impl Instant {
     /// Time elapsed from `earlier` to `self`, saturating to zero when `earlier`
     /// is the later of the two, as `std` does.
     #[must_use]
-    pub fn duration_since(&self, earlier: Self) -> Duration {
+    #[inline]
+    pub const fn duration_since(&self, earlier: Self) -> Duration {
         self.saturating_duration_since(earlier)
     }
 
     /// Time elapsed from `earlier` to `self`, or `None` if `earlier` is later.
     #[must_use]
-    pub fn checked_duration_since(&self, earlier: Self) -> Option<Duration> {
+    #[inline]
+    pub const fn checked_duration_since(&self, earlier: Self) -> Option<Duration> {
         self.0.checked_sub(earlier.0)
     }
 
     /// Time elapsed from `earlier` to `self`, or zero if `earlier` is later.
     #[must_use]
-    pub fn saturating_duration_since(&self, earlier: Self) -> Duration {
+    #[inline]
+    pub const fn saturating_duration_since(&self, earlier: Self) -> Duration {
         self.0.saturating_sub(earlier.0)
     }
 
     /// Time elapsed since this instant was taken.
     #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
     #[must_use]
+    #[inline]
     pub fn elapsed(&self) -> Duration {
         Self::now().saturating_duration_since(*self)
     }
 
     /// `self + duration`, or `None` on overflow.
     #[must_use]
-    pub fn checked_add(&self, duration: Duration) -> Option<Self> {
-        self.0.checked_add(duration).map(Self)
+    #[inline]
+    pub const fn checked_add(&self, duration: Duration) -> Option<Self> {
+        match self.0.checked_add(duration) {
+            Some(d) => Some(Self(d)),
+            None => None,
+        }
     }
 
     /// `self - duration`, or `None` if it would precede the time origin.
     #[must_use]
-    pub fn checked_sub(&self, duration: Duration) -> Option<Self> {
-        self.0.checked_sub(duration).map(Self)
+    #[inline]
+    pub const fn checked_sub(&self, duration: Duration) -> Option<Self> {
+        match self.0.checked_sub(duration) {
+            Some(d) => Some(Self(d)),
+            None => None,
+        }
     }
 }
 
@@ -134,6 +149,7 @@ impl Add<Duration> for Instant {
     type Output = Self;
     /// # Panics
     /// On overflow, exactly like `std::time::Instant`.
+    #[inline]
     fn add(self, rhs: Duration) -> Self {
         self.checked_add(rhs)
             .expect("overflow when adding duration to instant")
@@ -141,6 +157,7 @@ impl Add<Duration> for Instant {
 }
 
 impl AddAssign<Duration> for Instant {
+    #[inline]
     fn add_assign(&mut self, rhs: Duration) {
         *self = *self + rhs;
     }
@@ -150,6 +167,7 @@ impl Sub<Duration> for Instant {
     type Output = Self;
     /// # Panics
     /// On underflow, exactly like `std::time::Instant`.
+    #[inline]
     fn sub(self, rhs: Duration) -> Self {
         self.checked_sub(rhs)
             .expect("overflow when subtracting duration from instant")
@@ -157,6 +175,7 @@ impl Sub<Duration> for Instant {
 }
 
 impl SubAssign<Duration> for Instant {
+    #[inline]
     fn sub_assign(&mut self, rhs: Duration) {
         *self = *self - rhs;
     }
@@ -165,6 +184,7 @@ impl SubAssign<Duration> for Instant {
 impl Sub<Instant> for Instant {
     type Output = Duration;
     /// Saturating, matching `std`'s `Instant - Instant`.
+    #[inline]
     fn sub(self, rhs: Self) -> Duration {
         self.saturating_duration_since(rhs)
     }
@@ -189,11 +209,13 @@ impl SystemTime {
     /// Read the wall clock.
     #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
     #[must_use]
+    #[inline]
     pub fn now() -> Self {
         Self::from_js_millis(js::date_now())
     }
 
     /// Build from a raw JS millisecond reading: the native tests' seam.
+    #[inline]
     fn from_js_millis(ms: f64) -> Self {
         Self(duration_from_millis_f64(ms))
     }
@@ -203,10 +225,12 @@ impl SystemTime {
     /// # Errors
     /// When `earlier` is later than `self` (the clock moved backwards, or the
     /// arguments are swapped). The error carries the magnitude, as in `std`.
-    pub fn duration_since(&self, earlier: Self) -> Result<Duration, SystemTimeError> {
-        self.0
-            .checked_sub(earlier.0)
-            .ok_or_else(|| SystemTimeError(earlier.0.saturating_sub(self.0)))
+    #[inline]
+    pub const fn duration_since(&self, earlier: Self) -> Result<Duration, SystemTimeError> {
+        match self.0.checked_sub(earlier.0) {
+            Some(d) => Ok(d),
+            None => Err(SystemTimeError(earlier.0.saturating_sub(self.0))),
+        }
     }
 
     /// Time elapsed since this measurement.
@@ -214,20 +238,29 @@ impl SystemTime {
     /// # Errors
     /// When the wall clock has moved backwards since `self` was taken.
     #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+    #[inline]
     pub fn elapsed(&self) -> Result<Duration, SystemTimeError> {
         Self::now().duration_since(*self)
     }
 
     /// `self + duration`, or `None` on overflow.
     #[must_use]
-    pub fn checked_add(&self, duration: Duration) -> Option<Self> {
-        self.0.checked_add(duration).map(Self)
+    #[inline]
+    pub const fn checked_add(&self, duration: Duration) -> Option<Self> {
+        match self.0.checked_add(duration) {
+            Some(d) => Some(Self(d)),
+            None => None,
+        }
     }
 
     /// `self - duration`, or `None` if it would precede the epoch.
     #[must_use]
-    pub fn checked_sub(&self, duration: Duration) -> Option<Self> {
-        self.0.checked_sub(duration).map(Self)
+    #[inline]
+    pub const fn checked_sub(&self, duration: Duration) -> Option<Self> {
+        match self.0.checked_sub(duration) {
+            Some(d) => Some(Self(d)),
+            None => None,
+        }
     }
 }
 
@@ -235,6 +268,7 @@ impl Add<Duration> for SystemTime {
     type Output = Self;
     /// # Panics
     /// On overflow, exactly like `std::time::SystemTime`.
+    #[inline]
     fn add(self, rhs: Duration) -> Self {
         self.checked_add(rhs)
             .expect("overflow when adding duration to system time")
@@ -242,6 +276,7 @@ impl Add<Duration> for SystemTime {
 }
 
 impl AddAssign<Duration> for SystemTime {
+    #[inline]
     fn add_assign(&mut self, rhs: Duration) {
         *self = *self + rhs;
     }
@@ -251,6 +286,7 @@ impl Sub<Duration> for SystemTime {
     type Output = Self;
     /// # Panics
     /// On underflow, exactly like `std::time::SystemTime`.
+    #[inline]
     fn sub(self, rhs: Duration) -> Self {
         self.checked_sub(rhs)
             .expect("overflow when subtracting duration from system time")
@@ -258,6 +294,7 @@ impl Sub<Duration> for SystemTime {
 }
 
 impl SubAssign<Duration> for SystemTime {
+    #[inline]
     fn sub_assign(&mut self, rhs: Duration) {
         *self = *self - rhs;
     }
@@ -271,7 +308,8 @@ pub struct SystemTimeError(Duration);
 impl SystemTimeError {
     /// How far the second time is ahead of the first.
     #[must_use]
-    pub fn duration(&self) -> Duration {
+    #[inline]
+    pub const fn duration(&self) -> Duration {
         self.0
     }
 }

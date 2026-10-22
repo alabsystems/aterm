@@ -30,6 +30,7 @@ impl Choice {
     pub const ALL: [Self; 4] = [Self::Hours1, Self::Hours8, Self::Hours24, Self::Forever];
 
     /// The span this choice keeps the Mac awake for, `None` for [`Choice::Forever`].
+    #[inline]
     #[must_use]
     pub const fn span(self) -> Option<u64> {
         match self {
@@ -41,6 +42,7 @@ impl Choice {
     }
 
     /// The menu item's title.
+    #[inline]
     #[must_use]
     pub const fn label(self) -> &'static str {
         match self {
@@ -52,6 +54,7 @@ impl Choice {
     }
 
     /// The word `aterm caffeine on` takes for it.
+    #[inline]
     #[must_use]
     pub const fn word(self) -> &'static str {
         match self {
@@ -63,9 +66,16 @@ impl Choice {
     }
 
     /// The choice whose span is `span` exactly, if any.
+    #[inline]
     #[must_use]
-    pub fn from_span(span: Option<u64>) -> Option<Self> {
-        Self::ALL.into_iter().find(|c| c.span() == span)
+    pub const fn from_span(span: Option<u64>) -> Option<Self> {
+        match span {
+            Some(HOUR) => Some(Self::Hours1),
+            Some(s) if s == 8 * HOUR => Some(Self::Hours8),
+            Some(s) if s == 24 * HOUR => Some(Self::Hours24),
+            None => Some(Self::Forever),
+            Some(_) => None,
+        }
     }
 }
 
@@ -88,6 +98,7 @@ pub enum Mode {
 
 impl Mode {
     /// On for `span` seconds from `now`, or [`Mode::Forever`] for `None`. A zero span is off.
+    #[inline]
     #[must_use]
     pub const fn activate(span: Option<u64>, now: u64) -> Self {
         match span {
@@ -101,12 +112,14 @@ impl Mode {
     }
 
     /// What a menu choice made at `now` turns the mug to.
+    #[inline]
     #[must_use]
     pub const fn chosen(choice: Choice, now: u64) -> Self {
         Self::activate(choice.span(), now)
     }
 
     /// What a click at `now` turns the mug to: off when it is on, forever when it is off.
+    #[inline]
     #[must_use]
     pub const fn toggled(self, now: u64) -> Self {
         if self.is_on(now) {
@@ -117,6 +130,7 @@ impl Mode {
     }
 
     /// This mode as it stands at `now`: a deadline that has passed is off.
+    #[inline]
     #[must_use]
     pub const fn settled(self, now: u64) -> Self {
         match self {
@@ -126,6 +140,7 @@ impl Mode {
     }
 
     /// Whether the Mac is kept awake at `now`.
+    #[inline]
     #[must_use]
     pub const fn is_on(self, now: u64) -> bool {
         match self {
@@ -136,6 +151,7 @@ impl Mode {
     }
 
     /// Seconds left at `now` of a timed mode; `None` when off or forever.
+    #[inline]
     #[must_use]
     pub const fn remaining(self, now: u64) -> Option<u64> {
         match self.settled(now) {
@@ -146,8 +162,9 @@ impl Mode {
 
     /// The menu choice this mode was set by at `now`: none when off or when the span is not a
     /// menu one (`aterm caffeine on 90m`).
+    #[inline]
     #[must_use]
-    pub fn choice(self, now: u64) -> Option<Choice> {
+    pub const fn choice(self, now: u64) -> Option<Choice> {
         match self.settled(now) {
             Self::Off => None,
             Self::Forever => Some(Choice::Forever),

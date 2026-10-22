@@ -716,6 +716,9 @@ pub fn pack_with(ctx: &Ctx, request: &PackRequest, tools: &dyn Tools) -> Result<
              updating user's PATH. Use `atpkg-publish pack-bundle {program}`"
         )));
     }
+    // A declared tool no shim may carry is refused before anything is built, and one the
+    // name-token fallback picks before anything is staged (below).
+    pkgdoc::check_exposes(program, &meta.expose)?;
     let exes = build(tools, &tc, request, &meta, &stage_dir)?;
     let gated = arch::gate(request.triple, &exes)?;
     eprintln!(
@@ -724,6 +727,7 @@ pub fn pack_with(ctx: &Ctx, request: &PackRequest, tools: &dyn Tools) -> Result<
         request.triple
     );
     let sel = select(&meta, &exes, request.triple)?;
+    pkgdoc::check_exposes(program, &sel.exposes)?;
     if sel.mode == ExposeMode::Heuristic {
         eprintln!(
             "atpkg-publish: WARNING — {program} has no [workspace.metadata.atpkg] expose list; \

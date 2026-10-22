@@ -40,13 +40,13 @@ pub struct Table {
 impl Table {
     /// `macStyle` bit 0.
     #[inline]
-    pub fn mac_bold(&self) -> bool {
+    pub const fn mac_bold(&self) -> bool {
         self.mac_style & 1 != 0
     }
 
     /// `macStyle` bit 1.
     #[inline]
-    pub fn mac_italic(&self) -> bool {
+    pub const fn mac_italic(&self) -> bool {
         self.mac_style & 2 != 0
     }
 }

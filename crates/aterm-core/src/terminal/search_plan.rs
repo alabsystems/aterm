@@ -91,8 +91,13 @@ impl SearchWindow {
     /// How many of the newest lines the search reads when the depth cap leaves older
     /// history unread, `None` when it reads every retained line.
     #[must_use]
-    pub fn searched_lines(&self) -> Option<usize> {
-        (self.skipped_prefix > 0).then_some(self.retained_total)
+    #[inline]
+    pub const fn searched_lines(&self) -> Option<usize> {
+        if self.skipped_prefix > 0 {
+            Some(self.retained_total)
+        } else {
+            None
+        }
     }
 }
 
@@ -100,6 +105,7 @@ impl SearchKey {
     /// The key of `t` as it stands, for an index that retains `depth_cap` lines (floored
     /// as [`SearchKey::max_lines`] says).
     #[must_use]
+    #[inline]
     pub fn capture(t: &Terminal, depth_cap: usize) -> Self {
         let grid = t.grid();
         let rows = t.rows();
@@ -122,6 +128,7 @@ impl SearchKey {
     /// Content that moved without any of those (output appended, a line rewritten) keeps
     /// the frame: an absolute row stays put when output scrolls it into history.
     #[must_use]
+    #[inline]
     pub fn same_frame(&self, now: &Self) -> bool {
         self.alt == now.alt
             && self.renumber_epoch == now.renumber_epoch
@@ -133,6 +140,7 @@ impl SearchKey {
     /// An index built under `self` is the index of `now`: the same frame, the same content
     /// and the same depth. The cache hit and the consistency of a finished query.
     #[must_use]
+    #[inline]
     pub fn same_generation(&self, now: &Self) -> bool {
         self.same_frame(now)
             && self.content_seq == now.content_seq
@@ -148,6 +156,7 @@ impl SearchKey {
     /// oldest rows leave, the survivors keep their keys), so a retreat can only be a slide
     /// nothing reported.
     #[must_use]
+    #[inline]
     pub fn refreshable_from(&self, prev: &Self) -> bool {
         let (was, is) = (prev.window(), self.window());
         self.same_frame(prev)
@@ -159,6 +168,7 @@ impl SearchKey {
     /// The rows a search under this key reads: the newest `max_lines` of the retained
     /// history and screen.
     #[must_use]
+    #[inline]
     pub fn window(&self) -> SearchWindow {
         let total = self.scrollback.saturating_add(usize::from(self.rows));
         let retained_total = total.min(self.max_lines);
@@ -258,6 +268,7 @@ pub(super) struct RowCopy {
 
 impl RowCopy {
     /// A build of `window` from nothing: every row of it.
+    #[inline]
     pub(super) fn window(window: &SearchWindow, discard: SearchDiscard) -> Self {
         let mut copy = Self::unnamed(None, None, discard);
         copy.name_spans(std::iter::once(window.retained_base..window.indexed_end).collect());
@@ -265,6 +276,7 @@ impl RowCopy {
     }
 
     /// A refresh of `base`, built under `previous`; the first chunk names its rows.
+    #[inline]
     pub(super) fn refresh(
         base: Arc<TerminalSearch>,
         previous: SearchKey,
@@ -274,6 +286,7 @@ impl RowCopy {
     }
 
     /// A copy with no rows named yet.
+    #[inline]
     fn unnamed(
         base: Option<Arc<TerminalSearch>>,
         pending: Option<SearchKey>,
@@ -291,12 +304,14 @@ impl RowCopy {
     }
 
     /// Set the rows to copy, before any is copied.
+    #[inline]
     pub(super) fn name_spans(&mut self, spans: Vec<Range<usize>>) {
         self.rows = SearchRows::with_capacity(spans.iter().map(ExactSizeIterator::len).sum());
         self.spans = spans;
     }
 
     /// Rows the spans hold that are not copied yet.
+    #[inline]
     fn rows_to_read(&self) -> usize {
         self.spans
             .iter()
@@ -309,19 +324,22 @@ impl RowCopy {
 impl SearchPlan {
     /// The key captured when the plan was made.
     #[must_use]
-    pub fn key(&self) -> &SearchKey {
+    #[inline]
+    pub const fn key(&self) -> &SearchKey {
         &self.key
     }
 
     /// The soft-wrap frame the plan's hits are re-expressed through.
     #[must_use]
-    pub fn wrap(&self) -> WrapFrame {
+    #[inline]
+    pub const fn wrap(&self) -> WrapFrame {
         self.wrap
     }
 
     /// The terminal's slot holds the index of the key's generation: nothing to copy.
     #[must_use]
-    pub fn is_hit(&self) -> bool {
+    #[inline]
+    pub const fn is_hit(&self) -> bool {
         matches!(self.kind, PlanKind::Hit { .. })
     }
 
@@ -329,6 +347,7 @@ impl SearchPlan {
     /// rows that may have changed on a refresh, none on a hit. Until a refresh's first
     /// chunk names its rows, the window's rows are their bound.
     #[must_use]
+    #[inline]
     pub fn rows_to_read(&self) -> usize {
         match &self.kind {
             PlanKind::Hit { .. } => 0,
@@ -407,18 +426,21 @@ pub struct BuiltSearch {
 impl BuiltSearch {
     /// The key the index was planned under.
     #[must_use]
-    pub fn key(&self) -> &SearchKey {
+    #[inline]
+    pub const fn key(&self) -> &SearchKey {
         &self.key
     }
 
     /// The soft-wrap frame hits are re-expressed through.
     #[must_use]
-    pub fn wrap(&self) -> WrapFrame {
+    #[inline]
+    pub const fn wrap(&self) -> WrapFrame {
         self.wrap
     }
 
     /// The index, for a walk the query layer does not make (a lazy point search).
     #[must_use]
+    #[inline]
     pub fn index(&self) -> &TerminalSearch {
         &self.index
     }
@@ -426,6 +448,7 @@ impl BuiltSearch {
     /// One query, in physical coordinates, with the match the request's anchor selects
     /// ([`query_search_index_narrowing`]): a literal query narrows from, and leaves, the
     /// frames the slot keeps beside this index.
+    #[inline]
     pub fn query(
         &mut self,
         query: &str,

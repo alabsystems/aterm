@@ -77,7 +77,8 @@ pub struct ParserRepr {
     clippy::trivially_copy_pass_by_ref,
     reason = "serde's skip_serializing_if hands the predicate a reference"
 )]
-fn is_zero(n: &u32) -> bool {
+#[inline]
+const fn is_zero(n: &u32) -> bool {
     *n == 0
 }
 
@@ -85,7 +86,8 @@ fn is_zero(n: &u32) -> bool {
     clippy::trivially_copy_pass_by_ref,
     reason = "serde's skip_serializing_if hands the predicate a reference"
 )]
-fn is_zero_u8(n: &u8) -> bool {
+#[inline]
+const fn is_zero_u8(n: &u8) -> bool {
     *n == 0
 }
 
@@ -93,7 +95,8 @@ fn is_zero_u8(n: &u8) -> bool {
     clippy::trivially_copy_pass_by_ref,
     reason = "serde's skip_serializing_if hands the predicate a reference"
 )]
-fn is_false(b: &bool) -> bool {
+#[inline]
+const fn is_false(b: &bool) -> bool {
     !*b
 }
 
@@ -161,6 +164,7 @@ impl ParserRepr {
     /// The carry this names — [`Self::exact`] when there is one, else these
     /// fields — or `None` for an unknown state name or non-hex bytes. Not a
     /// validation of the carry (see the module docs).
+    #[inline]
     #[must_use]
     pub fn to_carry(&self) -> Option<ParserCarry> {
         self.exact.as_deref().unwrap_or(self).fields_to_carry()

@@ -24,6 +24,7 @@ use aterm_types::keyboard::{Key, NamedKey};
 /// composition/launch/browser keys — that no terminal escape sequence covers).
 /// A `Character` logical key carries the single base codepoint; multi-grapheme
 /// logical strings (rare, IME-ish) are not single-key events and yield `None`.
+#[inline]
 #[must_use]
 pub fn map_logical_key(key: &WinitKey) -> Option<Key> {
     match key {
@@ -49,8 +50,9 @@ pub fn map_logical_key(key: &WinitKey) -> Option<Key> {
 /// and modifiers. Keypad keys are mapped first via [`map_numpad_key`]
 /// (since winit reports keypad presses using main-block logical keys with
 /// `KeyLocation::Numpad`). Returns `None` for keys without a terminal encoding.
+#[inline]
 #[must_use]
-pub(crate) fn map_named_key(named: WinitNamed) -> Option<NamedKey> {
+pub(crate) const fn map_named_key(named: WinitNamed) -> Option<NamedKey> {
     Some(match named {
         // Navigation
         WinitNamed::ArrowUp => NamedKey::ArrowUp,
@@ -148,6 +150,7 @@ pub(crate) fn map_named_key(named: WinitNamed) -> Option<NamedKey> {
 /// (`LEFT_SHIFT` 57441, `RIGHT_SHIFT` 57447, …), so a right-side press becomes the
 /// engine's *Right variant; every other key, and a modifier on any other
 /// location, is returned as it is.
+#[inline]
 #[must_use]
 pub fn sided_modifier(key: Key, location: KeyLocation) -> Key {
     if location != KeyLocation::Right {
@@ -169,8 +172,9 @@ pub fn sided_modifier(key: Key, location: KeyLocation) -> Key {
 /// `ShiftRight`, and Control, Alt and Super likewise), or `None` for any other
 /// key. Whether that key is still held decides a modifier release's own kitty
 /// bit ([`aterm_types::keyboard::NamedKey::modifier_twin`]).
+#[inline]
 #[must_use]
-pub fn physical_modifier_twin(physical: PhysicalKey) -> Option<PhysicalKey> {
+pub const fn physical_modifier_twin(physical: PhysicalKey) -> Option<PhysicalKey> {
     let PhysicalKey::Code(code) = physical else {
         return None;
     };
@@ -262,8 +266,9 @@ pub fn map_numpad_key(
 /// Unshifted US-QWERTY character for `physical`, used as the Kitty
 /// `REPORT_ALTERNATE_KEYS` `base_layout_key`, or `None` for non-printable
 /// keys.
+#[inline]
 #[must_use]
-pub fn base_layout_key_for(physical: PhysicalKey) -> Option<char> {
+pub const fn base_layout_key_for(physical: PhysicalKey) -> Option<char> {
     let PhysicalKey::Code(code) = physical else {
         return None;
     };
@@ -326,6 +331,7 @@ pub fn base_layout_key_for(physical: PhysicalKey) -> Option<char> {
 /// so a shortcut matcher that asks this names the letter the encoder would have
 /// sent. On a US digit or symbol key, where this names none, the encoder's Ctrl
 /// byte still follows the US key.
+#[inline]
 #[must_use]
 pub fn layout_letter_twin_for(logical: &WinitKey, physical: PhysicalKey) -> Option<char> {
     let WinitKey::Character(s) = logical else {
@@ -342,6 +348,7 @@ pub fn layout_letter_twin_for(logical: &WinitKey, physical: PhysicalKey) -> Opti
 /// Return the shifted US-QWERTY ASCII character for an unshifted US-QWERTY
 /// character (`'a'..'z'` → `'A'..'Z'`, `'1'` → `'!'`, `'/'` → `'?'`, etc.), or
 /// `None` if `base` is not a printable US-QWERTY base key.
+#[inline]
 #[must_use]
 pub const fn us_qwerty_shifted_ascii(base: char) -> Option<char> {
     if base >= 'a' && base <= 'z' {
@@ -383,6 +390,7 @@ const fn is_unicode_scalar(v: u32) -> bool {
 /// wire frame (`u32, u32, u32, u8, u8`). Rejects any scalar that is not a valid
 /// Unicode scalar (`char::from_u32`) or an `event_type` outside `1..=3`
 /// (`1 = press, 2 = repeat, 3 = release`).
+#[inline]
 #[must_use]
 pub const fn encode_kitty_key_wire_le(
     unicode_key: u32,
@@ -419,6 +427,7 @@ pub const fn encode_kitty_key_wire_le(
 
 /// Decode a 14-byte little-endian Kitty key event wire frame produced by
 /// [`encode_kitty_key_wire_le`].
+#[inline]
 #[must_use]
 pub const fn decode_kitty_key_wire_le(wire: &[u8; 14]) -> Option<(char, char, char, u8, u8)> {
     let u_raw = (wire[0] as u32)
@@ -453,6 +462,7 @@ pub const fn decode_kitty_key_wire_le(wire: &[u8; 14]) -> Option<(char, char, ch
 /// Encode a Kitty key event descriptor `(unicode_key, shifted_key,
 /// base_layout_key, modifiers_mask, event_type)` into a 14-byte big-endian
 /// wire frame (`u32, u32, u32, u8, u8`).
+#[inline]
 #[must_use]
 pub const fn encode_kitty_key_wire_be(
     unicode_key: u32,
@@ -489,6 +499,7 @@ pub const fn encode_kitty_key_wire_be(
 
 /// Decode a 14-byte big-endian Kitty key event wire frame produced by
 /// [`encode_kitty_key_wire_be`].
+#[inline]
 #[must_use]
 pub const fn decode_kitty_key_wire_be(wire: &[u8; 14]) -> Option<(char, char, char, u8, u8)> {
     let u_raw = ((wire[0] as u32) << 24)
@@ -522,6 +533,7 @@ pub const fn decode_kitty_key_wire_be(wire: &[u8; 14]) -> Option<(char, char, ch
 
 /// Convert a 6-bit Kitty modifier mask (`Shift=1, Alt=2, Ctrl=4, Super=8,
 /// Hyper=16, Meta=32`) into its 1-based CSI parameter (`1 + (mask & 0x3f)`).
+#[inline]
 #[must_use]
 pub const fn kitty_csi_modifier_param(modifiers_mask: u8) -> u8 {
     1 + (modifiers_mask & 0x3f)

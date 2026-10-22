@@ -752,6 +752,10 @@ const MACHINE_CONFIG_PARAGRAPH: &str = "\n\
      \x20 universal_control       \"off\" (default) | \"leave\". Off writes the two per-host keys\n\
      \x20                         that stop the cursor and keyboard roaming to other Macs and\n\
      \x20                         iPads on the same Apple account; leave never touches them.\n\
+     \x20 rosetta                 true (default) | false. On Apple silicon, true installs Rosetta\n\
+     \x20                         2 when it is missing (`softwareupdate --install-rosetta`, as\n\
+     \x20                         you, no admin password); false never does. An Intel Mac\n\
+     \x20                         ignores it.\n\
      \x20 It is applied by `aterm pkg machine apply`, which aterm runs once a day at the\n\
      \x20 first window or interactive terminal session, and by a package pass (update,\n\
      \x20 seed, install) when the [machine] table changed since it was last applied; no\n\

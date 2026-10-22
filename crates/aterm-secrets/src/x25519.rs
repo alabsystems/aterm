@@ -58,17 +58,22 @@ const A24: Gf = [0xDB41, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
 
 /// X25519(scalar, u): the u-coordinate of the clamped scalar times the point with
 /// u-coordinate `u`.
+#[inline]
+#[must_use]
 pub fn x25519(scalar: &[u8; 32], u: &[u8; 32]) -> [u8; 32] {
     crypto_scalarmult(scalar, u)
 }
 
 /// X25519(scalar, 9): the public key of `scalar`.
+#[inline]
+#[must_use]
 pub fn x25519_base(scalar: &[u8; 32]) -> [u8; 32] {
     x25519(scalar, &BASEPOINT)
 }
 
 /// `car25519`: one carry pass, the top limb's carry folded into limb 0 times 38
 /// (2^256 = 38 mod p). The verified form: no shift of a negative value left, no `c-1`.
+#[inline]
 fn car25519(o: &mut Gf) {
     for i in 0..16 {
         // The multiplier depends on the loop index only, never on the data.
@@ -80,6 +85,7 @@ fn car25519(o: &mut Gf) {
 
 /// `sel25519`: swaps `p` and `q` when `b` is 1, leaves them when `b` is 0, by mask: the
 /// same instructions and addresses either way.
+#[inline]
 fn sel25519(p: &mut Gf, q: &mut Gf, b: i64) {
     let c = !(b - 1);
     for i in 0..16 {
@@ -128,6 +134,7 @@ fn unpack25519(n: &[u8; 32]) -> Gf {
 }
 
 /// `A`: limb-wise sum, unreduced.
+#[inline]
 fn add(a: &Gf, b: &Gf) -> Gf {
     let mut o: Gf = [0; 16];
     for i in 0..16 {
@@ -137,6 +144,7 @@ fn add(a: &Gf, b: &Gf) -> Gf {
 }
 
 /// `Z`: limb-wise difference, unreduced.
+#[inline]
 fn sub(a: &Gf, b: &Gf) -> Gf {
     let mut o: Gf = [0; 16];
     for i in 0..16 {
@@ -146,6 +154,7 @@ fn sub(a: &Gf, b: &Gf) -> Gf {
 }
 
 /// `M`: schoolbook product, the high half folded down times 38, two carry passes.
+#[inline]
 fn mul(a: &Gf, b: &Gf) -> Gf {
     let mut t = [0i64; 31];
     for i in 0..16 {
@@ -164,6 +173,7 @@ fn mul(a: &Gf, b: &Gf) -> Gf {
 }
 
 /// `S`: the square.
+#[inline]
 fn sqr(a: &Gf) -> Gf {
     mul(a, a)
 }

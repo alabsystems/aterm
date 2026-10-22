@@ -45,11 +45,13 @@ impl<T: Copy + PartialEq + Default> Rle<T> {
     /// Find the run containing `index`: `(run_index, offset_within_run)`.
     ///
     /// O(runs) linear walk; see the `Rle` docs for why there is no index.
+    #[inline]
     pub(super) fn find_run(&self, index: u32) -> Option<(usize, u32)> {
         self.find_run_linear(index)
     }
 
     /// Linear scan over the run lengths.
+    #[inline]
     fn find_run_linear(&self, index: u32) -> Option<(usize, u32)> {
         let mut accumulated = 0u32;
         for (i, run) in self.runs.iter().enumerate() {

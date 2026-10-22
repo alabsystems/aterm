@@ -183,12 +183,14 @@ impl SgrStyleHandler<'_> {
     /// turned on blink (5), and `38;2;1;2` set faint, bold and faint again.
     /// xterm has no SGR 58; the underline colour follows the 38/48 rule.
     #[inline]
-    fn extended_color_skip(params: &[u16]) -> usize {
-        match params.get(1) {
-            Some(&2) => 4, // 38;2;r;g;b
-            Some(&5) => 2, // 38;5;n
-            Some(_) => 1,  // an unknown selector consumes itself
-            None => 0,     // a bare 38 at the end of the list
+    const fn extended_color_skip(params: &[u16]) -> usize {
+        if params.len() < 2 {
+            return 0; // a bare 38 at the end of the list
+        }
+        match params[1] {
+            2 => 4, // 38;2;r;g;b
+            5 => 2, // 38;5;n
+            _ => 1, // an unknown selector consumes itself
         }
     }
 
@@ -448,31 +450,60 @@ impl SgrStyleHandler<'_> {
         clippy::cast_possible_truncation,
         reason = "values clamped to u8::MAX by .min()"
     )]
-    fn parse_extended_color_colon(params: &[u16]) -> Option<PackedColor> {
+    #[inline]
+    const fn parse_extended_color_colon(params: &[u16]) -> Option<PackedColor> {
         if params.len() < 3 {
             return None;
         }
 
-        match params.get(1) {
-            Some(&2) => {
+        match params[1] {
+            2 => {
                 if params.len() >= 6 {
                     // Full format: 38:2:cs:r:g:b — skip colorspace at [2]
-                    let r = params[3].min(u16::from(u8::MAX)) as u8;
-                    let g = params[4].min(u16::from(u8::MAX)) as u8;
-                    let b = params[5].min(u16::from(u8::MAX)) as u8;
+                    let r = if params[3] > 255 {
+                        255
+                    } else {
+                        params[3] as u8
+                    };
+                    let g = if params[4] > 255 {
+                        255
+                    } else {
+                        params[4] as u8
+                    };
+                    let b = if params[5] > 255 {
+                        255
+                    } else {
+                        params[5] as u8
+                    };
                     Some(PackedColor::rgb(r, g, b))
                 } else if params.len() >= 5 {
                     // Short format: 38:2:r:g:b (no colorspace)
-                    let r = params[2].min(u16::from(u8::MAX)) as u8;
-                    let g = params[3].min(u16::from(u8::MAX)) as u8;
-                    let b = params[4].min(u16::from(u8::MAX)) as u8;
+                    let r = if params[2] > 255 {
+                        255
+                    } else {
+                        params[2] as u8
+                    };
+                    let g = if params[3] > 255 {
+                        255
+                    } else {
+                        params[3] as u8
+                    };
+                    let b = if params[4] > 255 {
+                        255
+                    } else {
+                        params[4] as u8
+                    };
                     Some(PackedColor::rgb(r, g, b))
                 } else {
                     None
                 }
             }
-            Some(&5) if params.len() >= 3 => {
-                let index = params[2].min(u16::from(u8::MAX)) as u8;
+            5 => {
+                let index = if params[2] > 255 {
+                    255
+                } else {
+                    params[2] as u8
+                };
                 Some(PackedColor::indexed(index))
             }
             _ => None,
@@ -484,22 +515,39 @@ impl SgrStyleHandler<'_> {
         clippy::cast_possible_truncation,
         reason = "values clamped to u8::MAX by .min()"
     )]
-    fn parse_extended_color(params: &[u16]) -> Option<PackedColor> {
+    #[inline]
+    const fn parse_extended_color(params: &[u16]) -> Option<PackedColor> {
         if params.len() < 2 {
             return None;
         }
 
-        match params.get(1) {
-            Some(&2) if params.len() >= 5 => {
+        match params[1] {
+            2 if params.len() >= 5 => {
                 // True color: 38;2;r;g;b
-                let r = params[2].min(u16::from(u8::MAX)) as u8;
-                let g = params[3].min(u16::from(u8::MAX)) as u8;
-                let b = params[4].min(u16::from(u8::MAX)) as u8;
+                let r = if params[2] > 255 {
+                    255
+                } else {
+                    params[2] as u8
+                };
+                let g = if params[3] > 255 {
+                    255
+                } else {
+                    params[3] as u8
+                };
+                let b = if params[4] > 255 {
+                    255
+                } else {
+                    params[4] as u8
+                };
                 Some(PackedColor::rgb(r, g, b))
             }
-            Some(&5) if params.len() >= 3 => {
+            5 if params.len() >= 3 => {
                 // 256-color: 38;5;n — clamped to [0, 255].
-                let index = params[2].min(u16::from(u8::MAX)) as u8;
+                let index = if params[2] > 255 {
+                    255
+                } else {
+                    params[2] as u8
+                };
                 Some(PackedColor::indexed(index))
             }
             _ => None,
@@ -511,22 +559,39 @@ impl SgrStyleHandler<'_> {
     /// Returns a u32 in format 0xTT_RRGGBB where:
     /// - TT = 0x01 for RGB color
     /// - TT = 0x02 for indexed color (index stored in low byte)
-    fn parse_underline_color(params: &[u16]) -> Option<u32> {
+    #[inline]
+    const fn parse_underline_color(params: &[u16]) -> Option<u32> {
         if params.len() < 2 {
             return None;
         }
 
-        match params.get(1) {
-            Some(&2) if params.len() >= 5 => {
+        match params[1] {
+            2 if params.len() >= 5 => {
                 // True color: 58;2;r;g;b
-                let r = u32::from(params[2].min(255));
-                let g = u32::from(params[3].min(255));
-                let b = u32::from(params[4].min(255));
+                let r = if params[2] > 255 {
+                    255
+                } else {
+                    params[2] as u32
+                };
+                let g = if params[3] > 255 {
+                    255
+                } else {
+                    params[3] as u32
+                };
+                let b = if params[4] > 255 {
+                    255
+                } else {
+                    params[4] as u32
+                };
                 Some(0x01_000000 | (r << 16) | (g << 8) | b)
             }
-            Some(&5) if params.len() >= 3 => {
+            5 if params.len() >= 3 => {
                 // 256-color: 58;5;n
-                let index = u32::from(params[2].min(255));
+                let index = if params[2] > 255 {
+                    255
+                } else {
+                    params[2] as u32
+                };
                 Some(0x02_000000 | index)
             }
             _ => None,
@@ -540,31 +605,60 @@ impl SgrStyleHandler<'_> {
     /// - `58:2::Pr:Pg:Pb`: RGB with an empty colour space (read as 0)
     ///
     /// `_subparam_mask` (bit 0 = `params[0]`) is unused.
-    fn parse_underline_color_colon(params: &[u16], _subparam_mask: u32) -> Option<u32> {
+    #[inline]
+    const fn parse_underline_color_colon(params: &[u16], _subparam_mask: u32) -> Option<u32> {
         if params.len() < 3 {
             return None;
         }
 
-        match params.get(1) {
-            Some(&2) => {
+        match params[1] {
+            2 => {
                 // RGB: 58:2:Pc:Pr:Pg:Pb or 58:2::Pr:Pg:Pb. Pc (colour space) is
                 // ignored; 6 params with it, 5 without.
                 if params.len() >= 6 {
-                    let r = u32::from(params[3].min(255));
-                    let g = u32::from(params[4].min(255));
-                    let b = u32::from(params[5].min(255));
+                    let r = if params[3] > 255 {
+                        255
+                    } else {
+                        params[3] as u32
+                    };
+                    let g = if params[4] > 255 {
+                        255
+                    } else {
+                        params[4] as u32
+                    };
+                    let b = if params[5] > 255 {
+                        255
+                    } else {
+                        params[5] as u32
+                    };
                     Some(0x01_000000 | (r << 16) | (g << 8) | b)
                 } else if params.len() >= 5 {
-                    let r = u32::from(params[2].min(255));
-                    let g = u32::from(params[3].min(255));
-                    let b = u32::from(params[4].min(255));
+                    let r = if params[2] > 255 {
+                        255
+                    } else {
+                        params[2] as u32
+                    };
+                    let g = if params[3] > 255 {
+                        255
+                    } else {
+                        params[3] as u32
+                    };
+                    let b = if params[4] > 255 {
+                        255
+                    } else {
+                        params[4] as u32
+                    };
                     Some(0x01_000000 | (r << 16) | (g << 8) | b)
                 } else {
                     None
                 }
             }
-            Some(&5) if params.len() >= 3 => {
-                let index = u32::from(params[2].min(255));
+            5 => {
+                let index = if params[2] > 255 {
+                    255
+                } else {
+                    params[2] as u32
+                };
                 Some(0x02_000000 | index)
             }
             _ => None,

@@ -2372,8 +2372,9 @@ fn reassert_rustup_seam_at(layout: &crate::store::Layout, home: Option<&std::pat
 /// Bring the trust exec roots and every trust shim in line ([`crate::compat::reconcile`]),
 /// print only what changed or failed, and answer whether nothing failed. A pass-level call,
 /// not only the lay in `activate::install_tools_env`, because an up-to-date program is
-/// short-circuited before any shim is laid. Called by update, install, the default set,
-/// seed and rollback, and by `repair` at `Deep`, where a failure is exit 1. Failures go to
+/// short-circuited before any shim is laid. Called by update, install, the default set and
+/// rollback; the seed, `repair` and doctor run it as the `base.pkg.exec-roots` item
+/// ([`crate::converge::repair`]), at `Deep`. Failures go to
 /// stderr, which the window keeps as what the pass said (aterm-gui's `read_pass_stderr`).
 fn reconcile_exec_roots(layout: &crate::store::Layout, depth: crate::seam::Depth) -> bool {
     let report = crate::compat::reconcile(layout, depth);
@@ -5025,6 +5026,7 @@ fn repair_store_rows(
         home: None,
         exe: None,
         rustup_home: None,
+        login_rc: None,
         pass: crate::converge::repair::Pass::Repair,
     });
     repair_rows(
@@ -5686,7 +5688,8 @@ fn cmd_uninstall_all() -> ExitCode {
     let report = crate::gc::run(&layout, last_verified_channel(&layout).as_ref());
     print_gc_sweeps("uninstall --all", &report);
     print_gc_abstentions("uninstall --all", &report);
-    crate::hooks::refresh(&layout);
+    // Provisions nothing, so it gives no shell an rc it lacks.
+    crate::hooks::refresh_creating_no_rc(&layout);
     // Last, after the removals: neither set-completion nor the seed lane may reinstate the
     // set. The seed installs whatever the store lacks (what makes an interrupted first run
     // resumable), so only a durable decline stops it.
@@ -7401,8 +7404,9 @@ pub const SHADOWED_MARKER: &str = "shadowed: ";
 /// no agent program is installed.
 pub const MANAGED_CURRENT_MARKER: &str = "managed-current: ";
 
-/// `machine-settings: universal-control disabled` — what this pass changed about the
-/// machine per the doctor's remedies, entries `; `-separated, omitted when nothing changed.
+/// `machine-settings: universal-control disabled; rosetta installed` — what this pass changed
+/// about the machine per the doctor's remedies, entries `; `-separated, omitted when nothing
+/// changed.
 /// The window records it as `appstatus` ledger entries (never a status-bar row) that carry
 /// the revert ([`crate::machine::UNIVERSAL_CONTROL_REVERT`]); Settings ▸ Security's "Last
 /// change" names it.
@@ -7424,6 +7428,94 @@ pub const FOREIGN_SEAM: &str = "seam";
 pub const FOREIGN_PATH: &str = "path";
 /// What a scope that found nothing foreign says.
 pub const FOREIGN_NONE: &str = "none";
+
+/// `c-toolchain: missing`, `c-toolchain: broken` or `c-toolchain: ready` — whether
+/// installing a C toolchain is what this machine needs ([`crate::prereq`]): `missing` where
+/// none is installed ([`crate::prereq::CcVerdict::NoDriver`], `NoDeveloperDir`: on macOS no
+/// Command Line Tools), `broken` where one is installed, cannot build, and an install fixes
+/// that (off macOS, the libc headers, [`crate::prereq::CcVerdict::fix`]), `ready` where
+/// installing one would fix nothing (it builds, it refuses for a reason of its own, it did
+/// not answer). The window files one exceptions entry naming the fix
+/// ([`crate::prereq::act`], on macOS `aterm init --only base.clt`) from `missing` or
+/// `broken` and ends it at `ready` (docs/DESIGN-init-system-2026-10-20.md §4.2,
+/// `base.clt`). A pass that laid programs down says it from the full probe
+/// ([`say_c_toolchain`]), and off macOS so does every update pass over a toolset (only the
+/// full probe tells a `cc` without headers from one that builds); on macOS the seed says it
+/// from the read-only half at every launch ([`c_toolchain_seed_marker`]), which there is
+/// the whole verdict, so a toolset that arrived with no window watching is filed at the
+/// next launch and the entry ends at the first launch after the tools arrive.
+/// Informational, and silent on a terminal, where doctor's sentence beside it says the
+/// same.
+pub const C_TOOLCHAIN_MARKER: &str = "c-toolchain: ";
+/// The [`C_TOOLCHAIN_MARKER`] body of a toolchain that is not installed.
+pub const C_TOOLCHAIN_MISSING: &str = "missing";
+/// The [`C_TOOLCHAIN_MARKER`] body of an installed compiler that cannot build, which an
+/// install fixes (off macOS only).
+pub const C_TOOLCHAIN_BROKEN: &str = "broken";
+/// The [`C_TOOLCHAIN_MARKER`] body of a toolchain an install would not change.
+pub const C_TOOLCHAIN_READY: &str = "ready";
+
+/// The [`C_TOOLCHAIN_MARKER`] line for `verdict`, or `None` where the probe asked nothing
+/// (Windows).
+fn c_toolchain_marker(verdict: &crate::prereq::CcVerdict) -> Option<String> {
+    use crate::prereq::CcVerdict;
+    let body = match verdict {
+        CcVerdict::NotProbed => return None,
+        CcVerdict::NoDriver | CcVerdict::NoDeveloperDir => C_TOOLCHAIN_MISSING,
+        broken if broken.fix().is_some() => C_TOOLCHAIN_BROKEN,
+        _ => C_TOOLCHAIN_READY,
+    };
+    Some(format!("atpkg: {C_TOOLCHAIN_MARKER}{body}"))
+}
+
+/// The seed's [`C_TOOLCHAIN_MARKER`] line, from the read-only half of the probe
+/// ([`crate::prereq::installed_with`]), on macOS only: there a compiler that is found but
+/// refuses is installed already, so whether one is found is the whole verdict
+/// ([`crate::prereq::CcVerdict::fix`]) and the seed never contradicts a pass's full
+/// probe. `ready` where the tools are found; `missing` where they are not and the toolset
+/// is here to need them (`toolset_present`), so a first launch leaves the filing to the
+/// pass that lays the set down. Off macOS a found `cc` may still lack the headers an
+/// install supplies, so only a pass's full probe says.
+fn c_toolchain_seed_marker(
+    path: Option<&std::ffi::OsStr>,
+    host: &crate::prereq::CcHost,
+    toolset_present: bool,
+) -> Option<String> {
+    if !cfg!(target_os = "macos") {
+        return None;
+    }
+    let body = match crate::prereq::installed_with(path, host)? {
+        true => C_TOOLCHAIN_READY,
+        false if toolset_present => C_TOOLCHAIN_MISSING,
+        false => return None,
+    };
+    Some(format!("atpkg: {C_TOOLCHAIN_MARKER}{body}"))
+}
+
+/// Say [`c_toolchain_seed_marker`]'s line, when there is one.
+fn say_c_toolchain_at_seed(
+    path: Option<&std::ffi::OsStr>,
+    host: &crate::prereq::CcHost,
+    toolset_present: bool,
+) {
+    if let Some(line) = c_toolchain_seed_marker(path, host, toolset_present) {
+        emit_marker_line(&line);
+    }
+}
+
+/// Say the C toolchain's verdict after a pass laid programs down: doctor's sentence when
+/// it blocks builds ([`prereq_line`]), then the [`C_TOOLCHAIN_MARKER`] line the window
+/// files or ends its entry from. One probe for both; `host` is
+/// [`crate::prereq::CcHost::this_machine`] in a pass.
+fn say_c_toolchain(path: Option<&std::ffi::OsStr>, host: &crate::prereq::CcHost) {
+    let verdict = crate::prereq::probe_with(path, host);
+    if let Some(line) = prereq_line(&verdict) {
+        println!("{line}");
+    }
+    if let Some(line) = c_toolchain_marker(&verdict) {
+        emit_marker_line(&line);
+    }
+}
 
 /// One thing a look found that aterm leaves alone ([`FOREIGN_MARKER`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -7578,20 +7670,58 @@ fn record_universal_control_outcome(
     }
 }
 
+/// Report the actual Rosetta 2 outcome: an install that did not land, or could not be
+/// tried on an unproven read, is a failure line, never a change.
+fn record_rosetta_outcome(
+    outcome: crate::machine::RosettaOutcome,
+    entries: &mut Vec<String>,
+) -> Option<String> {
+    use crate::machine::RosettaOutcome;
+    match outcome {
+        RosettaOutcome::Installed => {
+            entries.push(crate::machine::ROSETTA_ENTRY.to_string());
+            Some(
+                "atpkg: Rosetta 2 installed on this Mac (softwareupdate --install-rosetta, as \
+                 you); macOS keeps it, and [machine] rosetta = false stops aterm installing it \
+                 again"
+                    .to_string(),
+            )
+        }
+        RosettaOutcome::Failed(why) => Some(format!(
+            "{MACHINE_APPLY_FAILED_PREFIX}Rosetta 2 could not be installed on this Mac — {why} \
+             (`aterm pkg machine` reads it)"
+        )),
+        RosettaOutcome::AlreadyPresent | RosettaOutcome::NotApplicable => None,
+    }
+}
+
+/// The `machine-state:` record of this machine as it reads now — Universal Control's keys,
+/// Rosetta 2's runtime, the synthetic-home rule — and the home refusal, if any: one builder
+/// for bare `atpkg machine` and the apply's own record, so the window has one parser.
+fn machine_state_now(
+    cfg: &crate::config::MachineConfig,
+    policy: crate::config::UniversalControlPolicy,
+) -> (crate::machine::MachineState, Option<String>) {
+    let state = crate::machine::universal_control_state(&crate::machine::SystemDefaults);
+    let (home_posture, mismatch) = machine_home();
+    let st = crate::machine::MachineState {
+        universal_control: state.posture(),
+        policy,
+        home: home_posture,
+        config_unreadable: cfg.unreadable,
+        rosetta: crate::machine::rosetta_posture(&crate::machine::SystemRosetta),
+        rosetta_wanted: cfg.rosetta(),
+    };
+    (st, mismatch)
+}
+
 /// Print the pass's own `machine-state:` record, the machine re-read (not the apply's
 /// outcome), from the builder bare `atpkg machine` uses, so the window has one parser.
 fn print_machine_state_after_apply(
     cfg: &crate::config::MachineConfig,
     policy: crate::config::UniversalControlPolicy,
 ) {
-    let state = crate::machine::universal_control_state(&crate::machine::SystemDefaults);
-    let (home_posture, _) = machine_home();
-    let st = crate::machine::MachineState {
-        universal_control: state.posture(),
-        policy,
-        home: home_posture,
-        config_unreadable: cfg.unreadable,
-    };
+    let (st, _) = machine_state_now(cfg, policy);
     emit_marker_line(&format!(
         "atpkg: {MACHINE_STATE_MARKER}{}",
         crate::machine::machine_state_line(&st)
@@ -7632,8 +7762,27 @@ fn apply_machine_settings() -> MachineApply {
     let outcome = crate::machine::apply_universal_control(policy, &crate::machine::SystemDefaults);
     let uc_failed = outcome == crate::machine::UniversalControlOutcome::WriteFailed;
     out.failed |= uc_failed;
-    out.left_alone = policy == crate::config::UniversalControlPolicy::Leave;
+    if policy == crate::config::UniversalControlPolicy::Leave {
+        out.left_alone.push("universal_control = \"leave\"");
+    } else {
+        out.acts = true;
+    }
     if let Some(line) = record_universal_control_outcome(outcome, entries) {
+        println!("{line}");
+    }
+    // Rosetta 2, where it applies (macOS on Apple silicon): installed when missing, as
+    // this user — the one `softwareupdate` verb atpkg runs (owner ruling R1).
+    if crate::machine::ROSETTA_APPLIES {
+        if cfg.rosetta() {
+            out.acts = true;
+        } else {
+            out.left_alone.push("rosetta = false");
+        }
+    }
+    let rosetta = crate::machine::apply_rosetta(cfg.rosetta(), &crate::machine::SystemRosetta);
+    let rosetta_failed = matches!(rosetta, crate::machine::RosettaOutcome::Failed(_));
+    out.failed |= rosetta_failed;
+    if let Some(line) = record_rosetta_outcome(rosetta, entries) {
         println!("{line}");
     }
     if !entries.is_empty() {
@@ -7646,7 +7795,7 @@ fn apply_machine_settings() -> MachineApply {
     // gets here, so a refusal is retried by the next pass; one whose `defaults` write
     // failed forgets the table, so the next pass retries it.
     if let Some(layout) = crate::store::resolve_configured() {
-        if uc_failed {
+        if uc_failed || rosetta_failed {
             crate::machine::forget_applied(&layout);
         } else {
             crate::machine::record_applied(&layout, cfg);
@@ -7663,17 +7812,21 @@ struct MachineApply {
     entries: Vec<String>,
     /// A change did not land: a `machine settings failed —` line was printed.
     failed: bool,
-    /// `[machine] universal_control = "leave"`: nothing is the apply's to change.
-    left_alone: bool,
+    /// The `[machine]` settings switched off here, as spelled (`universal_control =
+    /// "leave"`, `rosetta = false`).
+    left_alone: Vec<&'static str>,
+    /// Some setting this apply acts on is switched on here.
+    acts: bool,
 }
 
 impl MachineApply {
     /// `atpkg machine apply`'s verdict when nothing changed: the one cause this apply saw.
+    /// The switches are the cause only when every setting that applies here is off.
     fn nothing_changed(&self) -> String {
         if self.failed {
             "nothing changed — a change did not land".to_string()
-        } else if self.left_alone {
-            "nothing changed — [machine] universal_control = \"leave\"".to_string()
+        } else if !self.acts && !self.left_alone.is_empty() {
+            format!("nothing changed — [machine] {}", self.left_alone.join(", "))
         } else {
             "nothing changed — already applied".to_string()
         }
@@ -7741,10 +7894,12 @@ fn machine_apply_turn_in(layout: &crate::store::Layout) -> MachineTurn {
 
 /// A pass's `[machine]` edit ([`main_entry`]), applied beside the pass: on its own thread,
 /// started before the store lock is asked for and joined when this guard drops (or at
-/// [`Self::join`]). The `defaults` reads and writes — tens of milliseconds; none while
-/// another apply holds the queue ([`apply_machine_edit`]) — then delay neither the lock
-/// attempt nor the work after it, and the edit has still landed, and said so on stdout,
-/// before the pass exits.
+/// [`Self::join`]). The `defaults` reads and writes — tens of milliseconds — and, on an
+/// Apple-silicon Mac without Rosetta 2, its install (about a second from the package macOS
+/// keeps on disk, at most [`crate::machine::ROSETTA_INSTALL_WITHIN`] when it must fetch
+/// it; none of it while another apply holds the queue, [`apply_machine_edit`]) then delay
+/// neither the lock attempt nor the work after it, and the edit has still landed, and said
+/// so on stdout, before the pass exits: the join waits for the install.
 struct MachineEdit(Option<std::thread::JoinHandle<()>>);
 
 impl MachineEdit {
@@ -7949,12 +8104,58 @@ fn cache_plan_words(why: crate::build_cache::Unused) -> String {
     }
 }
 
+/// Bare `atpkg machine`'s Rosetta 2 sentence (after the verdict prefix): the doctor's row
+/// without its level's next step, or why the setting is inert here.
+fn rosetta_state_line(posture: crate::machine::RosettaPosture, wanted: bool) -> String {
+    posture.doctor_row(wanted).map_or_else(
+        || {
+            "note — Rosetta 2: not applicable — [machine] rosetta acts only in an atpkg built \
+             for Apple silicon (arm64), and this one is built for x86_64"
+                .to_string()
+        },
+        |row| crate::doctor::spelled(&row),
+    )
+}
+
+/// Bare `atpkg machine`'s verdict (after the verdict prefix), from the record and the
+/// refusal: what an apply would do, that nothing is left, or why nothing is applied here.
+fn machine_read_verdict(st: &crate::machine::MachineState, refusal: Option<String>) -> String {
+    if let Some(reason) = refusal {
+        return format!("not applied here — {reason}");
+    }
+    let mut would = Vec::new();
+    if st.universal_control_next() {
+        would.push("Universal Control off for this host");
+    }
+    if st.rosetta_next() {
+        would.push("Rosetta 2 installed");
+    }
+    if would.is_empty() {
+        use crate::machine::RosettaPosture;
+        // An unread runtime is not where [machine] wants it: it is unknown, and the apply
+        // installs nothing on it, so the verdict says that instead of vouching for it.
+        let settings = match st.rosetta {
+            RosettaPosture::NotApplicable => "Universal Control is where [machine] wants it",
+            RosettaPosture::Unknown => {
+                "Universal Control is where [machine] wants it; Rosetta 2 could not be read, \
+                 and nothing is installed on that reading"
+            }
+            RosettaPosture::Present | RosettaPosture::Missing => {
+                "Universal Control and Rosetta 2 are where [machine] wants them"
+            }
+        };
+        format!("nothing to apply — {settings}")
+    } else {
+        format!("next — aterm pkg machine apply ({})", would.join("; "))
+    }
+}
+
 /// `atpkg machine [apply|cache]` — the `[machine]` settings' own door.
 ///
-/// Bare `atpkg machine` reads: the doctor's Universal Control line, the byte-stable
-/// [`MACHINE_STATE_MARKER`] record, and one verdict — `next — …` naming what an apply would
-/// do, `nothing to apply`, or `not applied here — <why>` on a home that is not this
-/// account's. `atpkg machine apply` runs [`apply_machine_settings`] and then says what
+/// Bare `atpkg machine` reads: the doctor's Universal Control and Rosetta 2 lines, the
+/// byte-stable [`MACHINE_STATE_MARKER`] record, and one verdict — `next — …` naming what an
+/// apply would do, `nothing to apply`, or `not applied here — <why>` on a home that is not
+/// this account's. `atpkg machine apply` runs [`apply_machine_settings`] and then says what
 /// changed, that nothing changed, or why nothing was applied, then runs the day's build cache
 /// housekeeping (`crate::build_cache::reclaim_home`); `atpkg machine cache` is that
 /// housekeeping's dry run (`crate::build_cache::plan_home`), each folder sized. Exit 0 either
@@ -7971,13 +8172,11 @@ fn cmd_machine(rest: &[String]) -> ExitCode {
             let policy = cfg.universal_control();
             let state = crate::machine::universal_control_state(&crate::machine::SystemDefaults);
             println!("{MACHINE_VERDICT_PREFIX}{}", state.state_line(policy));
-            let (home_posture, mismatch) = machine_home();
-            let st = crate::machine::MachineState {
-                universal_control: state.posture(),
-                policy,
-                home: home_posture,
-                config_unreadable: cfg.unreadable,
-            };
+            let (st, mismatch) = machine_state_now(cfg, policy);
+            println!(
+                "{MACHINE_VERDICT_PREFIX}{}",
+                rosetta_state_line(st.rosetta, st.rosetta_wanted)
+            );
             // The line the window reads — after the prose, so a person sees sentences
             // first, and after the platform check, so its absence means "not macOS".
             emit_marker_line(&format!(
@@ -7987,19 +8186,10 @@ fn cmd_machine(rest: &[String]) -> ExitCode {
             // One verdict for both surfaces: `st.next()` is what the window's Apply button
             // reads too, so the CLI cannot say "nothing to apply" while an apply would act.
             let refusal = machine_config_refusal(cfg).or(mismatch);
-            match (refusal, st.next()) {
-                (Some(reason), _) => {
-                    println!("{MACHINE_VERDICT_PREFIX}not applied here — {reason}")
-                }
-                (None, false) => println!(
-                    "{MACHINE_VERDICT_PREFIX}nothing to apply — Universal Control is where \
-                     [machine] wants it"
-                ),
-                (None, true) => println!(
-                    "{MACHINE_VERDICT_PREFIX}next — aterm pkg machine apply (Universal Control \
-                     off for this host)"
-                ),
-            }
+            println!(
+                "{MACHINE_VERDICT_PREFIX}{}",
+                machine_read_verdict(&st, refusal)
+            );
             ExitCode::SUCCESS
         }
         [sub] if sub == "apply" => {
@@ -8775,11 +8965,15 @@ fn human_marker(line: &str) -> Option<String> {
         );
     }
     if let Some(body) = marked(MACHINE_SETTINGS_MARKER) {
-        // The Universal Control change is said on its own line beside this one, revert
-        // and all ([`record_universal_control_outcome`]): not twice.
+        // The Universal Control change and the Rosetta 2 install are each said on their own
+        // line beside this one, revert and all ([`record_universal_control_outcome`],
+        // [`record_rosetta_outcome`]): not twice.
         let said: Vec<&str> = body
             .split("; ")
-            .filter(|entry| *entry != crate::machine::UNIVERSAL_CONTROL_ENTRY)
+            .filter(|entry| {
+                *entry != crate::machine::UNIVERSAL_CONTROL_ENTRY
+                    && *entry != crate::machine::ROSETTA_ENTRY
+            })
             .collect();
         return (!said.is_empty())
             .then(|| format!("Changed this Mac's settings: {}.", said.join("; ")));
@@ -8788,6 +8982,7 @@ fn human_marker(line: &str) -> Option<String> {
         || marked(GROUP_ABORTED_MARKER).is_some()
         || marked(SHADOWED_MARKER).is_some()
         || marked(FOREIGN_MARKER).is_some()
+        || marked(C_TOOLCHAIN_MARKER).is_some()
         || marked(MANAGED_CURRENT_MARKER).is_some()
         || marked(MACHINE_STATE_MARKER).is_some()
     {
@@ -9030,7 +9225,7 @@ fn do_install_with(
             // Refresh the interactive-shell PATH hook, at the CLI edge so flow's
             // synthetic-layout tests never write the real ~/.aterm. Best-effort.
             if !r.already_current {
-                crate::hooks::refresh(layout);
+                refresh_shell_hooks(layout);
             }
         }
         Err(e) => match failed_install_state(e) {
@@ -10521,9 +10716,143 @@ impl PassSeams<'static> {
 /// [`PassSeams::read_ahead_in`] for a pass that needs no word of its reads.
 fn no_read_ahead_note(_: &str) {}
 
-/// [`crate::hooks::refresh`] as a pass runs it: best-effort, its report unsaid.
+/// The shell's base relay items ([`SHELL_RELAY`]) as an install or update pass runs them
+/// at its end ([`relay_base`]).
 fn refresh_shell_hooks(layout: &crate::store::Layout) {
-    let _ = crate::hooks::refresh(layout);
+    relay_base(layout, &SHELL_RELAY);
+}
+
+/// The shell's half of the base relay items (design init-system §4.2): the `~/.local/bin`
+/// links, the `shell.d` hooks, and atpkg's block in the rc files (the login shell's own rc
+/// created when absent), in the repair items' order. What an install or update pass lays
+/// at its end, under the store lock it holds: none of them writes the store.
+const SHELL_RELAY: [&str; 3] = [
+    crate::converge::repair::LINKS,
+    crate::converge::repair::HOOKS,
+    crate::converge::repair::RC,
+];
+
+/// The base relay items the seed runs before the rustup seam (design init-system §5:
+/// `seed` = the base relay items plus adoption, unattended): [`SHELL_RELAY`], then the
+/// reroute stubs, an outlived held update and the installed programs' shims. The seam is
+/// the pass's own re-assertion ([`reassert_rustup_seam`]), as the update pass's is: it is
+/// the step that tells the window which foreign rustup entries stand (the `foreign:`
+/// marker), which the seam item, `NotApplicable` over a foreign entry, cannot say. The
+/// exec roots follow it ([`SEED_RELAY_AFTER_SEAM`]), the order every pass keeps.
+const SEED_RELAY: [&str; 6] = [
+    crate::converge::repair::LINKS,
+    crate::converge::repair::HOOKS,
+    crate::converge::repair::RC,
+    crate::converge::repair::STUBS,
+    crate::converge::repair::HELD_UPDATE,
+    crate::converge::repair::SHIMS,
+];
+
+/// The base relay items the seed runs after the rustup seam: the trust build's exec root.
+const SEED_RELAY_AFTER_SEAM: [&str; 1] = [crate::converge::repair::EXEC_ROOTS];
+
+/// Run the base relay items `ids` ([`crate::converge::repair`]) as an unattended pass
+/// runs them, under the store lock its verb holds: the doctor's pass (an rc block or a
+/// login rc the person deleted stays deleted; a bundle that is not the release
+/// `aterm.app` lays no shell integration), each applied where its probe differs, each
+/// change journaled first, where its items' account is (design init-system §3.3's
+/// [`aterm_types::dirs::account_state_dir`]: a scratch `$HOME`'s pass journals in that
+/// scratch). Run as root it changes nothing of the account's (`Requires::Account`): `sudo`
+/// keeps `$HOME`, and a root-owned rc would lock its owner out of it. Says what each item
+/// did on stdout and what it could not do on stderr, and never fails the pass.
+fn relay_base(layout: &crate::store::Layout, ids: &[&str]) {
+    let ground = std::sync::Arc::new(crate::converge::repair::Ground::of_process(
+        layout.clone(),
+        crate::converge::repair::Pass::Doctor,
+    ));
+    let rows = relay_rows(
+        &ground,
+        ids,
+        aterm_types::dirs::account_state_dir().as_deref(),
+    );
+    for row in &rows {
+        for line in relay_said(row) {
+            println!("{line}");
+        }
+        if let Some(warn) = relay_warning(row) {
+            eprintln!("{warn}");
+        }
+    }
+}
+
+/// Why a relay pass changes nothing of the account's: it runs as root (`sudo` keeps
+/// `$HOME`). A scratch `$HOME` or a private state root is the pass's own tree, laid as
+/// before items existed, so only root holds it back.
+fn relay_not_own_account() -> Option<&'static str> {
+    #[cfg(unix)]
+    {
+        relay_not_own_account_with(aterm_uds::peer::our_uid())
+    }
+    #[cfg(not(unix))]
+    {
+        None
+    }
+}
+
+/// The pure half of [`relay_not_own_account`], for the effective uid `euid`.
+#[cfg(unix)]
+fn relay_not_own_account_with(euid: u32) -> Option<&'static str> {
+    (euid == 0).then_some("it runs as root")
+}
+
+/// [`relay_base`]'s rows over `ground`: `ids` through the engine, journaled under `state`
+/// (`None`: no root to journal into, so every change is refused and says why).
+fn relay_rows(
+    ground: &std::sync::Arc<crate::converge::repair::Ground>,
+    ids: &[&str],
+    state: Option<&std::path::Path>,
+) -> Vec<aterm_converge::ItemReport> {
+    let scope = aterm_converge::Scope {
+        applies: &[aterm_converge::Class::Relay],
+        at_console: true,
+        not_own_account: relay_not_own_account(),
+    };
+    match state {
+        Some(state) => repair_rows(
+            ground,
+            &mut aterm_converge::FileJournal::under(state),
+            Some(ids),
+            scope,
+        ),
+        None => repair_rows(ground, &mut aterm_converge::ReadOnly, Some(ids), scope),
+    }
+}
+
+/// What a relay row did, one `atpkg:` line each (its detail); nothing for a row that
+/// changed nothing.
+fn relay_said(row: &aterm_converge::ItemReport) -> Vec<String> {
+    row.detail
+        .iter()
+        .flat_map(|detail| detail.lines())
+        .map(|line| {
+            if line.starts_with("atpkg: ") {
+                line.to_owned()
+            } else {
+                format!("atpkg: {line}")
+            }
+        })
+        .collect()
+}
+
+/// The one stderr line for a relay row left undone (failed, blocked, unread), or `None`.
+/// A row that stood aside, or that is not this machine's to do, says nothing.
+fn relay_warning(row: &aterm_converge::ItemReport) -> Option<String> {
+    use aterm_converge::Outcome;
+    match row.outcome {
+        Outcome::Failed | Outcome::Blocked | Outcome::Unknown if row.stood_aside.is_none() => {
+            Some(format!(
+                "atpkg: warn — {}: not done — {} (`aterm pkg repair` retries)",
+                row.title,
+                row.why.as_deref().unwrap_or("it failed")
+            ))
+        }
+        _ => None,
+    }
 }
 
 /// Whether a vendor program is installed here but disabled by a tombstone
@@ -10628,6 +10957,8 @@ fn run_update_pass_in<'scope, 'env>(
     // The one index this pass verifies, once a lane has resolved it, handed to every lane
     // below ([`reusable_index`]).
     let mut pass_index: Option<crate::TrustedIndex> = None;
+    // Whether this pass said the C toolchain's verdict ([`C_TOOLCHAIN_MARKER`]) already.
+    let mut c_toolchain_said = false;
     // The pass's one verify-select, first, before the vendor lane: a fresh verification
     // refreshes the yank latch, so the vendor lane binds the yanks published since the last
     // pass. A failed resolve blocks nothing: the vendor lane runs on the latch, and only
@@ -10947,6 +11278,13 @@ fn run_update_pass_in<'scope, 'env>(
                 arrived.join(", ")
             ));
             println!("{SEED_FOLLOW_ON}");
+            // What the programs that just arrived build with: the window files the missing
+            // Command Line Tools as an exceptions entry, a fact for later (§4.2 `base.clt`).
+            say_c_toolchain(
+                seams.path.as_deref(),
+                &crate::prereq::CcHost::this_machine(),
+            );
+            c_toolchain_said = true;
         } else if announced {
             // Always answer the announcement: a pass that said "installing over the
             // network" and installed nothing must say so — a failure, unless everything it
@@ -10998,6 +11336,20 @@ fn run_update_pass_in<'scope, 'env>(
     let _ = reconcile_exec_roots(layout, crate::seam::Depth::Shallow);
     // Refresh the interactive-shell PATH hook at the CLI edge, best-effort.
     (seams.shell_hooks)(layout);
+    // Off macOS only the full probe tells a `cc` without headers from one that builds, and
+    // the seed reads none, so every pass over a toolset says the verdict: the window's
+    // entry ends at the pass after a compiler is installed, not at the next program to
+    // arrive. (On macOS the seed's read is the whole verdict, at every launch.)
+    if !c_toolchain_said
+        && !cfg!(target_os = "macos")
+        && !crate::active_builds(layout).is_empty()
+        && let Some(line) = c_toolchain_marker(&crate::prereq::probe_with(
+            seams.path.as_deref(),
+            &crate::prereq::CcHost::this_machine(),
+        ))
+    {
+        emit_marker_line(&line);
+    }
     // Which managed agents are at their vendor's latest, for the window's ledger — a fact
     // about the vendor lane, said whatever the index lane's members did.
     print_managed_current(layout, &vendor.unchecked, (seams.now)());
@@ -12857,12 +13209,10 @@ fn install_toolset(
                     skipped.join(", ")
                 );
             }
-            if let Some(line) = default_set_prereq_line(
+            say_c_toolchain(
                 seams.path.as_deref(),
                 &crate::prereq::CcHost::this_machine(),
-            ) {
-                println!("{line}");
-            }
+            );
             print_managed_current(layout, &vendor.unchecked, now);
             record_index_freshness(layout, now, None);
             return 0;
@@ -12887,12 +13237,10 @@ fn install_toolset(
             skipped.join(", ")
         );
     }
-    if let Some(line) = default_set_prereq_line(
+    say_c_toolchain(
         seams.path.as_deref(),
         &crate::prereq::CcHost::this_machine(),
-    ) {
-        println!("{line}");
-    }
+    );
     print_managed_current(layout, &vendor.unchecked, now);
     record_index_freshness(layout, now, None);
     0
@@ -12902,13 +13250,8 @@ fn install_toolset(
 /// C toolchain's verdict ([`crate::prereq`]) against the `PATH` the pass ran with, in
 /// `doctor`'s own words, when it is an answer that blocks builds. The install did what
 /// was asked, so the exit code stays; the set simply stops claiming a capability it did
-/// not prove. `None` when a toolchain answers, or the probe cannot tell. `host` is
-/// [`crate::prereq::CcHost::this_machine`] in the verb.
-fn default_set_prereq_line(
-    path: Option<&std::ffi::OsStr>,
-    host: &crate::prereq::CcHost,
-) -> Option<String> {
-    let verdict = crate::prereq::probe_with(path, host);
+/// not prove. `None` when a toolchain answers, or the probe cannot tell.
+fn prereq_line(verdict: &crate::prereq::CcVerdict) -> Option<String> {
     verdict
         .blocks_builds()
         .then(|| format!("atpkg: {}", verdict.line()))
@@ -12990,19 +13333,27 @@ fn cmd_seed(rest: &[String]) -> ExitCode {
     // byte moves, and running one prints the live install state (`atpkg __pending`) instead
     // of "command not found". Compiled roster only; the first index resolve reconciles it.
     crate::stub::lay_adoption_stubs(&layout, cfg);
-    // Reroute stubs beside them: the upstream Rust names answer inside a session from the
-    // first seed on.
-    lay_reroute_stubs(&layout);
-    // The shell hooks now, not at the end of the first update pass: they are what append
+    // Then the base layer's relay items (design init-system §5), the doctor's own: the
+    // shell hooks now, not at the end of the first update pass, since they are what append
     // `bin/` to a shell's PATH (the window's integration re-sources them at the next
-    // prompt), so the stubs just laid answer at once and the real shims replace
-    // them in place as they land. Every gate stays [`crate::hooks::refresh`]'s own: the rc
-    // opt-out, the release-bundle rule, the consent-fenced folders.
-    refresh_shell_hooks(&layout);
+    // prompt), so the stubs just laid answer at once and the real shims replace them in
+    // place as they land; the rc block, in the login shell's own rc too when it is absent;
+    // the reroute stubs, so the upstream Rust names answer inside a session from the first
+    // seed on. Every gate is the items': the rc opt-out, the release-bundle rule, the
+    // consent-fenced folders.
+    relay_base(&layout, &SEED_RELAY);
     reassert_rustup_seam(&layout);
     // The exec roots beside the seam: this lane runs at every launch, so a trust machine is
     // healed at the next launch, not the next networked pass.
-    let _ = reconcile_exec_roots(&layout, crate::seam::Depth::Shallow);
+    relay_base(&layout, &SEED_RELAY_AFTER_SEAM);
+    // The Command Line Tools, read without running anything: a toolset that arrived with no
+    // window watching (an install over SSH, `--no-app`) files the window's entry at this
+    // launch, and tools installed since end it.
+    say_c_toolchain_at_seed(
+        std::env::var_os("PATH").as_deref(),
+        &crate::prereq::CcHost::this_machine(),
+        !crate::active_builds(&layout).is_empty(),
+    );
     // Promise nothing the index cannot deliver: say whether the signed index serves this
     // machine, and leave a durable trace of the answer.
     report_seedless_posture(&layout);
@@ -13928,7 +14279,7 @@ fn cmd_update_one(program: &String) -> ExitCode {
         // matches the pass: gc, the roots, the shell hook.
         reassert_rustup_seam(&layout);
         let _ = reconcile_exec_roots(&layout, crate::seam::Depth::Shallow);
-        crate::hooks::refresh(&layout);
+        refresh_shell_hooks(&layout);
         return if failures == 0 {
             ExitCode::SUCCESS
         } else {

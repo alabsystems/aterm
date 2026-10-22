@@ -2757,8 +2757,9 @@ impl App {
                 let frame = crate::app_window::CarriedFrame::of(&wl);
                 ws.take_carried_frame(frame.map(|frame| frame.inner_px));
             }
-            // Windows: placed while still hidden, by the attach below.
-            #[cfg(windows)]
+            // Windows (and X11, its position): placed while still hidden, by the
+            // attach below.
+            #[cfg(any(windows, target_os = "linux"))]
             self.stage_restore_placement(wid, outer, maximized);
             self.restore_into_window(wid, wl);
             let restored = self

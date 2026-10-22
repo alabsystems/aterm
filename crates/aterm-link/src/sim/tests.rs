@@ -42,6 +42,15 @@
 //!   F3, an endpoint that forgot every offset when a killed attach left it a
 //!   generation ahead of the next bridge's witness, is fixed in
 //!   aterm-gui-fabric (`LogClock::keep_below`) and is a negative control here;
+//! * the WRITE ERRORS of sim item S7: the device fails the state dir's writes
+//!   in every other eight committed seeds, and every law holds under it
+//!   ([`every_seed_with_write_errors_holds_every_law`], where aterm quits too) —
+//!   the eight defects it found fixed, each switched off a row of
+//!   [`each_rule_switched_off_is_caught`] and each seed it broke kept in
+//!   [`FOUND_ERRING`], [`FOUND_BOTH_WAYS`], [`FOUND_BOTH_WAYS_ERRING`] and
+//!   [`FOUND_QUITTING`]; a durable write whose flush failed after its rename
+//!   is written again rather than trusted
+//!   ([`a_durable_write_whose_flush_failed_is_not_trusted_and_is_written_again`]);
 //! * the seeds a wider search found breaking a law, each fixed in the bridge
 //!   and kept here ([`the_seeds_that_broke_a_law_hold_every_law`]).
 //!
@@ -96,8 +105,29 @@ use super::Rng;
 /// 1..=400 at 1500 (the race run in 1,978 and 397, the sibling's row standing
 /// in every one). Those F4 measurements used the superseded, unqualified
 /// device/inode mark; they do not establish cross-boot retirement for the
-/// current boot-bound mark. This many run in a few seconds.
+/// current boot-bound mark. With the device failing writes (sim item S7) in
+/// every other eight seeds and its fixes in, composed with main's per-open
+/// run admission, 1..=4000 at 400 steps and 1..=400 at 1500 broke none
+/// (11,961 and 4,396 writes failed before their effect, 2,113 and 738
+/// durable replaces renamed with their flush failed, 1,422 and 511 appends
+/// cut part-way, 63,281 and 23,230 writes a full disk refused), nor the
+/// world that loses power both ways, 1..=4000 at 400. With the errors on in
+/// every seed and aterm quitting now and then (`erring_quitting`,
+/// `both_ways_erring_quitting`), 1..=4000 at 400 of each and 1..=400 at 1500
+/// of the second broke none (25,002, 25,739 and 9,400 writes failed; 1,906,
+/// 2,253 and 1,208 flushes failed; 14,544 quits of aterm in the first, 9,542
+/// of them stopping the run cleanly), nor the worlds with a sibling or a
+/// racing one, erring and quitting, 1..=500 each, nor the both-ways world
+/// erring without quits, 1..=2000 — each process putting one copy of a file
+/// in the quarantine however often its recovery was tried. This many run in
+/// a few seconds.
 const SEEDS: u64 = 64;
+
+/// How many seeds the COMMITTED WORLD's own sweep runs ([`committed`]):
+/// twice [`SEEDS`] since sim item S7, whose write errors are on in every
+/// other eight seeds ([`Opts::write_errors`]), so that as many of its seeds
+/// run on a clean disk as before them, and as many again on a failing one.
+const COMMITTED_SEEDS: u64 = 2 * SEEDS;
 
 /// The most seeds a negative control may take to show its rule's law broken.
 const CONTROL_SEEDS: u64 = 64;
@@ -118,8 +148,20 @@ const SIBLING_SEEDS: u64 = 32;
 /// first within 8000 moved from 546 to 4023, and none within 4000 with the
 /// mirror off. 9000 since sim item S6 (a clean stop's one full flush, the
 /// emptied quarantine heard): the lease's control moved from 4023 to 8483, the
-/// first within 12000.
-const RARE_SEEDS: u64 = 9000;
+/// first within 12000. Sim item S7 adds one more such flush, the floor each
+/// open writes again before its first batch (`StateDir::raise_logfloor`):
+/// with it on, 8483 no longer breaks the lease's law, so the lease's control
+/// switches that admission off as well, and at 8483 again (neither off alone
+/// breaks it there, and the lease alone off breaks no seed of 1..=14000).
+/// 20000 since sim item S7 composed with main's per-open run admission (one
+/// more durable write at every bridge start, which moves where each erring
+/// seed's write errors land): the replay hold's control
+/// (`Mutant::DeliverBeforeTheDrain`) moved from 1844 to 18017, rare enough
+/// that it has a unit test of its own as well, `bridge.rs`'s
+/// `a_replayed_record_waits_for_its_posts_retirement_so_a_move_delivers_it_once`.
+/// A search stops at its first hit, so the wider limit costs a run only
+/// where a witness went stale.
+const RARE_SEEDS: u64 = 20000;
 
 fn report(out: &Outcome) -> String {
     let tail = out.trace.len().saturating_sub(40);
@@ -133,7 +175,7 @@ fn report(out: &Outcome) -> String {
     )
 }
 
-/// **THE COMMITTED WORLD BREAKS NO LAW**, over [`SEEDS`] seeds — every tier,
+/// **THE COMMITTED WORLD BREAKS NO LAW**, over [`COMMITTED_SEEDS`] seeds — every tier,
 /// kills at every kind of I/O step, relaunches, broker restarts of every kind
 /// with generation moves and lost suffixes, power cuts of the whole machine,
 /// tabs opening and closing, session logs mirrored onto the bus, acks answered
@@ -176,11 +218,14 @@ fn every_seed_holds_every_law() {
         total.acks_held += s.acks_held;
         total.tries_not_yet += s.tries_not_yet;
         total.seen_before_ack += s.seen_before_ack;
+        total.writes_failed += s.writes_failed;
+        total.renamed_unflushed += s.renamed_unflushed;
+        total.disk_full_refused += s.disk_full_refused;
     }
-    eprintln!("the committed world over {SEEDS} seeds: {total:?}");
+    eprintln!("the committed world over {COMMITTED_SEEDS} seeds: {total:?}");
     assert!(
         failures.is_empty(),
-        "{} of {SEEDS} seeds broke a law:\n{}",
+        "{} of {COMMITTED_SEEDS} seeds broke a law:\n{}",
         failures.len(),
         failures.join("\n")
     );
@@ -224,6 +269,15 @@ fn every_seed_holds_every_law() {
         ("acks the broker held", total.acks_held),
         ("reads that found an ack not yet there", total.tries_not_yet),
         ("records read before their ack", total.seen_before_ack),
+        // SIM ITEM S7: the device failed writes, before their effect and
+        // after it, and filled up ([`every_seed_with_write_errors_holds_every_law`]
+        // counts every kind).
+        ("state-dir writes failed", total.writes_failed),
+        (
+            "durable replaces renamed with their flush failed",
+            total.renamed_unflushed,
+        ),
+        ("writes a full disk refused", total.disk_full_refused),
     ] {
         assert!(n > 0, "the seeds exercised no {what}: {total:?}");
     }
@@ -345,14 +399,14 @@ fn run_all(
     par_map(&seeds, |&seed| run(&opts(seed)))
 }
 
-/// THE COMMITTED WORLD over seeds `1..=SEEDS`, run once for every test that
+/// THE COMMITTED WORLD over seeds `1..=COMMITTED_SEEDS`, run once for every test that
 /// reads it — its laws ([`every_seed_holds_every_law`]), the model's Tier-1
 /// ([`the_round_refines_its_exactly_once_model`]) and the replay
 /// of a passing seed: a seed is the same run however often it is asked for
 /// ([`a_failing_seed_replays_exactly`]), so asking again only costs a run.
 fn committed() -> &'static [Outcome] {
     static RUNS: std::sync::OnceLock<Vec<Outcome>> = std::sync::OnceLock::new();
-    RUNS.get_or_init(|| run_all(&Opts::seed, 1..=SEEDS))
+    RUNS.get_or_init(|| run_all(&Opts::seed, 1..=COMMITTED_SEEDS))
 }
 
 /// Whether `out` breaks `law` ([`breaks`]).
@@ -515,7 +569,7 @@ fn each_rule_switched_off_is_caught() {
                 o
             }),
             "not its ask",
-            120,
+            66,
         ),
         (
             "the inbox commit waits for the record's delivery",
@@ -562,7 +616,7 @@ fn each_rule_switched_off_is_caught() {
             "one post in flight per sender",
             Box::new(|s| Opts::seed(s).with(Mutant::PipelineSender)),
             "order:",
-            10,
+            5,
         ),
         // THE EXACTLY-ONCE WAIT aterm-0 KEEPS where the loop no longer waits
         // for its acks: the outbox peek reads every post in flight first. Run
@@ -604,8 +658,17 @@ fn each_rule_switched_off_is_caught() {
                 // entries a cut left (finding F2), which moved every schedule
                 // after a power cut; 546 until the mirror's durable copies,
                 // whose directory flushes pin `inc-lease` (`RARE_SEEDS`);
-                // 4023 until sim item S6; 8483 since.
-                both_ways(s).with(Mutant::LeaseAcrossBoots)
+                // 4023 until sim item S6, 8483 since. Sim item S7's floor,
+                // written again by each open before its first batch, is one
+                // more such flush, and with it 8483 no longer rolls a lease
+                // back with the lease alone off. So the floor's admission is
+                // switched off too, as the incidental flush it is
+                // (`Mutant::TrustTheFloorThatReads`): at 8483 neither switched
+                // off alone breaks the law, both do, and with every rule on
+                // the same seed keeps it.
+                both_ways(s)
+                    .with(Mutant::LeaseAcrossBoots)
+                    .with(Mutant::TrustTheFloorThatReads)
             }),
             "cap-compromised",
             8483,
@@ -634,7 +697,7 @@ fn each_rule_switched_off_is_caught() {
                 o
             }),
             "mirror:",
-            10,
+            12,
         ),
         (
             "a relaunched bridge republishes the mirror's pinned batch at its sequences",
@@ -694,6 +757,71 @@ fn each_rule_switched_off_is_caught() {
             "a bridge tells aterm what its quarantine holds",
             Box::new(|s| Opts::seed(s).with(Mutant::TellMovedNotHeld)),
             "quarantine:",
+            1,
+        ),
+        // SIM ITEM S7, THE DEVICE'S WRITE ERRORS: each rule a failed write
+        // needs, switched off where the committed world's disk fails
+        // ([`Opts::write_errors`], every other eight seeds).
+        (
+            "an offset below the self-lane window is not added to it",
+            Box::new(|s| Opts::seed(s).with(Mutant::RememberBelowTheWindow)),
+            "forged-self",
+            92,
+        ),
+        (
+            "the recovery a write error stopped is done before the run record",
+            Box::new(|s| Opts::seed(s).with(Mutant::BeginRunPastAFailedRecovery)),
+            "liveness",
+            47,
+        ),
+        (
+            "the mirror judges its pin once the recovery reconciled it",
+            Box::new(|s| Opts::seed(s).with(Mutant::JudgePinBeforeRecovery)),
+            "mirror",
+            31,
+        ),
+        (
+            "an own record is delivered only once its in-flight entry is gone",
+            Box::new(|s| Opts::seed(s).with(Mutant::DeliverPastAStandingEntry)),
+            "dup delivery",
+            28,
+        ),
+        (
+            "a mirror floor covers a batch only once this open made it durable",
+            Box::new(|s| Opts::seed(s).with(Mutant::TrustTheFloorThatReads)),
+            "mirror total",
+            1039,
+        ),
+        // The witness's write failing after a move, and then a later move:
+        // the world that loses power both ways.
+        (
+            "an attach delivers on a new log only once its witness is written",
+            Box::new(|s| both_ways(s).with(Mutant::AttachPastAnUnwrittenWitness)),
+            "dup delivery",
+            713,
+        ),
+        // A replayed post whose drain's try fails, and then a move: the world
+        // that loses power both ways with the disk failing in every seed.
+        (
+            "a record the attach published again is delivered once its post is retired",
+            Box::new(|s| both_ways_erring(s).with(Mutant::DeliverBeforeTheDrain)),
+            "dup delivery",
+            18017,
+        ),
+        // A clean stop made while the recovery is owed: a world where aterm
+        // quits, and the disk fails, in every seed.
+        (
+            "a run whose recovery is owed makes no clean stop",
+            Box::new(|s| erring_quitting(s).with(Mutant::CleanStopOverAnOwedRecovery)),
+            "mirror",
+            1535,
+        ),
+        // A recovery tried again after a try whose unlink failed: the world
+        // that loses power both ways with the disk failing in every seed.
+        (
+            "a recovery tried again moves each file once",
+            Box::new(|s| both_ways_erring(s).with(Mutant::CopyOnEveryTry)),
+            "quarantine copies:",
             1,
         ),
         (
@@ -760,8 +888,17 @@ fn each_rule_switched_off_is_caught() {
     // row still standing: seed 28 of the first 64 until aterm-0's review fixes
     // moved every schedule (a refused commit retried, an idle loop waiting for
     // its posts' answers), seed 66 until a later bridge of a state dir
-    // retired its predecessors' ghosts (finding F4), seed 194 since.
+    // retired its predecessors' ghosts (finding F4), seed 194 since. The
+    // self-lane window's needs a move after an `acked` write failed and the
+    // replay of the entry it kept: seed 28 of the first 64 on sim item S7's
+    // own base, 92 since main's per-open run admission (one more durable
+    // write at every bridge start) moved every schedule of an erring seed.
     const RARE: &[&str] = &[
+        "an offset below the self-lane window is not added to it",
+        "a run whose recovery is owed makes no clean stop",
+        "a record the attach published again is delivered once its post is retired",
+        "a mirror floor covers a batch only once this open made it durable",
+        "an attach delivers on a new log only once its witness is written",
         "`session-exited` publishes the session's `exited` row",
         "the incarnation lease is trusted only in the boot that wrote it",
         "the endpoint forgets the offsets a move took (the model's tap)",
@@ -822,6 +959,10 @@ fn each_rule_switched_off_is_caught() {
 /// seeds 65..=8064 at 400 steps, and 1..=400 at 1500), each a
 /// defect fixed since, kept so the fix stays one. `(seed, steps, what broke)`:
 /// the bridge, before its fix, broke these; every one now holds every law.
+/// Each was found on a disk that failed no write, and is run on one
+/// ([`on_a_clean_disk`]): sim item S7's write errors, on in every other eight
+/// seeds of the committed world, would draw another schedule for half of
+/// them, and their row would no longer replay the run that found it.
 const FOUND: &[(u64, usize, &str)] = &[
     (102, 1500, "a refused `exited` row nothing wrote again"),
     (110, 1500, "a refused `exited` row nothing wrote again"),
@@ -887,15 +1028,164 @@ const FOUND: &[(u64, usize, &str)] = &[
     (7963, 400, "a refused `exited` row nothing wrote again"),
 ];
 
-/// **THE SEEDS THAT BROKE A LAW HOLD EVERY LAW** ([`FOUND`]): a receipt
-/// journaled while the link was down that wedged every later attach; a
-/// refused post or a dropped receipt a power cut brought back and the next
-/// attach published; a refused `exited` row nothing wrote again; and the
-/// model's tap reading a commit owed on a replaced log as the offset's own.
+/// THE SEEDS THE DEVICE'S WRITE ERRORS FOUND BREAKING A LAW (sim item S7: the
+/// committed world, whose every other eight seeds fail writes, over 1..=4000
+/// at 400 steps; seeds 27, 28, 45, 47 and 63 broke a law too, and are among
+/// the committed world's own), each a defect fixed since: as [`FOUND`], but
+/// run in the committed world itself ([`Opts::seed`]), whose write errors
+/// are on for every one of these seeds.
+const FOUND_ERRING: &[(u64, usize, &str)] = &[
+    (
+        75,
+        400,
+        "a pin judged before the reconcile a write error stopped",
+    ),
+    (
+        95,
+        400,
+        "a pin judged before the reconcile a write error stopped",
+    ),
+    (
+        107,
+        400,
+        "a pin judged before the reconcile a write error stopped",
+    ),
+    (122, 400, "a deduped replay moved the self-lane window down"),
+    (
+        125,
+        400,
+        "a sweep a write error stopped, closed by the run record",
+    ),
+    (142, 400, "a deduped replay moved the self-lane window down"),
+    (154, 400, "a deduped replay moved the self-lane window down"),
+    (168, 400, "a deduped replay moved the self-lane window down"),
+    (
+        171,
+        400,
+        "a pin judged before the reconcile a write error stopped",
+    ),
+    (
+        185,
+        400,
+        "a sweep a write error stopped, closed by the run record",
+    ),
+    (
+        187,
+        400,
+        "a pin judged before the reconcile a write error stopped",
+    ),
+    (
+        191,
+        400,
+        "a pin judged before the reconcile a write error stopped",
+    ),
+    (443, 400, "a floor whose flush failed trusted as it read"),
+    (
+        746,
+        400,
+        "a record delivered while its in-flight entry stood",
+    ),
+    (
+        1240,
+        400,
+        "a record delivered while its in-flight entry stood",
+    ),
+    (
+        1530,
+        400,
+        "a record delivered while its in-flight entry stood",
+    ),
+];
+
+/// THE SEEDS A WIDER SEARCH OF THE WORLD THAT LOSES POWER BOTH WAYS FOUND
+/// BREAKING A LAW ([`both_ways`], 1..=2000 at 400 steps, and 7470 of a search
+/// of 2001..=14000 the lease's control ran), each a defect fixed since:
+/// `(seed, steps, what broke)`, as [`FOUND`].
+const FOUND_BOTH_WAYS: &[(u64, usize, &str)] = &[
+    (
+        1482,
+        400,
+        "an attach delivered on a new log whose witness it could not write",
+    ),
+    (
+        7470,
+        400,
+        "an attach delivered on a log with no witness, one a power cut tore",
+    ),
+];
+
+/// THE SEEDS THE WIDE SEARCH OF THE WORLD THAT LOSES POWER BOTH WAYS WITH THE
+/// DISK FAILING IN EVERY SEED FOUND BREAKING A LAW ([`both_ways_erring`],
+/// 1..=2000 at 400 steps), each a defect fixed since: as [`FOUND`].
+const FOUND_BOTH_WAYS_ERRING: &[(u64, usize, &str)] = &[(
+    1844,
+    400,
+    "a record the attach published again delivered while its post was queued",
+)];
+
+/// One found seed with the world it was found in: `(world, seed, steps, what
+/// broke)`.
+type FoundIn = (fn(u64) -> Opts, u64, usize, &'static str);
+
+/// THE SEEDS THE WIDE SEARCH OF THE WORLDS WHERE ATERM QUITS FOUND BREAKING A
+/// LAW ([`erring_quitting`] and [`both_ways_erring_quitting`], 1..=2000 at 400
+/// steps each), each a defect fixed since: `(world, seed, steps, what broke)`.
+const FOUND_QUITTING: &[FoundIn] = &[
+    (
+        erring_quitting,
+        863,
+        400,
+        "a clean stop over a recovery owed vouched for an unreconciled pin",
+    ),
+    (
+        both_ways_erring_quitting,
+        406,
+        400,
+        "a clean stop over a recovery owed vouched for a torn pin",
+    ),
+    (
+        both_ways_erring_quitting,
+        1682,
+        400,
+        "a clean stop over a recovery owed vouched for a torn file",
+    ),
+];
+
+/// **THE SEEDS THAT BROKE A LAW HOLD EVERY LAW** ([`FOUND`], on a clean disk,
+/// [`FOUND_ERRING`], [`FOUND_BOTH_WAYS`], [`FOUND_BOTH_WAYS_ERRING`],
+/// [`FOUND_QUITTING`]): a receipt journaled while the link was down that
+/// wedged every later attach; a refused post or a dropped receipt a power cut
+/// brought back and the next attach published; a refused `exited` row nothing
+/// wrote again; the model's tap reading a commit owed on a replaced log as the
+/// offset's own; and what the device's write errors found (sim item S7): the
+/// self-lane window moved down by a deduped replay, a sweep or a pin's
+/// reconcile a write error stopped and the run record closed, a pin judged
+/// before it was reconciled, a record delivered with its in-flight entry
+/// standing, a floor trusted as it read, and an attach that delivered on a
+/// new log whose witness it could not write.
 #[test]
 fn the_seeds_that_broke_a_law_hold_every_law() {
-    let outs = par_map(FOUND, |&(seed, steps, what)| {
-        let mut o = Opts::seed(seed);
+    let found: Vec<FoundIn> =
+        FOUND
+            .iter()
+            .map(|&(seed, steps, what)| (on_a_clean_disk as fn(u64) -> Opts, seed, steps, what))
+            .chain(
+                FOUND_ERRING
+                    .iter()
+                    .map(|&(seed, steps, what)| (Opts::seed as fn(u64) -> Opts, seed, steps, what)),
+            )
+            .chain(
+                FOUND_BOTH_WAYS
+                    .iter()
+                    .map(|&(seed, steps, what)| (both_ways as fn(u64) -> Opts, seed, steps, what)),
+            )
+            .chain(FOUND_BOTH_WAYS_ERRING.iter().map(|&(seed, steps, what)| {
+                (both_ways_erring as fn(u64) -> Opts, seed, steps, what)
+            }))
+            .chain(FOUND_QUITTING.iter().copied())
+            .collect();
+    let outs = par_map(&found, |&(world, seed, steps, what)| {
+        let mut o = world(seed);
         o.steps = steps;
         (run(&o), what)
     });
@@ -908,7 +1198,7 @@ fn the_seeds_that_broke_a_law_hold_every_law() {
         failures.is_empty(),
         "{} of {} found seeds break a law again:\n{}",
         failures.len(),
-        FOUND.len(),
+        found.len(),
         failures.join("\n")
     );
 }
@@ -991,12 +1281,12 @@ fn a_torn_state_file_after_a_power_cut_is_set_aside_and_the_attach_goes_on() {
         );
     }
     eprintln!(
-        "F1's law: {} of {SEEDS} committed seeds set {} torn files aside and broke no law",
+        "F1's law: {} of {COMMITTED_SEEDS} committed seeds set {} torn files aside and broke no law",
         torn.len(),
         torn.iter().map(|out| out.stats.set_aside).sum::<u64>()
     );
     let refusing = |s| Opts::seed(s).with(Mutant::RefuseTornAfterPowerCut);
-    let wedged = breaking_at(&refusing, "liveness", 1, CONTROL_SEEDS)
+    let wedged = breaking_at(&refusing, "liveness", 5, CONTROL_SEEDS)
         .expect("NEGATIVE CONTROL: with the old refusal, a torn file wedges some seed's attach");
     eprintln!(
         "the old refusal at seed {}: {}",
@@ -1014,7 +1304,7 @@ fn a_torn_state_file_after_a_power_cut_is_set_aside_and_the_attach_goes_on() {
         "the same seed under the old refusal with a device that never tears breaks no law"
     );
     let by_the_reader = |s| Opts::seed(s).with(Mutant::SweepByTheReaderAlone);
-    let kept = breaking_at(&by_the_reader, "liveness", 457, RARE_SEEDS).expect(
+    let kept = breaking_at(&by_the_reader, "liveness", 27, RARE_SEEDS).expect(
         "NEGATIVE CONTROL: a sweep that trusts the reader alone keeps a cut reply that wedges",
     );
     eprintln!(
@@ -1078,7 +1368,7 @@ fn a_torn_mirror_pin_after_a_power_cut_is_set_aside_and_the_mirror_resumes() {
         "and the mirror resumed: a later boot's sessions are on the bus"
     );
     eprintln!(
-        "the torn pin's law: {} of {SEEDS} committed seeds tore the pin {} times, set {} aside, \
+        "the torn pin's law: {} of {COMMITTED_SEEDS} committed seeds tore the pin {} times, set {} aside, \
          and broke no law",
         torn.len(),
         torn.iter().map(|out| out.stats.pins_torn).sum::<u64>(),
@@ -1813,6 +2103,212 @@ fn a_clean_stop_keeps_the_runs_files_exactly_under_its_record() {
     }
 }
 
+/// **A DURABLE WRITE WHOSE FLUSH FAILED AFTER ITS RENAME IS NOT TRUSTED, AND
+/// IS WRITTEN AGAIN** (sim item S7). Its new version is what every reader of
+/// the dir sees, and the media may still hold the one before it; a write
+/// skipped because the file already reads as wanted would leave it so. On the
+/// simulated device, with the directory flush of exactly one replace failing:
+///
+/// * `run`: the start's record reads as this boot's run and is not taken for
+///   one (main's per-open admission, `StateDir::begin_run`'s run fence), and
+///   the next `begin_run` writes it again — where after a record that
+///   finished it writes nothing (the control: the rewrite is the failure's);
+/// * `logfloor`: a floor raised with its flush failed covers no batch
+///   (`StateDir::logfloor_admitted`), and a raise to below it writes it again,
+///   as it stands; after that, a raise to below it writes nothing. A fresh
+///   open admits no floor it did not write — a killed predecessor's failed
+///   flush looks the same — and its first raise writes it again. And the
+///   media holds it: a power cut keeps the floor every batch was sent under.
+///   NEGATIVE CONTROL: the floor trusted as it reads
+///   (`StateDir::raise_logfloor_trusting_what_reads`) writes nothing after
+///   the failed raise, and the power cut may take it back.
+/// * `pins`: a first sight whose flush failed reads, and the route that reads
+///   it writes the table again (`StateDir::settle_pins`), once; a power cut
+///   then keeps the pin. NEGATIVE CONTROL: routed on as it reads (nothing
+///   written), some cut takes the first sight back.
+#[test]
+fn a_durable_write_whose_flush_failed_is_not_trusted_and_is_written_again() {
+    use crate::state::{StateDir, LOGFLOOR};
+    let boot = |n| crate::state::IncSeam {
+        boot: Some(Some(crate::durability::test_boot(n))),
+        off_volume: false,
+        kill_at: None,
+        mutant: 0,
+        span: None,
+    };
+    let open = |root: &std::path::Path, seed: u64| {
+        let core = super::Core::new(
+            seed,
+            bus::Broker::new(Tier::Strict, Escalation::aterm()),
+            Device::new(root),
+        );
+        let process = super::Process::new(std::sync::Arc::clone(&core), 1);
+        let st = StateDir::open_on(root, crate::fx::Disk::Sim(process))
+            .expect("the state dir on the device");
+        st.set_inc_seam(boot(1));
+        (core, st)
+    };
+    // THE RUN RECORD.
+    let dir = aterm_tempfile::Builder::new()
+        .prefix("sim-s7-run")
+        .tempdir_in("/tmp")
+        .expect("scratch");
+    let (core, st) = open(dir.path(), 1);
+    core.device.fail_after_its_rename(&dir.path().join("run"));
+    assert!(st.begin_run().is_err(), "the record's flush failed");
+    let this_boots = Some(crate::state::LastRun {
+        boot: Some(crate::durability::test_boot(1)),
+        clean: false,
+    });
+    assert_eq!(
+        st.last_run().unwrap(),
+        this_boots,
+        "it reads as this boot's"
+    );
+    assert_eq!(st.begin_run().unwrap().full, 2, "written again, durably");
+    assert_eq!(
+        st.begin_run().unwrap().full,
+        0,
+        "CONTROL: a record that finished is not written again"
+    );
+    // A refused required directory barrier, or any other failure after the
+    // rename, cannot admit a visible floor, even after an earlier success.
+    for kind in [
+        std::io::ErrorKind::PermissionDenied,
+        std::io::ErrorKind::Unsupported,
+    ] {
+        let dir = aterm_tempfile::Builder::new()
+            .prefix("sim-s7-floor-errors")
+            .tempdir_in("/tmp")
+            .expect("scratch");
+        let (_core, st) = open(dir.path(), 4);
+        for top in [100, 200] {
+            st.refuse_directory_flush(Some((dir.path(), aterm_durable::Flush::Durable, kind)));
+            assert_eq!(st.raise_logfloor(top).unwrap_err().kind(), kind);
+            assert_eq!(
+                st.logfloor().unwrap(),
+                Some(top),
+                "the renamed bytes are visible"
+            );
+            assert!(!st.logfloor_admitted(), "a refusal covers no batch");
+            st.refuse_directory_flush(None);
+            let before = st.ops().fsyncs;
+            assert_eq!(st.raise_logfloor(top - 1).unwrap(), top);
+            assert_eq!(
+                st.ops().fsyncs,
+                before + 2,
+                "retry finishes the required fence"
+            );
+            assert!(st.logfloor_admitted());
+        }
+        let mut killed = boot(1);
+        killed.kill_at = Some(crate::state::IncStep::Renamed);
+        st.set_inc_seam(killed);
+        assert!(st.raise_logfloor(300).is_err(), "post-rename kill point");
+        assert_eq!(st.logfloor().unwrap(), Some(300));
+        assert!(
+            !st.logfloor_admitted(),
+            "the kill point also revokes admission"
+        );
+        st.set_inc_seam(boot(1));
+        assert_eq!(st.raise_logfloor(250).unwrap(), 300);
+        assert!(st.logfloor_admitted(), "retry admits the visible floor");
+    }
+    // THE MIRROR'S FLOOR: a raise whose flush fails, the raise after it, and
+    // then a power cut — what the floor reads after it.
+    let floor_after = |trusting: bool, cut: u64| {
+        let dir = aterm_tempfile::Builder::new()
+            .prefix("sim-s7-floor")
+            .tempdir_in("/tmp")
+            .expect("scratch");
+        let root = dir.path();
+        let (core, st) = open(root, 2);
+        let raise = |top| {
+            if trusting {
+                st.raise_logfloor_trusting_what_reads(top)
+            } else {
+                st.raise_logfloor(top)
+            }
+        };
+        core.device.fail_after_its_rename(&root.join(LOGFLOOR));
+        assert!(raise(100).is_err(), "the floor's flush failed");
+        assert_eq!(st.logfloor().unwrap(), Some(100), "it reads as raised");
+        assert!(!st.logfloor_admitted(), "and covers no batch");
+        let before = st.ops().fsyncs;
+        assert_eq!(raise(50).unwrap(), 100, "never lowered");
+        let wrote = st.ops().fsyncs - before;
+        if trusting {
+            assert_eq!(wrote, 0, "CONTROL: the floor trusted as it reads");
+        } else {
+            assert_eq!(wrote, 2, "written again, as it stands, durably");
+            assert!(st.logfloor_admitted(), "and now it covers a batch");
+            let before = st.ops().fsyncs;
+            assert_eq!(st.raise_logfloor(60).unwrap(), 100);
+            assert_eq!(st.ops().fsyncs, before, "a floor this open made durable");
+            // A FRESH OPEN admits none it did not write.
+            let (_fresh_core, fresh) = open(root, 3);
+            assert!(!fresh.logfloor_admitted(), "a fresh open admits none");
+            let before = fresh.ops().fsyncs;
+            assert_eq!(fresh.raise_logfloor(60).unwrap(), 100);
+            assert_eq!(fresh.ops().fsyncs, before + 2, "its first raise writes it");
+        }
+        let _ = core.device.power_cut(&mut Rng::new(cut));
+        st.logfloor().unwrap()
+    };
+    for cut in 0..32 {
+        assert_eq!(
+            floor_after(false, cut),
+            Some(100),
+            "cut {cut}: the floor every batch was sent under stays"
+        );
+    }
+    assert!(
+        (0..32).any(|cut| floor_after(true, cut) != Some(100)),
+        "NEGATIVE CONTROL: trusted as it reads, some cut takes the floor back"
+    );
+    // A TOFU PIN: a first sight whose flush fails, the route's settle of the
+    // pin it reads (`Bridge::pinned_node_for`), and then a power cut.
+    let pin_after = |settle: bool, cut: u64| {
+        let dir = aterm_tempfile::Builder::new()
+            .prefix("sim-s7-pins")
+            .tempdir_in("/tmp")
+            .expect("scratch");
+        let root = dir.path();
+        let (core, st) = open(root, 4);
+        core.device.fail_after_its_rename(&root.join("pins"));
+        assert!(
+            st.pin("s-x", "n-far").is_err(),
+            "the first sight's flush failed"
+        );
+        assert_eq!(
+            st.pins().get("s-x").map(String::as_str),
+            Some("n-far"),
+            "it reads"
+        );
+        if settle {
+            let before = st.ops().fsyncs;
+            st.settle_pins().unwrap();
+            assert_eq!(st.ops().fsyncs, before + 2, "written again, durably");
+            let before = st.ops().fsyncs;
+            st.settle_pins().unwrap();
+            assert_eq!(st.ops().fsyncs, before, "and once on the media, not again");
+        }
+        let _ = core.device.power_cut(&mut Rng::new(cut));
+        st.pins().get("s-x").cloned()
+    };
+    for cut in 0..32 {
+        assert_eq!(
+            pin_after(true, cut).as_deref(),
+            Some("n-far"),
+            "cut {cut}: the pin a post was routed on stays"
+        );
+    }
+    assert!(
+        (0..32).any(|cut| pin_after(false, cut).is_none()),
+        "NEGATIVE CONTROL: routed on as it reads, some cut takes the first sight back"
+    );
+}
+
 /// A file of every kind a power cut may tear, written as a run writes it —
 /// with no flush: a reservation twice, a second in-flight entry cleared
 /// again, and the mirror's pin twice, its first write durable.
@@ -1834,7 +2330,7 @@ fn write_every_torn_kind(st: &crate::state::StateDir) {
         })
         .expect("an in-flight entry");
     }
-    st.clear_in_flight(8);
+    st.clear_in_flight(8).expect("the second entry cleared");
     st.set_post_pin("s-a", 1, &pin(7)).expect("a reservation");
     st.set_post_pin("s-a", 1, &pin(9))
         .expect("the reservation again");
@@ -1889,6 +2385,114 @@ fn both_ways(seed: u64) -> Opts {
     o.power_cuts = true;
     o.bus_losses = true;
     o
+}
+
+/// The committed world of `seed` ON A CLEAN DISK: the device fails no write
+/// ([`Opts::write_errors`] off), as in every seed before sim item S7 — the
+/// world [`FOUND`]'s seeds were found in, which they replay.
+fn on_a_clean_disk(seed: u64) -> Opts {
+    Opts {
+        write_errors: false,
+        ..Opts::seed(seed)
+    }
+}
+
+/// [`both_ways`] with the device's write errors on in every seed (sim item
+/// S7, [`Opts::write_errors`]).
+fn both_ways_erring(seed: u64) -> Opts {
+    Opts {
+        write_errors: true,
+        ..both_ways(seed)
+    }
+}
+
+/// The committed world of `seed` with the device's write errors and aterm's
+/// quits on in every seed ([`Opts::write_errors`], [`Opts::quits`]):
+/// [`every_seed_with_write_errors_holds_every_law`]'s.
+fn erring_quitting(seed: u64) -> Opts {
+    Opts {
+        write_errors: true,
+        quits: true,
+        ..Opts::seed(seed)
+    }
+}
+
+/// [`both_ways_erring`] with aterm's quits on too: the lossiest world the
+/// wide search ran.
+fn both_ways_erring_quitting(seed: u64) -> Opts {
+    Opts {
+        quits: true,
+        ..both_ways_erring(seed)
+    }
+}
+
+/// **EVERY SEED WITH WRITE ERRORS HOLDS EVERY LAW** (sim item S7): the
+/// committed world of each of [`SEEDS`] seeds with the device's write errors
+/// on in every one ([`Opts::write_errors`]) — `EIO` and `ENOSPC` on a replace's
+/// write, flush or rename, on an append, an unlink and a flush, a durable
+/// replace whose rename was made and whose directory flush failed, an append
+/// cut part-way, and the disk full for spells — and aterm quitting and coming
+/// back now and then ([`Opts::quits`]: the bridge's clean stop, its flushes
+/// and its record, and the start after it, under the same errors) breaks no
+/// law, the settle phase's clean disk healing whatever the faults held up;
+/// and the seeds together failed every kind of write the device fails, and
+/// stopped runs cleanly.
+///
+/// NO LAW IS WEAKER FOR IT. A post whose reservation or in-flight entry the
+/// disk refuses is left queued, never published unjournaled, and goes once
+/// the disk takes the write; a record of ours whose `acked` write or entry
+/// unlink failed is not delivered until both are made; an attach whose
+/// recovery, run record or new log's witness cannot be written does not go
+/// on. Each of those waits for the disk, and LIVENESS is judged on the clean
+/// disk the settle phase runs on: a bridge held up by a full disk is not a
+/// violation, one a later clean disk does not heal is.
+#[test]
+fn every_seed_with_write_errors_holds_every_law() {
+    let outs = run_all(&erring_quitting, 1..=SEEDS);
+    let failures: Vec<String> = outs
+        .iter()
+        .filter(|out| !out.violations.is_empty())
+        .map(report)
+        .collect();
+    assert!(
+        failures.is_empty(),
+        "{} of {SEEDS} seeds with write errors broke a law:\n{}",
+        failures.len(),
+        failures.join("\n")
+    );
+    let sum = |field: fn(&super::world::Stats) -> u64| -> u64 {
+        outs.iter().map(|out| field(&out.stats)).sum()
+    };
+    let counts = [
+        ("replaces and appends failed", sum(|s| s.writes_failed)),
+        ("unlinks failed", sum(|s| s.unlinks_failed)),
+        ("flushes failed", sum(|s| s.flushes_failed)),
+        (
+            "durable replaces renamed with their flush failed",
+            sum(|s| s.renamed_unflushed),
+        ),
+        ("appends cut part-way", sum(|s| s.appends_cut)),
+        ("writes a full disk refused", sum(|s| s.disk_full_refused)),
+        ("spells of a full disk", sum(|s| s.disk_full_spells)),
+        (
+            "links said down to wait for the disk",
+            sum(|s| s.held_for_the_disk),
+        ),
+        ("quits of aterm", sum(|s| s.quits)),
+        ("clean stops of a run", sum(|s| s.clean_stops)),
+        ("posts", sum(|s| s.posts)),
+        ("power cuts", sum(|s| s.power_cuts)),
+        ("generation moves", sum(|s| s.moves)),
+        ("torn state files set aside", sum(|s| s.set_aside)),
+        (
+            "in-flight entries of an earlier boot retired",
+            sum(|s| s.retired),
+        ),
+    ];
+    eprintln!("the committed world with write errors over {SEEDS} seeds: {counts:?}");
+    for &(what, n) in &counts {
+        assert!(n > 0, "the seeds exercised no {what}: {counts:?}");
+    }
 }
 
 /// **THE WORLD THAT LOSES POWER BOTH WAYS BREAKS NO LAW** ([`both_ways`]),
@@ -2026,8 +2630,9 @@ fn the_round_refines_its_exactly_once_model() {
     // after a move took it, before the bridge noticed the move — is rare: the
     // lossiest layout reaches it (below). So, since aterm-0's loop, is `Reuse`
     // — a later record at an offset a move took, before anything delivered the
-    // first: seed 248 the first of the committed world's (236 until aterm-0's
-    // review fixes moved every schedule), none of its first 64 (below).
+    // first: seed 122 the first of the committed world's since sim item S7
+    // (248 before it, 236 until aterm-0's review fixes moved every schedule),
+    // none of its first 64 (below).
     for action in model.actions.iter().map(|a| a.name) {
         if matches!(action, "CommitEarly" | "DeliverTaken" | "Reuse") {
             continue;
@@ -2055,7 +2660,7 @@ fn the_round_refines_its_exactly_once_model() {
     .expect("some run delivered a record a move took");
     assert!(taken.violations.is_empty(), "{}", report(&taken));
     // `Reuse`, in the committed world itself, past its first 64 seeds (above).
-    let reused = witnessed(&Opts::seed, 248, RARE_SEEDS, &|out| {
+    let reused = witnessed(&Opts::seed, 122, RARE_SEEDS, &|out| {
         out.model.2.contains("Reuse")
     })
     .expect("some committed run put a later record at an offset a move took");

@@ -806,6 +806,21 @@ pub fn took_up_earlier(body: &str, sid: &str) -> bool {
         .any(|l| l.contains(&field) && l.contains(&rule))
 }
 
+/// THE TIME OF THE NEWEST ROW in the ledger text `body` (unix ms, each row's
+/// leading `{"ts":`): what tells an agent process a loop before this one
+/// watched from one started since its last row (`IdleHost::launch` past it,
+/// P3 of `docs/measured/forever-lab-2026-10-20.md`). `None` with no row.
+#[must_use]
+pub fn last_row_ms(body: &str) -> Option<i64> {
+    body.lines()
+        .filter_map(|l| {
+            let rest = l.trim_start().strip_prefix("{\"ts\":")?;
+            let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+            digits.parse().ok()
+        })
+        .max()
+}
+
 /// THE BOOKS OF SESSION `sid` THROUGH THE TABS A COLD RESTORE REOPENED ITS
 /// TAB FROM (ATERM-KI-1016-1, follow-7), as one ledger (or one journal): the
 /// rows each earlier tab's loops wrote of that tab's own session
@@ -3927,6 +3942,19 @@ fn cut(s: &str, n: usize) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    /// [`super::last_row_ms`]: the newest of the rows' leading times, in any
+    /// order, other lines passed over; none with no row.
+    #[test]
+    fn the_newest_rows_time_is_the_books_last() {
+        let body = "{\"ts\":1792594893546,\"sid\":null}\n\
+                    {\"ts\":1792594893533,\"sid\":null}\n\
+                    \n\
+                    not a row\n";
+        assert_eq!(super::last_row_ms(body), Some(1_792_594_893_546));
+        assert_eq!(super::last_row_ms(""), None);
+        assert_eq!(super::last_row_ms("{\"t\":5}\n"), None, "a journal line");
+    }
 
     /// AN ACT'S ROW COUNTS ITS SLEEP ON A BOOT IN THE KERNEL'S SPELLING
     /// ([`BOOT`]: hyphenated, upper-case as macOS spells it, lower-case as

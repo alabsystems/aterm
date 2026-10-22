@@ -22,11 +22,12 @@
 
 /// Days since 1970-01-01 → proleptic-Gregorian `(year, month, day)` —
 /// Howard Hinnant's `civil_from_days`. Pure and total for every `i64` day.
+#[inline]
 #[must_use]
-pub fn civil_from_days(days: i64) -> (i64, i64, i64) {
+pub const fn civil_from_days(days: i64) -> (i64, i64, i64) {
     // Shift the epoch from 1970-01-01 to 0000-03-01 so leap days land at the
     // end of each 400-year era.
-    let z = i128::from(days) + 719_468;
+    let z = days as i128 + 719_468;
     let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
     let doe = z - era * 146_097; // day-of-era      [0, 146096]
     let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365; // [0, 399]
@@ -34,7 +35,7 @@ pub fn civil_from_days(days: i64) -> (i64, i64, i64) {
     let mp = (5 * doy + 2) / 153; // month, shifted so Mar = 0  [0, 11]
     let d = doy - (153 * mp + 2) / 5 + 1; // day-of-month  [1, 31]
     let m = if mp < 10 { mp + 3 } else { mp - 9 }; // month  [1, 12]
-    let y = yoe + era * 400 + i128::from(m <= 2); // Jan/Feb belong to the next year
+    let y = yoe + era * 400 + (m <= 2) as i128; // Jan/Feb belong to the next year
     // An i64 day spans fewer than 2^55 years; the canonical month and day
     // are bounded above. All three values therefore fit i64 exactly.
     (y as i64, m as i64, d as i64)
@@ -45,9 +46,10 @@ pub fn civil_from_days(days: i64) -> (i64, i64, i64) {
 /// Field validation is the caller's policy: out-of-range months/days
 /// extrapolate arithmetically instead of erroring. Results beyond the `i64`
 /// day range saturate, so arbitrary `i64` fields remain total.
+#[inline]
 #[must_use]
-pub fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
-    let (y, m, d) = (i128::from(y), i128::from(m), i128::from(d));
+pub const fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+    let (y, m, d) = (y as i128, m as i128, d as i128);
     let y = if m <= 2 { y - 1 } else { y };
     let era = if y >= 0 { y } else { y - 399 } / 400;
     let yoe = y - era * 400; // [0, 399]
@@ -55,7 +57,13 @@ pub fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
     let doy = (153 * mp + 2) / 5 + d - 1; // day-of-year (Mar 1 = 0)
     let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy; // day-of-era
     let days = era * 146_097 + doe - 719_468;
-    days.clamp(i128::from(i64::MIN), i128::from(i64::MAX)) as i64
+    if days < i64::MIN as i128 {
+        i64::MIN
+    } else if days > i64::MAX as i128 {
+        i64::MAX
+    } else {
+        days as i64
+    }
 }
 
 /// Format seconds-since-Unix-epoch as an RFC3339 UTC instant
@@ -99,6 +107,7 @@ pub fn format_rfc3339(secs: u64) -> String {
 /// normalized arithmetically, without validating a month's length or the
 /// leap-second schedule. Inverts [`format_rfc3339`] from the epoch through
 /// `9999-12-31T23:59:59Z`; larger formatted years are refused.
+#[inline]
 #[must_use]
 pub fn parse_utc(s: &str) -> Option<i64> {
     let b = s.as_bytes();
@@ -113,6 +122,7 @@ pub fn parse_utc(s: &str) -> Option<i64> {
 /// whole second. Offsets, a missing `Z` and trailing bytes are refused exactly
 /// as [`parse_utc`] refuses them. Only for a record whose writer stamps a
 /// fraction; every other reader wants [`parse_utc`].
+#[inline]
 #[must_use]
 pub fn parse_utc_fractional(s: &str) -> Option<i64> {
     let b = s.as_bytes();
@@ -135,6 +145,7 @@ pub fn parse_utc_fractional(s: &str) -> Option<i64> {
 
 /// The `YYYY-MM-DDTHH:MM:SS` head both parsers share: separators at their
 /// fixed offsets, ASCII digits in every field, every field in range.
+#[inline]
 fn parse_fields(b: &[u8]) -> Option<i64> {
     if b.len() < 19
         || b[4] != b'-'
@@ -165,6 +176,7 @@ fn parse_fields(b: &[u8]) -> Option<i64> {
 
 /// Append `v` in decimal, zero-padded to at least `width` digits —
 /// byte-identical to `format!("{v:0width$}")` for unsigned values.
+#[inline]
 fn push_padded(out: &mut String, v: u64, width: usize) {
     let digits = v.to_string();
     for _ in digits.len()..width {

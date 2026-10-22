@@ -37,6 +37,7 @@ pub(crate) const MAX_SCROLLBACK_LINE_SCAN_BYTES: usize = 1024 * 1024;
 /// A stored line's full text (all columns, no trim) bounded to `max_scan_bytes`: a
 /// [`Line::to_string`](aterm_scrollback::Line) an oversized line cannot blow up. Borrows
 /// valid UTF-8 under the ceiling; lossy-converts only a bounded prefix otherwise.
+#[inline]
 pub(crate) fn line_text_bounded(bytes: &[u8], max_scan_bytes: usize) -> Cow<'_, str> {
     let scan = if bytes.len() <= max_scan_bytes {
         bytes
@@ -90,6 +91,7 @@ fn scrollback_line_range_text(
 /// `true` if the row was clamped (only a char-boundary-safe prefix was pushed).
 /// Makes [`MAX_SELECTION_BYTES`] a hard cap even for one oversized row (up to
 /// `MAX_GRID_COLS` * `MAX_GRAPHEME_UNIT_BYTES`, ~1 MiB).
+#[inline]
 fn push_row_capped(result: &mut String, row_text: &str, max_bytes: usize) -> bool {
     if result.len().saturating_add(row_text.len()) <= max_bytes {
         result.push_str(row_text);
@@ -145,6 +147,7 @@ struct SelectionRow<'a> {
 /// [`LineCells::columns_of`]), never a walk of the text, which does not know the cells the
 /// grid kept apart or narrow (two flag halves drawn out of order, a VS16 base in the last
 /// column).
+#[inline]
 #[must_use]
 pub fn smart_word_in_cells(
     smart: &SmartSelection,
@@ -162,6 +165,7 @@ impl Terminal {
     /// separate rows with newlines. Bounded by [`MAX_SELECTION_ROWS`] /
     /// [`MAX_SELECTION_BYTES`], dropping clipped content silently; see
     /// [`Self::selection_to_string_bounded`].
+    #[inline]
     #[must_use]
     pub fn selection_to_string(&self) -> Option<String> {
         self.selection_to_string_bounded().0
@@ -170,6 +174,7 @@ impl Terminal {
     /// [`Self::selection_to_string`] and whether selected content is missing from either
     /// end (the copy caps drop the tail; a scrollback eviction that clamped the head drops
     /// the front), so callers can report it as search reports `incomplete`.
+    #[inline]
     #[must_use]
     pub fn selection_to_string_bounded(&self) -> (Option<String>, bool) {
         self.selection_to_string_capped(MAX_SELECTION_ROWS, MAX_SELECTION_BYTES)
@@ -384,6 +389,7 @@ impl Terminal {
 
     /// Read selection-space `row` for [`Self::push_linear_selection`]: its stored line when
     /// history (fetched once, here) and whether it continues the row above.
+    #[inline]
     fn selection_row(&self, row: i32) -> SelectionRow<'_> {
         let history = if row < 0 {
             usize::try_from(-(i64::from(row)) - 1)
@@ -427,6 +433,7 @@ impl Terminal {
 
     /// Whether selection-space `row` continues the previous row (soft wrap);
     /// the self-resolving form of [`Self::continuation_bit`].
+    #[inline]
     #[must_use]
     pub fn row_continues_previous(&self, row: i32) -> bool {
         self.continuation_bit(row, None)
@@ -489,6 +496,7 @@ impl Terminal {
     /// A stored line can hold text past the grid's width that no cell draws (restored from
     /// a checkpoint written wider); cutting it keeps a double-click's window, scanned
     /// under the terminal mutex, as long as the rows it spans.
+    #[inline]
     pub(crate) fn drawn_line_cells(&self, row: i32) -> Option<(String, LineCells)> {
         let (mut text, cells) = self.written_line_cells(row)?;
         let end = cells.end_byte();
@@ -502,6 +510,7 @@ impl Terminal {
     /// terminal-relative and scroll-invariant: `0..rows` are the live screen rows,
     /// negative rows are scrollback (`-1` = newest). `col_range` is inclusive; `None` is
     /// the whole line.
+    #[inline]
     pub fn get_line_text(&self, row: i32, col_range: Option<(u16, u16)>) -> Option<String> {
         self.line_text(row, col_range, TrailingBlanks::Trim)
     }
@@ -511,6 +520,7 @@ impl Terminal {
     /// own, for a reader that builds one reply or hash from many rows. What `out` held is
     /// kept; the trailing-blank trim reads only the appended text. `false`, with nothing
     /// appended, when `row` is not a screen row.
+    #[inline]
     pub fn push_line_text(&self, row: usize, out: &mut String) -> bool {
         let Ok(row) = u16::try_from(row) else {
             return false;
@@ -529,6 +539,7 @@ impl Terminal {
     /// [`MAX_SCROLLBACK_LINE_SCAN_BYTES`]). One extractor for both, so what search indexes
     /// does not change when output scrolls the row off. `None` when `row` addresses no
     /// line.
+    #[inline]
     #[must_use]
     pub fn written_line_text(&self, row: i32) -> Option<String> {
         if row < 0 {
@@ -579,6 +590,7 @@ impl Terminal {
 impl Terminal {
     /// The text in columns `start_col..=end_col` of a history row whose stored line is
     /// `line`, read from the cells the row is drawn in.
+    #[inline]
     fn history_range_text(
         &self,
         line: &aterm_scrollback::Line,

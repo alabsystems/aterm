@@ -58,6 +58,7 @@ pub const EMPTY_SELECTOR: &str = "ERR usage: empty or malformed selector: an @ n
 /// Whether a selector's body (what follows its `@`) names something: it is not
 /// empty and holds no whitespace or control character. One rule for both ends
 /// ([`EMPTY_SELECTOR`]).
+#[inline]
 #[must_use]
 pub fn selector_body_names_something(body: &str) -> bool {
     !body.is_empty() && !body.chars().any(|c| c.is_whitespace() || c.is_control())
@@ -278,12 +279,14 @@ impl Input {
     pub const CAUSE: Self = Self(1 << 12);
 
     /// These flags and `other`'s.
+    #[inline]
     #[must_use]
     pub const fn with(self, other: Self) -> Self {
         Self(self.0 | other.0)
     }
 
     /// Whether every flag of `flags` is set.
+    #[inline]
     #[must_use]
     pub const fn contains(self, flags: Self) -> bool {
         self.0 & flags.0 == flags.0
@@ -292,6 +295,7 @@ impl Input {
 
 impl OpClass {
     /// The machine-readable name `help --json` prints.
+    #[inline]
     #[must_use]
     pub const fn wire_name(self) -> &'static str {
         match self {
@@ -307,6 +311,7 @@ impl OpClass {
 
 impl Access {
     /// The machine-readable name `help --json` prints.
+    #[inline]
     #[must_use]
     pub const fn wire_name(self) -> &'static str {
         match self {
@@ -320,6 +325,7 @@ impl Access {
 
 impl Framing {
     /// The machine-readable name `help --json` prints.
+    #[inline]
     #[must_use]
     pub const fn wire_name(self) -> &'static str {
         match self {
@@ -333,6 +339,7 @@ impl Framing {
 
 impl Target {
     /// The machine-readable name `help --json` prints.
+    #[inline]
     #[must_use]
     pub const fn wire_name(self) -> &'static str {
         match self {
@@ -399,6 +406,7 @@ pub struct VerbSpec {
 
 impl VerbSpec {
     /// The row's [`Input`] class: what it declares, else [`Input::NONE`].
+    #[inline]
     #[must_use]
     pub const fn input_class(&self) -> Input {
         match self.input {
@@ -510,6 +518,7 @@ macro_rules! aux_targets {
             /// Parse a verb's target keyword or alias, case-insensitively;
             /// the empty word is the front window. `None` for any other word,
             /// so the verb refuses it naming the targets.
+            #[inline]
             #[must_use]
             pub fn parse(s: &str) -> Option<Self> {
                 match s.trim().to_ascii_lowercase().as_str() {
@@ -523,6 +532,7 @@ macro_rules! aux_targets {
 
             /// The target's keyword (for replies, refusals and default
             /// capture file names).
+            #[inline]
             #[must_use]
             pub const fn keyword(self) -> &'static str {
                 match self {
@@ -534,6 +544,7 @@ macro_rules! aux_targets {
             }
 
             /// Whether `open <target> [close]` opens (and closes) it.
+            #[inline]
             #[must_use]
             pub const fn opens(self) -> bool {
                 matches!(self, Self::$o0 $(| Self::$o)*)
@@ -602,8 +613,11 @@ aux_targets! {
         /// The Overview (`docs/DESIGN-owner-surfaces-2026-10-16.md` §6, was
         /// the Connection Map); `open overview` raises it on the front window,
         /// `controls overview` reads the open card's groups, chips and manages
-        /// lines, and every wire read of it is Owner-gated. `connections`, the
-        /// map's keyword, still names it.
+        /// lines (where this aterm's fabric is on, its "On the fabric" group
+        /// too: `overview fabric chip node= sid= need= age= mark= older=`
+        /// lines, read off the fabric's log and never acted on), and every
+        /// wire read of it is Owner-gated. `connections`, the map's keyword,
+        /// still names it.
         Overview = "overview" | "connections",
         /// The native Settings `/updates` route, projected from its compiled
         /// semantic frame while that route is open.
@@ -783,7 +797,7 @@ const fn bytes_eq(a: &[u8], b: &[u8], len: usize) -> bool {
 /// The bound is on the SHAPE (one row per verb, first sentence only, capped at
 /// `summary_max_chars!()`, 96), so a new verb raises it by about its own row; never reword
 /// unrelated verbs' help to make room. Checked at compile time with the summary cap.
-pub const SHORT_CATALOG_MAX_BYTES: usize = 13753;
+pub const SHORT_CATALOG_MAX_BYTES: usize = 13874;
 
 /// The `subscribe` stream vocabulary: frame sources, then the two modifiers. The catalog row,
 /// the `ERR usage` refusal, `Requested::parse`'s fold table and the installed drive skill
@@ -1340,10 +1354,17 @@ pub const VERBS: &[VerbSpec] = &[
          recorded, {\"why\":\"<word>\"} for every other word, null for none, before \
          trimmed and first, which come last but for \
          `order=display`'s \"order\" and \"display_map\", and, beside a null \
-         human_ms only, \"unkeyed_ms\":<ms>, which end the object (how long the host has \
+         human_ms only, \"unkeyed_ms\":<ms> (how long the host has \
          served the session with no person's input, a seamless update's carried time \
          included; an adopted shell nothing was carried for counts from the successor's \
-         Commit)",
+         Commit); \"submits\":<n> ends the object: how many Enters this instance has \
+         written to the session's program over something typed since the Enter before \
+         (a plain Enter key, keypad Enter, or a CR in raw bytes, after any key that is no \
+         plain Enter, text, a paste or a raw byte), whoever typed them — a person at the \
+         window, a `send`/`key`/`paste`/`feed`/`turn` — counted as the sink accepts the \
+         write and read after the rows, so rows that show a submission's answer come with a \
+         count that holds it; an Enter over nothing typed since the last is none, and a \
+         session carried across a seamless update starts again at 0",
     )
     .json(Json::Emits),
     v(
@@ -1468,8 +1489,10 @@ pub const VERBS: &[VerbSpec] = &[
         Read,
         Status,
         Session,
-        "cell <r> <c>: OK <grapheme%enc> <fg> <bg> <attrs>[ link=]",
-        "",
+        "cell <r> <c>|abs=<n> <c>: OK <grapheme%enc> <fg> <bg> <attrs>[ link=]",
+        "`abs=<n>` reads absolute row n (`line`'s and `search`'s coordinates): a history \
+         row's cell as it is drawn, whatever the viewport shows, with no link=, or a live row's; \
+         ERR evicted for a row older than retained history, ERR out of range past the screen",
     )
     .json(Json::Refused),
     v(
@@ -2113,6 +2136,40 @@ pub const VERBS: &[VerbSpec] = &[
     )
     // Chrome only: the debug pin re-arms cards, never writes a PTY.
     .input(Input::NONE),
+    // Aos hosted execution of the front window's momentum glow (`aterm-gui`'s
+    // `aos_verb`, `docs/DESIGN-aos-hosted-execution-2026-10-21.md` §5), debug builds
+    // only. `Write` for every form but the two reads: each changes which code runs
+    // the glow, what it records, or whether its inputs are delivered or queued.
+    v(
+        "aos",
+        Write,
+        Status,
+        App,
+        "aos [status|attach|pause|repair|resume|detach|trace]: host the momentum glow (debug builds)",
+        "Acts on the front window's typing-momentum glow as an Aos task. `aos status` (and \
+         bare `aos`) answers one `OK window=<id> attached=<bool> code=<name> ...` line: the \
+         code running the glow, its revision, the pause and its queue, the log and its \
+         cursor, hot/active/settling, `cold_at=` and the last wake as signed ns from the \
+         recording epoch, and the boundary's counters. `aos attach [code=<name>]` (`shipped`, \
+         the default, or `demo-stranded-settle`, an intentionally introduced demonstration \
+         fault that names no settle wake) checkpoints the glow and records every key, frame \
+         and scheduler query from then on. `aos pause` stops it at this step boundary: keys \
+         queue, frames show the held overlay. `aos repair [code=<name>]` (default `shipped`) \
+         pauses first if running, replays the live code and the candidate from the \
+         checkpoint over the recorded trace, and publishes code and replayed state as one \
+         value with a new revision only when the live replay reproduced the paused head and \
+         the candidate passes the contract `momentum-glow.no-stranded-light`; it answers both \
+         verdicts and the witness's grade (`tested`: shadow replay over one trace, not a \
+         proof), and a refused repair it paused for resumes the old code. `aos resume` \
+         rejects the pending update (each queued key goes once to the old code). \
+         `aos detach` stops hosting. `aos trace` answers the exported trace's log length, \
+         trace digest, checkpoint digest and broken flag. Every form needs a debug build \
+         and is refused otherwise.",
+    )
+    .forms(&[form(AnyOf(&["status", "trace"])).op(Read)])
+    // Outside the halt: the glow is an overlay on the front window's caret, so no form
+    // ever writes a byte to a PTY or input to a session.
+    .input(Input::NONE),
 
     // The harness's login notices (`aterm-gui`'s `login_notice_verb`): listed,
     // and (development builds only) raised for the front tab through the
@@ -2286,7 +2343,11 @@ pub const VERBS: &[VerbSpec] = &[
          inert, so the rows after it keep their frame rows. `controls fact-menu` reads a \
          fact's menu the same way (`fact-menu open=true session=<sid> fact=<fact>`, rows \
          keyed `fact-menu/<fact>/<act>`). `controls overview` is \
-         Owner-escalated; the rest answer at any scope. Off macOS `front` \
+         Owner-escalated; where this aterm's fabric is on it lists the \
+         \"On the fabric\" group's remote needs as `overview fabric chip node=<id> sid=<sid> \
+         need=<word> age=<s|-> mark=<decide|stuck> older=<0|1> selected=<bool>` lines, read off \
+         the fabric's log and never acted on, its header ending `fabric=<n> \
+         fabric_error=<run|refused|no-brief|->`. The rest answer at any scope. Off macOS `front` \
          ends with `confirm open=<true|false>`: a close or quit waiting on an answer in the \
          window, `by=` who asked. When a control client asked, `answer=\"confirm yes\"` goes \
          ahead and `cancel=\"confirm no\"` keeps it; when a person asked, both are `-` and \
@@ -6502,6 +6563,7 @@ pub fn json_verbs() -> impl Iterator<Item = &'static str> {
 /// it, regardless of op-class. The dispatch reads THIS (not a hardcoded verb list),
 /// so classifying a verb `OwnerOnly` in the table is what gates it. Unknown verbs
 /// are not owner-only (they fall through to `ERR unknown verb`).
+#[inline]
 #[must_use]
 pub fn is_owner_only(verb: &str) -> bool {
     spec(verb).is_some_and(|s| matches!(s.access, Access::OwnerOnly))
@@ -6509,6 +6571,7 @@ pub fn is_owner_only(verb: &str) -> bool {
 
 /// Whether `verb` is answered for any authenticated scope before target resolution
 /// ([`Access::AnyScopeMeta`]).
+#[inline]
 #[must_use]
 pub fn is_any_scope_meta(verb: &str) -> bool {
     spec(verb).is_some_and(|s| matches!(s.access, Access::AnyScopeMeta))
@@ -6559,6 +6622,7 @@ pub const LINK_QUARANTINE_LANE: u32 = 5;
 
 /// Whether `verb` is bridge-only per the table: no token unlocks it, Owner included. The
 /// dispatch reads this; unknown verbs are not bridge-only (`ERR unknown verb`).
+#[inline]
 #[must_use]
 pub fn is_bridge_only(verb: &str) -> bool {
     spec(verb).is_some_and(|s| matches!(s.access, Access::BridgeOnly))
@@ -6734,6 +6798,7 @@ impl core::fmt::Display for RowsFence {
 
 /// Whether `nonce` is the 32-hex-digit (either case) nonce of a guarded artifact
 /// acknowledgement.
+#[inline]
 #[must_use]
 pub fn valid_artifact_ack_nonce(nonce: &str) -> bool {
     nonce.len() == 32 && nonce.bytes().all(|byte| byte.is_ascii_hexdigit())
@@ -6743,6 +6808,7 @@ pub fn valid_artifact_ack_nonce(nonce: &str) -> bool {
 /// retention: [`spec_for`]'s acknowledgement for the text after the verb, so the
 /// shipping client and the server share one classification. The full `request`
 /// line is read like [`framing_of`]'s. An `ERR` never needs the acknowledgement.
+#[inline]
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn artifact_reply_requires_ack(verb: &str, request: &str) -> bool {
@@ -6754,6 +6820,7 @@ pub fn artifact_reply_requires_ack(verb: &str, request: &str) -> bool {
 /// get`) and a `--json` on a JSON-emitting verb frame as the table says. The line is
 /// read by the request grammar the server reads it by ([`head`]), so a leading
 /// `@<selector>` is skipped. Unknown verbs are `Status`.
+#[inline]
 #[must_use]
 // Skip: iterator absent std bodies.
 #[cfg_attr(trust_verify, trust::skip)]

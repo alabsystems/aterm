@@ -2287,9 +2287,9 @@ impl EffectsPipeline {
 #[path = "pipeline_native.rs"]
 mod native;
 pub use native::{
-    CanvasInk, CursorStep, CursorStepOut, Delivery, Flanks, NovaInto, PaneDrain, PaneGrid,
-    RowProbe, ScrollChange, StreakEcho, StreakGrid, StreakKnobs, StreakPane, TornBand, WordGrid,
-    WordGridOut, WordPane, WordPanes, WordPanesOut, WordRescan,
+    CanvasInk, CursorStep, CursorStepOut, Delivery, Flanks, FlyingSeat, NovaInto, PaneDrain,
+    PaneGrid, RowProbe, ScrollChange, StreakEcho, StreakGrid, StreakKnobs, StreakPane, TornBand,
+    WordGrid, WordGridOut, WordPane, WordPanes, WordPanesOut, WordRescan,
 };
 
 #[cfg(test)]

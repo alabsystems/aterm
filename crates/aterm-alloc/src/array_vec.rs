@@ -22,6 +22,7 @@ pub struct ArrayVec<T, const N: usize> {
 
 impl<T, const N: usize> ArrayVec<T, N> {
     /// Create a new, empty `ArrayVec`.
+    #[inline]
     #[must_use]
     pub const fn new() -> Self {
         Self {
@@ -33,30 +34,35 @@ impl<T, const N: usize> ArrayVec<T, N> {
     }
 
     /// Const-compatible alias for `new`.
+    #[inline]
     #[must_use]
     pub const fn new_const() -> Self {
         Self::new()
     }
 
     /// The number of elements.
+    #[inline]
     #[must_use]
     pub const fn len(&self) -> usize {
         self.len
     }
 
     /// Whether the collection is empty.
+    #[inline]
     #[must_use]
     pub const fn is_empty(&self) -> bool {
         self.len == 0
     }
 
     /// The fixed capacity `N`.
+    #[inline]
     #[must_use]
     pub const fn capacity(&self) -> usize {
         N
     }
 
     /// Remaining capacity before full.
+    #[inline]
     #[must_use]
     pub const fn remaining_capacity(&self) -> usize {
         // `len <= N` by invariant; `saturating_sub` makes the no-underflow obligation
@@ -65,6 +71,7 @@ impl<T, const N: usize> ArrayVec<T, N> {
     }
 
     /// Whether the collection is at full capacity.
+    #[inline]
     #[must_use]
     pub const fn is_full(&self) -> bool {
         self.len == N
@@ -85,6 +92,7 @@ impl<T, const N: usize> ArrayVec<T, N> {
     // `#[track_caller]` so a capacity panic names the caller's line (as
     // upstream `arrayvec` does); the shim inherits it through the re-export,
     // so an overflow in the patched graph points at the real caller.
+    #[inline]
     #[track_caller]
     pub fn push(&mut self, value: T) {
         // Guard on a local copy of `len`: the open-model verifier reloads
@@ -110,6 +118,7 @@ impl<T, const N: usize> ArrayVec<T, N> {
     ///
     /// Returns the element back inside a [`CapacityError`] when `len == N`
     /// (upstream `arrayvec`'s signature).
+    #[inline]
     pub fn try_push(&mut self, value: T) -> Result<(), CapacityError<T>> {
         // Same local-copy idiom as `push`.
         let len = self.len;
@@ -129,6 +138,7 @@ impl<T, const N: usize> ArrayVec<T, N> {
     // `len` counts exactly the initialized prefix; `push`/`try_push` increment
     // `len` only after initializing `buf[len]`, and `pop` decrements before
     // reading.
+    #[inline]
     #[cfg_attr(trust_verify, trust::skip)]
     pub fn pop(&mut self) -> Option<T> {
         // Same local-copy idiom as `push`; `wrapping_sub` is exact under the
@@ -174,6 +184,7 @@ impl<T, const N: usize> ArrayVec<T, N> {
 
     /// Clear all elements.
     // Skip: `truncate(0)` is in the same init-tracking class as `pop`.
+    #[inline]
     #[cfg_attr(trust_verify, trust::skip)]
     pub fn clear(&mut self) {
         self.truncate(0);
@@ -204,6 +215,7 @@ impl<T, const N: usize> ArrayVec<T, N> {
     }
 
     /// View as a slice.
+    #[inline]
     #[must_use]
     // Skip: the raw-parts reconstruction is in the same init/provenance class
     // as `pop`/`clear`/`truncate`.
@@ -221,6 +233,7 @@ impl<T, const N: usize> ArrayVec<T, N> {
 
     /// View as a mutable slice.
     // Skip: same class as `as_slice` above.
+    #[inline]
     #[cfg_attr(trust_verify, trust::skip)]
     pub fn as_mut_slice(&mut self) -> &mut [T] {
         // Clamp to a provably in-bounds length and take the initialized
@@ -234,11 +247,13 @@ impl<T, const N: usize> ArrayVec<T, N> {
     }
 
     /// An iterator over references.
+    #[inline]
     pub fn iter(&self) -> core::slice::Iter<'_, T> {
         self.as_slice().iter()
     }
 
     /// An iterator over mutable references.
+    #[inline]
     pub fn iter_mut(&mut self) -> core::slice::IterMut<'_, T> {
         self.as_mut_slice().iter_mut()
     }
@@ -501,6 +516,7 @@ impl<T, const N: usize> ArrayVec<T, N> {
 // ── Trait impls ─────────────────────────────────────────────────────────────
 
 impl<T, const N: usize> Default for ArrayVec<T, N> {
+    #[inline]
     fn default() -> Self {
         Self::new()
     }
@@ -509,12 +525,14 @@ impl<T, const N: usize> Default for ArrayVec<T, N> {
 impl<T, const N: usize> Deref for ArrayVec<T, N> {
     type Target = [T];
 
+    #[inline]
     fn deref(&self) -> &[T] {
         self.as_slice()
     }
 }
 
 impl<T, const N: usize> DerefMut for ArrayVec<T, N> {
+    #[inline]
     fn deref_mut(&mut self) -> &mut [T] {
         self.as_mut_slice()
     }
@@ -599,18 +617,21 @@ pub struct CapacityError<T = ()> {
 
 impl<T> CapacityError<T> {
     /// Wrap the element that did not fit.
+    #[inline]
     #[must_use]
     pub const fn new(element: T) -> Self {
         Self { element }
     }
 
     /// Take the element back out.
+    #[inline]
     #[must_use]
     pub fn element(self) -> T {
         self.element
     }
 
     /// Drop the payload, keeping only the "it did not fit" fact.
+    #[inline]
     #[must_use]
     pub fn simplify(self) -> CapacityError {
         CapacityError { element: () }

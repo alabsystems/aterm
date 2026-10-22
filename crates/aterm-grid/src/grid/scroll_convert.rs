@@ -186,6 +186,7 @@ pub(crate) struct DeferredLine {
 impl DeferredLine {
     /// Snapshot `row`'s cells into `scratch`, a recycled body from the
     /// [`CellPool`] (or `Vec::new()`).
+    #[inline]
     pub(crate) fn new(row: &Row, extras: ScrolledRowExtras, scratch: Vec<Cell>) -> Self {
         Self::new_boxed(row, (!extras.is_empty()).then(|| Box::new(extras)), scratch)
     }
@@ -193,6 +194,7 @@ impl DeferredLine {
     /// [`new`](Self::new) for a caller that already owns the extras in a `Box`
     /// (scroll-off popping `ring_extras`): no unbox/re-box per line under
     /// `term_lock`.
+    #[inline]
     pub(crate) fn new_boxed(
         row: &Row,
         extras: Option<Box<ScrolledRowExtras>>,
@@ -218,6 +220,7 @@ impl DeferredLine {
     }
 
     /// The materialized [`Line`], converted on first call and cached.
+    #[inline]
     pub(crate) fn to_line(&self) -> &Line {
         self.cached.get_or_init(|| self.materialize())
     }
@@ -225,6 +228,7 @@ impl DeferredLine {
     /// Estimated heap bytes owned by this line (not `size_of::<DeferredLine>()`,
     /// which the container counts): the cell body, everything the extras retain
     /// and the materialized line once read.
+    #[inline]
     pub(crate) fn heap_memory_used(&self) -> usize {
         let mut total = self
             .cells
@@ -243,6 +247,7 @@ impl DeferredLine {
     /// [`strip_hyperlinks`](Self::strip_hyperlinks), which the buffer re-weighs.
     /// The `cached` line is excluded: it changes under `&self`, so it could not
     /// be kept as a running sum.
+    #[inline]
     pub(crate) fn staged_bytes(&self) -> usize {
         std::mem::size_of::<Self>()
             .saturating_add(
@@ -254,6 +259,7 @@ impl DeferredLine {
     }
 
     /// Everything the extras retain, boxed struct included.
+    #[inline]
     fn extras_bytes(&self) -> usize {
         self.extras
             .as_deref()
@@ -261,6 +267,7 @@ impl DeferredLine {
     }
 
     /// The OSC 8 payload this line holds (`ScrolledRowExtras::link_bytes`).
+    #[inline]
     pub(crate) fn link_bytes(&self) -> usize {
         self.extras
             .as_deref()
@@ -296,6 +303,7 @@ impl DeferredLine {
 
     /// Convert into an owned [`Line`], returning the cell body to `pool` for the
     /// next scroll-off instead of freeing it.
+    #[inline]
     pub(crate) fn into_line_recycled(self, pool: &mut CellPool) -> Line {
         let (line, body) = self.into_line_and_body();
         pool.put(body);
@@ -499,11 +507,13 @@ struct FloodCut {
 
 impl FloodCut {
     /// The marker line for the current count.
+    #[inline]
     fn line(&self) -> &Line {
         self.line.get_or_init(|| flood_marker_line(self.dropped))
     }
 
     /// The marker line, owned — for a drain that promotes the cut into the store.
+    #[inline]
     fn into_line(self) -> Line {
         let dropped = self.dropped;
         self.line
@@ -514,6 +524,7 @@ impl FloodCut {
     /// Make the marker name `dropped` lines (any built marker line is then
     /// stale). Returns how far that raised the cut's peak: the lines to add to
     /// the grid's loss counter.
+    #[inline]
     fn set(&mut self, dropped: u64) -> u64 {
         if dropped != self.dropped {
             self.dropped = dropped;
@@ -616,12 +627,14 @@ impl CellPool {
     }
 
     /// Drop every pooled body and the free-list's own allocation.
+    #[inline]
     fn clear(&mut self) {
         self.bufs = Vec::new();
         self.pooled_cells = 0;
     }
 
     /// Heap bytes held by the free-list (bodies + the `Vec<Vec<Cell>>` spine).
+    #[inline]
     fn memory_used(&self) -> usize {
         self.bufs
             .capacity()
@@ -672,8 +685,11 @@ impl LazyBuffer {
 
     /// Rows staged since the previous call (see the `arrivals_since_drain`
     /// field), resetting the count: called once per bounded drain opportunity.
-    pub(crate) fn take_arrivals(&mut self) -> u64 {
-        std::mem::take(&mut self.arrivals_since_drain)
+    #[inline]
+    pub(crate) const fn take_arrivals(&mut self) -> u64 {
+        let arrivals = self.arrivals_since_drain;
+        self.arrivals_since_drain = 0;
+        arrivals
     }
 
     /// Snapshot `row` into a pooled cell body and stage it.
@@ -710,8 +726,11 @@ impl LazyBuffer {
     /// Lines the open flood cut's marker names — `0` when no cut is open.
     #[inline]
     #[must_use]
-    pub(crate) fn cut_dropped(&self) -> u64 {
-        self.cut.as_ref().map_or(0, |cut| cut.dropped)
+    pub(crate) const fn cut_dropped(&self) -> u64 {
+        match &self.cut {
+            Some(cut) => cut.dropped,
+            None => 0,
+        }
     }
 
     /// Staged content rows: [`len`](Self::len) without the marker row.
@@ -742,7 +761,8 @@ impl LazyBuffer {
 
     /// Whether staged rows exceed `budget`, before a caller walks their weights.
     #[must_use]
-    pub(crate) fn outweighs(&self, budget: usize) -> bool {
+    #[inline]
+    pub(crate) const fn outweighs(&self, budget: usize) -> bool {
         self.staged_bytes > budget
     }
 
@@ -809,7 +829,7 @@ impl LazyBuffer {
     /// Whether a flood cut is open at the front (see [`FloodCut`]).
     #[inline]
     #[must_use]
-    pub(crate) fn cut_open(&self) -> bool {
+    pub(crate) const fn cut_open(&self) -> bool {
         self.cut.is_some()
     }
 
@@ -906,6 +926,7 @@ impl LazyBuffer {
     /// A line by index (0 = oldest: the flood marker when a cut is open),
     /// materialized on first access.
     #[must_use]
+    #[inline]
     pub(crate) fn get_line(&self, idx: usize) -> Option<&Line> {
         match &self.cut {
             Some(cut) if idx == 0 => Some(cut.line()),
@@ -916,6 +937,7 @@ impl LazyBuffer {
 
     /// Clear all pending lines and the recycling pool. Every caller invalidates
     /// history (never the flood path), so the memory goes back to the allocator.
+    #[inline]
     pub(crate) fn clear(&mut self) {
         self.lines.clear();
         self.staged_bytes = 0;
@@ -930,6 +952,7 @@ impl LazyBuffer {
     /// Drop the recycled cell bodies, keeping the staged lines: after a width
     /// change the pooled capacities fit the old column count. A footprint guard
     /// only: `DeferredLine::new` refills the body from the row slice.
+    #[inline]
     pub(crate) fn clear_pool(&mut self) {
         self.pool.clear();
     }
@@ -1009,7 +1032,7 @@ impl LazyBuffer {
     /// The staged rows' OSC 8 payload (the running sum), O(1).
     #[inline]
     #[must_use]
-    pub(crate) fn link_bytes(&self) -> usize {
+    pub(crate) const fn link_bytes(&self) -> usize {
         self.link_bytes
     }
 
@@ -1585,6 +1608,7 @@ fn push_cell_text(
 ///
 /// The one place the complex cursor advances. Shared by [`push_cell_text`] (the
 /// Line serializer) and the ring fast materializer.
+#[inline]
 pub(in crate::grid) fn next_complex_char<'a>(
     extras: &'a ScrolledRowExtras,
     cursors: &mut RowToLineCursorState,
@@ -1599,20 +1623,26 @@ pub(in crate::grid) fn next_complex_char<'a>(
 /// The one column cursor every reader of a stored row's extras advances: the
 /// Line serializer, the ring fast materializer and the holder fence's row
 /// fingerprint, which visit a row's columns in ascending order.
-pub(in crate::grid) fn next_keyed<'a, T>(
+#[inline]
+pub(in crate::grid) const fn next_keyed<'a, T>(
     entries: &'a [(u16, T)],
     idx: &mut usize,
     col_u16: u16,
 ) -> Option<&'a T> {
-    let (_, value) = entries.get(*idx).filter(|(col, _)| *col == col_u16)?;
-    *idx += 1;
-    Some(value)
+    if *idx < entries.len() && entries[*idx].0 == col_u16 {
+        let value = &entries[*idx].1;
+        *idx += 1;
+        Some(value)
+    } else {
+        None
+    }
 }
 
 /// Consume this column's stored combining marks, if the cursor is on them.
 ///
 /// The one place the combining cursor advances. Shared by
 /// [`push_combining_marks`] and the ring fast materializer.
+#[inline]
 pub(in crate::grid) fn next_combining<'a>(
     extras: &'a ScrolledRowExtras,
     cursors: &mut RowToLineCursorState,
@@ -1625,7 +1655,8 @@ pub(in crate::grid) fn next_combining<'a>(
 /// inline when the cell carries it, else the column's pre-resolved stored RGB
 /// (extraction resolved RGB overflow at scroll time), else the
 /// default. Shared with the ring fast materializer.
-pub(in crate::grid) fn resolve_cell_color(
+#[inline]
+pub(in crate::grid) const fn resolve_cell_color(
     needs_stored: bool,
     inline_raw: u32,
     stored_colors: &[(u16, [u8; 3])],
@@ -1637,8 +1668,10 @@ pub(in crate::grid) fn resolve_cell_color(
         return inline_raw;
     }
 
-    next_keyed(stored_colors, color_idx, col_u16)
-        .map_or(default_raw, |&[r, g, b]| PackedColor::rgb(r, g, b).0)
+    match next_keyed(stored_colors, color_idx, col_u16) {
+        Some(&[r, g, b]) => PackedColor::rgb(r, g, b).0,
+        None => default_raw,
+    }
 }
 
 /// Accumulates a materializing line's attribute runs, allocating nothing until

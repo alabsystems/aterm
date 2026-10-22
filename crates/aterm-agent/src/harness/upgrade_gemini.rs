@@ -306,10 +306,13 @@ fn looks_like_flag(tok: &str) -> bool {
     tok.len() > 1 && tok.starts_with('-')
 }
 
-/// One launch's argv, read: the flags it carries, verbatim and in order.
+/// One launch's argv, read: the flags it carries, verbatim and in order,
+/// and whether it carries a first prompt (`-i`/`--prompt-interactive`, a
+/// positional, words after `--`).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct Read {
     kept: Vec<String>,
+    prompt: bool,
 }
 
 /// Why a [`read`] stopped, with its word.
@@ -341,6 +344,7 @@ fn read(argv: &[String]) -> Result<Read, Stop> {
         i += 1;
         if tok == "--" {
             // Everything after is the first prompt's words: dropped.
+            out.prompt |= i < argv.len();
             return Ok(out);
         }
         let Some((name, attached)) = flag_token(tok) else {
@@ -348,11 +352,13 @@ fn read(argv: &[String]) -> Result<Read, Stop> {
                 return Err(Stop::Ends(tok.to_string()));
             }
             positional_seen = true;
+            out.prompt = true;
             continue;
         };
         let Some((arity, fate)) = flag(name) else {
             return Err(Stop::Unknown(name.to_string()));
         };
+        out.prompt |= name == "i" || name == FLAG_PROMPT_INTERACTIVE;
         let mut words = vec![tok.to_string()];
         if attached.is_none() {
             match arity {
@@ -450,6 +456,15 @@ fn flag_value<'a>(argv: &'a [String], names: &[&str]) -> Option<&'a str> {
         };
     }
     found
+}
+
+/// WHETHER `argv` CARRIES A FIRST PROMPT — `-i`/`--prompt-interactive
+/// <text>`, a positional, words after `--` — which no relaunch types again
+/// ([`rewrite_argv`]). `true` for an argv the table cannot read: nothing
+/// is vouched for it.
+#[must_use]
+pub fn carries_first_prompt(argv: &[String]) -> bool {
+    read(argv).map_or(true, |r| r.prompt)
 }
 
 /// THE SESSION AN ARGV NAMES, where it names one by its full UUID: the
@@ -1223,13 +1238,18 @@ pub enum ExitKind {
     Unwitnessed,
     /// `42` where ITS OWN RESTART MET THE ID ITS FIRST START WROTE
     /// ([`restart_id`], the start-time rule naming that id for the process):
-    /// Gemini CLI's own restart (`/settings`, IDE trust, admin settings: exit
-    /// `199`) runs the CLI again with the same argv, and a worker's
-    /// `--session-id <uuid>` (`harness::worker`) is then a session already
-    /// written (`Session ID … already exists`, exit 42, which the parent
-    /// relays). Never [`exit_kind`]'s: the status alone is a refusal.
-    /// Resumed on that session by id, nothing typed: a person's restart,
-    /// never a crash.
+    /// Gemini CLI's own restart (`/settings`, IDE trust, admin settings, the
+    /// folder-trust dialog's `Trust folder`: exit `199`) runs the CLI again
+    /// with the same argv, and a worker's `--session-id <uuid>`
+    /// (`harness::worker`) is then a session already written (`Session ID …
+    /// already exists`, exit 42, which the parent relays; MEASURED on 0.46.0
+    /// in the lab, with and without a first turn: the header is written at
+    /// the UI's mount, before any dialog is answered). Never [`exit_kind`]'s:
+    /// the status alone is a refusal. Resumed on that session by id, nothing
+    /// typed: a person's restart, never a crash. The parent's argv and its
+    /// child's are the same on every run (the bundle's relaunch spawns the
+    /// child with the parent's own arguments), so no argv tells a rerun from
+    /// a first run: the session file begun since the start is the witness.
     Restarted,
 }
 

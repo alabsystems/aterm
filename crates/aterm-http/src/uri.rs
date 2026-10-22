@@ -34,6 +34,7 @@ pub enum Scheme {
 
 impl Scheme {
     /// The port used when the URL does not name one.
+    #[inline]
     #[must_use]
     pub const fn default_port(self) -> u16 {
         match self {
@@ -43,6 +44,7 @@ impl Scheme {
     }
 
     /// The lowercase scheme token, without the `://`.
+    #[inline]
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -52,12 +54,14 @@ impl Scheme {
     }
 
     /// Return `true` when this scheme uses TLS (`https`).
+    #[inline]
     #[must_use]
     pub const fn is_tls(self) -> bool {
         matches!(self, Self::Https)
     }
 
     /// Return `true` when `port` equals this scheme's default port.
+    #[inline]
     #[must_use]
     pub const fn uses_default_port(self, port: u16) -> bool {
         port == self.default_port()
@@ -68,36 +72,42 @@ impl Scheme {
 pub const MAX_URI_LEN: usize = 8192;
 
 /// Return `true` when `len` is a valid non-empty URI length (`1..=8192`).
+#[inline]
 #[must_use]
 pub const fn is_valid_uri_len(len: usize) -> bool {
     len >= 1 && len <= MAX_URI_LEN
 }
 
 /// Return `true` when `status` is a `2xx` HTTP success code (`200..=299`).
+#[inline]
 #[must_use]
 pub const fn is_http_status_success(status: u16) -> bool {
     status >= 200 && status <= 299
 }
 
 /// Return `true` when `status` is a `3xx` HTTP redirect code (`300..=399`).
+#[inline]
 #[must_use]
 pub const fn is_http_status_redirect(status: u16) -> bool {
     status >= 300 && status <= 399
 }
 
 /// Return `true` when `status` is a `4xx` HTTP client error code (`400..=499`).
+#[inline]
 #[must_use]
 pub const fn is_http_status_client_error(status: u16) -> bool {
     status >= 400 && status <= 499
 }
 
 /// Return `true` when `status` is a `5xx` HTTP server error code (`500..=599`).
+#[inline]
 #[must_use]
 pub const fn is_http_status_server_error(status: u16) -> bool {
     status >= 500 && status <= 599
 }
 
 /// Encode an HTTP endpoint summary (`host_hash`, `port`, `status`, `body_len`) into 16 LE bytes.
+#[inline]
 #[must_use]
 pub const fn encode_http_endpoint_le(
     host_hash: u64,
@@ -126,6 +136,7 @@ pub const fn encode_http_endpoint_le(
 }
 
 /// Decode 16 LE bytes into an HTTP endpoint summary (`host_hash`, `port`, `status`, `body_len`).
+#[inline]
 #[must_use]
 pub const fn decode_http_endpoint_le(bytes: [u8; 16]) -> (u64, u16, u16, u32) {
     let host_hash = (bytes[0] as u64)
@@ -200,42 +211,49 @@ impl Uri {
     }
 
     /// The URL's scheme.
+    #[inline]
     #[must_use]
     pub const fn scheme(&self) -> Scheme {
         self.scheme
     }
 
     /// Host, without brackets for an IPv6 literal.
+    #[inline]
     #[must_use]
     pub fn host(&self) -> &str {
         &self.host
     }
 
     /// Port — the scheme default when the URL did not name one.
+    #[inline]
     #[must_use]
     pub const fn port(&self) -> u16 {
         self.port
     }
 
     /// Return `true` when the authority explicitly included `:port`.
+    #[inline]
     #[must_use]
     pub const fn has_explicit_port(&self) -> bool {
         self.explicit_port
     }
 
     /// Return `true` when `self.port()` matches `self.scheme().default_port()`.
+    #[inline]
     #[must_use]
     pub const fn uses_default_port(&self) -> bool {
         self.scheme.uses_default_port(self.port)
     }
 
     /// The origin-form request target (`/v1/chat/completions?x=1`).
+    #[inline]
     #[must_use]
     pub fn path_and_query(&self) -> &str {
         &self.path_and_query
     }
 
     /// The path alone, without the query string.
+    #[inline]
     #[must_use]
     pub fn path(&self) -> &str {
         self.path_and_query
@@ -247,6 +265,7 @@ impl Uri {
     /// The authority exactly as written, for agreement checks against a naive
     /// textual split of the same input: if they differ, the endpoint is
     /// ambiguous.
+    #[inline]
     #[must_use]
     pub fn authority_as_written(&self) -> &str {
         &self.authority_raw
@@ -282,6 +301,7 @@ impl Uri {
 }
 
 /// ASCII-case-insensitive `strip_prefix` (schemes are case-insensitive).
+#[inline]
 pub(crate) fn strip_prefix_ascii_ci<'a>(text: &'a str, prefix: &str) -> Option<&'a str> {
     let (head, rest) = text.split_at_checked(prefix.len())?;
     head.eq_ignore_ascii_case(prefix).then_some(rest)
@@ -337,6 +357,7 @@ fn parse_port_digits(text: &str) -> Option<u16> {
 
 /// Reject a host containing a character that has no business in a `Host`
 /// header or an SNI name.
+#[inline]
 fn host_is_plausible(host: &str) -> bool {
     host.bytes()
         .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~' | b'%'))

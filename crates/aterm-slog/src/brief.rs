@@ -419,18 +419,12 @@ fn scan<'a>(window: &[&'a Rec], seeds: &'a [Rec]) -> Scan<'a> {
 /// The needs the brief names as observed: every one but a claim (a need
 /// raised by a mark), most urgent first.
 fn observed_needs(st: &SessionState) -> impl Iterator<Item = &Need> {
-    st.needs
-        .iter()
-        .flatten()
-        .filter(|n| n.src != Src::Mark && n.conf != Conf::Claim)
+    st.needs.iter().flatten().filter(|n| n.observed())
 }
 
 /// The needs raised by a mark: claims, each on a `claim need` line.
 fn claimed_needs(st: &SessionState) -> impl Iterator<Item = &Need> {
-    st.needs
-        .iter()
-        .flatten()
-        .filter(|n| n.src == Src::Mark || n.conf == Conf::Claim)
+    st.needs.iter().flatten().filter(|n| !n.observed())
 }
 
 /// The session line: the most urgent observed need, else the phase.

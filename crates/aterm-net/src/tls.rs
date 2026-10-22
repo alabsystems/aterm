@@ -212,7 +212,8 @@ impl<C> TlsTransport<C> {
     /// A transport over `stream`, whose handshake is complete, carrying the
     /// keying material its caller exported under its own label (the fleet's,
     /// [`crate::fleet`]).
-    pub(crate) fn from_parts(
+    #[inline]
+    pub(crate) const fn from_parts(
         stream: StreamOwned<C, TcpStream>,
         exporter: [u8; EXPORTER_LEN],
     ) -> Self {
@@ -224,23 +225,27 @@ impl<C> TlsTransport<C> {
     /// owner's own label (the fleet's, [`crate::fleet`]). It is what a proof
     /// covers, never its key: the fleet's role proofs are each keyed by their
     /// secret and taken over this value.
+    #[inline]
     #[must_use]
-    pub fn exporter(&self) -> &[u8] {
+    pub const fn exporter(&self) -> &[u8] {
         &self.exporter
     }
 
     /// The connected TLS stream (Read + Write) for the post-handshake relay.
-    pub fn stream(&mut self) -> &mut StreamOwned<C, TcpStream> {
+    #[inline]
+    pub const fn stream(&mut self) -> &mut StreamOwned<C, TcpStream> {
         &mut self.stream
     }
 
     /// Consume into the raw TLS stream.
+    #[inline]
     pub fn into_stream(self) -> StreamOwned<C, TcpStream> {
         self.stream
     }
 
     /// The socket under the stream.
-    pub(crate) fn tcp(&self) -> &TcpStream {
+    #[inline]
+    pub(crate) const fn tcp(&self) -> &TcpStream {
         &self.stream.sock
     }
 }
@@ -259,6 +264,7 @@ impl<C> Answering<'_, C> {
     ///
     /// # Errors
     /// The socket's own.
+    #[inline]
     pub fn set_read_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
         self.stream.sock.set_read_timeout(timeout)
     }
@@ -268,6 +274,7 @@ impl<C> Answering<'_, C> {
     ///
     /// # Errors
     /// The socket's own.
+    #[inline]
     pub fn set_write_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
         self.stream.sock.set_write_timeout(timeout)
     }
@@ -276,6 +283,7 @@ impl<C> Answering<'_, C> {
     ///
     /// # Errors
     /// The socket's own.
+    #[inline]
     pub fn peer_addr(&self) -> io::Result<std::net::SocketAddr> {
         self.stream.sock.peer_addr()
     }

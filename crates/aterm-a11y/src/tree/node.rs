@@ -61,32 +61,39 @@ pub(crate) struct Node<'a> {
 }
 
 impl<'a> Node<'a> {
-    pub(crate) fn incarnation(&self) -> u64 {
+    #[inline]
+    pub(crate) const fn incarnation(&self) -> u64 {
         self.state.incarnation
     }
 
-    pub(crate) fn data(&self) -> &'a NodeData {
+    #[inline]
+    pub(crate) const fn data(&self) -> &'a NodeData {
         &self.state.data
     }
 
+    #[inline]
     pub(crate) fn is_focused(&self) -> bool {
         self.tree_state.focus_id() == Some(self.id())
     }
 
+    #[inline]
     pub(crate) fn is_focused_in_tree(&self) -> bool {
         self.tree_state.focus == self.id()
     }
 
+    #[inline]
     pub(crate) fn is_focusable(&self, parent_filter: &impl Fn(&Node) -> FilterResult) -> bool {
         self.supports_action(Action::Focus, parent_filter) || self.is_focused_in_tree()
     }
 
+    #[inline]
     pub(crate) fn is_root(&self) -> bool {
         // Don't check for absence of a parent node, in case a non-root node
         // somehow gets detached from the tree.
         self.id() == self.tree_state.root_id()
     }
 
+    #[inline]
     pub(crate) fn parent_id(&self) -> Option<NodeId> {
         self.state
             .parent_and_index
@@ -94,6 +101,7 @@ impl<'a> Node<'a> {
             .map(|ParentAndIndex(id, _)| *id)
     }
 
+    #[inline]
     pub(crate) fn parent(&self) -> Option<Node<'a>> {
         self.parent_id()
             .and_then(|id| self.tree_state.node_by_id(id))
@@ -112,6 +120,7 @@ impl<'a> Node<'a> {
         }
     }
 
+    #[inline]
     pub(crate) fn parent_and_index(self) -> Option<(Node<'a>, usize)> {
         let ParentAndIndex(parent, index) = self.state.parent_and_index?;
         Some((self.tree_state.node_by_id(parent)?, index))
@@ -166,6 +175,7 @@ impl<'a> Node<'a> {
 
     /// Returns the transform defined directly on this node, or the identity
     /// transform, without taking into account transforms on ancestors.
+    #[inline]
     pub(crate) fn direct_transform(&self) -> Affine {
         self.data()
             .transform()
@@ -197,6 +207,7 @@ impl<'a> Node<'a> {
         acc
     }
 
+    #[inline]
     pub(crate) fn raw_bounds(&self) -> Option<Rect> {
         self.data().bounds()
     }
@@ -271,48 +282,59 @@ impl<'a> Node<'a> {
         self.hit_test(point, filter).map(|(node, _)| node)
     }
 
-    pub(crate) fn id(&self) -> NodeId {
+    #[inline]
+    pub(crate) const fn id(&self) -> NodeId {
         self.id
     }
 
+    #[inline]
     pub(crate) fn role(&self) -> Role {
         self.data().role()
     }
 
+    #[inline]
     pub(crate) fn is_disabled(&self) -> bool {
         self.data().is_disabled()
     }
 
+    #[inline]
     pub(crate) fn is_offscreen(&self) -> bool {
         self.data().is_offscreen()
     }
 
+    #[inline]
     pub(crate) fn is_read_only(&self) -> bool {
         self.data().is_read_only()
             || self.should_have_read_only_state_by_default()
             || !self.is_read_only_supported()
     }
 
+    #[inline]
     pub(crate) fn is_read_only_or_disabled(&self) -> bool {
         self.is_read_only() || self.is_disabled()
     }
 
+    #[inline]
     pub(crate) fn toggled(&self) -> Option<Toggled> {
         self.data().toggled()
     }
 
+    #[inline]
     pub(crate) fn numeric_value(&self) -> Option<f64> {
         self.data().numeric_value()
     }
 
+    #[inline]
     pub(crate) fn min_numeric_value(&self) -> Option<f64> {
         self.data().min_numeric_value()
     }
 
+    #[inline]
     pub(crate) fn max_numeric_value(&self) -> Option<f64> {
         self.data().max_numeric_value()
     }
 
+    #[inline]
     pub(crate) fn numeric_value_step(&self) -> Option<f64> {
         self.data().numeric_value_step()
     }
@@ -332,6 +354,7 @@ impl<'a> Node<'a> {
         }
     }
 
+    #[inline]
     pub(crate) fn is_text_input(&self) -> bool {
         matches!(
             self.role(),
@@ -339,11 +362,13 @@ impl<'a> Node<'a> {
         )
     }
 
+    #[inline]
     pub(crate) fn is_multiline(&self) -> bool {
         self.role() == Role::MultilineTextInput
     }
 
     /// The orientation a list box and a tab list have by their role.
+    #[inline]
     pub(crate) fn orientation(&self) -> Option<Orientation> {
         match self.role() {
             Role::ListBox => Some(Orientation::Vertical),
@@ -352,6 +377,7 @@ impl<'a> Node<'a> {
         }
     }
 
+    #[inline]
     pub(crate) fn is_dialog(&self) -> bool {
         self.role() == Role::AlertDialog
     }
@@ -365,10 +391,12 @@ impl<'a> Node<'a> {
     // and we assume that it will based on the role, the attempted action
     // does nothing. This stance is a departure from Chromium.
 
+    #[inline]
     pub(crate) fn is_clickable(&self, parent_filter: &impl Fn(&Node) -> FilterResult) -> bool {
         self.supports_action(Action::Click, parent_filter)
     }
 
+    #[inline]
     pub(crate) fn is_selectable(&self) -> bool {
         // It's selectable if it has the attribute, whether it's true or false.
         self.is_selected().is_some() && !self.is_disabled()
@@ -377,6 +405,7 @@ impl<'a> Node<'a> {
     /// Whether this node supports `action`. (accesskit_consumer also asked
     /// the filtered parent for actions it grants its children; aterm's model
     /// has no such grants, so `_parent_filter` decides nothing.)
+    #[inline]
     pub(crate) fn supports_action(
         &self,
         action: Action,
@@ -408,6 +437,7 @@ impl<'a> Node<'a> {
             .flatten()
     }
 
+    #[inline]
     pub(crate) fn label_comes_from_value(&self) -> bool {
         self.role() == Role::Label
     }
@@ -455,10 +485,12 @@ impl<'a> Node<'a> {
             .map(|description| description.to_string())
     }
 
+    #[inline]
     pub(crate) fn url(&self) -> Option<&str> {
         self.data().url()
     }
 
+    #[inline]
     pub(crate) fn supports_url(&self) -> bool {
         self.role() == Role::Link && self.url().is_some()
     }
@@ -482,6 +514,7 @@ impl<'a> Node<'a> {
         }
     }
 
+    #[inline]
     pub(crate) fn is_read_only_supported(&self) -> bool {
         self.is_text_input()
             || matches!(
@@ -490,6 +523,7 @@ impl<'a> Node<'a> {
             )
     }
 
+    #[inline]
     pub(crate) fn should_have_read_only_state_by_default(&self) -> bool {
         matches!(
             self.role(),
@@ -503,10 +537,12 @@ impl<'a> Node<'a> {
             .unwrap_or_else(|| self.parent().map_or(Live::Off, |parent| parent.live()))
     }
 
+    #[inline]
     pub(crate) fn is_selected(&self) -> Option<bool> {
         self.data().is_selected()
     }
 
+    #[inline]
     pub(crate) fn is_item_like(&self) -> bool {
         matches!(
             self.role(),
@@ -514,10 +550,12 @@ impl<'a> Node<'a> {
         )
     }
 
+    #[inline]
     pub(crate) fn is_container_with_selectable_children(&self) -> bool {
         matches!(self.role(), Role::ListBox | Role::Menu | Role::TabList)
     }
 
+    #[inline]
     pub(crate) fn raw_text_selection(&self) -> Option<&TextSelection> {
         self.data().text_selection()
     }

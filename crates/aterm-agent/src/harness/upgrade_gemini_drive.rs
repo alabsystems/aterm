@@ -24,7 +24,9 @@
 //!    `42`, `52`… a refused start); with no word, nothing is relaunched. A
 //!    worker's `42` that is ITS OWN RESTART meeting the `--session-id` its
 //!    first start wrote ([`own_restart`]) is resumed on that session as a
-//!    crash is, quietly: nothing typed after it.
+//!    crash is, quietly: nothing typed after it — even with no turn taken,
+//!    for a launch with no first prompt ([`resumes_turnless`], measured: a
+//!    folder-trust restart).
 //! 3. **The relaunch** ([`relaunch`]): once the parent is gone and its shell
 //!    holds the terminal again — a parent SIGKILLed leaves its child orphaned
 //!    in the old group, reading no terminal its shell holds (its reads fail),
@@ -48,7 +50,8 @@
 //!    once the start-time rule names the session for the new process and its
 //!    composer reads empty and idle, by a guarded `turn` under its caret.
 //! 5. **What it never types**: a session the rule cannot name, one that took
-//!    no turn, or one whose resume would load a copy missing turns — the
+//!    no turn (but its own bare restart's), or one whose resume would load a
+//!    copy missing turns — the
 //!    person is told (`refused:…`, the host's `Cannot`) with Gemini CLI's own
 //!    line where it is safe to run ([`told`]), and what aterm could not tell
 //!    where it is not.
@@ -799,15 +802,29 @@ pub(super) fn after_exit_onto(
         typed_on = Some(earlier.thread.clone()).filter(|s| ug::is_session_uuid(s));
     }
     let word = match left {
-        // Owed as a crash is, its own restart refused for its own id too
-        // ([`look_at_exit`]): the block's word, read again, tells which.
+        // ITS OWN RESTART, READ AT ITS EXIT ([`look_at_exit`]'s word, kept
+        // as the exit was seen): resumed quietly whatever the shell draws by
+        // now — the word is gone once another command's block is the newest,
+        // and nothing else says which of the two it was (held to the model's
+        // `ARestartTypesNothingAfter` by its tier-1 replay).
+        ExitRecord::Restarted if !relaunched_before && cause == ExitCause::Exit => {
+            Some(ExitKind::Restarted)
+        }
+        // A crash read at its exit: the block's word, read again where it is
+        // still drawn, tells an own restart a record of an older look
+        // conflated; where the word is gone the crash stands, continued
+        // after its line. Never a restart on a guess: any `--session-id`
+        // launch's `42` would be its own restart ([`own_restart`]), every
+        // worker's included, and a crash read so went with no continuation
+        // (the review of 3a4586a01e, R2; the model's
+        // `ACrashRelaunchedIsContinued`).
         ExitRecord::Crashed if !relaunched_before && cause == ExitCause::Exit => {
             match shell_word(opts, snap, k) {
                 Some(ExitKind::Restarted) => Some(ExitKind::Restarted),
                 _ => Some(ExitKind::Crashed),
             }
         }
-        ExitRecord::Crashed => Some(ExitKind::Crashed),
+        ExitRecord::Crashed | ExitRecord::Restarted => Some(ExitKind::Crashed),
         ExitRecord::Removed => Some(ExitKind::Clean),
         ExitRecord::Refused => Some(ExitKind::Refused),
         ExitRecord::Unread | ExitRecord::Survived(_) if cause == ExitCause::Exit => {
@@ -870,9 +887,12 @@ pub(super) fn after_exit_onto(
         }
         Err(why) => return refuse(opts, r, "refused:no-witness", why.said()),
     };
-    // THE PRE-CHECK: what `--resume` would load must hold every turn.
+    // THE PRE-CHECK: what `--resume` would load must hold every turn — and
+    // a session that took none is resumed only for its own bare restart
+    // ([`resumes_turnless`]).
     match precheck_at(run.chats.as_deref(), &session) {
         Precheck::Safe { .. } => {}
+        Precheck::NoTurns if resumes_turnless(restarted, &snap.argv) => {}
         Precheck::NoTurns => {
             return refuse(
                 opts,
@@ -955,6 +975,25 @@ pub(super) fn after_exit_onto(
     let r = relaunch(opts, r, &mut st, &mut c, k);
     save(opts, &session_key, &st);
     r
+}
+
+/// WHETHER A SESSION THAT TOOK NO TURN IS RESUMED ALL THE SAME
+/// ([`Precheck::NoTurns`]): only on its own restart (`restarted`, the
+/// record's `quiet`) of a launch that carried no first prompt
+/// ([`ug::carries_first_prompt`]). MEASURED on 0.46.0 (lab, 2026-10-21):
+/// Gemini CLI writes its session's header at its UI's mount, before any
+/// dialog is answered, so its folder-trust dialog's `Trust folder` restarts
+/// it onto a session already written, and its `--session-id` is refused
+/// (`42`) with no turn in it; `gemini --resume <id>` of that session comes
+/// up at its composer on that very session, the next turn recorded into its
+/// file — what the restart itself would have come back as. A crash's session
+/// that took no turn is left (nothing of it to bring back), and so is a
+/// restart's whose first prompt was never sent: the resume would drop it.
+/// No restart can be refused before the header is written: with no session
+/// file under its id the restarted run starts it afresh and the parent never
+/// exits (the bundle's `resolveSessionId`), so no other witness is owed.
+fn resumes_turnless(restarted: bool, argv: &[String]) -> bool {
+    restarted && !ug::carries_first_prompt(argv)
 }
 
 /// A pre-check that is not [`Precheck::Safe`] in a person's words.
@@ -1130,6 +1169,7 @@ fn relaunch_held(
     // The pre-check again, right before the line: what `--resume` loads now.
     match precheck_at(chats.as_deref(), &st.thread) {
         Precheck::Safe { .. } => {}
+        Precheck::NoTurns if resumes_turnless(st.quiet, &st.argv) => {}
         Precheck::NoTurns => {
             return fail(
                 opts,

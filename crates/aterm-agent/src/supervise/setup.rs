@@ -202,7 +202,8 @@ pub struct SessionSetup {
 
 impl SessionSetup {
     /// The setup [`Session::new`] runs under for `sid`: every timing at its
-    /// shipped value, no ledger, typing under no hand, the holder
+    /// shipped value (but the turn-end ladder a development build is told to
+    /// scale, [`TurnEndTiming::for_build`]), no ledger, typing under no hand, the holder
     /// `aterm-supervise:<pid>`, and the approval policy's inputs read from
     /// this process ([`ApprovalEnv::of_process`]).
     #[must_use]
@@ -221,7 +222,7 @@ impl SessionSetup {
             claim_renew: claim::CLAIM_RENEW,
             claim_ttl_ms: claim::ttl_ms(&crate::harness::Timings::for_build()),
             redecide_after_skip: crate::harness::Timings::for_build().redecide_after_skip,
-            turn_end_timing: TurnEndTiming::default(),
+            turn_end_timing: TurnEndTiming::for_build(),
             press_badge_after: approval_loop::PRESS_BADGE_AFTER,
             survey_retry: SURVEY_RETRY,
             survey_settle: SURVEY_SETTLE,

@@ -42,6 +42,8 @@ pub enum NotificationUrgency {
 
 impl NotificationUrgency {
     /// Parse urgency from OSC 99 'u' parameter value.
+    #[inline]
+    #[must_use]
     pub fn from_param(value: &str) -> Self {
         match value {
             "0" => Self::Low,
@@ -68,8 +70,9 @@ pub struct Notification {
 
 impl Notification {
     /// Check if this notification has any content to display.
+    #[inline]
     #[must_use]
-    pub fn has_content(&self) -> bool {
+    pub const fn has_content(&self) -> bool {
         self.title.is_some() || self.body.is_some()
     }
 }

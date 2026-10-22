@@ -12,8 +12,12 @@ use std::sync::OnceLock;
 /// The facts every verb shares, resolved once.
 #[derive(Debug)]
 pub struct Paths {
-    /// `$LAB_STATE`, else `<repo>/target/real-claude-lab`: `runs/ logs/ captures/ results/`.
+    /// `$LAB_STATE`, else [`default_state`] (`/private/tmp/at.lab-<uid>/<checkout>`,
+    /// outside every home): `runs/ logs/ captures/ results/`.
     pub state: PathBuf,
+    /// Whether [`Self::state`] is the default ([`default_state`]: `$LAB_STATE`
+    /// unset or empty), which [`Paths::make_default_state`] makes private.
+    pub state_default: bool,
     /// `$LAB_STATE` as given, when it is relative: refused before anything is
     /// made ([`Paths::need_state`]): each call would read it from its own cwd,
     /// which a jailed process may write.
@@ -103,14 +107,15 @@ impl Paths {
             .parent()
             .and_then(Path::parent)
             .map_or_else(|| PathBuf::from("."), Path::to_path_buf);
-        let (state, state_relative) = match std::env::var("LAB_STATE") {
-            Ok(s) if !s.is_empty() && !s.starts_with('/') => {
-                (repo.join("target/real-claude-lab"), Some(s))
-            }
-            Ok(s) if !s.is_empty() => (PathBuf::from(s), None),
-            _ => (repo.join("target/real-claude-lab"), None),
+        // The default is taken as written, never through what stands at its
+        // root in the shared /private/tmp: [`Paths::make_default_state`]
+        // refuses a link there before anything is made.
+        let fallback = || default_state(crate::sys::getuid(), &physical(&repo));
+        let (state, state_relative, state_default) = match std::env::var("LAB_STATE") {
+            Ok(s) if !s.is_empty() && !s.starts_with('/') => (fallback(), Some(s), false),
+            Ok(s) if !s.is_empty() => (physical(Path::new(s.trim_end_matches('/'))), None, false),
+            _ => (fallback(), None, true),
         };
-        let state = physical(Path::new(state.to_string_lossy().trim_end_matches('/')));
         let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("aterm-lab"));
         let (aterm, aterm_note) = find_aterm(&exe, &repo);
         let real_home = home_path(account.as_deref());
@@ -121,6 +126,7 @@ impl Paths {
         Paths {
             state,
             state_relative,
+            state_default,
             aterm,
             aterm_note,
             real_home,
@@ -186,11 +192,25 @@ impl Paths {
         !self.caller_home.is_empty() && self.caller_home != self.real_home
     }
 
-    /// The state dir, or the refusal of a relative `$LAB_STATE`.
+    /// The state dir to make things in: the refusal of a relative
+    /// `$LAB_STATE`, and the default made this user's private directory
+    /// first ([`Self::make_default_state`]), so no verb, one that skips the
+    /// lab's up-front check (`fleet-sim`'s record) among them, makes anything
+    /// through a link or in a directory another user planted at the shared
+    /// `/private/tmp`.
     ///
     /// # Errors
-    /// `$LAB_STATE` is relative.
+    /// `$LAB_STATE` is relative, or the default is not this user's own
+    /// private directory.
     pub fn need_state(&self) -> Result<&Path, String> {
+        let state = self.state_named()?;
+        self.make_default_state()?;
+        Ok(state)
+    }
+
+    /// The state dir, or the refusal of a relative `$LAB_STATE`: a check that
+    /// makes nothing.
+    fn state_named(&self) -> Result<&Path, String> {
         match &self.state_relative {
             Some(s) => Err(format!(
                 "LAB_STATE={s} is relative (each call would read it from its own cwd, which a jailed process may \
@@ -198,6 +218,68 @@ impl Paths {
             )),
             None => Ok(&self.state),
         }
+    }
+
+    /// The state dir, or the refusal of one inside a home the jail fences
+    /// (`homes`, [`Self::guarded_homes`]): the fence refuses every directory
+    /// from that home down to a run's state root, which the harness's tape
+    /// store opens one at a time, so a lab there would keep no tape. The
+    /// default sits outside every home.
+    ///
+    /// # Errors
+    /// `$LAB_STATE` is the home or lies under it.
+    pub fn need_state_outside(&self, homes: &[String]) -> Result<&Path, String> {
+        let state = self.state_named()?;
+        let real = physical(state);
+        let inside = |h: &&String| {
+            let home = physical(Path::new(h));
+            [state, real.as_path()]
+                .iter()
+                .any(|s| s.starts_with(h) || s.starts_with(&home))
+        };
+        match homes.iter().find(inside) {
+            Some(h) => Err(format!(
+                "LAB_STATE={} sits inside the home {h}, whose contents the lab's jail fences: the fence refuses \
+                 each directory from that home down to a run, which the harness's tape store opens one at a time, so \
+                 a lab there keeps no tape. Leave LAB_STATE unset (the default, {}, is outside every home) or name \
+                 a directory outside every home",
+                state.display(),
+                default_state(crate::sys::getuid(), &physical(&self.repo)).display()
+            )),
+            None => Ok(state),
+        }
+    }
+
+    /// The default state dir made private before anything goes into it, when
+    /// it is the one in use ([`Self::state_default`]; a `$LAB_STATE` the
+    /// caller named is left as it is): its root, `/private/tmp/at.lab-<uid>`,
+    /// and its own directory, each made mode 0700 and then required to be a
+    /// directory (no link) this user owns that nobody else may write
+    /// ([`private_dir`]). `/private/tmp` is shared, so a squatted or linked
+    /// root is refused, never followed; every lab's jail refuses writes there
+    /// (`jail.sb`'s `/private/tmp/at.*` rule), as it does in the lab's
+    /// socket dirs.
+    ///
+    /// # Errors
+    /// Either directory cannot be made, or is not this user's own private
+    /// directory.
+    pub fn make_default_state(&self) -> Result<(), String> {
+        if !self.state_default {
+            return Ok(());
+        }
+        let root = self
+            .state
+            .parent()
+            .ok_or_else(|| format!("{} has no parent", self.state.display()))?;
+        for dir in [root, self.state.as_path()] {
+            private_dir(dir, crate::sys::getuid()).map_err(|why| {
+                format!(
+                    "the lab's default state dir: {why}; set LAB_STATE to an absolute directory outside every \
+                     home"
+                )
+            })?;
+        }
+        Ok(())
     }
 
     /// The directory this program runs from: the lab trusts it from outside
@@ -357,6 +439,104 @@ pub fn physical(path: &Path) -> PathBuf {
             return path.to_path_buf();
         }
     }
+}
+
+/// Where the default state dirs of every checkout of this user sit:
+/// `/private/tmp/at.lab-<uid>`, outside every home (the jail fences the homes'
+/// contents, and the harness's tape store must open each directory down to a
+/// run's state root) and short (a state dir under it is at most 56 bytes, so
+/// a socket a lab's program names under a run keeps within the 103 bytes a
+/// unix socket name may take). Its `at.` prefix puts it under every lab
+/// jail's `/private/tmp/at.*` write refusal, which older builds' jails hold
+/// too. macOS's `tmp_cleaner` clears `/private/tmp` of what nobody used for
+/// days: the default is scratch, and a `$LAB_STATE` keeps logs that must
+/// last.
+#[must_use]
+pub fn state_root(uid: u32) -> PathBuf {
+    PathBuf::from(format!("/private/tmp/at.lab-{uid}"))
+}
+
+/// The state dir a checkout at `repo` uses when `$LAB_STATE` is unset:
+/// [`state_root`] and the checkout's own name ([`checkout_key`]), so that two
+/// worktrees' labs of the same tag never share a run dir.
+#[must_use]
+pub fn default_state(uid: u32, repo: &Path) -> PathBuf {
+    state_root(uid).join(checkout_key(repo))
+}
+
+/// A checkout's directory name under [`state_root`]: its last component in
+/// letters, digits, `.`, `_` and `-` (anything else `_`), at most 16 of them,
+/// then `-` and eight hex digits of the FNV-1a hash of its whole path, so
+/// two checkouts of one name differ.
+#[must_use]
+pub fn checkout_key(repo: &Path) -> String {
+    use std::os::unix::ffi::OsStrExt as _;
+    let name: String = repo
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default()
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || "._-".contains(c) {
+                c
+            } else {
+                '_'
+            }
+        })
+        .take(16)
+        .collect();
+    let mut hash: u32 = 0x811c_9dc5;
+    for b in repo.as_os_str().as_bytes() {
+        hash ^= u32::from(*b);
+        hash = hash.wrapping_mul(0x0100_0193);
+    }
+    let name = if name.is_empty() || name.starts_with('.') {
+        format!("lab{name}")
+    } else {
+        name
+    };
+    format!("{name}-{hash:08x}")
+}
+
+/// `dir` made (mode 0700) when missing, then required to be what a private
+/// directory of `uid` is: a directory, not a link to one, owned by `uid`,
+/// writable by nobody else (a looser mode on one `uid` owns is narrowed to
+/// 0700).
+///
+/// # Errors
+/// It cannot be made, or it is a link, not a directory, another user's, or
+/// its mode cannot be narrowed.
+pub fn private_dir(dir: &Path, uid: u32) -> Result<(), String> {
+    use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _, PermissionsExt as _};
+    match std::fs::DirBuilder::new().mode(0o700).create(dir) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(e) => return Err(format!("{}: cannot be made ({e})", dir.display())),
+    }
+    let meta = std::fs::symlink_metadata(dir)
+        .map_err(|e| format!("{}: cannot be read ({e})", dir.display()))?;
+    if meta.file_type().is_symlink() || !meta.is_dir() {
+        return Err(format!(
+            "{} is not a directory (a link, or a file, stands there)",
+            dir.display()
+        ));
+    }
+    if meta.uid() != uid {
+        return Err(format!(
+            "{} belongs to uid {}, not to this user ({uid})",
+            dir.display(),
+            meta.uid()
+        ));
+    }
+    if meta.mode() & 0o077 != 0 {
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).map_err(|e| {
+            format!(
+                "{}: its mode cannot be narrowed to 0700 ({e})",
+                dir.display()
+            )
+        })?;
+    }
+    Ok(())
 }
 
 /// A lab tag: letters, digits, `_` and `-`, at most 24.
@@ -573,5 +753,200 @@ mod tests {
         // NEGATIVE CONTROL
         let env_only = Paths::resolve_with(None, std::env::var_os("HOME"));
         assert!(env_only.real_home.is_empty() && env_only.need_home().is_err());
+    }
+
+    /// THE DEFAULT STATE DIR SITS OUTSIDE EVERY HOME, SHORT AND PER CHECKOUT:
+    /// `/private/tmp/at.lab-<uid>/<name>-<hash>`, the name the checkout's own
+    /// in safe letters (at most 16), the hash its whole path's, so two
+    /// worktrees of one name differ; the longest is 56 bytes. NEGATIVE
+    /// CONTROL: the same checkout path gives the same key.
+    #[test]
+    fn the_default_state_sits_outside_every_home_short_and_per_checkout() {
+        let a = default_state(501, Path::new("/Users//o/Developer/aterm"));
+        let b = default_state(501, Path::new("/Users//o/Developer/wt/aterm"));
+        for d in [&a, &b] {
+            assert!(d.starts_with("/private/tmp/at.lab-501"), "{}", d.display());
+            assert!(!d.starts_with("/Users//o"));
+            let key = d.file_name().unwrap().to_string_lossy();
+            assert!(
+                key.starts_with("aterm-") && key.len() == "aterm-".len() + 8,
+                "{key}"
+            );
+        }
+        assert_ne!(a, b, "two checkouts named aterm keep two state dirs");
+        assert_eq!(a, default_state(501, Path::new("/Users//o/Developer/aterm")));
+        assert!(checkout_key(Path::new("/x/my repo!")).starts_with("my_repo_-"));
+        assert!(checkout_key(Path::new("/x/.hidden")).starts_with("lab.hidden-"));
+        assert!(checkout_key(Path::new("/")).starts_with("lab-"));
+        let long = default_state(
+            u32::MAX,
+            Path::new("/x/a-checkout-whose-name-runs-on-and-on"),
+        );
+        assert!(
+            long.to_string_lossy()
+                .starts_with("/private/tmp/at.lab-4294967295/a-checkout-whose-")
+        );
+        assert_eq!(long.as_os_str().len(), 56, "{}", long.display());
+        // the lab's own facts take it when LAB_STATE is unset
+        let p = paths();
+        if std::env::var_os("LAB_STATE").is_none_or(|s| s.is_empty()) {
+            assert!(p.state_default);
+            assert_eq!(
+                p.state,
+                default_state(crate::sys::getuid(), &physical(&p.repo))
+            );
+            assert!(p.need_state_outside(&p.guarded_homes()).is_ok());
+        }
+    }
+
+    /// A scratch tree under the temp dir, removed when it drops.
+    struct Tree(PathBuf);
+
+    impl Drop for Tree {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn tree(name: &str) -> Tree {
+        let top = std::fs::canonicalize(std::env::temp_dir())
+            .unwrap()
+            .join(format!("lab-paths-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&top);
+        std::fs::create_dir_all(&top).unwrap();
+        Tree(top)
+    }
+
+    fn mode(p: &Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::symlink_metadata(p).unwrap().permissions().mode() & 0o777
+    }
+
+    /// THE DEFAULT STATE DIR IS MADE THIS USER'S PRIVATE DIRECTORY: its root
+    /// and its own directory are made 0700, and a looser root of this user's
+    /// is narrowed. NEGATIVE CONTROLS: a link in the root's place, a file
+    /// there, and a root another user owns (the uid seam) are each refused,
+    /// naming `LAB_STATE`; a named `$LAB_STATE` is left as it is.
+    #[test]
+    fn the_default_state_is_made_private_and_a_squatted_root_is_refused() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let t = tree("private");
+        let uid = crate::sys::getuid();
+        let mut p = Paths::resolve_with(None, None);
+        p.state_relative = None;
+        p.state_default = true;
+        p.state = t.0.join("root/key");
+        p.make_default_state().unwrap();
+        assert_eq!((mode(&t.0.join("root")), mode(&p.state)), (0o700, 0o700));
+        std::fs::set_permissions(t.0.join("root"), std::fs::Permissions::from_mode(0o755)).unwrap();
+        p.make_default_state().unwrap();
+        assert_eq!(mode(&t.0.join("root")), 0o700, "a looser root is narrowed");
+        // NEGATIVE CONTROLS
+        std::fs::create_dir_all(t.0.join("elsewhere")).unwrap();
+        std::os::unix::fs::symlink(t.0.join("elsewhere"), t.0.join("linked")).unwrap();
+        p.state = t.0.join("linked/key");
+        let err = p.make_default_state().unwrap_err();
+        assert!(
+            err.contains("not a directory") && err.contains("set LAB_STATE"),
+            "{err}"
+        );
+        assert!(
+            !t.0.join("elsewhere/key").exists(),
+            "nothing made through the link"
+        );
+        std::fs::write(t.0.join("file"), "x").unwrap();
+        p.state = t.0.join("file/key");
+        assert!(
+            p.make_default_state()
+                .unwrap_err()
+                .contains("not a directory")
+        );
+        let err = private_dir(&t.0.join("root"), uid.wrapping_add(1)).unwrap_err();
+        assert!(err.contains("belongs to uid"), "{err}");
+        p.state_default = false;
+        p.state = t.0.join("linked/key");
+        assert!(
+            p.make_default_state().is_ok(),
+            "a named LAB_STATE is not touched"
+        );
+    }
+
+    /// THE STATE DIR A VERB MAKES THINGS IN IS MADE PRIVATE FIRST, whichever
+    /// verb asks ([`Paths::need_state`]): `fleet-sim` skips the lab's
+    /// up-front check and writes its record under `need_state()`, so a link
+    /// planted at the default's root in the shared `/private/tmp` is refused
+    /// there and nothing is made through it, and a fresh default comes back
+    /// made, mode 0700. NEGATIVE CONTROLS: the same calls on a named
+    /// `$LAB_STATE` make nothing and go through, a relative one is refused,
+    /// and [`Paths::need_state_outside`] (a check) makes nothing.
+    #[test]
+    fn the_state_a_verb_makes_things_in_is_made_private_first() {
+        let t = tree("need");
+        let mut p = Paths::resolve_with(None, None);
+        p.state_relative = None;
+        p.state_default = true;
+        std::fs::create_dir_all(t.0.join("elsewhere")).unwrap();
+        std::os::unix::fs::symlink(t.0.join("elsewhere"), t.0.join("linked")).unwrap();
+        p.state = t.0.join("linked/key");
+        let err = p.need_state().unwrap_err();
+        assert!(err.contains("not a directory"), "{err}");
+        let results = t.0.join("linked/key/results");
+        assert!(
+            !t.0.join("elsewhere/key").exists() && !results.exists(),
+            "nothing made through the link"
+        );
+        p.state = t.0.join("root/key");
+        assert!(p.need_state_outside(&[]).is_ok());
+        assert!(!t.0.join("root").exists(), "a check makes nothing");
+        assert_eq!(p.need_state().unwrap(), t.0.join("root/key"));
+        assert_eq!((mode(&t.0.join("root")), mode(&p.state)), (0o700, 0o700));
+        // NEGATIVE CONTROLS
+        p.state_default = false;
+        p.state = t.0.join("named/key");
+        assert_eq!(p.need_state().unwrap(), t.0.join("named/key"));
+        assert!(
+            !t.0.join("named").exists(),
+            "a named LAB_STATE is not made here"
+        );
+        p.state_relative = Some("rel".into());
+        assert!(p.need_state().unwrap_err().contains("is relative"));
+    }
+
+    /// A STATE DIR INSIDE A FENCED HOME IS REFUSED: in the account's home,
+    /// in a scratch `HOME`, the home itself, and a path outside that leads in
+    /// by a link, each naming the home and the default. NEGATIVE CONTROLS: a
+    /// directory outside both homes and a sibling whose name only starts like
+    /// the home's go through.
+    #[test]
+    fn a_state_dir_inside_a_home_is_refused_and_one_outside_goes_through() {
+        let t = tree("inside");
+        let (account, scratch) = (t.0.join("account"), t.0.join("scratch-home"));
+        for h in [&account, &scratch] {
+            std::fs::create_dir_all(h.join("lab")).unwrap();
+        }
+        std::os::unix::fs::symlink(account.join("lab"), t.0.join("leads-in")).unwrap();
+        let mut p = Paths::resolve_with(Some(account.clone()), Some(scratch.clone().into()));
+        p.state_relative = None;
+        p.state_default = false;
+        let homes = p.guarded_homes();
+        for (state, home) in [
+            (account.join("lab/state"), &account),
+            (scratch.join("lab"), &scratch),
+            (account.clone(), &account),
+            (t.0.join("leads-in/state"), &account),
+        ] {
+            p.state = state;
+            let err = p.need_state_outside(&homes).unwrap_err();
+            assert!(
+                err.contains(&format!("sits inside the home {}", home.display()))
+                    && err.contains("/private/tmp/at.lab-"),
+                "{err}"
+            );
+        }
+        // NEGATIVE CONTROLS
+        for state in [t.0.join("outside"), t.0.join("account2/state")] {
+            p.state = state.clone();
+            assert_eq!(p.need_state_outside(&homes), Ok(state.as_path()));
+        }
     }
 }

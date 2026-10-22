@@ -140,6 +140,7 @@ pub mod wait_tally;
 ///
 /// Nothing orders by it (a broker-stamped time is a named seed, §4.1, §14), so
 /// a clock jump costs a confusing display and nothing else.
+#[inline]
 #[must_use]
 pub fn now_ms() -> u64 {
     aterm_time::unix_millis().unwrap_or(0)

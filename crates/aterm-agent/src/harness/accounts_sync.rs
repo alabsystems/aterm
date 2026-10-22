@@ -24,7 +24,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::io::{self, BufRead, Read, Seek, SeekFrom, Write};
 use std::net::{SocketAddr, TcpListener};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -666,6 +666,126 @@ pub fn find_default_home_standing_wall(
     newest_wall.filter(|w| w.at >= newest_clear_at)
 }
 
+/// Match a `"session_context"` transcript line's `"userEmail"` against `roster`
+/// IN MEMORY ONLY, returning `Some(Some(label))` when the line names an email
+/// in `roster`, `Some(None)` when the line names an email not in `roster`, or
+/// `None` when the line is not a `"session_context"` with `"userEmail"`.
+fn match_session_context_label(line: &str, roster: &Roster) -> Option<Option<String>> {
+    if !line.contains("\"session_context\"") || !line.contains("\"userEmail\"") {
+        return None;
+    }
+    let v: Value = aterm_json::from_str(line).ok()?;
+    let attachment = v.get("attachment")?;
+    if attachment.get("type").and_then(Value::as_str) != Some("session_context") {
+        return None;
+    }
+    let user_email = attachment.get("context")?.get("userEmail")?.as_str()?;
+    let tok = user_email
+        .split([' ', '\t', '\n', '\r', '<', '>', '"', '\''])
+        .map(|s| s.trim_end_matches(['.', ',', ';', ':']))
+        .find(|s| s.contains('@'))?;
+    let matched = roster
+        .rows
+        .iter()
+        .find(|r| {
+            r.email
+                .as_deref()
+                .is_some_and(|re| accounts::email_matches(re, tok))
+        })
+        .map(|r| r.label.clone());
+    Some(matched)
+}
+
+/// Scan recent `.jsonl` transcripts under `<claude_dir>/projects/*/*.jsonl`
+/// (up to 16 newest files by modification time), attributing quota walls and
+/// model answers to the active account row tracked via `"session_context"`
+/// `"userEmail"` entries (falling back to the roster's default login row when
+/// a transcript has no `"session_context"`). Returns each roster label's
+/// newest standing quota wall (`until > now`) that was not cleared by a newer
+/// model turn under that same label.
+#[must_use]
+pub fn find_transcript_walls_by_email(
+    claude_dir: &Path,
+    roster: &Roster,
+    now: i64,
+) -> BTreeMap<String, upgrade::StandingWall> {
+    let projects = claude_dir.join("projects");
+    let Ok(entries) = fs::read_dir(&projects) else {
+        return BTreeMap::new();
+    };
+    let mut files_with_mtime: Vec<(std::time::SystemTime, PathBuf)> = Vec::new();
+    for proj in entries.flatten() {
+        if !proj.file_type().is_ok_and(|ft| ft.is_dir()) {
+            continue;
+        }
+        let Ok(files) = fs::read_dir(proj.path()) else {
+            continue;
+        };
+        for file in files.flatten() {
+            let path = file.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+                continue;
+            }
+            let mtime = file
+                .metadata()
+                .and_then(|m| m.modified())
+                .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+            files_with_mtime.push((mtime, path));
+        }
+    }
+    files_with_mtime.sort_by_key(|a| std::cmp::Reverse(a.0));
+    files_with_mtime.truncate(16);
+
+    let default_label = roster.row_for_login(None).map(|r| r.label.clone());
+    let mut newest_wall: BTreeMap<String, upgrade::StandingWall> = BTreeMap::new();
+    let mut newest_answer: BTreeMap<String, u64> = BTreeMap::new();
+
+    for (_, path) in files_with_mtime {
+        let Ok(f) = fs::File::open(&path) else {
+            continue;
+        };
+        let mut reader = io::BufReader::new(f);
+        let mut current_label: Option<String> = default_label.clone();
+        let mut line = String::new();
+        while reader.read_line(&mut line).ok().is_some_and(|n| n > 0) {
+            if line.contains("\"session_context\"") && line.contains("\"userEmail\"") {
+                if let Some(matched) = match_session_context_label(&line, roster) {
+                    current_label = matched;
+                }
+            } else if line.contains("<local-command-stdout>Login successful</local-command-stdout>")
+            {
+                current_label = None;
+            } else if line.contains("\"assistant\"")
+                && let Some(label) = current_label.as_deref()
+            {
+                if line.contains("\"quotaLimits\"") && line.contains("\"rejected\"") {
+                    if let Some(wall) = upgrade::transcript_standing_wall(&line) {
+                        let until = wall.until.and_then(|u| i64::try_from(u).ok());
+                        if until.is_some_and(|u| u > now)
+                            && newest_wall.get(label).is_none_or(|prev| wall.at > prev.at)
+                        {
+                            newest_wall.insert(label.to_owned(), wall);
+                        }
+                    }
+                } else if line.contains("\"model\"")
+                    && !line.contains("<synthetic>")
+                    && !line.contains("\"isApiErrorMessage\":true")
+                    && !line.contains("\"isApiErrorMessage\": true")
+                    && !line.contains("\"isSidechain\":true")
+                    && !line.contains("\"isSidechain\": true")
+                    && let Some(ans_at) = upgrade::transcript_last_answer(&line, u64::MAX)
+                {
+                    let entry = newest_answer.entry(label.to_owned()).or_insert(0);
+                    *entry = (*entry).max(ans_at);
+                }
+            }
+            line.clear();
+        }
+    }
+    newest_wall.retain(|label, wall| wall.at >= newest_answer.get(label).copied().unwrap_or(0));
+    newest_wall
+}
+
 fn read_file_tail(path: &Path, max_bytes: u64) -> Option<String> {
     let mut f = fs::File::open(path).ok()?;
     let len = f.metadata().ok()?.len();
@@ -785,12 +905,6 @@ pub fn load_fleet_source(env: &Env, source: Option<&str>) -> Result<FleetRoster,
 }
 
 fn default_sync_source(env: &Env) -> String {
-    if let Some(home) = &env.home {
-        let downloads = home.join("Downloads").join(DEFAULT_DOWNLOADS_CSV);
-        if downloads.is_file() {
-            return downloads.to_string_lossy().into_owned();
-        }
-    }
     if let Some(roster_path) = env.accounts_roster()
         && let Some(parent) = roster_path.parent()
     {
@@ -925,7 +1039,7 @@ fn persist_accounts_sync(
     fleet: &FleetRoster,
     machine: &str,
     default_email: Option<&str>,
-    standing_wall: Option<&upgrade::StandingWall>,
+    standing_walls: &BTreeMap<String, upgrade::StandingWall>,
     now: i64,
 ) -> Result<SyncedAccounts, String> {
     let held = store
@@ -995,16 +1109,19 @@ fn persist_accounts_sync(
                         ));
                     }
                 }
-                if let Some(wall) = standing_wall {
-                    let win = wall
-                        .window
-                        .as_deref()
-                        .filter(|w| !w.trim().is_empty())
-                        .unwrap_or(accounts::UNNAMED_WINDOW);
-                    let until = wall.until.and_then(|u| i64::try_from(u).ok());
-                    let at = i64::try_from(wall.at).unwrap_or(now).min(now);
-                    events.extend(accounts::note_wall(state, label, win, until, at, now));
+            }
+            for (wall_label, wall) in standing_walls {
+                if roster.row(wall_label).is_none() {
+                    continue;
                 }
+                let win = wall
+                    .window
+                    .as_deref()
+                    .filter(|w| !w.trim().is_empty())
+                    .unwrap_or(accounts::UNNAMED_WINDOW);
+                let until = wall.until.and_then(|u| i64::try_from(u).ok());
+                let at = i64::try_from(wall.at).unwrap_or(now).min(now);
+                events.extend(accounts::note_wall(state, wall_label, win, until, at, now));
             }
             Ok(events)
         })
@@ -1085,9 +1202,12 @@ pub fn run_accounts_sync(
 
     // The potentially slow discovery is outside the short account lock.
     let store = env.accounts_store();
-    let standing_wall = env
+    let prelim_roster =
+        build_machine_roster(&fleet, &machine, &store, None, default_email.as_deref());
+    let standing_walls = env
         .claude_dir()
-        .and_then(|dir| find_default_home_standing_wall(&dir, env.now));
+        .map(|dir| find_transcript_walls_by_email(&dir, &prelim_roster, env.now))
+        .unwrap_or_default();
     let SyncedAccounts {
         roster,
         fleet_path,
@@ -1099,7 +1219,7 @@ pub fn run_accounts_sync(
         &fleet,
         &machine,
         default_email.as_deref(),
-        standing_wall.as_ref(),
+        &standing_walls,
         env.now,
     ) {
         Ok(saved) => saved,
@@ -1115,7 +1235,14 @@ pub fn run_accounts_sync(
     let needs_renew: Vec<String> = roster
         .rows
         .iter()
-        .filter(|r| r.dir.is_some() && !enrolled.contains(&r.label))
+        .filter(|r| {
+            r.dir.is_some()
+                && !enrolled.contains(&r.label)
+                && !state
+                    .accounts
+                    .get(&r.label)
+                    .is_some_and(|a| a.limited_until(env.now).is_some())
+        })
         .map(|r| r.label.clone())
         .collect();
 
@@ -1183,6 +1310,17 @@ pub fn run_accounts_sync(
                 accounts::Condition::Limited { until } => {
                     format!("limited until {}", super::usage::rfc3339_utc(until))
                 }
+                accounts::Condition::NotEnrolled => match state
+                    .accounts
+                    .get(&row.label)
+                    .and_then(|a| a.limited_until(env.now))
+                {
+                    Some(until) => format!(
+                        "not-enrolled (limited until {})",
+                        super::usage::rfc3339_utc(until)
+                    ),
+                    None => accounts::Condition::NotEnrolled.as_str().to_owned(),
+                },
                 other => other.as_str().to_owned(),
             };
             let where_word = if row.dir.is_none() {
@@ -1210,6 +1348,365 @@ pub fn run_accounts_sync(
         }
     }
     ExitCode::SUCCESS
+}
+
+static AUTO_SYNC_COOLDOWN: std::sync::Mutex<Option<Instant>> = std::sync::Mutex::new(None);
+
+/// Auto-sync `accounts.toml` when `roster_path` is missing on a live host,
+/// bounded by a 10-minute cooldown so a machine without network/rclone access
+/// is not re-queried on every turn. Returns `true` when `roster_path` exists.
+pub fn sync_if_missing_live(home: &Path, state_dir: &Path, roster_path: &Path, now: i64) -> bool {
+    if roster_path.exists() {
+        return true;
+    }
+    {
+        let mut guard = AUTO_SYNC_COOLDOWN
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if guard.is_some_and(|last| last.elapsed() < Duration::from_secs(600)) {
+            return false;
+        }
+        *guard = Some(Instant::now());
+    }
+    let config_path = roster_path
+        .parent()
+        .map(|p| p.join("aterm.toml"))
+        .unwrap_or_else(|| PathBuf::from("aterm.toml"));
+    let env = Env {
+        state: state_dir.to_path_buf(),
+        aterm_state: state_dir
+            .parent()
+            .and_then(Path::parent)
+            .map(Path::to_path_buf),
+        cwd: home.to_path_buf(),
+        home: Some(home.to_path_buf()),
+        claude_dir: Some(home.join(".claude")),
+        claude_config_unusable: None,
+        claude_profile: Some(home.join(".claude.json")),
+        claude_custom_oauth: false,
+        claude_session: None,
+        claude_pid: None,
+        codex_thread: None,
+        codex_home: None,
+        now,
+        tz_s: 0,
+        sid: String::new(),
+        sock: None,
+        config: Some(config_path),
+        claude_tmp: None,
+        claude_running: None,
+    };
+    let mut out = Vec::new();
+    let mut err = Vec::new();
+    let _ = run_accounts_sync(&env, None, None, true, &mut out, &mut err);
+    roster_path.exists()
+}
+
+struct AutoRenewGuard {
+    in_flight: bool,
+    last_attempt: BTreeMap<String, Instant>,
+}
+
+static AUTO_RENEW_GUARD: std::sync::LazyLock<std::sync::Arc<std::sync::Mutex<AutoRenewGuard>>> =
+    std::sync::LazyLock::new(|| {
+        std::sync::Arc::new(std::sync::Mutex::new(AutoRenewGuard {
+            in_flight: false,
+            last_attempt: BTreeMap::new(),
+        }))
+    });
+
+/// Own busy admission before the closure reaches the thread builder. A
+/// refused spawn drops the closure too, releasing the same permit that a
+/// finished or unwinding worker releases.
+struct AutoRenewPermit(std::sync::Arc<std::sync::Mutex<AutoRenewGuard>>);
+
+impl AutoRenewPermit {
+    fn claim(
+        state: &std::sync::Arc<std::sync::Mutex<AutoRenewGuard>>,
+        label: &str,
+        now: Instant,
+    ) -> Option<Self> {
+        let mut guard = state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if guard.in_flight
+            || guard
+                .last_attempt
+                .get(label)
+                .is_some_and(|last| now.saturating_duration_since(*last) < Duration::from_secs(900))
+        {
+            return None;
+        }
+        guard.in_flight = true;
+        guard.last_attempt.insert(label.to_owned(), now);
+        Some(Self(std::sync::Arc::clone(state)))
+    }
+}
+
+impl Drop for AutoRenewPermit {
+    fn drop(&mut self) {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .in_flight = false;
+    }
+}
+
+fn start_auto_renew(
+    permit: AutoRenewPermit,
+    work: impl FnOnce() + Send + 'static,
+    spawn: impl FnOnce(Box<dyn FnOnce() + Send>) -> io::Result<()>,
+) -> io::Result<()> {
+    spawn(Box::new(move || {
+        let _permit = permit;
+        work();
+    }))
+}
+
+fn resolve_claude_program(home: &Path) -> PathBuf {
+    let local_bin = home.join(".local/bin/claude");
+    if local_bin.is_file() {
+        return local_bin;
+    }
+    if let Some(twin) = super::upgrade_drive::managed_agent_twin("claude") {
+        return twin;
+    }
+    PathBuf::from("claude")
+}
+
+fn resolve_opener_link(home: &Path, store: &accounts::Store) -> Option<PathBuf> {
+    let custom_opener = home.join(".local/bin").join(super::open_url::OPENER);
+    if custom_opener.is_file() {
+        struct HomeOpenerHost(PathBuf);
+        impl super::cli::AccountsHost for HomeOpenerHost {
+            fn stdin_is_terminal(&self) -> bool {
+                false
+            }
+            fn auth_status(&self, _: &str) -> Result<super::align::Captured, String> {
+                Err("unused".to_owned())
+            }
+            fn unaskable(&self) -> Option<String> {
+                None
+            }
+            fn login(&self, _: Option<&str>) -> Result<i32, String> {
+                Err("unused".to_owned())
+            }
+            fn now(&self) -> i64 {
+                0
+            }
+            fn renew_flow(
+                &self,
+                _: &str,
+                _: &str,
+                _: &super::cli::RenewBrowser,
+            ) -> Result<i32, String> {
+                Err("unused".to_owned())
+            }
+            fn status_in_home(&self, _: &str) -> Result<super::align::Captured, String> {
+                Err("unused".to_owned())
+            }
+            fn current_exe(&self) -> Option<PathBuf> {
+                Some(self.0.clone())
+            }
+        }
+        return super::cli::opener_link(store, &HomeOpenerHost(custom_opener));
+    }
+    super::cli::opener_link(store, &super::cli::LiveAccounts)
+}
+
+fn resolve_mailbox_dir(home: &Path, store: &accounts::Store) -> Option<PathBuf> {
+    if let Some(env_val) = std::env::var_os(super::open_url::MAILBOX_ENV).filter(|v| !v.is_empty())
+    {
+        let path = PathBuf::from(env_val);
+        if path.is_dir() {
+            return Some(path);
+        }
+    }
+    let store_mailbox = store.dir.join(super::open_url::DEFAULT_MAILBOX_DIR);
+    if store_mailbox.is_dir() {
+        return Some(store_mailbox);
+    }
+    let config_mailbox = home
+        .join(".config/aterm")
+        .join(super::open_url::DEFAULT_MAILBOX_DIR);
+    if config_mailbox.is_dir() {
+        return Some(config_mailbox);
+    }
+    None
+}
+
+/// When the active or default account (or any recorded session's account) on a
+/// live host stands at a quota wall and no enrolled account is ready to take
+/// over (`candidates` has no `Ok`), automatically launches a background
+/// `claude auth login --claudeai --email <email>` renewal into a staging
+/// directory for the next non-limited account (`sign_in_next`), bounded by a
+/// single in-flight worker and a 15-minute per-label cooldown. Once verified
+/// via `claude auth status --json`, binds the account in `logins.json` +
+/// `state.json` and touches `wake` so waiting sessions rotate immediately.
+pub fn auto_renew_next_account(home: &Path, state_dir: &Path, roster_path: &Path, now: i64) {
+    let Ok(file_roster) = Roster::load(roster_path) else {
+        return;
+    };
+    if file_roster.rows.is_empty() {
+        return;
+    }
+    let store = accounts::Store::at(state_dir);
+    let Ok((state, _)) = store.load(now) else {
+        return;
+    };
+    let Ok((logins, _)) = store.load_logins(now) else {
+        return;
+    };
+    let roster = accounts::bound(&file_roster, &logins);
+    let enrolled = accounts::enrolled(&roster);
+    let me = state
+        .active
+        .as_deref()
+        .filter(|label| roster.row(label).is_some())
+        .or_else(|| roster.row_for_login(None).map(|row| row.label.as_str()));
+    let is_walled = |label: &str| {
+        state
+            .accounts
+            .get(label)
+            .is_some_and(|a| a.limited_until(now).is_some() || a.auth == accounts::Auth::SignedOut)
+    };
+    let any_walled =
+        me.is_some_and(is_walled) || state.sessions.values().any(|s| is_walled(&s.account));
+    if !any_walled {
+        return;
+    }
+    let wall_point = accounts::Point::Wall {
+        window: String::new(),
+        at: None,
+    };
+    let has_ready_candidate =
+        accounts::candidates(&roster, &state, &enrolled, me, &wall_point, now)
+            .iter()
+            .any(|(_, verdict)| verdict.is_ok());
+    if has_ready_candidate {
+        return;
+    }
+    let Some((next_label, true)) = accounts::sign_in_next(&roster, &state, &enrolled, me, now)
+    else {
+        return;
+    };
+    let Some(next_row) = roster.row(&next_label).cloned() else {
+        return;
+    };
+    let Some(next_email) = next_row.email.clone() else {
+        return;
+    };
+    let Some(permit) = AutoRenewPermit::claim(&AUTO_RENEW_GUARD, &next_label, Instant::now())
+    else {
+        return;
+    };
+    let home_owned = home.to_path_buf();
+    let state_owned = state_dir.to_path_buf();
+    let _ = start_auto_renew(
+        permit,
+        move || {
+            let store = accounts::Store::at(&state_owned);
+            let Ok(staging) = store.claim_staging_dir(&next_label) else {
+                return;
+            };
+            let Some(staging_text) = staging.to_str().map(str::to_owned) else {
+                let _ = fs::remove_dir_all(&staging);
+                return;
+            };
+            let env_var = |name: &str| {
+                std::env::var_os(name)
+                    .or_else(|| (name == "USER").then(|| std::ffi::OsString::from("aterm")))
+            };
+            let Ok(pass_env) = super::cli::auth_check_env(&env_var) else {
+                let _ = fs::remove_dir_all(&staging);
+                return;
+            };
+            let mailbox_dir = resolve_mailbox_dir(&home_owned, &store);
+            let opener = resolve_opener_link(&home_owned, &store);
+            let browser = match (next_row.browser.as_deref(), opener) {
+                (Some(profile), Some(opener)) => super::cli::RenewBrowser::Profile {
+                    opener,
+                    profile: profile.to_owned(),
+                },
+                (None, Some(opener)) if mailbox_dir.is_some() => super::cli::RenewBrowser::Remote {
+                    opener: Some(opener),
+                },
+                _ => super::cli::RenewBrowser::Default,
+            };
+            let claude_prog = resolve_claude_program(&home_owned);
+            let mut cmd = super::cli::renew_command(
+                claude_prog.as_os_str(),
+                &staging_text,
+                &next_email,
+                &browser,
+            );
+            cmd.env("HOME", &home_owned)
+                .env(super::open_url::EMAIL_ENV, &next_email)
+                .envs(pass_env);
+            if let Some(mailbox) = &mailbox_dir {
+                cmd.env(super::open_url::MAILBOX_ENV, mailbox);
+            }
+            let ran = super::align::capture_bounded(cmd, Duration::from_secs(300), 64 * 1024);
+            if !ran.is_ok_and(|cap| cap.code == Some(0)) || !accounts::login_made(&staging) {
+                let _ = fs::remove_dir_all(&staging);
+                return;
+            }
+            let Ok(status_got) = super::cli::status_in_home_within(
+                claude_prog.as_os_str(),
+                &staging_text,
+                &env_var,
+                super::cli::AUTH_CHECK_BUDGET,
+            ) else {
+                let _ = fs::remove_dir_all(&staging);
+                return;
+            };
+            let now_done = crate::supervise::limit::unix_now().max(now);
+            let matched = std::iter::once(&next_row)
+                .chain(roster.rows.iter().filter(|r| r.label != next_row.label))
+                .find_map(|row| {
+                    let email = row.email.as_deref()?;
+                    let facts = super::cli::status_facts(&status_got, email)?;
+                    if !facts.renews() {
+                        return None;
+                    }
+                    Some((row.label.clone(), facts.subscription))
+                });
+            let Some((matched_label, subscription)) = matched else {
+                let _ = fs::remove_dir_all(&staging);
+                return;
+            };
+            let (fresh_state, _) = store.load(now_done).unwrap_or_default();
+            if fresh_state
+                .accounts
+                .get(&matched_label)
+                .is_some_and(|a| a.limited_until(now_done).is_some())
+            {
+                let _ = fs::remove_dir_all(&staging);
+                return;
+            }
+            let own_dir = file_roster
+                .row(&matched_label)
+                .and_then(|r| r.dir.as_deref());
+            let mut note = None;
+            let _ = store.transact_logins(now_done, &mut note, |state, logins| {
+                Ok(accounts::note_renewed(
+                    state,
+                    logins,
+                    &matched_label,
+                    own_dir,
+                    &staging_text,
+                    subscription.as_deref(),
+                    now_done,
+                ))
+            });
+        },
+        |work| {
+            std::thread::Builder::new()
+                .name("aterm-auto-renew".to_owned())
+                .spawn(work)
+                .map(|_| ())
+        },
+    );
 }
 
 /// Run `aterm harness accounts serve [--bind <addr:port>] [<source>] [--machine <mN>]`.
@@ -2066,13 +2563,14 @@ m,email,computer,,claude,Open AI,google,meta,Payment,notes,,
                 Ok(rows)
             })
             .expect("observed before adoption");
+        let empty_walls = BTreeMap::new();
         let saved = persist_accounts_sync(
             &store,
             &roster_path,
             &fleet,
             "m8",
             Some("two@example.test"),
-            None,
+            &empty_walls,
             now,
         )
         .expect("publish captured inputs");
@@ -2120,8 +2618,9 @@ m,email,computer,,claude,Open AI,google,meta,Payment,notes,,
             );
         }
 
-        let kept = persist_accounts_sync(&store, &roster_path, &fleet, "m8", None, None, now)
-            .expect("preserve the current default without a profile hint");
+        let kept =
+            persist_accounts_sync(&store, &roster_path, &fleet, "m8", None, &empty_walls, now)
+                .expect("preserve the current default without a profile hint");
         assert_eq!(kept.roster.row_for_login(None).unwrap().label, "m8-2");
         let before_roster = fs::read(&target).unwrap();
         let before_fleet = fs::read(&saved.fleet_path).unwrap();
@@ -2130,7 +2629,8 @@ m,email,computer,,claude,Open AI,google,meta,Payment,notes,,
         let malformed = b"[[account]\nlabel = \"broken\"\n";
         fs::write(&target, malformed).unwrap();
         assert!(
-            persist_accounts_sync(&store, &roster_path, &fleet, "m8", None, None, now).is_err()
+            persist_accounts_sync(&store, &roster_path, &fleet, "m8", None, &empty_walls, now)
+                .is_err()
         );
         assert_eq!(fs::read(&target).unwrap(), malformed);
         assert_eq!(fs::read(&saved.fleet_path).unwrap(), before_fleet);
@@ -2143,8 +2643,16 @@ m,email,computer,,claude,Open AI,google,meta,Payment,notes,,
             let before = fs::read(&path).unwrap();
             fs::write(&path, "{\"schema\":999}").unwrap();
             assert!(
-                persist_accounts_sync(&store, &roster_path, &changed, "m8", None, None, now)
-                    .is_err()
+                persist_accounts_sync(
+                    &store,
+                    &roster_path,
+                    &changed,
+                    "m8",
+                    None,
+                    &empty_walls,
+                    now
+                )
+                .is_err()
             );
             assert_eq!(fs::read(&target).unwrap(), before_roster);
             assert_eq!(fs::read(&saved.fleet_path).unwrap(), before_fleet);
@@ -2160,7 +2668,7 @@ m,email,computer,,claude,Open AI,google,meta,Payment,notes,,
                 &duplicated_fleet,
                 "m8",
                 None,
-                None,
+                &empty_walls,
                 now
             )
             .is_err()
@@ -2173,7 +2681,16 @@ m,email,computer,,claude,Open AI,google,meta,Payment,notes,,
         fs::remove_file(&saved.fleet_path).unwrap();
         fs::create_dir(&saved.fleet_path).unwrap();
         assert!(
-            persist_accounts_sync(&store, &roster_path, &changed, "m8", None, None, now).is_err()
+            persist_accounts_sync(
+                &store,
+                &roster_path,
+                &changed,
+                "m8",
+                None,
+                &empty_walls,
+                now
+            )
+            .is_err()
         );
         assert_eq!(
             Roster::load(&target)
@@ -2187,7 +2704,8 @@ m,email,computer,,claude,Open AI,google,meta,Payment,notes,,
         assert!(saved.fleet_path.is_dir());
         fs::remove_dir(&saved.fleet_path).unwrap();
         let reset =
-            persist_accounts_sync(&store, &roster_path, &fleet, "m8", None, None, now).unwrap();
+            persist_accounts_sync(&store, &roster_path, &fleet, "m8", None, &empty_walls, now)
+                .unwrap();
 
         // Exercise the actual CLI function's failure return and absence of
         // success output using a local CSV and no vendor/profile location.
@@ -2268,5 +2786,115 @@ m,email,computer,,claude,Open AI,google,meta,Payment,notes,,
             None,
             "a newer model turn in another transcript clears the older transcript's wall"
         );
+    }
+
+    #[test]
+    fn transcript_walls_by_email_retains_prior_account_wall_after_in_session_login_switch() {
+        let dir = aterm_tempfile::Builder::new()
+            .prefix("aterm-walls-by-email-")
+            .tempdir()
+            .expect("tempdir");
+        let proj = dir.path().join("projects").join("ws");
+        fs::create_dir_all(&proj).unwrap();
+        let transcript = proj.join("conv.jsonl");
+        let lines = concat!(
+            "{\"type\":\"attachment\",\"attachment\":{\"type\":\"session_context\",\"context\":{\"userEmail\":\"The user's email address is first@example.test. Use it only to identify the user.\"}}}\n",
+            "{\"type\":\"assistant\",\"timestamp\":\"2026-10-20T06:50:53Z\",\"isApiErrorMessage\":true,\"error\":\"rate_limit\",\"message\":{\"model\":\"<synthetic>\",\"content\":[{\"type\":\"text\",\"text\":\"You've hit your weekly limit · resets Oct 23 at 8am\"}]},\"quotaLimits\":{\"status\":\"rejected\",\"resetsAt\":1792767600,\"rateLimitType\":\"seven_day\"}}\n",
+            "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"<local-command-stdout>Login successful</local-command-stdout>\"}}\n",
+            "{\"type\":\"attachment\",\"attachment\":{\"type\":\"session_context\",\"context\":{\"userEmail\":\"The user's email address is second@example.test. Use it only to identify the user.\"},\"changed\":true,\"reason\":\"account_change\"}}\n",
+            "{\"type\":\"assistant\",\"timestamp\":\"2026-10-20T07:00:00Z\",\"message\":{\"model\":\"claude-opus-5-5\",\"content\":[{\"type\":\"text\",\"text\":\"done\"}]}}\n",
+            "{\"type\":\"assistant\",\"timestamp\":\"2026-10-22T06:21:44Z\",\"isApiErrorMessage\":true,\"error\":\"rate_limit\",\"message\":{\"model\":\"<synthetic>\",\"content\":[{\"type\":\"text\",\"text\":\"You've hit your weekly limit · resets Oct 22 at 10pm\"}]},\"quotaLimits\":{\"status\":\"rejected\",\"resetsAt\":1792731600,\"rateLimitType\":\"seven_day\"}}\n"
+        );
+        fs::write(&transcript, lines).unwrap();
+        let roster = Roster {
+            rows: vec![
+                Row {
+                    label: "m15-2".into(),
+                    dir: None,
+                    email: Some("second@example.test".into()),
+                    ..Row::default()
+                },
+                Row {
+                    label: "m15".into(),
+                    dir: Some("/tmp/m15".into()),
+                    email: Some("first@example.test".into()),
+                    ..Row::default()
+                },
+                Row {
+                    label: "m15-3".into(),
+                    dir: Some("/tmp/m15-3".into()),
+                    email: Some("third@example.test".into()),
+                    ..Row::default()
+                },
+            ],
+        };
+        let now = 1_792_660_000;
+        let walls = find_transcript_walls_by_email(dir.path(), &roster, now);
+        assert_eq!(
+            walls.get("m15").and_then(|w| w.until),
+            Some(1_792_767_600),
+            "first account's weekly wall stands even after switching to second account"
+        );
+        assert_eq!(
+            walls.get("m15-2").and_then(|w| w.until),
+            Some(1_792_731_600),
+            "second account's weekly wall is also recorded"
+        );
+        assert!(!walls.contains_key("m15-3"));
+    }
+
+    /// The production permit and spawn seam, without a thread, process,
+    /// account home or global guard reset. A refused builder must release
+    /// busy admission; a queued worker owns it until it actually finishes.
+    #[test]
+    fn a_refused_renewal_worker_releases_admission_without_running_it() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::{Arc, Mutex};
+
+        let state = Arc::new(Mutex::new(AutoRenewGuard {
+            in_flight: false,
+            last_attempt: BTreeMap::new(),
+        }));
+        let now = Instant::now();
+        let ran = Arc::new(AtomicBool::new(false));
+        let called = Arc::clone(&ran);
+        let permit = AutoRenewPermit::claim(&state, "first", now).expect("admitted");
+        let result = start_auto_renew(
+            permit,
+            move || called.store(true, Ordering::SeqCst),
+            |_work| Err(io::Error::other("injected spawn refusal")),
+        );
+        assert!(result.is_err());
+        assert!(!ran.load(Ordering::SeqCst), "a refused spawn ran nothing");
+        assert!(!state.lock().unwrap().in_flight, "refusal releases busy");
+        assert!(
+            AutoRenewPermit::claim(&state, "first", now).is_none(),
+            "the per-label cooldown still prevents repeated attempts"
+        );
+
+        let permit = AutoRenewPermit::claim(&state, "second", now)
+            .expect("spawn refusal cannot block another account");
+        let called = Arc::clone(&ran);
+        let mut queued = None;
+        start_auto_renew(
+            permit,
+            move || called.store(true, Ordering::SeqCst),
+            |work| {
+                queued = Some(work);
+                Ok(())
+            },
+        )
+        .expect("accepted by injected builder");
+        assert!(!ran.load(Ordering::SeqCst), "still queued");
+        assert!(state.lock().unwrap().in_flight);
+        assert!(AutoRenewPermit::claim(&state, "third", now).is_none());
+        queued.take().expect("queued worker")();
+        assert!(ran.load(Ordering::SeqCst), "accepted worker ran");
+        assert!(!state.lock().unwrap().in_flight, "completion releases busy");
+        let later = now + Duration::from_secs(900);
+        let permit = AutoRenewPermit::claim(&state, "first", later)
+            .expect("the original account can retry after its cooldown");
+        drop(permit);
+        assert!(!state.lock().unwrap().in_flight);
     }
 }

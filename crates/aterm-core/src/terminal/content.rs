@@ -12,6 +12,7 @@ use crate::search::LineCells;
 
 use super::Terminal;
 
+#[inline]
 fn push_cell_text(grid: &Grid, row: u16, col: u16, out: &mut String) {
     // Live-frame (screen-row) reads: the extras lookups are keyed by the live
     // visible row, and callers pass terminal-relative rows (the renderer's
@@ -25,6 +26,7 @@ fn push_cell_text(grid: &Grid, row: u16, col: u16, out: &mut String) {
 /// [`push_cell_text`] with the screen row already resolved: `cells` is
 /// `grid.row_at_screen(row)`. A row-text walk resolves it once instead of
 /// twice per cell.
+#[inline]
 fn push_row_cell_text(grid: &Grid, row: u16, cells: &Row, col: u16, out: &mut String) {
     let Some(cell) = cells.get(col) else {
         return;
@@ -71,6 +73,7 @@ pub(crate) enum TrailingBlanks {
 
 /// Extract live-frame (screen-row, display_offset-independent) row text for an
 /// inclusive column range.
+#[inline]
 #[must_use]
 pub(crate) fn visible_row_bounds_to_string(
     grid: &Grid,
@@ -86,6 +89,7 @@ pub(crate) fn visible_row_bounds_to_string(
 
 /// [`visible_row_bounds_to_string`] appended to `out`. What `out` held is kept:
 /// the trailing-blank rule reads only the appended text.
+#[inline]
 pub(crate) fn push_visible_row_bounds(
     grid: &Grid,
     row: u16,
@@ -102,6 +106,7 @@ pub(crate) fn push_visible_row_bounds(
 /// from: each cell's bytes in the text, its column and its width, 2 for a
 /// wide glyph whose right half follows it. What the search index reports a
 /// visible row's matches in.
+#[inline]
 #[must_use]
 pub(crate) fn visible_row_written(grid: &Grid, row: u16) -> (String, LineCells) {
     let mut cells = LineCells::new();
@@ -202,6 +207,7 @@ fn push_visible_row_text(
 
 impl Terminal {
     /// Get visible content as string (for debugging/testing).
+    #[inline]
     #[must_use]
     pub fn visible_content(&self) -> String {
         self.grid.visible_content()
@@ -209,6 +215,7 @@ impl Terminal {
 
     /// The text of visible row `row` (0 is the top), or `None` if out of
     /// bounds.
+    #[inline]
     #[must_use]
     pub fn row_text(&self, row: usize) -> Option<String> {
         let rows = usize::from(self.grid.rows());
@@ -223,6 +230,7 @@ impl Terminal {
     /// [`row_text`](Self::row_text). `out` is cleared first; an out-of-range row
     /// leaves it empty and returns `false`. Used by the observation kernel's
     /// per-batch row scan.
+    #[inline]
     #[must_use]
     pub fn row_text_into(&self, row: usize, out: &mut String) -> bool {
         let rows = usize::from(self.grid.rows());
@@ -241,6 +249,7 @@ impl Terminal {
     /// per-frame row diffing: one `char` per grid column (the lead char at its
     /// column, `'\0'` at wide continuations, `' '` for blanks), so span math
     /// survives CJK/emoji. Clears and extends the caller's buffer.
+    #[inline]
     pub fn row_cols_into(&self, row: usize, out: &mut Vec<char>) -> u16 {
         let rows = usize::from(self.grid.rows());
         if row >= rows {
@@ -264,6 +273,7 @@ impl Terminal {
     /// row and appends each cell's text with
     /// [`push_cell_text`](aterm_grid::VisibleRowView::push_cell_text), testing
     /// for wide continuations itself; that walk yields these same bytes.
+    #[inline]
     #[must_use]
     pub fn cell_grapheme(&self, row: usize, col: usize) -> Option<String> {
         let r = u16::try_from(row).ok()?;
@@ -288,6 +298,7 @@ impl Terminal {
     ///
     /// A wide-continuation cell returns the empty string; `None` only for
     /// out-of-range coordinates.
+    #[inline]
     #[must_use]
     pub fn display_cell_grapheme(&self, row: usize, col: usize) -> Option<String> {
         let r = u16::try_from(row).ok()?;
@@ -343,6 +354,7 @@ impl Terminal {
     /// display row 0 is a scrollback line while scrolled back. Converts to a
     /// terminal-relative row and reads scrollback (negative) or the live grid.
     /// `None` if out of bounds.
+    #[inline]
     #[must_use]
     pub fn display_row_text(&self, display_row: usize) -> Option<String> {
         if self.grid.display_offset() == 0 {
@@ -355,6 +367,7 @@ impl Terminal {
     /// The terminal-relative row (negative is scrollback) display row
     /// `display_row` shows: `display_row - display_offset`. `None` past the
     /// viewport's bottom.
+    #[inline]
     fn display_terminal_row(&self, display_row: usize) -> Option<i32> {
         if display_row >= usize::from(self.grid.rows()) {
             return None;
@@ -377,8 +390,9 @@ impl Terminal {
     /// and a double-click (and a web host's word under a cell) read a row's
     /// cells, so they report such a row where it is drawn; the text measurers
     /// measure it under the new policy.
+    #[inline]
     #[must_use]
-    pub fn ambiguous_width(&self) -> aterm_types::text_shaping::AmbiguousWidth {
+    pub const fn ambiguous_width(&self) -> aterm_types::text_shaping::AmbiguousWidth {
         if self.modes.ambiguous_width_double {
             aterm_types::text_shaping::AmbiguousWidth::Double
         } else {
@@ -392,6 +406,7 @@ impl Terminal {
     /// boundaries. Maps through [`written_line_cells`](Self::written_line_cells)
     /// and [`smart_word_in_cells`](super::smart_word_in_cells) so wide/emoji
     /// cells align with drawn columns.
+    #[inline]
     #[must_use]
     pub fn smart_word_at(
         &self,
@@ -405,6 +420,7 @@ impl Terminal {
 
     /// [`smart_word_at`](Self::smart_word_at) returning `(word, start_col, end_col)`
     /// extracted from the drawn cells.
+    #[inline]
     #[must_use]
     pub fn smart_word_text_at(
         &self,

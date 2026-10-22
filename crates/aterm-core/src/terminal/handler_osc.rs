@@ -87,6 +87,7 @@ impl TerminalHandler<'_> {
     /// program's own state report, kept as one value for the host to show
     /// and log as a claim ([`super::program_state`]). The body is one parameter: a `;` inside it
     /// makes it no report, never one read from its first half.
+    #[inline]
     fn handle_osc_7501(&mut self, params: &[&[u8]]) {
         let [_, body] = params else {
             return;
@@ -152,6 +153,7 @@ impl TerminalHandler<'_> {
     /// Handle OSC 7 current working directory (`OSC 7 ; file://host/path ST`):
     /// a report no one signed ([`Self::report_cwd`]). `params[1..]` is the URI,
     /// which the parser split at its literal semicolons.
+    #[inline]
     pub(super) fn handle_osc_7(&mut self, params: &[&[u8]]) {
         self.report_cwd(params.get(1..).unwrap_or_default(), false);
     }
@@ -246,6 +248,7 @@ impl TerminalHandler<'_> {
 
     /// Apply an OSC 7 report: queue its real parsed cwd (host-preserving) for
     /// poll-based hosts, then store its local path (or clear the cwd).
+    #[inline]
     pub(super) fn apply_cwd_report(&mut self, report: super::shell::CwdReport) {
         if let Some(event) = report.event {
             self.queue_osc_event(7, event);
@@ -529,6 +532,7 @@ impl TerminalHandler<'_> {
 ///   megabytes in the count-capped cwd/event fields;
 /// - no NUL byte: no directory name contains one (OSC 7's decode turns `%00`
 ///   into `\0`), and the seamless-update wire refuses a cwd holding one.
+#[inline]
 pub(super) fn reported_cwd_is_storable(path: &str) -> bool {
     path.len() <= MAX_CWD_PATH_BYTES && !path.contains('\0')
 }

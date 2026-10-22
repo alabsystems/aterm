@@ -54,6 +54,7 @@ use std::fmt;
 /// Write `v` in decimal, identical to `write!(f, "{v}")` (width/fill flags on
 /// `f` are ignored). Avoids `format_args!`, whose unsafe `fmt::Arguments`
 /// constructor Trust's model fails closed on.
+#[inline]
 pub(crate) fn write_usize_decimal(f: &mut fmt::Formatter<'_>, v: usize) -> fmt::Result {
     // usize is at most 64 bits, so at most 20 decimal digits.
     let mut buf = [0u8; 20];
@@ -81,6 +82,7 @@ pub(crate) fn write_usize_decimal(f: &mut fmt::Formatter<'_>, v: usize) -> fmt::
 /// Write `b` as exactly two uppercase hex digits, byte-identical to
 /// `write!(f, "{b:02X}")` (a `u8` always renders as exactly two digits under
 /// `02X`). Same rationale as [`write_usize_decimal`]: no `format_args!`.
+#[inline]
 pub(crate) fn write_hex_byte_upper(f: &mut fmt::Formatter<'_>, b: u8) -> fmt::Result {
     const HEX_UPPER: &[u8; 16] = b"0123456789ABCDEF";
     let digits = [HEX_UPPER[(b >> 4) as usize], HEX_UPPER[(b & 0x0F) as usize]];

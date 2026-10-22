@@ -37,6 +37,7 @@ macro_rules! stable_id {
             /// The stable integer representation used by restore and control
             /// serialization.  It is never a vector index.
             #[must_use]
+            #[inline]
             pub const fn get(self) -> u64 {
                 self.0
             }
@@ -63,6 +64,7 @@ macro_rules! from_stored {
     ($name:ident) => {
         impl $name {
             #[must_use]
+            #[inline]
             pub const fn from_stored(raw: u64) -> Self {
                 Self(raw)
             }
@@ -107,6 +109,7 @@ pub trait StableId: Copy {
 macro_rules! stable_id_impl {
     ($name:ident) => {
         impl StableId for $name {
+            #[inline]
             fn from_raw(raw: u64) -> Self {
                 Self(raw)
             }
@@ -120,6 +123,7 @@ stable_id_impl!(AppInstanceId);
 
 impl<I: StableId> IdAllocator<I> {
     /// Mint the next identity.  An exhausted allocator stays exhausted.
+    #[inline]
     pub fn allocate(&mut self) -> Result<I, IdExhausted> {
         let raw = self.next;
         self.next = raw.checked_add(1).ok_or(IdExhausted)?;
@@ -151,6 +155,7 @@ pub enum View {
 impl View {
     /// Resolve the PTY session only for a terminal view.
     #[must_use]
+    #[inline]
     pub const fn terminal_session(self) -> Option<u64> {
         match self {
             Self::Terminal(view) => Some(view.session),
@@ -168,11 +173,13 @@ pub struct ViewStore {
 
 impl ViewStore {
     /// Insert a new terminal view over `session`.
+    #[inline]
     pub fn insert_terminal(&mut self, session: u64) -> Result<ViewId, IdExhausted> {
         self.insert(View::Terminal(TerminalView { session }))
     }
 
     /// Insert a new native view linked to `instance`.
+    #[inline]
     pub fn insert_native(&mut self, instance: AppInstanceId) -> Result<ViewId, IdExhausted> {
         self.insert(View::Native(NativeViewRef { instance }))
     }
@@ -185,26 +192,31 @@ impl ViewStore {
     }
 
     #[must_use]
+    #[inline]
     pub fn get(&self, id: ViewId) -> Option<&View> {
         self.views.get(&id)
     }
 
     #[must_use]
+    #[inline]
     pub fn contains(&self, id: ViewId) -> bool {
         self.views.contains_key(&id)
     }
 
     /// Remove a view.  Its identity remains burned and is never allocated again.
+    #[inline]
     pub fn remove(&mut self, id: ViewId) -> Option<View> {
         self.views.remove(&id)
     }
 
+    #[inline]
     pub fn iter(&self) -> impl Iterator<Item = (ViewId, View)> + '_ {
         self.views.iter().map(|(id, view)| (*id, *view))
     }
 
     #[cfg(any(test, debug_assertions))]
     #[must_use]
+    #[inline]
     pub fn len(&self) -> usize {
         self.views.len()
     }
@@ -212,6 +224,7 @@ impl ViewStore {
     /// Whether the store holds no view.
     #[cfg(any(test, debug_assertions))]
     #[must_use]
+    #[inline]
     pub fn is_empty(&self) -> bool {
         self.views.is_empty()
     }
@@ -240,11 +253,13 @@ pub enum SplitTree<T> {
 
 impl<T> SplitTree<T> {
     #[must_use]
-    pub fn leaf(value: T) -> Self {
+    #[inline]
+    pub const fn leaf(value: T) -> Self {
         Self::Leaf(value)
     }
 
     #[must_use]
+    #[inline]
     #[allow(
         clippy::len_without_is_empty,
         reason = "a split tree always holds at least one leaf"
@@ -439,6 +454,7 @@ impl<T: Copy + Eq> SplitTree<T> {
     }
 
     #[must_use]
+    #[inline]
     pub fn first_leaf(&self) -> T {
         match self {
             Self::Leaf(value) => *value,
@@ -450,6 +466,7 @@ impl<T: Copy + Eq> SplitTree<T> {
     /// [`Self::first_leaf`]. Used to find the leaf that touches a divider from
     /// the side above/left of it ([`Self::absorbing_neighbor`]).
     #[must_use]
+    #[inline]
     pub fn last_leaf(&self) -> T {
         match self {
             Self::Leaf(value) => *value,
@@ -515,6 +532,7 @@ pub struct LogicalSize {
 
 impl LogicalSize {
     #[must_use]
+    #[inline]
     pub const fn new(width: f32, height: f32) -> Self {
         Self { width, height }
     }
@@ -529,6 +547,7 @@ pub struct LogicalRect {
 
 impl LogicalRect {
     #[must_use]
+    #[inline]
     pub const fn new(x: f32, y: f32, width: f32, height: f32) -> Self {
         Self {
             origin: LogicalPoint { x, y },
@@ -537,7 +556,8 @@ impl LogicalRect {
     }
 
     #[must_use]
-    pub fn contains(self, point: LogicalPoint) -> bool {
+    #[inline]
+    pub const fn contains(self, point: LogicalPoint) -> bool {
         point.x >= self.origin.x
             && point.y >= self.origin.y
             && point.x < self.origin.x + self.size.width
@@ -567,11 +587,13 @@ pub struct LeafSizing {
 
 impl LeafSizing {
     #[must_use]
+    #[inline]
     pub const fn new(minimum: LogicalSize, preferred: LogicalSize) -> Self {
         Self { minimum, preferred }
     }
 
     #[must_use]
+    #[inline]
     fn sanitized(self) -> Self {
         let component = |value: f32| {
             if value.is_finite() {
@@ -623,17 +645,20 @@ pub struct SplitPath(Vec<SplitBranch>);
 
 impl SplitPath {
     #[must_use]
+    #[inline]
     pub fn root() -> Self {
         Self::default()
     }
 
     #[must_use]
+    #[inline]
     pub fn branches(&self) -> &[SplitBranch] {
         &self.0
     }
 
     #[must_use]
-    pub fn from_branches(branches: Vec<SplitBranch>) -> Self {
+    #[inline]
+    pub const fn from_branches(branches: Vec<SplitBranch>) -> Self {
         Self(branches)
     }
 
@@ -659,6 +684,7 @@ pub struct VisibleLeaf {
 impl VisibleLeaf {
     /// The complete pane allocation, including its optional subtab header.
     #[must_use]
+    #[inline]
     pub fn outer_rect(&self) -> LogicalRect {
         self.header.map_or(self.rect, |header| {
             LogicalRect::new(
@@ -675,6 +701,7 @@ impl VisibleLeaf {
 /// remains. Shared with the terminal compatibility layout so its blits and the
 /// canonical plan's sizing, input and accessibility agree on the same inset.
 #[must_use]
+#[inline]
 pub fn pane_header_rect(rect: LogicalRect) -> Option<LogicalRect> {
     (rect.size.height >= 2.0 && rect.size.width > 0.0)
         .then(|| LogicalRect::new(rect.origin.x, rect.origin.y, rect.size.width, 1.0))
@@ -723,11 +750,13 @@ impl VisibleLeafPlan {
     }
 
     #[must_use]
+    #[inline]
     pub fn leaf(&self, view: ViewId) -> Option<&VisibleLeaf> {
         self.leaves.iter().find(|leaf| leaf.view == view)
     }
 
     #[must_use]
+    #[inline]
     pub fn leaf_at(&self, point: LogicalPoint) -> Option<&VisibleLeaf> {
         self.leaves
             .iter()
@@ -735,6 +764,7 @@ impl VisibleLeafPlan {
     }
 
     #[must_use]
+    #[inline]
     pub fn header_at(&self, point: LogicalPoint) -> Option<&VisibleLeaf> {
         self.leaves
             .iter()
@@ -742,6 +772,7 @@ impl VisibleLeafPlan {
     }
 
     #[must_use]
+    #[inline]
     pub fn divider_at(&self, point: LogicalPoint) -> Option<&VisibleDivider> {
         self.dividers
             .iter()
@@ -751,6 +782,7 @@ impl VisibleLeafPlan {
     }
 
     #[must_use]
+    #[inline]
     pub fn ratio_for_pointer(&self, divider: &VisibleDivider, point: LogicalPoint) -> Option<f32> {
         let pointer = match divider.axis {
             SplitAxis::Horizontal => point.x,
@@ -1347,6 +1379,7 @@ impl TabIndicators {
     /// so every renderer and the introspection serializer fold here rather than
     /// picking a field.
     #[must_use]
+    #[inline]
     pub const fn wants_attention(self) -> bool {
         self.attention || self.status_attention
     }
@@ -1369,6 +1402,7 @@ pub enum TabIconKind {
 impl TabIconKind {
     /// Stable semantic name used by chrome inspection (`toolbar-tabs icons=`).
     #[must_use]
+    #[inline]
     pub const fn semantic_name(self) -> &'static str {
         match self {
             Self::Settings => "settings",
@@ -1380,6 +1414,7 @@ impl TabIconKind {
 
     /// The app's name in words, for hover help.
     #[must_use]
+    #[inline]
     pub const fn display_name(self) -> &'static str {
         match self {
             Self::Settings => "Settings",
@@ -1411,6 +1446,7 @@ pub enum TabConnRole {
 impl TabConnRole {
     /// The role the two per-session predicate flags spell; `None` = no mark.
     #[must_use]
+    #[inline]
     pub const fn from_flags(outbound: bool, inbound: bool) -> Option<Self> {
         match (outbound, inbound) {
             (true, true) => Some(Self::Both),
@@ -1423,6 +1459,7 @@ impl TabConnRole {
     /// This role's directional flags, `(outbound, inbound)` — the inverse of
     /// [`Self::from_flags`], so folds can union in flag space.
     #[must_use]
+    #[inline]
     pub const fn flags(self) -> (bool, bool) {
         match self {
             Self::Outbound => (true, false),
@@ -1434,6 +1471,7 @@ impl TabConnRole {
     /// OR-fold two optional roles (the [`aggregate_presentations`] discipline:
     /// one pane's role never hides another's — outbound + inbound = both).
     #[must_use]
+    #[inline]
     pub const fn union(a: Option<Self>, b: Option<Self>) -> Option<Self> {
         let (ao, ai) = match a {
             Some(role) => role.flags(),
@@ -1451,6 +1489,7 @@ impl TabConnRole {
     /// spelling, so a script greps `conn-out`/`conn-in` and never misses a
     /// direction (§6: marks are never visual-only).
     #[must_use]
+    #[inline]
     pub const fn chrome_states(self) -> &'static [&'static str] {
         match self {
             Self::Outbound => &["conn-out"],
@@ -1776,6 +1815,7 @@ pub struct TabSet {
 
 impl TabSet {
     #[must_use]
+    #[inline]
     pub fn new(first: Tab) -> Self {
         Self {
             active: Some(first.id),
@@ -1784,51 +1824,61 @@ impl TabSet {
     }
 
     #[must_use]
-    pub fn len(&self) -> usize {
+    #[inline]
+    pub const fn len(&self) -> usize {
         self.tabs.len()
     }
 
     #[must_use]
-    pub fn is_empty(&self) -> bool {
+    #[inline]
+    pub const fn is_empty(&self) -> bool {
         self.tabs.is_empty()
     }
 
     #[must_use]
-    pub fn active_id(&self) -> Option<TabId> {
+    #[inline]
+    pub const fn active_id(&self) -> Option<TabId> {
         self.active
     }
 
     #[must_use]
+    #[inline]
     pub fn active_index(&self) -> Option<usize> {
         let active = self.active?;
         self.tabs.iter().position(|tab| tab.id == active)
     }
 
     #[must_use]
+    #[inline]
     pub fn active(&self) -> Option<&Tab> {
         self.active_index().and_then(|index| self.tabs.get(index))
     }
 
+    #[inline]
     pub fn active_mut(&mut self) -> Option<&mut Tab> {
         let index = self.active_index()?;
         self.tabs.get_mut(index)
     }
 
     #[must_use]
+    #[inline]
     pub fn get(&self, id: TabId) -> Option<&Tab> {
         self.tabs.iter().find(|tab| tab.id == id)
     }
 
     #[must_use]
+    #[inline]
     pub fn tab_at(&self, index: usize) -> Option<&Tab> {
         self.tabs.get(index)
     }
 
+    #[inline]
     pub fn tab_at_mut(&mut self, index: usize) -> Option<&mut Tab> {
         self.tabs.get_mut(index)
     }
 
     #[must_use]
+    #[inline]
     pub fn tabs(&self) -> &[Tab] {
         &self.tabs
     }

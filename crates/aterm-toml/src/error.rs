@@ -68,12 +68,14 @@ impl Error {
 
     /// The byte range in the original document this error points at, when the
     /// failure has a source position.
+    #[inline]
     #[must_use]
     pub fn span(&self) -> Option<Range<usize>> {
         self.span.clone()
     }
 
     /// The failure text without the position prefix.
+    #[inline]
     #[must_use]
     pub fn message_text(&self) -> &str {
         &self.message
@@ -83,6 +85,7 @@ impl Error {
 /// The largest char boundary at or below `i`. `Display` must not panic whatever span it is
 /// handed, and slicing inside a character panics; rounding down keeps the caret on the
 /// character the span started in.
+#[inline]
 fn floor_boundary(source: &str, i: usize) -> usize {
     let mut i = i.min(source.len());
     while i > 0 && !source.is_char_boundary(i) {
@@ -94,6 +97,7 @@ fn floor_boundary(source: &str, i: usize) -> usize {
 /// Where `offset` sits: 1-based line and column. End of input is on the last line, not the
 /// empty line after it (`"x = [1, 2\n"` reports line 1, column 11), so an unterminated
 /// construct's diagnostic lands under its own text.
+#[inline]
 fn line_col(source: &str, offset: usize) -> (usize, usize) {
     let (line, col, _) = locate(source, offset);
     (line, col)
@@ -174,7 +178,8 @@ impl fmt::Display for Error {
 }
 
 /// Digits in `n`, for the snippet's line-number gutter.
-fn decimal_width(n: usize) -> usize {
+#[inline]
+const fn decimal_width(n: usize) -> usize {
     if n == 0 { 1 } else { n.ilog10() as usize + 1 }
 }
 

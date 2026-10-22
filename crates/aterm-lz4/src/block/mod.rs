@@ -105,12 +105,14 @@ impl fmt::Display for DecompressError {
 
 impl DecompressError {
     /// Whether this error indicates the destination buffer was smaller than required.
+    #[inline]
     #[must_use]
     pub const fn is_output_too_small(&self) -> bool {
         matches!(self, DecompressError::OutputTooSmall { .. })
     }
 
     /// Return the minimum expected output size when [`Self::OutputTooSmall`].
+    #[inline]
     #[must_use]
     pub const fn expected_output_size(&self) -> Option<usize> {
         match *self {
@@ -136,78 +138,91 @@ impl Error for DecompressError {}
 impl Error for CompressError {}
 
 /// Return the LZ4 sliding window size (`64 KiB`).
+#[inline]
 #[must_use]
 pub const fn window_size() -> usize {
     WINDOW_SIZE
 }
 
 /// Return the LZ4 minimum compressible block length (`13` bytes).
+#[inline]
 #[must_use]
 pub const fn lz4_min_length() -> usize {
     LZ4_MIN_LENGTH
 }
 
 /// Return the maximum backward match distance (`65,535` bytes).
+#[inline]
 #[must_use]
 pub const fn max_distance() -> usize {
     MAX_DISTANCE
 }
 
 /// Return the minimum LZ4 duplicate match length (`4` bytes).
+#[inline]
 #[must_use]
 pub const fn min_match() -> usize {
     MINMATCH
 }
 
 /// Return `true` iff an independent block of `input_len` bytes is long enough to contain matches.
+#[inline]
 #[must_use]
 pub const fn is_compressible_block_len(input_len: usize) -> bool {
     input_len >= LZ4_MIN_LENGTH
 }
 
 /// Return `true` iff `distance` is a valid LZ4 backward offset at `output_pos`.
+#[inline]
 #[must_use]
 pub const fn valid_match_distance(distance: usize, output_pos: usize) -> bool {
     distance > 0 && distance <= MAX_DISTANCE && distance <= output_pos
 }
 
 /// Return `true` iff `match_len` meets the LZ4 minimum match length (`>= 4`).
+#[inline]
 #[must_use]
 pub const fn valid_match_len(match_len: usize) -> bool {
     match_len >= MINMATCH
 }
 
 /// High nibble of an LZ4 sequence token (literal length base `0..=15`).
+#[inline]
 #[must_use]
 pub const fn token_literal_nibble(token: u8) -> usize {
     (token >> 4) as usize
 }
 
 /// Low nibble of an LZ4 sequence token (match length base `0..=15`).
+#[inline]
 #[must_use]
 pub const fn token_match_nibble(token: u8) -> usize {
     (token & 0x0f) as usize
 }
 
 /// Pack literal and match nibbles (`0..=15`) into an LZ4 sequence token byte.
+#[inline]
 #[must_use]
 pub const fn pack_token(lit_nibble: u8, match_nibble: u8) -> u8 {
     ((lit_nibble & 0x0f) << 4) | (match_nibble & 0x0f)
 }
 
 /// Return `true` iff `token`'s literal nibble is `15` (continuation length bytes follow).
+#[inline]
 #[must_use]
 pub const fn token_needs_literal_ext(token: u8) -> bool {
     (token >> 4) == 0x0f
 }
 
 /// Return `true` iff `token`'s match nibble is `15` (continuation length bytes follow).
+#[inline]
 #[must_use]
 pub const fn token_needs_match_ext(token: u8) -> bool {
     (token & 0x0f) == 0x0f
 }
 
 /// Checked worst-case compressed size for `input_len` bytes (`input_len + input_len / 255 + 16`).
+#[inline]
 #[must_use]
 pub const fn checked_max_compressed_size(input_len: usize) -> Option<usize> {
     let extra = input_len / 255;
@@ -218,6 +233,7 @@ pub const fn checked_max_compressed_size(input_len: usize) -> Option<usize> {
 }
 
 /// Checked worst-case compressed size including the 4-byte little-endian uncompressed-size prefix.
+#[inline]
 #[must_use]
 pub const fn checked_size_prepended_max_len(input_len: usize) -> Option<usize> {
     match checked_max_compressed_size(input_len) {
@@ -227,6 +243,7 @@ pub const fn checked_size_prepended_max_len(input_len: usize) -> Option<usize> {
 }
 
 /// Encode a 32-bit uncompressed length into its 4-byte little-endian prefix.
+#[inline]
 #[must_use]
 pub const fn encode_prepended_size_le(uncompressed_len: u32) -> [u8; 4] {
     [
@@ -238,12 +255,14 @@ pub const fn encode_prepended_size_le(uncompressed_len: u32) -> [u8; 4] {
 }
 
 /// Decode a 4-byte little-endian uncompressed length prefix.
+#[inline]
 #[must_use]
 pub const fn decode_prepended_size_le(hdr: [u8; 4]) -> u32 {
     (hdr[0] as u32) | ((hdr[1] as u32) << 8) | ((hdr[2] as u32) << 16) | ((hdr[3] as u32) << 24)
 }
 
 /// Encode an LZ4 token byte plus its 16-bit little-endian match offset into a 3-byte frame.
+#[inline]
 #[must_use]
 pub const fn encode_lz4_match_copy_token(lit_nibble: u8, match_nibble: u8, offset: u16) -> [u8; 3] {
     [
@@ -254,6 +273,7 @@ pub const fn encode_lz4_match_copy_token(lit_nibble: u8, match_nibble: u8, offse
 }
 
 /// Decode a 3-byte LZ4 `(token, offset_lo, offset_hi)` header into `(lit_nibble, match_nibble, offset)`.
+#[inline]
 #[must_use]
 pub const fn decode_lz4_match_copy_token(bytes: [u8; 3]) -> (u8, u8, u16) {
     let tok = bytes[0];

@@ -495,6 +495,73 @@ impl Prefix {
         }
     }
 
+    /// A retained version's admitted tap identity, for destructive decisions.
+    /// Unlike `full_name`, an unreadable or malformed receipt never becomes
+    /// an official-tap fallback. Legacy receipts with no field, and the
+    /// official API's exact short name, keep their established identity.
+    pub(super) fn full_name_checked(
+        &self,
+        kind: Kind,
+        name: &str,
+        version: &str,
+    ) -> Result<String, String> {
+        if !super::valid_component(name) || !super::valid_cask_version(version) {
+            return Err("abrew: invalid installed identity".to_owned());
+        }
+        let base = match kind {
+            Kind::Formula => self.cellar(),
+            Kind::Cask => self.caskroom(),
+        };
+        let package = base.join(name);
+        let dir = package.join(version);
+        for path in [&self.root, &base, &package, &dir] {
+            let metadata = std::fs::symlink_metadata(path)
+                .map_err(|e| format!("abrew: cannot inspect {}: {e}", path.display()))?;
+            if !metadata.file_type().is_dir() || crate::platform::is_reparse(&metadata) {
+                return Err(format!("abrew: {} is not a real directory", path.display()));
+            }
+        }
+        let receipt_path = dir.join("INSTALL_RECEIPT.json");
+        let bytes = crate::metadata_io::read_bounded_regular(&receipt_path, 64 * 1024)
+            .map_err(|e| format!("abrew: cannot read {}: {e}", receipt_path.display()))?;
+        let receipt = aterm_json::from_slice::<aterm_json::Value>(&bytes)
+            .map_err(|e| format!("abrew: cannot parse {}: {e}", receipt_path.display()))?;
+        let word = |key| receipt.get(key).and_then(aterm_json::Value::as_str);
+        if word("installed_by") != Some("abrew")
+            || word(match kind {
+                Kind::Formula => "name",
+                Kind::Cask => "token",
+            }) != Some(name)
+            || word("version") != Some(version)
+        {
+            return Err(format!(
+                "abrew: unowned install receipt: {}",
+                receipt_path.display()
+            ));
+        }
+        if let Some(value) = receipt.get("full_name") {
+            let full = value
+                .as_str()
+                .ok_or_else(|| format!("abrew: invalid full name in {}", receipt_path.display()))?;
+            if full != name {
+                if !super::valid_name(full)
+                    || !full.contains('/')
+                    || full.rsplit('/').next() != Some(name)
+                {
+                    return Err(format!(
+                        "abrew: invalid full name in {}",
+                        receipt_path.display()
+                    ));
+                }
+                return Ok(full.to_owned());
+            }
+        }
+        Ok(match kind {
+            Kind::Formula => format!("homebrew/core/{name}"),
+            Kind::Cask => format!("homebrew/cask/{name}"),
+        })
+    }
+
     pub fn is_pinned(&self, name: &str) -> bool {
         self.pinned_version(name).is_some()
     }

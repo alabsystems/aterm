@@ -15,6 +15,7 @@ use std::path::Path;
 
 /// Our effective uid.
 #[cfg(unix)]
+#[inline]
 fn our_uid() -> u32 {
     // SAFETY: getuid() is always-safe (no args, cannot fail).
     unsafe { libc::getuid() }

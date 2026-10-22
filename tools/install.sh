@@ -5,8 +5,9 @@
 # install.sh — the aterm install: the released aterm.app AND the `aterm`
 # command (ONE name on PATH; it fronts every verb — aterm help / ctl / pkg /
 # fleet / drive), in one command. Current macOS releases are lean apps; Linux
-# releases provide one executable. The ALab toolchain installs separately, on a
-# lean app's first launch with live progress unless excluded.
+# releases provide one executable. The ALab toolchain installs separately: on a
+# lean app's first launch with live progress when the installing user is at this
+# Mac's console, else here (toolset_deferral), unless excluded.
 #
 # The download source is the public release repo (alabsystems/aterm; a run from
 # a checkout derives the slug from its Cargo.toml, ATERM_REPO_SLUG names
@@ -66,8 +67,9 @@
 #         toolchain skips that fallback with a remedy. A PATH hint prints if
 #         ~/.local/bin isn't on PATH.
 #   toolset — `aterm pkg seed` + `pkg update` (a fresh lean install defers it
-#         to the app's first launch); PATH — one marker-fenced block in your
-#         shell profile. Each has its --no-… flag.
+#         to the app's first launch when the installing user owns this Mac's
+#         console, and runs it here otherwise: toolset_deferral); PATH — one
+#         marker-fenced block in your shell profile. Each has its --no-… flag.
 #
 # Failsafe policy: each half is pre-flighted before any install work; a half
 # that is impossible here (piped script with no checkout, an OS/arch with no
@@ -92,8 +94,9 @@
 #                                                     # into ~/.config/aterm/aterm.toml
 #                                                     # (never over a value already there)
 #   tools/install.sh --no-path                        # skip this script's PATH block (the
-#                                                     # toolset still adds its own to an
-#                                                     # existing shell rc)
+#                                                     # toolset still adds its own to each
+#                                                     # existing shell rc and your login
+#                                                     # shell's, made when absent)
 #   tools/install.sh --version 0.5.0                  # pin the app release
 #   tools/install.sh --dry-run                        # print the whole plan, change nothing
 #   tools/install.sh --uninstall                      # reverse everything it installed
@@ -129,7 +132,8 @@ usage() {
 usage: install.sh [--no-app] [--no-cli] [--no-toolchain] [--no-path] [--version X.Y.Z] [--dry-run]
        install.sh --uninstall [--dry-run]
 
-Installs aterm.app (macOS), the `aterm` command, and the ALab toolset.
+Installs aterm.app (macOS) and the `aterm` command; the ALab toolset installs at
+the first launch, or here with --no-app, over SSH and on Linux.
 On Linux the app is the signed `aterm` binary, which updates itself (aterm update status).
 
   --no-app          leave the app alone (Linux: the signed `aterm` binary)
@@ -138,7 +142,8 @@ On Linux the app is the signed `aterm` binary, which updates itself (aterm updat
                     [packages] auto_install = false into aterm.toml
                     ($XDG_CONFIG_HOME/aterm, default ~/.config/aterm)
   --no-path         skip this script's PATH block (the toolset still adds its
-                    own to an existing shell rc; delete it and it stays deleted;
+                    own to each existing shell rc and to your login shell's,
+                    which it makes when absent; delete it and it stays deleted;
                     `aterm pkg repair` puts it back)
   --version X.Y.Z   install that release instead of the latest
   --dry-run         print the plan and change nothing
@@ -935,6 +940,72 @@ elect_container() { # <toolchain01> <version> <dmg> <dmg_sha> <zip> <zip_sha>
 	# it has, and the universal app inside installs on either CPU. (Such a
 	# release may still name the retired Intel DMG pair; those keys are not read.)
 	return 0
+}
+
+# --- the toolset's deferral: a function of who holds this Mac's console -------
+# docs/DESIGN-init-system-2026-10-20.md §4.2, "The SSH install". The lean default
+# leaves the first seed to aterm's first launch, whose window shows the download
+# per program and records adoption through the GUI's own seed pass — but only
+# someone at this Mac's screen opens that window. When the installing user does
+# not own /dev/console (an install over SSH while another login holds the screen;
+# a box nobody is logged in to, where loginwindow's root owns it), no window
+# follows, and a box only ever reached over SSH would never adopt the toolset. So
+# that run seeds here, through install_toolchain: the same `aterm pkg seed` +
+# `aterm pkg update` lane --no-app runs, under the same [packages] consent.
+#
+# Never as root: the toolset lives under the home of the account that uses it,
+# and macOS's sudo keeps $HOME, so a root seed would leave root-owned stubs and
+# a root-owned store in that person's tree, which their own passes then cannot
+# write. The installing user is the one who typed `sudo` ($SUDO_UID, read only
+# when this run is root): at the console, theirs is the ordinary deferral; anyone
+# else's root run stays deferred and TOOLSET_AS_ROOT=1 names the command to run
+# as that user.
+#
+# Pure, so crates/aterm-update/tests/install_sh pins it without a console:
+# <console_uid> owns /dev/console (console_owner_uid), <euid> is this run's
+# `id -u` and <sudo_uid> its $SUDO_UID. Over elect_container's outputs: a deferral
+# (TOOLCHAIN_DEFERRED=1) stands for the console's owner and for root; for anyone
+# else, or an owner that cannot be read, it is cleared and TOOLSET_NO_WINDOW=1
+# says why the toolset installs here. A run that deferred nothing is left as it
+# was.
+toolset_deferral() { # <console_uid> <euid> <sudo_uid>
+	TOOLSET_NO_WINDOW=0
+	TOOLSET_AS_ROOT=0
+	[[ "${TOOLCHAIN_DEFERRED:-0}" -eq 1 ]] || return 0
+	local installing="$2"
+	[[ "$2" == 0 && -n "$3" ]] && installing="$3"
+	[[ -n "$1" && "$1" == "$installing" ]] && return 0
+	if [[ "$2" == 0 ]]; then
+		TOOLSET_AS_ROOT=1
+		return 0
+	fi
+	TOOLCHAIN_DEFERRED=0
+	TOOLSET_NO_WINDOW=1
+}
+
+# What a root run that left the toolset deferred says in its place.
+ROOT_TOOLSET_LINE="not installed as root: it lives in the home of the account that uses it — run \`aterm pkg install --default-set\` as that user, or it installs on their first aterm launch at this Mac's console"
+
+# The uid that owns /dev/console: the login at this Mac's screen, or root at the
+# loginwindow; empty when it cannot be read. /usr/bin/stat by path, since a GNU
+# stat first on PATH (Homebrew's coreutils) reads -f as --file-system.
+# ATERM_INSTALL_CONSOLE_UID names it instead (an install_sh test's stand-in for
+# another login at the screen); it moves only when the toolset installs, under
+# the same consent.
+console_owner_uid() {
+	if [[ -n "${ATERM_INSTALL_CONSOLE_UID:-}" ]]; then
+		printf '%s\n' "$ATERM_INSTALL_CONSOLE_UID"
+		return 0
+	fi
+	/usr/bin/stat -f %u /dev/console 2>/dev/null || true
+}
+
+# The container election (elect_container) and the toolset's deferral over it
+# (toolset_deferral), as one step: the plan and the install both run this, so
+# a --dry-run's toolset line can never disagree with what the install does.
+elect_install_lane() { # <toolchain01> <version> <dmg> <dmg_sha> <zip> <zip_sha>
+	elect_container "$@" || return 1
+	toolset_deferral "$(console_owner_uid)" "$(id -u)" "${SUDO_UID:-}"
 }
 
 # --- the cargo that honours the pin (source-build lane) ----------------------
@@ -2575,7 +2646,7 @@ print_install_plan() {
 		team_want="$(required_team_for "$REPO_SLUG" "${ATERM_TEAM_ID:-}" "$TEAM_MANIFEST")" || exit 1
 		# The same shared election install_app runs, so the plan can never
 		# name a different container than the install downloads.
-		elect_container "$DO_TOOLCHAIN" "$VERSION" \
+		elect_install_lane "$DO_TOOLCHAIN" "$VERSION" \
 			"$DMG_NAME" "$SHA_WANT" "$ZIP_NAME" "$ZIP_SHA" || exit 1
 		asset_size="$(release_asset_size "$TAG" "$ASSET_NAME")" || exit 1
 		echo "install.sh: app: $REPO_SLUG $TAG"
@@ -2616,6 +2687,14 @@ print_install_plan() {
 		append | insert) echo "  config:   adds \`auto_install = false\` to [packages] in $cfg — the exclusion persists: $NO_TOOLCHAIN_EFFECT" ;;
 		keep*) echo "  config:   $cfg already says \`${plan#keep }\` — left as it is" ;;
 		esac
+	elif [[ "${TOOLSET_AS_ROOT:-0}" -eq 1 ]]; then
+		# Root, for someone not at this Mac's console: never seeded as root
+		# (toolset_deferral).
+		echo "install.sh: toolset: $ROOT_TOOLSET_LINE"
+	elif [[ "${TOOLSET_NO_WINDOW:-0}" -eq 1 ]]; then
+		# A lean install nobody at this Mac's console will open: no window
+		# follows, so the toolset installs here (toolset_deferral).
+		echo "install.sh: toolset: aterm pkg seed + pkg update here — ${TOOLSET_SIZE:-size shown before download}${TOOLSET_SIZE:+ under your home directory} (you are not at this Mac's console, so no aterm window will install it)"
 	elif [[ "${TOOLCHAIN_DEFERRED:-0}" -eq 1 || "${CONTAINER_KIND:-}" == zip ]]; then
 		if [[ -n "$TOOLSET_SIZE" ]]; then
 			echo "install.sh: toolset: installs on aterm's first launch ($TOOLSET_SIZE on disk when finished)"
@@ -3107,8 +3186,9 @@ install_app() {
 	# crates/aterm-update/tests/install_sh pins the whole matrix without a
 	# network. It sets CONTAINER_KIND/
 	# ASSET_NAME/ASSET_SHA/LEAN_REASON/TOOLCHAIN_DEFERRED; a refusal already
-	# named its cause.
-	elect_container "$DO_TOOLCHAIN" "$VERSION" \
+	# named its cause. The toolset is deferred to the window only when the
+	# installing user holds the console, or this run is root (toolset_deferral).
+	elect_install_lane "$DO_TOOLCHAIN" "$VERSION" \
 		"$DMG_NAME" "$SHA_WANT" "$ZIP_NAME" "$ZIP_SHA" || exit 1
 	# The election is not narrated: the download line below names the
 	# container, and --no-toolchain's one caveat rides that plan.
@@ -3158,7 +3238,10 @@ install_app() {
 		fi
 	else
 		echo "install.sh: downloading $ASSET_NAME — $((ASSET_SIZE / 1000000)) MB"
-		if [[ "$LEAN_REASON" == default ]]; then
+		if [[ "$LEAN_REASON" == default && "${TOOLSET_NO_WINDOW:-0}" -eq 1 ]]; then
+			# No window follows (toolset_deferral): the toolset installs here.
+			echo "  then: aterm.app -> $DEST, and the toolset installs here (${TOOLSET_SIZE:-a size shown before download}${TOOLSET_SIZE:+ under your home directory}): you are not at this Mac's console, so no aterm window will"
+		elif [[ "$LEAN_REASON" == default ]]; then
 			# The small download is the whole wait: the toolset arrives on
 			# first launch, which the run's last toolset line says.
 			echo "  then: aterm.app -> $DEST"
@@ -3704,14 +3787,16 @@ install_toolchain() {
 
 # --- PATH, for shells that are not aterm ------------------------------------------
 # atpkg writes a per-shell hook into ~/.aterm/shell.d on every install, and its
-# install/update pass appends a block sourcing it to an EXISTING ~/.zshrc,
-# ~/.bashrc, ~/.bash_profile or ~/.config/fish/config.fish. The installed aterm's
-# `pkg shell-setup --path` reaches what that leaves out (~/.bash_login and
-# ~/.profile on a macOS home without ~/.bash_profile, fish under $XDG_CONFIG_HOME,
-# a profile that does not exist yet) with ONE marker-fenced block — the hook,
-# and $BIN_DIR when PATH lacks it — which `self-uninstall` undoes. PATH_BLOCK_WROTE
-# says a block stands; without a runnable aterm nothing is written, and the
-# hand-edit hint below says what to add.
+# seed, install and update passes append a block sourcing it to each EXISTING
+# ~/.zshrc, ~/.bashrc, ~/.bash_profile or ~/.config/fish/config.fish, creating
+# only the login shell's own rc when it is absent (the account record's shell,
+# never $SHELL). The installed aterm's `pkg shell-setup --path` adds ONE
+# marker-fenced block — the hook, and $BIN_DIR when PATH lacks it — to the rc
+# that same login shell reads (a macOS login bash's first of ~/.bash_profile,
+# ~/.bash_login and ~/.profile that exists; fish's under $XDG_CONFIG_HOME), made
+# when absent, which `self-uninstall` undoes. PATH_BLOCK_WROTE says a block
+# stands; without a runnable aterm nothing is written, and the hand-edit hint
+# below says what to add.
 wire_shell_path() {
 	local aterm args=(pkg shell-setup --path --bin-dir "$BIN_DIR")
 	[[ "${TOOLCHAIN_DEFERRED:-0}" -eq 1 ]] && args+=(--toolset-coming)
@@ -3761,11 +3846,20 @@ if [[ "$DO_TOOLCHAIN" -eq 1 ]]; then
 		# and the GUI's own seed pass records adoption there — the audited
 		# consent seam (atpkg cmd_seed). A headless `pkg seed` here would block
 		# on the full download and move the consent write out of that seam.
-		# TOOLCHAIN_DEFERRED is set only by a fresh lean-default app install;
-		# every repair lane (--no-app, an already-current app, a pinned
-		# pre-lean DMG, Linux) still runs install_toolchain here.
-		echo "install.sh: toolset: installs on aterm's first launch (from a terminal instead: aterm pkg install --default-set)"
+		# TOOLCHAIN_DEFERRED is set only by a fresh lean-default app install
+		# whose user holds this Mac's console (toolset_deferral); every other
+		# lane (--no-app, an already-current app, a pinned pre-lean DMG,
+		# Linux, an install over SSH) runs install_toolchain here. A root run
+		# for someone else stays deferred: no toolset is ever seeded as root.
+		if [[ "${TOOLSET_AS_ROOT:-0}" -eq 1 ]]; then
+			echo "install.sh: toolset: $ROOT_TOOLSET_LINE"
+		else
+			echo "install.sh: toolset: installs on aterm's first launch (from a terminal instead: aterm pkg install --default-set)"
+		fi
 	else
+		if [[ "${TOOLSET_NO_WINDOW:-0}" -eq 1 ]]; then
+			echo "install.sh: toolset: you are not at this Mac's console, so no aterm window will install it — installing it here"
+		fi
 		install_toolchain
 	fi
 else

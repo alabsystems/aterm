@@ -33,6 +33,7 @@ impl ScrollInputState {
     /// Accumulate a row delta and return the whole rows that flipped (truncation
     /// toward zero), banking the remainder. Non-finite deltas are ignored; the return
     /// saturates to `i32` (the engine clamps to the real history bound).
+    #[inline]
     pub(crate) fn add_rows(&mut self, delta_rows: f64) -> i32 {
         if !delta_rows.is_finite() {
             return 0;
@@ -46,7 +47,12 @@ impl ScrollInputState {
     /// Zero the residual on a side with no content: below the live bottom or above the
     /// oldest retained line. With no history both sides clamp, so the alternate screen
     /// never banks a shift.
-    pub(crate) fn clamp_at_history_edges(&mut self, display_offset: usize, history_lines: usize) {
+    #[inline]
+    pub(crate) const fn clamp_at_history_edges(
+        &mut self,
+        display_offset: usize,
+        history_lines: usize,
+    ) {
         if display_offset == 0 && self.frac_rows < 0.0 {
             self.frac_rows = 0.0;
         }
@@ -56,17 +62,20 @@ impl ScrollInputState {
     }
 
     /// Drop the residual (whole-row navigation lands row-aligned).
-    pub(crate) fn reset(&mut self) {
+    #[inline]
+    pub(crate) const fn reset(&mut self) {
         self.frac_rows = 0.0;
     }
 
     /// The banked residual in rows, in `(-1.0, 1.0)`.
-    pub(crate) fn frac_rows(&self) -> f64 {
+    #[inline]
+    pub(crate) const fn frac_rows(&self) -> f64 {
         self.frac_rows
     }
 
     /// The device-px shift presenting this residual: the negated residual, rounded and
     /// clamped inside the translate's domain `(-cell_h, cell_h)`.
+    #[inline]
     pub(crate) fn frac_px(&self, cell_h: usize) -> i32 {
         if cell_h == 0 {
             return 0;
@@ -79,6 +88,7 @@ impl ScrollInputState {
     /// Stamp the presented `scroll_frac_px` and a whole-frame grid band `[0, grid_rows)`
     /// onto the frame (`compose_band_into_frame` then moves the band below any message
     /// rows). Call every frame: a kept scratch would otherwise carry a stale shift.
+    #[inline]
     pub(crate) fn stamp(&self, input: &mut RenderInput, grid_rows: usize, cell_h: usize) {
         input.scroll_frac_px = self.frac_px(cell_h);
         input.grid_top_row = 0;
@@ -132,6 +142,7 @@ web_terminal_impl!(bind);
 
 // Not wasm-exported: the ingress shared by both input units.
 impl WebTerminal {
+    #[inline]
     fn scroll_rows_input(&mut self, delta_rows: f64) {
         let whole = self.scroll_input.add_rows(delta_rows);
         if whole != 0 {

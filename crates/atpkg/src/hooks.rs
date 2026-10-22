@@ -36,10 +36,13 @@
 //! `~/.aterm/shell.d` is sourced by aterm's shell integration inside a session, and from the
 //! user's own rc through the marker-bounded block [`ensure_rc_sources_hooks`] writes (which
 //! rc files, and why), so an ordinary interactive shell (Terminal.app, ssh, an agent's shell)
-//! gets the tools too (docs/AUDIT-nux-first-open-toolchain-2026-08-31.md). Only rc files that
-//! exist are edited (`aterm pkg doctor` prints the PATH line for the rest), and an rc that
-//! resolves under a macOS-protected folder ([`crate::protected`]) is never opened: the wiring
-//! runs unattended and would raise a consent dialog with nobody at the screen.
+//! gets the tools too (docs/AUDIT-nux-first-open-toolchain-2026-08-31.md). An rc that exists is
+//! edited, and one file may be created: the rc the account's login shell reads, when it is
+//! absent ([`login_rc`]; a new Mac has no `~/.zshrc`, and without it Trust is never on PATH
+//! in Terminal.app). No other shell gains a file (`aterm pkg doctor` prints the PATH line for
+//! those), and an rc that resolves under a macOS-protected folder ([`crate::protected`]) is
+//! never opened or created: the wiring runs unattended and would raise a consent dialog with
+//! nobody at the screen.
 //!
 //! `~/.aterm/shell.d` is outside the managed prefix, so [`refresh`] hardens `~/.aterm` and
 //! `~/.aterm/shell.d` with `ensure_private_dir` (symlink-refusing, `0700`, fail-closed)
@@ -574,19 +577,25 @@ impl HookPass {
     }
 }
 
-/// What one pass did to one rc file that exists (atpkg never creates one), so `atpkg
-/// repair` prints a line per rc. People are sent to `repair` for unrelated reasons too, so
-/// re-laying an opt-out is announced, never implied.
+/// What one pass did to one rc file: one that exists, or the login shell's own rc, the one
+/// file a pass creates ([`login_rc`]), so `atpkg repair` prints a line per rc. People are
+/// sent to `repair` for unrelated reasons too, so re-laying an opt-out is announced, never
+/// implied.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum RcOutcome {
     /// The rc already carried atpkg's block; nothing was written to it.
     AlreadyWired,
     /// atpkg's block was appended to an rc that had never carried it.
     Appended,
+    /// The login shell's rc did not exist, and atpkg created it holding only its block
+    /// ([`login_rc`]); no other rc is ever created.
+    Created,
     /// atpkg's block was laid again in an rc the user had deleted it from (recorded in
-    /// `RC_LEDGER`, no marker present). Only [`refresh_rewiring_rc`] does this.
+    /// `RC_LEDGER`, no marker present), or the login shell's rc atpkg created was made again
+    /// after the user deleted the file. Only [`refresh_rewiring_rc`] does this.
     RelaidOverOptOut,
-    /// The user had deleted atpkg's block and this pass left the rc exactly as it was.
+    /// The user had deleted atpkg's block (or the login shell's rc atpkg created) and this
+    /// pass left it exactly as it was.
     OptOutKept,
     /// The rc resolves under a folder macOS guards with a consent dialog, so it was not
     /// even opened (the consent fence in `ensure_rc_sources_hooks`).
@@ -599,28 +608,32 @@ pub enum RcOutcome {
     WriteFailed,
 }
 
-/// Best-effort choke point called after activation ([`crate::flow`]). Hardens `~/.aterm` +
-/// `~/.aterm/shell.d` (0700, symlink-refusing) then writes the hooks. NEVER propagates an
-/// error — hooks are ergonomics, not trust; a failed write must not fail an install.
-///
-/// Its callers: the first-launch seed (right after it lays the pending stubs, so `bin/` is
-/// on a shell's PATH before anything installs), the end of every update pass, an install,
-/// and `uninstall --all`. The hooks name the three managed directories and nothing that
-/// is installed, so they are valid before the first byte of the toolset moves. Off macOS the
-/// same pass first lays any argv0 alias missing beside a store-installed aterm
+/// The whole shell pass in one call: hardens `~/.aterm` + `~/.aterm/shell.d` (0700,
+/// symlink-refusing), writes the hooks, wires the rc files (creating the login shell's
+/// own rc when absent, [`login_rc`]) and lays the command links. NEVER propagates an
+/// error — hooks are ergonomics, not trust; a failed write must not fail an install. Off
+/// macOS the same pass first lays any argv0 alias missing beside a store-installed aterm
 /// ([`ensure_store_aliases`]).
 ///
-/// Callers: the seed, right after it lays the pending stubs (so `bin/` is on a shell's PATH
-/// before anything installs), the end of every update pass, an install, and
-/// `uninstall --all`. The hooks name the three managed directories and nothing installed in
-/// them, so they are valid before anything installs.
+/// The provisioning lanes (the seed, the end of an install or update pass, doctor, init,
+/// `repair`) run the same steps as the base relay items `base.shell.hooks`, `.rc` and
+/// `.links` ([`crate::converge::repair`]), each probed and journaled; `uninstall --all`
+/// runs this pass without creating an rc ([`refresh_creating_no_rc`]). The hooks name the
+/// three managed directories and nothing installed in them, so they are valid before
+/// anything installs.
 ///
-/// The unattended pass (install, seed, the six-hourly `update`), so its rc wiring honours
-/// the opt-out the block documents: an rc wired once that no longer carries the block is
-/// left as the user left it ([`RC_LEDGER`]). [`refresh_rewiring_rc`] writes it back. Every
-/// caller discards the returned [`HookPass`]; `atpkg repair` reports the rewiring pass's.
+/// The unattended pass, so its rc wiring honours the opt-out the block documents: an rc
+/// wired once that no longer carries the block is left as the user left it
+/// ([`RC_LEDGER`]). [`refresh_rewiring_rc`] writes it back.
 pub fn refresh(layout: &Layout) -> HookPass {
-    refresh_with(layout, RcWiring::HonorOptOut)
+    refresh_with(layout, RcWiring::HonorOptOut, account_login_rc)
+}
+
+/// [`refresh`], creating no rc: the pass `uninstall --all` runs, which provisions nothing
+/// and so gives no shell a file it did not have. An rc that exists is wired as
+/// [`refresh`] wires it.
+pub fn refresh_creating_no_rc(layout: &Layout) -> HookPass {
+    refresh_with(layout, RcWiring::HonorOptOut, |_| None)
 }
 
 /// [`refresh`], but the rc block is written back even where the user removed it: the
@@ -628,7 +641,7 @@ pub fn refresh(layout: &Layout) -> HookPass {
 /// dotfile to undo. The returned [`HookPass`] names each rc it re-laid
 /// ([`RcOutcome::RelaidOverOptOut`]), so `repair` says so.
 pub fn refresh_rewiring_rc(layout: &Layout) -> HookPass {
-    refresh_with(layout, RcWiring::Rewire)
+    refresh_with(layout, RcWiring::Rewire, account_login_rc)
 }
 
 /// What a pass does with an rc whose block the user deleted: an unattended pass leaves it
@@ -641,10 +654,91 @@ pub(crate) enum RcWiring {
     Rewire,
 }
 
-fn refresh_with(layout: &Layout, wiring: RcWiring) -> HookPass {
+/// The pass, the rc it may create read from `home` by `creates` ([`account_login_rc`], or
+/// none).
+fn refresh_with(
+    layout: &Layout,
+    wiring: RcWiring,
+    creates: fn(&Path) -> Option<&'static str>,
+) -> HookPass {
     let exe = std::env::current_exe().and_then(|e| e.canonicalize()).ok();
     let home = aterm_types::dirs::home_dir();
-    refresh_as(layout, wiring, exe.as_deref(), home.as_deref(), HEALS_STORE)
+    let login = home.as_deref().and_then(creates);
+    refresh_as(
+        layout,
+        wiring,
+        exe.as_deref(),
+        home.as_deref(),
+        HEALS_STORE,
+        login,
+    )
+}
+
+/// The development seam ([`aterm_types::dev_seam!`]) naming the login shell (a path, as the
+/// account record spells it) a development build reads in place of the account record's:
+/// a test's `chsh`, so a spawned pass can be given a login shell its host account does not
+/// have. A shipped binary reads the account record whatever the environment holds.
+pub const LOGIN_SHELL_SEAM: &str = "ATPKG_LOGIN_SHELL";
+
+/// The account's login shell: the program the account record names (`getpwuid`,
+/// [`aterm_uds::account::shell`]), never `$SHELL`, which a test, a wrapper or a parent
+/// process may set. `None` when the record names none (and off unix).
+#[must_use]
+pub fn login_shell() -> Option<std::path::PathBuf> {
+    if let Some(seam) = aterm_types::dev_seam!(LOGIN_SHELL_SEAM) {
+        return Some(seam.into());
+    }
+    #[cfg(unix)]
+    {
+        aterm_uds::account::shell()
+    }
+    #[cfg(not(unix))]
+    {
+        None
+    }
+}
+
+/// The [`RC_FILES`] row this account's login shell reads ([`login_rc`] of [`login_shell`],
+/// fish's config under `$XDG_CONFIG_HOME`), which a pass creates when it is absent.
+#[must_use]
+pub fn account_login_rc(home: &Path) -> Option<&'static str> {
+    let shell = login_shell()?;
+    let xdg_config = std::env::var_os("XDG_CONFIG_HOME")
+        .map(std::path::PathBuf::from)
+        .filter(|dir| dir.is_absolute());
+    login_rc(&shell.to_string_lossy(), home, xdg_config.as_deref())
+}
+
+/// The [`RC_FILES`] row the login shell `shell` (a path or a bare name) reads, by the one
+/// election `aterm pkg shell-setup --path` and `tools/install.sh` use
+/// ([`crate::selfsetup::rc_target`]): `~/.zshrc` for zsh; for bash on macOS the first of
+/// `~/.bash_profile`, `~/.bash_login`, `~/.profile` that is a file, else `~/.bash_profile`,
+/// and `~/.bashrc` elsewhere; fish's `config.fish` under `xdg_config` (else `~/.config`).
+///
+/// `None` when the election picks a file that is no row (bash's `.bash_login` or
+/// `.profile`, which a login bash already reads; fish under another `$XDG_CONFIG_HOME`), or
+/// knows no such shell (sh, nushell): such a shell is never given a file.
+#[must_use]
+pub fn login_rc(shell: &str, home: &Path, xdg_config: Option<&Path>) -> Option<&'static str> {
+    // `selfsetup` is a unix module, and off unix there is no rc row to elect.
+    #[cfg(unix)]
+    {
+        let places = crate::selfsetup::Places::defaults(home, None, xdg_config);
+        let env = crate::selfsetup::ShellEnv {
+            shell: Some(shell.to_owned()),
+            ..crate::selfsetup::ShellEnv::default()
+        };
+        let target = crate::selfsetup::rc_target(&places, &env)?;
+        RC_FILES
+            .iter()
+            .map(|(rc, _)| *rc)
+            .find(|rc| home.join(rc) == target)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (shell, home, xdg_config);
+        None
+    }
 }
 
 /// Whether the hooks pass completes a store's argv0 aliases ([`heal_store_aliases`]): off
@@ -661,6 +755,7 @@ fn refresh_as(
     exe: Option<&Path>,
     home: Option<&Path>,
     heals_store: bool,
+    login: Option<&'static str>,
 ) -> HookPass {
     // The store's own argv0 aliases first: they are aterm's install, not the shell's, so
     // neither a missing $HOME nor an unhardened ~/.aterm holds them back.
@@ -673,7 +768,7 @@ fn refresh_as(
     let Some(home) = home else {
         return HookPass::NotHardened;
     };
-    pass_as(layout, home, wiring, exe)
+    pass_as(layout, home, wiring, exe, login)
 }
 
 /// The store folder `tools/install.sh` lays (`~/.local/lib/aterm/bin`, or the folder
@@ -741,22 +836,35 @@ pub(crate) fn canonical(path: &Path) -> Option<std::path::PathBuf> {
 /// ([`RcWiring::HonorOptOut`]) from a bundle that is not the release `aterm.app` writes
 /// nothing ([`HookPass::NotReleaseBundle`]); the asked-for pass ([`RcWiring::Rewire`],
 /// `atpkg repair`) runs from anywhere.
-fn pass_as(layout: &Layout, home: &Path, wiring: RcWiring, exe: Option<&Path>) -> HookPass {
+fn pass_as(
+    layout: &Layout,
+    home: &Path,
+    wiring: RcWiring,
+    exe: Option<&Path>,
+    login: Option<&'static str>,
+) -> HookPass {
     if wiring == RcWiring::HonorOptOut && exe.is_some_and(is_non_release_bundle_exe) {
         return HookPass::NotReleaseBundle;
     }
-    pass_at(layout, home, wiring)
+    pass_at(layout, home, wiring, login)
 }
 
 /// One whole pass against a known `home`, as [`refresh_with`] runs it, so a test in another
 /// module (`cli`'s repair report, `doctor`'s rc lines) can drive it on a synthetic home.
-pub(crate) fn pass_at(layout: &Layout, home: &Path, wiring: RcWiring) -> HookPass {
+/// `login` is the login shell's rc row, which the pass creates when absent ([`login_rc`]).
+pub(crate) fn pass_at(
+    layout: &Layout,
+    home: &Path,
+    wiring: RcWiring,
+    login: Option<&'static str>,
+) -> HookPass {
     refresh_at(
         home,
         &layout.bin_dir(),
         &layout.agents_dir(),
         &layout.reroute_dir(),
         wiring,
+        login,
     )
 }
 
@@ -772,6 +880,7 @@ fn refresh_at(
     agents_dir: &Path,
     reroute_dir: &Path,
     wiring: RcWiring,
+    login: Option<&'static str>,
 ) -> HookPass {
     let aterm = home.join(".aterm");
     let shell_d = aterm.join("shell.d");
@@ -781,13 +890,13 @@ fn refresh_at(
     let hooks_written = write_hooks(&shell_d, bin_dir, agents_dir, reroute_dir).is_ok();
     #[cfg(unix)]
     let rc = if hooks_written {
-        ensure_rc_sources_hooks(home, wiring)
+        ensure_rc_sources_hooks(home, wiring, login)
     } else {
         Vec::new()
     };
     #[cfg(not(unix))]
     let rc = {
-        let _ = wiring;
+        let _ = (wiring, login);
         Vec::new()
     };
     #[cfg(unix)]
@@ -810,11 +919,12 @@ pub(crate) const RC_END: &str = "# <<< atpkg shell integration <<<";
 
 /// The rc files atpkg wires: each row is a path relative to `$HOME` and the `shell.d` hook
 /// it sources. The one roster, so the pass that writes the block and the report of its
-/// state ([`rc_wiring`]) agree. atpkg edits one only when it already exists.
+/// state ([`rc_wiring`]) agree. atpkg edits one that exists, and creates only the one the
+/// account's login shell reads when it is absent ([`login_rc`]).
 ///
 /// A shell that reads none of these is not wired: fish with `$XDG_CONFIG_HOME` set reads a
-/// different `config.fish`, and a login bash with no `~/.bash_profile` falls through to
-/// `~/.bash_login` and `~/.profile`. `aterm pkg doctor`'s PATH line is the way in for those.
+/// different `config.fish`, and a login bash with `~/.bash_login` or `~/.profile` and no
+/// `~/.bash_profile` reads those. `aterm pkg doctor`'s PATH line is the way in for those.
 #[cfg(unix)]
 pub(crate) const RC_FILES: [(&str, &str); 4] = [
     (".zshrc", "00-atpkg.zsh"),
@@ -826,7 +936,7 @@ pub(crate) const RC_FILES: [(&str, &str); 4] = [
 
 /// `~/.aterm/rc-wired`: the rc files this machine has wired, one canonical path per line.
 ///
-/// The block says "delete this block to opt out", but [`refresh`] runs from install, every
+/// The block says "delete this block to opt out", but the rc pass runs from install, every
 /// launch's seed and the six-hourly `update`, so with the marker as the only check the
 /// opt-out would last until the next pass. A wired rc is recorded here, and a recorded rc that no
 /// longer carries the block is the user's opt-out and is skipped. A pass also records an rc
@@ -885,7 +995,10 @@ fn record_rc_wired(home: &Path, real: &Path, ledger: &mut std::collections::BTre
 /// aterm session.
 ///
 /// Conservative about a file it does not own:
-/// * only rc files that already exist are edited;
+/// * rc files that exist are edited, and exactly one may be created: `login`, the row the
+///   account's login shell reads ([`login_rc`]), when it is absent and its directory
+///   exists. A shell the user does not log in with never gains a file, and the created rc is
+///   recorded like a wired one, so deleting it is an opt-out too;
 /// * the block is bounded by [`RC_BEGIN`]/[`RC_END`], so it is idempotent and a user can
 ///   delete it in one motion, and a deletion stays deleted ([`RC_LEDGER`]);
 /// * it sources `shell.d` rather than inlining a PATH, so there is one generator and the
@@ -898,15 +1011,18 @@ fn record_rc_wired(home: &Path, real: &Path, ledger: &mut std::collections::BTre
 /// `bash -i` reads `.bashrc` alone, and with no `.bash_profile` a login falls through to
 /// `.profile`. Both source the same `00-atpkg.bash`; a `.bash_profile` that sources
 /// `.bashrc` runs it twice, which the hook tolerates (bin/ presence-guarded, the front dirs
-/// moved, never duplicated). A home with a `.bashrc` and no `.bash_profile` gets nothing
-/// invented. `~/.bash_login` and `~/.profile` are not rows: `sh`/dash logins read
+/// moved, never duplicated). A home with a `.bashrc` and no `.bash_profile` gains a
+/// `.bash_profile` only when the login shell is bash on macOS and no `.bash_login` or
+/// `.profile` stands. `~/.bash_login` and `~/.profile` are not rows: `sh`/dash logins read
 /// `.profile`, and the hook body (`${x//p/r}`) is not written for them.
 ///
-/// Returns one [`RcOutcome`] per row that exists, in [`RC_FILES`] order.
+/// Returns one [`RcOutcome`] per row that exists, and for `login` when it was absent and a
+/// pass created it or left it so, in [`RC_FILES`] order.
 #[cfg(unix)]
 pub(crate) fn ensure_rc_sources_hooks(
     home: &Path,
     wiring: RcWiring,
+    login: Option<&'static str>,
 ) -> Vec<(&'static str, RcOutcome)> {
     // Both sides of the protected-root comparison canonical: `$TMPDIR` and a home
     // reached through a link both spell `/private/…` once resolved.
@@ -916,10 +1032,16 @@ pub(crate) fn ensure_rc_sources_hooks(
     let mut outcomes: Vec<(&'static str, RcOutcome)> = Vec::new();
     for (rc, hook) in RC_FILES {
         let rc_path = home.join(rc);
-        // Never create an rc: a shell the user does not use should not gain one. `lstat`
-        // and `realpath` are metadata-only and gated nowhere, so finding where the rc
-        // really lives costs no consent.
+        // Create only the login shell's rc: a shell the user does not log in with should not
+        // gain one. `lstat` and `realpath` are metadata-only and gated nowhere, so finding
+        // where the rc really lives costs no consent.
         if fs::symlink_metadata(&rc_path).is_err() {
+            if login == Some(rc)
+                && let Some(outcome) =
+                    create_login_rc(home, &canonical_home, rc, hook, wiring, &mut ledger)
+            {
+                outcomes.push((rc, outcome));
+            }
             continue;
         }
         // Write to the file the rc names, never over a link: renaming over a symlinked rc
@@ -967,37 +1089,12 @@ pub(crate) fn ensure_rc_sources_hooks(
             outcomes.push((rc, RcOutcome::OptOutKept));
             continue;
         }
-        let hook_path = home.join(".aterm").join("shell.d").join(hook);
-        // Double-quoted, both interpolations (`sh_quote`'s contract): bare, a HOME with a
-        // space word-splits and the hook is never sourced. The block is marker-bounded, so
-        // no later pass rewrites a bad line; it has to be born right.
-        //
-        // Status-neutral in both dialects: this is the last line many rc files run, so its
-        // status is the `$?` the first prompt reads. `[ -f … ] && . …` exits 1 when the hook
-        // is absent; `if …; then …; fi` reports the hook's own status, and 0 when there is
-        // nothing to source.
-        let line = if hook.ends_with(".fish") {
-            format!(
-                "if test -f \"{p}\"; source \"{p}\"; end",
-                p = fish_quote(&hook_path)
-            )
-        } else {
-            format!(
-                "if [ -f \"{p}\" ]; then . \"{p}\"; fi",
-                p = sh_quote(&hook_path)
-            )
-        };
         let mut next = existing;
         if !next.is_empty() && !next.ends_with('\n') {
             next.push('\n');
         }
-        next.push_str(&format!(
-            "\n{RC_BEGIN}\n\
-             # Puts the ALab toolchain on PATH. Managed by atpkg; delete this block to opt\n\
-             # out -- it stays deleted; `aterm pkg repair` puts it back.\n\
-             {line}\n\
-             {RC_END}\n"
-        ));
+        next.push('\n');
+        next.push_str(&rc_block(home, hook));
         // Temp + rename: a reader never sees a half-written rc, and a failure leaves the
         // original untouched. The temp sits beside the real file (same filesystem, so the
         // rename replaces it and not the link) and carries its mode. A directory we cannot
@@ -1032,6 +1129,119 @@ pub(crate) fn ensure_rc_sources_hooks(
         }
     }
     outcomes
+}
+
+/// atpkg's block for an rc that sources `hook` from `home`'s `shell.d`, markers included.
+#[cfg(unix)]
+fn rc_block(home: &Path, hook: &str) -> String {
+    let hook_path = home.join(".aterm").join("shell.d").join(hook);
+    // Double-quoted, both interpolations (`sh_quote`'s contract): bare, a HOME with a
+    // space word-splits and the hook is never sourced. The block is marker-bounded, so
+    // no later pass rewrites a bad line; it has to be born right.
+    //
+    // Status-neutral in both dialects: this is the last line many rc files run, so its
+    // status is the `$?` the first prompt reads. `[ -f … ] && . …` exits 1 when the hook
+    // is absent; `if …; then …; fi` reports the hook's own status, and 0 when there is
+    // nothing to source.
+    let line = if hook.ends_with(".fish") {
+        format!(
+            "if test -f \"{p}\"; source \"{p}\"; end",
+            p = fish_quote(&hook_path)
+        )
+    } else {
+        format!(
+            "if [ -f \"{p}\" ]; then . \"{p}\"; fi",
+            p = sh_quote(&hook_path)
+        )
+    };
+    format!(
+        "{RC_BEGIN}\n\
+         # Puts the ALab toolchain on PATH. Managed by atpkg; delete this block to opt\n\
+         # out -- it stays deleted; `aterm pkg repair` puts it back.\n\
+         {line}\n\
+         {RC_END}\n"
+    )
+}
+
+/// Where the absent login rc `rc` would be created: its directory resolved (a `~/.config`
+/// that is a link counts as its target) and the file name joined on, so the consent fence
+/// and the ledger read the path the file will have. `None` when the directory is missing:
+/// a pass creates one file, never a directory for it.
+#[cfg(unix)]
+fn login_rc_target(home: &Path, rc: &str) -> Option<std::path::PathBuf> {
+    let path = home.join(rc);
+    let name = path.file_name()?;
+    let dir = fs::canonicalize(path.parent()?).ok()?;
+    fs::metadata(&dir).ok()?.is_dir().then(|| dir.join(name))
+}
+
+/// What a pass does about the absent login rc `rc` ([`login_rc`]); `None` when it can be
+/// neither created nor reported (its directory is missing).
+///
+/// Under the consent fence it is not created ([`RcOutcome::ConsentFenced`]). One the
+/// ledger records was created (or wired) once and is gone, so the user deleted it: the
+/// unattended pass leaves it absent ([`RcOutcome::OptOutKept`]) and `repair` creates it
+/// again ([`RcOutcome::RelaidOverOptOut`]). Otherwise it is created holding only the
+/// block, exclusively (`O_EXCL`, so a file that appeared since the `lstat` is never
+/// replaced; such a file is wired by the next pass) and `0600`, then recorded.
+#[cfg(unix)]
+fn create_login_rc(
+    home: &Path,
+    canonical_home: &Path,
+    rc: &'static str,
+    hook: &str,
+    wiring: RcWiring,
+    ledger: &mut std::collections::BTreeSet<String>,
+) -> Option<RcOutcome> {
+    let real = login_rc_target(home, rc)?;
+    if crate::protected::under_protected_root(canonical_home, &real) {
+        return Some(RcOutcome::ConsentFenced);
+    }
+    let opted_out = ledger.contains(real.to_string_lossy().as_ref());
+    if wiring == RcWiring::HonorOptOut && opted_out {
+        return Some(RcOutcome::OptOutKept);
+    }
+    let body = rc_block(home, hook);
+    let mut file = match crate::platform::create_private_new(&real) {
+        Ok(file) => file,
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => return None,
+        Err(_) => return Some(RcOutcome::WriteFailed),
+    };
+    // A file this call created, so a failed write takes it back rather than leave a shell a
+    // half block to parse.
+    if io::Write::write_all(&mut file, body.as_bytes()).is_err() {
+        drop(file);
+        let _ = fs::remove_file(&real);
+        return Some(RcOutcome::WriteFailed);
+    }
+    record_rc_wired(home, &real, ledger);
+    Some(if opted_out {
+        RcOutcome::RelaidOverOptOut
+    } else {
+        RcOutcome::Created
+    })
+}
+
+/// The absent login rc `rc`'s state for a report, as [`create_login_rc`] would treat it:
+/// [`RcState::Unwired`] when a pass creates it, [`RcState::OptedOut`] when the user deleted
+/// the one a pass created, [`RcState::ConsentFenced`] under the fence. `None` when `rc`
+/// stands (the report reads it as any rc) or cannot be created (no directory for it).
+#[cfg(unix)]
+pub(crate) fn absent_login_rc(home: &Path, rc: &str) -> Option<RcState> {
+    if fs::symlink_metadata(home.join(rc)).is_ok() {
+        return None;
+    }
+    let real = login_rc_target(home, rc)?;
+    let canonical_home = fs::canonicalize(home).unwrap_or_else(|_| home.to_path_buf());
+    Some(
+        if crate::protected::under_protected_root(&canonical_home, &real) {
+            RcState::ConsentFenced
+        } else if read_rc_ledger(home).contains(real.to_string_lossy().as_ref()) {
+            RcState::OptedOut
+        } else {
+            RcState::Unwired
+        },
+    )
 }
 
 /// The bash login profiles `tools/install.sh`'s `path_block_rc_target` can elect that atpkg
@@ -1765,9 +1975,9 @@ mod tests {
         let home = tmp("rcwire");
         let zshrc = home.join(".zshrc");
         std::fs::write(&zshrc, "# pre-existing user content\nexport FOO=1\n").unwrap();
-        // .bashrc deliberately absent: atpkg must not create an rc.
+        // .bashrc deliberately absent, and no login rc named: atpkg must not create an rc.
 
-        ensure_rc_sources_hooks(&home, RcWiring::HonorOptOut);
+        ensure_rc_sources_hooks(&home, RcWiring::HonorOptOut, None);
         let once = std::fs::read_to_string(&zshrc).unwrap();
         let ino_once = fs::metadata(&zshrc).unwrap().ino();
         assert!(
@@ -1785,7 +1995,7 @@ mod tests {
         assert!(!home.join(".bashrc").exists(), "no rc was invented");
 
         // Idempotent: a second pass stacks no second block and rewrites nothing (same inode).
-        ensure_rc_sources_hooks(&home, RcWiring::HonorOptOut);
+        ensure_rc_sources_hooks(&home, RcWiring::HonorOptOut, None);
         let twice = std::fs::read_to_string(&zshrc).unwrap();
         assert_eq!(twice, once, "a second pass must be a no-op");
         assert_eq!(twice.matches(RC_BEGIN).count(), 1, "exactly one block");
@@ -1809,7 +2019,7 @@ mod tests {
         let user = "# pre-existing user content\nexport FOO=1\n";
         fs::write(&zshrc, user).unwrap();
 
-        ensure_rc_sources_hooks(&home, RcWiring::HonorOptOut);
+        ensure_rc_sources_hooks(&home, RcWiring::HonorOptOut, None);
         assert!(
             fs::read_to_string(&zshrc).unwrap().contains(RC_BEGIN),
             "wired on the first pass, as before"
@@ -1833,7 +2043,7 @@ mod tests {
         // The user does exactly what the block tells them to.
         fs::write(&zshrc, user).unwrap();
         for pass in 0..3 {
-            ensure_rc_sources_hooks(&home, RcWiring::HonorOptOut);
+            ensure_rc_sources_hooks(&home, RcWiring::HonorOptOut, None);
             assert_eq!(
                 fs::read_to_string(&zshrc).unwrap(),
                 user,
@@ -1842,7 +2052,7 @@ mod tests {
         }
 
         // `atpkg repair` is the pass the user asks for, so it wires the rc again.
-        ensure_rc_sources_hooks(&home, RcWiring::Rewire);
+        ensure_rc_sources_hooks(&home, RcWiring::Rewire, None);
         assert!(
             fs::read_to_string(&zshrc).unwrap().contains(RC_BEGIN),
             "repair puts the block back"
@@ -1850,7 +2060,7 @@ mod tests {
 
         // …and the opt-out is still available afterwards.
         fs::write(&zshrc, user).unwrap();
-        ensure_rc_sources_hooks(&home, RcWiring::HonorOptOut);
+        ensure_rc_sources_hooks(&home, RcWiring::HonorOptOut, None);
         assert_eq!(
             fs::read_to_string(&zshrc).unwrap(),
             user,
@@ -1858,6 +2068,133 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(&home);
+    }
+
+    /// The one file a pass creates (design init-system §4.2): the login shell's absent rc,
+    /// holding only the block, private, recorded. No other shell's rc appears, even where
+    /// its directory stands. Deleting the created file is an opt-out the unattended pass
+    /// keeps and `repair` lifts.
+    #[cfg(unix)]
+    #[test]
+    fn the_login_shell_s_absent_rc_is_created_and_no_other_shell_gains_one() {
+        let home = tmp("rclogin");
+        // fish's directory stands, so a pass that created a file for any shell could.
+        fs::create_dir_all(home.join(".config/fish")).unwrap();
+        let login = login_rc("/bin/zsh", &home, None);
+        assert_eq!(login, Some(".zshrc"));
+        let zshrc = home.join(".zshrc");
+
+        assert_eq!(
+            ensure_rc_sources_hooks(&home, RcWiring::HonorOptOut, login),
+            [(".zshrc", RcOutcome::Created)]
+        );
+        let body = fs::read_to_string(&zshrc).unwrap();
+        assert!(body.starts_with(RC_BEGIN), "only the block: {body:?}");
+        assert!(body.contains(".aterm/shell.d/00-atpkg.zsh"), "{body:?}");
+        assert_eq!(body.matches(RC_BEGIN).count(), 1);
+        assert_eq!(
+            fs::metadata(&zshrc).unwrap().permissions().mode() & 0o777,
+            0o600,
+            "born private"
+        );
+        let real = fs::canonicalize(&zshrc).unwrap();
+        assert!(
+            read_rc_ledger(&home).contains(real.to_string_lossy().as_ref()),
+            "recorded like a wired rc"
+        );
+        for other in [".bashrc", ".bash_profile", ".config/fish/config.fish"] {
+            assert!(
+                fs::symlink_metadata(home.join(other)).is_err(),
+                "{other} appeared for a shell this account does not log in with"
+            );
+        }
+
+        // The next pass finds it wired and writes nothing.
+        assert_eq!(
+            ensure_rc_sources_hooks(&home, RcWiring::HonorOptOut, login),
+            [(".zshrc", RcOutcome::AlreadyWired)]
+        );
+        assert_eq!(fs::read_to_string(&zshrc).unwrap(), body);
+
+        // The user deletes the file: every unattended pass leaves it gone, and says so.
+        fs::remove_file(&zshrc).unwrap();
+        assert_eq!(absent_login_rc(&home, ".zshrc"), Some(RcState::OptedOut));
+        for pass in 0..2 {
+            assert_eq!(
+                ensure_rc_sources_hooks(&home, RcWiring::HonorOptOut, login),
+                [(".zshrc", RcOutcome::OptOutKept)],
+                "pass {pass}"
+            );
+            assert!(fs::symlink_metadata(&zshrc).is_err(), "pass {pass}");
+        }
+        // `repair` makes it again.
+        assert_eq!(
+            ensure_rc_sources_hooks(&home, RcWiring::Rewire, login),
+            [(".zshrc", RcOutcome::RelaidOverOptOut)]
+        );
+        assert_eq!(fs::read_to_string(&zshrc).unwrap(), body);
+        assert_eq!(absent_login_rc(&home, ".zshrc"), None, "it stands again");
+    }
+
+    /// The login rc is selfsetup's `rc_target` election, and only a file atpkg wires: a
+    /// shell it does not know, and an election that picks a file no row names, get nothing.
+    #[cfg(unix)]
+    #[test]
+    fn the_login_rc_is_the_rc_target_election_s_and_only_a_row() {
+        let home = tmp("rcelect");
+        assert_eq!(login_rc("/bin/zsh", &home, None), Some(".zshrc"));
+        assert_eq!(login_rc("zsh", &home, None), Some(".zshrc"));
+        assert_eq!(
+            login_rc("/opt/homebrew/bin/fish", &home, None),
+            Some(".config/fish/config.fish")
+        );
+        assert_eq!(
+            login_rc("/opt/homebrew/bin/fish", &home, Some(&home.join(".config"))),
+            Some(".config/fish/config.fish")
+        );
+        // fish under another XDG_CONFIG_HOME reads a config.fish no row names.
+        assert_eq!(
+            login_rc("/opt/homebrew/bin/fish", &home, Some(&home.join("xdg"))),
+            None
+        );
+        for unknown in ["/bin/sh", "/bin/dash", "/usr/bin/nu", "/usr/bin/false", ""] {
+            assert_eq!(login_rc(unknown, &home, None), None, "{unknown:?}");
+        }
+        if cfg!(target_os = "macos") {
+            assert_eq!(login_rc("/bin/bash", &home, None), Some(".bash_profile"));
+            // A login bash that reads `~/.profile` is left to it.
+            fs::write(home.join(".profile"), "").unwrap();
+            assert_eq!(login_rc("/bin/bash", &home, None), None);
+        } else {
+            assert_eq!(login_rc("/bin/bash", &home, None), Some(".bashrc"));
+        }
+    }
+
+    /// The created rc keeps the consent fence: a login rc whose directory resolves under a
+    /// guarded folder is neither created nor opened, and a missing directory is never made.
+    #[cfg(unix)]
+    #[test]
+    fn a_login_rc_under_a_guarded_folder_or_with_no_directory_is_not_created() {
+        let home = tmp("rcloginfence");
+        let login = login_rc("/usr/local/bin/fish", &home, None);
+        assert_eq!(login, Some(".config/fish/config.fish"));
+        // No ~/.config/fish: nothing is created, and no directory either.
+        assert_eq!(ensure_rc_sources_hooks(&home, RcWiring::Rewire, login), []);
+        assert!(fs::symlink_metadata(home.join(".config")).is_err());
+        assert_eq!(absent_login_rc(&home, ".config/fish/config.fish"), None);
+
+        // ~/.config is a link into ~/Documents (a dotfiles checkout there).
+        fs::create_dir_all(home.join("Documents/dotfiles/fish")).unwrap();
+        std::os::unix::fs::symlink(home.join("Documents/dotfiles"), home.join(".config")).unwrap();
+        assert_eq!(
+            ensure_rc_sources_hooks(&home, RcWiring::Rewire, login),
+            [(".config/fish/config.fish", RcOutcome::ConsentFenced)]
+        );
+        assert!(!home.join("Documents/dotfiles/fish/config.fish").exists());
+        assert_eq!(
+            absent_login_rc(&home, ".config/fish/config.fish"),
+            Some(RcState::ConsentFenced)
+        );
     }
 
     /// A machine wired before the ledger existed opts out on its first deletion: a pass
@@ -1879,7 +2216,7 @@ mod tests {
             "the pre-2026-09-16 shape: wired, with nothing recorded"
         );
 
-        ensure_rc_sources_hooks(&home, RcWiring::HonorOptOut);
+        ensure_rc_sources_hooks(&home, RcWiring::HonorOptOut, None);
         assert_eq!(
             fs::read_to_string(&bashrc).unwrap(),
             pre,
@@ -1892,7 +2229,7 @@ mod tests {
 
         // The first deletion on such a machine is honoured.
         fs::write(&bashrc, user).unwrap();
-        ensure_rc_sources_hooks(&home, RcWiring::HonorOptOut);
+        ensure_rc_sources_hooks(&home, RcWiring::HonorOptOut, None);
         assert_eq!(
             fs::read_to_string(&bashrc).unwrap(),
             user,
@@ -1948,7 +2285,7 @@ mod tests {
             fs::write(shell_d.join(hook), body).unwrap();
         }
 
-        ensure_rc_sources_hooks(&home, RcWiring::HonorOptOut);
+        ensure_rc_sources_hooks(&home, RcWiring::HonorOptOut, None);
 
         // The generated source line for one dialect, read from inside the markers.
         let line_of = |rc: &str| -> String {
@@ -2025,7 +2362,7 @@ mod tests {
             fs::create_dir_all(rc_path.parent().unwrap()).unwrap();
             fs::write(&rc_path, "# pre-existing user content\n").unwrap();
         }
-        ensure_rc_sources_hooks(&home, RcWiring::HonorOptOut);
+        ensure_rc_sources_hooks(&home, RcWiring::HonorOptOut, None);
 
         let line_of = |rc: &str| -> String {
             let body = fs::read_to_string(home.join(rc)).unwrap();
@@ -2098,6 +2435,7 @@ mod tests {
             Path::new("/opt/atpkg-fixture/agents"),
             Path::new("/opt/atpkg-fixture/reroute"),
             RcWiring::HonorOptOut,
+            None,
         );
 
         assert!(
@@ -2135,7 +2473,7 @@ mod tests {
         fs::write(&fish, "set -x FOO 1\n").unwrap();
         fs::set_permissions(&fish, fs::Permissions::from_mode(0o600)).unwrap();
 
-        ensure_rc_sources_hooks(&home, RcWiring::HonorOptOut);
+        ensure_rc_sources_hooks(&home, RcWiring::HonorOptOut, None);
         assert!(
             fs::symlink_metadata(&link)
                 .unwrap()
@@ -2170,7 +2508,7 @@ mod tests {
             "a regular 0600 rc must not widen either"
         );
 
-        ensure_rc_sources_hooks(&home, RcWiring::HonorOptOut);
+        ensure_rc_sources_hooks(&home, RcWiring::HonorOptOut, None);
         assert_eq!(
             fs::read_to_string(&target)
                 .unwrap()
@@ -2205,7 +2543,7 @@ mod tests {
         let profile = home.join(".bash_profile");
         fs::write(&profile, "# login-only content\nexport FOO=1").unwrap(); // no final newline
 
-        ensure_rc_sources_hooks(&home, RcWiring::HonorOptOut);
+        ensure_rc_sources_hooks(&home, RcWiring::HonorOptOut, None);
         let wired = fs::read_to_string(&profile).unwrap();
         assert!(
             wired.contains(RC_BEGIN) && wired.contains(RC_END),
@@ -2227,7 +2565,7 @@ mod tests {
         // Both present: both wired, each with exactly one block and the same hook.
         let bashrc = home.join(".bashrc");
         fs::write(&bashrc, "export BAR=1\n").unwrap();
-        ensure_rc_sources_hooks(&home, RcWiring::HonorOptOut);
+        ensure_rc_sources_hooks(&home, RcWiring::HonorOptOut, None);
         for rc in [&profile, &bashrc] {
             let body = fs::read_to_string(rc).unwrap();
             assert_eq!(
@@ -2266,7 +2604,7 @@ mod tests {
         fs::write(&bashrc, "export BAR=1\n").unwrap();
         std::os::unix::fs::symlink(&bashrc, home.join(".bashrc")).unwrap();
 
-        ensure_rc_sources_hooks(&home, RcWiring::HonorOptOut);
+        ensure_rc_sources_hooks(&home, RcWiring::HonorOptOut, None);
 
         assert_eq!(
             fs::read_to_string(&zshrc).unwrap(),
@@ -2624,14 +2962,21 @@ mod tests {
         let amacs = store.join("amacs");
 
         for wiring in [RcWiring::HonorOptOut, RcWiring::Rewire] {
-            let pass = refresh_as(&layout, wiring, Some(&aterm), None, false);
+            let pass = refresh_as(&layout, wiring, Some(&aterm), None, false, None);
             assert_eq!(pass, HookPass::NotHardened);
             assert!(
                 fs::symlink_metadata(&amacs).is_err(),
                 "heal off: nothing laid"
             );
         }
-        let pass = refresh_as(&layout, RcWiring::HonorOptOut, Some(&aterm), None, true);
+        let pass = refresh_as(
+            &layout,
+            RcWiring::HonorOptOut,
+            Some(&aterm),
+            None,
+            true,
+            None,
+        );
         assert_eq!(pass, HookPass::NotHardened, "no $HOME: no hook is written");
         assert_eq!(fs::read_link(&amacs).unwrap(), Path::new("aterm"));
         assert!(
@@ -2913,7 +3258,7 @@ mod tests {
         let release = root.join("Applications/aterm.app/Contents/MacOS/aterm");
         let hook = home.join(".aterm/shell.d/00-atpkg.zsh");
 
-        let pass = pass_as(&layout, &home, RcWiring::HonorOptOut, Some(&dev));
+        let pass = pass_as(&layout, &home, RcWiring::HonorOptOut, Some(&dev), None);
         assert_eq!(pass, HookPass::NotReleaseBundle);
         assert!(pass.rc().is_empty());
         assert!(
@@ -2921,19 +3266,19 @@ mod tests {
             "the unattended pass from a dev bundle touches nothing under $HOME"
         );
 
-        let pass = pass_as(&layout, &home, RcWiring::HonorOptOut, Some(&release));
+        let pass = pass_as(&layout, &home, RcWiring::HonorOptOut, Some(&release), None);
         assert!(matches!(pass, HookPass::Rewritten(_)), "{pass:?}");
         assert!(hook.exists(), "the release bundle lays the hook");
 
         fs::remove_file(&hook).unwrap();
-        let pass = pass_as(&layout, &home, RcWiring::Rewire, Some(&dev));
+        let pass = pass_as(&layout, &home, RcWiring::Rewire, Some(&dev), None);
         assert!(matches!(pass, HookPass::Rewritten(_)), "{pass:?}");
         assert!(
             hook.exists(),
             "repair is the asked-for pass and writes from anywhere"
         );
 
-        let pass = pass_as(&layout, &home, RcWiring::HonorOptOut, None);
+        let pass = pass_as(&layout, &home, RcWiring::HonorOptOut, None, None);
         assert!(
             matches!(pass, HookPass::Rewritten(_)),
             "an unresolvable executable never stops a pass: {pass:?}"
@@ -3295,7 +3640,7 @@ mod tests {
                 "set -g ATPKG_RC_TEST sourced\n",
             )
             .unwrap();
-            ensure_rc_sources_hooks(&rc_home, RcWiring::HonorOptOut);
+            ensure_rc_sources_hooks(&rc_home, RcWiring::HonorOptOut, None);
             let written = fs::read_to_string(&rc).unwrap();
             let line = written
                 .lines()
@@ -3327,7 +3672,7 @@ mod tests {
         fs::create_dir_all(rc.parent().unwrap()).unwrap();
         fs::write(&rc, "# pre-existing user content\n").unwrap();
 
-        ensure_rc_sources_hooks(&home, RcWiring::HonorOptOut);
+        ensure_rc_sources_hooks(&home, RcWiring::HonorOptOut, None);
 
         let written = fs::read_to_string(&rc).unwrap();
         let line = written

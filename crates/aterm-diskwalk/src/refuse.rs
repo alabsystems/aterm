@@ -103,6 +103,7 @@ pub enum Refusal {
 
 impl Refusal {
     /// The wire word (`why=` of a `sys disk` row).
+    #[inline]
     #[must_use]
     pub const fn word(self) -> &'static str {
         match self {
@@ -125,6 +126,7 @@ impl Refusal {
     }
 
     /// The sentence a row shows.
+    #[inline]
     #[must_use]
     pub const fn label(self) -> &'static str {
         match self {
@@ -186,30 +188,35 @@ impl Deny {
 
     /// [`Self::for_home`] with the case rule named, for a test of the other
     /// platform's rule.
+    #[inline]
     #[must_use]
-    pub fn with_fold_case(mut self, fold_case: bool) -> Self {
+    pub const fn with_fold_case(mut self, fold_case: bool) -> Self {
         self.fold_case = fold_case;
         self
     }
 
     /// The home this set was built for, canonical.
+    #[inline]
     #[must_use]
     pub fn home(&self) -> &Path {
         &self.home
     }
 
     /// The denied roots, canonical (for a `not measured` listing).
+    #[inline]
     #[must_use]
     pub fn roots(&self) -> &[PathBuf] {
         &self.roots
     }
 
     /// Whether path comparisons ignore ASCII case (macOS, as APFS does).
+    #[inline]
     #[must_use]
     pub const fn fold_case(&self) -> bool {
         self.fold_case
     }
 
+    #[inline]
     fn under(&self, path: &Path, root: &Path) -> bool {
         under(path, root, self.fold_case)
     }

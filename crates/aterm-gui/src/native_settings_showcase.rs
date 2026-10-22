@@ -369,15 +369,32 @@ impl ShowcaseState {
     /// The rows `query` (trimmed, lowercase) admits: [`Self::visible`] for
     /// that filter.
     pub(crate) fn visible_for(&self, query: &str) -> Vec<usize> {
+        let reach = self.reach_for(query);
         self.cards
             .iter()
             .enumerate()
             .filter(|(_, card)| {
                 (card.section != Section::Community || self.pack_open || !query.is_empty())
-                    && card.matches(query)
+                    && card.matches(query, reach)
             })
             .map(|(index, _)| index)
             .collect()
+    }
+
+    /// How far the filter `query` reaches over the whole list — the themes
+    /// needing attention and every card ([`MatchReach`]): word hits where
+    /// any row has one, else loose ones, so a filter nothing starts a word
+    /// with still lists the themes that hold it.
+    pub(crate) fn reach_for(&self, query: &str) -> MatchReach {
+        MatchReach::of(
+            self.attention
+                .iter()
+                .any(|row| attention_row_matches(row, query, MatchReach::Words))
+                || self
+                    .cards
+                    .iter()
+                    .any(|card| card.matches(query, MatchReach::Words)),
+        )
     }
 
     /// The rows the last render listed, in order.
@@ -414,6 +431,18 @@ impl ShowcaseState {
     pub(crate) fn note_input(&self) {
         self.input_pending.set(true);
     }
+}
+
+/// Whether the filter `query` (trimmed, lowercase) at `reach`
+/// ([`ShowcaseState::reach_for`]) admits a theme needing attention, by its id.
+pub(crate) fn attention_row_matches(row: &AttentionRow, query: &str, reach: MatchReach) -> bool {
+    query.is_empty()
+        || crate::native_config_language::candidate_match_score(
+            &row.id.to_lowercase(),
+            query,
+            reach,
+        )
+        .is_some()
 }
 
 /// Which of the page's own text fields the keyboard is in.
@@ -2947,6 +2976,7 @@ fn text_field(
                     visual_value: None,
                     input: Some(input.projection()),
                     swatch,
+                    swatch_line: false,
                     trailing_hint: None,
                     description: None,
                     end_button: false,

@@ -1,0 +1,45 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Andrew Yates
+#
+# aterm-aos's lint config. Clippy reads only the nearest clippy.toml, so the
+# workspace file's rows that can resolve in a crate with no libc, winit or windows
+# dependency are repeated here (the root file says why each exists), followed by
+# the injected clock and the purity rows.
+#
+# The injected clock: the Aos task reads no clock. Time enters as recorded input
+# (a signed nanosecond offset from the epoch the host declared at attach), so a
+# replay of the same log reproduces the same state; a read of the clock here would
+# be an input nothing records. `aterm_time::Instant::now` is
+# `std::time::Instant::now` on native targets, so the std row covers it; `elapsed`
+# reads the clock too. The aterm_time and aterm_types rows name crates this one
+# does not depend on (allow-invalid): they stand guard should one ever be added.
+#
+# Purity: the crate holds no thread, file or socket (design §1). A step that
+# slept, spawned or read a file would not replay; those doors are banned too.
+disallowed-methods = [
+  { path = "std::fs::File::lock", reason = "take it through a guard whose Drop releases by LOCK_UN (clippy.toml: the flock release rule)" },
+  { path = "std::fs::File::try_lock", reason = "take it through a guard whose Drop releases by LOCK_UN (clippy.toml: the flock release rule)" },
+  { path = "std::fs::File::lock_shared", reason = "take it through a guard whose Drop releases by LOCK_UN (clippy.toml: the flock release rule)" },
+  { path = "std::fs::File::try_lock_shared", reason = "take it through a guard whose Drop releases by LOCK_UN (clippy.toml: the flock release rule)" },
+  { path = "std::fs::File::sync_all", reason = "finish the write with aterm_durable::durable or aterm_durable::ordered: name what a power loss may leave (clippy.toml: a chosen flush)" },
+  { path = "std::fs::File::sync_data", reason = "finish the write with aterm_durable::durable_data or aterm_durable::ordered: name what a power loss may leave (clippy.toml: a chosen flush)" },
+  { path = "std::process::abort", reason = "die by SIGKILL: aterm_uds::process::kill_self_now() (clippy.toml: no core-dump death)" },
+  { path = "std::os::windows::process::CommandExt::creation_flags", reason = "set a child's console with aterm_uds::spawn (clippy.toml: one Windows console decision)", allow-invalid = true },
+  { path = "std::time::Instant::now", reason = "the Aos task reads no clock: time enters as recorded input (clippy.toml: the injected clock)" },
+  { path = "std::time::SystemTime::now", reason = "the Aos task reads no clock: time enters as recorded input (clippy.toml: the injected clock)" },
+  { path = "std::time::Instant::elapsed", reason = "the Aos task reads no clock: time enters as recorded input (clippy.toml: the injected clock)" },
+  { path = "std::time::SystemTime::elapsed", reason = "the Aos task reads no clock: time enters as recorded input (clippy.toml: the injected clock)" },
+  { path = "aterm_time::since_epoch", reason = "the Aos task reads no clock: time enters as recorded input (clippy.toml: the injected clock)", allow-invalid = true },
+  { path = "aterm_time::unix_secs", reason = "the Aos task reads no clock: time enters as recorded input (clippy.toml: the injected clock)", allow-invalid = true },
+  { path = "aterm_time::unix_millis", reason = "the Aos task reads no clock: time enters as recorded input (clippy.toml: the injected clock)", allow-invalid = true },
+  { path = "aterm_types::shell_types::current_time_ms", reason = "the Aos task reads no clock: time enters as recorded input (clippy.toml: the injected clock)", allow-invalid = true },
+  { path = "std::thread::spawn", reason = "the Aos substrate holds no thread: a step runs on its host's thread and replays there (clippy.toml: purity)" },
+  { path = "std::thread::sleep", reason = "the Aos task reads no clock: time enters as recorded input (clippy.toml: the injected clock)" },
+]
+disallowed-types = [
+  { path = "std::process::Command", reason = "build children with aterm_uds::spawnfd::command, which hands them stdio and nothing else (clippy.toml: one child constructor)" },
+  { path = "std::fs::File", reason = "the Aos substrate holds no file: the host hands it bytes and takes bytes back (clippy.toml: purity)" },
+  { path = "std::net::TcpStream", reason = "the Aos substrate holds no socket: external effects go through an EffectPort the host supplies (clippy.toml: purity)" },
+  { path = "std::net::TcpListener", reason = "the Aos substrate holds no socket: external effects go through an EffectPort the host supplies (clippy.toml: purity)" },
+  { path = "std::net::UdpSocket", reason = "the Aos substrate holds no socket: external effects go through an EffectPort the host supplies (clippy.toml: purity)" },
+]

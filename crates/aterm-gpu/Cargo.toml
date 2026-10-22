@@ -56,7 +56,7 @@ aterm-spec-anchor = { workspace = true }
 # on Linux and, as WebGL2, on wasm32, wgpu's DX12 on Windows), so no cell
 # compiles another's backend (`vulkan` was ~160k lines on Windows;
 # docs/THIRD_PARTY_ROAD_TO_ZERO.md).
-# The trade: a box whose one driver is broken falls to the CPU softbuffer present
+# The trade: a box whose one driver is broken falls to the CPU present
 # path, not a second GPU backend. `gpu = false` chooses that path outright. `dx12`
 # stays in the `cfg(windows)` table: its feature forwards `naga/hlsl-out`, which
 # is not target-gated and would compile ~10k dead lines of HLSL writer on other
@@ -85,8 +85,9 @@ raw-window-handle = "0.6"
 wgpu = { version = "29", default-features = false, features = ["vulkan", "wgsl"] }
 
 # Linux renders on the first-party GL arm (`src/gl`,
-# docs/AUDIT-third-party-2026-10-15.md GW.4): it opens `libEGL.so.1` (and, on
-# Wayland, `libwayland-egl.so.1`) with `dlopen` through aterm-libc's
+# docs/AUDIT-third-party-2026-10-15.md GW.4): it opens `libEGL.so.1` (on
+# Wayland also `libwayland-egl.so.1`; on X11 `libGLX.so.0` and `libX11.so.6`,
+# whose windows post through GLX) with `dlopen` through aterm-libc's
 # declarations; no GL library is linked and no crate binds one. wgpu compiles
 # here only as the oracle (`wgpu-oracle`), with both backends the GL arm is
 # byte-compared against on the same driver: GLES (the downlevel plan) and
@@ -129,6 +130,13 @@ aterm-models-render = { workspace = true }
 # The pure, clockless supernova emitters feed `nova_parity`'s RenderInput
 # channels directly, with no engine.
 aterm-effects = { workspace = true }
+
+# The GL arm's windowed X11 test (`gl::glx`) runs its work in a child, this test
+# binary run again, with its output in a scratch directory: Xlib's error and IO
+# handlers are process-wide.
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+aterm-uds = { workspace = true }
+aterm-tempfile = { workspace = true }
 
 [lints]
 workspace = true

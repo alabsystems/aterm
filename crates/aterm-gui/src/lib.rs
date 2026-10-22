@@ -421,6 +421,9 @@ mod devtools_helper_drive;
 /// window, who manages whom, and the go-there / take-over / read-result /
 /// stop-worker selection machine.
 mod overview;
+/// The Overview's "On the fabric" group: one bounded `aterm fabric brief
+/// --json` child at a time, composed into the card's remote needs.
+mod overview_fabric;
 /// Why a save of a file (aterm.toml, a Manual document) did not land, in
 /// the words Settings, Messages, Manual and `aterm ctl settings set` give:
 /// amacs-files' one set, which amacs's terminal face says too.
@@ -701,7 +704,7 @@ mod pinned_dir;
 mod platform_win;
 /// The CPU present seam: the trait pair the fail-soft (GPU-failure) renderer
 /// presents through, plus the per-cell backend behind it — first-party
-/// CoreGraphics on macOS, MIT-SHM / `wl_shm` on Linux, `softbuffer` on Windows.
+/// CoreGraphics on macOS, MIT-SHM / `wl_shm` on Linux, GDI on Windows.
 mod present;
 mod press_custody_conformance;
 mod relaunch_notice;
@@ -898,6 +901,10 @@ mod trail_audio;
 // Predictive local echo (mosh-style speculative typing) lives in the shared
 // `aterm-predict` crate so the web embedders drive the same state machine.
 pub(crate) use aterm_predict as predict;
+/// `aos …`: the front window's momentum glow as an Aos task (a debug build's):
+/// the control thread's parse and lines, and the main thread's App methods.
+mod aos_host;
+mod aos_verb;
 /// `card [seed=…]`: the harness card's constellation pin (a debug build's).
 mod card_verb;
 /// `harness policy`: a session's `[harness]` policy for an agent that answers for itself.
@@ -1045,6 +1052,9 @@ mod stats_paint;
 mod stats_plan;
 /// The sill: the stats bars' compact form in the bottom pad, no terminal row.
 mod stats_sill;
+/// How many Enters submitted something typed into a session (`text --json`'s
+/// `"submits"`), whoever typed it.
+mod submit_count;
 mod subscribe;
 /// Agents ▸ Summarize the Fleet in a New Tab: the briefs, the start block, and
 /// the one worker it starts (`docs/DESIGN-owner-surfaces-2026-10-16.md` §4).
@@ -4439,6 +4449,13 @@ enum Wake {
         asked: card_verb::Asked,
         reply: std::sync::mpsc::Sender<Result<String, String>>,
     },
+    /// `aos [status|attach|pause|repair|resume|detach|trace]` (control socket; a
+    /// debug or test build's only): the front window's momentum glow as an Aos
+    /// task ([`aos_verb`], answered by [`App::control_aos`]).
+    Aos {
+        asked: aos_verb::Asked,
+        reply: std::sync::mpsc::Sender<Result<String, String>>,
+    },
     /// `person look <window>|off` | `person menubar press <at>` (control
     /// socket; a debug build launched with `ATERM_DEBUG_PERSON_INVOKE=1`
     /// only): a development build's stand-in for the person at the window
@@ -4869,17 +4886,27 @@ enum Wake {
     /// The fleet glance wrote its slot (fleet_glance.rs): a read began or
     /// ended, or the book moved (`App::on_fleet_read`).
     FleetRead,
+    /// A read of the fabric's log landed in the Overview's slot
+    /// (overview_fabric.rs): the open cards re-render (`App::on_fabric_read`).
+    FabricRead,
     /// Whose banner aterm's own notices arrive as is known
     /// (`notify::learn_voice`, off the event loop): the Notify Me hover says
     /// it from the next glance.
     #[cfg(target_os = "macos")]
     NoticeVoice,
-    /// The owner clicked a notice about `session` (Windows' balloon, or
-    /// aterm's own macOS notice through `notice_center`'s delegate): take
-    /// them there, as the ❯ menu's Go does (`App::go_to_session`).
-    #[cfg(any(target_os = "macos", windows))]
+    /// The owner clicked a notice about `session` (Windows' balloon, aterm's
+    /// own macOS notice through `notice_center`'s delegate, or a Linux
+    /// notification's `default` action, heard by `notify`'s bus thread): take
+    /// them there, as the ❯ menu's Go does (`App::go_to_session`; on Linux
+    /// `App::notice_clicked`).
+    #[cfg(any(target_os = "macos", windows, target_os = "linux"))]
     NoticeClicked {
         session: u64,
+        /// The activation token the notification server sent for the click
+        /// (`ActivationToken`), which the raise presents to the window
+        /// manager; `None` from a server that sent none.
+        #[cfg(target_os = "linux")]
+        activation: Option<String>,
     },
     /// AppKit asked to terminate by a path that bypasses the menu (Dock,
     /// AppleScript, logout/restart). The delegate vetoed it and posted this
@@ -5212,6 +5239,10 @@ enum Wake {
     /// leaves alone, as one exceptions entry ended by its first empty report
     /// (`App::note_foreign_tools`).
     PkgForeign(String),
+    /// `c-toolchain: missing|broken|ready` ([`atpkg::cli::C_TOOLCHAIN_MARKER`]): the C
+    /// toolchain's verdict a pass or the seed said, as one exceptions entry naming atpkg's
+    /// fix (`App::note_c_toolchain`).
+    PkgCToolchain(String),
     /// `machine-state:` — the posture record a pass prints after its apply
     /// ([`atpkg::cli::MACHINE_STATE_MARKER`]); Security's This Mac status takes it
     /// instead of spawning `atpkg machine` again.
@@ -8811,8 +8842,8 @@ fn fold_owned_deadline(
 )]
 enum PresentTarget {
     Cpu {
-        /// This cell's CPU presenter — first-party on macOS and Linux, `softbuffer` on
-        /// Windows (see [`crate::present`]), with any display context folded inside.
+        /// This cell's CPU presenter — first-party on every cell (see
+        /// [`crate::present`]), with any display context folded inside.
         surface: present::CpuSurface,
     },
     Gpu {
@@ -9431,6 +9462,11 @@ struct WindowState {
     /// layer owning the pointer. The frame-time hover refresh resolves nothing while
     /// `false`. Written with [`Self::pointer_position_known`].
     hover_grid_owned: bool,
+    /// A wheel moved a native page under the still pointer: the next frame of
+    /// the page as it now stands is hovered where the pointer is
+    /// (`App::refresh_native_hover_for_frame`). A motion resolves the hover
+    /// itself and clears it, as the pointer's leaving does.
+    native_rehover: bool,
     /// The mapping [`Self::last_mouse_cell`] was derived under when
     /// [`Self::hover_grid_owned`] was last set (front session, window size and grid,
     /// chrome rows, cell geometry, focused pane rect). `App::route_cursor_moved`'s
@@ -9580,6 +9616,9 @@ struct WindowState {
     /// pet, rain and output streak. Idle until an effect runs; this host resolves
     /// policy and performs what the frame steps hand back.
     fx: aterm_effects::pipeline::EffectsPipeline,
+    /// What the `aos` verb keeps for this window's momentum glow between its calls
+    /// (the recording epoch, the attach count): [`aos_host`].
+    aos: aos_host::AosWindow,
     /// The Backspace price memory: the row's erasable tail, so a Backspace can price
     /// the glyph it erases for the glow's press ring
     /// ([`crate::app_input::ErasePriceMemory`]).
@@ -9833,9 +9872,9 @@ struct WindowState {
     /// ([`App::attach_frame_px`]) and `take()`s it. `None` for every other window.
     carried_inner_px: Option<PhysicalSize<u32>>,
     /// A restored window's persisted place, applied by its first attach while it
-    /// is still hidden and `take()`n there (Windows,
+    /// is still hidden and `take()`n there (Windows, and X11's position,
     /// [`App::stage_restore_placement`]). `None` = place it as any new window.
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "linux"))]
     restore_placement: Option<app_window::RestorePlacement>,
     /// When this window last presented genuine content (not an animation tick); bulk
     /// output within `MIN_FRAME_INTERVAL` coalesces. Animation-only presents never
@@ -11341,6 +11380,7 @@ impl WindowState {
             pointer_position_known: false,
             native_rest: None,
             hover_grid_owned: false,
+            native_rehover: false,
             hover_mapping: app_mouse::HoverMapping::default(),
             last_mouse_px_off: crate::input::PixelOffset::CELL_ORIGIN,
             scroll_residual: 0.0,
@@ -11377,6 +11417,7 @@ impl WindowState {
             composed_sync_observation_scratch: Vec::new(),
             bell_flash: BellFlash::new(),
             fx: aterm_effects::pipeline::EffectsPipeline::for_window(),
+            aos: aos_host::AosWindow::default(),
             erase_prices: crate::app_input::ErasePriceMemory::default(),
             block_fill: None,
             trick_listener: aterm_effects::typed_tricks::TrickListener::default(),
@@ -11439,7 +11480,7 @@ impl WindowState {
             last_visible_views: Vec::new(),
             win_px: None,
             carried_inner_px: None,
-            #[cfg(windows)]
+            #[cfg(any(windows, target_os = "linux"))]
             restore_placement: None,
             last_present_at: None,
             content_pending: false,
@@ -14304,6 +14345,11 @@ struct App {
     /// raise completes when this window's `Occluded(false)`/`Focused(true)`
     /// arrives (cleared then, or when the window closes — a stale id no-ops).
     pending_deminiaturize_focus: Option<WindowId>,
+    /// The activation token of the Linux notification click being answered
+    /// (`App::notice_clicked`), which the raise it makes presents to the
+    /// window manager (`App::raise_window`); `None` outside that answer.
+    #[cfg(target_os = "linux")]
+    notice_activation: Option<String>,
     /// Retained native toolbar objects per window (macOS): AppKit holds the delegate
     /// and item targets weakly, so dropping one kills the "+" button. Inserted in
     /// `attach_os_window`, removed in `close_window_logical`; empty off macOS.
@@ -20331,6 +20377,8 @@ impl App {
             end_carry: std::collections::HashMap::new(),
             fleet_adopt: None,
             pending_deminiaturize_focus: None,
+            #[cfg(target_os = "linux")]
+            notice_activation: None,
             _toolbars: BTreeMap::new(),
             session_chrome: std::collections::HashMap::new(),
             // Private store: parallel tests must not bump each other's chrome epochs through
@@ -24317,6 +24365,10 @@ impl ApplicationHandler<Wake> for App {
         // A theme preview whose TTL ran out reverts to the configured theme.
         // One `Option` check when none stands.
         self.expire_theme_preview(Instant::now());
+        // An open Overview reads the fabric's log again a minute after the
+        // last read began (`overview_fabric`, step 6E-7). One `Option` check
+        // where no read was ever kicked or the fabric is off.
+        self.tick_overview_fabric(Instant::now());
         // Autopilot's timer: one whose instant came lands its session. Nothing
         // armed reads no clock. (The glass's ended labels went where their
         // deadline is folded, `App::harness_acts_wait`.)
@@ -24400,6 +24452,17 @@ impl ApplicationHandler<Wake> for App {
                 &mut deadline_owner,
                 preview_wake,
                 metrics::DeadlineOwner::ThemePreview,
+            );
+        }
+        // The open Overview's next read of the fabric's log, folded AFTER its
+        // tick above, so a due read never re-arms its own passed instant: none
+        // while no card is open, a read is out, or the fabric is off.
+        if let Some(fabric_wake) = self.overview_fabric_wake() {
+            fold_owned_deadline(
+                &mut deadline,
+                &mut deadline_owner,
+                fabric_wake,
+                metrics::DeadlineOwner::OverviewFabric,
             );
         }
         // Autopilot's timer: the instant a timed Cruise lands
@@ -24558,7 +24621,9 @@ impl ApplicationHandler<Wake> for App {
         // still hidden: the attach takes the staged place before its reveal, so a
         // restored (or maximized) window never appears elsewhere first. The
         // seamless carry outranks it, as below.
-        #[cfg(windows)]
+        // X11 takes the position the same way (a window manager places a window it
+        // maps itself unless the position came first) and maximizes below.
+        #[cfg(any(windows, target_os = "linux"))]
         let placed_hidden = self.seamless_position.is_none() && {
             let first = self
                 .pending_restore
@@ -24569,7 +24634,7 @@ impl ApplicationHandler<Wake> for App {
                 self.stage_restore_placement(target_id, outer, maximized)
             })
         };
-        #[cfg(not(windows))]
+        #[cfg(not(any(windows, target_os = "linux")))]
         let placed_hidden = false;
         if !self.attach_os_window(el, target_id) {
             // The first window's GPU surface failed: nothing else keeps the app alive and
@@ -24597,9 +24662,10 @@ impl ApplicationHandler<Wake> for App {
         // Position first, validated against current monitors, then maximized, since
         // `set_outer_position` clears the OS maximized flag. Only `Some(true)` maximizes.
         // Windows applied it inside the attach, before the reveal (`placed_hidden`):
-        // here the window is already on glass, so this would be the hop.
+        // here the window is already on glass, so this would be the hop. X11 took only
+        // the position there: it maximizes here, on a mapped window.
         if carried_position.is_none()
-            && !placed_hidden
+            && (!placed_hidden || cfg!(not(windows)))
             && let Some(w) = self
                 .windows
                 .get(&target_id)
@@ -24611,7 +24677,8 @@ impl ApplicationHandler<Wake> for App {
                 .and_then(|m| m.windows.first());
             let outer = first.and_then(|wl| Some((wl.outer_x?, wl.outer_y?)));
             let maximized = first.and_then(|wl| wl.maximized);
-            if let Some((x, y)) = outer
+            if !placed_hidden
+                && let Some((x, y)) = outer
                 && crate::app_window::restored_position_on_screen(w, x, y)
             {
                 w.set_outer_position(aterm_window::dpi::PhysicalPosition::new(x, y));
@@ -25725,6 +25792,9 @@ impl App {
             Wake::CardSeed { asked, reply } => {
                 let _ = reply.send(self.control_card_seed(asked));
             }
+            Wake::Aos { asked, reply } => {
+                let _ = reply.send(self.control_aos(asked, Instant::now()));
+            }
             Wake::PersonStandIn { asked, reply } => {
                 let _ = reply.send(self.person_stand_in(asked));
             }
@@ -25984,6 +26054,10 @@ impl App {
             Wake::PkgForeign(body) => {
                 aterm_log::debug!("atpkg foreign: {body}");
                 self.note_foreign_tools(&body);
+            }
+            Wake::PkgCToolchain(body) => {
+                aterm_log::debug!("atpkg c-toolchain: {body}");
+                self.note_c_toolchain(&body);
             }
             Wake::PkgMachineRefused(detail) => {
                 aterm_log::info!("atpkg machine: {detail}");
@@ -26531,6 +26605,7 @@ impl App {
                 let _ = reply.send(self.answer_close_confirm_from_wire(proceed));
             }
             Wake::FleetRead => self.on_fleet_read(),
+            Wake::FabricRead => self.on_fabric_read(),
             // Whose banner a notice is was read again, and with it whether a
             // center is open to be the delegate of (`notice_center`).
             #[cfg(target_os = "macos")]
@@ -26539,7 +26614,14 @@ impl App {
                 self.notice_center.adopt_clicks();
             }
             #[cfg(any(target_os = "macos", windows))]
-            Wake::NoticeClicked { session } => self.go_to_session(session),
+            Wake::NoticeClicked { session } => {
+                self.go_to_session(session);
+            }
+            #[cfg(target_os = "linux")]
+            Wake::NoticeClicked {
+                session,
+                activation,
+            } => self.notice_clicked(session, activation),
             Wake::SiblingScan(rows) => {
                 if self.siblings != rows {
                     self.siblings = rows;
@@ -26672,7 +26754,10 @@ impl App {
                 );
                 self.on_close_requested(el, wid);
             }
-            WindowEvent::RedrawRequested => self.redraw_window(wid),
+            WindowEvent::RedrawRequested => {
+                self.note_owed_repaint(wid);
+                self.redraw_window(wid);
+            }
             // Re-sample the frame-pacing interval from the monitor the window now occupies
             // (cheap unless the monitor changed or the throttled re-read is due).
             WindowEvent::Moved(position) => {
@@ -30927,6 +31012,10 @@ fn parse_seed_line(line: &str) -> Option<Wake> {
     if let Some(body) = r6_marker_body(line, atpkg::cli::FOREIGN_MARKER) {
         return Some(Wake::PkgForeign(body.to_string()));
     }
+    // No C toolchain that builds where an install would fix it: an exceptions entry.
+    if let Some(body) = r6_marker_body(line, atpkg::cli::C_TOOLCHAIN_MARKER) {
+        return Some(Wake::PkgCToolchain(body.to_string()));
+    }
     // The pass's own state record, after its change line.
     if let Some(body) = r6_marker_body(line, atpkg::cli::MACHINE_STATE_MARKER) {
         return Some(Wake::PkgMachineState(body.to_string()));
@@ -31280,6 +31369,8 @@ impl App {
                     self.post_machine_settings(body);
                 } else if let Some(body) = r6_marker_body(text, atpkg::cli::FOREIGN_MARKER) {
                     self.note_foreign_tools(body);
+                } else if let Some(body) = r6_marker_body(text, atpkg::cli::C_TOOLCHAIN_MARKER) {
+                    self.note_c_toolchain(body);
                 } else {
                     self.record_message(toolchain_words::appnotice(
                         aterm_messages::tags::TOOLCHAIN,
@@ -34881,9 +34972,10 @@ pub fn main_entry_with_first_run(argv: Vec<std::ffi::OsString>, first_run: Optio
         }
     }
     // aterm installs no vendor hook into an agent: remove ones an older aterm wrote
-    // (off-thread). A headless instance never touches the user's settings.
+    // (off-thread), and add the Claude Code defaults only under `agents_auto_prime`. A
+    // headless instance never touches the user's settings.
     if !headless {
-        harness_host::sweep_legacy_hooks();
+        harness_host::sweep_legacy_hooks(config.agents_auto_prime_or_default());
     }
     // Kept for the graceful-exit cleanup.
     let root_sid = session0.ctx.self_id.clone();
@@ -35539,6 +35631,8 @@ pub fn main_entry_with_first_run(argv: Vec<std::ffi::OsString>, first_run: Optio
         end_carry: seamless_end_carry,
         fleet_adopt: seamless_adopting.then(|| fleet_glance::parse_told(&seamless_fleet_told)),
         pending_deminiaturize_focus: None,
+        #[cfg(target_os = "linux")]
+        notice_activation: None,
         _toolbars: BTreeMap::new(),
         // Composed tab chrome (tooltip, context menu), filled per session on first strip
         // refresh.
@@ -36748,6 +36842,12 @@ mod early_out_tests;
 #[cfg(test)]
 #[path = "lib_tests.rs"]
 mod tests;
+
+/// M2 on the host path: the `aos` verb's App methods over normal key dispatch, the
+/// effect lane and the scripted present (design §5).
+#[cfg(test)]
+#[path = "lib_aos_repair_tests.rs"]
+mod aos_repair_tests;
 
 #[cfg(test)]
 #[path = "lib_session_pool_tests.rs"]

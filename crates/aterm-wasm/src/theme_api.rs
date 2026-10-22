@@ -75,20 +75,23 @@ pub(crate) struct WebThemeState {
     pub(crate) host_set: bool,
 }
 
-fn appearance_word(a: Appearance) -> &'static str {
+#[inline]
+const fn appearance_word(a: Appearance) -> &'static str {
     match a {
         Appearance::Dark => "dark",
         Appearance::Light => "light",
     }
 }
 
-fn source_word(source: AppearanceSource) -> &'static str {
+#[inline]
+const fn source_word(source: AppearanceSource) -> &'static str {
     match source {
         AppearanceSource::Declared => "declared",
         AppearanceSource::Measured => "measured",
     }
 }
 
+#[inline]
 fn json_opt(s: Option<&str>) -> String {
     s.map_or_else(|| "null".to_string(), json_string)
 }
@@ -103,18 +106,21 @@ fn json_warnings(meta: &ThemeMeta) -> String {
 }
 
 /// Pack an engine colour as `0x00RRGGBB`.
+#[inline]
 pub(crate) fn pack(c: Rgb) -> u32 {
     (u32::from(c.r) << 16) | (u32::from(c.g) << 8) | u32::from(c.b)
 }
 
 /// Unpack `0x00RRGGBB` into an engine colour.
-pub(crate) fn unpack(c: u32) -> Rgb {
+#[inline]
+pub(crate) const fn unpack(c: u32) -> Rgb {
     let [_, r, g, b] = c.to_be_bytes();
     Rgb { r, g, b }
 }
 
 impl WebThemeState {
-    pub(crate) fn new(appearance: Appearance) -> Self {
+    #[inline]
+    pub(crate) const fn new(appearance: Appearance) -> Self {
         Self {
             selector: None,
             appearance,
@@ -124,6 +130,7 @@ impl WebThemeState {
         }
     }
 
+    #[inline]
     fn find_registered(&self, name: &str) -> Option<&CatalogTheme> {
         self.registered
             .iter()

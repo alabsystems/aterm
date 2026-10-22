@@ -377,14 +377,57 @@ fn unmeasured(id: &str, family: &str, layer: Option<Layer>, why: String) -> Item
 }
 
 /// The base items `aterm init` runs before its workstation items (design §4.2, S5): the
-/// same repair items, the doctor's pass (an opted-out rc stays as the person left it).
+/// same repair items, the doctor's pass (an opted-out rc stays as the person left it),
+/// and `base.clt` over atpkg's C toolchain probe (S6).
 #[cfg(target_os = "macos")]
 pub(crate) fn init_base(applies: bool) -> aterm_machines::init::Base {
-    match atpkg::store::resolve_configured() {
+    let base = match atpkg::store::resolve_configured() {
         Some(layout) => {
             init_base_over(&Arc::new(Ground::of_process(layout, Pass::Doctor)), applies)
         }
         None => aterm_machines::init::Base::none(),
+    };
+    aterm_machines::init::Base {
+        clt: command_line_tools(),
+        ..base
+    }
+}
+
+/// `base.clt` ([`aterm_machines::init_clt`]): its probe is atpkg's C toolchain probe over
+/// this process's `PATH`, which raises no Apple dialog, and its root half runs from this
+/// executable. `None` when this executable cannot name itself.
+#[cfg(target_os = "macos")]
+fn command_line_tools() -> Option<aterm_machines::init_clt::CommandLineTools> {
+    let aterm = std::env::current_exe()
+        .and_then(|exe| exe.canonicalize())
+        .ok()?;
+    Some(aterm_machines::init_clt::CommandLineTools::new(
+        Box::new(|_: &dyn aterm_machines::port::System| {
+            clt_found(&atpkg::prereq::probe(std::env::var_os("PATH").as_deref()))
+        }),
+        aterm,
+    ))
+}
+
+/// What `base.clt` reads in a C toolchain verdict ([`atpkg::prereq::CcVerdict`]): a
+/// missing developer directory or `cc` is what the install supplies; a compiler that
+/// refuses is installed already (an unaccepted Xcode license, a PATH-first `cc` without an
+/// SDK); a compiler that did not answer is unknown.
+#[cfg(target_os = "macos")]
+fn clt_found(verdict: &atpkg::prereq::CcVerdict) -> aterm_machines::init_clt::Found {
+    use aterm_machines::init_clt::Found;
+    use atpkg::prereq::CcVerdict;
+    match verdict {
+        CcVerdict::Ready { .. } => Found::Present(verdict.line()),
+        CcVerdict::NoDeveloperDir => Found::Missing(
+            "not installed: no developer directory holds a clang (`/usr/bin/cc` is macOS's \
+             install shim)"
+                .to_owned(),
+        ),
+        CcVerdict::NoDriver => Found::Missing("no C compiler (`cc`) on PATH".to_owned()),
+        CcVerdict::Broken { .. } => Found::Refuses(verdict.line()),
+        CcVerdict::Unanswered { .. } | CcVerdict::Unproven { .. } => Found::Unknown(verdict.line()),
+        CcVerdict::NotProbed => Found::NotHere(verdict.line()),
     }
 }
 
@@ -398,16 +441,22 @@ fn init_base_over(ground: &Arc<Ground>, applies: bool) -> aterm_machines::init::
     use aterm_machines::init::Base;
     let items = repair::items(ground);
     if !applies {
-        return Base { items, held: None };
+        return Base {
+            items,
+            held: None,
+            clt: None,
+        };
     }
     match atpkg::lock::try_lock_store(&ground.layout) {
         Ok(lock) => Base {
             items,
             held: Some(Box::new(lock)),
+            clt: None,
         },
         Err(why @ atpkg::lock::StoreLockError::Contended(_)) => Base {
             items: aterm_converge::standing_aside(items, &StoodAside::Lock(why.to_string())),
             held: None,
+            clt: None,
         },
         Err(why) => Base {
             items: aterm_converge::held_back(
@@ -415,6 +464,7 @@ fn init_base_over(ground: &Arc<Ground>, applies: bool) -> aterm_machines::init::
                 &format!("the store lock could not be taken ({why})"),
             ),
             held: None,
+            clt: None,
         },
     }
 }

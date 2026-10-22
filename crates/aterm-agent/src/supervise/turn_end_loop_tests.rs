@@ -3539,8 +3539,12 @@ fn an_agy_draft_homed_to_its_caret_is_never_typed_over() {
                 ..TurnEndTiming::default()
             });
         });
+        // The composer's cell (column 2): none. The message's column-0
+        // cells (`Session::message_bounded_by_cells`) are another read.
         assert!(
-            !m.requests.iter().any(|r| r.starts_with("cell ")),
+            !m.requests
+                .iter()
+                .any(|r| r.starts_with("cell ") && !r.ends_with(" 0")),
             "typed {typed}: {:#?}",
             m.requests
         );
@@ -8487,6 +8491,7 @@ fn the_wall_cache_is_dropped_when_the_worker_has_worked() {
         cols: None,
         pane_rows: None,
         launch: None,
+        submits: None,
     };
     let wall = of(memory_wall_in("3h"));
     let r = s.turn_end_reading(&wall, None, &opts);
@@ -9280,6 +9285,7 @@ fn read_screen(rows: Vec<String>) -> Screen {
         cols: None,
         pane_rows: None,
         launch: None,
+        submits: None,
     }
 }
 
@@ -28631,6 +28637,89 @@ fn a_turn_the_verdict_never_saw_busy_is_read_and_judged_within_a_recheck() {
     assert!(dirty_checks(&m) >= 1, "{:#?}", m.requests);
 }
 
+/// P4'S STILL-OPEN CASE, THE LOOP: A TURN THE POINT'S KEY CANNOT TELL FROM
+/// THE POINT IS READ AND JUDGED BY ITS SUBMISSION ([`super::submitted_over`],
+/// `text --json`'s `"submits"`). The person's prompt is the point's own
+/// prompt again, answered at once with the same words, the history above
+/// scrolled by it: the rows the point's key reads ([`super::point_key`], the
+/// last few up to the last thing said) are the point's, so the look passed
+/// it over as the point already handed and the verdict's recheck waited on.
+/// The host counted the person's Enter and the conversation moved: a new
+/// point, judged a turn of someone else's, its back-off counted from there,
+/// nothing typed over it. FAILS WITHOUT THE FIX: one point, and the first
+/// point's act typed at its back-off into the person's answer. NEGATIVE
+/// CONTROLS, each one point and its act typed once at its back-off: the same
+/// rows with nothing submitted (a redraw of the history above), and a
+/// submission counted over the very rows the point stood on (not drawn).
+#[test]
+fn a_turn_the_points_key_cannot_tell_is_judged_by_its_submission() {
+    const PROMPT: &str = "write the parser for this repository";
+    const FIRST: &str = "Wrote the parser module.";
+    const DONE: &str = "✻ Worked for 3s · done 4:24 PM";
+    let under = |top: &str| {
+        let mut r = vec![format!("⏺ {top}")];
+        r.extend((2..=10).map(|i| format!("⏺ Earlier: step {i} of the plan is in.")));
+        r.push(String::new());
+        r.extend(answered_turn(PROMPT, FIRST, DONE));
+        r
+    };
+    let first = under("Earlier: step 1 of the plan is in.");
+    let run = |tag: &str, next: Vec<String>, submits: [u64; 2]| {
+        let mut m = Mock::new(vec![busy_screen(), first.clone(), next]);
+        m.submits_on = [(1, submits[0]), (2, submits[1])].into_iter().collect();
+        m.sends_gen = true;
+        m.agent_pushes = true;
+        m.stall_sleep = Some(Duration::from_secs(20));
+        m.vanish_after = Some(40);
+        let (dir, path) = journal_file(tag);
+        let opts = SuperviseOpts {
+            journal: Some(path.clone()),
+            ..hosted(3600)
+        };
+        let _ = watch_lines(&mut m, &opts);
+        let (records, _) = journal_records(&path);
+        let _ = std::fs::remove_dir_all(&dir);
+        let lines: Vec<String> = records.into_iter().map(|r| r.line).collect();
+        let points = lines
+            .iter()
+            .filter(|l| l.starts_with("EVENT idle seq="))
+            .count();
+        (m, lines, points)
+    };
+    let scrolled = under("Earlier: the plan's first step, scrolled by the turn below.");
+    // THE SAME PROMPT AGAIN, ANSWERED THE SAME, its Enter counted.
+    let (m, lines, points) = run("same-words-submitted", scrolled.clone(), [1, 2]);
+    assert_eq!(points, 2, "the person's turn is a point: {lines:#?}");
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.starts_with("WAITING ") && l.contains("2 short turn(s) in a row")),
+        "judged as a turn of someone else's, backed off from there: {lines:#?}"
+    );
+    assert_eq!(
+        m.turns, 0,
+        "nothing typed over it: {lines:#?}\n{:#?}",
+        m.requests
+    );
+    // NEGATIVE CONTROLS.
+    for (tag, next, submits) in [
+        ("same-words-unsubmitted", scrolled.clone(), [1, 1]),
+        ("submitted-undrawn", first.clone(), [1, 2]),
+    ] {
+        let (m, lines, points) = run(tag, next, submits);
+        assert_eq!(points, 1, "{tag}: no new point: {lines:#?}");
+        assert!(
+            !lines.iter().any(|l| l.contains("2 short turn(s)")),
+            "{tag}: {lines:#?}"
+        );
+        assert_eq!(
+            m.turns, 1,
+            "{tag}: the first point's act, once: {lines:#?}\n{:#?}",
+            m.requests
+        );
+    }
+}
+
 /// A host that saw the agent LAUNCHED at `launch` (unix ms; `None`: it saw
 /// no launch, as for a supervisor attaching to an agent it did not start, or
 /// one a person keyed into since) and started this loop as the session's Off
@@ -28963,6 +29052,85 @@ fn a_successors_first_point_keeps_its_seeds() {
     assert!(!lines.iter().any(|l| l.starts_with("DONE ")), "{lines:#?}");
 }
 
+/// P3'S STILL-OPEN CASE: AN AGENT STARTED AGAIN SINCE THE BOOKS' LAST ROW
+/// IS A LAUNCH'S, BOOKS OR NOT (`Session::unasked_launch`,
+/// [`approvals::last_row_ms`]). A person quit the agent and started it again
+/// in a tab whose ledger already holds an earlier loop's rows (its point
+/// judged at a streak of one, a turn read running after it), nothing keyed
+/// since: the host saw the new process launched after the books' newest row.
+/// Its frame before the banner is no turn's end — no point record there,
+/// neither the end of the turn the books read running (the old process's)
+/// nor a point of its own — and the prompt's reply is the one point, the
+/// streak the books left lengthened once (`2 short turn(s) in a row: 4 min
+/// back-off`, as any successor carries a streak). FAILS WITHOUT THE FIX: the
+/// frame was the end of the turn the books read running (`point@v1 … 2` at
+/// its seq), the reply a third short turn and its back-off 8 min. NEGATIVE
+/// CONTROLS, each the books' streak lengthened at the frame as before
+/// ([`a_successors_first_point_keeps_its_seeds`]): the same agent process,
+/// launched before the books' last row (the loop before watched it, and
+/// this loop is a supervisor attaching to it), and no launch seen at all.
+#[test]
+fn an_agent_started_again_since_its_books_is_a_launchs() {
+    use aterm_phase::gemini::fixtures as g;
+    use aterm_phase::prompt::fixtures::screen;
+    let screens = || {
+        vec![
+            screen(g::PRE_BANNER),
+            screen(g::BUSY_THINKING),
+            gemini_ended(LAB_REPLY),
+        ]
+    };
+    let (_, books) = launched_run(
+        "p3b-books",
+        &mut gemini_mock(vec![screen(g::PRE_BANNER), screen(g::BUSY_THINKING)]),
+        &LaunchHost::saw(None),
+        Some(""),
+    );
+    assert_eq!(point_rows(&books), [(101, 1)], "the books: {books:#?}");
+    let books = books.join("\n") + "\n";
+    let last = approvals::last_row_ms(&books).expect("the books' last row");
+    // STARTED AGAIN since the books' last row.
+    let host = LaunchHost::saw(Some(last + 1_000));
+    let (lines, rows) = launched_run(
+        "p3b-started-again",
+        &mut gemini_mock(screens()),
+        &host,
+        Some(&books),
+    );
+    let after: Vec<(u64, u32)> = point_rows(&rows).into_iter().skip(1).collect();
+    assert_eq!(after, [(103, 2)], "{rows:#?}\n{lines:#?}");
+    assert_eq!(
+        back_offs(&lines),
+        ["2 short turn(s) in a row: 4 min back-off"],
+        "{lines:#?}"
+    );
+    assert!(
+        lines.contains(&"EVENT idle seq=101 -".to_string()),
+        "the frame was read at a point: {lines:#?}"
+    );
+    assert!(host.asked.load(Ordering::SeqCst) >= 1);
+    // NEGATIVE CONTROLS: the same process (launched before the last row),
+    // and no launch seen.
+    for (tag, launch) in [
+        ("p3b-same-process", Some(last - 1_000)),
+        ("p3b-unseen", None),
+    ] {
+        let (lines, rows) = launched_run(
+            tag,
+            &mut gemini_mock(screens()),
+            &LaunchHost::saw(launch),
+            Some(&books),
+        );
+        let after: Vec<(u64, u32)> = point_rows(&rows).into_iter().skip(1).collect();
+        assert_eq!(after, [(101, 2), (103, 3)], "{tag}: {rows:#?}\n{lines:#?}");
+        assert_eq!(
+            back_offs(&lines).last().map(String::as_str),
+            Some("3 short turn(s) in a row: 8 min back-off"),
+            "{tag}: {lines:#?}"
+        );
+    }
+}
+
 /// ONLY THE FIRST POINT IS A LAUNCH'S: once a point was judged, a screen
 /// that holds nothing of a conversation (a redraw that cleared it, a
 /// `/clear`, a blank flash) is no launch's, though no person keyed since — the
@@ -29110,6 +29278,50 @@ fn a_first_turn_ended_with_no_words_after_a_launch_is_judged() {
     let mut m = gemini_mock(screens());
     let (_, rows_attach) = launched_run("rv2-attach", &mut m, &host, Some(""));
     assert_eq!(point_rows(&rows_attach), [(101, 1)], "{rows_attach:#?}");
+}
+
+/// F3 ON MUSE CODE, THROUGH THE LOOP (measured live 2026-10-21, the lab's
+/// `forever --mode resid` chain `tool-end`): a launch's first screen, then
+/// the first turn ended on Muse Code's own read row (`  Read README.md`, no
+/// `◆`) with no words after it. FAILS WITHOUT THE FIX
+/// (`aterm_phase::muse`'s read rows): the point was counted (its point
+/// record), but the screen was no evidence of an ended turn, so the policy
+/// decided nothing — no back-off, nothing typed, and the session waited for
+/// ever. NEGATIVE CONTROL: the same read row with the message's own wrapped
+/// row directly over it (no blank between) is still no evidence, and
+/// nothing is decided on it.
+#[test]
+fn a_first_turn_ended_on_muses_read_row_after_a_launch_is_judged() {
+    use aterm_phase::muse::fixtures as u;
+    use aterm_phase::prompt::fixtures::screen;
+    let ended = screen(u::END_OF_TURN_READ_ROW);
+    let run = |tag: &str, end: &[String]| {
+        let screens = vec![
+            screen(u::IDLE_1_4_10),
+            end.to_vec(),
+            end.to_vec(),
+            end.to_vec(),
+        ];
+        let host = LaunchHost::saw(Some(LAUNCHED_MS));
+        let mut m = muse_mock(screens);
+        launched_run(tag, &mut m, &host, Some(""))
+    };
+    let (lines, rows) = run("f3-muse-read", &ended);
+    assert_eq!(point_rows(&rows).len(), 1, "the turn's point: {rows:#?}");
+    assert_eq!(
+        back_offs(&lines),
+        ["1 short turn(s) in a row: 2 min back-off"],
+        "{lines:#?}"
+    );
+    // NEGATIVE CONTROL: no evidence, no decision.
+    let mut glued = ended.clone();
+    let at = glued
+        .iter()
+        .position(|r| r == "  Read README.md")
+        .expect("the read row");
+    glued[at - 1] = "  and every test it needs".to_string();
+    let (lines, _) = run("f3-muse-glued", &glued);
+    assert!(back_offs(&lines).is_empty(), "{lines:#?}");
 }
 
 /// RV-1, THE SCREEN SIDE: Claude Code's tall report whose act's `❯` row is
@@ -29296,4 +29508,217 @@ fn a_turn_the_verdict_never_saw_busy_is_rechecked_under_a_short_settle() {
         1,
         "no new point: {lines:#?}"
     );
+}
+
+/// A host whose step at an idle point, asked once `wanting`, MOVED the session
+/// where `moved` (the live upgrade's relaunch under Land: the agent ended and
+/// its line typed at the shell, no carry-on) or moved nothing, typing no turn
+/// either way.
+#[derive(Debug)]
+struct RelaunchHost {
+    moved: bool,
+    wanting: AtomicBool,
+}
+
+impl IdleHost for RelaunchHost {
+    fn wants(&self) -> bool {
+        self.wanting.load(Ordering::SeqCst)
+    }
+    fn at_idle(&self) -> Option<HostStep> {
+        self.wanting.store(false, Ordering::SeqCst);
+        Some(HostStep {
+            line: "upgrade step=relaunched".to_string(),
+            moved: self.moved,
+            typed: None,
+            repeat: false,
+        })
+    }
+    fn owns_turn_end(&self) -> bool {
+        false
+    }
+}
+
+/// THE REVIEW OF `b9/resid3`, THE LOOP: A HOST STEP THAT MOVED THE SESSION
+/// TELLS THE POLICY ITS KEYS ARE THE HARNESS'S
+/// ([`super::super::policy::turn_end::TurnEndState::host_moved`]). The point
+/// judged over the host's count 2; the live upgrade's relaunch at it types
+/// its line, which the host counts: the count's baseline goes, so the
+/// resumed process's redraw is told by the opener and the words alone. FAILS
+/// WITHOUT THE FIX (the loop telling the policy nothing): the point's count
+/// stood, and the redraw over a count moved by the relaunch line read as a
+/// turn someone asked (`policy/turn_end_tests.rs`'s
+/// `the_harnesss_own_keys_ask_no_turn`). NEGATIVE CONTROL: a step that moved
+/// nothing leaves the count where the point read it.
+#[test]
+fn a_host_step_that_moved_the_session_spends_the_count_on_the_harness() {
+    let run = |moved: bool| {
+        let host = Arc::new(RelaunchHost {
+            moved,
+            wanting: AtomicBool::new(false),
+        });
+        let mut m = Mock::new(vec![idle_screen()]);
+        m.cursor_on_caret = true;
+        m.submits_on = [(0, 2)].into_iter().collect();
+        let opts = SuperviseOpts {
+            idle_host: Some(Arc::clone(&host) as Arc<dyn IdleHost>),
+            ..hosted(30)
+        };
+        let mut s = session(&mut m, Some("@s-1".to_string()));
+        s.set_clock(TEST_NOW, PDT);
+        let screen = s.screen().expect("the point");
+        assert_eq!(screen.submits, Some(2), "the host's count");
+        let point = s.turn_of(screen);
+        let _ = s
+            .turn_end_at_point(&point, Some(Duration::from_secs(6)), &opts)
+            .expect("the decision");
+        let counted = s.turn_end.redrawn_fresh(Some(2));
+        host.wanting.store(true, Ordering::SeqCst);
+        let stepped = s
+            .host_steps_here(&point, &opts, &mut false, &mut Alone)
+            .expect("the host's step");
+        (counted, stepped, s.turn_end.redrawn_fresh(Some(2)))
+    };
+    assert_eq!(
+        run(true),
+        (true, true, false),
+        "the relaunch's keys spend the count"
+    );
+    // NEGATIVE CONTROL.
+    assert_eq!(run(false), (true, true, true), "a step that moved nothing");
+}
+
+/// THE REVIEW OF `b9/resid3`, F1/F2 ON GEMINI CLI, THE LOOP: A SCREEN ITS
+/// READER TAKES FOR A LAUNCH CARD, NOTHING SUBMITTED SINCE A POINT THAT HELD
+/// A TASK, IS READ AS THAT CONVERSATION
+/// ([`super::super::policy::turn_end::TurnEndState::redrawn_fresh`], the
+/// loop's `taskless`). The frames are the live run's (`r3-res-gemini`, the
+/// `same-words` tab, seq 3614 and 4306): Gemini CLI 0.46.0 at 144 columns,
+/// its first reply judged; then re-wrapped at 104, each band row split in
+/// two and the message over two rows, so its reader finds no band — the
+/// banner in sight, the screen `fresh`, the reading taskless — and the first
+/// point's back-off was dropped (`Nothing`: no due, a Cruise session idle
+/// for good). FAILS WITHOUT THE FIX: the re-wrapped point decided `Nothing`.
+/// NEGATIVE CONTROL: the same frame over a count moved (a `/clear` typed) is
+/// taskless as read.
+#[test]
+fn a_rewrapped_band_read_as_a_launch_card_keeps_the_points_back_off() {
+    let msg = " > FOREVERLAB-SAME-WORDS. write the parser for this repository under \
+               lab/parser-module-parser-module-parser.rs and land it";
+    let said = "✦ Implemented the parser module and its unit tests in this turn.";
+    let banner = || {
+        [
+            "",
+            " ▝▜▄     Gemini CLI v0.46.0",
+            "   ▝▜▄",
+            "  ▗▟▀    Authenticated with gemini-api-key /auth",
+            " ▝▀",
+            "",
+            "",
+            "Tips for getting started:",
+            "1. Create GEMINI.md files to customize your interactions",
+            "2. /help for more information",
+            "3. Ask coding questions, edit code or run commands",
+            "4. Be specific for the best results",
+        ]
+        .iter()
+        .map(|r| (*r).to_string())
+        .collect::<Vec<_>>()
+    };
+    let footer = |cols: usize, gap: usize, blank: usize| {
+        let mut r = vec![String::new(); blank];
+        r.extend([
+            format!("{}? for shortcuts", " ".repeat(cols - 16)),
+            "─".repeat(cols),
+            " Shift+Tab to accept edits".to_string(),
+            "▄".repeat(cols),
+            " >   Type your message or @path/to/file".to_string(),
+            "▀".repeat(cols),
+            format!(
+                " workspace (/directory){}branch{}sandbox{}/model",
+                " ".repeat(gap),
+                " ".repeat(14),
+                " ".repeat(18)
+            ),
+            format!(
+                " /private/tmp/at.8Vr8/proj/same-words{}main{}no sandbox{}Auto",
+                " ".repeat(gap),
+                " ".repeat(16),
+                " ".repeat(17)
+            ),
+        ]);
+        r
+    };
+    // Seq 3614: the first reply at 144 columns.
+    let mut whole = banner();
+    whole.extend([
+        "▄".repeat(144),
+        msg.to_string(),
+        "▀".repeat(144),
+        said.to_string(),
+    ]);
+    whole.extend(footer(144, 42, 2));
+    whole.extend(std::iter::repeat_n(String::new(), 24));
+    // Seq 4306: the same rows re-wrapped at 104.
+    let mut rewrapped = banner();
+    rewrapped.extend([
+        "▄".repeat(104),
+        "▄".repeat(40),
+        msg[..104].to_string(),
+        msg[104..].to_string(),
+        "▀".repeat(104),
+        "▀".repeat(40),
+        said.to_string(),
+    ]);
+    rewrapped.extend(footer(104, 29, 5));
+    // …and the old width's footer left re-wrapped under it.
+    rewrapped.extend([
+        String::new(),
+        format!("ox{}/model", " ".repeat(31)),
+        format!(
+            " /private/tmp/at.8Vr8/proj/same-words{}main{}no sa",
+            " ".repeat(28),
+            " ".repeat(30)
+        ),
+        format!("ndbox{}Auto", " ".repeat(30)),
+    ]);
+    rewrapped.extend(std::iter::repeat_n(String::new(), 26));
+    assert!(
+        !aterm_phase::gemini::fresh(&whole) && aterm_phase::gemini::fresh(&rewrapped),
+        "the reader takes the re-wrapped frame for a launch card"
+    );
+    // Each frame as the loop read it: the cursor in the composer, and the
+    // host's count.
+    let read = |rows: &[String], cursor_row: usize, seq: u64, submits: u64| Screen {
+        rows: rows.to_vec(),
+        cursor_row,
+        cursor_col: 3,
+        seq,
+        submits: Some(submits),
+        ..Screen::default()
+    };
+    let run = |cleared: bool| {
+        let mut m = Mock::new(vec![whole.clone()]);
+        m.program = "gemini";
+        let opts = hosted(30);
+        let mut s = session(&mut m, Some("@s-1".to_string()));
+        s.set_clock(TEST_NOW, PDT);
+        let first = s.turn_of(read(&whole, 22, 3614, 2));
+        let a = s
+            .turn_end_at_point(&first, Some(Duration::from_secs(6)), &opts)
+            .expect("the first decision");
+        assert!(
+            matches!(&a, TurnEndAction::WaitUntil { why, .. } if why.contains("1 short turn(s)")),
+            "the first point's back-off: {a:?}"
+        );
+        let again = s.turn_of(read(&rewrapped, 28, 4306, if cleared { 3 } else { 2 }));
+        s.turn_end_at_point(&again, None, &opts)
+            .expect("the re-wrapped point's decision")
+    };
+    let a = run(false);
+    assert!(
+        matches!(&a, TurnEndAction::WaitUntil { why, .. } if why.contains("1 short turn(s)")),
+        "the first point's back-off stands: {a:?}"
+    );
+    // NEGATIVE CONTROL.
+    assert_eq!(run(true), TurnEndAction::Nothing, "a /clear: no task");
 }

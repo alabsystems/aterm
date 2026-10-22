@@ -559,12 +559,47 @@ pub fn with_reply(spec: J, users: &[String]) -> J {
         return spec;
     };
     let mut spec = spec;
-    for key in ["text", "delay_ms", "pace_s"] {
+    for key in ["text", "delay_ms", "pace_s", "tool"] {
         if let Some(v) = rule.get(key) {
             spec.set(key, v.clone());
         }
     }
     spec
+}
+
+/// A SCRIPTED RULE'S TOOL CALL (`"tool": {"name", "input"}` on a rule of
+/// [`scripted_reply`], kept on the spec by [`with_reply`]): the call a turn's
+/// first request is answered with, before the request that carries the
+/// call's result back (`answered`, each API's reader: [`messages_answered`],
+/// [`gemini::results_answered`], [`muse::results_answered`], each true once
+/// any request of the conversation carries it) is answered with the rule's
+/// `text` — an empty one, and the turn ends on the tool's row. `None` where
+/// the spec holds no call, or its result is in: the call is made once a
+/// conversation.
+#[must_use]
+pub fn scripted_call(spec: &J, answered: bool) -> Option<(String, J)> {
+    let call = spec.get("tool").filter(|c| matches!(c, J::Obj(_)))?;
+    let name = call_name(call);
+    (!answered && !name.is_empty()).then(|| (name, call_input(call)))
+}
+
+/// Whether a Messages API request's conversation carries a tool's result
+/// back: a user message of it holds a `tool_result` block (Claude Code's
+/// answer to a call) — the newest, or one before a later message (the next
+/// prompt, a retry's user-role error turn after an empty reply), so a
+/// scripted call is made once a conversation ([`scripted_call`]), never again
+/// at each retry (agy's 2501 calls on Gemini's API before its reader read the
+/// whole conversation).
+#[must_use]
+pub fn messages_answered(body: &[u8]) -> bool {
+    let Ok(j) = J::parse_bytes(body) else {
+        return false;
+    };
+    j.get("messages")
+        .and_then(J::as_arr)
+        .unwrap_or_default()
+        .iter()
+        .any(is_tool_result)
 }
 
 /// The user texts of a Messages API request, oldest first: each user
@@ -2066,6 +2101,10 @@ impl Stub {
             .filter(|sp| kind == "main" || !is_scripted(sp))
         {
             let sp = with_reply(sp, &message_users(body));
+            if let Some((name, input)) = scripted_call(&sp, messages_answered(body)) {
+                let s = format!("{summary} custom tool:{name}");
+                return self.stream_tool(&base.in_mode(&mode), &s, &name, &input, out);
+            }
             return self.custom(&base.in_mode(&mode), &sp, &summary, out);
         }
         if self.custom_spec(&mode).is_some() {
@@ -2255,6 +2294,19 @@ impl Stub {
             .filter(|sp| !matches!(kind, "codex-json" | "muse-json") || !is_scripted(sp))
         {
             let spec = with_reply(spec, &responses_users(body));
+            if dialect == Dialect::Muse
+                && let Some((name, input)) = scripted_call(&spec, muse::results_answered(body))
+            {
+                let s = format!("{summary} custom tool:{name}");
+                return self.muse_call(
+                    (method, path, blen, mode.as_str()),
+                    &info,
+                    &s,
+                    &name,
+                    &input,
+                    out,
+                );
+            }
             if let Some(ms) = spec
                 .get("delay_ms")
                 .and_then(J::as_f64)

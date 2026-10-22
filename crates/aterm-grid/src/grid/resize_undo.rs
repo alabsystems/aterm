@@ -85,27 +85,29 @@ pub(crate) struct ResizeUndo {
 static NEXT_SERIAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 impl Grid {
-    fn cursor_picture(&self) -> CursorPicture {
+    #[inline]
+    const fn cursor_picture(&self) -> CursorPicture {
         let s = &self.storage;
         CursorPicture {
-            cursor: s.cursor,
-            pending_wrap: s.pending_wrap,
-            saved_cursor: s.saved_cursor.cursor,
-            saved_valid: s.saved_cursor.valid,
-            saved_pending_wrap: s.saved_cursor.pending_wrap,
+            cursor: s.cursor_state.cursor,
+            pending_wrap: s.cursor_state.pending_wrap,
+            saved_cursor: s.cursor_state.saved_cursor.cursor,
+            saved_valid: s.cursor_state.saved_cursor.valid,
+            saved_pending_wrap: s.cursor_state.saved_cursor.pending_wrap,
             scroll_region: s.cursor_state.scroll_region,
             margins: s.cursor_state.horizontal_margins,
             has_margins: s.has_horizontal_margins,
         }
     }
 
-    fn set_cursor_picture(&mut self, p: CursorPicture) {
+    #[inline]
+    const fn set_cursor_picture(&mut self, p: CursorPicture) {
         let s = &mut self.storage;
-        s.cursor = p.cursor;
-        s.pending_wrap = p.pending_wrap;
-        s.saved_cursor.cursor = p.saved_cursor;
-        s.saved_cursor.valid = p.saved_valid;
-        s.saved_cursor.pending_wrap = p.saved_pending_wrap;
+        s.cursor_state.cursor = p.cursor;
+        s.cursor_state.pending_wrap = p.pending_wrap;
+        s.cursor_state.saved_cursor.cursor = p.saved_cursor;
+        s.cursor_state.saved_cursor.valid = p.saved_valid;
+        s.cursor_state.saved_cursor.pending_wrap = p.saved_pending_wrap;
         s.cursor_state.scroll_region = p.scroll_region;
         s.cursor_state.horizontal_margins = p.margins;
         s.has_horizontal_margins = p.has_margins;
@@ -113,6 +115,7 @@ impl Grid {
 
     /// The grid shape a stash is kept for: no retention, no tiered store, no
     /// history, under the Native policy.
+    #[inline]
     fn keeps_resize_undo(&self, policy: ResizePolicy) -> bool {
         policy == ResizePolicy::Native
             && self.storage.max_scrollback == 0
@@ -251,6 +254,7 @@ impl Grid {
     /// same serial after a resize means the same stash, still unbroken, and
     /// [`crate::ResizeShape::undone`] says when it has been handed back whole.
     #[must_use]
+    #[inline]
     pub fn resize_undo_serial(&self) -> Option<u64> {
         self.storage.resize_undo.as_ref().map(|u| u.serial)
     }

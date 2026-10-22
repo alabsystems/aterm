@@ -215,6 +215,12 @@ struct DryRun {
 
 #[cfg(target_os = "macos")]
 fn dry_run(scratch: &Scratch, home: &Home, args: &[&str]) -> DryRun {
+    dry_run_with(scratch, home, args, &[])
+}
+
+/// [`dry_run`] with `env` added to the installer's environment.
+#[cfg(target_os = "macos")]
+fn dry_run_with(scratch: &Scratch, home: &Home, args: &[&str], env: &[(&str, &str)]) -> DryRun {
     let web = scratch.mkdir("web");
     scratch.stand_in("web/curl", WEB_STUB);
     scratch.stand_in("web/gh", NO_GH);
@@ -229,21 +235,60 @@ fn dry_run(scratch: &Scratch, home: &Home, args: &[&str]) -> DryRun {
     let log = scratch.join("requests.log");
     write(&log, "");
     let path = format!("{}:{}", s(&web), system_path());
-    let run = installer(
-        &install_sh(),
-        home,
-        &[
-            ("PATH", &path),
-            ("ATERM_REPO_SLUG", "example/aterm"),
-            ("STUB_SLUG", "example/aterm"),
-            ("STUB_LOG", s(&log)),
-            ("STUB_MANIFEST", s(&manifest)),
-        ],
-        args,
-    );
+    let mut vars = vec![
+        ("PATH", path.as_str()),
+        ("ATERM_REPO_SLUG", "example/aterm"),
+        ("STUB_SLUG", "example/aterm"),
+        ("STUB_LOG", s(&log)),
+        ("STUB_MANIFEST", s(&manifest)),
+    ];
+    vars.extend_from_slice(env);
+    let run = installer(&install_sh(), home, &vars, args);
     DryRun {
         run,
         requests: read(&log).lines().map(str::to_string).collect(),
+    }
+}
+
+/// The plan's toolset line follows the console's owner through the one step
+/// the install runs too (`elect_install_lane`; docs/DESIGN-init-system-2026-10-20.md
+/// §4.2, "The SSH install"): the installing user at the screen leaves the toolset
+/// to aterm's first launch, and with another login at the screen it installs
+/// here, saying why.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_dry_run_s_toolset_line_follows_the_console_owner() {
+    let scratch = Scratch::new();
+    // SAFETY: getuid has no preconditions and cannot fail.
+    let me = unsafe { libc::getuid() };
+    assert_ne!(me, 0, "the suite does not run as root");
+    for (console, want, not) in [
+        (
+            me,
+            "toolset: installs on aterm's first launch",
+            "pkg update here",
+        ),
+        (
+            me + 1,
+            "toolset: aterm pkg seed + pkg update here",
+            "installs on aterm's first launch",
+        ),
+    ] {
+        let fresh = scratch.home(&format!("console-{console}"));
+        let console = console.to_string();
+        let dry = dry_run_with(
+            &scratch,
+            &fresh,
+            &["--dry-run"],
+            &[
+                ("ATERM_INSTALL_CONSOLE_UID", console.as_str()),
+                ("ATERM_NO_TOOLCHAIN", "0"),
+            ],
+        );
+        let plan = dry.run.all();
+        assert_eq!(dry.run.code(), 0, "{plan}");
+        assert!(plan.contains(want), "console {console}: {plan}");
+        assert!(!plan.contains(not), "console {console}: {plan}");
     }
 }
 

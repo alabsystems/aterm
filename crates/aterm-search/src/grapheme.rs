@@ -23,6 +23,7 @@ const SIGMA: char = '\u{03C3}';
 /// sigma ς (U+03C2) to σ (U+03C3), so Σ, σ and ς collapse to one form; otherwise the
 /// index, query key and scan buffer disagree on a word-final Σ and miss sigma
 /// matches. Both encode to 2 bytes, so [`LowerByteMap`] offsets stay aligned.
+#[inline]
 pub(crate) fn lower_fold_char(c: char) -> impl Iterator<Item = char> {
     c.to_lowercase()
         .map(|lc| if lc == FINAL_SIGMA { SIGMA } else { lc })
@@ -46,6 +47,7 @@ pub(crate) enum LowerNeed {
 
 /// Classify `text` for the lowered trigram pass: the two arms of
 /// `!text.is_ascii() || text.bytes().any(|b| b.is_ascii_uppercase())`.
+#[inline]
 pub(crate) fn lower_need(text: &str) -> LowerNeed {
     if !text.is_ascii() {
         LowerNeed::Unicode
@@ -98,6 +100,7 @@ pub fn byte_to_column(s: &str, byte_offset: usize) -> usize {
 /// Display columns `text` occupies, in the column frame every
 /// [`SearchMatch`](crate::SearchMatch) is measured in (a wide glyph counts 2, a
 /// combining mark 0).
+#[inline]
 #[must_use]
 pub fn display_columns(text: &str) -> usize {
     display_columns_with(text, AmbiguousWidth::Single)
@@ -106,6 +109,7 @@ pub fn display_columns(text: &str) -> usize {
 /// [`display_columns`] under the terminal's `ambiguous_width` policy, the
 /// frame a [`SearchIndex`](crate::SearchIndex) built with the same policy
 /// measures its matches in.
+#[inline]
 #[must_use]
 pub fn display_columns_with(text: &str, ambiguous: AmbiguousWidth) -> usize {
     // Printable ASCII holds no East Asian Ambiguous character, so the
@@ -220,17 +224,19 @@ struct ClusterRun {
 
 /// A line offset or column as a run stores it (see [`ColumnMap`] on the
 /// 4 GiB saturation).
+#[inline]
 fn narrow(value: usize) -> u32 {
     u32::try_from(value).unwrap_or(u32::MAX)
 }
 
 impl ClusterRun {
     /// Grapheme `i`'s byte offset, start column and cursor-before column.
-    fn grapheme(self, i: u32) -> ClusterColumns {
-        let offset = (self.offset as usize)
-            .saturating_add((i as usize).saturating_mul(usize::from(self.bytes)));
-        let start = (self.start as usize)
-            .saturating_add((i as usize).saturating_mul(usize::from(self.cols)));
+    #[inline]
+    const fn grapheme(self, i: u32) -> ClusterColumns {
+        let offset =
+            (self.offset as usize).saturating_add((i as usize).saturating_mul(self.bytes as usize));
+        let start =
+            (self.start as usize).saturating_add((i as usize).saturating_mul(self.cols as usize));
         let before = if i == 0 { self.before as usize } else { start };
         ClusterColumns {
             offset,
@@ -410,6 +416,7 @@ impl ColumnMap {
 
     /// The identity map over `len` bytes: every byte one grapheme one column
     /// wide, which needs no runs.
+    #[inline]
     fn identity(len: usize, source: MapSource) -> Self {
         Self {
             runs: Box::default(),
@@ -420,8 +427,9 @@ impl ColumnMap {
     }
 
     /// What this map's columns were measured from.
+    #[inline]
     #[must_use]
-    pub(crate) fn source(&self) -> MapSource {
+    pub(crate) const fn source(&self) -> MapSource {
         self.source
     }
 
@@ -549,6 +557,7 @@ impl LowerByteMap {
 
     /// Map a byte offset in lowered text to the corresponding byte offset in
     /// original text. O(log C). Semantics match `map_lower_byte_to_original`.
+    #[inline]
     #[must_use]
     pub fn map_to_original(&self, lower_byte: usize) -> usize {
         let total = self.entries.last().map_or(0, |&(_, orig)| orig);

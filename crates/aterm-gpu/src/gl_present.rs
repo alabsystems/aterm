@@ -684,9 +684,11 @@ impl GpuRenderer {
     }
 
     /// The injected-loss drill's fire site (`gl_inject_loss_after`): counts
-    /// successful GL presents, and at zero arms the device so its next
-    /// `eglMakeCurrent` fails as a lost context's does. Announces itself on
-    /// stderr.
+    /// successful GL presents, and at zero arms the device so it loses its
+    /// context as a real loss does (`GlShared::inject_context_loss`: on a GLX
+    /// device the next present's reset check reads a reset, after its GLX
+    /// binds; on an EGL device the next `eglMakeCurrent` fails as a lost
+    /// context's does). Announces itself on stderr.
     pub(crate) fn gl_maybe_inject_loss(&mut self) {
         let Some(n) = self.gl_inject_loss_after.as_mut() else {
             return;
@@ -699,11 +701,8 @@ impl GpuRenderer {
         let Some(live) = self.gl_arm.as_ref() else {
             return;
         };
-        live.dev.shared().inject_context_loss();
-        crate::stderr_line!(
-            "aterm-gpu: ATERM_GL_INJECT_LOSS fired; the GL device's next eglMakeCurrent \
-             reports EGL_CONTEXT_LOST (drill lever)"
-        );
+        let what = live.dev.shared().inject_context_loss();
+        crate::stderr_line!("aterm-gpu: ATERM_GL_INJECT_LOSS fired; {what} (drill lever)");
     }
 
     /// Fire the injected-loss drill after `n` more successful GL presents, as
@@ -770,14 +769,17 @@ impl GpuRenderer {
 }
 
 /// The shipped Linux build's window presents: the GL arm owns the window's
-/// EGL surface (a build that also carries wgpu, Linux's `--features
-/// wgpu-oracle` lane, attaches windows on wgpu).
+/// surface, a `GLXWindow` on X11 and an EGL surface on Wayland (a build that
+/// also carries wgpu, Linux's `--features wgpu-oracle` lane, attaches windows
+/// on wgpu).
 #[cfg(not(wgpu_arm))]
 impl GpuRenderer {
     /// Attach `target`'s window: the arm on the window system's display (minted
-    /// there, or minted again there if a headless frame came first), and an
-    /// EGL window surface at `width` x `height` (clamped like every
-    /// framebuffer). `Err` sends the frontend to the CPU renderer.
+    /// there, or minted again there if a headless frame came first), and a
+    /// window surface at `width` x `height` (clamped like every framebuffer):
+    /// a `GLXWindow` on X11, an EGL surface on Wayland (where X11's GLX
+    /// cannot serve there is no device, `gl::glx`). `Err` sends the frontend
+    /// to the CPU renderer.
     #[cfg(not(target_arch = "wasm32"))]
     pub(crate) fn gl_create_window_surface<W: WindowTarget>(
         &mut self,

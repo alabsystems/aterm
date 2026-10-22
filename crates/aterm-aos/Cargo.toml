@@ -1,0 +1,32 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Andrew Yates
+
+[package]
+name = "aterm-aos"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Aos hosted execution: versioned task identities, full-copy checkpoints, the ordered event log, shadow replay with an effect frontier, and same-schema boundary publication. No clock, thread, file or socket: the host hands it time and bytes."
+# Integration tests are modules of the one `aos_suite` binary: a tests/*.rs that
+# is not a `mod` of tests/aos_suite.rs never compiles.
+autotests = false
+
+[lints]
+workspace = true
+
+[dependencies]
+# SHA-256 identities and digests (astream-digest's, re-exported).
+aterm-digest = { workspace = true }
+# CRC-framed dense step records: the event log and checkpoint containers, with
+# torn-tail vs fault classification.
+astream-wire = { path = "../../vendor/astream/crates/astream-wire" }
+
+[dev-dependencies]
+aterm-spec = { workspace = true }
+aterm-models-aos = { workspace = true }
+
+[[test]]
+name = "aos_suite"
+path = "tests/aos_suite.rs"

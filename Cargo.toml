@@ -11,7 +11,7 @@ members = ["crates/*"]
 # they are publication tools or check runners.
 default-members = [
     "crates/agh", "crates/agh-fake", "crates/amacs", "crates/amacs-files", "crates/amacs-term",
-    "crates/aterm", "crates/aterm-a11y", "crates/aterm-agent", "crates/aterm-alloc", "crates/aterm-arrayvec",
+    "crates/aterm", "crates/aterm-a11y", "crates/aterm-agent", "crates/aterm-alloc", "crates/aterm-aos", "crates/aterm-arrayvec",
     "crates/aterm-bidi", "crates/aterm-bits", "crates/aterm-buffer",
     "crates/aterm-caffeine", "crates/aterm-cap",
     "crates/aterm-cfg-if", "crates/aterm-cg", "crates/aterm-cli", "crates/aterm-codec",
@@ -29,7 +29,7 @@ default-members = [
     "crates/aterm-keeper", "crates/aterm-lexicon", "crates/aterm-libc", "crates/aterm-libm",
     "crates/aterm-link", "crates/aterm-log", "crates/aterm-machines", "crates/aterm-log-shim", "crates/aterm-lz4",
     "crates/aterm-macro-support", "crates/aterm-messages", "crates/aterm-net", "crates/aterm-objc",
-    "crates/aterm-models-agh", "crates/aterm-models-atpkg", "crates/aterm-models-core", "crates/aterm-models-effects",
+    "crates/aterm-models-agh", "crates/aterm-models-aos", "crates/aterm-models-atpkg", "crates/aterm-models-core", "crates/aterm-models-effects",
     "crates/aterm-models-gui", "crates/aterm-models-harness", "crates/aterm-models-misc",
     "crates/aterm-models-native", "crates/aterm-models-release", "crates/aterm-models-render",
     "crates/aterm-models-session", "crates/aterm-models-update",
@@ -79,7 +79,7 @@ bundle = []
 update_channel = "alabsystems/aterm"
 
 [workspace.package]
-version = "0.111.0"
+version = "0.112.0"
 edition = "2024"
 license = "Apache-2.0"
 repository = "https://github.com/alabsystems/aterm"
@@ -118,6 +118,8 @@ amacs-term = { path = "crates/amacs-term" }
 aterm-a11y = { path = "crates/aterm-a11y" }
 aterm-agent = { path = "crates/aterm-agent" }
 aterm-alloc = { path = "crates/aterm-alloc" }
+# Aos hosted execution: task checkpoints, the ordered event log, replay and boundary publication.
+aterm-aos = { path = "crates/aterm-aos" }
 aterm-bidi = { path = "crates/aterm-bidi" }
 aterm-bits = { path = "crates/aterm-bits" }
 aterm-cap = { path = "crates/aterm-cap" }
@@ -178,6 +180,7 @@ aterm-messages = { path = "crates/aterm-messages" }
 # Formal models, one crate per domain; `aterm-models` aggregates all domains for checks.
 aterm-models = { path = "crates/aterm-models" }
 aterm-models-agh = { path = "crates/aterm-models-agh" }
+aterm-models-aos = { path = "crates/aterm-models-aos" }
 aterm-models-atpkg = { path = "crates/aterm-models-atpkg" }
 aterm-models-core = { path = "crates/aterm-models-core" }
 aterm-models-effects = { path = "crates/aterm-models-effects" }
@@ -567,8 +570,8 @@ unicode-width = { path = "crates/aterm-unicode-width" }
 #   used by `ring` on `win-arm`, imported from `kernel32.dll` via `raw-dylib`
 #   and checked against registry 0.52.0 by `tests/oracle/`.
 # - 0.61.2 (`crates/aterm-windows-sys`, re-exporting `crates/aterm-win32`): the
-#   generated Win32 closure, used through this facade by `aterm-window` and
-#   `softbuffer` (aterm's own crates name `aterm-win32` directly), checked
+#   generated Win32 closure, used through this facade by `aterm-window`
+#   (aterm's own crates name `aterm-win32` directly), checked
 #   against registry 0.61.2 by `win32-oracle/`.
 #   Excluded from `[workspace]` above because cargo forbids two workspace
 #   members with package name `windows-sys`.

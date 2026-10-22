@@ -178,6 +178,18 @@ impl PreeditCallbacks {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Each spot an input context was sent on this thread (`ImeContext::set_spot`), with its
+    /// window, for a test.
+    pub(crate) static SPOTS_SENT: std::cell::RefCell<Vec<(ffi::Window, c_short, c_short)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+    /// Each window whose input context was given the focus on this thread
+    /// (`ImeContext::focus`), for a test.
+    pub(crate) static FOCUSES_SENT: std::cell::RefCell<Vec<ffi::Window>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
 struct ImeContextClientData {
     window: ffi::Window,
     event_sender: ImeEventSender,
@@ -333,6 +345,8 @@ impl ImeContext {
     }
 
     pub(crate) fn focus(&self, xconn: &Arc<XConnection>) -> Result<(), XError> {
+        #[cfg(test)]
+        FOCUSES_SENT.with(|sent| sent.borrow_mut().push(self._client_data.window));
         unsafe {
             (xconn.xlib.XSetICFocus)(self.ic);
         }
@@ -361,6 +375,8 @@ impl ImeContext {
         }
 
         self.ic_spot = ffi::XPoint { x, y };
+        #[cfg(test)]
+        SPOTS_SENT.with(|sent| sent.borrow_mut().push((self._client_data.window, x, y)));
 
         unsafe {
             let preedit_attr = util::memory::XSmartPointer::new(

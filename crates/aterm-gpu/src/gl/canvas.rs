@@ -2,8 +2,8 @@
 // Copyright 2026 Andrew Yates
 
 //! The GL arm's swapchain in a browser: the WebGL2 canvas's drawing buffer,
-//! and the present that posts a frame to it (wasm32; `surface` is the EGL
-//! twin on Linux).
+//! and the present that posts a frame to it (wasm32; `surface` is the GLX
+//! and EGL twin on Linux).
 //!
 //! A present composes into a stand-in texture the surface owns, then
 //! [`GlCanvasSurface::present`] copies it into the canvas's default

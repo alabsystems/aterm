@@ -27,6 +27,14 @@ description = "aterm's in-process readers of another process (working directory,
 [target.'cfg(any(target_os = "macos", target_os = "linux"))'.dependencies]
 libc = { workspace = true }
 
+# The Linux arm's one library: an NVIDIA card's busy figure is NVML's
+# (`libnvidia-ml.so.1`, which the proprietary driver installs), opened at run
+# time with its three entry points read into a table (`src/nvml.rs`), so a
+# machine without the driver runs the same binary. Workspace crate, libc
+# only.
+[target.'cfg(target_os = "linux")'.dependencies]
+aterm-dl = { workspace = true }
+
 # Scratch directories removed on drop: the Linux readers' fixture roots
 # (`src/tests.rs`), the Windows identity tests' files and junctions
 # (`src/volumes_tests.rs`; a junction is set by `FSCTL_SET_REPARSE_POINT`

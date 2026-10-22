@@ -255,23 +255,35 @@ fn pull(path: &std::path::Path, user: &str, repo: &str) -> Result<(), String> {
 }
 
 /// Full names of installed packages whose receipted identity lives
-/// in `user/repo`, split by kind (brew's untap census).
-fn tap_installed_names(prefix: &Prefix, user: &str, repo: &str) -> (Vec<String>, Vec<String>) {
-    let want = format!("{user}/{repo}/");
+/// in `user/repo`, split by kind. Every retained version must be known:
+/// a partial presentation scan cannot authorize deleting its recipe.
+fn tap_installed_names(
+    prefix: &Prefix,
+    user: &str,
+    repo: &str,
+) -> Result<(Vec<String>, Vec<String>), String> {
     let mut by_kind = (Vec::new(), Vec::new());
     for (kind, out) in [
         (Kind::Formula, &mut by_kind.0),
         (Kind::Cask, &mut by_kind.1),
     ] {
-        for inst in prefix.installed(kind) {
-            let full = prefix.full_name(&inst);
-            if full.starts_with(&want) {
-                out.push(full);
+        for inst in prefix.installed_checked(kind)? {
+            for version in &inst.versions {
+                let full = prefix.full_name_checked(kind, &inst.name, version)?;
+                let (tap, _) = full.rsplit_once('/').ok_or_else(|| {
+                    format!("abrew: installed package has no tap identity: {full}")
+                })?;
+                let (owner, source) = parse_tap_name(tap)
+                    .ok_or_else(|| format!("abrew: invalid installed tap identity: {full}"))?;
+                if owner == user && source == repo {
+                    out.push(format!("{user}/{repo}/{}", inst.name));
+                }
             }
         }
         out.sort();
+        out.dedup();
     }
-    by_kind
+    Ok(by_kind)
 }
 
 pub fn remove(prefix: &Prefix, name: &str) -> Result<(), String> {
@@ -285,7 +297,11 @@ pub fn remove(prefix: &Prefix, name: &str) -> Result<(), String> {
     // the official API taps are exempt, as in brew's API mode.
     let official = user == "homebrew" && matches!(repo.as_str(), "core" | "cask");
     if !official {
-        let (formulae, casks) = tap_installed_names(prefix, &user, &repo);
+        let (formulae, casks) = tap_installed_names(prefix, &user, &repo).map_err(|error| {
+            format!(
+                "abrew: refusing to untap {user}/{repo}: installed package census is incomplete: {error}"
+            )
+        })?;
         if !formulae.is_empty() || !casks.is_empty() {
             let types = if casks.is_empty() {
                 "formulae"
@@ -451,33 +467,154 @@ mod tests {
 
     #[test]
     fn untap_refuses_while_tap_packages_are_installed() {
-        let tmp = aterm_tempfile::tempdir().unwrap();
-        let p = Prefix::at(tmp.path());
-        p.ensure().unwrap();
-        // A receipted formula whose identity lives in someone/tap.
-        let keg = p.keg("tool", "1.0");
-        std::fs::create_dir_all(&keg).unwrap();
-        p.write_receipt(
-            &keg,
-            &[
+        fn payload(p: &Prefix, kind: Kind, version: &str, full: Option<&str>) -> PathBuf {
+            let dir = match kind {
+                Kind::Formula => p.keg("tool", version),
+                Kind::Cask => p.cask_dir("tool", version),
+            };
+            std::fs::create_dir_all(&dir).unwrap();
+            let mut fields = vec![
                 ("installed_by", "abrew"),
-                ("name", "tool"),
-                ("version", "1.0"),
-                ("full_name", "someone/tap/tool"),
-            ],
-        )
-        .unwrap();
-        // The tap stands on disk as a plain directory.
-        let tap_dir = p.taps_dir().join("someone/homebrew-tap");
-        std::fs::create_dir_all(&tap_dir).unwrap();
-        let error = remove(&p, "someone/tap").unwrap_err();
-        assert!(error.contains("Refusing to untap someone/tap"), "{error}");
-        assert!(error.contains("someone/tap/tool"), "{error}");
-        assert!(tap_dir.is_dir(), "tap survives the refusal");
-        // Once the keg is gone, untap proceeds.
-        std::fs::remove_dir_all(p.cellar().join("tool")).unwrap();
-        remove(&p, "someone/tap").unwrap();
-        assert!(!tap_dir.exists());
+                (
+                    match kind {
+                        Kind::Formula => "name",
+                        Kind::Cask => "token",
+                    },
+                    "tool",
+                ),
+                ("version", version),
+            ];
+            if let Some(full) = full {
+                fields.push(("full_name", full));
+            }
+            p.write_receipt(&dir, &fields).unwrap();
+            dir
+        }
+        fn tapped(p: &Prefix) -> PathBuf {
+            let tap = p.taps_dir().join("someone/homebrew-tap");
+            std::fs::create_dir_all(&tap).unwrap();
+            std::fs::write(tap.join("KEEP"), b"tap recipes").unwrap();
+            tap
+        }
+        fn refused(p: &Prefix, tap: &std::path::Path) -> String {
+            let error = remove(p, "someone/tap").unwrap_err();
+            assert_eq!(std::fs::read(tap.join("KEEP")).unwrap(), b"tap recipes");
+            error
+        }
+        let tmp = aterm_tempfile::tempdir().unwrap();
+        for kind in [Kind::Formula, Kind::Cask] {
+            let p = Prefix::at(&tmp.path().join(kind.word()));
+            p.ensure().unwrap();
+            let official = match kind {
+                Kind::Formula => "homebrew/core/tool",
+                Kind::Cask => "homebrew/cask/tool",
+            };
+            let old = payload(&p, kind, "1.0", Some("someone/tap/tool"));
+            let current = payload(&p, kind, "2.0", Some(official));
+            let tap = tapped(&p);
+            // The newer version belongs elsewhere. A retained older recipe
+            // still refuses untap, in both the Cellar and Caskroom.
+            let error = refused(&p, &tap);
+            assert!(error.contains("Refusing to untap someone/tap"), "{error}");
+            assert!(error.contains("someone/tap/tool"), "{error}");
+            assert!(old.is_dir() && current.is_dir());
+            // The accepted homebrew- spelling names that same tap.
+            payload(&p, kind, "1.0", Some("someone/homebrew-tap/tool"));
+            assert!(refused(&p, &tap).contains("someone/tap/tool"));
+            std::fs::remove_dir_all(&old).unwrap();
+            let receipt = current.join("INSTALL_RECEIPT.json");
+            let official_bytes = std::fs::read(&receipt).unwrap();
+            remove(&p, "someone/tap").unwrap();
+            assert!(
+                !tap.exists(),
+                "an unrelated installed version is no use of this tap"
+            );
+            assert_eq!(std::fs::read(&receipt).unwrap(), official_bytes);
+
+            let tap = tapped(&p);
+            let key = match kind {
+                Kind::Formula => "name",
+                Kind::Cask => "token",
+            };
+            // Ownership alone cannot turn an unknown identity into the
+            // official tap. These receipts still pass the old census.
+            for full in [
+                "null",
+                "42",
+                "\"\"",
+                "\"other\"",
+                "\"someone/tap/other\"",
+                "\"someone/tool\"",
+                "\"../tap/tool\"",
+            ] {
+                let bytes = format!(
+                    "{{\"installed_by\":\"abrew\",\"{key}\":\"tool\",\"version\":\"2.0\",\"full_name\":{full}}}"
+                );
+                std::fs::write(&receipt, bytes.as_bytes()).unwrap();
+                let _ = refused(&p, &tap);
+                assert_eq!(std::fs::read(&receipt).unwrap(), bytes.as_bytes());
+            }
+            for bytes in [b"{".as_slice(), b"[]".as_slice()] {
+                std::fs::write(&receipt, bytes).unwrap();
+                let _ = refused(&p, &tap);
+                assert_eq!(std::fs::read(&receipt).unwrap(), bytes);
+            }
+            std::fs::remove_file(&receipt).unwrap();
+            let _ = refused(&p, &tap);
+            // A directory cannot be read as regular metadata. This is an
+            // unconditional refusal, independent of UID or chmod behavior.
+            std::fs::create_dir(&receipt).unwrap();
+            let _ = refused(&p, &tap);
+            assert!(receipt.is_dir());
+            std::fs::remove_dir(&receipt).unwrap();
+            let oversized = vec![b' '; 64 * 1024 + 1];
+            std::fs::write(&receipt, &oversized).unwrap();
+            let _ = refused(&p, &tap);
+            assert_eq!(
+                std::fs::metadata(&receipt).unwrap().len(),
+                oversized.len() as u64
+            );
+            std::fs::remove_file(&receipt).unwrap();
+
+            #[cfg(unix)]
+            {
+                let external = tmp.path().join(format!("{}-receipt", kind.word()));
+                std::fs::write(&external, &official_bytes).unwrap();
+                std::os::unix::fs::symlink(&external, &receipt).unwrap();
+                let _ = refused(&p, &tap);
+                assert_eq!(std::fs::read_link(&receipt).unwrap(), external);
+                assert_eq!(std::fs::read(&external).unwrap(), official_bytes);
+                std::fs::remove_file(&receipt).unwrap();
+                payload(&p, kind, "2.0", Some(official));
+                // Neither a package-row alias nor a retained-version alias
+                // is evidence that the tap is unused.
+                for version_only in [false, true] {
+                    let row = if version_only {
+                        current.clone()
+                    } else {
+                        current.parent().unwrap().to_path_buf()
+                    };
+                    let held = tmp
+                        .path()
+                        .join(format!("{}-held-{version_only}", kind.word()));
+                    std::fs::rename(&row, &held).unwrap();
+                    std::os::unix::fs::symlink(&held, &row).unwrap();
+                    let _ = refused(&p, &tap);
+                    assert_eq!(std::fs::read_link(&row).unwrap(), held);
+                    std::fs::remove_file(&row).unwrap();
+                    std::fs::rename(&held, &row).unwrap();
+                }
+            }
+            // A valid legacy receipt, then the official API's short-name
+            // receipt, both leave this tap genuinely unused.
+            for full in [None, Some("tool")] {
+                payload(&p, kind, "2.0", full);
+                let tap = tapped(&p);
+                remove(&p, "someone/tap").unwrap();
+                assert!(!tap.exists());
+                assert!(current.is_dir());
+            }
+        }
     }
 
     #[test]

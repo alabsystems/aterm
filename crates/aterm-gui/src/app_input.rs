@@ -138,6 +138,10 @@ pub(crate) struct OutputEchoTracker {
     /// counts what a person or controller sent ([`Self::input_sent`]).
     sent: AtomicU64,
     published: Mutex<OutputEchoPublished>,
+    /// The Enters among those writes that submitted something composed since
+    /// the last ([`crate::submit_count`], [`Self::submits`]), folded in at
+    /// each write's full acceptance.
+    submit: crate::submit_count::SubmitCount,
 }
 
 /// How a paste's insert is priced for the cursor engine ([`DeliveryTicket::insert`]),
@@ -342,6 +346,10 @@ pub(crate) struct OutputEchoWrite<'a> {
     kind: OutputEchoInput,
     /// The queued write's [`DeliveryTicket`], published on acceptance.
     ticket: Option<DeliveryTicket>,
+    /// What the write means for the session's submission count
+    /// ([`crate::submit_count::SubmitInput`]), folded in at its full
+    /// acceptance.
+    submit: crate::submit_count::SubmitInput,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -401,6 +409,7 @@ impl OutputEchoTracker {
             counted,
             kind,
             ticket: None,
+            submit: crate::submit_count::SubmitInput::Neither,
         }
     }
 
@@ -425,8 +434,18 @@ impl OutputEchoTracker {
         self.sent.load(Ordering::Acquire)
     }
 
+    /// How many Enters written to the session submitted something typed
+    /// since the one before ([`crate::submit_count`]): `text --json`'s
+    /// `"submits"`, read after the screen it is sent with.
+    #[must_use]
+    pub(crate) fn submits(&self) -> u64 {
+        self.submit.submits()
+    }
+
     pub(crate) fn begin_event(&self, ev: &InputEvent) -> OutputEchoWrite<'_> {
-        self.begin(OutputEchoInput::of(ev))
+        let mut write = self.begin(OutputEchoInput::of(ev));
+        write.submit = crate::submit_count::SubmitInput::of(ev);
+        write
     }
 
     /// The render prelude's read: every delivery newer than `after`, oldest first,
@@ -650,6 +669,12 @@ impl OutputEchoWrite<'_> {
     /// writes never manufacture a post-return echo timestamp; an explicitly
     /// accepted guarded prefix does.
     fn finish(mut self, receipt: input::EgressReceipt, sink: &SinkWriter) {
+        // THE SUBMISSION COUNT, at the write's full acceptance: before the
+        // program can have read it, so a screen that shows its answer is read
+        // before a count that holds it.
+        if receipt.fully_accepted_nonempty() {
+            self.tracker.submit.accepted(self.submit);
+        }
         if self.kind != OutputEchoInput::Ignored
             && let Some(order) = receipt.accepted_order()
         {
@@ -740,7 +765,8 @@ pub(crate) fn tracked_egress_metered(
     ticket: Option<DeliveryTicket>,
     meter: Option<&aterm_session::sink::BulkMeter>,
 ) -> input::EgressReceipt {
-    let write = tracker.begin_ticketed(OutputEchoInput::of(ev), ticket);
+    let mut write = tracker.begin_ticketed(OutputEchoInput::of(ev), ticket);
+    write.submit = crate::submit_count::SubmitInput::of(ev);
     let receipt = input::seam_egress_receipt_metered(term, modes, sink, ev, mode, meter);
     write.finish(receipt, sink);
     receipt

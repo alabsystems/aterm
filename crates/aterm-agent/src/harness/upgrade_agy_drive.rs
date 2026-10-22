@@ -741,7 +741,8 @@ pub(super) fn after_exit_onto(
     // above — it stands (the relaunch's agy deleted the first crash file as
     // it started).
     let word = match left {
-        ExitRecord::Crashed => Some(ExitKind::Crashed),
+        // (`Restarted` is a Gemini CLI's word alone: read as a crash.)
+        ExitRecord::Crashed | ExitRecord::Restarted => Some(ExitKind::Crashed),
         ExitRecord::Removed => Some(ExitKind::Clean),
         ExitRecord::Refused => Some(ExitKind::Refused),
         ExitRecord::Unread | ExitRecord::Survived(_) if cause == ExitCause::Exit => {

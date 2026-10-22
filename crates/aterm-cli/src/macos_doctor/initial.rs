@@ -498,13 +498,17 @@ fn stage_restart(root: &Path, plan: &Plan) -> Result<Progress, String> {
     let next = progress(root)?.unwrap_or_default().next_for_plan(plan)?;
     save_plan(root, plan)?;
     save_progress(root, next)?;
-    match std::fs::remove_file(root.join("automatic-attempt.json")) {
-        Ok(()) => durable_directory(root).map_err(|error| error.to_string())?,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => {
-            return Err(format!(
-                "cannot reset the automatic retry cooldown: {error}"
-            ));
+    // The new run's automatic attempts start afresh: its cooldown, and the items an
+    // earlier run's attempt left held (`automatic_pass`), which a new revision already
+    // retires, so that an unreadable record cannot outlive a person's rerun either.
+    for (record, what) in [
+        ("automatic-attempt.json", "the automatic retry cooldown"),
+        (HELD_RECORD, "the held automatic setup items"),
+    ] {
+        match std::fs::remove_file(root.join(record)) {
+            Ok(()) => durable_directory(root).map_err(|error| error.to_string())?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(format!("cannot reset {what}: {error}")),
         }
     }
     // Release an earlier stop only after the new plan and progress are durable.
@@ -2717,6 +2721,134 @@ mod tests {
         );
         assert!(host.calls.is_empty());
         assert!(finished_at(empty.path()).unwrap());
+    }
+
+    /// The worker's stage loop over a Mac setting macOS never keeps: every retry runs
+    /// the Workstation stage again through the worker's own entry, and it stays pending,
+    /// but only two retries ten minutes apart make the change, relaunch the Dock and put
+    /// the change back. Every other retry writes and relaunches nothing while the other
+    /// stages go on retrying. Negative control: an automatic pass that holds nothing
+    /// (`host.hold(&[])` in `automatic_pass`) relaunches the Dock on every retry, as the
+    /// worker did every minute on 2026-10-22.
+    #[test]
+    fn a_workstation_stage_that_never_verifies_disrupts_twice_across_worker_retries() {
+        struct Stages {
+            doctor: super::super::tests::NeverVerifies,
+            rest: Fake,
+        }
+        impl InitialHost for Stages {
+            fn workstation(&mut self, root: &Path) -> Result<Option<Report>, String> {
+                self.doctor.pass(root)
+            }
+            fn spotlight(&mut self) -> Result<Vec<Row>, String> {
+                self.rest.spotlight()
+            }
+            fn permissions(&mut self) -> Result<Vec<Row>, String> {
+                self.rest.permissions()
+            }
+            fn secrets(
+                &mut self,
+                plan: &Plan,
+                password: Option<&SecretBytes>,
+            ) -> Result<Vec<Row>, String> {
+                self.rest.secrets(plan, password)
+            }
+            fn current_vault(&mut self, plan: &Plan) -> Result<Vec<Row>, String> {
+                self.rest.current_vault(plan)
+            }
+            fn repositories(&mut self) -> Result<Vec<Row>, String> {
+                self.rest.repositories()
+            }
+        }
+        let root = aterm_tempfile::tempdir().unwrap();
+        let plan = selected(&[Setting::Dock, Setting::Widgets, Setting::Secrets]);
+        let revision = authorize_at(root.path(), &plan).unwrap().unwrap();
+        let mut stages = Stages {
+            doctor: super::super::tests::NeverVerifies::dock(),
+            rest: Fake {
+                pending: Some(Stage::Secrets),
+                ..Fake::default()
+            },
+        };
+        // Each retry is a minute after the last; `why` is what the held Dock row says.
+        let retries = |stages: &mut Stages, count: usize, why: &str| {
+            for retry in 0..count {
+                let report = execute_initial_for_revision(stages, root.path(), revision, None)
+                    .unwrap()
+                    .unwrap();
+                assert!(report.needs_attention(), "retry {retry}");
+                assert!(
+                    report
+                        .rows
+                        .iter()
+                        .any(|row| row.status == "blocked" && row.detail == why),
+                    "retry {retry}: {}",
+                    report.to_text()
+                );
+            }
+        };
+        let first = execute_initial_for_revision(&mut stages, root.path(), revision, None)
+            .unwrap()
+            .unwrap();
+        assert!(first.needs_attention());
+        let once = (stages.doctor.changes(), stages.doctor.relaunches());
+        assert_eq!(once.1, 1);
+        retries(&mut stages, 9, WAITING);
+        assert_eq!(
+            (stages.doctor.changes(), stages.doctor.relaunches()),
+            once,
+            "nothing between the tries"
+        );
+        // The first retry ten minutes after the first try is the second; after it, none.
+        execute_initial_for_revision(&mut stages, root.path(), revision, None).unwrap();
+        let twice = (stages.doctor.changes(), stages.doctor.relaunches());
+        assert_eq!(twice.1, 2);
+        assert!(twice.0 > once.0);
+        retries(&mut stages, 20, HELD);
+        assert_eq!((stages.doctor.changes(), stages.doctor.relaunches()), twice);
+        assert_eq!(
+            stages
+                .rest
+                .calls
+                .iter()
+                .filter(|stage| **stage == Stage::Secrets)
+                .count(),
+            31,
+            "the pending vault keeps retrying"
+        );
+        assert!(!finished_at(root.path()).unwrap());
+        assert_eq!(
+            progress(root.path()).unwrap().unwrap().done & Stage::Workstation.bit(),
+            0,
+            "a held setting keeps its stage open for the person"
+        );
+    }
+
+    /// A rerun of the plan (System State's Apply) starts its automatic attempts afresh,
+    /// so a held-items record the worker cannot read, which fails every automatic pass,
+    /// does not outlive the person's rerun. Negative control: leaving [`HELD_RECORD`]
+    /// out of `stage_restart`'s resets keeps the unreadable record, and the rerun's
+    /// Workstation stage fails.
+    #[test]
+    fn a_rerun_retires_an_unreadable_held_record() {
+        let root = aterm_tempfile::tempdir().unwrap();
+        let plan = selected(&[Setting::Dock, Setting::Widgets]);
+        let revision = authorize_at(root.path(), &plan).unwrap().unwrap();
+        std::fs::write(root.path().join(HELD_RECORD), b"not json").unwrap();
+        let mut doctor = super::super::tests::NeverVerifies::dock();
+        assert!(
+            doctor.pass(root.path()).is_err(),
+            "an unreadable record holds the pass"
+        );
+        let rerun = restart_at(root.path(), &plan).unwrap();
+        assert_ne!(rerun, revision);
+        assert!(!root.path().join(HELD_RECORD).exists());
+        let report = doctor
+            .pass(root.path())
+            .expect("the rerun's pass runs")
+            .expect("its setup is pending");
+        assert!(report.needs_attention(), "{}", report.to_text());
+        assert_eq!(doctor.relaunches(), 1, "it tried the Dock once");
     }
 
     #[test]

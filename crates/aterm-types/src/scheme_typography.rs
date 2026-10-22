@@ -85,6 +85,7 @@ impl ThemeTypography {
     };
 
     /// Whether this sets nothing.
+    #[inline]
     #[must_use]
     pub fn is_empty(&self) -> bool {
         *self == Self::NONE
@@ -92,8 +93,9 @@ impl ThemeTypography {
 
     /// Whether this sets `key` (always `false` for a key outside the
     /// typography group).
+    #[inline]
     #[must_use]
-    pub fn is_set(&self, key: ThemeKey) -> bool {
+    pub const fn is_set(&self, key: ThemeKey) -> bool {
         match key {
             ThemeKey::FontFamily => self.font_family.is_some(),
             ThemeKey::FontFamilyBold => self.font_family_bold.is_some(),
@@ -113,6 +115,7 @@ impl ThemeTypography {
     }
 
     /// Unset `key` (a no-op for a key outside the typography group).
+    #[inline]
     pub fn clear(&mut self, key: ThemeKey) {
         match key {
             ThemeKey::FontFamily => self.font_family = None,
@@ -548,9 +551,10 @@ pub fn parse_schema(value: &str) -> Result<u16, String> {
 }
 
 /// Whether `key` is in the typography group (by its [`THEME_KEYS`] row).
+#[inline]
 #[must_use]
-pub fn is_typography_key(key: ThemeKey) -> bool {
-    theme_key_spec(key).group == ThemeKeyGroup::Typography
+pub const fn is_typography_key(key: ThemeKey) -> bool {
+    matches!(theme_key_spec(key).group, ThemeKeyGroup::Typography)
 }
 
 #[cfg(test)]

@@ -221,19 +221,23 @@ impl EventLog {
     /// Append a Surface text op at `Ticks(0)`. Eviction here just forgets the
     /// oldest entry; temporal callers use [`append_at`](Self::append_at) and
     /// handle the spill seam.
+    #[inline]
     fn append(&mut self, op: Op) -> Seq {
         let (seq, _evicted) = self.append_at(op, Ticks(0));
         seq
     }
     /// The logical length of the spine (total events ever appended).
-    pub fn total(&self) -> u64 {
+    #[inline]
+    pub const fn total(&self) -> u64 {
         self.total
     }
     /// The current Seq (head of the spine), or `Seq(0)` before any event.
-    pub fn head(&self) -> Seq {
+    #[inline]
+    pub const fn head(&self) -> Seq {
         Seq(self.total)
     }
     /// Live (un-evicted) events, oldest first.
+    #[inline]
     pub fn live(&self) -> impl Iterator<Item = &Event> {
         self.ring.iter()
     }
@@ -244,6 +248,7 @@ impl EventLog {
     /// `seq >= oldest_live().seq` means "still on the spine". A keyframe store
     /// that outlives the ring must check this before seeding a replay, or it
     /// would fold a chain whose head was evicted into a wrong engine.
+    #[inline]
     pub fn oldest_live(&self) -> Option<&Event> {
         self.ring.front()
     }
@@ -252,6 +257,7 @@ impl EventLog {
     ///
     /// With [`append_at`](Self::append_at) fed from one monotone clock, `ts` is
     /// nondecreasing down the ring, so this is also the latest recorded instant.
+    #[inline]
     pub fn newest_live(&self) -> Option<&Event> {
         self.ring.back()
     }
@@ -262,6 +268,7 @@ impl EventLog {
     /// sits at offset `after + 1 - oldest.seq`, clamped to `[0, len]`: a
     /// watermark below the low-water yields everything, one at or past the head
     /// yields nothing.
+    #[inline]
     pub fn live_after(&self, after: Seq) -> impl Iterator<Item = &Event> {
         let start = match self.ring.front() {
             None => 0,
@@ -287,12 +294,14 @@ pub struct Surface {
 }
 
 impl Default for Surface {
+    #[inline]
     fn default() -> Self {
         Self::new()
     }
 }
 
 impl Surface {
+    #[inline]
     pub fn new() -> Self {
         Surface {
             lines: Arc::new(Vec::new()),
@@ -301,10 +310,12 @@ impl Surface {
         }
     }
 
+    #[inline]
     pub fn log(&self) -> &EventLog {
         &self.log
     }
     /// The current head of the spine.
+    #[inline]
     pub fn seq(&self) -> Seq {
         self.log.head()
     }
@@ -334,6 +345,7 @@ impl Surface {
         low
     }
 
+    #[inline]
     fn line_index(&self, id: LineId) -> Option<usize> {
         let index = self.line_lower_bound(id);
         match self.lines.get(index) {
@@ -343,6 +355,7 @@ impl Surface {
     }
 
     /// Ordered half-open bounds for `r`; inverted/empty ranges stay empty.
+    #[inline]
     fn line_range_bounds(&self, r: Range) -> (usize, usize) {
         let start = self.line_lower_bound(r.start);
         if r.end <= r.start {
@@ -413,6 +426,7 @@ impl Surface {
 
     /// COMPOSE: O(1) copy-on-write snapshot. The line and event-log spines are
     /// shared; the first mutation of either detaches only that spine.
+    #[inline]
     pub fn snapshot(&self, _c: &ReadCap) -> Snapshot {
         Snapshot {
             at: self.seq(),
@@ -424,6 +438,7 @@ impl Surface {
 
     /// Open a subscription cursor at the current head; it sees events appended
     /// after this point.
+    #[inline]
     pub fn subscribe(&self, _c: &ReadCap) -> Cursor {
         Cursor { at: self.seq() }
     }
@@ -485,6 +500,7 @@ pub struct Snapshot {
 
 impl Snapshot {
     /// Read the frozen world at the snapshot's seq.
+    #[inline]
     pub fn read_text(&self, c: &ReadCap, r: Range) -> TextWithOrigin {
         self.surface.read_text(c, r)
     }

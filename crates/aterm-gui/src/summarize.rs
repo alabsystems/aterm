@@ -21,7 +21,11 @@
 //! start here ([`StartBlock`], the spawn's own checks plus a `claude` on the
 //! PATH a new tab starts from). Whether this Mac is in a fleet decides the
 //! brief and Read the Fleet's row ([`in_fleet`]): the fleet secret in the
-//! state directory, the one answer the fleet glance reads too.
+//! state directory, the one answer the fleet glance reads too. Whether this
+//! aterm's fabric is configured adds one sentence to either brief, right
+//! after its survey: read the fabric's log once ([`FABRIC_READ`], session log
+//! Phase 6 step 6E-5, ruling U45); without the fabric the briefs are
+//! [`FLEET_BRIEF`] and [`MAC_BRIEF`] byte for byte.
 
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -38,20 +42,53 @@ then what finished. Change nothing and start nothing: this is a read-only summar
 to commit, push or land.";
 
 /// [`FLEET_BRIEF`] for a Mac in no fleet: the same summary of this Mac's
-/// sessions, from `aterm ctl survey`.
+/// sessions, from `aterm ctl survey`, then the local brief, `aterm ctl survey
+/// --brief`: each instance's node log and its sessions' briefs, read off the
+/// session log (session log Phase 6 step 6H-7).
 pub(crate) const MAC_BRIEF: &str = "Summarize this Mac's aterm sessions for the person reading \
-this tab. Run `aterm ctl survey` once. Write, in this order: first what needs the person (the \
-session, and why); then what each manager and its workers are doing; then what finished. \
+this tab. Run `aterm ctl survey` once, then `aterm ctl survey --brief` once, for what each \
+session's log says. Write, in this order: first what needs the person (the session, and why); \
+then what each manager and its workers are doing; then what finished. \
 Change nothing and start nothing: this is a read-only summary, with nothing to commit, push or \
 land.";
 
-/// The worker order Summarize spawns: the brief alone, no fact line naming a
-/// starter (no client waits on it; its task record's `from=` is `ctl`), under
-/// Autopilot Land, so its end is its landing.
-pub(crate) fn summary_order(fleet: bool) -> crate::task_launch::TaskOrder {
-    let brief = if fleet { FLEET_BRIEF } else { MAC_BRIEF };
+/// [`FLEET_BRIEF`]'s survey sentence, after which [`FABRIC_READ`] goes.
+const FLEET_SURVEY: &str = "Run `aterm ctl survey --fleet` once.";
+
+/// [`MAC_BRIEF`]'s survey sentence (the survey, then the local brief), after
+/// which [`FABRIC_READ`] goes.
+const MAC_SURVEY: &str = "Run `aterm ctl survey` once, then `aterm ctl survey --brief` once, \
+for what each session's log says.";
+
+/// THE FABRIC'S SENTENCE (session log Phase 6 step 6E-5, ruling U45): where
+/// this aterm's fabric is configured, either brief reads the fabric's log
+/// once too, right after its survey, for the sessions the fabric's other
+/// machines report from the bus alone.
+pub(crate) const FABRIC_READ: &str =
+    "Then run `aterm fabric brief` once, for what the fabric's other machines report.";
+
+/// The brief a summary's worker is given: the fleet's or this Mac's, with
+/// [`FABRIC_READ`] after its survey where this aterm's fabric is configured,
+/// and byte for byte [`FLEET_BRIEF`] or [`MAC_BRIEF`] where it is not.
+pub(crate) fn summary_brief(fleet: bool, fabric: bool) -> String {
+    let (brief, survey) = if fleet {
+        (FLEET_BRIEF, FLEET_SURVEY)
+    } else {
+        (MAC_BRIEF, MAC_SURVEY)
+    };
+    if fabric {
+        brief.replacen(survey, &format!("{survey} {FABRIC_READ}"), 1)
+    } else {
+        brief.to_string()
+    }
+}
+
+/// The worker order Summarize spawns: the brief alone ([`summary_brief`]),
+/// no fact line naming a starter (no client waits on it; its task record's
+/// `from=` is `ctl`), under Autopilot Land, so its end is its landing.
+pub(crate) fn summary_order(fleet: bool, fabric: bool) -> crate::task_launch::TaskOrder {
     crate::task_launch::TaskOrder {
-        task: brief.as_bytes().to_vec(),
+        task: summary_brief(fleet, fabric).into_bytes(),
         agent: aterm_phase::Program::Claude,
         model: None,
         caller: None,
@@ -126,13 +163,15 @@ pub(crate) fn summary_booking(
 }
 
 /// What Summarize books in `folder` ([`summary_folder`]): its order
-/// ([`summary_order`]), trusting that folder alone as a spawn's named folder
-/// is, and its booking ([`summary_booking`]). With no folder it books
-/// nothing and says why ([`NO_SUMMARY_FOLDER`]): the focused pane's folder is
-/// a person's repository, where Land would press the read-only summary to
-/// commit and push that person's work.
+/// ([`summary_order`]: the fleet's brief or this Mac's, the fabric's
+/// sentence where `fabric` is configured), trusting that folder alone as a
+/// spawn's named folder is, and its booking ([`summary_booking`]). With no
+/// folder it books nothing and says why ([`NO_SUMMARY_FOLDER`]): the focused
+/// pane's folder is a person's repository, where Land would press the
+/// read-only summary to commit and push that person's work.
 fn summary_spawn(
     fleet: bool,
+    fabric: bool,
     folder: Option<&std::path::Path>,
 ) -> Result<
     (
@@ -146,7 +185,7 @@ fn summary_spawn(
         trusted_cwd: folder
             .to_str()
             .and_then(crate::spawn_folder::canonical_folder),
-        ..summary_order(fleet)
+        ..summary_order(fleet, fabric)
     };
     Ok((order, summary_booking(folder)))
 }
@@ -351,13 +390,32 @@ impl crate::App {
         (!claude_on_path()).then_some(StartBlock::NoClaude)
     }
 
+    /// What a Summarize press books in `folder` ([`summary_spawn`]): the
+    /// fleet's brief where this Mac is in a fleet ([`in_fleet`]), this Mac's
+    /// otherwise, with the fabric's sentence where THIS aterm's fabric is
+    /// configured ([`Self::fabric_configured`], ruling U45).
+    fn summary_spawn_in(
+        &self,
+        folder: Option<&std::path::Path>,
+    ) -> Result<
+        (
+            crate::task_launch::TaskOrder,
+            crate::control::control_media::SpawnBooking,
+        ),
+        String,
+    > {
+        summary_spawn(in_fleet(), self.fabric_configured(), folder)
+    }
+
     /// AGENTS ▸ SUMMARIZE THE FLEET IN A NEW TAB: one worker (`spawn
     /// agent=claude`, [`Self::book_spawn`]) in a new tab of the front window,
     /// raised so the person who clicked sees it, no role, its task
     /// [`summary_order`] (the fleet's brief in a fleet, this Mac's
-    /// otherwise), `from=ctl`. `Err` is the spawn's refusal before anything
-    /// is booked — what [`Self::summarize_start_block`] greys the row for; a
-    /// tab that did not open is said when it settles.
+    /// otherwise; the fabric's sentence where this aterm's fabric is
+    /// configured, [`Self::fabric_configured`]), `from=ctl`. `Err` is the
+    /// spawn's refusal before anything is booked — what
+    /// [`Self::summarize_start_block`] greys the row for; a tab that did not
+    /// open is said when it settles.
     pub(crate) fn summarize_in_new_tab(&mut self) -> Result<(), String> {
         if let Some(block) = self.summarize_start_block() {
             return Err(block.hint());
@@ -369,7 +427,7 @@ impl crate::App {
         }
         // In aterm's own folder, trusted as a spawn's named folder is; with
         // none, nothing is booked.
-        let (order, booking) = summary_spawn(in_fleet(), summary_folder().as_deref())?;
+        let (order, booking) = self.summary_spawn_in(summary_folder().as_deref())?;
         let plan = self.resolve_spawn(crate::control::SpawnAim::Front, Some(order))?;
         self.book_spawn(
             plan,
@@ -404,11 +462,13 @@ mod tests {
     /// nothing to land, under Land.
     #[test]
     fn the_briefs_read_the_survey_once_and_end() {
-        for (fleet, survey) in [
-            (true, "`aterm ctl survey --fleet`"),
-            (false, "`aterm ctl survey`"),
+        for (fleet, fabric, survey) in [
+            (true, false, "`aterm ctl survey --fleet`"),
+            (false, false, "`aterm ctl survey`"),
+            (true, true, "`aterm ctl survey --fleet`"),
+            (false, true, "`aterm ctl survey`"),
         ] {
-            let order = summary_order(fleet);
+            let order = summary_order(fleet, fabric);
             let brief = String::from_utf8(order.task.clone()).expect("UTF-8");
             assert!(brief.contains(survey), "{brief}");
             assert!(!brief.contains("ATERM-TASK-DONE"), "no output marker");
@@ -420,6 +480,78 @@ mod tests {
                 aterm_agent::supervise::Autopilot::Land,
                 "spawned under Land: its end is its landing"
             );
+        }
+    }
+
+    /// THE FABRIC'S SENTENCE, ONLY WHERE THE FABRIC IS ON (session log
+    /// Phase 6 step 6E-5, ruling U45), in all four arms: with no fabric each
+    /// brief is [`FLEET_BRIEF`] or [`MAC_BRIEF`] byte for byte and names no
+    /// fabric; with it, the same brief with exactly [`FABRIC_READ`] added,
+    /// right after its survey and before what it asks for. NEGATIVE
+    /// CONTROLS, run: the old order (no fabric arm) fails the fabric arms,
+    /// and the sentence on the no-fabric arm fails the byte-identical arm.
+    #[test]
+    fn the_briefs_read_the_fabric_only_where_it_is_on() {
+        let task = |fleet: bool, fabric: bool| {
+            String::from_utf8(summary_order(fleet, fabric).task).expect("UTF-8")
+        };
+        for (fleet, today, survey) in [
+            (true, FLEET_BRIEF, FLEET_SURVEY),
+            (false, MAC_BRIEF, MAC_SURVEY),
+        ] {
+            let plain = task(fleet, false);
+            assert_eq!(plain, today, "byte for byte without the fabric");
+            assert!(!plain.contains("fabric"), "{plain}");
+            assert_eq!(today.matches(survey).count(), 1, "{today}");
+            let read = task(fleet, true);
+            assert!(
+                read.contains(&format!("{survey} {FABRIC_READ} Write,")),
+                "{read}"
+            );
+            assert_eq!(read.matches("aterm fabric brief").count(), 1, "{read}");
+            assert_eq!(read.replacen(&format!(" {FABRIC_READ}"), "", 1), plain);
+        }
+    }
+
+    /// THIS MAC'S BRIEF READS THE SURVEY, THEN THE LOCAL BRIEF (session log
+    /// Phase 6 step 6H-7): `aterm ctl survey` once, then `aterm ctl survey
+    /// --brief` once, and where the fabric is on its sentence follows both.
+    /// The fleet's brief is unchanged. NEGATIVE CONTROL, run: the old order
+    /// (the survey alone) fails it.
+    #[test]
+    fn this_macs_brief_reads_the_survey_then_the_local_brief() {
+        for fabric in [false, true] {
+            let brief = String::from_utf8(summary_order(false, fabric).task).expect("UTF-8");
+            let at = |s: &str| brief.find(s).unwrap_or_else(|| panic!("{s}: {brief}"));
+            let survey = at("`aterm ctl survey` once");
+            let local = at("`aterm ctl survey --brief` once");
+            assert!(survey < local, "{brief}");
+            assert_eq!(brief.matches("aterm ctl survey").count(), 2, "{brief}");
+            if fabric {
+                assert!(local < at("`aterm fabric brief`"), "{brief}");
+            }
+            let fleet = String::from_utf8(summary_order(true, fabric).task).expect("UTF-8");
+            assert!(!fleet.contains("--brief"), "{fleet}");
+        }
+    }
+
+    /// A PRESS NAMES THE FABRIC WHERE THIS ATERM'S IS ON (session log Phase
+    /// 6 step 6E-5, ruling U45), at the press: the order Summarize books
+    /// ([`App::summary_spawn_in`]) carries [`FABRIC_READ`] exactly where
+    /// [`App::fabric_configured`] says this aterm's fabric is configured.
+    /// NEGATIVE CONTROL, run: the press passing `false` for the fabric fails
+    /// it.
+    #[test]
+    fn a_press_names_the_fabric_where_this_aterms_fabric_is_on() {
+        let root = aterm_tempfile::tempdir().expect("tempdir");
+        let folder = summary_folder_under(root.path()).expect("made");
+        let mut app = App::headless_for_test();
+        for on in [false, true] {
+            app.agents.overview_fabric.configured = on;
+            let (order, booking) = app.summary_spawn_in(Some(&folder)).expect("books");
+            assert_eq!(booking.cwd.as_deref(), folder.to_str());
+            let task = String::from_utf8(order.task).expect("UTF-8");
+            assert_eq!(task.contains(FABRIC_READ), on, "fabric {on}: {task}");
         }
     }
 
@@ -539,12 +671,12 @@ mod tests {
     /// raised, trusting that folder alone.
     #[test]
     fn summarize_with_no_folder_of_its_own_refuses_in_plain_words() {
-        let refused = summary_spawn(true, None).map(|_| ());
+        let refused = summary_spawn(true, false, None).map(|_| ());
         assert_eq!(refused, Err(NO_SUMMARY_FOLDER.to_string()));
         assert!(!NO_SUMMARY_FOLDER.contains("ATERM-TASK-DONE"));
         let root = aterm_tempfile::tempdir().expect("tempdir");
         let folder = summary_folder_under(root.path()).expect("made");
-        let (order, booking) = summary_spawn(false, Some(&folder)).expect("CONTROL: books");
+        let (order, booking) = summary_spawn(false, false, Some(&folder)).expect("CONTROL: books");
         assert_eq!(booking.cwd.as_deref(), folder.to_str(), "started there");
         assert!(booking.raise && booking.split.is_none());
         let canonical = std::fs::canonicalize(&folder).expect("canonical");

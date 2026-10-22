@@ -111,6 +111,7 @@ pub struct AuditToken(pub [u32; 8]);
 impl AuditToken {
     /// The token's bytes in memory order, as `SecCodeCopyGuestWithAttributes`
     /// takes them inside a `CFData`.
+    #[inline]
     #[must_use]
     pub fn to_bytes(&self) -> [u8; 32] {
         let mut out = [0u8; 32];
@@ -121,15 +122,17 @@ impl AuditToken {
     }
 
     /// The pid the token names (`audit_token_to_pid`: word 5).
+    #[inline]
     #[must_use]
-    pub fn pid(&self) -> u32 {
+    pub const fn pid(&self) -> u32 {
         self.0[5]
     }
 
     /// The pid version the token names (`audit_token_to_pidversion`: word 7):
     /// the generation of the process at [`Self::pid`].
+    #[inline]
     #[must_use]
-    pub fn pid_version(&self) -> u32 {
+    pub const fn pid_version(&self) -> u32 {
         self.0[7]
     }
 }

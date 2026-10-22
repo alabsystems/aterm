@@ -31,7 +31,8 @@ pub(super) struct Cell {
 /// renderer would otherwise draw its colour face two cells wide. All are the
 /// row's own ([`BAND_GLYPHS`]), so no free text carries one. The measure
 /// ([`cells`]) and the painter's pin read this one list.
-fn text_presentation(c: char) -> bool {
+#[inline]
+const fn text_presentation(c: char) -> bool {
     matches!(
         c,
         '\u{2713}' | '\u{2717}' | '\u{26a0}' | '\u{2709}' | '\u{2715}' | '\u{1f512}'

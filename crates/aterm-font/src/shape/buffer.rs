@@ -55,6 +55,7 @@ pub struct GlyphPosition {
 }
 
 impl Default for GlyphInfo {
+    #[inline]
     fn default() -> Self {
         GlyphInfo {
             glyph_id: 0,
@@ -72,13 +73,16 @@ impl Default for GlyphInfo {
 
 impl GlyphInfo {
     #[inline]
-    pub(crate) fn as_char(&self) -> char {
+    pub(crate) const fn as_char(&self) -> char {
         // Only ever a code point while it is read as one: `add` stores a `char`.
-        char::from_u32(self.glyph_id).unwrap_or('\u{FFFD}')
+        match char::from_u32(self.glyph_id) {
+            Some(c) => c,
+            None => '\u{FFFD}',
+        }
     }
 
     #[inline]
-    pub(crate) fn as_glyph(&self) -> crate::GlyphId {
+    pub(crate) const fn as_glyph(&self) -> crate::GlyphId {
         crate::GlyphId(self.glyph_id as u16)
     }
 }
@@ -143,6 +147,7 @@ impl Buffer {
     const MAX_OPS_MIN: i32 = 16384;
     const MAX_OPS_DEFAULT: i32 = 0x1FFF_FFFF;
 
+    #[inline]
     pub(crate) fn new() -> Self {
         Buffer {
             direction: Direction::Invalid,
@@ -164,6 +169,7 @@ impl Buffer {
         }
     }
 
+    #[inline]
     pub(crate) fn clear(&mut self) {
         self.direction = Direction::Invalid;
         self.script = None;
@@ -240,6 +246,7 @@ impl Buffer {
         self.serial
     }
 
+    #[inline]
     pub(crate) fn add(&mut self, codepoint: u32, cluster: u32) {
         if !self.ensure(self.len + 1) {
             return;
@@ -253,6 +260,7 @@ impl Buffer {
         self.len += 1;
     }
 
+    #[inline]
     pub(crate) fn push_str(&mut self, text: &str) {
         if !self.ensure(self.len + text.chars().count()) {
             return;
@@ -270,6 +278,7 @@ impl Buffer {
         self.reverse_range(0, self.len);
     }
 
+    #[inline]
     pub(crate) fn reverse_range(&mut self, start: usize, end: usize) {
         if end - start < 2 {
             return;
@@ -361,6 +370,7 @@ impl Buffer {
         true
     }
 
+    #[inline]
     pub(crate) fn clear_output(&mut self) {
         self.have_output = true;
         self.have_positions = false;
@@ -369,6 +379,7 @@ impl Buffer {
         self.have_separate_output = false;
     }
 
+    #[inline]
     pub(crate) fn clear_positions(&mut self) {
         self.have_output = false;
         self.have_positions = true;
@@ -399,6 +410,7 @@ impl Buffer {
         self.out_len += num_out;
     }
 
+    #[inline]
     pub(crate) fn replace_glyph(&mut self, glyph_index: u32) {
         if self.have_separate_output || self.out_len != self.idx {
             if !self.make_room_for(1, 1) {
@@ -414,6 +426,7 @@ impl Buffer {
         self.out_len += 1;
     }
 
+    #[inline]
     pub(crate) fn output_glyph(&mut self, glyph_index: u32) {
         if !self.make_room_for(0, 1) {
             return;
@@ -439,6 +452,7 @@ impl Buffer {
 
     /// Copies the glyph at `idx` to the output and advances (just advances
     /// when there is no output).
+    #[inline]
     pub(crate) fn next_glyph(&mut self) {
         if self.have_output {
             if self.have_separate_output || self.out_len != self.idx {
@@ -452,6 +466,7 @@ impl Buffer {
         self.idx += 1;
     }
 
+    #[inline]
     pub(crate) fn next_glyphs(&mut self, n: usize) {
         if self.have_output {
             if self.have_separate_output || self.out_len != self.idx {
@@ -468,10 +483,12 @@ impl Buffer {
     }
 
     /// Advances `idx` without copying to the output.
+    #[inline]
     pub(crate) fn skip_glyph(&mut self) {
         self.idx += 1;
     }
 
+    #[inline]
     pub(crate) fn reset_masks(&mut self, mask: u32) {
         for info in &mut self.info[..self.len] {
             info.mask = mask;
@@ -617,6 +634,7 @@ impl Buffer {
         true
     }
 
+    #[inline]
     #[must_use]
     fn ensure(&mut self, size: usize) -> bool {
         if size < self.len {
@@ -638,6 +656,7 @@ impl Buffer {
         true
     }
 
+    #[inline]
     #[must_use]
     fn make_room_for(&mut self, num_in: usize, num_out: usize) -> bool {
         if !self.ensure(self.out_len + num_out) {
@@ -673,6 +692,7 @@ impl Buffer {
     }
 
     /// Called around shaping: the length and work budgets scale with the input.
+    #[inline]
     pub(crate) fn enter(&mut self) {
         self.serial = 0;
         self.scratch_flags = 0;
@@ -686,6 +706,7 @@ impl Buffer {
         }
     }
 
+    #[inline]
     pub(crate) fn leave(&mut self) {
         self.max_len = Self::MAX_LEN_DEFAULT;
         self.max_ops = Self::MAX_OPS_DEFAULT;
@@ -706,6 +727,7 @@ impl Buffer {
 }
 
 /// Grapheme groups: a glyph continues the group before it.
-pub(crate) fn grapheme_group(_: &GlyphInfo, b: &GlyphInfo) -> bool {
+#[inline]
+pub(crate) const fn grapheme_group(_: &GlyphInfo, b: &GlyphInfo) -> bool {
     b.unicode_props & unicode_props::CONTINUATION != 0
 }

@@ -108,7 +108,7 @@ impl<'a> Table<'a> {
     /// [Glyph Class Definition Table](
     /// https://docs.microsoft.com/en-us/typography/opentype/spec/gdef#glyph-class-definition-table).
     #[inline]
-    pub fn has_glyph_classes(&self) -> bool {
+    pub const fn has_glyph_classes(&self) -> bool {
         self.glyph_classes.is_some()
     }
 

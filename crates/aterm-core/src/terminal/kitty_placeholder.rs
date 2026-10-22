@@ -71,6 +71,7 @@ pub(crate) fn decode_cell(
 /// the live cell at screen (`row`, `col`), whose packed colours are `colors`:
 /// an RGB fg is `(r<<16)|(g<<8)|b`; an indexed fg is the palette index; a
 /// default fg is 0 (matching kitty's `colorToId`).
+#[inline]
 fn fg_image_id(grid: &Grid, row: u16, col: u16, colors: PackedColors) -> u32 {
     if let Some(rgb) = grid.fg_rgb_at(row, col) {
         return rgb_id(rgb);
@@ -83,12 +84,14 @@ fn fg_image_id(grid: &Grid, row: u16, col: u16, colors: PackedColors) -> u32 {
 }
 
 /// A 24-bit id spelled as an RGB colour.
-fn rgb_id([r, g, b]: [u8; 3]) -> u32 {
-    (u32::from(r) << 16) | (u32::from(g) << 8) | u32::from(b)
+#[inline]
+const fn rgb_id([r, g, b]: [u8; 3]) -> u32 {
+    ((r as u32) << 16) | ((g as u32) << 8) | (b as u32)
 }
 
 /// The encoded value of a row/column/high diacritic (its index in `DIACRITICS`), or `None` for
 /// any other codepoint.
+#[inline]
 pub(crate) fn diacritic_value(c: char) -> Option<u32> {
     DIACRITICS
         .binary_search(&c)

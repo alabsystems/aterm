@@ -15,6 +15,7 @@ use super::{KittyKeyboardFlags, Terminal, TerminalModes, XtermKeyboardState};
 /// Derive `KeyboardMode` from terminal modes, Kitty flags and xterm state:
 /// `aterm_types::keyboard::TermMode::from_keyboard_state` (the single source of
 /// the keyboard projection) plus the legacy-encoding modes it does not cover.
+#[inline]
 #[must_use]
 pub(crate) fn keyboard_mode_from_state(
     modes: &TerminalModes,
@@ -73,7 +74,8 @@ pub(crate) fn keyboard_mode_from_state(
 /// outlived the program). There the family is refused as the kitty protocol is:
 /// setters are ignored, a query reads level 0, and a level negotiated before
 /// the host said so stops reaching the encoder.
-pub(crate) fn offered_xterm_keyboard(
+#[inline]
+pub(crate) const fn offered_xterm_keyboard(
     modes: &TerminalModes,
     xterm: XtermKeyboardState,
 ) -> XtermKeyboardState {
@@ -89,6 +91,7 @@ impl Terminal {
     ///
     /// Returns a bridge-agnostic `KeyboardMode` that can be passed directly
     /// to `aterm_types::keyboard::encode_key*` functions.
+    #[inline]
     #[must_use]
     pub fn keyboard_mode(&self) -> KeyboardMode {
         // Capability off ⇒ derive as if the protocol is unsupported: no kitty
@@ -107,6 +110,7 @@ impl Terminal {
     /// enhancement is active: every key reaches the application as a CSI-u
     /// report, so it never receives echoing text. A narrow read-only projection
     /// of [`Self::keyboard_mode`], with the same capability-off gating.
+    #[inline]
     #[must_use]
     pub fn kitty_report_all_keys(&self) -> bool {
         self.keyboard_mode()
@@ -122,6 +126,7 @@ impl Terminal {
     /// For chrome deference: a host gesture must not claim a key the front
     /// application negotiated for, and may take one nobody receives. A read-only
     /// projection of [`Self::keyboard_mode`]; it never feeds an encoder.
+    #[inline]
     #[must_use]
     pub fn kitty_reports_functional_keys(&self) -> bool {
         self.keyboard_mode()
@@ -139,6 +144,7 @@ impl Terminal {
     /// beeps or inserts it (`aterm_predict::KeySample::escaped_chords`,
     /// R-KITTY). A read-only projection of [`Self::keyboard_mode`], bound to
     /// the encoder by its test; it never feeds an encoder.
+    #[inline]
     #[must_use]
     pub fn control_chords_escaped(&self) -> bool {
         let mode = self.keyboard_mode();
@@ -152,6 +158,7 @@ impl Terminal {
     /// main screen repaints its own input line, so guesses would duplicate its
     /// text until the predictor timeout). A narrow read-only projection for
     /// display-side callers.
+    #[inline]
     #[must_use]
     pub fn kitty_suppresses_predictive_echo(&self) -> bool {
         self.keyboard_mode()

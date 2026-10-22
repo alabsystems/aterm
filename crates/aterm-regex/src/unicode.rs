@@ -24,6 +24,7 @@
 //! `\w` diverges from `regex`.
 
 /// Membership test for a sorted, disjoint, inclusive range table.
+#[inline]
 fn in_ranges(table: &[(u32, u32)], c: char) -> bool {
     let cp = c as u32;
     table
@@ -70,6 +71,7 @@ pub(crate) fn is_word(c: char) -> bool {
 
 /// The simple-case-folding orbit of `c`: `c` first, then the rest of its orbit
 /// in ascending order, wrapping. An uncased code point is its own singleton.
+#[inline]
 pub(crate) fn fold_orbit(c: char) -> impl Iterator<Item = char> {
     let mut cur = Some(c);
     core::iter::from_fn(move || {
@@ -81,6 +83,7 @@ pub(crate) fn fold_orbit(c: char) -> impl Iterator<Item = char> {
 }
 
 /// The next code point in `c`'s fold orbit (`c` itself when uncased).
+#[inline]
 fn fold_next(c: char) -> char {
     let cp = c as u32;
     match FOLD.binary_search_by_key(&cp, |&(k, _)| k) {

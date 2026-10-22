@@ -1245,6 +1245,11 @@ label_enum! {
         /// `crate::control_theme`): one wake at the instant the preview reverts to
         /// the configured theme by itself. No preview arms nothing.
         ThemePreview => "theme_preview",
+        /// THE OVERVIEW'S FABRIC READ (`crate::overview_fabric`, session log
+        /// Phase 6 step 6E-7): one wake a minute after the last read of the
+        /// fabric's log began, while an Overview is open and no read is out.
+        /// No card open, or no fabric, arms nothing.
+        OverviewFabric => "overview_fabric",
         /// THE SESSION LOG's settle tick (`crate::session_log::Wakes`): one wake at
         /// the instant a session's turn tracker has waited out the settle on a
         /// resting word (`aterm_slog::SETTLE_MS` after it first held), so the turn

@@ -3437,15 +3437,17 @@ fn a_typography_card_says_what_type_it_sets() {
         .find(|card| card.id == "Studio")
         .expect("Studio");
     assert!(studio.typography.is_some() && studio.typography_spoken.is_some());
-    assert!(studio.matches("berkeley") && studio.matches("font"));
+    assert!(
+        studio.matches("berkeley", MatchReach::Words) && studio.matches("font", MatchReach::Words)
+    );
     let plain = crate::settings_preview::theme_card::showcase_cards(&studio_catalog(""));
     let plain = plain
         .iter()
         .find(|card| card.id == "Studio")
         .expect("Studio");
     assert!(plain.typography.is_none() && plain.typography_spoken.is_none());
-    assert!(!plain.matches("berkeley"));
-    assert!(!plain.matches("font"));
+    assert!(!plain.matches("berkeley", MatchReach::Words));
+    assert!(!plain.matches("font", MatchReach::Words));
     let spoken = studio.typography_spoken.clone().unwrap_or_default();
     let value = studio.row_value(false, false);
     assert!(value.ends_with(&format!(", {spoken}")), "{value}");
@@ -5035,7 +5037,7 @@ fn filter_finds_pack_themes_and_collapses_empty_sections() {
                 .showcase
                 .cards
                 .iter()
-                .any(|card| card.id == id && card.matches("kanagawa"))
+                .any(|card| card.id == id && card.matches("kanagawa", MatchReach::Words))
     }));
     for word in ["signature", "builtin", "yours"] {
         assert!(
@@ -5584,7 +5586,7 @@ fn colour_rows_show_the_colour_they_draw() {
 /// a page-wide field) fails it. The keyboard on a field left to the theme
 /// paints the theme's hex, whole, not the field's own words cut ("Theme…",
 /// the round-7 audit at every size): NEGATIVE CONTROL, those words,
-/// "Theme default", are wider than the field.
+/// "Theme (default)", are wider than the field.
 #[test]
 fn colour_rows_are_one_line_with_one_field_column() {
     let paint_rect = |compiled: &crate::native_ui::CompiledUi, key: &str| {
@@ -5679,8 +5681,8 @@ fn colour_rows_are_one_line_with_one_field_column() {
         // NEGATIVE CONTROL: the field's own words would not fit it.
         let field = rect_of(&focused, control);
         assert!(
-            crate::native_ui::text_field_width_for("Theme default", true) > field.width + 0.5,
-            "{width}x{height}: the control: \"Theme default\" fits {field:?}"
+            crate::native_ui::text_field_width_for("Theme (default)", true) > field.width + 0.5,
+            "{width}x{height}: the control: \"Theme (default)\" fits {field:?}"
         );
     }
 }

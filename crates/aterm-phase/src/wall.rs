@@ -135,17 +135,28 @@ pub enum ApiCause {
 
 impl WallKind {
     /// The lowercase word the CLI prints after `wall:` (`overloaded`).
+    #[inline]
     #[must_use]
-    pub fn name(&self) -> &'static str {
-        let wire = self.wire();
-        wire.strip_prefix("wall:").unwrap_or(wire)
+    pub const fn name(&self) -> &'static str {
+        match self {
+            WallKind::UsageSession => "usage-session",
+            WallKind::UsageWeekly => "usage-weekly",
+            WallKind::ModelBucket { .. } => "model-bucket",
+            WallKind::Spend => "spend",
+            WallKind::Context => "context",
+            WallKind::Auth => "auth",
+            WallKind::ApiError { .. } => "api-error",
+            WallKind::Overloaded => "overloaded",
+            WallKind::Memory => "memory",
+        }
     }
 
     /// The whole word `status agent=` publishes for this wall: `wall:` and
     /// [`Self::name`] (`wall:overloaded`). Static because a published
     /// verdict word is.
+    #[inline]
     #[must_use]
-    pub fn wire(&self) -> &'static str {
+    pub const fn wire(&self) -> &'static str {
         match self {
             WallKind::UsageSession => "wall:usage-session",
             WallKind::UsageWeekly => "wall:usage-weekly",
@@ -163,14 +174,15 @@ impl WallKind {
     /// [`crate::phase::Phase::Limited`]: the usage windows, a model bucket,
     /// spend, and an API rate limit (429) — the kinds it has always read so.
     /// The others end a turn that reads `idle` there; [`wall`] names them.
+    #[inline]
     #[must_use]
-    pub fn reads_limited(&self) -> bool {
+    pub const fn reads_limited(&self) -> bool {
         match self {
             WallKind::UsageSession
             | WallKind::UsageWeekly
             | WallKind::ModelBucket { .. }
             | WallKind::Spend => true,
-            WallKind::ApiError { code, .. } => *code == Some(429),
+            WallKind::ApiError { code, .. } => matches!(*code, Some(429)),
             WallKind::Context | WallKind::Auth | WallKind::Overloaded | WallKind::Memory => false,
         }
     }

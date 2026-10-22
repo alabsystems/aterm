@@ -32,7 +32,7 @@ use crate::{SessionCtx, term_lock};
 /// path=<frozen|live> program=<name|-> agent=<word|-> agent_detail=<pct|->
 /// agent_rev=<n> agent_since_ms=<ms> … supervisor=<holder|-> autopilot=<off|cruise|land|->
 /// path_evidence=<measured:<ms>|unconfirmed:<ms>|carried|-> copy=<managed|foreign|->
-/// upgrade=<-|<state>/<to>/<why>/<age>> land_at=<unix s|-> task=<open|landed|done|spent|theirs|->
+/// upgrade=<-|<state>/<to>/<why>/<age>> land_at=<unix s|-> task=<open|landed|theirs|->
 /// pause=<unix s|-> task_state=<working|done|exited|stalled|-> task_rev=<n>`.
 ///
 /// The store snapshot is cloned out before formatting, so this never holds the

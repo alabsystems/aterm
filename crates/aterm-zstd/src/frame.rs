@@ -124,7 +124,8 @@ impl ContentSize {
     }
 
     /// `Frame_Content_Size_flag`, bits 6-7 of the descriptor.
-    fn flag(&self) -> u8 {
+    #[inline]
+    const fn flag(&self) -> u8 {
         match self {
             Self::One(_) => 0,
             Self::Two(_) => 1,
@@ -132,6 +133,7 @@ impl ContentSize {
         }
     }
 
+    #[inline]
     fn write<W: Write + ?Sized>(&self, out: &mut W) -> io::Result<()> {
         match *self {
             Self::One(n) => out.write_all(&[n]),
@@ -143,7 +145,8 @@ impl ContentSize {
 
 /// A `Raw_Block` header (RFC 8878 §3.1.1.2): `Last_Block` in bit 0,
 /// `Block_Type` 0 in bits 1-2, `Block_Size` in bits 3-23, little-endian.
-fn block_header(size: usize, last: bool) -> [u8; 3] {
+#[inline]
+const fn block_header(size: usize, last: bool) -> [u8; 3] {
     // size <= BLOCK_MAX = 2^17, so the cast is exact and the shift fits 21 bits.
     let word = (size as u32) << 3 | if last { LAST_BLOCK } else { 0 };
     let [a, b, c, _] = word.to_le_bytes();

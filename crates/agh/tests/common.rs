@@ -53,26 +53,45 @@ pub fn scratch(label: &str) -> aterm_tempfile::TempDir {
         .expect("a scratch directory")
 }
 
-/// `create_private_dir(dir)` (its parent must exist), then `write_private(dir, name, token +
-/// "\n")`.
+/// `create_private_dir(dir)` (its parent must exist), then the token and a newline in
+/// `name`, 0600 ([`setup_file`]).
 #[cfg(unix)]
 pub fn write_token(dir: &Path, name: &str, token: &str) -> PathBuf {
     aterm_uds::private_file::create_private_dir(dir).expect("the token directory");
-    aterm_uds::private_file::write_private(dir, name, format!("{token}\n").as_bytes())
-        .expect("the token file");
+    setup_file(&dir.join(name), format!("{token}\n").as_bytes());
     dir.join(name)
 }
 
+/// A test's setup file, 0600 when new, written whole (replacing what stood there) and NOT
+/// flushed. `write_private` (the
+/// writer agh's own store uses) ends each write with two `F_FULLFSYNC`s, a drive-cache
+/// flush that holds up most creates, renames and flushes on the volume while it runs;
+/// the suite's 614 tests made one or two each, and nothing a test reads depends on the
+/// drive's cache. Sampled in a full run, its threads waited in those flushes and in the
+/// renames and `mkdir`s behind them.
+#[cfg(unix)]
+fn setup_file(path: &Path, bytes: &[u8]) {
+    use std::io::Write as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)
+        .and_then(|mut f| f.write_all(bytes))
+        .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+}
+
 /// `create_dir_all(dirs.config.parent())`, `create_private_dir(&dirs.config)`, then
-/// `write_private(&dirs.config, "agh.toml", text)`.
+/// `text` in `agh.toml` there, 0600 ([`setup_file`]).
 #[cfg(unix)]
 pub fn write_config(dirs: &Dirs, text: &str) {
     if let Some(parent) = dirs.config.parent() {
         std::fs::create_dir_all(parent).expect("the config directory's parent");
     }
     aterm_uds::private_file::create_private_dir(&dirs.config).expect("the config directory");
-    aterm_uds::private_file::write_private(&dirs.config, "agh.toml", text.as_bytes())
-        .expect("agh.toml");
+    setup_file(&dirs.config.join("agh.toml"), text.as_bytes());
 }
 
 /// The canonical config: `fixtures/canonical.toml` with `{root}` filled. The fixture holds

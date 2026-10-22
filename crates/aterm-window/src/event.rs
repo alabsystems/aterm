@@ -337,6 +337,14 @@ pub enum WindowEvent {
     /// [`applicationDidEnterBackground`]: https://developer.apple.com/documentation/uikit/uiapplicationdelegate/1622997-applicationdidenterbackground
     /// [iOS application lifecycle]: https://developer.apple.com/documentation/uikit/app_and_environment/managing_your_app_s_life_cycle
     ///
+    /// ### X11
+    ///
+    /// Occluded while the window is unmapped after a map (the window manager iconified it or
+    /// moved it off the current workspace, or the application hid it), while its
+    /// `_NET_WM_STATE` holds `_NET_WM_STATE_HIDDEN`, or while `VisibilityNotify` says it is
+    /// fully obscured; reported when that changes. A compositing window manager redirects the
+    /// window, so a window merely covered by others is not reported there.
+    ///
     /// ### Others
     ///
     /// - **Web:** Doesn't take into account CSS [`border`], [`padding`], or [`transform`].
@@ -355,7 +363,8 @@ pub enum WindowEvent {
     /// - The application has explicitly requested a redraw via [`Window::request_redraw`].
     ///
     /// Winit will aggregate duplicate redraw requests into a single event, to
-    /// help avoid duplicating rendering work.
+    /// help avoid duplicating rendering work. On X11, `platform::x11::redraw_is_exposure` says
+    /// during the dispatch whether the server's `Expose` is among them.
     RedrawRequested,
 }
 
@@ -917,6 +926,7 @@ impl Force {
     /// Instead of normalizing the force, you should prefer to handle
     /// [`Force::Calibrated`] so that the amount of force the user has to apply is
     /// consistent across devices.
+    #[inline]
     pub fn normalized(&self) -> f64 {
         match self {
             Force::Calibrated { force, max_possible_force, altitude_angle } => {
@@ -946,8 +956,9 @@ pub enum ElementState {
 
 impl ElementState {
     /// True if `self == Pressed`.
-    pub fn is_pressed(self) -> bool {
-        self == ElementState::Pressed
+    #[inline]
+    pub const fn is_pressed(self) -> bool {
+        matches!(self, ElementState::Pressed)
     }
 }
 
@@ -1001,11 +1012,13 @@ pub struct InnerSizeWriter {
 }
 
 impl InnerSizeWriter {
-    pub(crate) fn new(new_inner_size: Weak<Mutex<PhysicalSize<u32>>>) -> Self {
+    #[inline]
+    pub(crate) const fn new(new_inner_size: Weak<Mutex<PhysicalSize<u32>>>) -> Self {
         Self { new_inner_size }
     }
 
     /// Try to request inner size which will be set synchronously on the window.
+    #[inline]
     pub fn request_inner_size(
         &mut self,
         new_inner_size: PhysicalSize<u32>,
@@ -1020,6 +1033,7 @@ impl InnerSizeWriter {
 }
 
 impl PartialEq for InnerSizeWriter {
+    #[inline]
     fn eq(&self, other: &Self) -> bool {
         self.new_inner_size.as_ptr() == other.new_inner_size.as_ptr()
     }

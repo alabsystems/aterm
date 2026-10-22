@@ -23,7 +23,7 @@ use super::MAX_INTERMEDIATES;
 /// `tests::string_bulk::osc_bulk_copy_agrees_with_per_byte_puts_at_every_breakpoint`
 /// holds the bulk path's [`osc_bulk_copy_len`] to.
 #[inline]
-pub(crate) fn osc_put_keeps(len: usize) -> bool {
+pub(crate) const fn osc_put_keeps(len: usize) -> bool {
     len < MAX_OSC_DATA
 }
 
@@ -32,8 +32,9 @@ pub(crate) fn osc_put_keeps(len: usize) -> bool {
 /// `tests::string_bulk::osc_bulk_copy_agrees_with_per_byte_puts_at_every_breakpoint`
 /// checks the two agree and the cap holds.
 #[inline]
-pub(crate) fn osc_bulk_copy_len(len: usize, n: usize) -> usize {
-    n.min(MAX_OSC_DATA.saturating_sub(len))
+pub(crate) const fn osc_bulk_copy_len(len: usize, n: usize) -> usize {
+    let cap = MAX_OSC_DATA.saturating_sub(len);
+    if n < cap { n } else { cap }
 }
 
 #[cfg(clean_islands)]

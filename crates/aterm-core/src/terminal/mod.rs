@@ -193,7 +193,7 @@ pub use search_query::{
     NarrowStack, WrapFrame, join_wrapped_rows, query_search_index, query_search_index_narrowing,
 };
 pub(crate) use search_rows::history_line_text_cells;
-pub use search_rows::{AbsRowText, SearchRows};
+pub use search_rows::{AbsRowAt, AbsRowText, SearchRows};
 pub use selection::smart_word_in_cells;
 pub use shell::{
     Annotation, BlockState, CommandMark, OutputBlock, ShellState, StartFlags, StartKind, StartMark,
@@ -243,6 +243,10 @@ pub(crate) const MAX_COMMANDLINE_BYTES: usize = 64 * 1024;
 
 /// An SGR color parameter as a palette index; values above 255 saturate.
 #[inline]
-pub(crate) fn sgr_color_u8(val: u16) -> u8 {
-    val.try_into().unwrap_or(u8::MAX)
+pub(crate) const fn sgr_color_u8(val: u16) -> u8 {
+    if val > 255 {
+        u8::MAX
+    } else {
+        val.to_le_bytes()[0]
+    }
 }

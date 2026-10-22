@@ -56,6 +56,7 @@ use std::borrow::Cow;
 
 /// `text` as it goes to stdout: unchanged, except into a pipe a Windows shell
 /// reads in a legacy code page, where its punctuation is ASCII (module doc).
+#[inline]
 pub(crate) fn for_stdout(text: &str) -> Cow<'_, str> {
     #[cfg(windows)]
     if windows::shell_reads_in_code_page(&std::io::stdout()) {
@@ -65,6 +66,7 @@ pub(crate) fn for_stdout(text: &str) -> Cow<'_, str> {
 }
 
 /// `text` as it goes to stderr: `for_stdout`'s rule, read off stderr's handle.
+#[inline]
 pub(crate) fn for_stderr(text: &str) -> Cow<'_, str> {
     #[cfg(windows)]
     if windows::shell_reads_in_code_page(&std::io::stderr()) {

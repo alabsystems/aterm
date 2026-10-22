@@ -358,7 +358,7 @@ impl Parser {
 
     /// Get current parser state.
     #[inline]
-    pub fn state(&self) -> State {
+    pub const fn state(&self) -> State {
         self.state
     }
 
@@ -368,7 +368,7 @@ impl Parser {
     /// collected lives in the sink, which no [`Parser::carry`] reaches.
     #[inline]
     #[must_use]
-    pub fn in_hooked_dcs(&self) -> bool {
+    pub const fn in_hooked_dcs(&self) -> bool {
         self.dcs_active || self.dcs_st_pending
     }
 
@@ -380,7 +380,7 @@ impl Parser {
     /// `ESC \` the wrapper.
     #[inline]
     #[must_use]
-    pub fn tmux_passthrough(&self) -> TmuxPassthrough {
+    pub const fn tmux_passthrough(&self) -> TmuxPassthrough {
         self.tmux
     }
 }

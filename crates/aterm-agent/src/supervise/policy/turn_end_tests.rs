@@ -93,9 +93,12 @@ fn idle(said: &str, worked: Option<Duration>) -> TurnEndReading {
         composer: Composer::Empty,
         said_tail: Some(said.to_string()),
         said_cut: false,
+        opens_cut: false,
         turn_said: None,
         opened_by: None,
         message_drawn: false,
+        submits: None,
+        screen_mark: None,
         worked,
         rules: None,
         pending_input: false,
@@ -21657,4 +21660,511 @@ fn an_opener_rewrapped_over_the_same_words_is_no_new_turn() {
         t + secs(20),
     );
     assert!(backs_off(&a, 2), "a turn: {a:?}");
+}
+
+/// `r` read with the host's submission count `submits`
+/// ([`TurnEndReading::submits`]) over a conversation marked `screen`
+/// ([`TurnEndReading::screen_mark`]).
+fn counted(r: TurnEndReading, submits: u64, screen: u64) -> TurnEndReading {
+    TurnEndReading {
+        submits: Some(submits),
+        screen_mark: Some(screen),
+        ..r
+    }
+}
+
+/// P4'S STILL-OPEN CASES, SOMEONE ELSE'S TURN: A TURN ASKED SINCE THE POINT
+/// JUDGED LAST IS TOLD BY ITS SUBMISSION, WHATEVER ITS WORDS AND ITS OPENER
+/// ([`TurnEndState::unseen_turn`], [`TurnEndReading::submits`]). The host
+/// counted an Enter over something typed since the point (a person's prompt,
+/// an orchestrator's) and the conversation was drawn since; answered between
+/// two of the loop's reads, its turn is someone else's that ended there,
+/// judged once — where the opener and the words could not tell it: a
+/// prompt whose first words are the opener's before it (Gemini CLI's band
+/// hashes the message's lead; the same prompt again on Claude Code's `❯`
+/// row), a reply whose opener is out of sight, a turn answered with the
+/// very words of the reply before it (the trade-off F1/F2 made), and the
+/// same prompt answered the same, the earlier turn above it. FAILS WITHOUT
+/// THE FIX: each read as the point it came after, nothing judged — the
+/// back-off of the point before ran on and its act was typed over the
+/// person's answer. NEGATIVE CONTROLS, the count where the point left it:
+/// the same screen; a redraw; a scroll (other rows, the same turn); a
+/// re-wrap (the opener hashed at another width over the same words); and,
+/// with the count moved, the very conversation the point stood on (a
+/// submission not drawn yet: judged when it is, once) and a message drawn
+/// with no reply under it.
+#[test]
+fn a_turn_asked_since_the_point_is_told_by_its_submission_whatever_its_words() {
+    const PROMPT: &str = "write the parser for this repository and land it";
+    const AGAIN: &str = "write the parser for this repository and land it now, the lexer first";
+    const ASK: &str = "a person asks: what stands now?";
+    const REPLY: &str = "Here is where it stands: the parser module is written and tested.";
+    const FIRST: &str = "Wrote the parser module.";
+    let secs = Duration::from_secs;
+    let t = t0();
+    assert_eq!(
+        crate::supervise::approvals::words_lead(PROMPT),
+        crate::supervise::approvals::words_lead(AGAIN),
+        "one lead"
+    );
+    for program in [aterm_phase::Program::Claude, aterm_phase::Program::Gemini] {
+        let shown = |said: &str, msg: &str| match program {
+            aterm_phase::Program::Claude => closing(said, msg, None),
+            _ => opened(said, msg),
+        };
+        // The first point, count 1 over conversation 100: a short first
+        // reply, backed off.
+        let start = || {
+            let mut st = TurnEndState::default();
+            let first = TurnEndReading {
+                worked: Some(secs(6)),
+                ..counted(shown(FIRST, PROMPT), 1, 100)
+            };
+            let a = at(&mut st, &first, t);
+            assert!(backs_off(&a, 1), "{program:?}: {a:?}");
+            st
+        };
+        // A turn of someone else's, judged at once and once.
+        let turn = |what: &str, r: TurnEndReading| {
+            let mut st = start();
+            let before = st.point_number();
+            let a = at(&mut st, &r, t + secs(10));
+            assert!(backs_off(&a, 2), "{program:?} {what}: {a:?}");
+            assert_ne!(st.point_number(), before, "{program:?} {what}");
+            assert_eq!(st.followed(), None, "{program:?} {what}: someone else's");
+            let judged = st.point_number();
+            let a = at(&mut st, &r, t + secs(30));
+            assert!(backs_off(&a, 2), "{program:?} {what}: {a:?}");
+            assert_eq!(
+                (st.short_streak(), st.point_number()),
+                (2, judged),
+                "{program:?} {what}: judged once"
+            );
+        };
+        // The point it came after, read again.
+        let same = |what: &str, r: TurnEndReading| {
+            let mut st = start();
+            let before = st.point_number();
+            let a = at(&mut st, &r, t + secs(10));
+            assert!(backs_off(&a, 1), "{program:?} {what}: {a:?}");
+            assert_eq!(
+                (st.short_streak(), st.point_number()),
+                (1, before),
+                "{program:?} {what}"
+            );
+        };
+        let out_of_sight = |said: &str| TurnEndReading {
+            answered: None,
+            opened_by: None,
+            program,
+            ..idle(said, None)
+        };
+        // THE STILL-OPEN CASES, a submission counted since.
+        turn("the same opener", counted(shown(REPLY, PROMPT), 2, 200));
+        if program != aterm_phase::Program::Claude {
+            turn("the same first words", counted(shown(REPLY, AGAIN), 2, 200));
+        }
+        turn(
+            "its opener out of sight",
+            counted(out_of_sight(REPLY), 2, 200),
+        );
+        turn("the reply's very words", counted(shown(FIRST, ASK), 2, 200));
+        turn(
+            "the same prompt answered the same",
+            counted(shown(FIRST, PROMPT), 2, 200),
+        );
+        // …and the same, the count unmoved: no turn was asked.
+        same(
+            "the same opener, nothing submitted",
+            counted(shown(REPLY, PROMPT), 1, 200),
+        );
+        same(
+            "its opener out of sight, nothing submitted",
+            counted(out_of_sight(REPLY), 1, 200),
+        );
+        same(
+            "the reply's very words, nothing submitted",
+            counted(shown(FIRST, ASK), 1, 200),
+        );
+        // NEGATIVE CONTROLS, nothing submitted: the same screen, a redraw
+        // (the same letters), a scroll (other rows, the same turn) and a
+        // re-wrap (another hash of the opener over the same words).
+        same("the same screen", counted(shown(FIRST, PROMPT), 1, 100));
+        same("a redraw", counted(shown(FIRST, PROMPT), 1, 100));
+        same("a scroll", counted(shown(FIRST, PROMPT), 1, 300));
+        same(
+            "a re-wrap",
+            counted(
+                shown(FIRST, "write the parser for this reposi tory and land it"),
+                1,
+                400,
+            ),
+        );
+        // A SUBMISSION NOT DRAWN YET: the count moved over the very
+        // conversation the point stood on — no turn there, and the turn
+        // judged where it is drawn, once.
+        let mut st = start();
+        let before = st.point_number();
+        let a = at(&mut st, &counted(shown(FIRST, PROMPT), 2, 100), t + secs(5));
+        assert!(backs_off(&a, 1), "{program:?} not drawn yet: {a:?}");
+        assert_eq!(st.point_number(), before, "{program:?} not drawn yet");
+        let drawn = counted(shown(FIRST, PROMPT), 2, 200);
+        let a = at(&mut st, &drawn, t + secs(10));
+        assert!(backs_off(&a, 2), "{program:?} drawn: {a:?}");
+        let judged = st.point_number();
+        let a = at(&mut st, &drawn, t + secs(30));
+        assert!(backs_off(&a, 2), "{program:?}: {a:?}");
+        assert_eq!(st.point_number(), judged, "{program:?}: judged once");
+        // A MESSAGE DRAWN WITH NO REPLY UNDER IT, the count moved: a turn not
+        // answered yet, whatever was counted.
+        same(
+            "a message with no reply",
+            counted(
+                TurnEndReading {
+                    said_tail: None,
+                    message_drawn: true,
+                    ..out_of_sight("")
+                },
+                2,
+                200,
+            ),
+        );
+    }
+}
+
+/// P4'S STILL-OPEN CASE, THE ACT: AN ACT TYPED AGAIN WITH THE SAME WORDS AND
+/// ANSWERED THE SAME IS TAKEN BY ITS OWN SUBMISSION
+/// ([`TurnEndState::answered_unseen`], [`Awaited::submitted_since`]). The
+/// continuation typed over the `❯` row (Claude Code) or the band (Gemini
+/// CLI) of the same continuation, answered before any read saw it run with
+/// the same reply: nothing on the screen tells it from the turn before but
+/// the conversation above (the earlier turn's rows), and the host counted
+/// its Enter. FAILS WITHOUT THE FIX: untaken to its take window (`WAITING …
+/// the worker to take …`), judged not taken there, its answer a turn that
+/// said nothing. NEGATIVE CONTROLS, each untaken to its window as before:
+/// the count unmoved (no Enter of its reached the program), and the count
+/// moved over the conversation it was typed at (its Enter not answered yet).
+#[test]
+fn an_act_typed_again_and_answered_the_same_is_taken_by_its_submission() {
+    const PROMPT: &str = "write the parser for this repository and land it";
+    const FIRST: &str = "Wrote the parser module.";
+    const REPLY: &str = "Continuing: the lexer is next.";
+    let secs = Duration::from_secs;
+    let fast = Duration::from_millis(600);
+    for program in [aterm_phase::Program::Claude, aterm_phase::Program::Gemini] {
+        let shown = |said: &str, msg: &str| match program {
+            aterm_phase::Program::Claude => closing(said, msg, None),
+            _ => opened(said, msg),
+        };
+        // The continuation typed past the first reply's back-off, answered
+        // with REPLY after a read saw it run (count 2 over conversation 200);
+        // then typed again with the same words past that reply's back-off.
+        let again = || {
+            let mut st = TurnEndState::default();
+            let first = TurnEndReading {
+                worked: Some(secs(6)),
+                ..counted(shown(FIRST, PROMPT), 1, 100)
+            };
+            let (a, sent) = past_backoff(&mut st, &first, t0());
+            let TurnEndAction::Type { text, .. } = &a else {
+                panic!("{program:?}: the continuation: {a:?}")
+            };
+            let text = text.clone();
+            st.acted(&a, &counted(shown(FIRST, PROMPT), 1, 100), sent);
+            let answered = TurnEndReading {
+                worked: Some(secs(8)),
+                ..counted(shown(REPLY, &text), 2, 200)
+            };
+            let (a, sent) = past_backoff(&mut st, &answered, sent + secs(10));
+            assert_eq!(
+                a,
+                TurnEndAction::Type {
+                    text: text.clone(),
+                    rule_id: RULE_CONTINUE
+                },
+                "{program:?}: the same words again"
+            );
+            st.acted(&a, &counted(shown(REPLY, &text), 2, 200), sent);
+            (st, text, sent)
+        };
+        // TAKEN AND ANSWERED: the same reply under the same words, the count
+        // moved past the act's and the conversation drawn since.
+        let (mut st, text, sent) = again();
+        let before = st.point_number();
+        let a = at(&mut st, &counted(shown(REPLY, &text), 3, 300), sent + fast);
+        assert!(!awaits(&a, sent + fast), "{program:?}: {a:?}");
+        assert_ne!(st.point_number(), before, "{program:?}: judged there");
+        assert_eq!(st.followed(), Some(RULE_CONTINUE), "{program:?}: {st:?}");
+        // NEGATIVE CONTROLS.
+        for (what, submits, screen) in [("nothing submitted", 2, 300), ("not answered yet", 3, 200)]
+        {
+            let (mut st, text, sent) = again();
+            let a = at(
+                &mut st,
+                &counted(shown(REPLY, &text), submits, screen),
+                sent + fast,
+            );
+            assert!(awaits(&a, sent + fast), "{program:?} {what}: {a:?}");
+        }
+    }
+}
+
+/// THE REVIEW OF `b9/resid3`, THE HARNESS'S OWN KEYS: A SUBMISSION THE
+/// HARNESS TYPED OUTSIDE AN ACT ASKS NO TURN ([`TurnEndState::host_moved`],
+/// [`TurnEndState::restarted`]). The host counts every Enter over something
+/// typed, whoever typed it, and the live upgrade's relaunch types its line
+/// at the shell (`upgrade_drive::type_line`): the resumed process redraws
+/// the conversation, its letters moved, over a count past the point's.
+/// FAILS WITHOUT THE FIX: under Land, the landed task's redraw read as a
+/// turn someone asked — the landing undone and, past the back-off, Land's
+/// nudge typed into finished work; under Cruise, a loop's restart counted a
+/// short turn the agent never ran (its back-off doubled). NEGATIVE
+/// CONTROLS: the same redraw with no harness key told is a turn someone
+/// asked, as T1 reads it; and past the redraw's point, the count tells a
+/// prompt answered at once again.
+#[test]
+fn the_harnesss_own_keys_ask_no_turn() {
+    const PROMPT: &str = "write the parser for this repository and land it";
+    const FIRST: &str = "Wrote the parser module.";
+    const ASK: &str = "a person asks: what stands now?";
+    const REPLY: &str = "Here is where it stands: the parser module is written and tested.";
+    let secs = Duration::from_secs;
+    let t = t0();
+    for program in [aterm_phase::Program::Claude, aterm_phase::Program::Gemini] {
+        let shown = |said: &str, msg: &str| match program {
+            aterm_phase::Program::Claude => closing(said, msg, None),
+            _ => opened(said, msg),
+        };
+        // LAND: the land act typed at the first point, its clean defense
+        // landing the task (count 2 over conversation 200).
+        let landed = || {
+            let mut st = TurnEndState::default();
+            let first = land(TurnEndReading {
+                worked: Some(3 * MIN),
+                ..counted(shown("Stage 1 landed.", PROMPT), 1, 100)
+            });
+            assert_eq!(act(&mut st, &first, t), land_instruction(), "{program:?}");
+            let defense = land(TurnEndReading {
+                worked: Some(3 * MIN),
+                ..counted(shown(DEFENSE, LAND), 2, 200)
+            });
+            let a = at(&mut st, &defense, t + 3 * MIN);
+            assert_eq!(a, TurnEndAction::Nothing, "{program:?}: {st:?}");
+            assert!(st.landed(), "{program:?}: landed");
+            st
+        };
+        // The live upgrade relaunched it: its line counted, the resumed
+        // process's redraw of the same conversation.
+        let redrawn = land(counted(shown(DEFENSE, LAND), 3, 300));
+        let mut st = landed();
+        st.host_moved();
+        let a = at(&mut st, &redrawn, t + 4 * MIN);
+        assert_eq!(a, TurnEndAction::Nothing, "{program:?}: the redraw: {a:?}");
+        assert!(st.landed(), "{program:?}: still landed: {st:?}");
+        let (a, _) = past_backoff(&mut st, &redrawn, t + 4 * MIN);
+        assert_eq!(
+            a,
+            TurnEndAction::Nothing,
+            "{program:?}: nothing typed: {a:?}"
+        );
+        // …and past it the count tells again: a prompt answered at once.
+        let asked = land(counted(shown(REPLY, ASK), 4, 400));
+        let before = st.point_number();
+        let _ = at(&mut st, &asked, t + 5 * MIN);
+        assert_ne!(st.point_number(), before, "{program:?}: a turn asked");
+        assert!(
+            !st.landed(),
+            "{program:?}: someone's turn after the landing"
+        );
+        // NEGATIVE CONTROL: the same redraw with no harness key told.
+        let mut st = landed();
+        let before = st.point_number();
+        let _ = at(&mut st, &redrawn, t + 4 * MIN);
+        assert_ne!(st.point_number(), before, "{program:?}: read as a turn");
+        // CRUISE: a loop's restart (the memory banner's), then the redraw.
+        let started = || {
+            let mut st = TurnEndState::default();
+            let first = TurnEndReading {
+                worked: Some(secs(6)),
+                ..counted(shown(FIRST, PROMPT), 1, 100)
+            };
+            let a = at(&mut st, &first, t);
+            assert!(backs_off(&a, 1), "{program:?}: {a:?}");
+            st
+        };
+        let redrawn = counted(shown(FIRST, PROMPT), 2, 300);
+        let mut st = started();
+        let point = st.point_number();
+        st.restarted(&Restart::Memory, true, &redrawn, t + secs(20));
+        let a = at(&mut st, &redrawn, t + secs(30));
+        assert!(backs_off(&a, 1), "{program:?}: the restart's redraw: {a:?}");
+        assert_eq!(
+            (st.short_streak(), st.point_number()),
+            (1, point),
+            "{program:?}: no short turn the agent never ran"
+        );
+        // NEGATIVE CONTROL: no restart told, the count moved: a turn.
+        let mut st = started();
+        let a = at(&mut st, &redrawn, t + secs(30));
+        assert!(backs_off(&a, 2), "{program:?}: {a:?}");
+    }
+}
+
+/// THE REVIEW OF `b9/resid3`, A TURN JUDGED AT A POINT THAT IS NOT ANSWERED
+/// SPENDS ITS SUBMISSION ([`TurnEndState::observe`]'s re-base of
+/// [`TurnEndState::point_submits`]). A person's prompt (counted) runs, read
+/// busy, and ends under their next draft (`Composer::Typed`): the turn is
+/// judged there, a short turn more. The person deletes the draft and the
+/// same conversation is read again at an empty composer. FAILS WITHOUT THE
+/// FIX: the count's baseline was still the point before that turn, so the
+/// same turn was folded in again ([`TurnEndState::unseen_turn`]) — a third
+/// short turn, the back-off 8 min where it was 4. NEGATIVE CONTROLS: a new
+/// prompt submitted from there and answered at once is a turn; and a turn
+/// first read under a draft with no read of it busy (nothing judged there)
+/// is still folded in once the draft goes.
+#[test]
+fn a_turn_judged_under_a_draft_spends_its_submission() {
+    const PROMPT: &str = "write the parser for this repository and land it";
+    const FIRST: &str = "Wrote the parser module.";
+    const ASK: &str = "a person asks: what stands now?";
+    const REPLY: &str = "Here is where it stands: the parser module is written and tested.";
+    const AGAIN: &str = "and the lexer?";
+    const LEXER: &str = "The lexer is next; it is not started.";
+    let secs = Duration::from_secs;
+    let t = t0();
+    for program in [aterm_phase::Program::Claude, aterm_phase::Program::Gemini] {
+        let shown = |said: &str, msg: &str| match program {
+            aterm_phase::Program::Claude => closing(said, msg, None),
+            _ => opened(said, msg),
+        };
+        let start = || {
+            let mut st = TurnEndState::default();
+            let first = TurnEndReading {
+                worked: Some(secs(6)),
+                ..counted(shown(FIRST, PROMPT), 1, 100)
+            };
+            let a = at(&mut st, &first, t);
+            assert!(backs_off(&a, 1), "{program:?}: {a:?}");
+            st
+        };
+        let drafted = |r: TurnEndReading| TurnEndReading {
+            composer: Composer::Typed,
+            ..r
+        };
+        // The person's turn, read running, ended under their next draft.
+        let mut st = start();
+        let _ = at(
+            &mut st,
+            &TurnEndReading {
+                worked: Some(secs(6)),
+                ..drafted(counted(shown(REPLY, ASK), 2, 200))
+            },
+            t + secs(20),
+        );
+        assert_eq!(st.short_streak(), 2, "{program:?}: judged under the draft");
+        let judged = st.point_number();
+        // The draft deleted: the same turn, read again.
+        let a = at(&mut st, &counted(shown(REPLY, ASK), 2, 200), t + secs(30));
+        assert!(backs_off(&a, 2), "{program:?}: the same turn: {a:?}");
+        assert_eq!(
+            (st.short_streak(), st.point_number()),
+            (2, judged),
+            "{program:?}: judged once"
+        );
+        // NEGATIVE CONTROL: a new prompt from there, answered at once.
+        let a = at(&mut st, &counted(shown(LEXER, AGAIN), 3, 300), t + secs(40));
+        assert!(backs_off(&a, 3), "{program:?}: a new turn: {a:?}");
+        // NEGATIVE CONTROL: the person's turn first read under the draft
+        // with no read of it busy — nothing judged there — is folded in once
+        // the draft goes.
+        let mut st = start();
+        let before = st.point_number();
+        let _ = at(
+            &mut st,
+            &drafted(counted(shown(REPLY, ASK), 2, 200)),
+            t + secs(20),
+        );
+        assert_eq!(
+            st.point_number(),
+            before,
+            "{program:?}: a draft is no point"
+        );
+        let a = at(&mut st, &counted(shown(REPLY, ASK), 2, 200), t + secs(30));
+        assert!(backs_off(&a, 2), "{program:?}: folded in: {a:?}");
+        assert_ne!(st.point_number(), before, "{program:?}");
+    }
+}
+
+/// THE REVIEW OF `b9/resid3`, F1/F2 ON GEMINI CLI LIVE: A SCREEN READ AS NO
+/// TASK YET WITH NOTHING SUBMITTED SINCE A POINT THAT HELD ONE IS THAT
+/// CONVERSATION REDRAWN ([`TurnEndState::redrawn_fresh`]). A resize split
+/// Gemini CLI 0.46.0's message band into fragments its reader takes for no
+/// band, so the screen read as the launch card; the loop's reading is
+/// taskless only where this says no. FAILS WITHOUT THE FIX (`redrawn_fresh`
+/// always false): the reading stays taskless, the first point's back-off is
+/// dropped (decided `Nothing`) and nothing is ever typed. NEGATIVE
+/// CONTROLS, each taskless as read: a `/clear` (the count moved), the
+/// harness's relaunch (its keys), a host that counts none, and a screen read
+/// so again after a `/clear` (that point held no task).
+#[test]
+fn a_launch_card_read_with_nothing_submitted_is_the_conversation_redrawn() {
+    const PROMPT: &str = "write the parser for this repository and land it";
+    const FIRST: &str = "Wrote the parser module.";
+    let secs = Duration::from_secs;
+    let t = t0();
+    let start = || {
+        let mut st = TurnEndState::default();
+        let first = TurnEndReading {
+            worked: Some(secs(6)),
+            ..counted(opened(FIRST, PROMPT), 2, 100)
+        };
+        let a = at(&mut st, &first, t);
+        assert!(backs_off(&a, 1), "{a:?}");
+        st
+    };
+    // The loop's reading of the re-wrapped screen: no words, no message,
+    // read as a launch card unless the policy says it is a redraw.
+    let rewrapped = |st: &TurnEndState, submits: Option<u64>| TurnEndReading {
+        said_tail: None,
+        opened_by: None,
+        taskless: !st.redrawn_fresh(submits),
+        submits,
+        screen_mark: Some(200),
+        program: aterm_phase::Program::Gemini,
+        ..idle("", None)
+    };
+    let mut st = start();
+    let r = rewrapped(&st, Some(2));
+    assert!(!r.taskless, "read as the conversation redrawn");
+    let due = match at(&mut st, &r, t + secs(10)) {
+        TurnEndAction::WaitUntil { until, why, .. } if why.contains("1 short turn(s)") => until,
+        a => panic!("the first point's back-off stands: {a:?}"),
+    };
+    let first_due = match at(&mut start(), &counted(opened(FIRST, PROMPT), 2, 100), t) {
+        TurnEndAction::WaitUntil { until, .. } => until,
+        a => panic!("{a:?}"),
+    };
+    assert_eq!(due, first_due, "the same due");
+    // …and its act typed at that due.
+    let r = rewrapped(&st, Some(2));
+    let a = at(&mut st, &r, due);
+    assert!(matches!(a, TurnEndAction::Type { .. }), "{a:?}");
+    // NEGATIVE CONTROLS.
+    let st = start();
+    assert!(!st.redrawn_fresh(Some(3)), "a /clear: the count moved");
+    assert!(!st.redrawn_fresh(None), "a host that counts none");
+    let mut st = start();
+    st.host_moved();
+    assert!(!st.redrawn_fresh(Some(2)), "the harness's relaunch");
+    let mut st = start();
+    let cleared = TurnEndReading {
+        taskless: true,
+        ..rewrapped(&st, Some(3))
+    };
+    let a = at(&mut st, &cleared, t + secs(10));
+    assert_eq!(a, TurnEndAction::Nothing, "a cleared conversation: {a:?}");
+    assert!(
+        !st.redrawn_fresh(Some(3)),
+        "read so again after the /clear: no task"
+    );
 }

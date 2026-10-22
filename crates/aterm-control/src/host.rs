@@ -28,6 +28,7 @@ pub struct HostCapabilities {
 impl HostCapabilities {
     /// Headless daemon capabilities (`roster` enabled, no windowing or clipboard).
     #[must_use]
+    #[inline]
     pub const fn headless_daemon() -> Self {
         Self {
             frame_source: false,
@@ -39,6 +40,7 @@ impl HostCapabilities {
 
     /// Full GUI capabilities (all 4 facilities enabled).
     #[must_use]
+    #[inline]
     pub const fn full_gui() -> Self {
         Self {
             frame_source: true,
@@ -50,12 +52,14 @@ impl HostCapabilities {
 
     /// Whether the host can capture rendered window frames (`frame_source && event_loop`).
     #[must_use]
+    #[inline]
     pub const fn can_capture_frames(self) -> bool {
         self.frame_source && self.event_loop
     }
 
     /// Count of enabled host facilities (`0..=4`).
     #[must_use]
+    #[inline]
     pub const fn enabled_count(self) -> u8 {
         (self.frame_source as u8)
             + (self.event_loop as u8)
@@ -79,6 +83,7 @@ pub enum SessionState {
 impl SessionState {
     /// Wire token for this session state (`"spawning"`, `"alive"`, or `"exited"`).
     #[must_use]
+    #[inline]
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Spawning => "spawning",
@@ -89,12 +94,14 @@ impl SessionState {
 
     /// Whether the session's input sink can accept bytes (`Spawning` or `Alive`).
     #[must_use]
+    #[inline]
     pub const fn can_accept_input(self) -> bool {
         matches!(self, Self::Spawning | Self::Alive)
     }
 
     /// Whether the session has exited.
     #[must_use]
+    #[inline]
     pub const fn is_exited(self) -> bool {
         matches!(self, Self::Exited)
     }
@@ -151,6 +158,7 @@ impl<'a> From<Selector<'a>> for aterm_types::control_request::Selector<'a> {
 impl<'a> Selector<'a> {
     /// Return the local sid if `self` is [`Selector::Local`].
     #[must_use]
+    #[inline]
     pub const fn local_sid(self) -> Option<u64> {
         match self {
             Self::Local(sid) => Some(sid),
@@ -160,6 +168,7 @@ impl<'a> Selector<'a> {
 
     /// Return the stable id string if `self` is [`Selector::Id`].
     #[must_use]
+    #[inline]
     pub const fn stable_id(self) -> Option<&'a str> {
         match self {
             Self::Local(_) => None,

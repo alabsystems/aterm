@@ -30,6 +30,7 @@ impl Address {
     }
 
     /// The value of `key`, if present.
+    #[inline]
     #[must_use]
     pub fn get(&self, key: &str) -> Option<&str> {
         self.params
@@ -39,6 +40,7 @@ impl Address {
     }
 
     /// The server GUID the address promises, which the handshake must match.
+    #[inline]
     #[must_use]
     pub fn guid(&self) -> Option<&str> {
         self.get("guid")

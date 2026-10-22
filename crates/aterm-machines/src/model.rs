@@ -256,12 +256,14 @@ pub struct HostReport {
 
 impl HostReport {
     /// Whether this run's exit status is nonzero (design §9).
+    #[inline]
     #[must_use]
     pub fn failed(&self) -> bool {
         self.refused.is_some() || self.items.iter().any(|i| i.outcome.is_failure())
     }
 
     /// How many items ended with `outcome`.
+    #[inline]
     #[must_use]
     pub fn count(&self, outcome: Outcome) -> usize {
         self.items.iter().filter(|i| i.outcome == outcome).count()

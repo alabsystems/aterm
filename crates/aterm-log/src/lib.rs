@@ -73,6 +73,7 @@ pub enum Level {
 
 impl Level {
     /// Return the uppercase string representation of this level.
+    #[inline]
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -85,12 +86,14 @@ impl Level {
     }
 
     /// Return `true` when this level is `Error` or `Warn`.
+    #[inline]
     #[must_use]
     pub const fn is_error_or_warn(self) -> bool {
         matches!(self, Self::Error | Self::Warn)
     }
 
     /// Return the numeric rank (`1 = Error` .. `5 = Trace`).
+    #[inline]
     #[must_use]
     pub const fn rank(self) -> u8 {
         match self {
@@ -104,6 +107,7 @@ impl Level {
 }
 
 /// Encode a compact log record header (`timestamp_ns`, `level_rank`, `line`) into 16 LE bytes.
+#[inline]
 #[must_use]
 pub const fn encode_log_header_le(timestamp_ns: u64, level_rank: u32, line: u32) -> [u8; 16] {
     [
@@ -127,6 +131,7 @@ pub const fn encode_log_header_le(timestamp_ns: u64, level_rank: u32, line: u32)
 }
 
 /// Decode 16 LE bytes into a compact log record header (`timestamp_ns`, `level_rank`, `line`).
+#[inline]
 #[must_use]
 pub const fn decode_log_header_le(bytes: [u8; 16]) -> (u64, u32, u32) {
     let ts = (bytes[0] as u64)
@@ -283,8 +288,9 @@ verify_island! {
 
 /// The body cap for a record at `level`: [`MAX_ALERT_RECORD_BYTES`] for WARN
 /// and ERROR, [`MAX_RECORD_BYTES`] for everything else.
+#[inline]
 #[must_use]
-pub fn record_cap(level: Level) -> usize {
+pub const fn record_cap(level: Level) -> usize {
     match level {
         Level::Error | Level::Warn => MAX_ALERT_RECORD_BYTES,
         Level::Info | Level::Debug | Level::Trace => MAX_RECORD_BYTES,
@@ -296,12 +302,14 @@ pub fn record_cap(level: Level) -> usize {
 /// Replaces control characters (C0, DEL, C1) with U+FFFD to prevent record
 /// forgery (`\n`) or terminal escape injection (`ESC]…`), and caps length near
 /// [`MAX_RECORD_BYTES`] with `…`. Clean short input is returned borrowed.
+#[inline]
 #[must_use]
 pub fn sanitize_record(msg: &str) -> Cow<'_, str> {
     sanitize_capped(msg, MAX_RECORD_BYTES)
 }
 
 /// [`sanitize_record`] with the cap for a record at `level` ([`record_cap`]).
+#[inline]
 #[must_use]
 pub fn sanitize_record_for(level: Level, msg: &str) -> Cow<'_, str> {
     sanitize_capped(msg, record_cap(level))
@@ -350,8 +358,9 @@ pub struct Metadata {
 
 impl Metadata {
     /// The severity level.
+    #[inline]
     #[must_use]
-    pub fn level(&self) -> Level {
+    pub const fn level(&self) -> Level {
         self.level
     }
 }
@@ -368,38 +377,44 @@ pub struct Record<'a> {
 
 impl<'a> Record<'a> {
     /// The severity level.
+    #[inline]
     #[must_use]
-    pub fn level(&self) -> Level {
+    pub const fn level(&self) -> Level {
         self.level
     }
 
     /// The target (typically the module path).
+    #[inline]
     #[must_use]
-    pub fn target(&self) -> &'a str {
+    pub const fn target(&self) -> &'a str {
         self.target
     }
 
     /// The formatted log message.
+    #[inline]
     #[must_use]
-    pub fn args(&self) -> &fmt::Arguments<'a> {
+    pub const fn args(&self) -> &fmt::Arguments<'a> {
         &self.args
     }
 
     /// Source file, if available.
+    #[inline]
     #[must_use]
-    pub fn file(&self) -> Option<&'a str> {
+    pub const fn file(&self) -> Option<&'a str> {
         self.file
     }
 
     /// Source line number, if available.
+    #[inline]
     #[must_use]
-    pub fn line(&self) -> Option<u32> {
+    pub const fn line(&self) -> Option<u32> {
         self.line
     }
 
     /// Build metadata from this record.
+    #[inline]
     #[must_use]
-    pub fn metadata(&self) -> Metadata {
+    pub const fn metadata(&self) -> Metadata {
         Metadata { level: self.level }
     }
 }

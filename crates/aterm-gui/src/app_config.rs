@@ -3131,6 +3131,9 @@ pub(crate) struct MachineConfig {
     /// `"off"` (default) writes `com.apple.universalcontrol Disable`/`DisableMagicEdges`
     /// for the current host when they are not already set; `"leave"` never touches them.
     pub(crate) universal_control: Option<String>,
+    /// `true` (default) installs Rosetta 2 on an Apple-silicon Mac that lacks it, as the
+    /// user (`atpkg::machine::apply_rosetta`); `false` never does.
+    pub(crate) rosetta: Option<bool>,
 }
 
 /// The `[sys]` table: system awareness.
@@ -4857,6 +4860,15 @@ impl Config {
         }
     }
 
+    /// `[machine] rosetta`, resolved as `atpkg::config::MachineConfig::rosetta` (absent ⇒
+    /// `true`).
+    pub(crate) fn machine_rosetta(&self) -> bool {
+        self.machine
+            .as_ref()
+            .and_then(|m| m.rosetta)
+            .unwrap_or(true)
+    }
+
     /// The `[privacy]` master bit (default true). Off, every consent field reads
     /// `unknown`, not `denied`.
     pub(crate) fn privacy_enabled(&self) -> bool {
@@ -6183,14 +6195,14 @@ mod titlebar_band_acceptance_tests {
 }
 
 /// Once-per-process warning that `background_opacity < 1.0` renders solid on
-/// the CPU backend (the softbuffer surface is opaque). The raised contrast floor
+/// the CPU backend (the CPU presenters' surfaces are opaque). The raised contrast floor
 /// still applies.
 fn warn_background_opacity_unimplemented_once() {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
         crate::logging::stderr_line!(
             "aterm-gui: background_opacity < 1.0 requests translucent glass, but the \
-             CPU (softbuffer) renderer has no translucent present path; the window \
+             CPU renderer has no translucent present path; the window \
              renders solid (use the GPU backend for real vibrancy; the raised contrast \
              floor still applies)"
         );
@@ -6212,7 +6224,7 @@ fn warn_background_material_unimplemented_once() {
     ONCE.call_once(|| {
         crate::logging::stderr_line!(
             "aterm-gui: background_material selects a window-level vibrancy blur \
-             (NSVisualEffectView), but the CPU (softbuffer) renderer cannot composite \
+             (NSVisualEffectView), but the CPU renderer cannot composite \
              over it; the setting has no effect on the CPU backend (use the GPU backend)"
         );
         // Same reasoning as its opacity sibling above: a deliberately-set key
@@ -14496,10 +14508,14 @@ mod matrix_rain_cfg_tests {
         let gui = Config::default();
         let pkg = atpkg::config::MachineConfig::default();
         assert_eq!(gui.machine_universal_control(), pkg.universal_control());
+        assert_eq!(gui.machine_rosetta(), pkg.rosetta());
         for text in [
             "[machine]\nuniversal_control = \"leave\"\n",
             "[machine]\nuniversal_control = \"off\"\n",
             "[machine]\nuniversal_control = \"\"\n",
+            "[machine]\nrosetta = false\n",
+            "[machine]\nrosetta = true\n",
+            "[machine]\nuniversal_control = \"leave\"\nrosetta = false\n",
             "[machine]\n",
             "",
         ] {
@@ -14510,6 +14526,7 @@ mod matrix_rain_cfg_tests {
                 pkg.universal_control(),
                 "{text:?}"
             );
+            assert_eq!(gui.machine_rosetta(), pkg.rosetta(), "{text:?}");
         }
         let bogus =
             aterm_toml::from_str::<Config>("[machine]\nuniversal_control = \"bogus\"\n").unwrap();

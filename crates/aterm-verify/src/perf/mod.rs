@@ -16,9 +16,10 @@
 //! perf` runs every floor lane. The ARENA lanes ([`arena`]) open real
 //! windows and take minutes; they run only when named, and what they measure
 //! has no floor, so they report MEASURED, never a pass. The MEASURED lanes
-//! ([`fabric`]) are headless but just as unjudgeable — their numbers are a
-//! disk's fsync before they are aterm's — so they too run only when named and
-//! report MEASURED, writing a ledger entry under `docs/measured/`.
+//! ([`fabric`], [`aos`]) are headless but just as unjudgeable — their numbers
+//! are a disk's fsync, or a shared desk's scheduler, before they are aterm's —
+//! so they too run only when named and report MEASURED (fabric writing a
+//! ledger entry under `docs/measured/`, aos a summary and its JSON).
 //!
 //! `--no-windows` (the house switch for an agent sharing the owner's desktop)
 //! turns every lane that opens a window into a named skip and runs the rest.
@@ -30,6 +31,8 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Instant;
 
+#[cfg(unix)]
+mod aos;
 #[cfg(unix)]
 pub(crate) mod arena;
 mod driver;
@@ -100,6 +103,7 @@ pub(crate) enum Lane {
     Scroll,
     Vte,
     Fabric,
+    Aos,
 }
 
 /// Which kind of lane, and so whether a bare run includes it.
@@ -115,7 +119,7 @@ pub(crate) enum Kind {
 }
 
 impl Lane {
-    pub(crate) const ALL: [Lane; 16] = [
+    pub(crate) const ALL: [Lane; 17] = [
         Lane::Throughput,
         Lane::Pathological,
         Lane::ScrollScrub,
@@ -132,6 +136,7 @@ impl Lane {
         Lane::Scroll,
         Lane::Vte,
         Lane::Fabric,
+        Lane::Aos,
     ];
 
     pub(crate) fn name(self) -> &'static str {
@@ -152,6 +157,7 @@ impl Lane {
             Lane::Scroll => "scroll",
             Lane::Vte => "vte",
             Lane::Fabric => "fabric",
+            Lane::Aos => "aos",
         }
     }
 
@@ -168,7 +174,7 @@ impl Lane {
             | Lane::Effects
             | Lane::Wasm => Kind::Floor,
             Lane::Start | Lane::Compare | Lane::Cat | Lane::Scroll | Lane::Vte => Kind::Arena,
-            Lane::Fabric => Kind::Measured,
+            Lane::Fabric | Lane::Aos => Kind::Measured,
         }
     }
 
@@ -207,6 +213,11 @@ impl Lane {
                 "fabric post->deliver latency, burst throughput, request/reply ping-pong, attach \
                  time and records per message over a real broker, bridge and headless aterm"
             }
+            Lane::Aos => {
+                "the momentum glow hosted under Aos on one recorded typing story: per-call cost \
+                 on the engine, the unattached host and the attached host, checkpoint, event \
+                 log, shadow replay and repair, warm and cold"
+            }
         }
     }
 
@@ -234,6 +245,10 @@ impl Lane {
             Lane::Fabric => {
                 "unix, targo (builds aterm and its fabric_bench bench: test, or opt-test with \
                  --profile opt)"
+            }
+            Lane::Aos => {
+                "unix, targo (builds aterm-bench's aos_harness twice: release, and opt-test \
+                 for the stranded repair); macOS for its instruction, fault and syscall counters"
             }
         }
     }
@@ -350,7 +365,7 @@ struct OptSpec {
 }
 
 const START_LANES: &[Lane] = &[Lane::Start, Lane::Compare];
-const JSON_LANES: &[Lane] = &[Lane::Start, Lane::Compare, Lane::Fabric];
+const JSON_LANES: &[Lane] = &[Lane::Start, Lane::Compare, Lane::Fabric, Lane::Aos];
 const GHOSTTY_LANES: &[Lane] = &[Lane::Cat, Lane::Vte];
 const BENCH_BOX_LANES: &[Lane] = &[Lane::Cat, Lane::Scroll, Lane::Vte];
 
@@ -516,8 +531,28 @@ const OPTIONS: &[OptSpec] = &[
         value: Some("TIER,..."),
         lanes: &[Lane::Fabric],
         help: "the arms, one run and one ledger entry each, opened with aterm's options: \
-               strict (default), ordered (once per --horizon-ms) and relaxed (no flush: the \
+               ordered (default, once per --horizon-ms), strict and relaxed (no flush: the \
                ceiling arm)",
+    },
+    OptSpec {
+        flag: "--retention",
+        value: Some("on|off"),
+        lanes: &[Lane::Fabric],
+        help: "whether every world's broker retains its log by aterm's default rules (default \
+               on, what ships; off also keeps the bridge's auto mirror off)",
+    },
+    OptSpec {
+        flag: "--log",
+        value: Some("auto|off"),
+        lanes: &[Lane::Fabric],
+        help: "the bridge's bus mirror (default auto, what ships: on over a retaining broker)",
+    },
+    OptSpec {
+        flag: "--retention-interval-ms",
+        value: Some("N"),
+        lanes: &[Lane::Fabric],
+        help: "the retaining broker's retention tick interval (default astream's minute, what \
+               ships)",
     },
     OptSpec {
         flag: "--horizon-ms",
@@ -691,8 +726,8 @@ fn list() -> String {
             }
             Kind::Measured => {
                 "MEASURED lanes (only when named; headless, real processes, minutes; measured, \
-                 not judged: fabric writes a docs/measured/fabric entry, and JSON with \
-                 --json-out)\n"
+                 not judged: fabric writes a docs/measured/fabric entry, aos prints a summary, \
+                 and JSON with --json-out)\n"
             }
         });
         for lane in Lane::ALL.into_iter().filter(|l| l.kind() == kind) {
@@ -818,6 +853,13 @@ fn main(args: &[String]) -> ExitCode {
             #[cfg(not(unix))]
             Lane::Fabric => LaneRun::skip(
                 "the fabric bridge is unix-only (aterm-link)",
+                "run it on macOS or Linux",
+            ),
+            #[cfg(unix)]
+            Lane::Aos => aos::run(cli.options.get("--json-out").map(Path::new)),
+            #[cfg(not(unix))]
+            Lane::Aos => LaneRun::skip(
+                "the aos lane spawns its harness through the unix process helpers",
                 "run it on macOS or Linux",
             ),
         };
@@ -997,6 +1039,29 @@ mod tests {
         let cli = parse(&args("--record restore fabric")).expect("parses");
         assert_eq!(cli.record, vec![Lane::Restore]);
         assert_eq!(cli.lanes, vec![Lane::Restore, Lane::Fabric]);
+    }
+
+    #[test]
+    fn the_aos_lane_runs_only_when_named_and_writes_its_json_alone() {
+        let cli = parse(&args("aos --json-out /tmp/a.json")).expect("parses");
+        assert_eq!(cli.lanes, vec![Lane::Aos]);
+        assert_eq!(
+            cli.options.get("--json-out").map(String::as_str),
+            Some("/tmp/a.json")
+        );
+        assert_eq!(Lane::Aos.kind(), Kind::Measured);
+        assert!(!Lane::Aos.opens_windows());
+        assert!(!parse(&[]).expect("parses").lanes.contains(&Lane::Aos));
+        // It takes no other lane's options.
+        let why = parse(&args("aos --burst 9")).unwrap_err();
+        assert_eq!(why, "`--burst` is read only by fabric; name one of them");
+        // One JSON file, one writer.
+        assert!(parse(&args("aos fabric --json-out /tmp/a.json")).is_err());
+        assert!(parse(&args("aos fabric")).is_ok());
+        // Named after --record it just runs: it has no baseline to rewrite.
+        let cli = parse(&args("--record restore aos")).expect("parses");
+        assert_eq!(cli.record, vec![Lane::Restore]);
+        assert_eq!(cli.lanes, vec![Lane::Restore, Lane::Aos]);
     }
 
     #[test]

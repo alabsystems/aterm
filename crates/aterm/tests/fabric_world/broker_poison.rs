@@ -245,9 +245,14 @@ fn a_poisoned_log_exits_75_and_the_restarted_broker_lands_the_post_once() {
         "the run was recorded Lossy, so the reopen moves the generation"
     );
 
-    // EXACTLY ONCE: the refused post is resent under its pinned sequence and
-    // lands — on the reopened log its record is the one the failed flush
-    // held back, and the resend dedups to it.
+    // EXACTLY ONCE, end to end: the refused post is resent under its pinned
+    // sequence, and the lane holds it once (`on_lane == 1`). This counts
+    // copies; it does not see which branch fired. astream proves both
+    // (`broker.poisoned-refusal`): a same-boot reopen kept the held record and
+    // the resend dedups to it, and a record a power loss cut is appended once.
+    // That claim also names what neither this test nor astream reaches: a real
+    // device's failed flush that left the record's pages clean but unwritten,
+    // where a later power loss makes the next open refuse, loud, not silent.
     until("the refused post to land after the restart", || {
         (on_lane(&w, &a, "refused by the poison") > 0).then_some(())
     });

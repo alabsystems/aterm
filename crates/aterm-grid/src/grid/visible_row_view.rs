@@ -314,6 +314,22 @@ impl Grid {
         }
     }
 
+    /// The history row `rev_idx` lines above the live screen (0 = the newest scrolled-off
+    /// line), materialized as a scrolled-back viewport row is ([`History`]) but read whatever
+    /// the viewport shows: socket introspection's read of a history row's cells (`cell
+    /// abs=<n>`), which pairs with the live frame's reads of the screen. [`Empty`] for a row
+    /// the history does not hold.
+    ///
+    /// [`History`]: VisibleRowView::History
+    /// [`Empty`]: VisibleRowView::Empty
+    #[must_use]
+    pub fn history_row_view(&self, rev_idx: usize) -> VisibleRowView<'_> {
+        match self.materialized_history_row(rev_idx, self.cols()) {
+            Some(mat) => VisibleRowView::History { mat },
+            None => VisibleRowView::Empty,
+        }
+    }
+
     /// The absolute row number of the history row at `rev_idx` (0 = newest scrolled-off line),
     /// or `None` when it cannot be computed exactly: one above the top live line,
     /// `absolute_row_counter - visible_rows`. Absolute numbers only count up and are never

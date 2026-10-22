@@ -1392,6 +1392,8 @@ fn lab_readings() -> Vec<Lab> {
         lab(lab::BUSY_STREAMING, "busy", true),
         lab(lab::END_OF_TURN, "idle", true),
         lab(lab::WORKER_FIRST_PROMPT, "idle", true),
+        lab(lab::PERSON_PARAGRAPHS, "idle", true),
+        lab(lab::PERSON_PARAGRAPHS_LONG_REPLY, "idle", true),
         lab(lab::REPLY_WRAPPED_50, "question", true),
         lab(lab::INTERRUPTED, "idle", true),
         lab(lab::SLASH_MENU, "idle", false),
@@ -2505,4 +2507,123 @@ fn the_message_that_opened_the_turn_is_read_under_its_rule() {
     assert!(said_tail(&cut).is_some());
     assert_eq!(turn_opened_by(&cut), None);
     assert_eq!(ClaudeReader.turn_opened_by(&rows), None);
+}
+
+/// The grid rows of the long-reply screen's last message whose column-0
+/// cells agy drew in its caret row's style (`5c5cff` bold), its blank row
+/// among them: MEASURED with the capture (`aterm-agent`'s
+/// `supervise/fixtures/agy-1.4.0-lab-person-paragraphs-long-reply.cells`).
+/// Every other row under the message, blank ones too, is plain.
+const LONG_REPLY_MESSAGE_ROWS: [usize; 3] = [30, 31, 32];
+
+/// The same for the first screen's person's message: rows 8 to 11.
+const PARAGRAPHS_MESSAGE_ROWS: [usize; 4] = [8, 9, 10, 11];
+
+/// What a reader of the cells keeps of [`message_blanks`]: the blank rows
+/// in the message's style, top down, up to the first plain one.
+fn inner_of(blanks: &[usize], styled: &[usize]) -> Vec<usize> {
+    blanks
+        .iter()
+        .copied()
+        .take_while(|b| styled.contains(b))
+        .collect()
+}
+
+/// A PERSON'S PARAGRAPHS ARE BOUNDED BY THE MESSAGE'S CELLS (module
+/// header's A MESSAGE'S BLANK LINE): on the measured screens of a person's
+/// message whose blank line agy drew as a blank row, the text names the
+/// blank rows to read under the message ([`message_blanks`]), the measured
+/// cells say which are the message's own, and with those taken out
+/// ([`fold_message`]) the reply is agy's alone — no `NEEDS YOU:` of the
+/// person's in it — the turn opened by every paragraph of the message, the
+/// composer, the footer and the reply's rows where they were. NEGATIVE
+/// CONTROLS: read as drawn, the person's later paragraph is agy's reply and
+/// its `NEEDS YOU:` with it; no fold where the cells keep no blank row, or
+/// the caret row is no message's; and no rows to read while a turn runs.
+#[test]
+fn a_persons_paragraphs_are_bounded_by_the_messages_cells() {
+    // The long reply: the person's two paragraphs, the stub's three.
+    let rows = screen(lab::PERSON_PARAGRAPHS_LONG_REPLY);
+    assert!(
+        provenance(lab::PERSON_PARAGRAPHS_LONG_REPLY)
+            .is_some_and(|p| p.contains("MEASURED") && p.contains("5c5cff` bold"))
+    );
+    let (caret, blanks) = message_blanks(&rows).expect("rows to read");
+    assert_eq!(rows[caret], "> Second message, first paragraph.");
+    assert_eq!(blanks[..2], [31, 33], "{blanks:?}");
+    let inner = inner_of(&blanks, &LONG_REPLY_MESSAGE_ROWS);
+    assert_eq!(inner, [31]);
+    let folded = fold_message(&rows, caret, &inner);
+    assert_eq!(folded.len(), rows.len());
+    assert_eq!(
+        folded[33..],
+        rows[33..],
+        "the rows under the message keep their place"
+    );
+    assert_eq!(composer(&folded), composer(&rows));
+    let said = said_tail(&folded).expect("agy's reply");
+    assert!(said.starts_with("This is a long canned reply"), "{said}");
+    assert!(
+        said.contains("Nothing here is advice") && !said.contains("NEEDS YOU"),
+        "{said}"
+    );
+    assert!(said_whole(&folded) && turn_whole(&folded));
+    assert_eq!(
+        turn_opened_by(&folded).as_deref(),
+        Some(
+            "Second message, first paragraph. NEEDS YOU: the person's own words after a blank line."
+        )
+    );
+    assert_eq!(AgyReader.fold_message(&rows, caret, &inner), folded);
+    assert_eq!(
+        AgyReader.message_blanks(&rows),
+        Some((caret, blanks.clone()))
+    );
+    // NEGATIVE CONTROL: read as drawn, the person's paragraph is the reply.
+    let misread = said_tail(&rows).expect("words");
+    assert!(
+        misread.starts_with("NEEDS YOU: the person's own words"),
+        "{misread}"
+    );
+
+    // The first screen, cut to the person's turn: three paragraphs, a line
+    // break then a blank line, the stub's one-line reply.
+    let first = screen(lab::PERSON_PARAGRAPHS);
+    let act = first
+        .iter()
+        .position(|r| r.starts_with("> [aterm harness]"))
+        .expect("the act");
+    let caret_rule = composer(&first).expect("the composer") - 1;
+    let mut turn: Vec<String> = first[..act - 1].to_vec();
+    turn.extend(first[caret_rule..].iter().cloned());
+    let (caret, blanks) = message_blanks(&turn).expect("rows to read");
+    assert!(turn[caret].starts_with("> A person's first paragraph"));
+    let inner = inner_of(&blanks, &PARAGRAPHS_MESSAGE_ROWS);
+    assert_eq!(inner, [10]);
+    let folded = fold_message(&turn, caret, &inner);
+    assert_eq!(
+        said_tail(&folded).as_deref(),
+        Some("Hi! I am the local lab stub, not a model. (reply 1)")
+    );
+    // NEGATIVE CONTROL: as drawn, the third paragraph is agy's need.
+    assert!(said_tail(&turn).is_some_and(|t| t.starts_with("NEEDS YOU: a paragraph after")));
+
+    // NEGATIVE CONTROLS: nothing kept, or no message's caret, folds nothing.
+    assert_eq!(fold_message(&rows, caret_of(&rows), &[]), rows);
+    assert_eq!(fold_message(&rows, 31, &[33]), rows);
+    // The rows of the full first screen: its last message is the act's,
+    // whose blank row under it is the plain one (not kept by the cells).
+    let (act_caret, act_blanks) = message_blanks(&first).expect("rows to read");
+    assert_eq!(act_caret, act);
+    assert!(inner_of(&act_blanks, &[16, 17, 18]).is_empty());
+    // No rows while a turn runs, nor on a fresh screen.
+    assert_eq!(message_blanks(&screen(lab::BUSY_STREAMING)), None);
+    assert_eq!(message_blanks(&screen(lab::IDLE)), None);
+    assert_eq!(ClaudeReader.message_blanks(&rows), None);
+    assert_eq!(ClaudeReader.fold_message(&rows, caret, &inner), rows);
+}
+
+/// The last message's caret row on `rows`.
+fn caret_of(rows: &[String]) -> usize {
+    message_blanks(rows).expect("a message").0
 }

@@ -396,8 +396,12 @@ impl CursorGlow {
         for r in &mut self.comet_runs {
             r.clear();
         }
+        for r in &mut self.comet_typing {
+            r.clear();
+        }
         let mut runs_len = 0usize;
         self.comet_run.clear();
+        self.comet_run_typing.clear();
         let mut prev: Option<(u16, u16)> = None;
         // The head sample's coverage before Fire's caps: the bridge onto the
         // empty caret cell is the one place its streak runs at it.
@@ -588,12 +592,23 @@ impl CursorGlow {
             }
             let (x, y) = center(s.row, s.col);
             let sample = CometSample { x, y, cov, pos };
-            let (runs, run) = (&mut self.comet_runs, &mut self.comet_run);
-            chain_comet_sample(runs, run, &mut runs_len, prev, here, sample);
+            let mut runs = CometRuns {
+                runs: &mut self.comet_runs,
+                run: &mut self.comet_run,
+                typing: &mut self.comet_typing,
+                run_typing: &mut self.comet_run_typing,
+            };
+            runs.chain(&mut runs_len, prev, here, sample, s.typing);
             prev = Some(here);
             head_full = full_f.min(255.0) as u8;
         }
-        publish_comet_run(&mut self.comet_runs, &mut self.comet_run, &mut runs_len);
+        CometRuns {
+            runs: &mut self.comet_runs,
+            run: &mut self.comet_run,
+            typing: &mut self.comet_typing,
+            run_typing: &mut self.comet_run_typing,
+        }
+        .publish(&mut runs_len);
         if runs_len == 0 {
             return;
         }
@@ -709,6 +724,16 @@ impl CursorGlow {
                     });
                 }
             }
+        }
+
+        // The bridge and knee samples just pushed onto the head run carry
+        // the head's own kind, sample for sample.
+        if let (Some(samples), Some(kinds)) = (
+            self.comet_runs.get(runs_len - 1),
+            self.comet_typing.get_mut(runs_len - 1),
+        ) {
+            let head = kinds.last().copied().unwrap_or(true);
+            kinds.resize(samples.len(), head);
         }
 
         // Light themes: additive light cannot brighten white, and saturating
@@ -4437,28 +4462,59 @@ fn streak_layers(style: GlowStyle) -> &'static [(f32, f32, u32, f32, f32, usize)
     }
 }
 
-/// Chain one lit swept cell `here` into the comet runs (`runs` up to its
-/// watermark `runs_len`, `run` the open one): a cell more than one step from
-/// `prev` publishes the open run first, so a hide/show gap or a stale older
-/// group never connects across empty space.
-#[inline]
-fn chain_comet_sample(
-    runs: &mut Vec<Vec<CometSample>>,
-    run: &mut Vec<CometSample>,
-    runs_len: &mut usize,
-    prev: Option<(u16, u16)>,
-    here: (u16, u16),
-    sample: CometSample,
-) {
-    if let Some((pr, pc)) = prev
-        && (here.0 as i32 - pr as i32)
+/// The comet's run pools ([`CursorGlow`]'s `comet_runs` and `comet_run`)
+/// and, sample for sample beside them, whether typing laid each sample
+/// (`comet_typing`, `comet_run_typing`).
+struct CometRuns<'a> {
+    runs: &'a mut Vec<Vec<CometSample>>,
+    run: &'a mut Vec<CometSample>,
+    typing: &'a mut Vec<Vec<bool>>,
+    run_typing: &'a mut Vec<bool>,
+}
+
+impl CometRuns<'_> {
+    /// Add `sample` (laid by typing or not) to the open run, first publishing
+    /// that run where `here` is not beside the last swept cell, so a hide/show
+    /// gap or a stale older group never connects across empty space.
+    fn chain(
+        &mut self,
+        runs_len: &mut usize,
+        prev: Option<(u16, u16)>,
+        here: (u16, u16),
+        sample: CometSample,
+        typing: bool,
+    ) {
+        if breaks_comet_run(prev, here) {
+            self.publish(runs_len);
+        }
+        self.run.push(sample);
+        self.run_typing.push(typing);
+    }
+
+    /// [`publish_comet_run`], publishing the kinds at the same watermark.
+    fn publish(&mut self, runs_len: &mut usize) {
+        if self.run.is_empty() {
+            return;
+        }
+        let at = *runs_len;
+        while self.typing.len() <= at {
+            self.typing.push(Vec::new());
+        }
+        std::mem::swap(&mut self.typing[at], self.run_typing);
+        self.run_typing.clear();
+        publish_comet_run(self.runs, self.run, runs_len);
+    }
+}
+
+/// Whether a swept cell `here` after `prev` starts a new run: it is not
+/// beside the last.
+fn breaks_comet_run(prev: Option<(u16, u16)>, here: (u16, u16)) -> bool {
+    prev.is_some_and(|(pr, pc)| {
+        (here.0 as i32 - pr as i32)
             .abs()
             .max((here.1 as i32 - pc as i32).abs())
             > 1
-    {
-        publish_comet_run(runs, run, runs_len);
-    }
-    run.push(sample);
+    })
 }
 
 /// Publish the open comet `run`, when it holds a sample, at the pool

@@ -29,11 +29,13 @@
 //! commits rolled back, `ERR_REFUSED`), the Ordered horizon's flush, a jump
 //! of the clock, and — in a world whose broker holds acks
 //! ([`Opts::hold_acks`]) — a flush landing that sends the acks it held
-//! ([`bus::Broker::answer_held`]).
-//! Then the SETTLE phase: no more faults, the broker up, a bridge running, and
-//! the loop and its readers run until nothing moves and presence and the
-//! mirror have caught up, or ten minutes have passed (half an hour of the
-//! world's clock is the hang detector).
+//! ([`bus::Broker::answer_held`]), and — in a world whose disk fails writes
+//! ([`Opts::write_errors`], sim item S7) — the disk filling up or having room
+//! again ([`Device::fill`]).
+//! Then the SETTLE phase: no more faults, a clean disk, the broker up, a
+//! bridge running, and the loop and its readers run until nothing moves and
+//! presence and the mirror have caught up, or ten minutes have passed (half
+//! an hour of the world's clock is the hang detector).
 //!
 //! ## One device or two
 //!
@@ -104,7 +106,14 @@
 //!   ([`bus::law_check`]; P1 holds by construction, P8 is not modelled).
 //! * LIVENESS: the settle phase ends, the bridge never panics — after a power
 //!   cut that tore a state file too (finding F1: the bridge sets it aside;
-//!   [`Mutant::RefuseTornAfterPowerCut`], the old refusal, wedges).
+//!   [`Mutant::RefuseTornAfterPowerCut`], the old refusal, wedges), and after
+//!   any write error (sim item S7): the settle phase's disk is clean, so a
+//!   bridge a full disk held up is no violation and one a clean disk does not
+//!   heal is. No other law is weaker under write errors: what the disk
+//!   refuses waits for it — a post whose reservation or in-flight entry is not
+//!   written stays queued, a record of ours whose `acked` or entry unlink is
+//!   not written is not delivered, an attach whose recovery, run record or
+//!   witness is not written does not go on.
 //! * WHAT WAS SET ASIDE IS TOLD, NEVER MORE, once settled: the bridges told
 //!   aterm (`link set-aside`) of no more torn files than the state dir's
 //!   quarantine holds — counting none of the whole in-flight entries an
@@ -237,6 +246,58 @@ pub(crate) enum Mutant {
     /// a later boot that moves fewer understates what an earlier one left
     /// there, and at 0 would end the owner's entry over bytes still held.
     TellMovedNotHeld,
+    /// An offset of ours below the self-lane window's oldest is added to it,
+    /// as before sim item S7 (`Bridge::remember_self_ack`): an attach after a
+    /// move that replays an in-flight entry a failed `acked` write kept moves
+    /// the window's oldest down, and the node's own records between are
+    /// judged `forged-self`.
+    RememberBelowTheWindow,
+    /// A recovery step a write error stopped — the torn files' sweep, the
+    /// earlier boot's in-flight retirement, the pin's reconcile — is said and
+    /// survived, and `run` written after it all the same, as before sim item
+    /// S7 (`Bridge::recover`): the verdict ends with the torn file left, and
+    /// every attach of the boot refuses it.
+    BeginRunPastAFailedRecovery,
+    /// The mirror judges its pin at the hello, the recovery that reconciles
+    /// it complete or not, as before sim item S7
+    /// (`Bridge::mirror_hello_answered`): a torn pin stops the mirror for the
+    /// bridge's life, a rolled-back one counts below its floor.
+    JudgePinBeforeRecovery,
+    /// An own record whose `acked` write or in-flight entry's unlink failed is
+    /// delivered with its entry standing, as before sim item S7
+    /// (`Bridge::settled_before_delivery`): a move that takes the record has
+    /// the next attach publish the entry again, a second copy in the
+    /// recipient's ring.
+    DeliverPastAStandingEntry,
+    /// The mirror's floor is trusted as it reads, as before sim item S7
+    /// (`StateDir::raise_logfloor`): a durable raise whose directory flush
+    /// failed after its rename reads as raised, the batch is sent past it,
+    /// and the next power cut takes the floor back below what was counted.
+    TrustTheFloorThatReads,
+    /// An attach that could not write the state dir's witness of the log —
+    /// a re-base onto a moved or replaced log, or a first witness where none
+    /// reads — goes on and delivers on it, as before sim item S7: the next
+    /// attach tells the endpoint the move from the older witness (or, with
+    /// none, a bare identity), and the endpoint forgets rows it holds — a
+    /// second delivery.
+    AttachPastAnUnwrittenWitness,
+    /// An in-flight entry the attach published again is cleared as it lands,
+    /// as before sim item S7 (`Bridge::land_replayed`): its record is
+    /// delivered while its post is still queued, and where the drain's try
+    /// fails and a move then takes the record, the drain publishes the post
+    /// again — a second row.
+    DeliverBeforeTheDrain,
+    /// A bridge whose recovery after an unclean stop is owed stops its run
+    /// cleanly all the same, as before sim item S7 (`Bridge::end_run`): the
+    /// clean record vouches for a torn file nobody set aside, and the next
+    /// start refuses it where it reads it.
+    CleanStopOverAnOwedRecovery,
+    /// Each try of the recovery's moves publishes a copy of every file again,
+    /// as before sim item S7's review (`StateDir::move_into_quarantine`'s one
+    /// copy per file): a try whose unlink failed leaves its copies, and the
+    /// recovery, tried again at each attach, adds one more under the next
+    /// suffix every time — copies the owner must clear, counted as torn files.
+    CopyOnEveryTry,
 }
 
 /// What one run is.
@@ -294,6 +355,19 @@ pub(crate) struct Opts {
     /// The sibling takes the CURRENT attach's incarnation, making its node
     /// publish collide and its own aliased will fire over the live sibling.
     pub(crate) alias: bool,
+    /// WRITE ERRORS (sim item S7, [`Device::arm_write_errors`]): through the
+    /// fault phase the state dir's device fails `EIO` and `ENOSPC` on a write,
+    /// a rename, a flush or an unlink at a rate the seed draws, and fills up
+    /// now and then; the settle phase's disk is clean.
+    pub(crate) write_errors: bool,
+    /// ATERM QUITS AND COMES BACK, in the same boot ([`World::quit`]): the
+    /// bridge takes `bye quit`, withdraws the sessions and stops its run
+    /// CLEANLY (`StateDir::end_run_clean`), and a new instance with new
+    /// sessions starts — so the clean stop's flushes, its record, and the
+    /// start after it meet the disk's write errors and the power cuts too.
+    /// Off in the committed worlds; on in the sweep with write errors in
+    /// every seed (sim item S7).
+    pub(crate) quits: bool,
 }
 
 /// The sibling's one session ([`Opts::sibling`]).
@@ -340,6 +414,16 @@ impl Opts {
             sibling: false,
             race: false,
             alias: false,
+            // WRITE ERRORS ON OR OFF, alternating by eights, so each layout,
+            // mirror setting and broker holding acks or not runs both ways:
+            // a disk that fails some of the state dir's writes, and fills up
+            // now and then, until the settle phase's clean disk (sim item S7).
+            write_errors: (seed / 8) % 2 == 1,
+            // NO QUIT in the committed worlds, whose seeds the controls and
+            // the found seeds name: the sweep with write errors in every
+            // seed quits too (`super::tests`'
+            // `every_seed_with_write_errors_holds_every_law`, sim item S7).
+            quits: false,
         }
     }
 
@@ -467,6 +551,28 @@ pub(crate) struct Stats {
     pub(crate) acks_held: u64,
     pub(crate) tries_not_yet: u64,
     pub(crate) seen_before_ack: u64,
+    /// WRITE ERRORS the device injected ([`Opts::write_errors`],
+    /// [`super::device::WriteErrors`]): writes and appends failed with
+    /// nothing made, unlinks and flushes failed, durable replaces renamed
+    /// with their directory flush failed, appends cut short, and writes a
+    /// full disk refused; and the spells the disk was full.
+    pub(crate) writes_failed: u64,
+    pub(crate) unlinks_failed: u64,
+    pub(crate) flushes_failed: u64,
+    pub(crate) renamed_unflushed: u64,
+    pub(crate) appends_cut: u64,
+    pub(crate) disk_full_refused: u64,
+    pub(crate) disk_full_spells: u64,
+    /// Times the bridge said its link down for a state-dir write the disk
+    /// refused (`link down reason=error`): an attach that waits for its
+    /// recovery, its run record or its witness, a record of ours not
+    /// delivered while its in-flight entry stands.
+    pub(crate) held_for_the_disk: u64,
+    /// QUITS ([`Opts::quits`]): times aterm quit and came back, and of them
+    /// how many left `run` saying the run stopped cleanly (a kill or a write
+    /// error inside the stop leaves it open).
+    pub(crate) quits: u64,
+    pub(crate) clean_stops: u64,
 }
 
 /// One message the world made, by its marker (the text it carries).
@@ -552,6 +658,9 @@ struct World {
     /// TIER-1 OF `FabricExactlyOnce`: every inbox offset the world's messages
     /// took, followed through the model after every step ([`super::conform`]).
     tap: conform::Tap,
+    /// The quarantine's names when the running bridge's process was launched
+    /// ([`World::copies_since_launch`]): what the processes before it made.
+    quarantine_at_launch: BTreeSet<String>,
 }
 
 /// The producer id of `principal` (astream's derivation).
@@ -617,6 +726,13 @@ impl World {
         }
         let core = Core::new(opts.seed, broker, device);
         *lock(&core.mutants) = opts.mutants.clone();
+        if opts.write_errors {
+            // A stream of its own, so the device's failures shift no other
+            // draw; and the seed's rate, one write in 20, 50 or 120.
+            let mut errors = Rng::new(opts.seed ^ 0x0e10_e5bc_0057);
+            let per = [20, 50, 120][usize::try_from(errors.below(3)).unwrap_or(0)];
+            core.device.arm_write_errors(errors, per);
+        }
         let ep = Endpoint::new(opts.ep, opts.mirror);
         let cfg = Config {
             fleet: FLEET.to_string(),
@@ -662,6 +778,7 @@ impl World {
             sibling_dead: false,
             alias_ghost: None,
             tap: conform::Tap::new(aterm_models_session::fabric_exactly_once_model()),
+            quarantine_at_launch: BTreeSet::new(),
             stats: Stats::default(),
         };
         if w.opts.sibling {
@@ -855,12 +972,17 @@ impl World {
     }
 
     /// Move the broker's and the endpoint's notes into the trace.
-    fn collect_notes(&self) {
+    fn collect_notes(&mut self) {
         for n in self.core.broker.take_notes() {
             self.core.note(n);
         }
         let reqs = std::mem::take(&mut lock(&self.ep.state).requests);
         for r in reqs {
+            // The link said down for a state-dir write the disk refused
+            // (sim item S7): an attach held back, a record held back.
+            if r.starts_with("link down reason=error") {
+                self.stats.held_for_the_disk += 1;
+            }
             self.core.note(format!("ctl {r}"));
         }
     }
@@ -870,7 +992,38 @@ impl World {
     // ---------------------------------------------------------------------
 
     /// Launch a bridge, as aterm's supervisor does.
+    /// ONE COPY PER FILE, IN EACH PROCESS (sim item S7's review): of the
+    /// files the quarantine came to hold since the last launch — what the
+    /// bridge process launched then made — no two under one source's name
+    /// ([`quarantine_base`]) hold the same bytes. The recovery is tried again
+    /// at each attach while it is owed, and a try after one whose unlink
+    /// failed takes the copy that try made rather than publish another. (Two
+    /// processes may: one killed between a copy and its unlink, and a later
+    /// boot's file at the same path torn to the same bytes, are nothing the
+    /// dir tells apart.) Said as violations; the snapshot moves to now.
+    fn copies_since_launch(&mut self) {
+        let dir = std::path::Path::new(&self.cfg.state_dir).join(crate::state::QUARANTINE);
+        let now: BTreeSet<String> = std::fs::read_dir(&dir)
+            .map(|dir| {
+                dir.flatten()
+                    .map(|e| e.file_name().to_string_lossy().into_owned())
+                    .collect()
+            })
+            .unwrap_or_default();
+        let made: Vec<String> = now
+            .difference(&self.quarantine_at_launch)
+            .cloned()
+            .collect();
+        for v in quarantine_copies(&dir, &made) {
+            if !self.violations.contains(&v) {
+                self.violations.push(v);
+            }
+        }
+        self.quarantine_at_launch = now;
+    }
+
     fn launch(&mut self) {
+        self.copies_since_launch();
         let pid = self.next_pid;
         self.next_pid += 1;
         let process = Process::new(Arc::clone(&self.core), pid);
@@ -1144,6 +1297,57 @@ impl World {
         self.open_sessions();
     }
 
+    /// ATERM QUITS AND COMES BACK, in the same boot ([`Opts::quits`]): its
+    /// last word on the push lane — `EVENT * bye quit`, latched as the event
+    /// reader latches it — and the bridge's loop until it acknowledged it
+    /// (`link bye quit`, which the quitting instance waits for), or a few
+    /// passes; then the lanes close, and the bridge withdraws the sessions it
+    /// carries and stops its run cleanly ([`crate::state::StateDir::end_run_clean`])
+    /// — unless a kill armed earlier lands inside it, or the disk refuses one
+    /// of its writes, and `run` stays open. The instance is gone with its
+    /// sessions; a new one starts with new ones, and the scheduler relaunches
+    /// its bridge (a new process, as a quit and relaunch has).
+    fn quit(&mut self) {
+        let Some(live) = &self.live else {
+            return;
+        };
+        self.stats.quits += 1;
+        self.note("aterm quits");
+        live.mailbox
+            .note_bye(aterm_types::fabric_grammar::Bye::Quit);
+        self.push_event("EVENT * bye quit");
+        let acked = lock(&self.ep.state).byes_acked;
+        for _ in 0..8 {
+            if self.live.is_none() || lock(&self.ep.state).byes_acked > acked {
+                break;
+            }
+            self.pass();
+            self.collect_notes();
+        }
+        if let Some(live) = &self.live {
+            live.mailbox.push_aterm_closed();
+        }
+        for _ in 0..4 {
+            if self.live.is_none() {
+                break;
+            }
+            self.pass();
+            self.collect_notes();
+        }
+        // A bridge still running when its aterm is gone has no lane left to
+        // serve; the next instance's is another bridge's.
+        self.kill();
+        let run = crate::state::StateDir::peek(&self.cfg.state_dir).last_run();
+        if matches!(run, Ok(Some(run)) if run.clean) {
+            self.stats.clean_stops += 1;
+        }
+        // The instance is gone with its sessions, and its memory of the log
+        // with it; the next one mints new ones.
+        self.ep.power_cut();
+        self.epoch += 1;
+        self.open_sessions();
+    }
+
     /// ONE STEP OF THE FAULT PHASE.
     fn fault_step(&mut self) {
         let up = lock(&self.core.broker.state).up;
@@ -1179,6 +1383,14 @@ impl World {
         }
         if self.opts.hold_acks {
             menu.push((4, 18));
+        }
+        if alive && self.opts.quits {
+            menu.push((1, 20));
+        }
+        if self.opts.write_errors {
+            // The disk fills, or has room again (an emptied full disk sooner
+            // than a full one fills).
+            menu.push((if self.core.device.is_full() { 4 } else { 1 }, 19));
         }
         let total: u64 = menu.iter().map(|(w, _)| w).sum();
         let mut draw = self.rng.below(total);
@@ -1243,6 +1455,20 @@ impl World {
             18 => {
                 self.core.broker.answer_held(false);
             }
+            // THE STATE DIR'S DISK FILLS, or has room again (sim item S7):
+            // while full, every write that takes space fails `ENOSPC`.
+            19 => {
+                let full = !self.core.device.is_full();
+                self.core.device.fill(full);
+                if full {
+                    self.stats.disk_full_spells += 1;
+                }
+                self.note(if full { "disk full" } else { "disk has room" });
+            }
+            // ATERM QUITS (sim item S7, [`Opts::quits`]): `bye quit`, the
+            // bridge withdraws and stops its run cleanly, and aterm comes
+            // back in the same boot.
+            20 => self.quit(),
             _ => {
                 let d = Duration::from_millis(100 + self.rng.below(20_000));
                 self.note(format!("time +{}ms", d.as_millis()));
@@ -1280,6 +1506,9 @@ impl World {
     fn settle(&mut self) {
         self.core.disarm_kill();
         self.note("settle");
+        // A CLEAN DISK from here on (sim item S7): what a write error left
+        // must be healed by the writes the bridge makes on it.
+        self.core.device.clean_disk();
         if !lock(&self.core.broker.state).up {
             self.core.broker.start();
         }
@@ -2120,6 +2349,56 @@ impl World {
     }
 }
 
+/// The name a quarantined file's copies share: the one its source's path
+/// gives it (`StateDir::move_into_quarantine`: `/` as `.`, a `retired.`
+/// prefix), without the `.<n>` a name already taken adds. Each kind's path
+/// has a fixed count of parts — `logpin` one; `inflight/<seq>`, `keys/<sid>`
+/// and `unhandled/<sid>` two; `sent/<sid>.<id>`, `acks/<sid>.<rid>` and
+/// `retired.inflight.<seq>` three — so the parts past them are a suffix.
+fn quarantine_base(name: &str) -> &str {
+    let parts = match name.split('.').next() {
+        Some("logpin") => 1,
+        Some("inflight" | "keys" | "unhandled") => 2,
+        Some("sent" | "acks" | "retired") => 3,
+        _ => return name,
+    };
+    name.match_indices('.')
+        .nth(parts - 1)
+        .map_or(name, |(at, _)| &name[..at])
+}
+
+/// THE QUARANTINE'S SECOND COPIES ([`World::copies_since_launch`]): each pair of
+/// regular files under one source's name ([`quarantine_base`]) that hold the
+/// same bytes.
+fn quarantine_copies(dir: &std::path::Path, names: &[String]) -> Vec<String> {
+    let mut by_base: BTreeMap<&str, Vec<(&str, Vec<u8>)>> = BTreeMap::new();
+    for name in names {
+        let path = dir.join(name);
+        if !std::fs::symlink_metadata(&path).is_ok_and(|m| m.is_file()) {
+            continue;
+        }
+        if let Ok(bytes) = std::fs::read(&path) {
+            by_base
+                .entry(quarantine_base(name))
+                .or_default()
+                .push((name.as_str(), bytes));
+        }
+    }
+    let mut bad = Vec::new();
+    for copies in by_base.values() {
+        for (i, (a, bytes)) in copies.iter().enumerate() {
+            for (b, other) in &copies[i + 1..] {
+                if bytes == other {
+                    bad.push(format!(
+                        "quarantine copies: {a} and {b} hold the same bytes, one file moved twice"
+                    ));
+                }
+            }
+        }
+    }
+    bad
+}
+
 /// RUN ONE SEED: the fault phase, the settle phase, the oracle.
 pub(crate) fn run(opts: &Opts) -> Outcome {
     let mut w = World::new(opts.clone());
@@ -2172,6 +2451,7 @@ pub(crate) fn run(opts: &Opts) -> Outcome {
         w.settle();
         w.collect_notes();
         w.check_settled();
+        w.copies_since_launch();
     }
     let trace = w.core.trace();
     // End the bridge before the world goes: its threads, its lanes.
@@ -2183,6 +2463,13 @@ pub(crate) fn run(opts: &Opts) -> Outcome {
         w.stats.tries_not_yet,
         w.stats.seen_before_ack,
     ) = w.core.broker.held_counts();
+    let errors = w.core.device.write_errors();
+    w.stats.writes_failed = errors.writes;
+    w.stats.unlinks_failed = errors.unlinks;
+    w.stats.flushes_failed = errors.flushes;
+    w.stats.renamed_unflushed = errors.renamed_unflushed;
+    w.stats.appends_cut = errors.appends_cut;
+    w.stats.disk_full_refused = errors.disk_full;
     Outcome {
         seed: opts.seed,
         tier: w.tier,

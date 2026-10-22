@@ -33,8 +33,9 @@
 //! log, black-hole lines and `debuglog`, and the row counts its
 //! `transcript`, which `down` keeps in `logs/<tag>-<time>/` (`stub.log`,
 //! `claude-debug.log`, `claude-projects/`) from the runs of 2026-10-16 on:
-//! in the state dir, which is the checkout's `target/` unless `LAB_STATE`
-//! names another, so they go when the checkout does.
+//! in the state dir, which is `/private/tmp/at.lab-<uid>/<checkout>` unless
+//! `LAB_STATE` names another, so they go when macOS clears `/private/tmp` of
+//! what nobody used for days (logs that must last want a `LAB_STATE`).
 //!
 //! * WHERE THE ACCOUNT READS GO (READ-FROM-CODE in the 2.1.301 bundle, then
 //!   seen below). Every claude.ai account read is built on the OAuth

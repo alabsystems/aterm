@@ -40,6 +40,7 @@ pub enum FlagWords {
 }
 
 impl FlagWords {
+    #[inline]
     const fn word(self, v: bool) -> &'static str {
         match (self, v) {
             (Self::ZeroOne, true) => "1",
@@ -64,10 +65,12 @@ pub struct Decimal {
 impl Decimal {
     /// `value`, written to `places` decimal places.
     #[must_use]
+    #[inline]
     pub const fn new(value: f64, places: u8) -> Self {
         Self { value, places }
     }
 
+    #[inline]
     fn write(self, out: &mut String) {
         let _ = write!(out, "{:.*}", usize::from(self.places), self.value);
     }
@@ -105,6 +108,7 @@ pub trait FieldSink {
     fn pairs(&mut self, key: &str, pairs: &[(&str, Cell<'_>)], empty_text: &'static str);
 
     /// [`count`](Self::count) when `Some`, else [`absent`](Self::absent).
+    #[inline]
     fn opt_count(&mut self, key: &str, v: Option<u64>, absent_text: &'static str) {
         match v {
             Some(v) => self.count(key, v),
@@ -113,6 +117,7 @@ pub trait FieldSink {
     }
 
     /// [`decimal`](Self::decimal) when `Some`, else [`absent`](Self::absent).
+    #[inline]
     fn opt_decimal(&mut self, key: &str, v: Option<Decimal>, absent_text: &'static str) {
         match v {
             Some(v) => self.decimal(key, v),
@@ -143,6 +148,7 @@ impl TextSink {
     /// A line that starts with `head` (`OK`, or empty for a fragment) and
     /// spells flags as `flags`.
     #[must_use]
+    #[inline]
     pub fn new(head: &str, flags: FlagWords) -> Self {
         Self {
             out: head.to_string(),
@@ -152,10 +158,12 @@ impl TextSink {
 
     /// The line so far, with no trailing newline.
     #[must_use]
+    #[inline]
     pub fn finish(self) -> String {
         self.out
     }
 
+    #[inline]
     fn key(&mut self, key: &str) {
         self.out.push(' ');
         self.out.push_str(key);
@@ -245,6 +253,7 @@ pub struct JsonSink {
 }
 
 impl Default for JsonSink {
+    #[inline]
     fn default() -> Self {
         Self::new()
     }
@@ -253,6 +262,7 @@ impl Default for JsonSink {
 impl JsonSink {
     /// An empty object.
     #[must_use]
+    #[inline]
     pub fn new() -> Self {
         Self {
             out: String::from("{"),
@@ -262,11 +272,13 @@ impl JsonSink {
 
     /// The closed object.
     #[must_use]
+    #[inline]
     pub fn finish(mut self) -> String {
         self.out.push('}');
         self.out
     }
 
+    #[inline]
     fn key(&mut self, key: &str) {
         if !std::mem::take(&mut self.first) {
             self.out.push(',');
@@ -275,12 +287,14 @@ impl JsonSink {
         self.out.push(':');
     }
 
+    #[inline]
     fn string(&mut self, s: &str) {
         self.out.push('"');
         crate::json::escape_into(&mut self.out, s);
         self.out.push('"');
     }
 
+    #[inline]
     fn decimal_value(&mut self, d: Decimal) {
         if d.value.is_finite() {
             d.write(&mut self.out);

@@ -88,6 +88,7 @@ pub enum Reason {
 
 impl Reason {
     /// The bridge cap a keyframe for this reason is captured with.
+    #[inline]
     #[must_use]
     pub const fn bridge_cap(self) -> usize {
         match self {
@@ -161,27 +162,31 @@ impl KeyframePolicy {
     /// parse thread then waits for its next batch with a [`QUIET_MS`] timeout, and
     /// otherwise blocks. A session a K5 deferral parked is not dirty here, though its tail
     /// is past its keyframe (module doc).
+    #[inline]
     #[must_use]
-    pub fn dirty(&self) -> bool {
+    pub const fn dirty(&self) -> bool {
         self.dirty && !self.parked
     }
 
     /// A clear (ED3, RIS) reset the history ring: the next slice end or quiet wait forces
     /// a keyframe ([`Reason::Clear`]), after which the writer settles the clear.
-    pub fn note_clear(&mut self) {
+    #[inline]
+    pub const fn note_clear(&mut self) {
         self.clear_pending = true;
     }
 
     /// The host renumbered the engine's history with no output (an import attached older
     /// history): a keyframe is forced at the next slice end or quiet wait
     /// ([`Reason::Renumbered`]).
-    pub fn note_renumbered(&mut self) {
+    #[inline]
+    pub const fn note_renumbered(&mut self) {
         self.renumbered = true;
     }
 
     /// The host changed the engine-relevant config (stored as `config_fp`): a keyframe
     /// is forced at the next slice end or quiet wait.
-    pub fn note_config(&mut self, config_fp: u64) {
+    #[inline]
+    pub const fn note_config(&mut self, config_fp: u64) {
         self.config_fp = config_fp;
     }
 
@@ -189,21 +194,26 @@ impl KeyframePolicy {
     /// slice): the session is dirty from `now_ms`, so a quiet keyframe follows at the new
     /// geometry; a resize that changed the width or grew the rows (`regridded`) makes a K7
     /// keyframe due as soon as the pressure gap allows.
-    pub fn note_resize(&mut self, now_ms: u64, regridded: bool) {
+    #[inline]
+    pub const fn note_resize(&mut self, now_ms: u64, regridded: bool) {
         self.dirty = true;
         self.parked = false;
         self.last_batch_ms = now_ms;
         self.regrid_pending |= regridded;
     }
 
-    fn since_keyframe(&self, now_ms: u64) -> u64 {
-        self.last_keyframe_ms
-            .map_or(u64::MAX, |at| now_ms.saturating_sub(at))
+    #[inline]
+    const fn since_keyframe(&self, now_ms: u64) -> u64 {
+        match self.last_keyframe_ms {
+            Some(at) => now_ms.saturating_sub(at),
+            None => u64::MAX,
+        }
     }
 
     /// A forced or deferred keyframe, which no rate applies to. A pending clear comes
     /// first, so the keyframe its settle follows is never reported as another reason.
-    fn owed(&self) -> Option<Reason> {
+    #[inline]
+    const fn owed(&self) -> Option<Reason> {
         if self.clear_pending {
             Some(Reason::Clear)
         } else if self.config_fp != self.config_fp_at_keyframe {
@@ -262,7 +272,8 @@ impl KeyframePolicy {
 
     /// A keyframe was written at `now_ms`: the tail is rebased past everything so far,
     /// and the clear and config it was forced for are settled.
-    pub fn keyframe_written(&mut self, now_ms: u64) {
+    #[inline]
+    pub const fn keyframe_written(&mut self, now_ms: u64) {
         self.dirty = false;
         self.last_keyframe_ms = Some(now_ms);
         self.clear_pending = false;
@@ -279,7 +290,8 @@ impl KeyframePolicy {
     /// retried at the next slice end. The session PARKS until then: no quiet wait retries
     /// it, as nothing but new bytes moves the parser (module doc). The marks the deferred
     /// keyframe would have held stay counted until a later one commits.
-    pub fn keyframe_deferred(&mut self, reason: Reason) {
+    #[inline]
+    pub const fn keyframe_deferred(&mut self, reason: Reason) {
         self.deferred = Some(reason);
         self.parked = true;
     }
@@ -288,7 +300,8 @@ impl KeyframePolicy {
     /// can clear by itself (a slot too small for its bridge, which the writer drops for
     /// the retry): it is retried at the next slice end or quiet wait, and the session
     /// stays dirty.
-    pub fn keyframe_retry(&mut self, reason: Reason) {
+    #[inline]
+    pub const fn keyframe_retry(&mut self, reason: Reason) {
         self.deferred = Some(reason);
     }
 }

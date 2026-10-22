@@ -49,18 +49,21 @@ pub struct Bucket {
 
 impl Bucket {
     /// The mean reading; `None` when nothing was read.
+    #[inline]
     #[must_use]
     pub fn value(&self) -> Option<f64> {
         (self.n > 0).then(|| self.sum / f64::from(self.n))
     }
 
     /// Over for at least half its readings.
+    #[inline]
     #[must_use]
-    pub fn is_over(&self) -> bool {
-        self.n > 0 && u32::from(self.over_n) * 2 >= u32::from(self.n)
+    pub const fn is_over(&self) -> bool {
+        self.n > 0 && (self.over_n as u32) * 2 >= (self.n as u32)
     }
 
     /// The bucket as a strip cell.
+    #[inline]
     #[must_use]
     pub fn cell(&self) -> Cell {
         Cell {
@@ -70,6 +73,7 @@ impl Bucket {
         }
     }
 
+    #[inline]
     fn add(&mut self, v: f64, over: bool) {
         self.max = if self.n == 0 { v } else { self.max.max(v) };
         self.sum += v;
@@ -262,12 +266,14 @@ impl BucketRing {
     }
 
     /// The open bucket's key; `None` before the first push.
+    #[inline]
     #[must_use]
     pub fn open_k(&self) -> Option<i64> {
         (!self.b.is_empty()).then(|| self.first_k + self.b.len() as i64 - 1)
     }
 
     /// The bucket with key `k`, while the ring holds it.
+    #[inline]
     #[must_use]
     pub fn bucket(&self, k: i64) -> Option<&Bucket> {
         let i = usize::try_from(k.checked_sub(self.first_k)?).ok()?;
@@ -275,6 +281,7 @@ impl BucketRing {
     }
 
     /// Every bucket with its key, oldest first.
+    #[inline]
     pub fn iter(&self) -> impl DoubleEndedIterator<Item = (i64, &Bucket)> {
         let first = self.first_k;
         self.b
@@ -284,12 +291,14 @@ impl BucketRing {
     }
 
     /// How many buckets it holds (unread ones included).
+    #[inline]
     #[must_use]
     pub fn len(&self) -> usize {
         self.b.len()
     }
 
     /// Whether nothing was pushed yet.
+    #[inline]
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.b.is_empty()

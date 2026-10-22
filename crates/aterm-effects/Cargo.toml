@@ -42,6 +42,8 @@ aterm-time = { workspace = true }
 # The anchor attributes' registry (std-only): `#[cfg_attr(any(test, debug_assertions),
 # aterm_spec_anchor::refines(…))]` expands in every test and debug build; release strips it.
 aterm-spec-anchor = { workspace = true }
+# Aos hosted execution: the momentum glow's task schema, boundary publication and replay.
+aterm-aos = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
 # Native config-referenced visual feeds are opened O_NONBLOCK/O_NOFOLLOW on

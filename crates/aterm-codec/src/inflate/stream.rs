@@ -54,6 +54,7 @@ struct Cursor {
 }
 
 impl Cursor {
+    #[inline]
     const fn start() -> Self {
         Self {
             pos: 0,
@@ -62,7 +63,8 @@ impl Cursor {
         }
     }
 
-    fn reader<'a>(&self, data: &'a [u8]) -> BitReader<'a> {
+    #[inline]
+    const fn reader<'a>(&self, data: &'a [u8]) -> BitReader<'a> {
         BitReader {
             data,
             byte_pos: self.pos,
@@ -71,7 +73,8 @@ impl Cursor {
         }
     }
 
-    fn save(br: &BitReader<'_>) -> Self {
+    #[inline]
+    const fn save(br: &BitReader<'_>) -> Self {
         Self {
             pos: br.byte_pos,
             bits: br.bit_buffer,
@@ -82,6 +85,7 @@ impl Cursor {
     /// Index of the first input byte not yet spoken for: `pos` less the whole
     /// bytes still unread in the accumulator. After a member's final block this
     /// is where the gzip trailer starts; it is also the compaction floor.
+    #[inline]
     const fn byte_position(&self) -> usize {
         self.pos.saturating_sub((self.count / 8) as usize)
     }
@@ -135,7 +139,8 @@ struct Inflater {
 }
 
 impl Inflater {
-    fn new() -> Self {
+    #[inline]
+    const fn new() -> Self {
         Self {
             input: Vec::new(),
             cursor: Cursor::start(),
@@ -148,6 +153,7 @@ impl Inflater {
     }
 
     /// Bytes decoded but not yet handed to the caller.
+    #[inline]
     fn pending(&self) -> usize {
         self.out.len().saturating_sub(self.out_at)
     }
@@ -408,6 +414,7 @@ fn decode_one(
 }
 
 /// Map a decode failure onto an `io::Error` the way a decompressing reader must.
+#[inline]
 fn io_err(err: InflateError) -> io::Error {
     match err {
         InflateError::Truncated => {
@@ -446,7 +453,8 @@ pub struct DeflateReader<R> {
 
 impl<R: Read> DeflateReader<R> {
     /// Wrap `source`.
-    pub fn new(source: R) -> Self {
+    #[inline]
+    pub const fn new(source: R) -> Self {
         Self {
             source,
             inflater: Inflater::new(),
@@ -557,7 +565,8 @@ pub struct ZlibReader<R> {
 
 impl<R: Read> ZlibReader<R> {
     /// Wrap `source`.
-    pub fn new(source: R) -> Self {
+    #[inline]
+    pub const fn new(source: R) -> Self {
         Self {
             inner: DeflateReader::new(source),
             adler: Adler32::new(),
@@ -636,6 +645,7 @@ fn take_pending(inf: &mut Inflater, buf: &mut [u8], crc: Option<&mut Crc32>) -> 
 }
 
 /// Why a gzip stream was refused.
+#[inline]
 fn gz_err(msg: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, msg)
 }
@@ -758,7 +768,8 @@ pub struct GzipReader<R> {
 
 impl<R: Read> GzipReader<R> {
     /// Wrap `source`.
-    pub fn new(source: R) -> Self {
+    #[inline]
+    pub const fn new(source: R) -> Self {
         Self {
             source,
             frame: Vec::new(),

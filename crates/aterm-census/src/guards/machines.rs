@@ -11,9 +11,16 @@
 //! `agent::main`), would be root work outside that lane. `scutil --set` and system-domain
 //! `launchctl` writes have no literal a line rule can tell from their read-only uses, so the
 //! crate's own review keeps them.
+//!
+//! One spelling is not root work, and is admitted (owner ruling R1, 2026-10-22, recorded in
+//! the design's §3.6): atpkg's Rosetta 2 install, `softwareupdate --install-rosetta
+//! --agree-to-license`, which installs as the user who runs it, with no administrator
+//! (measured 2026-10-18 and 2026-10-21). It passes only as that whole argv array, in the one
+//! atpkg file that holds it ([`ROSETTA_INSTALL`]); `softwareupdate` with any other words, in
+//! any other shape or file, is still a finding.
 
 use super::rules::{CENSUS_CRATE, PRODUCT, test_path};
-use super::{Bound, Finding, Rule, SourceFile, Tree, has};
+use super::{Bound, Finding, Line, Rule, SourceFile, Tree, has};
 
 /// The one crate that may name them.
 const MACHINES_CRATE: &str = "crates/aterm-machines/";
@@ -35,12 +42,24 @@ const ROOT_TOOLS: &[&str] = &[
 /// The agent's module, named by path.
 const AGENT_PATH: &str = "aterm_machines::agent";
 
+/// The one admitted spelling (owner ruling R1): the file, the tool, and the whole argv the
+/// tool may appear in there, as the array literal's text with the whitespace between its
+/// tokens removed (a trailing comma before `]` is rustfmt's, and allowed).
+const ROSETTA_INSTALL: (&str, &str, &str) = (
+    "crates/atpkg/src/platform/unix.rs",
+    "/usr/sbin/softwareupdate",
+    r#"["/usr/sbin/softwareupdate","--install-rosetta","--agree-to-license"]"#,
+);
+
 pub(super) const MACHINES_ROOT_DOOR: Rule = Rule {
     id: "machines-root-door",
     why: "installer, softwareupdate, visudo, /etc/sudoers.d, pmset, socketfilterfw and \
           systemsetup act as root on a whole Mac: only aterm-machines' agent, under the \
           owner's ruling M1 and one digest-pinned sudoers rule, may name them, and nothing \
-          outside the crate reaches `aterm_machines::agent` past `cli::main_entry`",
+          outside the crate reaches `aterm_machines::agent` past `cli::main_entry`. The one \
+          exception is not root work (ruling R1): atpkg's Rosetta 2 install, the whole argv \
+          [\"/usr/sbin/softwareupdate\", \"--install-rosetta\", \"--agree-to-license\"] in \
+          crates/atpkg/src/platform/unix.rs, which installs as the user with no administrator",
     scope: &[MACHINES_CRATE],
     check: machines_root_door,
 };
@@ -55,8 +74,17 @@ fn machines_root_door(tree: &Tree<'_>, out: &mut Vec<Finding>) {
         }
         for line in file.shipped_lines() {
             let why = if let Some(tool) = ROOT_TOOLS.iter().find(|t| line.text.contains(*t)) {
+                if is_rosetta_install(file, &line, tool) {
+                    continue;
+                }
                 Some(format!(
-                    "names `{tool}`, a root tool only aterm-machines' agent runs"
+                    "names `{tool}`, a root tool only aterm-machines' agent runs{}",
+                    if *tool == ROSETTA_INSTALL.1 {
+                        " (atpkg's one exception is its Rosetta 2 install, as the whole argv \
+                         array in crates/atpkg/src/platform/unix.rs)"
+                    } else {
+                        ""
+                    }
                 ))
             } else if reaches_agent(line.code) {
                 Some(format!(
@@ -70,6 +98,70 @@ fn machines_root_door(tree: &Tree<'_>, out: &mut Vec<Finding>) {
             }
         }
     }
+}
+
+/// Whether `line`'s one root tool is ruling R1's Rosetta 2 install: in its one file, the
+/// line names no root tool but `softwareupdate`, once, as the first element of an array
+/// literal that is exactly [`ROSETTA_INSTALL`]'s argv, however rustfmt wraps it.
+fn is_rosetta_install(file: &SourceFile, line: &Line<'_>, tool: &str) -> bool {
+    let (rel, admitted, argv) = ROSETTA_INSTALL;
+    if file.rel != rel
+        || tool != admitted
+        || ROOT_TOOLS
+            .iter()
+            .any(|t| *t != admitted && line.text.contains(t))
+        || line.text.matches(admitted).count() != 1
+    {
+        return false;
+    }
+    let quoted = format!("\"{admitted}\"");
+    let Some(at) = line.text.find(&quoted) else {
+        return false;
+    };
+    let lines: Vec<&str> = file.lines().map(|l| l.text).collect();
+    let here = line.no - 1;
+    // The literal opens the array: the text before it, back over blank lines, ends in `[`.
+    let before = std::iter::once(&line.text[..at])
+        .chain(lines[..here].iter().rev().copied())
+        .map(str::trim_end)
+        .find(|t| !t.is_empty());
+    if before.is_none_or(|t| !t.ends_with('[')) {
+        return false;
+    }
+    // And the array, from its first element to its `]`, is the argv and nothing more.
+    let rest = std::iter::once(&line.text[at..])
+        .chain(lines[here + 1..].iter().take(8).copied())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let body = &argv[1..argv.len() - 1];
+    squeeze(&rest)
+        .strip_prefix(body)
+        .is_some_and(|tail| tail.starts_with(']') || tail.starts_with(",]"))
+}
+
+/// `text` with the whitespace outside string literals removed, so a statement reads the
+/// same however it is wrapped.
+fn squeeze(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut quoted = false;
+    let mut escaped = false;
+    for c in text.chars() {
+        if quoted {
+            out.push(c);
+            match (escaped, c) {
+                (true, _) => escaped = false,
+                (false, '\\') => escaped = true,
+                (false, '"') => quoted = false,
+                _ => {}
+            }
+        } else if c == '"' {
+            quoted = true;
+            out.push(c);
+        } else if !c.is_whitespace() {
+            out.push(c);
+        }
+    }
+    out
 }
 
 /// Product source this crate does not own (the census spells every name it bans).
@@ -138,6 +230,69 @@ mod tests {
                 "crates/aterm-machines-extra/src/lib.rs:1",
             ],
             "{found:#?}"
+        );
+    }
+
+    /// Ruling R1's one admitted spelling, and every near miss of it. Positive: the whole
+    /// argv array in atpkg's platform file, as rustfmt wraps it and on one line. Negative:
+    /// the same array in another file; in that file, `softwareupdate` with other words, an
+    /// extra word, a word missing, `sudo` before it, outside an array, a second tool on the
+    /// line, or a bare `command(...)` of it.
+    #[test]
+    fn only_the_rosetta_install_argv_in_atpkgs_platform_file_names_softwareupdate() {
+        let rel = ROSETTA_INSTALL.0;
+        let admitted = "/// The install.\n\
+                        const ROSETTA_INSTALL: [&str; 3] = [\n\
+                        \x20   \"/usr/sbin/softwareupdate\",\n\
+                        \x20   \"--install-rosetta\",\n\
+                        \x20   \"--agree-to-license\",\n\
+                        ];\n\
+                        const ONE_LINE: [&str; 3] = [\"/usr/sbin/softwareupdate\", \"--install-rosetta\", \"--agree-to-license\"];\n\
+                        // a comment naming /usr/sbin/softwareupdate says nothing\n";
+        let near_misses = "fn a() { let mut c = spawnfd::command(\"/usr/sbin/softwareupdate\"); }\n\
+                           const ALL: [&str; 3] = [\"/usr/sbin/softwareupdate\", \"--install\", \"--all\"];\n\
+                           const MORE: [&str; 4] = [\"/usr/sbin/softwareupdate\", \"--install-rosetta\", \"--agree-to-license\", \"--restart\"];\n\
+                           const LESS: [&str; 2] = [\"/usr/sbin/softwareupdate\", \"--install-rosetta\"];\n\
+                           const SUDO: [&str; 4] = [\"/usr/bin/sudo\", \"/usr/sbin/softwareupdate\", \"--install-rosetta\", \"--agree-to-license\"];\n\
+                           fn b() { run(\"/usr/sbin/softwareupdate\", \"--install-rosetta\", \"--agree-to-license\"); }\n\
+                           const TWO: [&str; 3] = [\"/usr/sbin/softwareupdate\", \"--install-rosetta\", \"--agree-to-license\"]; const I: &str = \"/usr/sbin/installer\";\n\
+                           const TWICE: [&str; 3] = [\"/usr/sbin/softwareupdate\", \"--install-rosetta\", \"--agree-to-license\"]; const S: &str = \"/usr/sbin/softwareupdate\";\n\
+                           const SPACED: [&str; 3] = [\"/usr/sbin/softwareupdate\", \"--install-rosetta \", \"--agree-to-license\"];\n";
+        // The admitted text alone: nothing.
+        assert!(
+            run(&MACHINES_ROOT_DOOR, &[(rel, admitted)]).is_empty(),
+            "the admitted argv, wrapped and on one line"
+        );
+        let found = run(
+            &MACHINES_ROOT_DOOR,
+            &[
+                (rel, &format!("{admitted}{near_misses}")),
+                ("crates/atpkg/src/machine.rs", admitted),
+            ],
+        );
+        assert_eq!(
+            spots(&found),
+            [
+                "crates/atpkg/src/machine.rs:3",
+                "crates/atpkg/src/machine.rs:7",
+                "crates/atpkg/src/platform/unix.rs:9",
+                "crates/atpkg/src/platform/unix.rs:10",
+                "crates/atpkg/src/platform/unix.rs:11",
+                "crates/atpkg/src/platform/unix.rs:12",
+                "crates/atpkg/src/platform/unix.rs:13",
+                "crates/atpkg/src/platform/unix.rs:14",
+                "crates/atpkg/src/platform/unix.rs:15",
+                "crates/atpkg/src/platform/unix.rs:16",
+                "crates/atpkg/src/platform/unix.rs:17",
+            ],
+            "{found:#?}"
+        );
+        assert!(
+            found
+                .iter()
+                .filter(|f| f.detail.contains("softwareupdate"))
+                .all(|f| f.detail.contains("one exception is its Rosetta 2 install")),
+            "a refused spelling names the admitted one: {found:#?}"
         );
     }
 }

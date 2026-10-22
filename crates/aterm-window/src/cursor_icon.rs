@@ -55,7 +55,8 @@ pub enum CursorIcon {
 
 impl CursorIcon {
     /// The icon's CSS `cursor` keyword, which is also its name in a freedesktop cursor theme.
-    pub fn name(&self) -> &'static str {
+    #[inline]
+    pub const fn name(&self) -> &'static str {
         match self {
             CursorIcon::Default => "default",
             CursorIcon::Pointer => "pointer",
@@ -76,7 +77,8 @@ impl CursorIcon {
 
     /// Names the icon has in legacy Xcursor themes, to try in order when a theme has no icon
     /// under [`name`](Self::name).
-    pub fn alt_names(&self) -> &'static [&'static str] {
+    #[inline]
+    pub const fn alt_names(&self) -> &'static [&'static str] {
         match self {
             CursorIcon::Default => &["left_ptr", "arrow", "top_left_arrow", "left_arrow"],
             CursorIcon::Pointer => &["hand2", "hand1", "hand", "pointing_hand"],

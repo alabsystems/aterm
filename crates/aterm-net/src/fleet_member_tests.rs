@@ -3208,11 +3208,11 @@ impl Answer {
 const DRIBBLE_BYTES: usize = 4_000;
 
 /// A loopback fleet listener serving `survey` at `scope`, which answers the
-/// request as its [`Answer`] says; stopped on drop.
+/// request as its [`Answer`] says; told to stop on drop ([`Naming`]'s drop says
+/// why it is not joined).
 struct Answering {
     port: u16,
     running: Arc<AtomicBool>,
-    serving: Option<std::thread::JoinHandle<()>>,
 }
 
 impl Answering {
@@ -3230,7 +3230,7 @@ impl Answering {
             per_source: AT_ONCE,
             lifetime: HANG,
         };
-        let serving = std::thread::spawn({
+        std::thread::spawn({
             let running = Arc::clone(&running);
             move || {
                 serve(
@@ -3309,20 +3309,13 @@ impl Answering {
                 );
             }
         });
-        Self {
-            port,
-            running,
-            serving: Some(serving),
-        }
+        Self { port, running }
     }
 }
 
 impl Drop for Answering {
     fn drop(&mut self) {
         self.running.store(false, Ordering::Release);
-        if let Some(serving) = self.serving.take() {
-            let _ = serving.join();
-        }
     }
 }
 
@@ -3602,10 +3595,9 @@ fn at_once_holds_its_limit_and_its_order() {
 
 /// A fleet listener on `listener` that answers every `survey` with a header
 /// naming `node` (or with the lines it is given, [`Naming::replying`]);
-/// stopped on drop.
+/// told to stop on drop.
 struct Naming {
     running: Arc<AtomicBool>,
-    serving: Option<std::thread::JoinHandle<()>>,
     /// How many surveys it was asked.
     asked: Arc<AtomicUsize>,
 }
@@ -3649,7 +3641,7 @@ impl Naming {
             per_source: 8,
             lifetime: HANG,
         };
-        let serving = std::thread::spawn({
+        std::thread::spawn({
             let (running, asked) = (Arc::clone(&running), Arc::clone(&asked));
             move || {
                 serve(
@@ -3673,11 +3665,7 @@ impl Naming {
                 );
             }
         });
-        Self {
-            running,
-            serving: Some(serving),
-            asked,
-        }
+        Self { running, asked }
     }
 
     fn asked(&self) -> usize {
@@ -3685,12 +3673,15 @@ impl Naming {
     }
 }
 
+/// Told to stop, not joined: `serve` looks at `running` once per `ACCEPT_POLL`
+/// (200 ms) of an idle listener, and ends with its listener by then. Joined, each
+/// peer a test dropped cost that poll: 17 in
+/// [`a_proven_peer_is_read_only_as_the_node_it_proved`] (3.2 s alone, nearly all of
+/// it in these joins), seven in [`survey_all_answers_each_peer_within_one_deadline`].
+/// Nothing reads a peer after its drop, and every later peer binds a port of its own.
 impl Drop for Naming {
     fn drop(&mut self) {
         self.running.store(false, Ordering::Release);
-        if let Some(serving) = self.serving.take() {
-            let _ = serving.join();
-        }
     }
 }
 

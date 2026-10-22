@@ -22,15 +22,14 @@ use aterm_core::terminal::CursorStyle;
 use aterm_render::{GlowQuad, TrailCell};
 use aterm_time::Instant;
 
+use crate::aos_momentum::MomentumHost;
 use crate::cursor_beam::{BeamRodConfig, CursorBeamRod};
 use crate::cursor_comet::{CometConfig, CursorComet};
 use crate::cursor_droplet::{CursorDroplet, DropletConfig};
 use crate::cursor_glow::{
     BlockFill, BlockFillBase, BlockFillOwner, CursorGlow, Geom, GlowConfig, GlowStyle, OverInkTier,
 };
-use crate::cursor_momentum::{
-    MOMENTUM_GLOW_RADIUS_CELLS, MOMENTUM_GLOW_TAU_S, MomentumGlow, MomentumGlowConfig,
-};
+use crate::cursor_momentum::{MOMENTUM_GLOW_RADIUS_CELLS, MOMENTUM_GLOW_TAU_S, MomentumGlowConfig};
 use crate::cursor_phaser::{CursorPhaser, PhaserConfig};
 use crate::cursor_rainbow::{CursorRainbow, RainbowConfig};
 use crate::cursor_trail::{CursorTrail, TrailConfig, TypingCadence};
@@ -56,8 +55,9 @@ pub struct CursorFx {
     /// The `water` block body.
     pub droplet: CursorDroplet,
     /// The typing-momentum glow — every style, every shape, unless the rainbow
-    /// owns the caret.
-    pub momentum: MomentumGlow,
+    /// owns the caret. The shipped engine directly, or the Aos-hosted pair once
+    /// attached; nothing reaches the engine except through it.
+    pub momentum: MomentumHost,
     /// The light rod — the bar shape of every style, and the emitter block of
     /// the styles with no bespoke body.
     pub beamrod: CursorBeamRod,
@@ -1204,7 +1204,7 @@ impl CursorFx {
     /// A body that still owes frames but not the frame cadence, once its
     /// fingerprint stops moving frame to frame: the rainbow caret's colour
     /// release ([`CursorRainbow::settling`]) and the momentum glow's
-    /// cool-down ([`MomentumGlow::settling`]). Disjoint from
+    /// cool-down ([`MomentumHost::settling`]). Disjoint from
     /// [`Self::bodies_active`]; a host paces it by
     /// [`Self::bodies_next_change_deadline`] on its coarse one-shot arm.
     #[inline]
@@ -1215,7 +1215,7 @@ impl CursorFx {
 
     /// The earliest next visible step of the settling bodies (see
     /// [`CursorRainbow::next_change_deadline`] and
-    /// [`MomentumGlow::next_change_deadline`]), `None` when none is settling.
+    /// [`MomentumHost::next_change_deadline`]), `None` when none is settling.
     /// `&mut` because the rainbow's is a memoised dry run of its tick.
     #[inline]
     #[must_use]

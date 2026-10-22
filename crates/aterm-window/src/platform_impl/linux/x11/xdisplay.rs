@@ -11,7 +11,8 @@
 // first-party `aterm-x11`'s, where upstream used x11-dl and x11rb:
 // docs/AUDIT-third-party-2026-10-15.md, LW.7. With no XSETTINGS manager there is no window
 // to watch, and none is asked for: upstream selected events on window 0 and took the
-// BadWindow, which the lane's X11 wire trace showed on every start, X11-TRACE.)
+// BadWindow, which the lane's X11 wire trace showed on every start, X11-TRACE. Where the server
+// has SYNC, it is initialised for the windows' resize sync counters, `sync_request.rs`.)
 
 use std::collections::HashMap;
 use std::error::Error;
@@ -19,12 +20,12 @@ use std::ffi::OsString;
 use std::os::unix::ffi::OsStringExt as _;
 use std::path::PathBuf;
 use std::ptr::NonNull;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, RwLock, RwLockReadGuard};
 use std::{fmt, ptr};
 
 use aterm_x11::proto::xproto::{self, cw, event_mask};
-use aterm_x11::proto::{atom, randr, xinput, Reply, Request, ValueList, Void};
+use aterm_x11::proto::{atom, randr, sync, xinput, Reply, Request, ValueList, Void};
 use aterm_x11::xrm::{self, Database};
 
 use crate::window::CursorIcon;
@@ -32,6 +33,7 @@ use crate::window::CursorIcon;
 use super::atoms::Atoms;
 use super::ffi;
 use super::monitor::MonitorHandle;
+use super::util::CursorFollow;
 use super::{VoidCookie, X11Error};
 
 /// The XKEYBOARD extension's name; aterm-x11 encodes none of its requests (Xlib's
@@ -78,11 +80,27 @@ pub struct XConnection {
     /// XInput's major opcode.
     xinput_major: u8,
 
+    /// GLX's major opcode, where the server has GLX: an X error a GLX request raised is the GL
+    /// renderer's, which reads its failures from GLX's own answers, so the error handler keeps
+    /// it out of `latest_error`, where a later window call would take it for its own.
+    pub glx_major: Option<u8>,
+
+    /// SYNC's major opcode, where the server has SYNC 3.0 or later: each window then offers its
+    /// window manager a resize sync counter (`sync_request.rs`).
+    sync_major: Option<u8>,
+
     /// Atom for the XSettings screen.
     xsettings_screen: Option<xproto::Atom>,
 
     pub latest_error: Mutex<Option<XError>>,
     pub cursor_cache: Mutex<HashMap<CursorIcon, ffi::Cursor>>,
+    /// The last resource id admitted for a DND conversion. The display outlives event loops:
+    /// a later loop must not reuse a requestor an earlier source still names.
+    dnd_requestor_high: AtomicU32,
+
+    /// How the cursors follow the resource database's theme and size
+    /// (`follow_cursor_settings`).
+    pub(crate) cursor_follow: Mutex<CursorFollow>,
 }
 
 unsafe impl Send for XConnection {}
@@ -156,7 +174,7 @@ impl XConnection {
         {
             Ok(version) => version,
             Err(aterm_x11::Error::X11(_)) => {
-                return Err(XNotSupported::MissingExtension(Requirement::XInput2))
+                return Err(XNotSupported::MissingExtension(Requirement::XInput2));
             },
             Err(e) => return Err(failed(e)),
         };
@@ -164,6 +182,8 @@ impl XConnection {
             return Err(XNotSupported::MissingExtension(Requirement::XInput2));
         }
         present(XKB_EXTENSION_NAME)?;
+        let glx_major = xcb.extension(b"GLX").ok().flatten().map(|info| info.major_opcode);
+        let sync_major = sync_major(&xcb);
 
         let xsettings_screen = Self::new_xsettings_screen(&xcb, default_screen);
         if xsettings_screen.is_none() {
@@ -183,12 +203,16 @@ impl XConnection {
             default_screen,
             latest_error: Mutex::new(None),
             monitor_handles: Mutex::new(None),
+            cursor_follow: Mutex::new(CursorFollow::new(&database)),
             database: RwLock::new(database),
             cursor_cache: Default::default(),
             randr_major,
             randr_version: (randr_version.major_version, randr_version.minor_version),
             xinput_major,
+            glx_major,
+            sync_major,
             xsettings_screen,
+            dnd_requestor_high: AtomicU32::new(0),
         })
     }
 
@@ -268,10 +292,59 @@ impl XConnection {
         self.xinput_major
     }
 
+    /// SYNC's major opcode, which its requests carry; `None` where the server lacks SYNC 3.
+    #[inline]
+    pub fn sync_major(&self) -> Option<u8> {
+        self.sync_major
+    }
+
     /// Get the underlying XCB connection.
     #[inline]
     pub fn xcb_connection(&self) -> &aterm_x11::Connection {
         self.xcb.as_ref().expect("xcb_connection somehow called after drop?")
+    }
+
+    /// A conversion's never-reused requestor id on this display. Refuse a wrap or an allocator
+    /// returning an earlier id; remembering only the current drag would admit an old owner.
+    pub(super) fn dnd_requestor_id(&self) -> Result<u32, X11Error> {
+        let id = self.xcb_connection().generate_id()?;
+        let mut high = self.dnd_requestor_high.load(Ordering::Relaxed);
+        loop {
+            if id <= high {
+                return Err(aterm_x11::Error::IdsExhausted.into());
+            }
+            match self.dnd_requestor_high.compare_exchange_weak(
+                high,
+                id,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(observed) => high = observed,
+            }
+        }
+        Ok(id)
+    }
+
+    /// Exercise the real allocation refusal through the event-loop drop handler. While MAX
+    /// is installed no requestor id can be admitted, so restoring the prior admitted high
+    /// water is sound, including on unwind; no requestor is created or reused by the guard.
+    #[cfg(test)]
+    pub(super) fn with_dnd_requestors_refused<R>(&self, run: impl FnOnce() -> R) -> R {
+        struct Restore<'a> {
+            high: &'a AtomicU32,
+            previous: u32,
+        }
+        impl Drop for Restore<'_> {
+            fn drop(&mut self) {
+                self.high.store(self.previous, Ordering::Relaxed);
+            }
+        }
+        let _restore = Restore {
+            high: &self.dnd_requestor_high,
+            previous: self.dnd_requestor_high.swap(u32::MAX, Ordering::Relaxed),
+        };
+        run()
     }
 
     /// Send a request the server does not answer; its cookie holds its error.
@@ -329,6 +402,16 @@ impl fmt::Debug for XConnection {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         self.display.fmt(f)
     }
+}
+
+/// SYNC's major opcode, once Initialize (which the protocol asks for before any other SYNC
+/// request) has answered with version 3 or later, which has the counters; `None` where the
+/// server has no SYNC or an older one, or the requests fail. Nothing needs it to start: a window
+/// without a counter is one without the resize sync protocol.
+fn sync_major(xcb: &aterm_x11::Connection) -> Option<u8> {
+    let major = xcb.extension(sync::NAME).ok().flatten()?.major_opcode;
+    let version = xcb.send(sync::initialize(major, 3, 1)).ok()?.reply().ok()?;
+    (version.major_version >= 3).then_some(major)
 }
 
 /// The resource database as Xlib's `XrmGetDatabase` would build it, the order x11rb's
@@ -419,7 +502,7 @@ impl ConnectionEnd {
     ) -> Option<ConnectionEnd> {
         let seen = match status {
             Err(error) if !error.is_transport_failure() => {
-                return Some(ConnectionEnd::Closed(error))
+                return Some(ConnectionEnd::Closed(error));
             },
             Err(_) => "a read or write on the X server's socket failed (XCB_CONN_ERROR)",
             Ok(()) if xlib_io_error => "Xlib found the X server's connection broken (its IO error)",
@@ -666,6 +749,23 @@ mod tests {
 
     use super::{socket_end, ConnectionEnd};
 
+    /// [`socket_end`] once a closed peer's close has reached `fd`. A child another test forks
+    /// while the peer is open holds a copy of it until its exec closes it (`SOCK_CLOEXEC`), and
+    /// only then does the close come here: one run in 40 of the crate's suite, beside
+    /// `gone_tests`' children, read the closed peer as live. A wait for what must happen, so a
+    /// one-minute hang detector.
+    fn once_closed(fd: std::os::raw::c_int) -> std::io::Error {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        loop {
+            let end = socket_end(fd, "the witness");
+            if end.to_string() != "the witness" {
+                return end;
+            }
+            assert!(std::time::Instant::now() < deadline, "the peer's close never came");
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+
     /// A socket with nothing to say: the witness's word stands.
     fn witness(seen: &'static str) -> std::io::Error {
         std::io::Error::other(seen)
@@ -714,13 +814,13 @@ mod tests {
         assert_eq!(quiet.kind(), ErrorKind::Other, "{quiet}");
         assert_eq!(quiet.to_string(), "the witness");
         drop(server);
-        let closed = socket_end(ours.as_raw_fd(), "the witness");
+        let closed = once_closed(ours.as_raw_fd());
         assert_eq!(closed.kind(), ErrorKind::UnexpectedEof, "{closed}");
 
         let (mut ours, server) = UnixStream::pair().expect("socketpair");
         ours.write_all(b"a request").expect("write");
         drop(server);
-        let reset = socket_end(ours.as_raw_fd(), "the witness");
+        let reset = once_closed(ours.as_raw_fd());
         assert_eq!(reset.raw_os_error(), Some(libc::ECONNRESET), "{reset}");
 
         let (ours, mut server) = UnixStream::pair().expect("socketpair");

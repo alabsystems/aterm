@@ -410,15 +410,20 @@ impl ShowcaseCard {
     }
 
     /// Whether the chooser's filter `query` (lowercased, trimmed) admits the
-    /// row: its name, id, description, appearance or section words, by the
-    /// ladder Settings search and the theme picker use. An empty query admits
-    /// every row.
-    pub(crate) fn matches(&self, query: &str) -> bool {
+    /// row at `reach` (the filter's over the whole list:
+    /// `ShowcaseState::reach_for`): its name, id, description, appearance or
+    /// section words, by the ladder Settings search and the theme picker use.
+    /// An empty query admits every row.
+    pub(crate) fn matches(
+        &self,
+        query: &str,
+        reach: crate::native_config_language::MatchReach,
+    ) -> bool {
         if query.is_empty() {
             return true;
         }
         let matches = |candidate: &str| {
-            crate::native_config_language::candidate_match_score(candidate, query).is_some()
+            crate::native_config_language::candidate_match_score(candidate, query, reach).is_some()
         };
         self.search.iter().any(|candidate| matches(candidate)) || matches(self.appearance_word())
     }

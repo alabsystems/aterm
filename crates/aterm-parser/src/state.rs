@@ -90,6 +90,7 @@ impl State {
 
     /// The state's name (its `Debug` form) as a static string, so a caller
     /// outside this crate can report a state without allocating.
+    #[inline]
     #[must_use]
     pub const fn name(self) -> &'static str {
         match self {

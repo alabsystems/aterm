@@ -34,6 +34,7 @@ pub(super) struct ResetGroups<'a> {
 }
 
 impl ResetGroups<'_> {
+    #[inline]
     fn reset(&mut self) {
         self.kitty_keyboard.reset();
         self.xterm_keyboard.reset();
@@ -59,6 +60,7 @@ impl ResetGroups<'_> {
 /// capability the host declared absent (kitty) or claim one it never declared
 /// (win32-input), or flip host display state (CJK ambiguous width, the announced colour
 /// scheme, reconciled after the reset). The one list for both reset paths.
+#[inline]
 fn reset_modes(prev: &TerminalModes) -> TerminalModes {
     TerminalModes {
         allow_osc52_query: prev.allow_osc52_query,

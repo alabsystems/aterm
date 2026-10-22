@@ -46,7 +46,8 @@ pub struct HistoryFence {
 impl HistoryFence {
     /// How many history lines the fence spans.
     #[must_use]
-    pub fn lines(&self) -> u64 {
+    #[inline]
+    pub const fn lines(&self) -> u64 {
         self.end.saturating_sub(self.oldest)
     }
 
@@ -55,7 +56,8 @@ impl HistoryFence {
     /// since, same width, neither side detached, and the absolute counter has
     /// not gone backwards (a replaced grid starts it over).
     #[must_use]
-    pub fn holds_at(&self, now: &HistoryFence) -> bool {
+    #[inline]
+    pub const fn holds_at(&self, now: &HistoryFence) -> bool {
         !self.detached
             && !now.detached
             && self.renumber_epoch == now.renumber_epoch
@@ -141,13 +143,15 @@ impl OlderHistory {
 
     /// How many lines the built store holds (after any rewrap).
     #[must_use]
-    pub fn lines(&self) -> usize {
+    #[inline]
+    pub const fn lines(&self) -> usize {
         self.lines
     }
 
     /// The width the lines are wrapped at.
     #[must_use]
-    pub fn cols(&self) -> u16 {
+    #[inline]
+    pub const fn cols(&self) -> u16 {
         self.cols
     }
 }
@@ -194,6 +198,7 @@ impl std::fmt::Display for OlderHistoryRefusal {
 impl Grid {
     /// The fence a history export of this grid is taken on. A pure read.
     #[must_use]
+    #[inline]
     pub fn history_fence(&self) -> HistoryFence {
         HistoryFence {
             renumber_epoch: self.storage.history_renumber_epoch,

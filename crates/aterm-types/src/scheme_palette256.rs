@@ -108,6 +108,7 @@ pub fn generated_extended_palette(
 
 /// A cube level's interpolation fraction.
 // Skip: f64 arithmetic — the float-interval lane.
+#[inline]
 #[cfg_attr(trust_verify, trust::skip)]
 fn level_t(v: usize) -> f64 {
     f64::from(XTERM_CUBE_LEVELS[v % 6]) / 255.0
@@ -155,6 +156,7 @@ fn grey_slot(black: &(f64, f64, f64), white: &(f64, f64, f64), i: usize) -> Rgb 
     clippy::unreadable_literal,
     reason = "the published OkLab inverse matrices, digit for digit"
 )]
+#[inline]
 #[must_use]
 // Skip: f64 transcendental bodies absent; pure, total, no indexing.
 #[cfg_attr(trust_verify, trust::skip)]

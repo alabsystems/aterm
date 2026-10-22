@@ -37,6 +37,7 @@ const CHUNK_FRAMING: usize = 12;
 /// code (9 bits; a match never costs more per byte it covers). `None` when the
 /// geometry overflows.
 #[must_use]
+#[inline]
 pub fn max_encoded_len(width: u32, height: u32, color_type: ColorType) -> Option<usize> {
     let stride = row_bytes(width, color_type.samples(), BitDepth::Eight.bits())?;
     let filtered = stride.checked_add(1)?.checked_mul(height as usize)?;
@@ -61,6 +62,7 @@ pub fn max_encoded_len(width: u32, height: u32, color_type: ColorType) -> Option
 /// grows), and the compressor's fixed state. `None` when the geometry
 /// overflows.
 #[must_use]
+#[inline]
 pub fn encoder_scratch_len(width: u32, color_type: ColorType) -> Option<usize> {
     let stride = row_bytes(width, color_type.samples(), BitDepth::Eight.bits())?;
     let rows = stride.checked_mul(5)?.checked_add(1)?;
@@ -76,6 +78,7 @@ pub fn encoder_scratch_len(width: u32, color_type: ColorType) -> Option<usize> {
 /// accumulator's partial byte, the end-of-block code with its pad, and the
 /// Adler-32, so `finish` (at most the held-back lookahead and that tail) fits
 /// the same room. `None` when the geometry overflows.
+#[inline]
 fn pending_capacity(stride: usize) -> Option<usize> {
     let row_out = stride
         .checked_add(1 + deflate::LOOKAHEAD)?
@@ -99,7 +102,8 @@ pub struct Encoder<W: Write> {
 
 impl<W: Write> Encoder<W> {
     /// Start a `width` x `height` PNG. Defaults to 8-bit grayscale.
-    pub fn new(sink: W, width: u32, height: u32) -> Self {
+    #[inline]
+    pub const fn new(sink: W, width: u32, height: u32) -> Self {
         Self {
             sink,
             width,
@@ -113,27 +117,32 @@ impl<W: Write> Encoder<W> {
     }
 
     /// Set the sample layout.
-    pub fn set_color(&mut self, color_type: ColorType) {
+    #[inline]
+    pub const fn set_color(&mut self, color_type: ColorType) {
         self.color_type = color_type;
     }
 
     /// Set the bits per sample.
-    pub fn set_depth(&mut self, bit_depth: BitDepth) {
+    #[inline]
+    pub const fn set_depth(&mut self, bit_depth: BitDepth) {
         self.bit_depth = bit_depth;
     }
 
     /// Declare an `sRGB` chunk with this rendering intent.
-    pub fn set_source_srgb(&mut self, intent: SrgbRenderingIntent) {
+    #[inline]
+    pub const fn set_source_srgb(&mut self, intent: SrgbRenderingIntent) {
         self.srgb = Some(intent);
     }
 
     /// Set the `PLTE` palette (RGB triples). Required for
     /// [`ColorType::Indexed`].
+    #[inline]
     pub fn set_palette(&mut self, palette: impl Into<Vec<u8>>) {
         self.palette = Some(palette.into());
     }
 
     /// Set the `tRNS` chunk (per-index alpha for an indexed image).
+    #[inline]
     pub fn set_trns(&mut self, trns: impl Into<Vec<u8>>) {
         self.trns = Some(trns.into());
     }
@@ -450,6 +459,7 @@ fn write_full_idat_chunks<W: Write>(
 }
 
 /// Map an I/O result into the encoder's error type.
+#[inline]
 fn io(r: std::io::Result<()>) -> Result<(), EncodingError> {
     r.map_err(|e| EncodingError::Io(e.kind()))
 }
@@ -506,6 +516,7 @@ impl RowFilter {
 }
 
 /// Apply one PNG filter to a row (the forward direction of `decode::unfilter`).
+#[inline]
 fn apply_filter(kind: u8, cur: &[u8], prev: &[u8], bpp: usize, out: &mut [u8]) {
     match kind {
         0 => out.copy_from_slice(cur),

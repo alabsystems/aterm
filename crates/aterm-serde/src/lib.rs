@@ -32,8 +32,8 @@
 /// A facade around all the types we need from `std`. This avoids elaborate
 /// import wrangling having to happen in every module.
 mod lib {
-    pub use std::{cmp, mem, ptr, slice, str};
     pub use std::{f32, f64};
+    pub use std::{mem, ptr, slice, str};
 
     pub use std::borrow::{Cow, ToOwned};
     pub use std::boxed::Box;

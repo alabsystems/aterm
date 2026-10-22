@@ -14,8 +14,11 @@
 /// glyph, collapsing NUL/control chars to a space. Shared so the push face
 /// produces byte-identical rows to the poll face.
 #[must_use]
-pub fn visible_char(ch: char) -> char {
-    if ch == '\0' || ch.is_control() {
+#[inline]
+pub const fn visible_char(ch: char) -> char {
+    // NUL and the rest of `char::is_control` (general category Cc), spelled
+    // out: `is_control` is not a `const fn` on stable Rust.
+    if matches!(ch, '\u{0}'..='\u{1f}' | '\u{7f}'..='\u{9f}') {
         ' '
     } else {
         ch
@@ -71,6 +74,7 @@ fn show_tail(out: &mut String, start: usize, trim: VisibleTrim) {
 /// appends nothing for it. A raw line and its shown form answer alike, so a
 /// reply can count its blank tail before it frames a row.
 #[must_use]
+#[inline]
 pub fn is_blank_row(row: &str) -> bool {
     row.chars().all(|c| visible_char(c).is_whitespace())
 }
@@ -139,6 +143,7 @@ pub const WAIT_MAX_MS: u64 = 600_000;
 
 /// Clamp a wait duration in milliseconds to `[0, WAIT_MAX_MS]`.
 #[must_use]
+#[inline]
 pub const fn clamp_wait_ms(ms: u64) -> u64 {
     if ms > WAIT_MAX_MS { WAIT_MAX_MS } else { ms }
 }
@@ -146,6 +151,7 @@ pub const fn clamp_wait_ms(ms: u64) -> u64 {
 /// Resolve an optional `<ms>` wait parameter to [`WAIT_DEFAULT_MS`] when `None`
 /// or `clamp_wait_ms(ms)` when `Some(ms)`.
 #[must_use]
+#[inline]
 pub const fn resolve_wait_timeout_ms(requested: Option<u64>) -> u64 {
     match requested {
         Some(ms) => clamp_wait_ms(ms),
@@ -155,12 +161,14 @@ pub const fn resolve_wait_timeout_ms(requested: Option<u64>) -> u64 {
 
 /// Return `true` iff `ms <= WAIT_MAX_MS`.
 #[must_use]
+#[inline]
 pub const fn wait_within_bounds(ms: u64) -> bool {
     ms <= WAIT_MAX_MS
 }
 
 /// Bound one park slice of a waiting verb by `poll_ms` (flooring `poll_ms` at `1`).
 #[must_use]
+#[inline]
 pub const fn hangup_slice_ms(remaining_ms: u64, poll_ms: u64) -> u64 {
     let p = if poll_ms == 0 { 1 } else { poll_ms };
     if remaining_ms < p { remaining_ms } else { p }
@@ -172,6 +180,7 @@ pub const fn hangup_slice_ms(remaining_ms: u64, poll_ms: u64) -> u64 {
 /// whole 30 s default where `turn timeout=2s` and `await consent timeout=2s`
 /// refused it. One reading, so the family cannot disagree again.
 #[must_use]
+#[inline]
 pub fn wait_ms(token: &str) -> Option<u64> {
     token.parse::<u64>().ok().map(clamp_wait_ms)
 }
@@ -218,6 +227,16 @@ pub fn json_ok(body: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `visible_char` spells out `char::is_control` (not a `const fn` on
+    /// stable Rust): a control character, and only one, shows as a space.
+    #[test]
+    fn visible_char_blanks_exactly_the_control_characters() {
+        for c in (0..=u32::from(char::MAX)).filter_map(char::from_u32) {
+            let shown = if c.is_control() { ' ' } else { c };
+            assert_eq!(visible_char(c), shown, "{c:?}");
+        }
+    }
 
     #[test]
     fn json_member_keeps_arbitrary_keys_and_values_in_one_member() {

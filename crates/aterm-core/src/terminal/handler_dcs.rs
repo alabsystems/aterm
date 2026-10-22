@@ -151,6 +151,7 @@ impl TerminalHandler<'_> {
 
     /// Append the leading prefix of `data` that fits under `cap` into
     /// `dcs.data` — the bulk equivalent of the per-byte `len() < cap` push.
+    #[inline]
     fn push_dcs_data_capped(&mut self, data: &[u8], cap: usize) {
         let n = data.len().min(cap.saturating_sub(self.dcs.data.len()));
         if n > 0 {

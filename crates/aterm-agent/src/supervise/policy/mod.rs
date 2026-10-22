@@ -20,6 +20,9 @@
 //! * [`box_call`]: transcript candidates matching a box's possible tool and
 //!   file, which lift a settings hold only where the screen draws the box
 //!   under the Edit tool's own call row too.
+//! * [`box_command`]: the command a barred Bash box draws, taken from the
+//!   agent's transcript as its one pending Bash call and proven by drawing it
+//!   again, row for row, as the box's own rows.
 //! * [`git_config`]: what a git read would load that can run a program.
 //! * [`probe`]: the one door the approval policy looks at the machine by
 //!   ([`PolicyProbe`]), at the level of what it concluded — so a harness tape
@@ -47,6 +50,7 @@
 
 pub mod approval;
 pub mod box_call;
+pub mod box_command;
 pub mod box_facts;
 pub mod claude_settings;
 pub mod exception;
@@ -69,11 +73,12 @@ pub mod turn_end;
 pub use approval::{
     Answer, AnswerTarget, ApprovalCtx, Choice, DECLINE_PREFIX, Decision, DeclineStep,
     QuestionPriority, REFUSAL_LABEL, RULE_ALLOW_ONCE, RULE_ANSWER_LONG_TERM,
-    RULE_ANSWER_SHORT_TERM, RULE_DECLINE, RULE_LIMIT_RESET, RULE_MODEL_CONFIRM, RULE_MODEL_SWITCH,
-    RULE_NO_SPEND, RULE_PLAN, RULE_PROSE_LONG_TERM, RULE_PROSE_SHORT_TERM, RULE_READ_ONLY,
-    RULE_READ_OUTSIDE_CWD, RULE_RM_BREAKER, RULE_RM_BREAKER_WARN, RULE_TALL_BOX, RULE_TRUST_ANY,
-    RULE_TRUST_DIALOG, SecretRule, buys, decide, decide_screen, decide_traced, decline,
-    decline_step, decline_text, default_secrets, footer_mode, rm_breaker_label, roots_from_config,
+    RULE_ANSWER_SHORT_TERM, RULE_BREAKER_READ_ONLY, RULE_DECLINE, RULE_LIMIT_RESET,
+    RULE_MODEL_CONFIRM, RULE_MODEL_SWITCH, RULE_NO_SPEND, RULE_PLAN, RULE_PROSE_LONG_TERM,
+    RULE_PROSE_SHORT_TERM, RULE_READ_ONLY, RULE_READ_OUTSIDE_CWD, RULE_RM_BREAKER,
+    RULE_RM_BREAKER_WARN, RULE_TALL_BOX, RULE_TRUST_ANY, RULE_TRUST_DIALOG, SecretRule, buys,
+    decide, decide_screen, decide_traced, decline, decline_step, decline_text, default_secrets,
+    footer_mode, rm_breaker_label, roots_from_config,
 };
 pub use claude_settings::{AskKind, OwnerAsk};
 pub use git_config::{GitView, WorkerEnv};

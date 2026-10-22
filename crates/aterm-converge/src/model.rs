@@ -117,6 +117,7 @@ pub enum Outcome {
 impl Outcome {
     /// Whether this outcome makes a run's exit status nonzero: a change that did not land,
     /// or a state nobody could measure.
+    #[inline]
     #[must_use]
     pub const fn is_failure(self) -> bool {
         matches!(self, Self::Failed | Self::Unknown)
@@ -249,6 +250,7 @@ pub enum StoodAside {
 
 impl StoodAside {
     /// The one line a report carries.
+    #[inline]
     #[must_use]
     pub fn why(&self) -> &str {
         match self {
@@ -261,6 +263,7 @@ impl StoodAside {
     /// The exit status a run whose only incomplete rows stood aside this way ends with:
     /// 75 (`EX_TEMPFAIL`) for a lock or a wait on someone else, 69 (`EX_UNAVAILABLE`)
     /// offline, or 77 (`EX_NOPERM`) when a required permission has not been granted.
+    #[inline]
     #[must_use]
     pub const fn exit_status(&self) -> u8 {
         match self {
@@ -335,6 +338,7 @@ impl ItemReport {
     /// essential item the run left other than done (`Ok`, `Changed`), not applicable or
     /// waiting for an idle Mac. One rule for the surface's exit and for a reader of its
     /// `--json` (the machines toolset probe) naming the rows that decided it.
+    #[inline]
     #[must_use]
     pub const fn fails_surface(&self) -> bool {
         match self.outcome {

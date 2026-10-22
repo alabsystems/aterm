@@ -56,8 +56,9 @@ pub(crate) const EVICTION_RETAIN_DEN: usize = 4;
 /// with `floor(3·max/4) >= retained`. `max_cached_lines >=
 /// max_cached_for_retained(visible_rows)` keeps the whole visible screen searchable
 /// under any scrollback cap. `retained == 0` returns 0.
+#[inline]
 #[must_use]
-pub fn max_cached_for_retained(retained: usize) -> usize {
+pub const fn max_cached_for_retained(retained: usize) -> usize {
     // floor(NUM·max/DEN) >= retained  ⟺  max >= ceil(DEN·retained/NUM); and for an
     // integer target `retained`, floor(NUM·max/DEN) >= retained ⟺ NUM·max/DEN >= retained.
     retained
@@ -160,6 +161,7 @@ const MAX_KEY_SPAN: usize = MAX_KEY as usize;
 /// The bloom filter represents the posting dictionary, not each occurrence in
 /// every row. Repeated output and unchanged screen refreshes must not inflate
 /// its insertion count, allocation, or rebuild work.
+#[inline]
 fn insert_posting(
     trigrams: &mut FxHashMap<[u8; 3], SparseBitmap>,
     bloom: &mut BloomFilter,
@@ -201,6 +203,7 @@ pub(crate) struct CaseInsensitiveMatcher {
 }
 
 impl CaseInsensitiveMatcher {
+    #[inline]
     pub(crate) fn new(query: &str) -> Self {
         Self {
             lower_query: lower_fold(query),
@@ -208,7 +211,8 @@ impl CaseInsensitiveMatcher {
         }
     }
 
-    fn is_empty(&self) -> bool {
+    #[inline]
+    const fn is_empty(&self) -> bool {
         self.lower_query.is_empty()
     }
 
@@ -490,8 +494,9 @@ impl SearchIndex {
     }
 
     /// The `ambiguous_width` policy columns are measured under.
+    #[inline]
     #[must_use]
-    pub fn ambiguous_width(&self) -> AmbiguousWidth {
+    pub const fn ambiguous_width(&self) -> AmbiguousWidth {
         self.ambiguous_width
     }
 
@@ -1120,14 +1125,16 @@ impl SearchIndex {
     }
 
     /// Get the number of indexed lines.
+    #[inline]
     #[must_use]
-    pub fn len(&self) -> usize {
+    pub const fn len(&self) -> usize {
         self.line_count
     }
 
     /// Returns true if the index is empty.
+    #[inline]
     #[must_use]
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.line_count == 0
     }
 
@@ -1306,16 +1313,18 @@ impl SearchIndex {
 
     /// The oldest line number still retained: 0 until eviction, then the lowest line
     /// that can still match. The searchable range is `[lowest_retained_line(), len())`.
+    #[inline]
     #[must_use]
-    pub fn lowest_retained_line(&self) -> usize {
+    pub const fn lowest_retained_line(&self) -> usize {
         self.lowest_retained_line
     }
 
     /// Whether search results may be incomplete due to eviction: once the oldest lines
     /// were dropped, matches below [`lowest_retained_line`](Self::lowest_retained_line)
     /// are absent.
+    #[inline]
     #[must_use]
-    pub fn results_may_be_incomplete(&self) -> bool {
+    pub const fn results_may_be_incomplete(&self) -> bool {
         self.eviction_occurred
     }
 
@@ -1456,6 +1465,7 @@ pub(crate) const REGEX_LINE_STEP_CEILING: u64 = 1 << 26;
 /// budget, the per-byte rate keeps a long line's worst case per byte no worse than a
 /// full-width row's, and the ceiling bounds the pathological pattern's time on any
 /// one line.
+#[inline]
 pub(crate) fn regex_line_budget(len: usize) -> u64 {
     u64::try_from(len)
         .unwrap_or(u64::MAX)
@@ -1473,6 +1483,7 @@ pub(crate) fn regex_line_budget(len: usize) -> u64 {
 /// line is unsearched: the caller counts the line in
 /// [`SearchResults::cut_short_lines`] and goes on to the next one, rather than
 /// refusing every other line's matches.
+#[inline]
 pub(crate) fn scan_line<'r, 't>(
     re: &'r aterm_regex::Regex,
     text: &'t str,

@@ -33,7 +33,8 @@ use super::row_u16;
 use super::{CellCoord, CellExtras, PageStore, Row};
 
 /// Adjust chunk boundary to avoid splitting wide characters, ensuring forward progress.
-pub(super) fn adjust_chunk_boundary(
+#[inline]
+pub(super) const fn adjust_chunk_boundary(
     cells: &[crate::Cell],
     cell_offset: usize,
     chunk_end: usize,
@@ -46,7 +47,8 @@ pub(super) fn adjust_chunk_boundary(
         actual_end -= 1;
     }
     if actual_end == cell_offset && cell_offset < cells.len() {
-        actual_end = cell_offset + 2.min(cells.len() - cell_offset);
+        let rem = cells.len() - cell_offset;
+        actual_end = cell_offset + if rem < 2 { rem } else { 2 };
     }
     actual_end
 }
@@ -56,14 +58,19 @@ pub(super) fn adjust_chunk_boundary(
 /// Returns `Some((dest_row, column_in_chunk))` if the cursor (clamped to
 /// `cells_len`) is in `[cell_offset, actual_end)` (or `<= actual_end` for the
 /// last chunk, so a cursor past the final cell lands on the last row).
-pub(super) fn cursor_in_chunk(
+#[inline]
+pub(super) const fn cursor_in_chunk(
     cursor_logical_offset: usize,
     cells_len: usize,
     cell_offset: usize,
     actual_end: usize,
     dest_row: usize,
 ) -> Option<(usize, u16)> {
-    let clamped = cursor_logical_offset.min(cells_len);
+    let clamped = if cursor_logical_offset < cells_len {
+        cursor_logical_offset
+    } else {
+        cells_len
+    };
     let is_last_chunk = actual_end == cells_len;
     let in_range = clamped >= cell_offset
         && if is_last_chunk {
@@ -86,11 +93,18 @@ pub(super) fn source_coords_for_row(row: u16, len: usize) -> Vec<CellCoord> {
 }
 
 /// The source coordinate of the copied cell at `src_index`, for extras lookups.
-fn source_coord(extras_ctx: &ExtrasCopyCtx<'_>, src_index: usize) -> Option<CellCoord> {
+#[inline]
+const fn source_coord(extras_ctx: &ExtrasCopyCtx<'_>, src_index: usize) -> Option<CellCoord> {
     match extras_ctx.source {
         ExtrasSource::None => None,
         ExtrasSource::Row(r) => Some(CellCoord::new(r, row_u16(src_index))),
-        ExtrasSource::Coords(coords) => coords.get(src_index).copied(),
+        ExtrasSource::Coords(coords) => {
+            if src_index < coords.len() {
+                Some(coords[src_index])
+            } else {
+                None
+            }
+        }
     }
 }
 

@@ -66,6 +66,7 @@ impl PxRect {
 
     /// `[x0, x1) × [y0, y1)`.
     #[must_use]
+    #[inline]
     pub const fn new(x0: i32, y0: i32, x1: i32, y1: i32) -> Self {
         Self { x0, y0, x1, y1 }
     }
@@ -73,6 +74,7 @@ impl PxRect {
     /// The `w × h` rectangle with its top-left corner at `(x, y)`; the far
     /// edges saturate at `i32::MAX`.
     #[must_use]
+    #[inline]
     pub const fn at(x: i32, y: i32, w: u32, h: u32) -> Self {
         Self {
             x0: x,
@@ -84,40 +86,76 @@ impl PxRect {
 
     /// Whether the rectangle covers no pixel.
     #[must_use]
+    #[inline]
     pub const fn is_empty(self) -> bool {
         self.x0 >= self.x1 || self.y0 >= self.y1
     }
 
     /// The common part of two rectangles (possibly empty).
     #[must_use]
-    pub fn intersect(self, other: Self) -> Self {
+    #[inline]
+    pub const fn intersect(self, other: Self) -> Self {
         Self {
-            x0: self.x0.max(other.x0),
-            y0: self.y0.max(other.y0),
-            x1: self.x1.min(other.x1),
-            y1: self.y1.min(other.y1),
+            x0: if self.x0 > other.x0 {
+                self.x0
+            } else {
+                other.x0
+            },
+            y0: if self.y0 > other.y0 {
+                self.y0
+            } else {
+                other.y0
+            },
+            x1: if self.x1 < other.x1 {
+                self.x1
+            } else {
+                other.x1
+            },
+            y1: if self.y1 < other.y1 {
+                self.y1
+            } else {
+                other.y1
+            },
         }
     }
 
     /// Whether the two rectangles share a pixel.
     #[must_use]
-    pub fn overlaps(self, other: Self) -> bool {
+    #[inline]
+    pub const fn overlaps(self, other: Self) -> bool {
         !self.intersect(other).is_empty()
     }
 
     /// The smallest rectangle holding both; an empty operand contributes
     /// nothing, and two empties give [`Self::EMPTY`].
     #[must_use]
-    pub fn hull(self, other: Self) -> Self {
+    #[inline]
+    pub const fn hull(self, other: Self) -> Self {
         match (self.is_empty(), other.is_empty()) {
             (true, true) => Self::EMPTY,
             (true, false) => other,
             (false, true) => self,
             (false, false) => Self {
-                x0: self.x0.min(other.x0),
-                y0: self.y0.min(other.y0),
-                x1: self.x1.max(other.x1),
-                y1: self.y1.max(other.y1),
+                x0: if self.x0 < other.x0 {
+                    self.x0
+                } else {
+                    other.x0
+                },
+                y0: if self.y0 < other.y0 {
+                    self.y0
+                } else {
+                    other.y0
+                },
+                x1: if self.x1 > other.x1 {
+                    self.x1
+                } else {
+                    other.x1
+                },
+                y1: if self.y1 > other.y1 {
+                    self.y1
+                } else {
+                    other.y1
+                },
             },
         }
     }
@@ -125,6 +163,7 @@ impl PxRect {
     /// The rectangle moved by `(dx, dy)`, saturating; unbounded edges stay
     /// unbounded.
     #[must_use]
+    #[inline]
     pub const fn translate(self, dx: i32, dy: i32) -> Self {
         Self {
             x0: shift_edge(self.x0, dx),
@@ -141,6 +180,7 @@ impl PxRect {
     clippy::cast_possible_truncation,
     reason = "the cast arm is reached only with v strictly inside i32's range"
 )]
+#[inline]
 const fn shift_edge(edge: i32, d: i32) -> i32 {
     if edge == i32::MIN || edge == i32::MAX {
         edge
@@ -161,6 +201,7 @@ const fn shift_edge(edge: i32, d: i32) -> i32 {
     clippy::cast_possible_truncation,
     reason = "the cast arm is reached only with v inside i32's range"
 )]
+#[inline]
 const fn sat_i32(v: i64) -> i32 {
     if v > i32::MAX as i64 {
         i32::MAX
@@ -189,12 +230,14 @@ pub struct FxInk {
 impl FxInk {
     /// Additive light of `color` (premultiplied).
     #[must_use]
+    #[inline]
     pub const fn add(color: u32) -> Self {
         Self { color, alpha: 0 }
     }
 
     /// Source-over paint: `color` already premultiplied by `alpha`.
     #[must_use]
+    #[inline]
     pub const fn over(color: u32, alpha: u8) -> Self {
         Self { color, alpha }
     }
@@ -218,6 +261,7 @@ pub enum FxTexels {
 impl FxTexels {
     /// Bytes per texel.
     #[must_use]
+    #[inline]
     pub const fn bytes_per_texel(self) -> usize {
         match self {
             Self::Index8 => 1,
@@ -227,6 +271,7 @@ impl FxTexels {
 
     /// The blend an art of this kind is drawn under.
     #[must_use]
+    #[inline]
     pub const fn blend(self) -> FxBlend {
         match self {
             Self::Index8 | Self::Rgba8Premul => FxBlend::Exact,
@@ -238,6 +283,7 @@ impl FxTexels {
     /// pixel law F: index 0, an all-zero premultiplied texel, a zero straight
     /// alpha.
     #[must_use]
+    #[inline]
     pub const fn is_clear(self, value: u32) -> bool {
         match self {
             Self::Index8 | Self::Rgba8Premul => value == 0,
@@ -274,6 +320,7 @@ pub struct FxRowRuns {
 impl FxRowRuns {
     /// The runs of art row `y`, left to right (empty past the last row).
     #[must_use]
+    #[inline]
     pub fn row(&self, y: usize) -> &[FxRun] {
         let Some(next) = y.checked_add(1) else {
             return &[];
@@ -403,42 +450,49 @@ impl FxArt {
 
     /// The content address: FNV-1a/128 over kind, size and bytes.
     #[must_use]
+    #[inline]
     pub const fn id(&self) -> u128 {
         self.id
     }
 
     /// Width in texels.
     #[must_use]
+    #[inline]
     pub const fn w(&self) -> u16 {
         self.w
     }
 
     /// Height in texels.
     #[must_use]
+    #[inline]
     pub const fn h(&self) -> u16 {
         self.h
     }
 
     /// The texel kind.
     #[must_use]
+    #[inline]
     pub const fn texels(&self) -> FxTexels {
         self.texels
     }
 
     /// The raw bytes, row-major.
     #[must_use]
-    pub fn data(&self) -> &[u8] {
+    #[inline]
+    pub const fn data(&self) -> &[u8] {
         &self.data
     }
 
     /// Whether the art has no texel.
     #[must_use]
+    #[inline]
     pub const fn is_empty(&self) -> bool {
         self.w == 0 || self.h == 0
     }
 
     /// The largest Index8 texel value (0 for an RGBA art, or a blank one).
     #[must_use]
+    #[inline]
     pub const fn max_index(&self) -> u8 {
         self.max_index
     }
@@ -449,6 +503,7 @@ impl FxArt {
     /// # Panics
     /// When `(x, y)` lies outside the art.
     #[must_use]
+    #[inline]
     pub fn texel(&self, x: usize, y: usize) -> u32 {
         assert!(
             x < usize::from(self.w) && y < usize::from(self.h),
@@ -471,6 +526,7 @@ impl FxArt {
 
     /// The per-row run lists the CPU rasterizer stamps from, built on first
     /// call and kept.
+    #[inline]
     pub fn runs(&self) -> &FxRowRuns {
         self.runs.get_or_init(|| FxRowRuns::build(self))
     }
@@ -566,13 +622,12 @@ impl FxItem {
     /// The pixels the item may write, in the content's space: its box, and
     /// for a sprite that box within the sprite's clip.
     #[must_use]
-    pub fn bounds(&self) -> PxRect {
+    #[inline]
+    pub const fn bounds(&self) -> PxRect {
         match self {
-            Self::Rect(r) => PxRect::at(r.x, r.y, u32::from(r.w), u32::from(r.h)),
-            Self::Ramps(r) => PxRect::at(r.x, r.y, u32::from(r.w), u32::from(r.h)),
-            Self::Sprite(s) => {
-                PxRect::at(s.x, s.y, u32::from(s.dw), u32::from(s.dh)).intersect(s.clip)
-            }
+            Self::Rect(r) => PxRect::at(r.x, r.y, r.w as u32, r.h as u32),
+            Self::Ramps(r) => PxRect::at(r.x, r.y, r.w as u32, r.h as u32),
+            Self::Sprite(s) => PxRect::at(s.x, s.y, s.dw as u32, s.dh as u32).intersect(s.clip),
         }
     }
 
@@ -580,6 +635,7 @@ impl FxItem {
     /// Premul sprites are [`FxBlend::Exact`]; Straight sprites
     /// [`FxBlend::Linear`].
     #[must_use]
+    #[inline]
     pub fn blend(&self) -> FxBlend {
         match self {
             Self::Rect(_) | Self::Ramps(_) => FxBlend::Exact,
@@ -631,6 +687,7 @@ static FX_PAYLOAD_COPIES: AtomicU64 = AtomicU64::new(0);
 /// (re)built. A settled layer hands the renderer the same `Arc` and seals
 /// nothing, so this stands still at rest (`metrics`' `fx_layer_builds`).
 #[must_use]
+#[inline]
 pub fn fx_layer_builds() -> u64 {
     FX_LAYER_BUILDS.load(Ordering::Relaxed)
 }
@@ -640,6 +697,7 @@ pub fn fx_layer_builds() -> u64 {
 /// frame still holds pays a copy of its items and palette here, so a nonzero
 /// count at rest names a producer that should keep its own ring.
 #[must_use]
+#[inline]
 pub fn fx_payload_copies() -> u64 {
     FX_PAYLOAD_COPIES.load(Ordering::Relaxed)
 }
@@ -652,6 +710,7 @@ thread_local! {
 }
 
 /// Book `(builds, copies)` on this thread's counters.
+#[inline]
 fn count_here(builds: u64, copies: u64) {
     #[cfg(any(test, debug_assertions))]
     FX_COUNTS_HERE.with(|c| {
@@ -668,11 +727,13 @@ fn count_here(builds: u64, copies: u64) {
 #[cfg(any(test, debug_assertions))]
 #[doc(hidden)]
 #[must_use]
+#[inline]
 pub fn fx_counts_here() -> (u64, u64) {
     FX_COUNTS_HERE.with(std::cell::Cell::get)
 }
 
 impl Clone for FxContent {
+    #[inline]
     fn clone(&self) -> Self {
         FX_PAYLOAD_COPIES.fetch_add(1, Ordering::Relaxed);
         count_here(0, 1);
@@ -686,6 +747,7 @@ impl Clone for FxContent {
 }
 
 impl Default for FxContent {
+    #[inline]
     fn default() -> Self {
         Self {
             items: Vec::new(),
@@ -770,12 +832,14 @@ impl FxContent {
 
     /// The items, in draw order.
     #[must_use]
+    #[inline]
     pub fn items(&self) -> &[FxItem] {
         &self.items
     }
 
     /// The palette every item indexes.
     #[must_use]
+    #[inline]
     pub fn palette(&self) -> &[FxInk] {
         &self.palette
     }
@@ -783,6 +847,7 @@ impl FxContent {
     /// The hull of every item's bounds, in the content's space
     /// ([`PxRect::EMPTY`] when nothing can draw).
     #[must_use]
+    #[inline]
     pub const fn extent(&self) -> PxRect {
         self.extent
     }
@@ -790,10 +855,14 @@ impl FxContent {
     /// Whether a layer of blend `blend` draws this content: an empty content
     /// suits either, a mixed one neither.
     #[must_use]
-    pub fn accepts(&self, blend: FxBlend) -> bool {
+    #[inline]
+    pub const fn accepts(&self, blend: FxBlend) -> bool {
         match self.class {
             FxClass::Empty => true,
-            FxClass::Only(b) => b == blend,
+            FxClass::Only(b) => matches!(
+                (b, blend),
+                (FxBlend::Exact, FxBlend::Exact) | (FxBlend::Linear, FxBlend::Linear)
+            ),
             FxClass::Mixed => false,
         }
     }
@@ -960,6 +1029,7 @@ impl FxLayer {
     /// When the content cannot be drawn under `blend`, or a
     /// [`FxBlend::Linear`] layer asks for [`FxSlot::Glow`].
     #[must_use]
+    #[inline]
     pub fn new(
         id: u64,
         content: Arc<FxContent>,
@@ -990,6 +1060,7 @@ impl FxLayer {
     /// The pixels the layer may write, in its space: the content's extent at
     /// the offset, within the clip.
     #[must_use]
+    #[inline]
     pub fn extent(&self) -> PxRect {
         self.content
             .extent()
@@ -999,6 +1070,7 @@ impl FxLayer {
 }
 
 impl PartialEq for FxLayer {
+    #[inline]
     fn eq(&self, other: &Self) -> bool {
         self.id == other.id
             && Arc::ptr_eq(&self.content, &other.content)

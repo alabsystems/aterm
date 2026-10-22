@@ -34,6 +34,7 @@ macro_rules! atom_manager {
 atom_manager! {
     // General Use Atoms
     CARD32,
+    Incr: b"INCR",
     UTF8_STRING,
     WM_CHANGE_STATE,
     WM_CLIENT_MACHINE,
@@ -56,6 +57,10 @@ atom_manager! {
     _NET_WM_STATE_MAXIMIZED_HORZ,
     _NET_WM_STATE_MAXIMIZED_VERT,
     _NET_WM_WINDOW_TYPE,
+
+    // The resize sync protocol (`sync_request.rs`).
+    _NET_WM_SYNC_REQUEST,
+    _NET_WM_SYNC_REQUEST_COUNTER,
 
     // Startup notification (the launchee's side, `startup_notify.rs`).
     _NET_STARTUP_INFO_BEGIN,
@@ -130,6 +135,7 @@ mod tests {
         assert_eq!(NAMES.len(), _XSETTINGS_SETTINGS as usize + 1);
         assert_eq!(NAMES[CARD32 as usize], b"CARD32");
         assert_eq!(NAMES[TextUriList as usize], b"text/uri-list");
+        assert_eq!(NAMES[Incr as usize], b"INCR");
         assert_eq!(NAMES[AtomName::None as usize], b"None");
         assert_eq!(NAMES[_XSETTINGS_SETTINGS as usize], b"_XSETTINGS_SETTINGS");
     }

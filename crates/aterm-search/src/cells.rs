@@ -52,30 +52,33 @@ struct CellRun {
 }
 
 impl CellRun {
-    fn cell(self, i: u32) -> CellSpan {
+    #[inline]
+    const fn cell(self, i: u32) -> CellSpan {
         let i = i as usize;
         let byte = self
             .byte
             .saturating_add(i.saturating_mul(self.bytes as usize));
         let col = self
             .col
-            .saturating_add(i.saturating_mul(usize::from(self.width)));
+            .saturating_add(i.saturating_mul(self.width as usize));
         CellSpan {
             byte,
             end: byte.saturating_add(self.bytes as usize),
             col,
-            end_col: col.saturating_add(usize::from(self.width)),
+            end_col: col.saturating_add(self.width as usize),
         }
     }
 
     /// The byte after the run's last cell.
-    fn end_byte(self) -> usize {
+    #[inline]
+    const fn end_byte(self) -> usize {
         self.cell(self.count).byte
     }
 
     /// Whether `next` continues this run: the same shape, starting where the
     /// run ends in both bytes and columns.
-    fn continued_by(self, next: Self) -> bool {
+    #[inline]
+    const fn continued_by(self, next: Self) -> bool {
         let after = self.cell(self.count);
         next.bytes == self.bytes
             && next.width == self.width
@@ -100,6 +103,7 @@ pub(crate) struct CellSpan {
 
 impl LineCells {
     /// No cells yet.
+    #[inline]
     #[must_use]
     pub const fn new() -> Self {
         Self {
@@ -112,15 +116,17 @@ impl LineCells {
     /// Record that the text read with these cells stops short of the line's end:
     /// its reader stopped at a byte bound (aterm-core reads the first MiB of a
     /// stored history line), so the rest of the line is unread.
-    pub fn mark_truncated(&mut self) {
+    #[inline]
+    pub const fn mark_truncated(&mut self) {
         self.truncated = true;
     }
 
     /// Whether the text read with these cells stops short of the line's end
     /// ([`mark_truncated`](Self::mark_truncated)). A joined line stops short when
     /// any row joined into it does.
+    #[inline]
     #[must_use]
-    pub fn is_truncated(&self) -> bool {
+    pub const fn is_truncated(&self) -> bool {
         self.truncated
     }
 
@@ -131,6 +137,7 @@ impl LineCells {
     /// right half holds none), or one whose text starts before the previous
     /// cell's ends, is not recorded: its bytes could not be told apart from
     /// that cell's.
+    #[inline]
     pub fn push(&mut self, text: Range<usize>, col: usize, width: usize) {
         self.push_repeated(text, col, width, 1);
     }
@@ -233,17 +240,20 @@ impl LineCells {
     }
 
     /// The last run.
+    #[inline]
     fn last(&self) -> Option<&CellRun> {
         self.tail.last().or(self.head.as_ref())
     }
 
     /// Every run, in line order.
+    #[inline]
     fn runs(&self) -> impl Iterator<Item = &CellRun> {
         self.head.iter().chain(&self.tail)
     }
 
     /// The byte after the last cell's text: where the text the cells draw
     /// ends in the line, `0` with none.
+    #[inline]
     #[must_use]
     pub fn end_byte(&self) -> usize {
         self.last().map_or(0, |run| run.end_byte())
@@ -251,6 +261,7 @@ impl LineCells {
 
     /// The column after the last cell: how many columns the cells reach,
     /// `0` with none.
+    #[inline]
     #[must_use]
     pub fn end_col(&self) -> usize {
         self.last()
@@ -259,6 +270,7 @@ impl LineCells {
 
     /// Whether the cells are `len` one-byte, one-column cells from column 0:
     /// a line of printable ASCII read one cell per character.
+    #[inline]
     #[must_use]
     pub(crate) fn is_identity(&self, len: usize) -> bool {
         match (&self.head, self.tail.as_slice()) {
@@ -285,8 +297,9 @@ impl LineCells {
     }
 
     /// Whether no cell was recorded.
+    #[inline]
     #[must_use]
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.head.is_none()
     }
 

@@ -49,6 +49,7 @@ pub(super) struct FloatingTile {
 /// placement `placement_id` shows: that placement (its newest, should one id
 /// name several), or for placement `0` the image's newest virtual placement —
 /// kitty lets the terminal choose.
+#[inline]
 pub(super) fn placeholder_virtual(
     transient: &TransientState,
     image_id: u32,
@@ -65,6 +66,7 @@ pub(super) fn placeholder_virtual(
 }
 
 /// The virtual placement `parent` names — the newest, should it name several.
+#[inline]
 pub(super) fn named_virtual(
     transient: &TransientState,
     parent: KittyParent,
@@ -79,6 +81,7 @@ pub(super) fn named_virtual(
 
 /// The index in `kitty_floating` of the floating placement `parent` names —
 /// the newest, should it name several.
+#[inline]
 pub(super) fn named_floating(transient: &TransientState, parent: KittyParent) -> Option<usize> {
     transient
         .kitty_floating
@@ -90,6 +93,7 @@ pub(super) fn named_floating(transient: &TransientState, parent: KittyParent) ->
 }
 
 /// Whether `parent` still names a placement a floating placement can follow.
+#[inline]
 pub(super) fn parent_exists(transient: &TransientState, parent: KittyFloatParent) -> bool {
     match parent {
         KittyFloatParent::Virtual(p) => named_virtual(transient, p).is_some(),

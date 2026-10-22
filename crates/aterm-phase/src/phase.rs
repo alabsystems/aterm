@@ -125,7 +125,9 @@ pub enum Phase {
 
 impl Phase {
     /// The lowercase word the CLI prints.
-    pub fn name(&self) -> &'static str {
+    #[inline]
+    #[must_use]
+    pub const fn name(&self) -> &'static str {
         match self {
             Phase::Busy => "busy",
             Phase::Prompt => "prompt",
@@ -171,8 +173,9 @@ fn is_spinner_glyph(g: char) -> bool {
 /// Dangerous rm operation on possibly-empty variable path: ${…}/tmp (use a
 /// literal path: …)` (the vendor's own `${…}` placeholder, jF() in the
 /// binary) parsed as a box titled `│ removes /tmp)`, kind `other`.
-fn is_box_drawing(g: char) -> bool {
-    ('\u{2500}'..='\u{257F}').contains(&g)
+#[inline]
+const fn is_box_drawing(g: char) -> bool {
+    matches!(g, '\u{2500}'..='\u{257F}')
 }
 
 /// The SHAPE of Claude Code's spinner row, whatever glyph it is cycling:
@@ -280,14 +283,16 @@ pub struct Busy {
 }
 
 impl Busy {
-    fn hard(zone: Zone, rule: &'static str) -> Self {
+    #[inline]
+    const fn hard(zone: Zone, rule: &'static str) -> Self {
         Self {
             zone,
             rule,
             soft: false,
         }
     }
-    fn soft(zone: Zone, rule: &'static str) -> Self {
+    #[inline]
+    const fn soft(zone: Zone, rule: &'static str) -> Self {
         Self {
             zone,
             rule,
@@ -1160,6 +1165,22 @@ impl FrameReach {
 /// box covers the screen, and the whole-screen rules apply.
 pub fn has_composer_frame(rows: &[String]) -> bool {
     composer_frame(rows).is_some()
+}
+
+/// Whether Claude Code's composer frame on `rows` is caught mid-repaint: its
+/// bottom rule drawn shorter than its top rule, or standing on the last row
+/// read, where the footer row Claude Code draws under it is not yet written.
+/// A reply growing under the window is repainted row by row with its footer
+/// last; a read in between shows the frame and no busy footer (2.1.307, the
+/// forever lab's `r7-both` L6, 2026-10-22: the bottom rule 109 of 144
+/// columns on the grid's last row). False with no frame.
+#[must_use]
+pub fn composer_frame_torn(rows: &[String]) -> bool {
+    let Some(Frame { top, bottom }) = composer_frame(rows) else {
+        return false;
+    };
+    let width = |r: &str| crate::text::trim_end(r).chars().count();
+    bottom + 1 == rows.len() || width(&rows[bottom]) < width(&rows[top])
 }
 
 /// Claude Code's prompt box in SHELL MODE: `!` typed into the empty box
@@ -8122,5 +8143,58 @@ mod tests {
             assert_eq!(transcript_end(&r), 2);
             assert_eq!(worker_phase(&r), Phase::Busy, "{footer}");
         }
+    }
+
+    /// A COMPOSER FRAME CAUGHT MID-REPAINT (2.1.307, the forever lab's
+    /// `r7-both` L6, 2026-10-22): a reply growing under the window is
+    /// repainted row by row with its footer last, and a read in between held
+    /// the frame with its bottom rule drawn 109 of 144 columns on the grid's
+    /// last row. Torn: the bottom rule cut short, or the bottom rule whole on
+    /// the last row, the footer row not yet under it. NEGATIVE CONTROLS:
+    /// every measured 2.1.307 footer (idle, busy, a draft, each mode), a
+    /// frame whose footer row is blank, and a screen with no frame.
+    #[test]
+    fn a_composer_frame_caught_mid_repaint_is_torn() {
+        use crate::prompt::fixtures::screen as fx;
+        let body: Vec<String> = (30..=65).map(|i| format!("  - check {i} passed")).collect();
+        let framed = |bottom: &str, under: &[&str]| {
+            let mut r = body.clone();
+            r.extend(["".to_string(), "─".repeat(144), "❯".to_string()]);
+            r.push(bottom.to_string());
+            r.extend(under.iter().map(|s| (*s).to_string()));
+            r
+        };
+        let short = framed(&"─".repeat(109), &[]);
+        let unfooted = framed(&"─".repeat(144), &[]);
+        for (name, r) in [("short", &short), ("unfooted", &unfooted)] {
+            assert!(has_composer_frame(r), "{name}");
+            assert_eq!(worker_phase(r), Phase::Idle, "{name}: idle to the readers");
+            assert!(composer_frame_torn(r), "{name}");
+        }
+        assert!(composer_frame_torn(&framed(
+            &"─".repeat(109),
+            &["  ⏵⏵ auto mode on (shift+tab to cycle)"]
+        )));
+        // NEGATIVE CONTROLS.
+        for text in [
+            include_str!("fixtures/claude-2.1.307-footer-after-turn.txt"),
+            include_str!("fixtures/claude-2.1.307-footer-auto-idle.txt"),
+            include_str!("fixtures/claude-2.1.307-footer-busy.txt"),
+            include_str!("fixtures/claude-2.1.307-footer-auto-draft.txt"),
+            include_str!("fixtures/claude-2.1.307-footer-accept-edits.txt"),
+            include_str!("fixtures/claude-2.1.307-footer-bypass-idle.txt"),
+            include_str!("fixtures/claude-2.1.307-footer-manual.txt"),
+            include_str!("fixtures/claude-2.1.307-footer-plan.txt"),
+        ] {
+            let r = fx(text);
+            assert!(has_composer_frame(&r), "{text}");
+            assert!(!composer_frame_torn(&r), "{text}");
+        }
+        assert!(!composer_frame_torn(&framed(&"─".repeat(144), &[""])));
+        assert!(!composer_frame_torn(&framed(
+            &"─".repeat(144),
+            &["  ⏵⏵ auto mode on (shift+tab to cycle)"]
+        )));
+        assert!(!composer_frame_torn(&body));
     }
 }

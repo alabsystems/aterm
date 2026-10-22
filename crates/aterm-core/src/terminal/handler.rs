@@ -228,6 +228,7 @@ impl TerminalHandler<'_> {
     /// Apply any logical-row insertion before a protocol action creates new
     /// absolute-row metadata, preserving parser order: metadata emitted after a
     /// scroll must not be taken for an anchor that existed before it.
+    #[inline]
     pub(super) fn sync_absolute_row_metadata(&mut self) {
         if let Some(update) = self.grid.take_absolute_row_update() {
             apply_absolute_row_update(
@@ -240,6 +241,7 @@ impl TerminalHandler<'_> {
         }
     }
 
+    #[inline]
     pub(super) fn sgr_style(&mut self) -> SgrStyleHandler<'_> {
         SgrStyleHandler {
             grid: &mut *self.grid,
@@ -248,6 +250,7 @@ impl TerminalHandler<'_> {
         }
     }
 
+    #[inline]
     pub(super) fn cursor_state(&mut self) -> CursorStateHandler<'_> {
         CursorStateHandler {
             grid: &mut *self.grid,
@@ -349,6 +352,7 @@ impl TerminalHandler<'_> {
 
     /// Returns whether appending `additional_len` would stay within the cap,
     /// which the replies share with the unsolicited reports.
+    #[inline]
     pub(super) fn can_append_response_bytes(&self, additional_len: usize) -> bool {
         self.transient.owed_len().saturating_add(additional_len) <= MAX_RESPONSE_BUFFER_SIZE
     }
@@ -357,6 +361,7 @@ impl TerminalHandler<'_> {
     /// `Terminal::take_osc_event`: decoded payloads (OSC 52 clipboard, OSC 7
     /// cwd, OSC 133 marks), separate from PTY replies. Bounded by count and by
     /// bytes (`OscEventQueue`), even on a host that never drains it.
+    #[inline]
     pub(super) fn queue_osc_event(&mut self, code: u32, payload: String) {
         self.transient.osc_events.push(code, payload);
     }
@@ -654,6 +659,7 @@ pub(super) fn note_full_clear(top: u64, from_home: bool, shell: &mut super::Shel
 /// last. Where the redraw leaves out lines that were above the B (a hook's
 /// between the shell's A and its prompt), that row is too far down, and the
 /// shell's C brings it back (`TerminalHandler::shell_execution_start`).
+#[inline]
 fn restart_prompt(prompt: &mut u64, command: &mut Option<u64>, top: u64) {
     if let Some(row) = command {
         *row = top.saturating_add(row.saturating_sub(*prompt));

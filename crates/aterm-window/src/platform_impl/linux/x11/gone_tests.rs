@@ -22,7 +22,11 @@
 //! and the child panics in `outer_position`; the broken connection's check taken out of
 //! `XConnection::set_cursor_icon`, and the child dies of SIGSEGV inside libXcursor, as it did
 //! when this test was first run; the full-screen state kept when `set_fullscreen` found no
-//! position, and the child's assertion fails. Each way the parent fails.
+//! position, and the child's assertion fails; the lost display's check taken out of
+//! `ImeInner::server_side_gone`, and on a desk with an input method (IBus under GNOME) the child
+//! dies of SIGSEGV in libX11's `XSendEvent` under the event loop's `XDestroyIC`, as it did on such
+//! a desk on 2026-10-22 (Xvfb, with no input method, makes no input context). Each way the parent
+//! fails.
 //!
 //! It runs where `$DISPLAY` names an X server (the Linux lane's Xvfb); elsewhere it says SKIP and
 //! returns.

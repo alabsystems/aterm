@@ -22,6 +22,7 @@ impl Terminal {
     /// xterm, Alacritty and kitty. The grid clamps dimensions to
     /// `1..=`[`MAX_GRID_ROWS`](crate::grid::MAX_GRID_ROWS)`/`[`MAX_GRID_COLS`](crate::grid::MAX_GRID_COLS),
     /// so a hostile resize cannot request an arbitrarily large allocation.
+    #[inline]
     pub fn resize(&mut self, rows: u16, cols: u16) {
         self.resize_with_policy(rows, cols, ResizePolicy::Native);
     }
@@ -75,6 +76,7 @@ impl Terminal {
     /// a re-attach ([`Grid::lend_anchors`](crate::grid::Grid::lend_anchors)),
     /// reading history no further than `reach`. `None`, free, when no drawer
     /// ever ran.
+    #[inline]
     fn lend_main_anchors(
         &mut self,
         reach: aterm_grid::LendReach,
@@ -83,6 +85,7 @@ impl Terminal {
     }
 
     /// Put lent anchors back where their text landed.
+    #[inline]
     fn take_back_main_anchors(&mut self, lend: Option<aterm_grid::AnchorLend>) {
         if let Some(lend) = lend {
             self.main_grid_mut().take_back_anchors(lend);
@@ -139,6 +142,7 @@ impl Terminal {
     /// pass the result to [`Terminal::finish_resize_offload`]. `None` when there is
     /// nothing to offload (no width change or no tiered store): then this equals
     /// [`Terminal::resize`].
+    #[inline]
     pub fn resize_offloading_scrollback(
         &mut self,
         rows: u16,
@@ -242,6 +246,7 @@ impl Terminal {
     /// returning the primary-content grid to a bounded state so the detach window
     /// does not wedge it; see
     /// [`Grid::abort_reflow_offload`](crate::grid::Grid::abort_reflow_offload). Idempotent.
+    #[inline]
     pub fn abort_resize_offload(&mut self) {
         let target = if self.modes.alternate_screen {
             self.alt_grid.as_mut()
@@ -258,6 +263,7 @@ impl Terminal {
     /// attached, ingest defers lazy-buffer draining to the worker, keeping
     /// LZ4 promotion off the PTY-drain path. See
     /// [`Grid::set_compress_offload_active`](aterm_grid::Grid::set_compress_offload_active).
+    #[inline]
     pub fn set_compress_offload_active(&mut self, active: bool) {
         let target = if self.modes.alternate_screen {
             self.alt_grid.as_mut()
@@ -271,6 +277,7 @@ impl Terminal {
 
     /// Lines staged in the primary-content grid's lazy buffer awaiting
     /// off-thread promotion (the compression worker's backlog; 0 if none).
+    #[inline]
     #[must_use]
     pub fn lazy_backlog_len(&self) -> usize {
         if self.modes.alternate_screen {
@@ -286,6 +293,7 @@ impl Terminal {
     /// its tiered store, returning the lines still staged. The caller holds the
     /// terminal lock; the worker drives this per batch to keep each hold short.
     /// See [`Grid::drain_lazy_bounded`](aterm_grid::Grid::drain_lazy_bounded).
+    #[inline]
     pub fn drain_lazy_bounded(&mut self, max_lines: usize) -> usize {
         let target = if self.modes.alternate_screen {
             self.alt_grid.as_mut()
@@ -298,6 +306,7 @@ impl Terminal {
     /// A pressure-relief batch on the same primary-content backlog, refusing
     /// to promote an open cut's marker. The grid rechecks each batch, including
     /// one owed before the caller released its terminal lock.
+    #[inline]
     pub fn drain_lazy_pressure_bounded(&mut self, max_lines: usize) -> usize {
         let target = if self.modes.alternate_screen {
             self.alt_grid.as_mut()
@@ -313,6 +322,7 @@ impl Terminal {
     /// the flood path is cutting that backlog and a batch arrived since the last
     /// opportunity, so one flood leaves one marker and a slow tail still gets
     /// promoted. See [`Grid::trickle_lazy_bounded`](aterm_grid::Grid::trickle_lazy_bounded).
+    #[inline]
     pub fn trickle_lazy_bounded(&mut self, max_lines: usize) -> usize {
         let target = if self.modes.alternate_screen {
             self.alt_grid.as_mut()
@@ -424,18 +434,21 @@ impl Terminal {
     /// OSC 21) the `allow_palette_reconfigure` gate refuses in this session.
     /// It runs inside `process()` under the Terminal lock, at most once per
     /// session (RIS does not re-arm it), so a host only records the fact.
+    #[inline]
     pub fn set_palette_refused_callback<F: FnMut() + Send + 'static>(&mut self, callback: F) {
         self.color.palette_refused_callback = Some(Box::new(callback));
     }
 
     /// Whether this session has refused a palette set (see
     /// [`Self::set_palette_refused_callback`]).
+    #[inline]
     #[must_use]
-    pub fn palette_set_refused(&self) -> bool {
+    pub const fn palette_set_refused(&self) -> bool {
         self.color.palette_set_refused
     }
 
     /// Set bell callback.
+    #[inline]
     pub fn set_bell_callback<F: FnMut() + Send + 'static>(&mut self, callback: F) {
         self.bell_callback = Some(Box::new(callback));
     }
@@ -445,6 +458,7 @@ impl Terminal {
     /// bytes or `None`. The host owns the I/O and its security policy (whether to
     /// read at all, which paths, size caps), so the engine stays pure and wasm-safe;
     /// with no resolver installed, non-direct mediums are skipped.
+    #[inline]
     pub fn set_kitty_file_resolver<F>(&mut self, resolver: F)
     where
         F: Fn(crate::terminal::kitty_graphics::KittyMedium, &str) -> Option<Vec<u8>>
@@ -456,6 +470,7 @@ impl Terminal {
 
     /// Set the desktop notification callback for OSC 9 without a subcommand
     /// (`ESC ] 9 ; message BEL|ST`); it receives the message.
+    #[inline]
     pub fn set_notification_callback<F: FnMut(&str) + Send + 'static>(&mut self, callback: F) {
         self.notifications.callback = Some(Box::new(callback));
     }
@@ -463,6 +478,7 @@ impl Terminal {
     /// Set the callback for complete OSC 99 (kitty: title, body, urgency, id)
     /// and OSC 777 (`ESC ] 777 ; notify ; title ; body ST`) notifications.
     /// See <https://sw.kovidgoyal.net/kitty/desktop-notifications/>.
+    #[inline]
     pub fn set_advanced_notification_callback<F: FnMut(types::Notification) + Send + 'static>(
         &mut self,
         callback: F,
@@ -473,6 +489,7 @@ impl Terminal {
     /// Set the OSC 52 clipboard callback. `Set` and `Clear` return `None`;
     /// `Query` returns the contents, or `None` to deny. Queries (`Pd = ?`) are
     /// ignored unless `TerminalConfig::allow_osc52_query` is set.
+    #[inline]
     pub fn set_clipboard_callback<F>(&mut self, callback: F)
     where
         F: FnMut(ClipboardOperation) -> Option<String> + Send + 'static,
@@ -503,6 +520,7 @@ impl Terminal {
     /// });
     /// ```
     #[cfg(any(test, target_os = "linux"))]
+    #[inline]
     pub fn set_window_callback<F>(&mut self, callback: F)
     where
         F: FnMut(WindowOperation) -> Option<WindowResponse> + Send + 'static,

@@ -26,6 +26,7 @@ pub enum ContainmentMode {
 
 impl ContainmentMode {
     /// Numeric capability level. Higher = more capability.
+    #[inline]
     #[must_use]
     pub const fn level(self) -> u8 {
         self as u8
@@ -34,6 +35,7 @@ impl ContainmentMode {
     /// The variant's canonical name, identical to its `Display` rendering, so
     /// `Display` and the audit trail write one static string without
     /// `format_args!`.
+    #[inline]
     #[must_use]
     pub(crate) const fn name(self) -> &'static str {
         match self {
@@ -44,6 +46,7 @@ impl ContainmentMode {
     }
 
     /// Parse a mode name, case-insensitively.
+    #[inline]
     #[must_use]
     pub(crate) fn from_str_loose(s: &str) -> Option<Self> {
         match s.to_ascii_lowercase().as_str() {

@@ -24,6 +24,7 @@ pub struct BiDiConfig {
 }
 
 impl Default for BiDiConfig {
+    #[inline]
     fn default() -> Self {
         Self {
             mode: BiDiMode::default(),
@@ -159,6 +160,7 @@ pub struct TerminalConfig {
 }
 
 impl Default for TerminalConfig {
+    #[inline]
     fn default() -> Self {
         Self {
             // Display

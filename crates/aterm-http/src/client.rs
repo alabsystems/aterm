@@ -62,6 +62,7 @@ pub enum Error {
 impl Error {
     /// Whether this is the revoked-authority error, as opposed to a network
     /// fault. Callers surface the two differently.
+    #[inline]
     #[must_use]
     pub fn is_revoked(&self) -> bool {
         matches!(self, Self::Io(error) if error.kind() == std::io::ErrorKind::PermissionDenied)
@@ -108,6 +109,7 @@ pub enum Method {
 
 impl Method {
     /// The method's token on the request line.
+    #[inline]
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -121,12 +123,14 @@ impl Method {
     }
 
     /// Whether a request with this method may carry a body at all.
+    #[inline]
     const fn takes_body(self) -> bool {
         !matches!(self, Self::Get | Self::Head)
     }
 
     /// Whether a request with this method sends `Content-Length` even when
     /// its body is empty.
+    #[inline]
     const fn always_sends_length(self) -> bool {
         matches!(self, Self::Post | Self::Patch | Self::Put)
     }
@@ -1009,35 +1013,41 @@ pub struct Response {
 
 impl Response {
     /// The HTTP status code.
+    #[inline]
     #[must_use]
     pub const fn status(&self) -> u16 {
         self.status
     }
 
     /// Whether the status is 2xx.
+    #[inline]
     #[must_use]
     pub const fn is_success(&self) -> bool {
         self.status >= 200 && self.status < 300
     }
 
     /// The first value of `name`, matched case-insensitively.
+    #[inline]
     #[must_use]
     pub fn header(&self, name: &str) -> Option<&str> {
         header_values(&self.headers, name).next()
     }
 
     /// Every header as `(name, value)`, in the order the response sent them.
+    #[inline]
     pub fn headers(&self) -> impl Iterator<Item = (&str, &str)> {
         header_pairs(&self.headers)
     }
 
     /// Every value of `name`, matched case-insensitively, in order: repeated
     /// headers (`Link`, `Set-Cookie`, …) are each one item.
+    #[inline]
     pub fn header_all<'a>(&'a self, name: &'a str) -> impl Iterator<Item = &'a str> + 'a {
         header_values(&self.headers, name)
     }
 
     /// The response body.
+    #[inline]
     #[must_use]
     pub fn body(&self) -> &[u8] {
         &self.body
@@ -1072,28 +1082,33 @@ pub struct Exchange {
 
 impl Exchange {
     /// The HTTP status code.
+    #[inline]
     #[must_use]
     pub const fn status(&self) -> u16 {
         self.status
     }
 
     /// Every header as `(name, value)`, in the order the response sent them.
+    #[inline]
     pub fn headers(&self) -> impl Iterator<Item = (&str, &str)> {
         header_pairs(&self.headers)
     }
 
     /// The first value of `name`, matched case-insensitively.
+    #[inline]
     #[must_use]
     pub fn header(&self, name: &str) -> Option<&str> {
         header_values(&self.headers, name).next()
     }
 
     /// Every value of `name`, matched case-insensitively, in order.
+    #[inline]
     pub fn header_all<'a>(&'a self, name: &'a str) -> impl Iterator<Item = &'a str> + 'a {
         header_values(&self.headers, name)
     }
 
     /// The body, to be read incrementally.
+    #[inline]
     #[must_use]
     pub fn into_body(self) -> BodyReader {
         self.body

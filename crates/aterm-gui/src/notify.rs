@@ -34,9 +34,15 @@
 //!    there and folds control bytes.
 //!
 //! **Linux.** `org.freedesktop.Notifications.Notify` on the session bus, through
-//! the first-party `aterm-dbus` client, from the delivery thread: one lazily
-//! opened connection, a bounded call, every failure swallowed (no session bus,
-//! no notification server). A HEADLESS process delivers nothing — it presents no
+//! the first-party `aterm-dbus` client, from a bus thread of its own that the
+//! delivery thread starts at its first notice and hands each notice to: one
+//! lazily opened connection, a bounded call, every failure swallowed (no session
+//! bus, no notification server). A notice about a session carries the `default`
+//! action, and a click on it goes to that session's tab and pane as on macOS and
+//! Windows: the bus thread hears the server's `ActionInvoked` for the id `Notify`
+//! returned and wakes the App (`Wake::NoticeClicked`), with the activation token
+//! the server sent just before it (`ActivationToken`, notification spec 1.2) for
+//! the raise ([`freedesktop`]). A HEADLESS process delivers nothing — it presents no
 //! OS UI, and a test's or an agent's private instance often still carries the
 //! person's real session-bus address. Serious mode is the standard
 //! `suppress-sound` hint at normal urgency, never `urgency = low`, which GNOME
@@ -309,7 +315,8 @@ pub(crate) fn spawn_delivery(
             }
             // A click on the Windows notification brings back the tab it came
             // from (`win_balloon`), as one on aterm's own macOS notice does
-            // (its `userInfo` names the session); Linux's server owns the click.
+            // (its `userInfo` names the session) and one on Linux's does (its
+            // `default` action, `freedesktop`).
             #[cfg(windows)]
             win_balloon::set_click_target(msg.session);
             // The notice that asks macOS waits on the person's answer, and
@@ -331,11 +338,18 @@ pub(crate) fn spawn_delivery(
                     )
                 },
             );
-            #[cfg(not(target_os = "macos"))]
+            #[cfg(windows)]
             deliver(
                 msg.title.as_deref(),
                 &msg.body,
                 silent.load(Ordering::Acquire),
+            );
+            #[cfg(target_os = "linux")]
+            deliver(
+                msg.title.as_deref(),
+                &msg.body,
+                silent.load(Ordering::Acquire),
+                msg.session,
             );
         }
     });
@@ -894,28 +908,29 @@ const fn balloon_clicked(lparam: isize) -> bool {
 }
 
 /// The loop proxy a notice wakes the App through: a click on one goes to its
-/// tab (`Wake::NoticeClicked`: Windows' balloon, and aterm's own macOS notice
-/// through `notice_center`'s delegate), and macOS's answer to a notice's ask
+/// tab (`Wake::NoticeClicked`: Windows' balloon, aterm's own macOS notice
+/// through `notice_center`'s delegate, and a Linux notice's `default` action
+/// through [`freedesktop`]'s bus thread), and macOS's answer to a notice's ask
 /// reaches the Notify Me hover (`Wake::NoticeVoice`). Installed once at
 /// launch; before that, and in a headless App, a wake goes nowhere. A test
 /// build has none: its wakes are recorded ([`take_wakes`]).
-#[cfg(all(any(windows, target_os = "macos"), not(test)))]
+#[cfg(all(any(windows, target_os = "macos", target_os = "linux"), not(test)))]
 static PROXY: std::sync::OnceLock<aterm_window::event_loop::EventLoopProxy<crate::Wake>> =
     std::sync::OnceLock::new();
 
 /// Install the proxy a notice's wakes ride. First install wins. Only Windows'
-/// notifier and macOS's center wake the App; elsewhere, and in a test build,
-/// this is a no-op.
+/// notifier, macOS's center and Linux's bus thread wake the App; elsewhere, and
+/// in a test build, this is a no-op.
 pub(crate) fn install_proxy(proxy: &aterm_window::event_loop::EventLoopProxy<crate::Wake>) {
-    #[cfg(all(any(windows, target_os = "macos"), not(test)))]
+    #[cfg(all(any(windows, target_os = "macos", target_os = "linux"), not(test)))]
     let _ = PROXY.set(proxy.clone());
-    #[cfg(not(all(any(windows, target_os = "macos"), not(test))))]
+    #[cfg(not(all(any(windows, target_os = "macos", target_os = "linux"), not(test))))]
     let _ = proxy;
 }
 
 /// Hand `wake` to the App through the installed proxy ([`PROXY`]); a test
 /// build records it for [`take_wakes`] instead.
-#[cfg(any(windows, target_os = "macos"))]
+#[cfg(any(windows, target_os = "macos", target_os = "linux"))]
 fn wake(wake: crate::Wake) {
     #[cfg(not(test))]
     if let Some(proxy) = PROXY.get() {
@@ -925,7 +940,7 @@ fn wake(wake: crate::Wake) {
     WAKES.with(|wakes| wakes.borrow_mut().push(wake));
 }
 
-#[cfg(all(any(windows, target_os = "macos"), test))]
+#[cfg(all(any(windows, target_os = "macos", target_os = "linux"), test))]
 thread_local! {
     /// The wakes this thread's notices handed the App (test-only).
     static WAKES: std::cell::RefCell<Vec<crate::Wake>> = const { std::cell::RefCell::new(Vec::new()) };
@@ -950,59 +965,135 @@ pub(crate) fn raise_clicked(session: u64) {
 }
 
 /// Deliver one notification on Linux: `org.freedesktop.Notifications.Notify` on
-/// the session bus ([`freedesktop`]). Runs ONLY on the delivery thread (the call
-/// blocks up to [`freedesktop::CALL_TIMEOUT`]). Best-effort: no session bus, no
-/// notification server or a refused call is swallowed. Never from a headless
-/// process (the module doc's *Linux* paragraph), and never from a unit test,
-/// whose process carries the developer's own session-bus address (the live
-/// test drives [`freedesktop::Bus`] against a private daemon instead).
+/// the session bus, posted by the bus thread ([`freedesktop::Poster`]) that this
+/// delivery thread starts at its first notice. Runs ONLY on the delivery thread,
+/// which waits while the bus thread takes the notice, as it waited when it
+/// posted itself (each call is bounded by [`freedesktop::CALL_TIMEOUT`]).
+/// Best-effort: no session bus, no notification server or a refused call is
+/// swallowed. Never from a headless process (the module doc's *Linux*
+/// paragraph), and never from a unit test, whose process carries the
+/// developer's own session-bus address (the live tests drive
+/// [`freedesktop::Poster`] and [`freedesktop::Bus`] against a private daemon
+/// instead).
 #[cfg(target_os = "linux")]
-fn deliver(title: Option<&str>, body: &str, silent: bool) {
+fn deliver(title: Option<&str>, body: &str, silent: bool, session: u64) {
     if cfg!(test) || crate::menu::process_is_headless() {
         return;
     }
-    let Ok(call) = freedesktop::notify_call(title.unwrap_or("aterm"), body, silent) else {
-        return;
-    };
-    freedesktop::BUS.with(|bus| {
-        bus.borrow_mut()
-            .notify(&call, &aterm_dbus::Connection::session);
+    freedesktop::POSTER.with(|poster| {
+        if let Some(poster) = poster.get_or_init(freedesktop::Poster::session) {
+            post(poster, title, body, silent, session);
+        }
     });
 }
 
+/// The session an instance-level notice names (`consent_observer`'s
+/// `AttentionNotice`): no session has it, so it has no tab to go to.
+#[cfg(target_os = "linux")]
+const NO_SESSION: u64 = u64::MAX;
+
+/// Hand one notice to the bus thread. A notice about a session carries the
+/// `default` action, and a click on it goes to that session's tab
+/// ([`freedesktop::Clicks`]). An instance-level one carries no action, so the
+/// server's own activation of aterm answers its click (GNOME Shell raises the
+/// window aterm was last used in).
+#[cfg(target_os = "linux")]
+fn post(poster: &freedesktop::Poster, title: Option<&str>, body: &str, silent: bool, session: u64) {
+    let session = (session != NO_SESSION).then_some(session);
+    if let Ok(call) =
+        freedesktop::notify_call(title.unwrap_or("aterm"), body, silent, session.is_some())
+    {
+        poster.post(call, session);
+    }
+}
+
+/// Deliver one notification on the calling thread, at once (blocking up to
+/// [`freedesktop::CALL_TIMEOUT`]): the Linux arm of `menu::notify`, whose
+/// callers (a launch that cannot start, a file that cannot open) may end the
+/// process right after it, before the delivery thread would run. A desktop
+/// launch has no terminal, so its stderr reaches only the journal and this is
+/// what the person sees. It is about no tab, so it carries no action and the
+/// server's own activation of aterm answers a click. The same guards as
+/// [`deliver`].
+#[cfg(target_os = "linux")]
+pub(crate) fn deliver_now(title: &str, body: &str) {
+    if cfg!(test) || crate::menu::process_is_headless() {
+        return;
+    }
+    let Ok(call) = freedesktop::notify_call(title, body, false, false) else {
+        return;
+    };
+    freedesktop::Bus { conn: None }.notify(&call, &aterm_dbus::Connection::session, &mut |_| {});
+}
+
 /// `org.freedesktop.Notifications` over the first-party D-Bus client: the
-/// `Notify` call, and the delivery thread's one connection to the session bus.
+/// `Notify` call, the bus thread that posts each notice and hears the server's
+/// signals about it, and what a click on one is.
+///
+/// One thread holds aterm's one connection, both to post and to hear, so a
+/// server that sends its signals only to the connection that posted the
+/// notification reaches it as one that broadcasts them (GNOME Shell's) does.
+/// It waits on nothing but `poll(2)` over that connection and a
+/// wake socket the delivery thread rings with each notice, so it costs nothing
+/// while idle, and the UI thread never touches the bus: a click reaches the App
+/// as a wake through the event loop's proxy.
 #[cfg(target_os = "linux")]
 mod freedesktop {
-    use std::cell::RefCell;
+    use std::cell::OnceCell;
+    use std::collections::VecDeque;
+    use std::io::{ErrorKind, Read as _, Write as _};
+    use std::os::fd::{AsRawFd as _, RawFd};
+    use std::os::unix::net::UnixStream;
+    use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError};
     use std::time::Duration;
 
-    use aterm_dbus::{Connection, Message, Type, Value};
+    use aterm_dbus::{Connection, Kind, Message, Type, Value};
 
     /// The notification server's well-known name, object and interface.
     const SERVER: &str = "org.freedesktop.Notifications";
     const OBJECT: &str = "/org/freedesktop/Notifications";
 
-    /// How long the delivery thread waits for the server's answer. A server
+    /// The server's signals the bus thread asks the bus for: a click
+    /// (`ActionInvoked`), the activation token a server sends just before one
+    /// (`ActivationToken`, specification 1.2) and a close (`NotificationClosed`).
+    const SIGNALS: &str = "type='signal',interface='org.freedesktop.Notifications',\
+                           path='/org/freedesktop/Notifications'";
+
+    /// The action a click on a notification's body invokes (the specification's
+    /// `default`), and its label, which a server that lists actions may show.
+    const DEFAULT_ACTION: &str = "default";
+    const DEFAULT_LABEL: &str = "Go to tab";
+
+    /// How many notices about a session the bus thread remembers. Past it the
+    /// oldest is forgotten, so a server that never says one closed (or a tray
+    /// nobody clears) holds no more than this.
+    pub(super) const POSTED_CAP: usize = 64;
+
+    /// How long the bus thread waits for the server's answer. A server
     /// answers `Notify` at once; the bound only keeps a wedged bus from holding
-    /// the thread (the bounded queue drops what arrives meanwhile).
+    /// the thread (and the delivery thread waiting on it: the bounded queue
+    /// drops what arrives meanwhile).
     pub(super) const CALL_TIMEOUT: Duration = Duration::from_secs(2);
 
     thread_local! {
-        /// The delivery thread's connection, opened at its first notification.
-        pub(super) static BUS: RefCell<Bus> = const { RefCell::new(Bus { conn: None }) };
+        /// The delivery thread's end of the bus thread, started at its first
+        /// notice; `None` when the OS gave no socket pair or thread.
+        pub(super) static POSTER: OnceCell<Option<Poster>> = const { OnceCell::new() };
     }
 
     /// One `Notify(susssasa{sv}i)` call. `summary` is plain text by the
     /// specification; `body` is markup to a server that advertises
-    /// `body-markup`, so it is escaped ([`super::markup_escape`]). The hints
-    /// name aterm's desktop entry (`aterm.desktop`, which tools/install.sh
-    /// lays) so the shell attributes the notification to aterm, keep urgency
-    /// NORMAL, and add `suppress-sound` in serious mode (`silent`).
+    /// `body-markup`, so it is escaped ([`super::markup_escape`]). A
+    /// `clickable` notice offers the `default` action, which a click on its
+    /// body invokes, and nothing else. The hints name aterm's desktop entry
+    /// (`aterm.desktop`, which tools/install.sh lays) so the shell attributes
+    /// the notification to aterm, keep urgency NORMAL, and add
+    /// `suppress-sound` in serious mode (`silent`).
     pub(super) fn notify_call(
         summary: &str,
         body: &str,
         silent: bool,
+        clickable: bool,
     ) -> aterm_dbus::Result<Message> {
         let mut hints = vec![
             (
@@ -1017,6 +1108,11 @@ mod freedesktop {
                 Value::variant(Value::Bool(true)),
             ));
         }
+        let actions: &[&str] = if clickable {
+            &[DEFAULT_ACTION, DEFAULT_LABEL]
+        } else {
+            &[]
+        };
         Ok(
             Message::method_call(Some(SERVER), OBJECT, Some(SERVER), "Notify")?.with_body(vec![
                 Value::from("aterm"),
@@ -1024,15 +1120,32 @@ mod freedesktop {
                 Value::from("aterm"),
                 Value::Str(super::fold_controls(summary)),
                 Value::Str(super::markup_escape(body)),
-                Value::strings(std::iter::empty::<String>()),
+                Value::strings(actions.iter().copied()),
                 Value::dict(Type::Str, Type::Variant, hints)?,
                 Value::I32(-1),
             ]),
         )
     }
 
-    /// The delivery thread's session-bus connection, opened on first use and
-    /// dialled again when the bus has closed it.
+    /// Where a server put one notice: the id `Notify` returned, and the unique
+    /// name of the connection that answered (the server's: its signals come
+    /// from that name, so a server started since that hands out the same id
+    /// again is not taken for this one).
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub(super) struct Posted {
+        pub(super) server: Option<String>,
+        pub(super) id: u32,
+    }
+
+    /// What the bus thread observed. A connection's names and notice ids belong
+    /// to that connection's bus epoch: a replacement may reuse both.
+    pub(super) enum Observation<'a> {
+        ConnectionReset,
+        Message(&'a Message),
+    }
+
+    /// A session-bus connection, opened on first use and dialled again when the
+    /// bus has closed it.
     pub(super) struct Bus {
         pub(super) conn: Option<Connection>,
     }
@@ -1045,37 +1158,306 @@ mod freedesktop {
         /// dialled and the call sent once more, since a long-lived connection
         /// the bus restarted under is the expected way to find it dead. An error
         /// the SERVER answered (no notification server on this bus) leaves the
-        /// connection as it is: the bus is fine. Returns whether the server
-        /// accepted the notification.
+        /// connection as it is: the bus is fine. Returns where the server put
+        /// the notification, `None` when it took none. What the bus sent the
+        /// connection before the answer goes to `heard`, in order.
         pub(super) fn notify(
             &mut self,
             call: &Message,
             open: &dyn Fn() -> aterm_dbus::Result<Connection>,
-        ) -> bool {
+            heard: &mut dyn FnMut(Observation<'_>),
+        ) -> Option<Posted> {
             for _ in 0..2 {
+                // What the bus sent since the last call (a click on an earlier
+                // notice, `NameAcquired`) is heard first, which also keeps the
+                // connection's retained-message cap from filling and finds a
+                // connection the bus has closed.
+                self.drain(heard);
                 let dialled = self.conn.is_none();
                 if dialled {
                     self.conn = open().ok();
+                    if self.conn.is_some() {
+                        // Before even a retained message from the new connection
+                        // can be heard (including this method's retry).
+                        heard(Observation::ConnectionReset);
+                    }
                 }
-                let Some(conn) = self.conn.as_mut() else {
-                    return false;
-                };
-                // What the bus sent since the last call (`NameAcquired`, a
-                // server's `NotificationClosed`) is not this thread's business:
-                // drop it, so the connection's retained-message cap never fills.
-                while let Ok(Some(_)) = conn.recv(Some(Duration::ZERO)) {}
+                let conn = self.conn.as_mut()?;
                 match conn.call(call.clone(), CALL_TIMEOUT) {
-                    Ok(_) => return true,
-                    Err(aterm_dbus::Error::Remote { .. }) => return false,
+                    Ok(answer) => {
+                        let id = answer.body.first().and_then(Value::as_u32)?;
+                        return Some(Posted {
+                            server: answer.sender,
+                            id,
+                        });
+                    }
+                    Err(aterm_dbus::Error::Remote { .. }) => return None,
                     Err(_) => {
-                        self.conn = None;
+                        self.end_connection(heard);
                         if dialled {
-                            return false;
+                            return None;
                         }
                     }
                 }
             }
-            false
+            None
+        }
+
+        /// Hand `heard` every message the bus has sent this connection, without
+        /// waiting. One this side cannot read is skipped; a connection that
+        /// failed is dropped, to be dialled again at the next notice.
+        pub(super) fn drain(&mut self, heard: &mut dyn FnMut(Observation<'_>)) {
+            while let Some(conn) = self.conn.as_mut() {
+                match conn.recv(Some(Duration::ZERO)) {
+                    Ok(Some(msg)) => heard(Observation::Message(&msg)),
+                    Ok(None) => return,
+                    Err(
+                        aterm_dbus::Error::Malformed { .. } | aterm_dbus::Error::Unsupported(_),
+                    ) => {}
+                    Err(_) => self.end_connection(heard),
+                }
+            }
+        }
+
+        /// Revoke this connection's click mappings at the loss itself, before
+        /// a retry or a later notice can expose another connection's traffic.
+        fn end_connection(&mut self, heard: &mut dyn FnMut(Observation<'_>)) {
+            if let Some(conn) = self.conn.take() {
+                drop(conn);
+                heard(Observation::ConnectionReset);
+            }
+        }
+    }
+
+    /// One notice about a session, as the bus thread remembers it.
+    struct Notice {
+        at: Posted,
+        session: u64,
+        /// The activation token the server sent for the click it is about to
+        /// report (`ActivationToken`), until that click takes it.
+        token: Option<String>,
+    }
+
+    /// What a click on a notice is: the bus thread's memory of the notices it
+    /// posted about a session, read against each message the bus sends it.
+    #[derive(Default)]
+    pub(super) struct Clicks {
+        posted: VecDeque<Notice>,
+    }
+
+    impl Clicks {
+        /// The server put a notice `at`. Replacing a key revokes its old target
+        /// and token, even when the new notice names no session.
+        pub(super) fn posted(&mut self, at: Posted, session: Option<u64>) {
+            self.posted.retain(|notice| notice.at != at);
+            let Some(session) = session else { return };
+            if self.posted.len() >= POSTED_CAP {
+                self.posted.pop_front();
+            }
+            self.posted.push_back(Notice {
+                at,
+                session,
+                token: None,
+            });
+        }
+
+        /// The common bus-observation path, before any message can route a
+        /// click. No label or activation token survives a connection epoch.
+        pub(super) fn observe(
+            &mut self,
+            observation: Observation<'_>,
+        ) -> Option<(u64, Option<String>)> {
+            match observation {
+                Observation::ConnectionReset => {
+                    self.posted.clear();
+                    None
+                }
+                Observation::Message(msg) => self.heard(msg),
+            }
+        }
+
+        /// One message from the bus: the session a click goes to, with the
+        /// activation token the server sent for it, where it is a click on one
+        /// of these notices (`ActionInvoked` with the `default` action). The
+        /// server's `ActivationToken` for one is kept for its click, and
+        /// `NotificationClosed` forgets it. A signal about another program's
+        /// notification (GNOME Shell broadcasts them all), from another sender
+        /// than the server that took the notice, or naming an action aterm
+        /// never offered, is no click; nor is anything else.
+        pub(super) fn heard(&mut self, msg: &Message) -> Option<(u64, Option<String>)> {
+            if msg.kind != Kind::Signal
+                || msg.interface.as_deref() != Some(SERVER)
+                || msg.path.as_ref().map(|path| path.as_str()) != Some(OBJECT)
+            {
+                return None;
+            }
+            let id = msg.body.first().and_then(Value::as_u32)?;
+            let index = self
+                .posted
+                .iter()
+                .position(|notice| notice.at.id == id && notice.at.server == msg.sender)?;
+            let arg = msg.body.get(1).and_then(Value::as_str);
+            match msg.member.as_deref()? {
+                "ActivationToken" => {
+                    self.posted[index].token = arg.map(str::to_owned);
+                    None
+                }
+                "ActionInvoked" if arg == Some(DEFAULT_ACTION) => {
+                    let notice = &mut self.posted[index];
+                    Some((notice.session, notice.token.take()))
+                }
+                "NotificationClosed" => {
+                    self.posted.remove(index);
+                    None
+                }
+                _ => None,
+            }
+        }
+    }
+
+    /// One notice for the bus thread, and the session a click on it goes to.
+    struct Post {
+        call: Message,
+        session: Option<u64>,
+    }
+
+    /// The delivery thread's end of the bus thread: dropped, it ends the thread.
+    pub(super) struct Poster {
+        posts: SyncSender<Post>,
+        wake: UnixStream,
+    }
+
+    impl Poster {
+        /// The product's bus thread: the session bus, and a click handed to the
+        /// App through the event loop's proxy (`super::wake`).
+        pub(super) fn session() -> Option<Self> {
+            Self::start(Connection::session, super::wake)
+        }
+
+        /// Start a bus thread. At its first notice it dials with `open` (and
+        /// again after the bus closes the connection), asks the bus for the
+        /// server's signals ([`SIGNALS`]) before it posts, and hands `clicked`
+        /// the wake a click on a notice about a session is
+        /// (`Wake::NoticeClicked`). `None`, logged, when the OS gives no socket
+        /// pair or thread.
+        pub(super) fn start(
+            open: impl Fn() -> aterm_dbus::Result<Connection> + Send + 'static,
+            clicked: impl Fn(crate::Wake) + Send + 'static,
+        ) -> Option<Self> {
+            let pair = UnixStream::pair().and_then(|(wake, rung)| {
+                wake.set_nonblocking(true)?;
+                rung.set_nonblocking(true)?;
+                Ok((wake, rung))
+            });
+            let (wake, rung) = match pair {
+                Ok(pair) => pair,
+                Err(e) => {
+                    aterm_log::warn!("notices: no wake socket ({e}); none is posted");
+                    return None;
+                }
+            };
+            // One notice in hand: the delivery thread waits while the bus
+            // thread posts, so the bounded queue before it still drops a flood.
+            let (posts, taken) = mpsc::sync_channel(1);
+            let spawned = std::thread::Builder::new()
+                .name("aterm-notices".to_owned())
+                .spawn(move || run(&open, &clicked, &taken, &rung));
+            if let Err(e) = spawned {
+                aterm_log::warn!("notices: no bus thread ({e}); none is posted");
+                return None;
+            }
+            Some(Self { posts, wake })
+        }
+
+        /// Hand the bus thread one `Notify` call, a click on which goes to
+        /// `session`, and ring it.
+        pub(super) fn post(&self, call: Message, session: Option<u64>) {
+            if self.posts.send(Post { call, session }).is_ok() {
+                // Non-blocking: a full socket already holds a ring.
+                let _ = (&self.wake).write(&[1]);
+            }
+        }
+    }
+
+    /// The bus thread: post each notice handed over, hear what the bus sends,
+    /// and otherwise wait in `poll(2)` for either. Ends when the delivery
+    /// thread's end ([`Poster`]) is dropped, or (logged) when poll fails.
+    fn run(
+        open: &dyn Fn() -> aterm_dbus::Result<Connection>,
+        clicked: &dyn Fn(crate::Wake),
+        posts: &Receiver<Post>,
+        rung: &UnixStream,
+    ) {
+        fn hear(clicks: &mut Clicks, observation: Observation<'_>, clicked: &dyn Fn(crate::Wake)) {
+            if let Some((session, activation)) = clicks.observe(observation) {
+                clicked(crate::Wake::NoticeClicked {
+                    session,
+                    activation,
+                });
+            }
+        }
+
+        let subscribed = || {
+            let mut conn = open()?;
+            if let Err(e) = conn.add_match(SIGNALS, CALL_TIMEOUT) {
+                aterm_log::debug!("notices: the bus refused {SIGNALS} ({e}); clicks go nowhere");
+            }
+            Ok(conn)
+        };
+        let mut bus = Bus { conn: None };
+        let mut clicks = Clicks::default();
+        loop {
+            loop {
+                match posts.try_recv() {
+                    Ok(post) => {
+                        let posted = bus.notify(&post.call, &subscribed, &mut |msg| {
+                            hear(&mut clicks, msg, clicked);
+                        });
+                        if let Some(at) = posted {
+                            clicks.posted(at, post.session);
+                        }
+                    }
+                    Err(TryRecvError::Empty) => break,
+                    Err(TryRecvError::Disconnected) => return,
+                }
+            }
+            // What came meanwhile, a call's own notice's signals among it: the
+            // call kept them for `recv`, so the socket may not say so.
+            bus.drain(&mut |msg| hear(&mut clicks, msg, clicked));
+            let mut fds = vec![rung.as_raw_fd()];
+            fds.extend(bus.conn.as_ref().map(|conn| conn.as_raw_fd()));
+            if let Err(e) = wait(&fds) {
+                aterm_log::warn!("notices: the bus thread's poll failed ({e}); none is posted");
+                return;
+            }
+            let mut sink = [0u8; 64];
+            while matches!((&*rung).read(&mut sink), Ok(n) if n > 0) {}
+        }
+    }
+
+    /// Wait until one of `fds` is readable or hung up.
+    fn wait(fds: &[RawFd]) -> std::io::Result<()> {
+        let mut polls: Vec<libc::pollfd> = fds
+            .iter()
+            .map(|&fd| libc::pollfd {
+                fd,
+                events: libc::POLLIN,
+                revents: 0,
+            })
+            .collect();
+        let count = libc::nfds_t::try_from(polls.len()).unwrap_or(libc::nfds_t::MAX);
+        loop {
+            // SAFETY: `polls` is an initialised array of `count` pollfd records,
+            // exclusively borrowed for the call; its descriptors are the wake
+            // socket's and the connection's, which the caller holds open across
+            // it. -1 waits until one is ready or a signal interrupts.
+            if unsafe { libc::poll(polls.as_mut_ptr(), count, -1) } >= 0 {
+                return Ok(());
+            }
+            let e = std::io::Error::last_os_error();
+            if e.kind() != ErrorKind::Interrupted {
+                return Err(e);
+            }
         }
     }
 }
@@ -2016,90 +2398,131 @@ mod tests {
         assert_eq!(fold_controls("t\x07i\ntle"), "t i\ntle");
     }
 
+    /// A wait in a live Linux test for something that must happen: a hang
+    /// detector, not a budget.
+    #[cfg(target_os = "linux")]
+    const HANG: std::time::Duration = std::time::Duration::from_secs(60);
+
+    /// The notification server's well-known name (also its interface), and its
+    /// object, as a stand-in serves them.
+    #[cfg(target_os = "linux")]
+    const SERVER: &str = "org.freedesktop.Notifications";
+    #[cfg(target_os = "linux")]
+    const OBJECT: &str = "/org/freedesktop/Notifications";
+
+    /// A private `dbus-daemon` for a live Linux test, never the session's bus:
+    /// killed when dropped. COULD NOT RUN where no `dbus-daemon` is on PATH.
+    #[cfg(target_os = "linux")]
+    struct PrivateBus {
+        addresses: Vec<aterm_dbus::address::Address>,
+        _daemon: Daemon,
+        _scratch: aterm_tempfile::TempDir,
+    }
+
+    /// The daemon's process, killed and reaped when dropped.
+    #[cfg(target_os = "linux")]
+    struct Daemon(aterm_uds::spawnfd::Child);
+
+    #[cfg(target_os = "linux")]
+    impl Drop for Daemon {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    impl PrivateBus {
+        fn start() -> Self {
+            use std::io::BufRead as _;
+            let Some(daemon) = std::env::var_os("PATH").and_then(|path| {
+                std::env::split_paths(&path)
+                    .map(|dir| dir.join("dbus-daemon"))
+                    .find(|p| p.is_file())
+            }) else {
+                aterm_spec::host::could_not_run(
+                    "no dbus-daemon on PATH, so no live notification round trip here; install \
+                     the distribution's dbus (dbus-daemon) to run it",
+                );
+            };
+            let scratch = aterm_tempfile::tempdir().unwrap();
+            let socket = scratch.path().join("bus");
+            let conf = scratch.path().join("bus.conf");
+            std::fs::write(
+                &conf,
+                format!(
+                    "<!DOCTYPE busconfig PUBLIC \"-//freedesktop//DTD D-Bus Bus Configuration 1.0//EN\"\n \
+                     \"http://www.freedesktop.org/standards/dbus/1.0/busconfig.dtd\">\n\
+                     <busconfig><type>session</type><listen>unix:path={}</listen><auth>EXTERNAL</auth>\
+                     <policy context=\"default\"><allow send_destination=\"*\"/>\
+                     <allow receive_sender=\"*\"/><allow own=\"*\"/></policy></busconfig>\n",
+                    socket.display()
+                ),
+            )
+            .unwrap();
+            let mut daemon = Daemon(
+                aterm_uds::spawnfd::command(&daemon)
+                    .arg(format!("--config-file={}", conf.display()))
+                    .arg("--nofork")
+                    .arg("--print-address")
+                    .stdout(aterm_uds::spawnfd::Stdio::piped())
+                    .spawn()
+                    .unwrap(),
+            );
+            let mut line = String::new();
+            std::io::BufReader::new(daemon.0.stdout.take().unwrap())
+                .read_line(&mut line)
+                .unwrap();
+            Self {
+                addresses: aterm_dbus::address::parse(line.trim()).unwrap(),
+                _daemon: daemon,
+                _scratch: scratch,
+            }
+        }
+
+        /// A stand-in notification server: a connection to this bus that owns
+        /// `org.freedesktop.Notifications`.
+        fn server(&self) -> aterm_dbus::Connection {
+            use aterm_dbus::{Connection, Message, Value};
+            let mut server = Connection::open(&self.addresses).unwrap();
+            let owned = server
+                .call(
+                    Message::method_call(
+                        Some("org.freedesktop.DBus"),
+                        "/org/freedesktop/DBus",
+                        Some("org.freedesktop.DBus"),
+                        "RequestName",
+                    )
+                    .unwrap()
+                    .with_body(vec![Value::from(SERVER), Value::U32(0)]),
+                    HANG,
+                )
+                .unwrap();
+            assert_eq!(
+                owned.body,
+                vec![Value::U32(1)],
+                "the stand-in owns the name"
+            );
+            server
+        }
+    }
+
     /// The `Notify` call a Linux host sends, end to end through a private
     /// `dbus-daemon` (never the session's bus) to a stand-in server holding
     /// `org.freedesktop.Notifications`: the eight arguments in order, the body
-    /// escaped, urgency normal with `suppress-sound` only in serious mode, and
-    /// a second notification over the same cached connection. COULD NOT RUN where
-    /// no `dbus-daemon` is on PATH.
+    /// escaped, the `default` action on a notice about a session and none on
+    /// one about no tab, urgency normal with `suppress-sound` only in serious
+    /// mode, and a second notification over the same cached connection; each
+    /// answer says where the server put the notice (its id, and the server's
+    /// own name). COULD NOT RUN where no `dbus-daemon` is on PATH.
     #[cfg(target_os = "linux")]
     #[test]
     fn a_linux_notification_is_a_notify_call_on_the_session_bus() {
         use aterm_dbus::{Connection, Kind, Message, Value};
-        use std::io::BufRead as _;
 
-        /// A wait for something that must happen: a hang detector, not a budget.
-        const HANG: std::time::Duration = std::time::Duration::from_secs(60);
-
-        let Some(daemon) = std::env::var_os("PATH").and_then(|path| {
-            std::env::split_paths(&path)
-                .map(|dir| dir.join("dbus-daemon"))
-                .find(|p| p.is_file())
-        }) else {
-            aterm_spec::host::could_not_run(
-                "no dbus-daemon on PATH, so no live Notify round trip here; install the \
-                 distribution's dbus (dbus-daemon) to run it",
-            );
-        };
-        let scratch = aterm_tempfile::tempdir().unwrap();
-        let socket = scratch.path().join("bus");
-        let conf = scratch.path().join("bus.conf");
-        std::fs::write(
-            &conf,
-            format!(
-                "<!DOCTYPE busconfig PUBLIC \"-//freedesktop//DTD D-Bus Bus Configuration 1.0//EN\"\n \
-                 \"http://www.freedesktop.org/standards/dbus/1.0/busconfig.dtd\">\n\
-                 <busconfig><type>session</type><listen>unix:path={}</listen><auth>EXTERNAL</auth>\
-                 <policy context=\"default\"><allow send_destination=\"*\"/>\
-                 <allow receive_sender=\"*\"/><allow own=\"*\"/></policy></busconfig>\n",
-                socket.display()
-            ),
-        )
-        .unwrap();
-        struct Daemon(aterm_uds::spawnfd::Child);
-        impl Drop for Daemon {
-            fn drop(&mut self) {
-                let _ = self.0.kill();
-                let _ = self.0.wait();
-            }
-        }
-        let mut daemon = Daemon(
-            aterm_uds::spawnfd::command(&daemon)
-                .arg(format!("--config-file={}", conf.display()))
-                .arg("--nofork")
-                .arg("--print-address")
-                .stdout(aterm_uds::spawnfd::Stdio::piped())
-                .spawn()
-                .unwrap(),
-        );
-        let mut line = String::new();
-        std::io::BufReader::new(daemon.0.stdout.take().unwrap())
-            .read_line(&mut line)
-            .unwrap();
-        let addresses = aterm_dbus::address::parse(line.trim()).unwrap();
-
-        let mut server = Connection::open(&addresses).unwrap();
-        let owned = server
-            .call(
-                Message::method_call(
-                    Some("org.freedesktop.DBus"),
-                    "/org/freedesktop/DBus",
-                    Some("org.freedesktop.DBus"),
-                    "RequestName",
-                )
-                .unwrap()
-                .with_body(vec![
-                    Value::from("org.freedesktop.Notifications"),
-                    Value::U32(0),
-                ]),
-                HANG,
-            )
-            .unwrap();
-        assert_eq!(
-            owned.body,
-            vec![Value::U32(1)],
-            "the stand-in owns the name"
-        );
+        let private = PrivateBus::start();
+        let mut server = private.server();
+        let server_name = server.unique_name().to_owned();
         let served = std::thread::spawn(move || {
             let mut seen = Vec::new();
             while seen.len() < 2 {
@@ -2113,12 +2536,20 @@ mod tests {
         });
 
         let mut bus = super::freedesktop::Bus { conn: None };
-        let open = || Connection::open(&addresses);
-        let loud = super::freedesktop::notify_call("build", "done <b>&</b>", false).unwrap();
-        assert!(bus.notify(&loud, &open), "the server took the first one");
-        let quiet = super::freedesktop::notify_call("aterm", "serious", true).unwrap();
+        let open = || Connection::open(&private.addresses);
+        let loud = super::freedesktop::notify_call("build", "done <b>&</b>", false, true).unwrap();
+        let posted = bus.notify(&loud, &open, &mut |_| {});
+        assert_eq!(
+            posted,
+            Some(super::freedesktop::Posted {
+                server: Some(server_name),
+                id: 7
+            }),
+            "the server took the first one, and said where"
+        );
+        let quiet = super::freedesktop::notify_call("aterm", "serious", true, false).unwrap();
         assert!(
-            bus.notify(&quiet, &open),
+            bus.notify(&quiet, &open, &mut |_| {}).is_some(),
             "and the second, on the cached connection"
         );
         let seen = served.join().unwrap();
@@ -2140,7 +2571,7 @@ mod tests {
                 Value::from("aterm"),
                 Value::from("build"),
                 Value::from("done &lt;b&gt;&amp;&lt;/b&gt;"),
-                Value::strings(std::iter::empty::<String>()),
+                Value::strings(["default", "Go to tab"]),
             ]
         );
         assert_eq!(seen[0].body[7], Value::I32(-1));
@@ -2170,5 +2601,298 @@ mod tests {
             "serious mode is suppress-sound at normal urgency, never urgency low"
         );
         assert_eq!(seen[1].body[4], Value::from("serious"));
+        assert_eq!(
+            seen[1].body[5],
+            Value::strings(std::iter::empty::<String>()),
+            "a notice about no tab offers no action: the server's own activation answers it"
+        );
+    }
+
+    /// WHAT A CLICK IS on Linux ([`super::freedesktop::Clicks`]): the server's
+    /// `ActionInvoked` with the `default` action, for a notice aterm posted
+    /// about a session, from the server that took it, goes to that session,
+    /// with the activation token the server sent just before it
+    /// (`ActivationToken`); the token goes with that one click. NEGATIVE
+    /// CONTROLS: a click with no token before it carries none; and a signal
+    /// about another program's notification (GNOME Shell broadcasts them), the
+    /// same id from another sender (a server started since), an action aterm
+    /// never offered, a method call or another interface's signal of the same
+    /// shape, a click on a closed notice, and one on the oldest of more notices
+    /// than the bus thread remembers, are no click.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_linux_click_is_the_default_action_on_a_notice_aterm_posted() {
+        use super::freedesktop::{Clicks, Observation, POSTED_CAP, Posted};
+        use aterm_dbus::{Message, Value};
+
+        const TOKEN: &str = "gnome-shell/aterm/4242-1-host_TIME5678";
+        let server = Some(":1.7".to_owned());
+        let sent = |sender: &Option<String>, mut msg: Message, id: u32, arg: Value| {
+            msg.sender.clone_from(sender);
+            msg.with_body(vec![Value::U32(id), arg])
+        };
+        let signal = |member: &str| Message::signal(OBJECT, SERVER, member).unwrap();
+        let token = |id| sent(&server, signal("ActivationToken"), id, Value::from(TOKEN));
+        let click = |id| sent(&server, signal("ActionInvoked"), id, Value::from("default"));
+        let closed = |id| sent(&server, signal("NotificationClosed"), id, Value::U32(2));
+        let at = |id| Posted {
+            server: server.clone(),
+            id,
+        };
+
+        let mut clicks = Clicks::default();
+        clicks.posted(at(41), Some(3));
+        clicks.posted(at(42), Some(5));
+        assert_eq!(clicks.heard(&token(42)), None, "a token is no click");
+        assert_eq!(
+            clicks.heard(&click(42)),
+            Some((5, Some(TOKEN.to_owned()))),
+            "a click goes to its notice's session, with the token sent before it"
+        );
+        assert_eq!(
+            clicks.heard(&click(42)),
+            Some((5, None)),
+            "the token went with that click"
+        );
+        assert_eq!(clicks.heard(&click(41)), Some((3, None)), "no token sent");
+
+        let other_sender = Some(":1.9".to_owned());
+        for (case, msg) in [
+            ("another program's notification", click(99)),
+            (
+                "another sender",
+                sent(
+                    &other_sender,
+                    signal("ActionInvoked"),
+                    42,
+                    Value::from("default"),
+                ),
+            ),
+            (
+                "an action aterm never offered",
+                sent(&server, signal("ActionInvoked"), 42, Value::from("reply")),
+            ),
+            (
+                "a method call",
+                sent(
+                    &server,
+                    Message::method_call(Some(SERVER), OBJECT, Some(SERVER), "ActionInvoked")
+                        .unwrap(),
+                    42,
+                    Value::from("default"),
+                ),
+            ),
+            (
+                "another interface",
+                sent(
+                    &server,
+                    Message::signal(OBJECT, "org.example.Notifications", "ActionInvoked").unwrap(),
+                    42,
+                    Value::from("default"),
+                ),
+            ),
+        ] {
+            assert_eq!(clicks.heard(&msg), None, "{case}");
+        }
+
+        assert_eq!(clicks.heard(&closed(41)), None);
+        assert_eq!(
+            clicks.heard(&click(41)),
+            None,
+            "a closed notice is forgotten"
+        );
+        assert_eq!(
+            clicks.heard(&click(42)),
+            Some((5, None)),
+            "control: the open one still clicks"
+        );
+
+        for id in 100..100 + u32::try_from(POSTED_CAP).unwrap() {
+            clicks.posted(at(id), Some(u64::from(id)));
+        }
+        assert_eq!(
+            clicks.heard(&click(42)),
+            None,
+            "the oldest of more than the bus thread remembers is forgotten"
+        );
+        assert_eq!(
+            clicks.heard(&click(100)),
+            Some((100, None)),
+            "control: the newer ones still click"
+        );
+
+        // A bus connection ended. Its replacement may reuse the server name
+        // and id: neither the old target nor its token can route new traffic.
+        let mut epochs = Clicks::default();
+        epochs.posted(at(41), Some(3));
+        assert_eq!(epochs.observe(Observation::Message(&token(41))), None);
+        assert_eq!(epochs.observe(Observation::ConnectionReset), None);
+        assert_eq!(epochs.observe(Observation::Message(&click(41))), None);
+        epochs.posted(at(41), Some(5));
+        assert_eq!(
+            epochs.observe(Observation::Message(&click(41))),
+            Some((5, None)),
+            "the replacement's notice routes to its own session, with no old token"
+        );
+        assert_eq!(epochs.observe(Observation::Message(&token(41))), None);
+        epochs.posted(at(41), Some(7));
+        assert_eq!(
+            epochs.observe(Observation::Message(&click(41))),
+            Some((7, None)),
+            "a repeated key replaces its target and token within an epoch too"
+        );
+        epochs.posted(at(42), Some(9));
+        epochs.posted(at(41), None);
+        assert_eq!(
+            epochs.observe(Observation::Message(&click(41))),
+            None,
+            "an instance-level replacement cannot route to an old session"
+        );
+        assert_eq!(
+            epochs.observe(Observation::Message(&click(42))),
+            Some((9, None)),
+            "an unrelated open notice still routes"
+        );
+    }
+
+    /// A CLICK ON A LINUX NOTIFICATION GOES TO THE TAB THAT POSTED IT, end to
+    /// end through a private `dbus-daemon` (never the session's bus). The
+    /// stand-in server answers `Notify` with ids and, as GNOME Shell 46 does,
+    /// reports a click on a notice that offers the `default` action by
+    /// broadcasting `ActivationToken` and then `ActionInvoked` (on a notice
+    /// without it, the shell activates the app itself and says nothing on the
+    /// bus). The owner is on tab A; tab A's and tab B's notices are posted
+    /// through the bus thread ([`super::freedesktop::Poster`], fed as the
+    /// delivery thread feeds it, by `post`), and tab B's is clicked. The bus
+    /// thread hands over `Wake::NoticeClicked` for tab B's session with the
+    /// token, and the App's answer ([`crate::App::notice_clicked`]) selects tab
+    /// B, raises its window and presents the token. Before that click the
+    /// server broadcast a click on another program's notification, closed tab
+    /// A's notice and clicked it: none of these reached the App, since the
+    /// first wake is tab B's. A click on a notice whose session has gone raises
+    /// the window aterm was last used in. NEGATIVE CONTROL (by hand): without
+    /// the `default` action the server reports no click, and the wait for tab
+    /// B's fails. COULD NOT RUN where no `dbus-daemon` is on PATH.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_click_on_a_linux_notification_goes_to_the_tab_that_posted_it() {
+        use aterm_dbus::{Connection, Kind, Message, Value};
+
+        use crate::app_tabs::{take_raised_activations, take_raised_windows};
+
+        const TOKEN: &str = "gnome-shell/aterm/4242-1-host_TIME5678";
+
+        fn emit(server: &mut Connection, member: &str, id: u32, arg: Value) {
+            server
+                .emit(OBJECT, SERVER, member, vec![Value::U32(id), arg])
+                .unwrap();
+        }
+        /// GNOME Shell 46's answer to a click on the notice `id` that `notify` posted.
+        fn click(server: &mut Connection, (id, notify): &(u32, Message)) {
+            let offers_default = notify.body[5].as_array().is_some_and(|actions| {
+                actions
+                    .items()
+                    .iter()
+                    .any(|a| a.as_str() == Some("default"))
+            });
+            if offers_default {
+                emit(server, "ActivationToken", *id, Value::from(TOKEN));
+                emit(server, "ActionInvoked", *id, Value::from("default"));
+            }
+        }
+
+        let private = PrivateBus::start();
+        let mut server = private.server();
+        let served = std::thread::spawn(move || {
+            let mut notices = Vec::new();
+            let mut next = 41;
+            while notices.len() < 2 {
+                let msg = server.recv(Some(HANG)).unwrap().expect("a Notify call");
+                if msg.kind == Kind::MethodCall && msg.member.as_deref() == Some("Notify") {
+                    server.reply(&msg, vec![Value::U32(next)]).unwrap();
+                    notices.push((next, msg));
+                    next += 1;
+                }
+            }
+            emit(&mut server, "ActionInvoked", 99, Value::from("default"));
+            emit(
+                &mut server,
+                "NotificationClosed",
+                notices[0].0,
+                Value::U32(2),
+            );
+            click(&mut server, &notices[0]);
+            click(&mut server, &notices[1]);
+            (server, notices)
+        });
+
+        let wid = crate::WindowId(0);
+        let mut app = crate::App::headless_for_test();
+        app.push_stub_tab(wid, crate::stub_session(app.next_session_id));
+        let (tab_a, tab_b) = (0, 1);
+        app.switch_tab_in(wid, 0);
+        assert_eq!(
+            app.windows[&wid].tabs.active, 0,
+            "fixture: the owner is on tab A"
+        );
+        let _ = (take_raised_windows(), take_raised_activations());
+
+        let (woke, wakes) = std::sync::mpsc::channel();
+        let addresses = private.addresses.clone();
+        let poster = super::freedesktop::Poster::start(
+            move || Connection::open(&addresses),
+            move |wake| {
+                let _ = woke.send(wake);
+            },
+        )
+        .expect("the bus thread starts");
+        super::post(&poster, Some("tab A"), "build done", false, tab_a);
+        super::post(&poster, Some("tab B"), "tests done", false, tab_b);
+
+        let wake = wakes
+            .recv_timeout(HANG)
+            .expect("the click on tab B's notice reaches aterm");
+        let crate::Wake::NoticeClicked {
+            session,
+            activation,
+        } = wake
+        else {
+            panic!("not a click: {wake:?}");
+        };
+        assert_eq!(
+            (session, activation.as_deref()),
+            (tab_b, Some(TOKEN)),
+            "tab B's notice, with the server's token: the other program's click and the closed \
+             notice's went nowhere"
+        );
+        app.notice_clicked(session, activation);
+        assert_eq!(app.windows[&wid].tabs.active, 1, "tab B is selected");
+        assert_eq!(take_raised_windows(), vec![wid], "its window raised");
+        assert_eq!(
+            take_raised_activations(),
+            vec![Some(TOKEN.to_owned())],
+            "with the click's activation token"
+        );
+
+        let (_server, notices) = served.join().unwrap();
+        for (_, notify) in &notices {
+            assert_eq!(
+                notify.body[5],
+                Value::strings(["default", "Go to tab"]),
+                "a notice about a session offers the default action"
+            );
+        }
+
+        app.notice_clicked(999, None);
+        assert_eq!(
+            app.windows[&wid].tabs.active, 1,
+            "a session gone moves no tab"
+        );
+        assert_eq!(
+            take_raised_windows(),
+            vec![wid],
+            "and raises the window aterm was last used in"
+        );
+        drop(poster);
     }
 }

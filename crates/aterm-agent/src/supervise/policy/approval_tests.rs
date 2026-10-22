@@ -462,12 +462,15 @@ fn a_shell_startup_the_models_do_not_assume_proves_no_rm_and_reads_nothing() {
 }
 
 /// UNDER ZSH ONLY A PLAIN LINE IS A PROVEN READ (the zsh sweeps are exhaustive
-/// only over the forms tried): a read the classifier clears but that expands
-/// something — a parameter, a brace, a quoted backslash — is a person's under
-/// `approve = "safe"` when the Bash tool may run zsh, and pressed all the same
-/// under full power with the reason kept as `unproven`. The same lines are
-/// proven reads where the tool runs bash (the negative control), and a plain
-/// read is proven under zsh.
+/// only over the forms tried): a read the classifier clears but that zsh
+/// expands further than bash — a modifier (`$x:h`), a flag (`$=x` splits), a
+/// glob after a read (`${x}[1]`), a brace, a quoted backslash — is a person's
+/// under `approve = "safe"` when the Bash tool may run zsh, and pressed all
+/// the same under full power with the reason kept as `unproven`. The same
+/// lines are proven reads where the tool runs bash (the negative control), and
+/// a plain read is proven under zsh: one with no expansion, and since
+/// `read-only@classify-v4` one with a plain `$NAME`, `${NAME}` or `$(…)`
+/// (MEASURED 2026-10-22: zsh takes none of them further than bash).
 #[test]
 fn under_zsh_only_a_plain_line_is_a_proven_read() {
     let zsh = zsh_startup("", "");
@@ -479,8 +482,10 @@ fn under_zsh_only_a_plain_line_is_a_proven_read() {
         ..git_host(ctx())
     };
     for line in [
-        "ls -la \"$TMPDIR\"",
-        "echo ${HOME}",
+        "echo $x:h",
+        "echo \"$x:h\"",
+        "echo $=x",
+        "echo ${x}[1]",
         "wc -l src/{a,b}.rs",
         "rg \"fn \\w+\" src",
     ] {
@@ -518,6 +523,9 @@ fn under_zsh_only_a_plain_line_is_a_proven_read() {
         "git log --oneline -5 --format='%h %s' 2>/dev/null | head -3",
         "grep -rn \"TODO\" src && wc -l ~/notes.txt",
         "ls *.rs # what's here",
+        "ls -la \"$TMPDIR\"",
+        "echo ${HOME}",
+        "echo \"$(ls)\" $(ls src)",
     ] {
         let b = bash_box(&[line], Some("Look"));
         assert_eq!(
@@ -3237,6 +3245,546 @@ fn full_power_answers_every_permission_box_with_its_one_shot_allow() {
     assert!(approved(&on_screen(&phase_fixtures::bash_one_row(), &none(full()))).is_none());
 }
 
+/// The MEASURED 2.1.307 too-many box (`echo` and 65 `$(true)`, its command in
+/// four barred rows between dashed rules; `bypass`: the bypass session's, its
+/// auto-deny countdown under the note) with its command rows replaced by
+/// `lines`, one barred row each: the box a command of short lines is drawn as.
+pub(crate) fn too_many_box(lines: &[String], bypass: bool) -> Vec<String> {
+    let rows = phase_fixtures::screen(if bypass {
+        phase_fixtures::BOX_RM_TOO_MANY_NO_RM_BYPASS_2_1_307
+    } else {
+        phase_fixtures::BOX_RM_TOO_MANY_NO_RM_2_1_307
+    });
+    let rules: Vec<usize> = (0..rows.len())
+        .filter(|&i| rows[i].trim_start().starts_with('\u{254c}'))
+        .collect();
+    let [open, close] = rules[..] else {
+        panic!("the capture's two dashed rules: {rules:?}");
+    };
+    assert_eq!(close - open - 1, 4, "the capture's four command rows");
+    assert!(
+        rows[open + 1].starts_with(" \u{2502} echo $(true)"),
+        "{}",
+        rows[open + 1]
+    );
+    let mut out = rows[..=open].to_vec();
+    out.extend(lines.iter().map(|l| format!(" \u{2502} {l}")));
+    out.extend_from_slice(&rows[close..]);
+    out
+}
+
+/// Thirteen lines of `echo` and five `$(true)` (the 65 substitutions the
+/// MEASURED note counts), with `line` put in place of line `k` (from 0) for
+/// each `(k, line)` of `swaps`.
+pub(crate) fn sixty_five(swaps: &[(usize, &str)]) -> Vec<String> {
+    let mut lines = vec!["echo $(true) $(true) $(true) $(true) $(true)".to_string(); 13];
+    for (k, line) in swaps {
+        lines[*k] = (*line).to_string();
+    }
+    lines
+}
+
+/// THE TOO-MANY BOX IS JUDGED ON THE TRANSCRIPT'S COMMAND WHERE IT DRAWS AS THE
+/// BOX (`breaker-read-only@v2`, MEASURED 2026-10-22): the MEASURED box itself,
+/// `echo` and 65 `$(true)` as one line wrapped into four barred rows, which no
+/// reading of the screen proves (its newline reading puts a `$(true)` where a
+/// command's name goes), is pressed `1` under the safe rules, in bypass and
+/// out, under bash and under a shell that may be zsh, where the agent's
+/// transcript holds that one line as its pending Bash call
+/// ([`ApprovalCtx::box_command`]) and it draws as the box's rows
+/// ([`super::super::box_command::drawn_as`]); the subject is that command.
+///
+/// NEGATIVE CONTROLS, each escalated under the safe rules, its reason led by
+/// the breaker's label:
+/// * the transcript holds the box's NEWLINE TWIN (captured: the same rows on
+///   screen): it draws as the box too, and is judged as written, so its
+///   `$(true)` in a command's name is refused, said to be the transcript's;
+/// * the transcript holds another command (a captured probe's): it does not
+///   draw as the box, so the screen's readings are judged and the reason says
+///   why the call was not taken;
+/// * the transcript named no call (`2 calls waiting`): the screen's readings,
+///   and the reason names why;
+/// * the box drawn from a subagent (` · from …` in its title): no call is
+///   matched to it;
+/// * nothing read (`None`): the screen's readings alone, as before.
+#[test]
+fn the_too_many_box_is_judged_on_the_transcripts_command_where_it_draws_as_the_box() {
+    use super::super::box_command::tests::command_of;
+    use phase_fixtures::{
+        BOX_RM_TOO_MANY_NO_RM_2_1_307, BOX_RM_TOO_MANY_NO_RM_BYPASS_2_1_307, screen,
+    };
+    let label = "the rm circuit breaker (not ruled out: too many command substitutions to \
+                 analyze; the command need not name rm)";
+    let space = command_of("Echo 65 empty substitutions");
+    let call = |command: &str| {
+        Some(Ok(BoxCommand {
+            id: "toolu_lab0c1b6e01".to_string(),
+            command: command.to_string(),
+        }))
+    };
+    let zsh = || Ok(ShellStartup::of_parts(Vec::new(), true));
+    for (text, base) in [
+        (BOX_RM_TOO_MANY_NO_RM_2_1_307, ctx()),
+        (BOX_RM_TOO_MANY_NO_RM_BYPASS_2_1_307, bypass()),
+    ] {
+        let rows = screen(text);
+        for c in [
+            ApprovalCtx {
+                box_command: call(&space),
+                ..base.clone()
+            },
+            ApprovalCtx {
+                box_command: call(&space),
+                shell: zsh(),
+                ..base.clone()
+            },
+        ] {
+            match on_screen(&rows, &c) {
+                Decision::Approve {
+                    rule_id,
+                    choice,
+                    subject,
+                    unproven,
+                    ..
+                } => {
+                    assert_eq!(
+                        (rule_id, choice),
+                        (RULE_BREAKER_READ_ONLY, Choice::Digit(1))
+                    );
+                    assert_eq!(unproven, None);
+                    assert_eq!(subject, space);
+                }
+                d => panic!("{d:?}"),
+            }
+        }
+        // NEGATIVE CONTROLS
+        let twin = command_of("Probe too-many-newline-twin");
+        let other = command_of("Probe wrap-long-word");
+        let mut from_subagent = rows.clone();
+        let title = from_subagent
+            .iter()
+            .position(|r| r == " Bash command")
+            .expect("the title row");
+        from_subagent[title] = " Bash command · from a subagent".to_string();
+        for (what, rows, box_command, why) in [
+            (
+                "the newline twin",
+                rows.clone(),
+                call(&twin),
+                "not read-only (newline reading): a command whose name this check cannot read \
+                 ($(…)) (judged on the transcript's command, drawn as the box)",
+            ),
+            (
+                "another command",
+                rows.clone(),
+                call(&other),
+                "; the transcript's waiting Bash call is not the box's: the command draws 6 rows",
+            ),
+            (
+                "no call named",
+                rows.clone(),
+                Some(Err("the transcript holds 2 calls waiting".to_string())),
+                "; no transcript call taken: the transcript holds 2 calls waiting",
+            ),
+            (
+                "from a subagent",
+                from_subagent,
+                call(&space),
+                "; the transcript's waiting Bash call is not the box's: the box is not one",
+            ),
+            (
+                "nothing read",
+                rows.clone(),
+                None,
+                "not read-only (newline reading): a command whose name this check cannot read",
+            ),
+        ] {
+            let c = ApprovalCtx {
+                box_command,
+                ..base.clone()
+            };
+            let r = reason(&on_screen(&rows, &c)).to_string();
+            assert!(r.starts_with(&format!("{label}: ")), "{what}: {r}");
+            assert!(r.contains(why), "{what}: {r}");
+        }
+    }
+}
+
+/// THE RM BREAKER'S TOO-MANY BOX OVER A COMMAND PROVEN A READ IS APPROVED
+/// UNDER ITS OWN RULE (`breaker-read-only@v2`): Claude Code 2.1.307 draws the
+/// box over any command with more than 64 command substitutions, rm or none,
+/// in a bypass session too (MEASURED). The MEASURED box with its rows made
+/// thirteen lines of `echo` and five `$(true)` is pressed `1` under the safe
+/// rules, warned or not, in bypass and out, under a shell that may be zsh
+/// (each `$(true)` a plain substitution there, MEASURED 2026-10-22), and under
+/// full power, ledgered under the rule with no `unproven`, its subject the
+/// command as drawn.
+///
+/// NEGATIVE CONTROLS, each escalated under the safe rules (bypass and out),
+/// its reason led by the breaker's label, and pressed under full power only as
+/// an unproven one-shot allow:
+/// * the MEASURED boxes themselves: `echo` and 65 `$(true)` as ONE line,
+///   wrapped into four barred rows, whose newline reading puts a `$(true)`
+///   where a command's name goes (the screen cannot tell a wrap from a
+///   newline); and the one that names rm;
+/// * an rm hidden in substitution 40 of 65 (`$(rm -f zz-none)`, and `$(RM …)`:
+///   the command names rm), and a `touch` there (the classifier's own refusal);
+/// * a command's name built from a substitution (`$(echo ls)`), `eval`, a
+///   redirect that writes, a function the line defines, a keyword after an
+///   assignment (`X=1 if …`: bash runs a program named `if`) or after a
+///   pipe's `time` (`… | time if true`: `/usr/bin/time` runs a program `if`),
+///   an option of a pipe's `time` (`… | time -o out.txt ls` writes
+///   `out.txt`, MEASURED in bash 3.2),
+///   and an arithmetic assignment to `PATH` (`$((x=1,PATH=0)); ls` runs
+///   `./0/ls`, MEASURED in bash 3.2);
+/// * an alias of `echo` in the shell's startup, a startup not read, and under
+///   a shell that may be zsh a form zsh takes further than bash (`$x:h`, a
+///   modifier; `$=x`, which splits);
+/// * a box with a third option: not the breaker's own `Yes`/`No`;
+/// * the nested breaker (MEASURED): no rule proves its kind a read.
+///
+/// Under `approve = "none"` nothing is pressed.
+#[test]
+fn the_too_many_breaker_over_a_proven_read_is_approved_under_its_rule() {
+    use phase_fixtures::{
+        BOX_RM_NESTED_2_1_307, BOX_RM_TOO_MANY_2_1_307, BOX_RM_TOO_MANY_NO_RM_2_1_307,
+        BOX_RM_TOO_MANY_NO_RM_BYPASS_2_1_307, screen,
+    };
+    let label = "the rm circuit breaker (not ruled out: too many command substitutions to \
+                 analyze; the command need not name rm)";
+    let full_bypass = || ApprovalCtx {
+        bypass_mode: true,
+        ..full()
+    };
+    let safe_warn_bypass = || ApprovalCtx {
+        bypass_mode: true,
+        ..safe_warn()
+    };
+    let zsh = || Ok(ShellStartup::of_parts(Vec::new(), true));
+    let lines = sixty_five(&[]);
+    for bypass_box in [false, true] {
+        let rows = too_many_box(&lines, bypass_box);
+        for (level, c) in [
+            ("safe", ctx()),
+            ("safe, warn", safe_warn()),
+            ("safe, bypass", bypass()),
+            ("safe, warn, bypass", safe_warn_bypass()),
+            (
+                "safe, zsh",
+                ApprovalCtx {
+                    shell: zsh(),
+                    ..ctx()
+                },
+            ),
+            (
+                "safe, bypass, zsh",
+                ApprovalCtx {
+                    shell: zsh(),
+                    ..bypass()
+                },
+            ),
+            ("full", full()),
+            ("full, bypass", full_bypass()),
+        ] {
+            match on_screen(&rows, &c) {
+                Decision::Approve {
+                    rule_id,
+                    choice,
+                    subject,
+                    unproven,
+                    ..
+                } => {
+                    assert_eq!(
+                        (rule_id, choice),
+                        (RULE_BREAKER_READ_ONLY, Choice::Digit(1)),
+                        "{bypass_box} {level}"
+                    );
+                    assert_eq!(unproven, None, "{bypass_box} {level}");
+                    assert_eq!(subject, lines.join("\n"), "{bypass_box} {level}");
+                }
+                d => panic!("{bypass_box} {level}: {d:?}"),
+            }
+        }
+        assert_eq!(approved(&on_screen(&rows, &none(full()))), None);
+    }
+    // NEGATIVE CONTROLS
+    let alias = ShellStartup::of_parts(
+        vec![("echo".into(), "an alias in a snapshot".into(), true)],
+        false,
+    );
+    let mut refused: Vec<(&str, Vec<String>, ApprovalCtx, &str)> = vec![
+        (
+            "the MEASURED one line, wrapped",
+            screen(BOX_RM_TOO_MANY_NO_RM_2_1_307),
+            ctx(),
+            "not read-only (newline reading): a command whose name this check cannot read",
+        ),
+        (
+            "the MEASURED one line, wrapped, bypass",
+            screen(BOX_RM_TOO_MANY_NO_RM_BYPASS_2_1_307),
+            bypass(),
+            "not read-only (newline reading): a command whose name this check cannot read",
+        ),
+        (
+            "the MEASURED one naming rm",
+            screen(BOX_RM_TOO_MANY_2_1_307),
+            ctx(),
+            "the command names rm or rmdir",
+        ),
+        (
+            "an rm in substitution 40 of 65",
+            too_many_box(
+                &sixty_five(&[(7, "echo $(true) $(true) $(true) $(true) $(rm -f zz-none)")]),
+                false,
+            ),
+            ctx(),
+            "the command names rm or rmdir",
+        ),
+        (
+            "an RM in substitution 40 of 65",
+            too_many_box(
+                &sixty_five(&[(7, "echo $(true) $(true) $(true) $(true) $(RM -f zz-none)")]),
+                true,
+            ),
+            bypass(),
+            "the command names rm or rmdir",
+        ),
+        (
+            "a touch in substitution 40 of 65",
+            too_many_box(
+                &sixty_five(&[(7, "echo $(true) $(true) $(true) $(true) $(touch zz-none)")]),
+                false,
+            ),
+            ctx(),
+            "not read-only (space reading): touch",
+        ),
+        (
+            "a command's name from a substitution",
+            too_many_box(
+                &sixty_five(&[(3, "$(echo ls) $(true) $(true) $(true) $(true)")]),
+                false,
+            ),
+            ctx(),
+            "a command whose name this check cannot read",
+        ),
+        (
+            "eval",
+            too_many_box(
+                &sixty_five(&[(5, "eval echo $(true) $(true) $(true) $(true) $(true)")]),
+                true,
+            ),
+            bypass(),
+            "not read-only (newline reading): eval",
+        ),
+        (
+            "a redirect that writes",
+            too_many_box(
+                &sixty_five(&[(12, "echo $(true) $(true) $(true) $(true) $(true) > out.txt")]),
+                false,
+            ),
+            ctx(),
+            "redirect > out.txt",
+        ),
+        (
+            "a function the line defines",
+            too_many_box(
+                &sixty_five(&[(
+                    0,
+                    "f() { true; }; f $(true) $(true) $(true) $(true) $(true)",
+                )]),
+                false,
+            ),
+            ctx(),
+            "not read-only",
+        ),
+        (
+            "a keyword after an assignment",
+            too_many_box(
+                &sixty_five(&[(
+                    0,
+                    "X=1 if true; then echo $(true) $(true) $(true) $(true) $(true); fi",
+                )]),
+                false,
+            ),
+            ctx(),
+            "`if` where the shell reads a command's name",
+        ),
+        (
+            "a keyword after a pipe's time",
+            too_many_box(
+                &sixty_five(&[(
+                    12,
+                    "echo $(true) $(true) $(true) $(true) $(true) | time if true",
+                )]),
+                false,
+            ),
+            ctx(),
+            "`if` where the shell reads a command's name",
+        ),
+        (
+            "an option of a pipe's time",
+            too_many_box(
+                &sixty_five(&[(
+                    12,
+                    "echo $(true) $(true) $(true) $(true) $(true) | time -o out.txt ls",
+                )]),
+                false,
+            ),
+            ctx(),
+            "time",
+        ),
+        (
+            "an arithmetic assignment to PATH",
+            too_many_box(
+                &sixty_five(&[(
+                    12,
+                    "echo $(true) $(true) $(true) $(true) $((x=1,PATH=0)); ls",
+                )]),
+                true,
+            ),
+            bypass(),
+            "an arithmetic evaluation",
+        ),
+        (
+            "an alias of echo",
+            too_many_box(&lines, false),
+            ApprovalCtx {
+                shell: Ok(alias),
+                ..ctx()
+            },
+            "`echo` is an alias in a snapshot",
+        ),
+        (
+            "the startup not read",
+            too_many_box(&lines, true),
+            ApprovalCtx {
+                shell: Err("not read".to_string()),
+                ..bypass()
+            },
+            "the Bash tool's shell may not start as this check reads a line: not read",
+        ),
+        (
+            "a modifier under a shell that may be zsh",
+            too_many_box(
+                &sixty_five(&[(12, "echo $(true) $(true) $(true) $(true) $(true) $x:h")]),
+                false,
+            ),
+            ApprovalCtx {
+                shell: zsh(),
+                ..ctx()
+            },
+            "not a plain line under zsh",
+        ),
+        (
+            "a split flag under a shell that may be zsh",
+            too_many_box(
+                &sixty_five(&[(12, "echo $(true) $(true) $(true) $(true) $(true) $=x")]),
+                true,
+            ),
+            ApprovalCtx {
+                shell: zsh(),
+                ..bypass()
+            },
+            "not a plain line under zsh",
+        ),
+    ];
+    // A third option: the same box with a standing grant between its two.
+    let mut third = too_many_box(&lines, false);
+    let no = third
+        .iter()
+        .position(|r| r.trim() == "2. No")
+        .expect("the No row");
+    third[no] = "   2. Yes, and don't ask again for echo commands in this project".to_string();
+    third.insert(no + 1, "   3. No".to_string());
+    refused.push(("a third option", third, ctx(), "its options are not"));
+    for (what, rows, c, why) in refused {
+        let r = reason(&on_screen(&rows, &c)).to_string();
+        assert!(r.starts_with(&format!("{label}: ")), "{what}: {r}");
+        assert!(r.contains(why), "{what}: {r}");
+        if what == "a third option" {
+            continue;
+        }
+        let full_c = ApprovalCtx {
+            approve: Approve::All,
+            ..c
+        };
+        match on_screen(&rows, &full_c) {
+            Decision::Approve {
+                rule_id,
+                unproven: Some(unproven),
+                ..
+            } => {
+                assert_eq!(rule_id, RULE_ALLOW_ONCE, "{what}");
+                assert!(unproven.contains(why), "{what}: {unproven}");
+            }
+            d => panic!("{what}, full: {d:?}"),
+        }
+    }
+    let nested = screen(BOX_RM_NESTED_2_1_307);
+    for c in [ctx(), bypass(), safe_warn()] {
+        let r = reason(&on_screen(&nested, &c)).to_string();
+        assert!(
+            r.starts_with(
+                "the rm circuit breaker (not ruled out: some nested commands or function \
+                 substitutions could not be analyzed; the command need not name rm): the \
+                 vendor draws this only over a shell keyword right after an assignment"
+            ),
+            "{r}"
+        );
+    }
+}
+
+/// AN ARITHMETIC ASSIGNMENT IS NO READ IN A PLAIN BASH BOX EITHER: the
+/// read-only rule clears a line by the same classifier, which had read
+/// `$((x=1,PATH=0))` as a subshell assigning `x` (bash 3.2 points `PATH` at
+/// `0`, so the `ls` after it runs `./0/ls`, MEASURED). Escalated under the
+/// safe rules, its reason the classifier's. NEGATIVE CONTROL: the same line
+/// with a command substitution where the arithmetic stood is approved under
+/// the read-only rule.
+#[test]
+fn an_arithmetic_assignment_is_no_read_in_a_plain_bash_box() {
+    let d = on_screen(
+        &bash_box(&["echo $((x=1,PATH=0)); ls"], Some("List")),
+        &ctx(),
+    );
+    assert_eq!(approved(&d), None, "{d:?}");
+    assert!(reason(&d).contains("an arithmetic evaluation"), "{d:?}");
+    // NEGATIVE CONTROL
+    let d = on_screen(&bash_box(&["echo $(true); ls"], Some("List")), &ctx());
+    assert_eq!(approved(&d), Some(RULE_READ_ONLY), "{d:?}");
+}
+
+/// [`names_a_removal`] is the vendor's `\brm(?:dir)?\b` made case-blind: `rm`
+/// and `rmdir` as words, in any case, wherever they stand. NEGATIVE CONTROLS:
+/// words that merely hold the letters (`rmx`, `xrm`, `rmdirs`, `firmware`,
+/// `rm_x`) name no removal.
+#[test]
+fn a_removal_is_rm_or_rmdir_as_a_word_in_any_case() {
+    for line in [
+        "rm -f x",
+        "echo $(rm -f x)",
+        "RM x",
+        "x; Rmdir d",
+        "a|rm",
+        "docker run --rm x",
+        "echo rm",
+        "/bin/rm x",
+    ] {
+        assert!(names_a_removal(line), "{line}");
+    }
+    for line in [
+        "rmx",
+        "xrm",
+        "rmdirs",
+        "firmware",
+        "rm_x",
+        "x_rm",
+        "echo $(true)",
+    ] {
+        assert!(!names_a_removal(line), "{line}");
+    }
+}
+
 /// Why the safe rules did not prove an answer (`None`: a safe rule proved
 /// it, or not an answer).
 fn unproven_of(d: &Decision) -> Option<&str> {
@@ -4467,8 +5015,11 @@ fn with_row(rows: &[String], from: &str, to: &str) -> Vec<String> {
 /// Every rm/rmdir breaker kind is the rm rule's to name; only the `rm`
 /// possibly-empty-variable form reaches its resolver, and only it is pressed
 /// with the warning under `approve = "safe"`'s default (every other kind stays
-/// a person's). The boxes are `CAP_RM` with its note row replaced. At full
-/// power each is pressed, its kind first in the unproven reason.
+/// a person's). The two kinds by which the vendor could not rule a removal out
+/// go to `breaker-read-only@v2` instead, which refuses this line for its rm
+/// and the nested kind outright. The boxes are `CAP_RM` with its note row
+/// replaced. At full power each is pressed, its kind first in the unproven
+/// reason.
 #[test]
 fn every_rm_breaker_kind_is_named_and_full_power_presses_each() {
     let note = CAP_RM
@@ -4478,36 +5029,44 @@ fn every_rm_breaker_kind_is_named_and_full_power_presses_each() {
         .to_string();
     let lead = &note[..note.find("Dangerous").expect("note")];
     let cmd = "S=/private/tmp/claude-502/x; rm -rf \"$S/t5\"";
-    for (text, kind) in [
+    let resolver = "resolves only an rm on";
+    for (text, kind, refusal) in [
         (
             "Dangerous rm operation on statically-unresolvable target: tmp/*",
             "statically-unresolvable target",
+            resolver,
         ),
         (
             "Dangerous rm operation on critical path: /usr",
             "critical path",
+            resolver,
         ),
         (
             "Dangerous rm operation on working directory or its ancestor: .",
             "working directory or its ancestor",
+            resolver,
         ),
         (
             "Dangerous rm operation on mounted drive path: /Volumes/x",
             "mounted drive path",
+            resolver,
         ),
         (
             "Dangerous rm operation — too many command substitutions to analyze (65)",
             "not ruled out: too many command substitutions to analyze; the command need not name rm",
+            "the command names rm or rmdir",
         ),
         (
             "Dangerous rm operation not ruled out — some nested commands or function substitutions \
              could not be analyzed",
             "not ruled out: some nested commands or function substitutions could not be analyzed; \
              the command need not name rm",
+            "the vendor draws this only over a shell keyword",
         ),
         (
             "Dangerous rmdir operation on critical path: /usr",
             "critical path",
+            resolver,
         ),
     ] {
         // The note wraps onto a second barred row in the capture: that row
@@ -4519,7 +5078,7 @@ fn every_rm_breaker_kind_is_named_and_full_power_presses_each() {
             why.contains(&format!("circuit breaker ({kind})")),
             "{text}: {why}"
         );
-        assert!(why.contains("resolves only an rm on"), "{text}: {why}");
+        assert!(why.contains(refusal), "{text}: {why}");
         let warned = ApprovalCtx {
             bypass_mode: true,
             ..safe_warn()
@@ -8447,7 +9006,7 @@ fn traced(rows: &[String], ctx: &ApprovalCtx) -> (Decision, Vec<super::super::tr
 
 /// THE TRACE NAMES THE RULE THAT DECIDED, and tells of the very decision the
 /// loop makes: a read-only box under the safe rules is decided at the safe
-/// rules by `read-only@classify-v3`, after the gates it passed (the program
+/// rules by `read-only@classify-v4`, after the gates it passed (the program
 /// supervised, no owner's review, no ask rule, no forced read, the box read
 /// whole); a write under full power is unproven by the safe rules and
 /// decided by full power; a box under `none` goes to a person at that check,
@@ -8504,8 +9063,9 @@ fn a_trace_names_the_rule_that_decided() {
     );
 }
 
-/// CLAUDE CODE 2.1.307'S BOXES AS THE LAB SAW THEM ANSWERED (crates/aterm-lab,
-/// 2026-10-21; docs/measured/claude-code-2.1.307-2026-10-21.md): at full
+/// CLAUDE CODE 2.1.307'S AND 2.1.308'S BOXES AS THE LAB SAW THEM ANSWERED
+/// (crates/aterm-lab, 2026-10-21; docs/measured/claude-code-2.1.307-2026-10-21.md
+/// and docs/measured/claude-code-2.1.308-2026-10-21.md): at full
 /// power the Bash, Write and Edit boxes get the one-shot `1`, never the
 /// standing grant or the mode switch beside it; `Ready to code?` gets its
 /// least-power yes, `2`; the ask rule's and the hook's boxes go to a person at
@@ -8513,15 +9073,19 @@ fn a_trace_names_the_rule_that_decided() {
 /// full power only, named as the breaker of their kind, and go to a person
 /// under the safe rules, never as a mere vendor note. NEGATIVE CONTROLS: under
 /// `approve = "none"` every box goes to a person, and each screen cut above
-/// its box holds nothing to decide.
+/// its box holds nothing to decide. 2.1.308's boxes are answered the same.
 #[test]
-fn the_2_1_307_lab_boxes_are_answered_as_measured() {
+fn the_lab_boxes_are_answered_as_measured() {
     use phase_fixtures::{
-        BOX_BASH_ASK_RULE_2_1_307, BOX_BASH_HOOK_ASK_2_1_307, BOX_BASH_TOUCH_2_1_307,
-        BOX_EDIT_2_1_307, BOX_RM_MOUNTED_DRIVE_2_1_307, BOX_RM_NESTED_2_1_307,
-        BOX_RM_TOO_MANY_2_1_307, BOX_RM_TOO_MANY_NO_RM_2_1_307,
-        BOX_RM_TOO_MANY_NO_RM_BYPASS_2_1_307, BOX_STATEMENT_FOLLOWS_16_2_1_307,
-        BOX_WRITE_CREATE_2_1_307, PLAN_READY_2_1_307, screen,
+        BOX_BASH_ASK_RULE_2_1_307, BOX_BASH_ASK_RULE_2_1_308, BOX_BASH_HOOK_ASK_2_1_307,
+        BOX_BASH_HOOK_ASK_2_1_308, BOX_BASH_TOUCH_2_1_307, BOX_BASH_TOUCH_2_1_308,
+        BOX_EDIT_2_1_307, BOX_EDIT_2_1_308, BOX_RM_MOUNTED_DRIVE_2_1_307,
+        BOX_RM_MOUNTED_DRIVE_2_1_308, BOX_RM_NESTED_2_1_307, BOX_RM_NESTED_2_1_308,
+        BOX_RM_TOO_MANY_2_1_307, BOX_RM_TOO_MANY_2_1_308, BOX_RM_TOO_MANY_NO_RM_2_1_307,
+        BOX_RM_TOO_MANY_NO_RM_2_1_308, BOX_RM_TOO_MANY_NO_RM_BYPASS_2_1_307,
+        BOX_RM_TOO_MANY_NO_RM_BYPASS_2_1_308, BOX_STATEMENT_FOLLOWS_16_2_1_307,
+        BOX_STATEMENT_FOLLOWS_16_2_1_308, BOX_WRITE_CREATE_2_1_307, BOX_WRITE_CREATE_2_1_308,
+        PLAN_READY_2_1_307, PLAN_READY_2_1_308, screen,
     };
     for (what, text, rule, choice) in [
         (
@@ -8538,6 +9102,30 @@ fn the_2_1_307_lab_boxes_are_answered_as_measured() {
         ),
         ("edit", BOX_EDIT_2_1_307, RULE_ALLOW_ONCE, Choice::Digit(1)),
         ("plan", PLAN_READY_2_1_307, RULE_PLAN, Choice::Digit(2)),
+        (
+            "2.1.308 bash",
+            BOX_BASH_TOUCH_2_1_308,
+            RULE_ALLOW_ONCE,
+            Choice::Digit(1),
+        ),
+        (
+            "2.1.308 write",
+            BOX_WRITE_CREATE_2_1_308,
+            RULE_ALLOW_ONCE,
+            Choice::Digit(1),
+        ),
+        (
+            "2.1.308 edit",
+            BOX_EDIT_2_1_308,
+            RULE_ALLOW_ONCE,
+            Choice::Digit(1),
+        ),
+        (
+            "2.1.308 plan",
+            PLAN_READY_2_1_308,
+            RULE_PLAN,
+            Choice::Digit(2),
+        ),
     ] {
         let rows = screen(text);
         let d = on_screen(&rows, &full());
@@ -8551,6 +9139,8 @@ fn the_2_1_307_lab_boxes_are_answered_as_measured() {
     for (what, text) in [
         ("ask rule", BOX_BASH_ASK_RULE_2_1_307),
         ("hook", BOX_BASH_HOOK_ASK_2_1_307),
+        ("2.1.308 ask rule", BOX_BASH_ASK_RULE_2_1_308),
+        ("2.1.308 hook", BOX_BASH_HOOK_ASK_2_1_308),
     ] {
         let rows = screen(text);
         let full_bypass = ApprovalCtx {
@@ -8572,11 +9162,14 @@ fn the_2_1_307_lab_boxes_are_answered_as_measured() {
     }
     // The rm breaker, every 2.1.307 box of it MEASURED. The two kinds by
     // which the vendor could not rule an rm out are named so, and as needing
-    // no rm in the command (2.1.307 draws them over `echo` and 65 `$(true)`,
-    // which aterm's own classifier reads as read-only). Full power presses
-    // `1`, naming the breaker; the safe rules hand each to a person, in a
-    // bypass session too (the rm rule resolves only an rm on a
-    // possibly-empty variable).
+    // no rm in the command (2.1.307 draws them over `echo` and 65 `$(true)`).
+    // Full power presses `1`, naming the breaker; the safe rules hand each to
+    // a person, in a bypass session too: the too-many boxes because one names
+    // rm and the other's barred rows, newline-joined, put a `$(true)` where a
+    // command's name goes (`breaker-read-only@v2` with no transcript call
+    // taken: the screen cannot tell a wrap from a newline), the nested box because nothing proves its kind a
+    // read, and the mounted drive because the rm rule resolves only an rm on
+    // a possibly-empty variable.
     let too_many = "the rm circuit breaker (not ruled out: too many command substitutions to \
                     analyze; the command need not name rm)";
     for (what, text, why) in [
@@ -8597,6 +9190,28 @@ fn the_2_1_307_lab_boxes_are_answered_as_measured() {
             "mounted drive",
             BOX_RM_MOUNTED_DRIVE_2_1_307,
             "the rm circuit breaker (mounted drive path)",
+        ),
+        ("2.1.308 too many, rm", BOX_RM_TOO_MANY_2_1_308, too_many),
+        (
+            "2.1.308 too many, no rm",
+            BOX_RM_TOO_MANY_NO_RM_2_1_308,
+            too_many,
+        ),
+        (
+            "2.1.308 mounted drive",
+            BOX_RM_MOUNTED_DRIVE_2_1_308,
+            "the rm circuit breaker (mounted drive path)",
+        ),
+        (
+            "2.1.308 too many, no rm, bypass",
+            BOX_RM_TOO_MANY_NO_RM_BYPASS_2_1_308,
+            too_many,
+        ),
+        (
+            "2.1.308 nested, no rm",
+            BOX_RM_NESTED_2_1_308,
+            "the rm circuit breaker (not ruled out: some nested commands or function \
+             substitutions could not be analyzed; the command need not name rm)",
         ),
     ] {
         let rows = screen(text);
@@ -8646,15 +9261,20 @@ fn the_2_1_307_lab_boxes_are_answered_as_measured() {
     // NEGATIVE CONTROL: the nested shape inside the vendor's budget is no
     // breaker: full power presses its plain `1`, nothing named; the safe
     // rules hand it over for its vendor note, not as a breaker.
-    let rows = screen(BOX_STATEMENT_FOLLOWS_16_2_1_307);
-    let d = on_screen(&rows, &full());
-    assert_eq!(pressed(&d), (RULE_ALLOW_ONCE, Choice::Digit(1)), "{d:?}");
-    assert!(
-        !format!("{d:?}").contains("circuit breaker"),
-        "within the budget: {d:?}"
-    );
-    let d = on_screen(&rows, &bypass());
-    assert!(!reason(&d).contains("circuit breaker"), "{d:?}");
+    for text in [
+        BOX_STATEMENT_FOLLOWS_16_2_1_307,
+        BOX_STATEMENT_FOLLOWS_16_2_1_308,
+    ] {
+        let rows = screen(text);
+        let d = on_screen(&rows, &full());
+        assert_eq!(pressed(&d), (RULE_ALLOW_ONCE, Choice::Digit(1)), "{d:?}");
+        assert!(
+            !format!("{d:?}").contains("circuit breaker"),
+            "within the budget: {d:?}"
+        );
+        let d = on_screen(&rows, &bypass());
+        assert!(!reason(&d).contains("circuit breaker"), "{d:?}");
+    }
     for text in [
         BOX_BASH_TOUCH_2_1_307,
         BOX_WRITE_CREATE_2_1_307,
@@ -8666,6 +9286,17 @@ fn the_2_1_307_lab_boxes_are_answered_as_measured() {
         BOX_RM_NESTED_2_1_307,
         BOX_RM_MOUNTED_DRIVE_2_1_307,
         PLAN_READY_2_1_307,
+        BOX_BASH_TOUCH_2_1_308,
+        BOX_WRITE_CREATE_2_1_308,
+        BOX_EDIT_2_1_308,
+        BOX_BASH_ASK_RULE_2_1_308,
+        BOX_BASH_HOOK_ASK_2_1_308,
+        BOX_RM_TOO_MANY_2_1_308,
+        BOX_RM_TOO_MANY_NO_RM_2_1_308,
+        BOX_RM_MOUNTED_DRIVE_2_1_308,
+        BOX_RM_TOO_MANY_NO_RM_BYPASS_2_1_308,
+        BOX_RM_NESTED_2_1_308,
+        PLAN_READY_2_1_308,
     ] {
         let rows = screen(text);
         let (top, _) = aterm_phase::prompt::prompt_box_span(&rows).expect("the span");

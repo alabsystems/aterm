@@ -86,7 +86,7 @@ impl CcVerdict {
     /// fixes a missing one. A compiler that cannot build names its own cause ([`Self::line`]);
     /// off macOS that is most often missing libc headers, which the install supplies, while
     /// on macOS the refusing compiler is already installed (an unaccepted Xcode license, a
-    /// PATH-first `cc` with no SDK) and `xcode-select --install` would only say so. `None`
+    /// PATH-first `cc` with no SDK) and installing the tools again would not change it. `None`
     /// for every verdict that does not block builds.
     #[must_use]
     pub fn fix(&self) -> Option<&'static str> {
@@ -142,11 +142,15 @@ impl CcVerdict {
     }
 }
 
-/// The act that installs a C toolchain on this platform.
+/// The act that installs a C toolchain on this platform. On macOS it is `base.clt`
+/// (docs/DESIGN-init-system-2026-10-20.md §4.2): `aterm init --only base.clt` installs
+/// Apple's Command Line Tools through the machines agent's root path, with one password
+/// prompt in the terminal, where `xcode-select --install` raises a dialog on the desktop
+/// and waits on whoever is there.
 #[must_use]
 pub fn act() -> &'static str {
     if cfg!(target_os = "macos") {
-        "xcode-select --install"
+        "aterm init --only base.clt"
     } else if cfg!(windows) {
         "install the Visual Studio Build Tools (C++ workload)"
     } else {
@@ -206,23 +210,63 @@ pub fn probe_with(path_var: Option<&OsStr>, host: &CcHost) -> CcVerdict {
     if cfg!(windows) {
         return CcVerdict::NotProbed;
     }
+    let cc = match locate(path_var, host) {
+        Ok(Located::Plain(cc)) => {
+            return match ask(&cc, &cc, &["--version"], host.bound) {
+                CcVerdict::Ready { driver } => build_probe(&cc, driver, path_var, host),
+                other => other,
+            };
+        }
+        Ok(Located::Shim(cc)) => cc,
+        Err(verdict) => return verdict,
+    };
+    // `xcrun --find cc` names the tool the shim forwards to.
+    let shim_dir = cc.parent().unwrap_or(Path::new("/usr/bin"));
+    match ask(&shim_dir.join("xcrun"), &cc, &["--find", "cc"], host.bound) {
+        CcVerdict::Ready { driver } => build_probe(&cc, driver, path_var, host),
+        other => other,
+    }
+}
+
+/// Whether a C toolchain is installed here, read without running anything: `Some(false)`
+/// exactly where [`probe_with`] answers [`CcVerdict::NoDriver`] or
+/// [`CcVerdict::NoDeveloperDir`] (what installing one fixes, [`CcVerdict::fix`]),
+/// `Some(true)` where it would go on to ask a compiler, `None` where it probes nothing
+/// (Windows). A few `stat`s and one `readlink`: what the seed reads at every launch to end
+/// the window's missing-toolchain entry once the tools are in place, without the build
+/// probe's compile.
+#[must_use]
+pub fn installed_with(path_var: Option<&OsStr>, host: &CcHost) -> Option<bool> {
+    (!cfg!(windows)).then(|| locate(path_var, host).is_ok())
+}
+
+/// The `cc` a build would run, as [`locate`] finds it.
+enum Located {
+    /// A compiler that is not the install shim: asked its version first.
+    Plain(PathBuf),
+    /// The libxcselect shim, with a developer directory holding a `clang` behind it.
+    Shim(PathBuf),
+}
+
+/// The read-only half of [`probe_with`]: the first `cc` on `path_var`, and for the install
+/// shim whether the active developer directory (the link, else the default) holds a
+/// `clang`; [`CcVerdict::NoDriver`] or [`CcVerdict::NoDeveloperDir`] when the probe stops
+/// there. Nothing is spawned.
+fn locate(path_var: Option<&OsStr>, host: &CcHost) -> Result<Located, CcVerdict> {
     let Some(cc) = path_var.and_then(|path| {
         std::env::split_paths(path)
             .filter(|dir| dir.is_absolute())
             .map(|dir| dir.join("cc"))
             .find(|candidate| is_executable(candidate))
     }) else {
-        return CcVerdict::NoDriver;
+        return Err(CcVerdict::NoDriver);
     };
     let is_shim = host
         .shim_dir
         .as_deref()
         .is_some_and(|shim| cc.parent() == Some(shim));
     if !is_shim {
-        return match ask(&cc, &cc, &["--version"], host.bound) {
-            CcVerdict::Ready { driver } => build_probe(&cc, driver, path_var, host),
-            other => other,
-        };
+        return Ok(Located::Plain(cc));
     }
     // The shim: `xcrun` is asked only when the developer directory holds a clang, and the
     // shim runs only once `xcrun` names a compiler.
@@ -234,14 +278,10 @@ pub fn probe_with(path_var: Option<&OsStr>, host: &CcHost) -> CcVerdict {
     ]
     .iter()
     .any(|clang| is_executable(clang));
-    if !holds_clang {
-        return CcVerdict::NoDeveloperDir;
-    }
-    // `xcrun --find cc` names the tool the shim forwards to.
-    let shim_dir = cc.parent().unwrap_or(Path::new("/usr/bin"));
-    match ask(&shim_dir.join("xcrun"), &cc, &["--find", "cc"], host.bound) {
-        CcVerdict::Ready { driver } => build_probe(&cc, driver, path_var, host),
-        other => other,
+    if holds_clang {
+        Ok(Located::Shim(cc))
+    } else {
+        Err(CcVerdict::NoDeveloperDir)
     }
 }
 
@@ -580,6 +620,41 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// [`installed_with`] is the probe's read-only half: `Some(false)` exactly where the probe
+    /// stops at NoDriver or NoDeveloperDir, `Some(true)` where it would ask a compiler, and
+    /// it spawns nothing on either path.
+    #[test]
+    fn installed_is_false_exactly_where_the_probe_finds_nothing_to_ask() {
+        let root = scratch("installed");
+        let ran = root.join("ran");
+        let plain = plain_host(&root);
+        let empty = root.join("empty");
+        std::fs::create_dir_all(&empty).unwrap();
+        assert_eq!(installed_with(Some(empty.as_os_str()), &plain), Some(false));
+        assert_eq!(installed_with(None, &plain), Some(false));
+        let good = root.join("good");
+        script(&good.join("cc"), &format!("touch '{}'", ran.display()));
+        assert_eq!(installed_with(Some(good.as_os_str()), &plain), Some(true));
+
+        let shim = root.join("usr-bin");
+        script(&shim.join("cc"), &format!("touch '{}'", ran.display()));
+        let developer = root.join("CommandLineTools");
+        let host = CcHost {
+            shim_dir: Some(shim.clone()),
+            default_developer_dir: developer.clone(),
+            ..plain_host(&root)
+        };
+        assert_eq!(installed_with(Some(shim.as_os_str()), &host), Some(false));
+        assert_eq!(
+            probe_with(Some(shim.as_os_str()), &host),
+            CcVerdict::NoDeveloperDir
+        );
+        script(&developer.join("usr/bin/clang"), "exit 0");
+        assert_eq!(installed_with(Some(shim.as_os_str()), &host), Some(true));
+        assert!(!ran.exists(), "nothing was spawned");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// A compiler that answers `--version` but cannot build is Broken, with its first stderr
     /// line.
     #[test]
@@ -615,8 +690,17 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// On macOS the install is `base.clt`, one password prompt in a terminal, never Apple's
+    /// desktop dialog (design init-system A15).
+    #[test]
+    fn the_macos_install_is_base_clt() {
+        if cfg!(target_os = "macos") {
+            assert_eq!(act(), "aterm init --only base.clt");
+        }
+    }
+
     /// A missing toolchain is told to install one; a refusing compiler on macOS is told to fix
-    /// what it reports, never `xcode-select --install`.
+    /// what it reports, never the install.
     #[test]
     fn a_refusing_compiler_is_not_told_to_install_what_it_is() {
         for missing in [CcVerdict::NoDriver, CcVerdict::NoDeveloperDir] {

@@ -120,6 +120,7 @@ pub(crate) type Rank = (bool, u8, bool, Reverse<Instant>, Reverse<MessageId>);
 /// Success with Info as one class, so the two order by `posted_at` alone (a
 /// launch pass's `✓` result posted first is not held behind the `↻` rows
 /// that follow it).
+#[inline]
 #[must_use]
 pub(crate) const fn severity_class(severity: Severity) -> u8 {
     match severity {
@@ -133,6 +134,7 @@ pub(crate) const fn severity_class(severity: Severity) -> u8 {
 /// run, `aterm crashed last time`, [`crate::Message::retrospective`]) ranks
 /// one severity class below its own: what happened last time never takes the
 /// row of what is happening now.
+#[inline]
 #[must_use]
 pub(crate) fn rank(live: &Live) -> Rank {
     (
@@ -145,6 +147,7 @@ pub(crate) fn rank(live: &Live) -> Rank {
 }
 
 /// `true` when `a` outranks `b` strictly.
+#[inline]
 #[must_use]
 pub(crate) fn outranks(a: &Live, b: &Live) -> bool {
     rank(a) > rank(b)

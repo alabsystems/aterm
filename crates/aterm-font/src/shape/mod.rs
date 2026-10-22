@@ -57,6 +57,7 @@ use buffer::Buffer;
 pub struct UnicodeBuffer(Buffer);
 
 impl Default for UnicodeBuffer {
+    #[inline]
     fn default() -> Self {
         Self::new()
     }
@@ -64,54 +65,69 @@ impl Default for UnicodeBuffer {
 
 impl UnicodeBuffer {
     /// An empty buffer.
+    #[inline]
+    #[must_use]
     pub fn new() -> Self {
         UnicodeBuffer(Buffer::new())
     }
 
     /// The number of characters.
-    pub fn len(&self) -> usize {
+    #[inline]
+    #[must_use]
+    pub const fn len(&self) -> usize {
         self.0.len
     }
 
     /// Whether there are none.
-    pub fn is_empty(&self) -> bool {
+    #[inline]
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
         self.0.len == 0
     }
 
     /// Appends `text`, each character's cluster its UTF-8 byte offset in it.
+    #[inline]
     pub fn push_str(&mut self, text: &str) {
         self.0.push_str(text);
     }
 
     /// Appends one character with the cluster value `cluster`.
+    #[inline]
     pub fn add(&mut self, c: char, cluster: u32) {
         self.0.add(c as u32, cluster);
     }
 
     /// Sets the direction (left unset, [`Self::guess_segment_properties`]
     /// takes the script's).
+    #[inline]
     pub fn set_direction(&mut self, direction: Direction) {
         self.0.direction = direction;
     }
 
     /// The direction, [`Direction::Invalid`] until set or guessed.
-    pub fn direction(&self) -> Direction {
+    #[inline]
+    #[must_use]
+    pub const fn direction(&self) -> Direction {
         self.0.direction
     }
 
     /// The script, if set or guessed and the text has one.
-    pub fn script(&self) -> Option<Script> {
+    #[inline]
+    #[must_use]
+    pub const fn script(&self) -> Option<Script> {
         self.0.script
     }
 
     /// Sets the script to the first that is not Common, Inherited or
     /// Unknown, and the direction to the one it is written in, for whichever
     /// of the two is unset.
+    #[inline]
     pub fn guess_segment_properties(&mut self) {
         self.0.guess_segment_properties();
     }
 
     /// Empties the buffer and its segment properties, keeping its storage.
+    #[inline]
     pub fn clear(&mut self) {
         self.0.clear();
     }
@@ -122,26 +138,36 @@ pub struct GlyphBuffer(Buffer);
 
 impl GlyphBuffer {
     /// The number of glyphs.
-    pub fn len(&self) -> usize {
+    #[inline]
+    #[must_use]
+    pub const fn len(&self) -> usize {
         self.0.len
     }
 
     /// Whether there are none.
-    pub fn is_empty(&self) -> bool {
+    #[inline]
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
         self.0.len == 0
     }
 
     /// The glyphs, in visual order (left to right for a right-to-left run).
+    #[inline]
+    #[must_use]
     pub fn glyph_infos(&self) -> &[GlyphInfo] {
         self.0.info.get(..self.0.len).unwrap_or(&[])
     }
 
     /// Their positions, parallel to [`Self::glyph_infos`].
+    #[inline]
+    #[must_use]
     pub fn glyph_positions(&self) -> &[GlyphPosition] {
         self.0.pos.get(..self.0.len).unwrap_or(&[])
     }
 
     /// Empties the buffer and hands its storage back for the next run.
+    #[inline]
+    #[must_use]
     pub fn clear(mut self) -> UnicodeBuffer {
         self.0.clear();
         UnicodeBuffer(self.0)
@@ -151,6 +177,7 @@ impl GlyphBuffer {
 /// Shapes `buffer` on `face` with `features`, guessing its segment
 /// properties and building a plan for them. Prefer [`shape_with_plan`] with a
 /// kept plan when shaping many runs.
+#[inline]
 pub fn shape(face: &ShapeFace, features: &[Feature], mut buffer: UnicodeBuffer) -> GlyphBuffer {
     buffer.guess_segment_properties();
     let plan = ShapePlan::new(face, buffer.0.direction, buffer.0.script, features);
@@ -159,6 +186,7 @@ pub fn shape(face: &ShapeFace, features: &[Feature], mut buffer: UnicodeBuffer) 
 
 /// Shapes `buffer` on `face` with `plan`, which must have been built for the
 /// buffer's direction and script (else the plan's are used).
+#[inline]
 pub fn shape_with_plan(face: &ShapeFace, plan: &ShapePlan, buffer: UnicodeBuffer) -> GlyphBuffer {
     let mut buffer = buffer.0;
     buffer.guess_segment_properties();

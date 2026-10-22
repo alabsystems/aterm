@@ -25,6 +25,7 @@ struct BitWriter {
 }
 
 impl BitWriter {
+    #[inline]
     fn with_capacity(capacity: usize) -> Self {
         Self {
             out: Vec::with_capacity(capacity),
@@ -34,6 +35,7 @@ impl BitWriter {
     }
 
     /// Emit `count` bits of `value`, least-significant bit first.
+    #[inline]
     fn bits(&mut self, value: u32, count: u32) {
         debug_assert!(count <= 24, "bit runs stay inside the accumulator");
         self.acc |= (value & ((1u32 << count) - 1)) << self.n;
@@ -47,6 +49,7 @@ impl BitWriter {
     }
 
     /// Emit a Huffman code: the same bits, but most-significant FIRST.
+    #[inline]
     fn huffman(&mut self, code: u16, len: u32) {
         let mut reversed = 0u32;
         for i in 0..len {
@@ -56,6 +59,7 @@ impl BitWriter {
     }
 
     /// Pad the final partial byte with zeroes and take the buffer.
+    #[inline]
     fn finish(mut self) -> Vec<u8> {
         if self.n > 0 {
             // `as u8`: only the live low bits remain.
@@ -93,7 +97,8 @@ const DIST_EXTRA: [u32; 30] = [
 ///
 /// RFC 1951 §3.2.6's table, as the four ranges it is actually defined by rather
 /// than 288 transcribed literals.
-fn fixed_litlen(symbol: u16) -> (u16, u32) {
+#[inline]
+const fn fixed_litlen(symbol: u16) -> (u16, u32) {
     match symbol {
         0..=143 => (0x30 + symbol, 8),
         144..=255 => (0x190 + (symbol - 144), 9),
@@ -104,8 +109,9 @@ fn fixed_litlen(symbol: u16) -> (u16, u32) {
 }
 
 /// The length code (257..=285) and extra-bit payload for a match length.
-fn length_code(len: u16) -> (u16, u32, u32) {
-    debug_assert!((3..=258).contains(&len));
+#[inline]
+const fn length_code(len: u16) -> (u16, u32, u32) {
+    debug_assert!(len >= 3 && len <= 258);
     let mut i = LENGTH_BASE.len() - 1;
     while i > 0 && LENGTH_BASE[i] > len {
         i -= 1;
@@ -113,19 +119,20 @@ fn length_code(len: u16) -> (u16, u32, u32) {
     // `as u16`/`as u32`: i < 29, and len - base fits the code's extra bits.
     (
         257 + i as u16,
-        u32::from(len - LENGTH_BASE[i]),
+        (len - LENGTH_BASE[i]) as u32,
         LENGTH_EXTRA[i],
     )
 }
 
 /// The distance code (0..=29) and extra-bit payload for a match distance.
-fn distance_code(dist: u16) -> (u16, u32, u32) {
-    debug_assert!((1..=32768).contains(&u32::from(dist).max(1)));
+#[inline]
+const fn distance_code(dist: u16) -> (u16, u32, u32) {
+    debug_assert!(dist >= 1 && dist <= 32768);
     let mut i = DIST_BASE.len() - 1;
     while i > 0 && DIST_BASE[i] > dist {
         i -= 1;
     }
-    (i as u16, u32::from(dist - DIST_BASE[i]), DIST_EXTRA[i])
+    (i as u16, (dist - DIST_BASE[i]) as u32, DIST_EXTRA[i])
 }
 
 // ---------------------------------------------------------------------------
@@ -152,8 +159,9 @@ const MAX_CHAIN: usize = 32;
 const GOOD_ENOUGH: usize = 32;
 
 /// Hash the three bytes at `data[i..]` into a bucket index.
-fn hash3(data: &[u8], i: usize) -> usize {
-    let h = (u32::from(data[i]) << 16) | (u32::from(data[i + 1]) << 8) | u32::from(data[i + 2]);
+#[inline]
+const fn hash3(data: &[u8], i: usize) -> usize {
+    let h = ((data[i] as u32) << 16) | ((data[i + 1] as u32) << 8) | (data[i + 2] as u32);
     // Knuth multiplicative; take the high HASH_BITS of the product.
     ((h.wrapping_mul(2_654_435_761)) >> (32 - HASH_BITS)) as usize & (HASH_SIZE - 1)
 }
@@ -258,7 +266,8 @@ impl ZlibStream {
 
     /// The compressed bytes produced so far and not yet taken. The caller may
     /// drain any prefix of it.
-    pub(crate) fn output(&mut self) -> &mut Vec<u8> {
+    #[inline]
+    pub(crate) const fn output(&mut self) -> &mut Vec<u8> {
         &mut self.bits.out
     }
 

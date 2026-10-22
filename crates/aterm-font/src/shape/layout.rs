@@ -20,6 +20,7 @@ pub(crate) const MAX_CONTEXT_LENGTH: usize = 64;
 
 /// Sets every glyph's class from `GDEF` and clears its ligature props:
 /// done once before substitution.
+#[inline]
 pub(crate) fn substitute_start(face: &ShapeFace, buffer: &mut Buffer) {
     for info in &mut buffer.info[..buffer.len] {
         info.glyph_props = face.glyph_props(info.as_glyph());
@@ -57,6 +58,7 @@ pub(crate) fn substitute(plan: &ShapePlan, face: &ShapeFace, buffer: &mut Buffer
     }
 }
 
+#[inline]
 fn buffer_digest(buffer: &Buffer) -> super::digest::Digest {
     let mut digest = super::digest::Digest::new();
     for info in &buffer.info[..buffer.len] {
@@ -116,32 +118,36 @@ const IS_LIG_BASE: u8 = 0x10;
 // another ligature's components.
 
 #[inline]
-pub(crate) fn set_lig_props_for_ligature(info: &mut GlyphInfo, lig_id: u8, lig_num_comps: u8) {
+pub(crate) const fn set_lig_props_for_ligature(
+    info: &mut GlyphInfo,
+    lig_id: u8,
+    lig_num_comps: u8,
+) {
     info.lig_props = (lig_id << 5) | IS_LIG_BASE | (lig_num_comps & 0x0F);
 }
 
 #[inline]
-pub(crate) fn set_lig_props_for_mark(info: &mut GlyphInfo, lig_id: u8, lig_comp: u8) {
+pub(crate) const fn set_lig_props_for_mark(info: &mut GlyphInfo, lig_id: u8, lig_comp: u8) {
     info.lig_props = (lig_id << 5) | (lig_comp & 0x0F);
 }
 
 #[inline]
-pub(crate) fn set_lig_props_for_component(info: &mut GlyphInfo, comp: u8) {
+pub(crate) const fn set_lig_props_for_component(info: &mut GlyphInfo, comp: u8) {
     set_lig_props_for_mark(info, 0, comp);
 }
 
 #[inline]
-pub(crate) fn lig_id(info: &GlyphInfo) -> u8 {
+pub(crate) const fn lig_id(info: &GlyphInfo) -> u8 {
     info.lig_props >> 5
 }
 
 #[inline]
-fn ligated_internal(info: &GlyphInfo) -> bool {
+const fn ligated_internal(info: &GlyphInfo) -> bool {
     info.lig_props & IS_LIG_BASE != 0
 }
 
 #[inline]
-pub(crate) fn lig_comp(info: &GlyphInfo) -> u8 {
+pub(crate) const fn lig_comp(info: &GlyphInfo) -> u8 {
     if ligated_internal(info) {
         0
     } else {
@@ -150,7 +156,7 @@ pub(crate) fn lig_comp(info: &GlyphInfo) -> u8 {
 }
 
 #[inline]
-pub(crate) fn lig_num_comps(info: &GlyphInfo) -> u8 {
+pub(crate) const fn lig_num_comps(info: &GlyphInfo) -> u8 {
     if info.glyph_props & glyph_props::LIGATURE != 0 && ligated_internal(info) {
         info.lig_props & 0x0F
     } else {
@@ -159,21 +165,21 @@ pub(crate) fn lig_num_comps(info: &GlyphInfo) -> u8 {
 }
 
 #[inline]
-pub(crate) fn is_base_glyph(info: &GlyphInfo) -> bool {
+pub(crate) const fn is_base_glyph(info: &GlyphInfo) -> bool {
     info.glyph_props & glyph_props::BASE_GLYPH != 0
 }
 
 #[inline]
-pub(crate) fn is_ligature(info: &GlyphInfo) -> bool {
+pub(crate) const fn is_ligature(info: &GlyphInfo) -> bool {
     info.glyph_props & glyph_props::LIGATURE != 0
 }
 
 #[inline]
-pub(crate) fn is_mark(info: &GlyphInfo) -> bool {
+pub(crate) const fn is_mark(info: &GlyphInfo) -> bool {
     info.glyph_props & glyph_props::MARK != 0
 }
 
 #[inline]
-pub(crate) fn substituted(info: &GlyphInfo) -> bool {
+pub(crate) const fn substituted(info: &GlyphInfo) -> bool {
     info.glyph_props & glyph_props::SUBSTITUTED != 0
 }

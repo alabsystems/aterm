@@ -142,6 +142,7 @@ pub struct FineTone {
 }
 
 impl From<Tone> for FineTone {
+    #[inline]
     fn from(t: Tone) -> Self {
         Self {
             fill: u16::from(t.fill) << 8,
@@ -192,8 +193,9 @@ impl Surface {
     }
 
     /// Whether the row has no meter and no track.
+    #[inline]
     #[must_use]
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.stops.is_empty()
     }
 
@@ -526,6 +528,7 @@ impl BandMotion {
 const ONE: u64 = 65_536;
 
 /// Smoothstep: `p²(3 − 2p)`.
+#[inline]
 #[must_use]
 pub(crate) fn smooth(p: u32) -> u32 {
     let p = u64::from(p).min(ONE);
@@ -537,6 +540,7 @@ pub(crate) fn smooth(p: u32) -> u32 {
 /// whose velocity runs from 0.72 to 1.14 of the mean — the head never stops
 /// and never lingers, and its pace is the same at both ends, so one crossing
 /// hands over to the next without a jolt.
+#[inline]
 #[must_use]
 pub(crate) fn breath(p: u32) -> u32 {
     let p = u64::from(p).min(ONE);
@@ -545,6 +549,7 @@ pub(crate) fn breath(p: u32) -> u32 {
 }
 
 /// Ease-out cubic: `1 − (1 − u)³`.
+#[inline]
 #[must_use]
 #[cfg(test)]
 pub(crate) fn ease_out_cubic(u: u32) -> u32 {
@@ -554,6 +559,7 @@ pub(crate) fn ease_out_cubic(u: u32) -> u32 {
 
 /// Ease-out quadratic: `1 − (1 − u)²`, a glide's curve: peak speed twice the
 /// mean, at the start, and no overshoot.
+#[inline]
 #[must_use]
 pub fn ease_out_quad(u: u32) -> u32 {
     let v = ONE - u64::from(u).min(ONE);
@@ -561,6 +567,7 @@ pub fn ease_out_quad(u: u32) -> u32 {
 }
 
 /// The bell: `4u(1 − u)`, 0 at both ends and 1 in the middle.
+#[inline]
 #[must_use]
 #[cfg(test)]
 pub(crate) fn bell(u: u32) -> u32 {
@@ -569,24 +576,28 @@ pub(crate) fn bell(u: u32) -> u32 {
 }
 
 /// `t` as a Q16 fraction of `span`, clamped to [0, 1].
+#[inline]
 fn frac(t: Duration, span: Duration) -> u32 {
     let span = span.as_millis().max(1);
     let t = t.as_millis().min(span);
     u32::try_from(t * u128::from(ONE) / span).unwrap_or(u32::MAX)
 }
 
+#[inline]
 fn ms32(d: Duration) -> u32 {
     u32::try_from(d.as_millis()).unwrap_or(u32::MAX)
 }
 
 /// `q` 0..=255 scaled by a Q16 fraction.
+#[inline]
 fn scale(q: u8, f: u32) -> u8 {
     u8::try_from((u64::from(q) * u64::from(f).min(ONE)) >> 16).unwrap_or(255)
 }
 
 /// Permille of the row as a Q16 fraction.
-fn permille_q16(p: u32) -> i64 {
-    i64::from(p.min(1000)) * i64::from(ROW) / 1000
+#[inline]
+const fn permille_q16(p: u32) -> i64 {
+    (if p < 1000 { p } else { 1000 }) as i64 * (ROW as i64) / 1000
 }
 
 // ---- the recipes --------------------------------------------------------------
@@ -729,9 +740,10 @@ fn raised_cosine(d: i64, r: i64, peak: u8) -> u8 {
 
 /// Whether a bar at `shown` carries a glint: a fill of at least half the
 /// glint's radius (on a shorter fill its centre is never on it).
+#[inline]
 #[must_use]
-pub(crate) fn bar_glints(shown: u16) -> bool {
-    u32::from(shown) * 2 >= GLINT_RADIUS_PERMILLE
+pub(crate) const fn bar_glints(shown: u16) -> bool {
+    (shown as u32) * 2 >= GLINT_RADIUS_PERMILLE
 }
 
 /// A determinate bar at `shown` permille of the row (0 % an empty track, 100 %

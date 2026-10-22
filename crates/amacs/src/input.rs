@@ -88,6 +88,7 @@ pub enum Follow {
 
 impl Reduction {
     /// The input was the editor's, with these effects.
+    #[inline]
     pub const fn reveal(effects: Vec<EditorEffect>) -> Self {
         Self {
             effects,
@@ -96,6 +97,7 @@ impl Reduction {
     }
 
     /// The input changed nothing.
+    #[inline]
     pub const fn ignored() -> Self {
         Self {
             effects: Vec::new(),
@@ -115,12 +117,13 @@ enum Shortcut {
 impl Shortcut {
     /// The shortcut Super+`key` runs (⌘A, ⌘Z, ⌘⇧Z, ⌘Y). ⌘S is not here: it
     /// saves ahead of every other reading of a key (see `reduce_editor_key`).
-    fn of(key: char, mods: Modifiers) -> Option<Self> {
-        match key.to_ascii_lowercase() {
-            'a' => Some(Self::SelectAll),
-            'z' if mods.contains(Modifiers::SHIFT) => Some(Self::Redo),
-            'z' => Some(Self::Undo),
-            'y' => Some(Self::Redo),
+    #[inline]
+    const fn of(key: char, mods: Modifiers) -> Option<Self> {
+        match key {
+            'a' | 'A' => Some(Self::SelectAll),
+            'z' | 'Z' if mods.contains(Modifiers::SHIFT) => Some(Self::Redo),
+            'z' | 'Z' => Some(Self::Undo),
+            'y' | 'Y' => Some(Self::Redo),
             _ => None,
         }
     }

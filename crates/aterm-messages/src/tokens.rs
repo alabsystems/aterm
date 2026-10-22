@@ -98,6 +98,7 @@ pub enum AccentSource {
 
 impl AccentSource {
     /// The source as `aterm ctl theme` reports it.
+    #[inline]
     #[must_use]
     pub const fn label(self) -> &'static str {
         match self {
@@ -224,6 +225,7 @@ impl ChromeTokens {
     }
 
     /// The accent floored to `floor`:1 on `ground`.
+    #[inline]
     #[must_use]
     pub fn accent_on(&self, ground: [u8; 3], floor: f64) -> [u8; 3] {
         ensure_contrast(self.accent, ground, floor)
@@ -232,6 +234,7 @@ impl ChromeTokens {
     /// The seam drawn on `ground`: the authored `border_color`, else `ground`
     /// stepped [`SEAM_T`] toward the foreground; either held to
     /// [`SEAM_FLOOR`] on `ground`.
+    #[inline]
     #[must_use]
     pub fn seam_on(&self, ground: [u8; 3]) -> [u8; 3] {
         let seam = self.border.unwrap_or_else(|| mix3(ground, self.fg, SEAM_T));
@@ -239,6 +242,7 @@ impl ChromeTokens {
     }
 
     /// The authored search-match tint, if any.
+    #[inline]
     #[must_use]
     pub const fn authored_search_match(&self) -> Option<[u8; 3]> {
         self.authored_search

@@ -7193,6 +7193,7 @@ impl App {
                 self.package_update_loop_running,
             )
             .with_machine_config(self.config.machine_universal_control())
+            .with_machine_rosetta(self.config.machine_rosetta())
             .with_retired_switch_note(self.config.packages_retired_switch_note());
         if !self
             .native_runtime

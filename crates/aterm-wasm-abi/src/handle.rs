@@ -80,6 +80,7 @@ pub struct RefMut<'a, T> {
 }
 
 /// Box `value` and return its handle, never 0.
+#[inline]
 #[must_use]
 pub fn into_raw<T: Class>(value: T) -> usize {
     Box::into_raw(Box::new(Cell {
@@ -97,6 +98,7 @@ pub fn into_raw<T: Class>(value: T) -> usize {
 /// # Safety
 /// `ptr` is 0 or a handle [`into_raw`] returned, for any class, not yet
 /// freed by [`free`].
+#[inline]
 unsafe fn cell<'a, T: Class>(ptr: usize) -> Result<&'a Cell<T>, Thrown> {
     if ptr == 0 {
         return Err(Thrown::Error(NULL.to_string()));
@@ -121,6 +123,7 @@ unsafe fn cell<'a, T: Class>(ptr: usize) -> Result<&'a Cell<T>, Thrown> {
 ///
 /// # Errors
 /// [`Thrown::Error`]: null, another class, or borrowed exclusively.
+#[inline]
 pub unsafe fn borrow<'a, T: Class>(ptr: usize) -> Result<Ref<'a, T>, Thrown> {
     // SAFETY: the caller's contract.
     let cell = unsafe { cell::<T>(ptr) }?;
@@ -139,6 +142,7 @@ pub unsafe fn borrow<'a, T: Class>(ptr: usize) -> Result<Ref<'a, T>, Thrown> {
 ///
 /// # Errors
 /// [`Thrown::Error`]: null, another class, or borrowed at all.
+#[inline]
 pub unsafe fn borrow_mut<'a, T: Class>(ptr: usize) -> Result<RefMut<'a, T>, Thrown> {
     // SAFETY: the caller's contract.
     let cell = unsafe { cell::<T>(ptr) }?;
@@ -180,6 +184,7 @@ pub unsafe fn free<T: Class>(ptr: usize, from_finalizer: bool) -> Result<(), Thr
 
 impl<T> Deref for Ref<'_, T> {
     type Target = T;
+    #[inline]
     fn deref(&self) -> &T {
         // SAFETY: this guard holds a shared borrow, so no `RefMut` exists.
         unsafe { &*self.cell.value.get() }
@@ -187,6 +192,7 @@ impl<T> Deref for Ref<'_, T> {
 }
 
 impl<T> Drop for Ref<'_, T> {
+    #[inline]
     fn drop(&mut self) {
         self.cell
             .header
@@ -197,6 +203,7 @@ impl<T> Drop for Ref<'_, T> {
 
 impl<T> Deref for RefMut<'_, T> {
     type Target = T;
+    #[inline]
     fn deref(&self) -> &T {
         // SAFETY: this guard holds the only borrow.
         unsafe { &*self.cell.value.get() }
@@ -204,6 +211,7 @@ impl<T> Deref for RefMut<'_, T> {
 }
 
 impl<T> DerefMut for RefMut<'_, T> {
+    #[inline]
     fn deref_mut(&mut self) -> &mut T {
         // SAFETY: this guard holds the only borrow, and `&mut self` makes
         // this reference unique for its lifetime.
@@ -212,6 +220,7 @@ impl<T> DerefMut for RefMut<'_, T> {
 }
 
 impl<T> Drop for RefMut<'_, T> {
+    #[inline]
     fn drop(&mut self) {
         self.cell.header.borrow.set(0);
     }

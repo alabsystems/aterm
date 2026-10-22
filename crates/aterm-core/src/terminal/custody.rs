@@ -111,8 +111,9 @@ impl CustodyTransition {
     /// The `PressCustody` action this transition is, by the model's spelling.
     /// Conformance takes the action name from here, the engine's own
     /// classification.
+    #[inline]
     #[must_use]
-    pub fn action(self) -> &'static str {
+    pub const fn action(self) -> &'static str {
         match self {
             Self::UserScroll => "UserScroll",
             Self::UserScrollTowardLive => "UserScrollTowardLive",
@@ -142,8 +143,9 @@ impl CustodyTransition {
     ///
     /// Not injective, as in the model: the variant is the discriminator, the tag
     /// its projection.
+    #[inline]
     #[must_use]
-    pub fn last_event(self) -> i64 {
+    pub const fn last_event(self) -> i64 {
         match self {
             Self::UserScroll | Self::UserSelect | Self::UserClear => 0,
             Self::TypingPress => 1,
@@ -177,8 +179,9 @@ impl CustodyTransition {
     ///
     /// [`Self::UserClear`] latches even for a deselecting click with nothing
     /// selected; it is still a gesture expressing intent about the highlight.
+    #[inline]
     #[must_use]
-    pub fn always_takes_custody(self) -> bool {
+    pub const fn always_takes_custody(self) -> bool {
         match self {
             Self::UserScroll
             | Self::UserScrollTowardLive
@@ -202,8 +205,9 @@ impl CustodyTransition {
     /// Whether this is a gesture of the person reading the session (typing,
     /// paste, scroll, selection, return to live) rather than output, a bare
     /// modifier or a key release. Counted by [`Terminal::reader_gesture_count`].
+    #[inline]
     #[must_use]
-    pub fn is_reader_gesture(self) -> bool {
+    pub const fn is_reader_gesture(self) -> bool {
         match self {
             Self::UserScroll
             | Self::UserScrollTowardLive
@@ -228,8 +232,9 @@ impl CustodyTransition {
     /// asking: output that replaced the selected rows, output that destroyed the
     /// coordinate space, output that took it for an unattributed reason, and
     /// typing (a documented but surprising side effect).
+    #[inline]
     #[must_use]
-    pub fn takes_a_selection_the_user_did_not_release(self) -> bool {
+    pub const fn takes_a_selection_the_user_did_not_release(self) -> bool {
         matches!(
             self,
             Self::OutputDamagesTheSelectedRows
@@ -311,7 +316,7 @@ impl Terminal {
     /// sample that differs means the person acted on the session in between.
     #[must_use]
     #[inline]
-    pub fn reader_gesture_count(&self) -> u64 {
+    pub const fn reader_gesture_count(&self) -> u64 {
         self.reader_gestures
     }
 
@@ -319,7 +324,7 @@ impl Terminal {
     /// custody since creation. Non-consuming (the `custody` verb's read).
     #[must_use]
     #[inline]
-    pub fn last_custody_transition(&self) -> Option<CustodyTransition> {
+    pub const fn last_custody_transition(&self) -> Option<CustodyTransition> {
         self.last_custody
     }
 
@@ -328,7 +333,7 @@ impl Terminal {
     /// ordinary output that overwrites [`Self::last_custody_transition`].
     #[must_use]
     #[inline]
-    pub fn last_custody_change(&self) -> Option<CustodyTransition> {
+    pub const fn last_custody_change(&self) -> Option<CustodyTransition> {
         self.last_custody_change
     }
 
@@ -336,7 +341,7 @@ impl Terminal {
     /// Survives later activity so the explanation is not erased. Non-consuming.
     #[must_use]
     #[inline]
-    pub fn last_selection_taker(&self) -> Option<CustodyTransition> {
+    pub const fn last_selection_taker(&self) -> Option<CustodyTransition> {
         self.last_selection_taker
     }
 

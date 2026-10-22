@@ -73,7 +73,8 @@ fn split_smallest_first(
 
 impl CandidateSource {
     /// A source that yields nothing.
-    pub(super) fn empty() -> Self {
+    #[inline]
+    pub(super) const fn empty() -> Self {
         Self {
             base: 0,
             keys: CandidateKeys::Empty,
@@ -81,7 +82,8 @@ impl CandidateSource {
     }
 
     /// Every key in `keys`, ascending, as lines from `base`.
-    pub(super) fn range(base: usize, keys: Range<u32>) -> Self {
+    #[inline]
+    pub(super) const fn range(base: usize, keys: Range<u32>) -> Self {
         Self {
             base,
             keys: CandidateKeys::Range(keys),
@@ -89,6 +91,7 @@ impl CandidateSource {
     }
 
     /// Every key in `keys`, descending, as lines from `base`.
+    #[inline]
     pub(super) fn range_rev(base: usize, keys: Range<u32>) -> Self {
         Self {
             base,
@@ -231,7 +234,12 @@ pub(crate) struct SearchMatchIterator<'a> {
 
 impl<'a> SearchMatchIterator<'a> {
     /// Create a new match iterator from a candidate source.
-    pub(super) fn new(index: &'a SearchIndex, query: &'a str, candidates: CandidateSource) -> Self {
+    #[inline]
+    pub(super) const fn new(
+        index: &'a SearchIndex,
+        query: &'a str,
+        candidates: CandidateSource,
+    ) -> Self {
         Self {
             index,
             searcher: Searcher::new(query.as_bytes()),
@@ -245,6 +253,7 @@ impl<'a> SearchMatchIterator<'a> {
 impl Iterator for SearchMatchIterator<'_> {
     type Item = SearchMatch;
 
+    #[inline]
     fn next(&mut self) -> Option<Self::Item> {
         loop {
             if let Some(line_num) = self.current_line
@@ -293,7 +302,12 @@ pub(crate) struct SearchMatchReverseIterator<'a> {
 
 impl<'a> SearchMatchReverseIterator<'a> {
     /// Create a new reverse match iterator.
-    pub(super) fn new(index: &'a SearchIndex, query: &'a str, candidates: CandidateSource) -> Self {
+    #[inline]
+    pub(super) const fn new(
+        index: &'a SearchIndex,
+        query: &'a str,
+        candidates: CandidateSource,
+    ) -> Self {
         Self {
             index,
             searcher: Searcher::new(query.as_bytes()),
@@ -307,6 +321,7 @@ impl<'a> SearchMatchReverseIterator<'a> {
 impl Iterator for SearchMatchReverseIterator<'_> {
     type Item = SearchMatch;
 
+    #[inline]
     fn next(&mut self) -> Option<Self::Item> {
         loop {
             if let Some(line_num) = self.current_line

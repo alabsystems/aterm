@@ -253,6 +253,7 @@ impl Announcer {
     /// Whether the check half has nothing said and unanswered (no failure, no lock's
     /// notice), so a recovery that reads as the whole ledger healing may be sent
     /// ([`InstallWatch::tick`]'s `quiet`).
+    #[inline]
     pub(crate) fn quiet(&self) -> bool {
         self.shown.is_none() && self.failure.is_none()
     }

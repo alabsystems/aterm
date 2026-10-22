@@ -460,6 +460,7 @@ pub enum Span {
 
 impl Span {
     /// The span's duration.
+    #[inline]
     #[must_use]
     pub const fn duration(self) -> Duration {
         match self {
@@ -536,6 +537,7 @@ impl Resurface {
     pub const MAX: Self = Self(90);
 
     /// The quiet span in milliseconds, for a first dismissal.
+    #[inline]
     #[must_use]
     pub const fn millis(self) -> u64 {
         self.0 as u64 * 86_400_000
@@ -544,6 +546,7 @@ impl Resurface {
     /// The quiet span after the `n`th dismissal of the same fact inside [`FILED_KEEP`]
     /// (`n` counts this one): the base, then four times it, then at most [`Self::MAX`],
     /// where it stays: a fact the owner keeps putting away is one they live with.
+    #[inline]
     #[must_use]
     pub const fn backed_off(self, n: u32) -> u64 {
         let mut ms = self.millis();
@@ -576,6 +579,7 @@ impl Horizon {
     pub const SUPERVISOR_RESTARTS: Self = Self(Duration::from_hours(1));
 
     /// The span.
+    #[inline]
     #[must_use]
     pub const fn duration(self) -> Duration {
         self.0
@@ -594,6 +598,7 @@ pub struct Persist(());
 
 impl Persist {
     /// The token.
+    #[inline]
     pub(crate) const fn mint() -> Self {
         Self(())
     }

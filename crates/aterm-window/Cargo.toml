@@ -141,9 +141,11 @@ rustdoc-args = [
 # so raw-window-handle leaves the macOS graph. 2026-10-17, the Linux half: an X11 or Wayland
 # window hands over its handles through first-party `aterm_types::native_window::
 # HasNativeWindow`, which the GL arm and the CPU presenters read, so it leaves the Linux graph
-# too; the opt-in `rwh_06` handles there wrap the same answer. The cells that still present
-# through wgpu or softbuffer (Windows, the BSDs) turn it on: aterm-gui's dependency row for
-# them. (accesskit_winit's default features also did, until A11Y.4 retired it.)
+# too; the opt-in `rwh_06` handles there wrap the same answer. The targets that still present
+# through wgpu or read a Win32 HWND (Windows; the BSDs, which have no cell, and since LW.3 no CPU
+# presenter either: aterm-gui's `present::CpuSurface` is macOS, Linux and Windows only) turn it on:
+# aterm-gui's dependency row for them. (accesskit_winit's default features also did, until A11Y.4
+# retired it.)
 default = [
     "x11",
     "wayland",
@@ -227,7 +229,8 @@ version = "0.2.64"
 # seat's capability-removal test (`seat/retire_tests.rs`) starts `lane-bus seat` and paces it
 # through files in a scratch directory. FIRST-PARTY, path-only, test builds only. 2026-10-21
 # (X11-GONE): the X11 lost-display test (`x11/gone_tests.rs`) runs its work in a child, this
-# test binary run again, with its output in a scratch directory.
+# test binary run again, with its output in a scratch directory, as does the GLX error test
+# (`x11/glx_error_tests.rs`).
 [target.'cfg(target_os = "linux")'.dev-dependencies.aterm-uds]
 workspace = true
 

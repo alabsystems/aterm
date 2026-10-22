@@ -43,8 +43,16 @@ impl Scratch {
             home: Some(self.home.to_path_buf()),
             exe: exe.map(Path::to_path_buf),
             rustup_home: Some(self.home.join(".rustup")),
+            login_rc: None,
             pass,
         })
+    }
+
+    /// [`Self::ground`] for an account whose login shell reads `login` ([`Ground::login_rc`]).
+    fn login_ground(&self, pass: Pass, login: &'static str) -> Arc<Ground> {
+        let mut ground = Arc::unwrap_or_clone(self.ground(pass, None));
+        ground.login_rc = Some(login);
+        Arc::new(ground)
     }
 
     /// A release-named app bundle under the scratch home, with `aterm` and `atpkg` in its
@@ -292,6 +300,73 @@ fn an_unwired_rc_is_wired_and_an_opted_out_one_is_laid_again_by_repair_alone() {
             .is_some_and(|d| d.contains("re-laid atpkg's block in ~/.zshrc"))
     );
     assert!(is_ok(&probe(&repair, super::RC)), "read back");
+}
+
+/// The one rc a pass creates: the login shell's, when absent (design init-system §4.2). A
+/// plan makes nothing; the doctor's pass makes it and no other shell's; deleting its block,
+/// or the file, is an opt-out every pass but repair keeps.
+#[test]
+fn the_login_shell_s_absent_rc_is_made_and_an_opt_out_lifts_under_repair_alone() {
+    let scratch = Scratch::new("rc-login");
+    let zshrc = scratch.home.join(".zshrc");
+    let doctor = scratch.login_ground(Pass::Doctor, ".zshrc");
+    run(&doctor, &[super::HOOKS, super::RC], Mode::Plan);
+    assert!(
+        std::fs::symlink_metadata(&zshrc).is_err(),
+        "a plan makes nothing"
+    );
+    // The block names the hooks, so the rc waits on them; once laid, the absent login rc
+    // is the change.
+    run(&doctor, &[super::HOOKS], Mode::Apply);
+    let Probe::Change { from, .. } = probe(&doctor, super::RC) else {
+        panic!("an absent login rc is a change");
+    };
+    assert!(from.contains("~/.zshrc does not exist"), "{from}");
+    assert!(
+        std::fs::symlink_metadata(&zshrc).is_err(),
+        "a probe makes nothing"
+    );
+
+    let rows = run(&doctor, &[super::HOOKS, super::RC], Mode::Apply);
+    assert_eq!(row(&rows, super::RC).outcome, Outcome::Changed, "{rows:?}");
+    assert!(
+        row(&rows, super::RC)
+            .detail
+            .as_deref()
+            .is_some_and(|d| d.contains("created ~/.zshrc")),
+        "{rows:?}"
+    );
+    let made = std::fs::read_to_string(&zshrc).unwrap();
+    assert!(made.starts_with(crate::hooks::RC_BEGIN), "{made:?}");
+    for other in [".bashrc", ".bash_profile", ".config/fish/config.fish"] {
+        assert!(!scratch.home.join(other).exists(), "{other} appeared");
+    }
+    assert!(is_ok(&probe(&doctor, super::RC)), "read back");
+
+    // The person deletes the block: the doctor's pass keeps it deleted, repair lays it.
+    std::fs::write(&zshrc, "").unwrap();
+    run(&doctor, &[super::HOOKS, super::RC], Mode::Apply);
+    assert_eq!(std::fs::read_to_string(&zshrc).unwrap(), "");
+    let repair = scratch.login_ground(Pass::Repair, ".zshrc");
+    run(&repair, &[super::HOOKS, super::RC], Mode::Apply);
+    assert!(
+        std::fs::read_to_string(&zshrc)
+            .unwrap()
+            .contains(crate::hooks::RC_BEGIN)
+    );
+
+    // The person deletes the file: the doctor's pass leaves it gone and says so.
+    std::fs::remove_file(&zshrc).unwrap();
+    let Probe::Ok { now } = probe(&doctor, super::RC) else {
+        panic!("doctor leaves a deleted login rc absent");
+    };
+    assert!(now.contains("~/.zshrc left absent"), "{now}");
+    run(&doctor, &[super::HOOKS, super::RC], Mode::Apply);
+    assert!(std::fs::symlink_metadata(&zshrc).is_err(), "left absent");
+    assert!(is_change(&probe(&repair, super::RC)));
+    let rows = run(&repair, &[super::HOOKS, super::RC], Mode::Apply);
+    assert_eq!(row(&rows, super::RC).outcome, Outcome::Changed, "{rows:?}");
+    assert_eq!(std::fs::read_to_string(&zshrc).unwrap(), made);
 }
 
 #[test]
@@ -592,6 +667,67 @@ fn a_deleted_shim_is_restored_and_read_back() {
     );
     let target = crate::platform::resolve_shim(&scratch.layout.shim(&ay)).unwrap();
     assert!(target.starts_with(&build), "{}", target.display());
+    assert!(is_ok(&probe(&ground, super::SHIMS)), "read back");
+}
+
+/// A shim an older atpkg laid under a name no shim may carry now (design S13: `pwsh` joined
+/// the deny-list) is the shim step's to remove, on the unattended pass (the base relay at the
+/// end of every install or update pass, a bare `aterm doctor`) as on `pkg repair`, into
+/// whichever program's store it forwards: one the step re-lays, and one it never re-lays (a
+/// program since removed, whose store is gone). The controls: a plan removes nothing, and a
+/// link under a refused name that forwards outside the store, and a person's own file, are
+/// left.
+#[test]
+fn a_shim_laid_under_a_now_refused_name_is_removed_and_read_back() {
+    let scratch = Scratch::new("refused-shims");
+    install(&scratch.layout, "ay", 17);
+    install(&scratch.layout, "ny", 3);
+    let ground = scratch.ground(Pass::Doctor, None);
+    assert!(is_ok(&probe(&ground, super::SHIMS)), "laid by the install");
+    let bin = scratch.layout.bin_dir();
+    let ay = crate::store::ToolName::new("ay").unwrap();
+    let ny = crate::store::ToolName::new("ny").unwrap();
+    std::fs::copy(scratch.layout.shim(&ay), bin.join("pwsh")).unwrap();
+    std::fs::copy(scratch.layout.shim(&ny), bin.join("fish")).unwrap();
+    let theirs = scratch.home.join("my-zsh");
+    std::fs::write(&theirs, b"#!/bin/sh\n").unwrap();
+    std::os::unix::fs::symlink(&theirs, bin.join("zsh")).unwrap();
+    std::fs::write(bin.join("csh"), b"#!/bin/sh\necho mine\n").unwrap();
+    // Left by a program since removed: it forwards into a store build that is gone.
+    std::os::unix::fs::symlink(
+        scratch.layout.build_dir("gone", 5).join("bin/ksh"),
+        bin.join("ksh"),
+    )
+    .unwrap();
+    let Probe::Change { from, .. } = probe(&ground, super::SHIMS) else {
+        panic!("a refused-name shim is a change");
+    };
+    assert!(
+        from.contains("bin/ shims under a name no shim may carry: fish, ksh, pwsh"),
+        "{from}"
+    );
+    let planned = run(&ground, &[super::SHIMS], Mode::Plan);
+    assert_eq!(row(&planned, super::SHIMS).outcome, Outcome::Planned);
+    assert!(bin.join("pwsh").is_file(), "a plan removes nothing");
+
+    let rows = run(&ground, &[super::SHIMS], Mode::Apply);
+    let applied = row(&rows, super::SHIMS);
+    assert_eq!(applied.outcome, Outcome::Changed, "{rows:?}");
+    assert!(
+        applied
+            .detail
+            .as_deref()
+            .is_some_and(|d| d.contains("under a name no shim may carry: fish, ksh, pwsh")),
+        "{applied:?}"
+    );
+    for gone in ["pwsh", "fish", "ksh"] {
+        assert!(
+            std::fs::symlink_metadata(bin.join(gone)).is_err(),
+            "{gone} is removed"
+        );
+    }
+    assert_eq!(std::fs::read_link(bin.join("zsh")).unwrap(), theirs);
+    assert!(bin.join("csh").is_file());
     assert!(is_ok(&probe(&ground, super::SHIMS)), "read back");
 }
 

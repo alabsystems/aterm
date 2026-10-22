@@ -27,8 +27,9 @@ use aterm_grapheme::GeneralCategory;
 /// Default_Ignorable code points, as HarfBuzz hides them: U+115F, U+1160,
 /// U+3164 and U+FFA0 are left out (fonts draw them as spacing glyphs, as
 /// Uniscribe does), and so are U+1BCA0..1BCA3.
-pub(crate) fn is_default_ignorable(c: char) -> bool {
-    let ch = u32::from(c);
+#[inline]
+pub(crate) const fn is_default_ignorable(c: char) -> bool {
+    let ch = c as u32;
     let plane = ch >> 16;
     if plane == 0 {
         let page = ch >> 8;
@@ -36,21 +37,17 @@ pub(crate) fn is_default_ignorable(c: char) -> bool {
             0x00 => ch == 0x00AD,
             0x03 => ch == 0x034F,
             0x06 => ch == 0x061C,
-            0x17 => (0x17B4..=0x17B5).contains(&ch),
-            0x18 => (0x180B..=0x180E).contains(&ch),
-            0x20 => {
-                (0x200B..=0x200F).contains(&ch)
-                    || (0x202A..=0x202E).contains(&ch)
-                    || (0x2060..=0x206F).contains(&ch)
-            }
-            0xFE => (0xFE00..=0xFE0F).contains(&ch) || ch == 0xFEFF,
-            0xFF => (0xFFF0..=0xFFF8).contains(&ch),
+            0x17 => matches!(ch, 0x17B4..=0x17B5),
+            0x18 => matches!(ch, 0x180B..=0x180E),
+            0x20 => matches!(ch, 0x200B..=0x200F | 0x202A..=0x202E | 0x2060..=0x206F),
+            0xFE => matches!(ch, 0xFE00..=0xFE0F | 0xFEFF),
+            0xFF => matches!(ch, 0xFFF0..=0xFFF8),
             _ => false,
         }
     } else {
         match plane {
-            0x01 => (0x1D173..=0x1D17A).contains(&ch),
-            0x0E => (0xE0000..=0xE0FFF).contains(&ch),
+            0x01 => matches!(ch, 0x1D173..=0x1D17A),
+            0x0E => matches!(ch, 0xE0000..=0xE0FFF),
             _ => false,
         }
     }
@@ -58,15 +55,17 @@ pub(crate) fn is_default_ignorable(c: char) -> bool {
 
 /// VARIATION SELECTOR-1..16 and -17..256. The Mongolian free variation
 /// selectors are the Arabic shaper's.
-pub(crate) fn is_variation_selector(c: char) -> bool {
-    let ch = u32::from(c);
-    (0xFE00..=0xFE0F).contains(&ch) || (0xE0100..=0xE01EF).contains(&ch)
+#[inline]
+pub(crate) const fn is_variation_selector(c: char) -> bool {
+    let ch = c as u32;
+    matches!(ch, 0xFE00..=0xFE0F | 0xE0100..=0xE01EF)
 }
 
 /// `Extended_Pictographic`, as upstream's generated list has it.
-pub(crate) fn is_emoji_extended_pictographic(c: char) -> bool {
+#[inline]
+pub(crate) const fn is_emoji_extended_pictographic(c: char) -> bool {
     matches!(
-        u32::from(c),
+        c as u32,
         0x00A9
             | 0x00AE
             | 0x203C
@@ -150,6 +149,7 @@ pub(crate) fn is_emoji_extended_pictographic(c: char) -> bool {
 
 /// Sets a character's general category and Unicode property bits, and the
 /// buffer's scratch flags they imply.
+#[inline]
 pub(crate) fn init_unicode_props(info: &mut GlyphInfo, scratch_flags: &mut u32) {
     let u = info.as_char();
     let gc = aterm_grapheme::general_category(u);
@@ -183,7 +183,7 @@ pub(crate) fn init_unicode_props(info: &mut GlyphInfo, scratch_flags: &mut u32) 
 }
 
 #[inline]
-pub(crate) fn is_unicode_mark(info: &GlyphInfo) -> bool {
+pub(crate) const fn is_unicode_mark(info: &GlyphInfo) -> bool {
     info.gc.is_mark()
 }
 
@@ -191,7 +191,7 @@ pub(crate) fn is_unicode_mark(info: &GlyphInfo) -> bool {
 /// (the `Cf` joiner and variation-selector bits), as upstream's packed form
 /// does.
 #[inline]
-pub(crate) fn set_general_category(info: &mut GlyphInfo, gc: GeneralCategory) {
+pub(crate) const fn set_general_category(info: &mut GlyphInfo, gc: GeneralCategory) {
     info.gc = gc;
     info.unicode_props &= 0x00FF;
 }
@@ -199,7 +199,7 @@ pub(crate) fn set_general_category(info: &mut GlyphInfo, gc: GeneralCategory) {
 /// Marks a variation selector the font could not map with its base, so GSUB
 /// sees it as a format character (`true`), or restores it (`false`).
 #[inline]
-pub(crate) fn set_variation_selector(info: &mut GlyphInfo, customize: bool) {
+pub(crate) const fn set_variation_selector(info: &mut GlyphInfo, customize: bool) {
     if customize {
         set_general_category(info, GeneralCategory::Format);
         info.unicode_props |= unicode_props::CF_VS;
@@ -209,36 +209,36 @@ pub(crate) fn set_variation_selector(info: &mut GlyphInfo, customize: bool) {
 }
 
 #[inline]
-pub(crate) fn is_default_ignorable_info(info: &GlyphInfo) -> bool {
+pub(crate) const fn is_default_ignorable_info(info: &GlyphInfo) -> bool {
     info.unicode_props & unicode_props::IGNORABLE != 0 && !super::layout::substituted(info)
 }
 
 #[inline]
-pub(crate) fn is_hidden(info: &GlyphInfo) -> bool {
+pub(crate) const fn is_hidden(info: &GlyphInfo) -> bool {
     info.unicode_props & unicode_props::HIDDEN != 0
 }
 
 #[inline]
-pub(crate) fn unhide(info: &mut GlyphInfo) {
+pub(crate) const fn unhide(info: &mut GlyphInfo) {
     info.unicode_props &= !unicode_props::HIDDEN;
 }
 
 #[inline]
-pub(crate) fn set_continuation(info: &mut GlyphInfo) {
+pub(crate) const fn set_continuation(info: &mut GlyphInfo) {
     info.unicode_props |= unicode_props::CONTINUATION;
 }
 
 #[inline]
-pub(crate) fn is_continuation(info: &GlyphInfo) -> bool {
+pub(crate) const fn is_continuation(info: &GlyphInfo) -> bool {
     info.unicode_props & unicode_props::CONTINUATION != 0
 }
 
 #[inline]
-pub(crate) fn is_zwnj(info: &GlyphInfo) -> bool {
-    info.gc == GeneralCategory::Format && info.unicode_props & unicode_props::CF_ZWNJ != 0
+pub(crate) const fn is_zwnj(info: &GlyphInfo) -> bool {
+    matches!(info.gc, GeneralCategory::Format) && info.unicode_props & unicode_props::CF_ZWNJ != 0
 }
 
 #[inline]
-pub(crate) fn is_zwj(info: &GlyphInfo) -> bool {
-    info.gc == GeneralCategory::Format && info.unicode_props & unicode_props::CF_ZWJ != 0
+pub(crate) const fn is_zwj(info: &GlyphInfo) -> bool {
+    matches!(info.gc, GeneralCategory::Format) && info.unicode_props & unicode_props::CF_ZWJ != 0
 }

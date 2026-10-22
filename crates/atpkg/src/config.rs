@@ -28,8 +28,8 @@
 //! multi-GB downloads. Nothing new installs unattended; what is installed keeps updating,
 //! and a typed `install` still installs.
 //!
-//! `[machine]` defaults act on the host (a `com.apple.universalcontrol` write), so an
-//! unreadable file falls to [`MachineConfig::inert`] instead. Each table is deserialized
+//! `[machine]` defaults act on the host (a `com.apple.universalcontrol` write, a Rosetta 2
+//! install), so an unreadable file falls to [`MachineConfig::inert`] instead. Each table is deserialized
 //! on its own ([`PackagesOnly`], [`MachineOnly`]), so a typo costs only its own table.
 
 use std::collections::BTreeMap;
@@ -365,7 +365,8 @@ pub fn config_path() -> Option<PathBuf> {
 /// `machine-settings:` row.
 ///
 /// All-Option like [`PackagesConfig`]; defaults live only in the resolver methods. The
-/// default acts, so the opt-out is spelled explicitly: `universal_control = "leave"`.
+/// defaults act, so each opt-out is spelled explicitly: `universal_control = "leave"`,
+/// `rosetta = false`.
 #[derive(Debug, Default, Clone, serde::Deserialize)]
 #[serde(default)]
 pub struct MachineConfig {
@@ -373,6 +374,10 @@ pub struct MachineConfig {
     /// `com.apple.universalcontrol Disable`/`DisableMagicEdges` for the current host when
     /// they are not already set; `"leave"` never touches them.
     pub universal_control: Option<String>,
+    /// `[machine].rosetta`: `true` (default) installs Rosetta 2 on an Apple-silicon Mac
+    /// that lacks it ([`crate::machine::apply_rosetta`], as the user, no elevation);
+    /// `false` never does. Inert on every other machine.
+    pub rosetta: Option<bool>,
     /// The config file exists and could not be parsed, so the opt-out above could not be
     /// read. Never deserialized; [`parse_machine`] sets it. The defaults act, so a table
     /// read from a file nobody could read fails closed.
@@ -398,9 +403,17 @@ impl MachineConfig {
     pub fn inert() -> Self {
         Self {
             universal_control: Some("leave".to_string()),
+            rosetta: Some(false),
             // Inert is not unreadable: `parse_machine` sets that flag itself.
             unreadable: false,
         }
+    }
+
+    /// `[machine].rosetta`, default `true`: whether the apply installs Rosetta 2 where it
+    /// can need it (macOS on Apple silicon, [`crate::machine::ROSETTA_APPLIES`]).
+    #[must_use]
+    pub fn rosetta(&self) -> bool {
+        self.rosetta.unwrap_or(true)
     }
 
     /// `[machine].universal_control`, default `off`. An unrecognised spelling is `Leave`,
@@ -527,6 +540,35 @@ pub fn load_abrew() -> AbrewConfig {
 pub fn cached_abrew() -> &'static AbrewConfig {
     static CFG: std::sync::OnceLock<AbrewConfig> = std::sync::OnceLock::new();
     CFG.get_or_init(load_abrew)
+}
+
+/// Deserialization wrapper for the top-level `agents_auto_prime` key alone.
+#[derive(Default, serde::Deserialize)]
+#[serde(default)]
+struct AutoPrimeOnly {
+    agents_auto_prime: Option<bool>,
+}
+
+/// The top-level `agents_auto_prime` key of full `aterm.toml` text, as the window resolves
+/// it (aterm-gui's `agents_auto_prime_from_text`): default true, and a file that does not
+/// parse, or a value that is not a boolean, reads as the default. `false` is the owner's
+/// word that a window writes nothing into an agent's own files: no primer, no skills and
+/// none of the Claude Code defaults (`base.agents.claude-defaults`,
+/// docs/DESIGN-init-system-2026-10-20.md §4.2).
+#[must_use]
+pub fn parse_agents_auto_prime(text: &str) -> bool {
+    aterm_toml::from_str::<AutoPrimeOnly>(text)
+        .ok()
+        .and_then(|root| root.agents_auto_prime)
+        .unwrap_or(true)
+}
+
+/// [`parse_agents_auto_prime`] of the config file as it is now; no file is the default.
+#[must_use]
+pub fn load_agents_auto_prime() -> bool {
+    config_path()
+        .and_then(|p| read_config_text(&p))
+        .is_none_or(|t| parse_agents_auto_prime(&t))
 }
 
 /// Deserialization wrapper for the `[reroute]` table alone (see [`PackagesOnly`]).
@@ -719,7 +761,7 @@ pub fn parse_machine(text: &str) -> MachineConfig {
             if !say_not_toml(text) {
                 crate::notice::say(&format!(
                     "[machine] in aterm.toml: {e} \u{2014} its settings are not applied; \
-                     Universal Control is left as it is"
+                     Universal Control and Rosetta 2 are left as they are"
                 ));
             }
             MachineConfig {
@@ -795,6 +837,28 @@ pub fn cached() -> &'static PackagesConfig {
 #[cfg(test)]
 mod tests {
 
+    /// `agents_auto_prime` resolves as the window resolves it: only a boolean `false`
+    /// turns it off; no key, a non-boolean and a file that does not parse are the default.
+    #[test]
+    fn agents_auto_prime_is_off_only_for_a_written_false() {
+        use super::parse_agents_auto_prime as prime;
+        assert!(!prime("agents_auto_prime = false\n"));
+        assert!(!prime(
+            "tab_status = true\nagents_auto_prime = false\n[packages]\n"
+        ));
+        assert!(prime("agents_auto_prime = true\n"));
+        assert!(prime(""));
+        assert!(
+            prime("[packages]\nagents_auto_prime = false\n"),
+            "a table's key"
+        );
+        assert!(prime("agents_auto_prime = \"no\"\n"));
+        assert!(
+            prime("agents_auto_prime = false\n[[[\n"),
+            "a file that does not parse"
+        );
+    }
+
     #[test]
     fn abrew_config_fails_closed_on_malformed_table() {
         assert!(!parse_abrew("[abrew]\nenabled = maybe\n").enabled());
@@ -850,6 +914,21 @@ mod tests {
             "a [machine] table that does not parse falls to the INERT reading, loudly: \
              these defaults ACT, and unreadable words are no licence to write the host"
         );
+        // Rosetta 2: installed by default, `false` is the opt-out, and a table nobody could
+        // read installs nothing.
+        assert!(none.rosetta(), "the default installs it");
+        assert!(
+            off.rosetta(),
+            "the Universal Control opt-out is not this one"
+        );
+        assert!(!parse_machine("[machine]\nrosetta = false\n").rosetta());
+        assert!(parse_machine("[machine]\nrosetta = true\n").rosetta());
+        assert!(
+            !parse_machine("[machine]\nrosetta = \"no\"\n").rosetta(),
+            "a value that is not a boolean makes the table unreadable, and that reading is inert"
+        );
+        assert!(!unreadable.rosetta(), "{unreadable:?}");
+        assert!(!MachineConfig::inert().rosetta());
         // The two tables come out of one file, independently.
         let both = "[packages]\nexclude = [\"ay\"]\n[machine]\nuniversal_control = \"leave\"\n";
         assert_eq!(parse_packages(both).exclude(), ["ay".to_string()]);

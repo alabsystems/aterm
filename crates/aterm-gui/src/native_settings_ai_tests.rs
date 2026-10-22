@@ -421,45 +421,82 @@ fn the_ai_fact_cards_keep_their_labels_whole_at_large_type() {
     });
 }
 
-/// A ONE-LINE ROW KEEPS THE END OF THE PATH ITS LOOK NAMED (item A5 of the
-/// round-9 narrow sweep): a CLI not installed by aterm whose copy lives under
-/// `~/Library/Application Support/` — a path with a space, where aterm's own
-/// reroute copies live — is cut in its middle on a desktop row too narrow
-/// for it, its binary and what the line says after it kept. The row found
-/// the path by the next space and painted "…/Library/Application", the
-/// binary and "(not measured in this build)" gone. NEGATIVE CONTROL: the
-/// same row told no path is cut at a word, which never names the binary.
+/// A CLI ROW PAINTS ITS WHOLE NAME AND FACT AT EVERY WIDTH (the round-14
+/// audit): a CLI not installed by aterm whose copy lives under
+/// `~/Library/Application Support/` — a path with a space, where aterm's
+/// own reroute copies live — and every other CLI paint their name and fact
+/// whole, wrapped to the text column (a path at its folders), on a compact
+/// page, beside the button on a medium and a wide one, and in a short wide
+/// window at 1×, 1.5× and 2× text: the painted lines, joined, are the
+/// row's accessible words, with no ellipsis. A one-line row cut its fact to
+/// one line: at 2× text in a 1564pt window it read "not installed by aterm
+/// (a… …/reroute/claude)". NEGATIVE CONTROL: the fact is longer than one
+/// line of the column at 2×, so a whole fact there is on lines.
 #[test]
-fn a_one_line_cli_row_keeps_the_end_of_a_path_with_a_space() {
+fn a_cli_row_paints_its_whole_name_and_fact_at_every_width() {
     let path = "/Users//someone/Library/Application Support/aterm/pkg/reroute/agy";
     let fact = format!(
         "not installed by aterm (a copy it does not manage is at {path}) \
          (not measured in this build)"
     );
-    let painted = |named: Option<&str>| {
-        let mut state = fixture();
-        let reading = state.ai.reading.as_mut().expect("the fixture's reading");
-        reading.clis[2] = AiCli {
-            path: named.map(str::to_string),
-            ..cli("agy", State::NotInstalled, Mark::Fail, &fact)
-        };
-        let (mut runtime, instance, view) = ai_route(state);
-        let pages = every_page(&mut runtime, instance, view, &view_cx_at(1_095.0, 700.0));
-        pages
-            .iter()
-            .flat_map(|page| page.paint.iter())
-            .find_map(|node| match &node.content {
-                UiContent::Text(text) if node.key.as_str() == "ai/cli/agy/detail" => {
-                    Some(text.text.clone())
+    at_each_text_scale(&[1.0, 1.5, 2.0], "whole CLI facts", |scale| {
+        let mut wrapped = false;
+        for (width, height) in [
+            (504.0, 628.0),
+            (924.0, 640.0),
+            (1_095.0, 700.0),
+            (1_564.0, 182.0),
+            (2_264.0, 432.0),
+        ] {
+            let context = format!("{scale}\u{d7} {width}\u{d7}{height}");
+            let mut state = fixture();
+            let reading = state.ai.reading.as_mut().expect("the fixture's reading");
+            reading.clis[2] = AiCli {
+                path: Some(path.to_string()),
+                ..cli("agy", State::NotInstalled, Mark::Fail, &fact)
+            };
+            let (mut runtime, instance, view) = ai_route(state);
+            let pages = every_page(&mut runtime, instance, view, &view_cx_at(width, height));
+            for id in ["claude", "codex", "agy", "muse"] {
+                let key = format!("ai/cli/{id}");
+                let label = node(&pages, &key).label.clone();
+                // Each line once, from the first page that paints it.
+                let mut lines: Vec<(String, String)> = Vec::new();
+                for page in &pages {
+                    for painted in &page.paint {
+                        let UiContent::Text(text) = &painted.content else {
+                            continue;
+                        };
+                        let at = painted.key.as_str();
+                        let part = ["title", "detail"].into_iter().any(|part| {
+                            let whole = format!("{key}/{part}");
+                            at == whole || at.starts_with(&format!("{whole}/line-"))
+                        });
+                        if part && !painted.peek && !lines.iter().any(|(seen, _)| seen == at) {
+                            lines.push((at.to_string(), text.text.clone()));
+                        }
+                    }
                 }
-                _ => None,
-            })
-            .expect("a one-line row paints the detail on one line")
-    };
-    let line = painted(Some(path));
-    assert_ne!(line, fact, "the line is cut");
-    assert!(line.contains("/reroute/agy)"), "{line:?}");
-    assert!(line.ends_with(" (not measured in this build)"), "{line:?}");
-    let unnamed = painted(None);
-    assert!(!unnamed.contains("/agy"), "{unnamed:?}");
+                let squeeze = |text: &str| text.split_whitespace().collect::<String>();
+                let joined: String = lines.iter().map(|(_, text)| squeeze(text)).collect();
+                assert!(
+                    lines.iter().all(|(_, text)| !text.contains('\u{2026}')),
+                    "{context} {id}: {lines:#?}"
+                );
+                assert_eq!(
+                    joined,
+                    squeeze(&label.replacen(": ", "", 1)),
+                    "{context} {id}: {lines:#?}"
+                );
+                if id == "agy" && scale >= 2.0 {
+                    wrapped |= lines
+                        .iter()
+                        .any(|(at, _)| at.starts_with("ai/cli/agy/detail/line-1"));
+                }
+            }
+        }
+        if scale >= 2.0 {
+            assert!(wrapped, "{scale}\u{d7}: the long fact is on lines");
+        }
+    });
 }

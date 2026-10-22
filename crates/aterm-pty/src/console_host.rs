@@ -133,8 +133,9 @@ impl ConsoleHostKind {
     /// the terminal out of step with every absolute cursor move the shell's line
     /// editor makes afterwards, and only a console client's `?1049l` (the
     /// Windows backend's `resync_alt_screen`) leaves both screens together.
+    #[inline]
     #[must_use]
-    pub fn passes_screen_switches_through(self) -> bool {
+    pub const fn passes_screen_switches_through(self) -> bool {
         matches!(self, Self::OpenConsole)
     }
 }

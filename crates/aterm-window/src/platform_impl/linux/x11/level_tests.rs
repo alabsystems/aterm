@@ -54,6 +54,7 @@ fn a_new_window_clears_keep_above_and_keep_below_after_its_map() {
         eprintln!("SKIP: no DISPLAY");
         return;
     }
+    let _turn = super::shared_display_turn();
     let (watcher, screen) =
         Connection::connect(None).expect("DISPLAY is set: the connection must open");
     let root = watcher.setup().roots[screen].root;

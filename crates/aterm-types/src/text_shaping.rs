@@ -50,6 +50,7 @@ pub struct FontFeature {
 
 impl FontFeature {
     /// Create a new font feature.
+    #[inline]
     #[must_use]
     pub const fn new(tag: [u8; 4], value: u32) -> Self {
         Self { tag, value }

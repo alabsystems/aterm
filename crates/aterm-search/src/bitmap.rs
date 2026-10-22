@@ -103,6 +103,7 @@ std::thread_local! {
 
 /// Append `value` to `buf` as an unsigned LEB128 varint. Push-only, so the Trust L0
 /// gate carries no slice-bounds obligation.
+#[inline]
 fn push_varint(buf: &mut Vec<u8>, mut value: u32) {
     while value >= 0x80 {
         buf.push((value as u8) | 0x80);
@@ -302,7 +303,8 @@ impl SparseBitmap {
     /// base row (`SearchIndex::make_room_for`). Gaps do not change, so only the cached
     /// endpoints move. The caller keeps every value inside `u32`; the arithmetic
     /// wraps, so it carries no overflow obligation.
-    pub(crate) fn shift(&mut self, up: bool, by: u32) {
+    #[inline]
+    pub(crate) const fn shift(&mut self, up: bool, by: u32) {
         if self.count == 0 {
             return;
         }
@@ -337,15 +339,15 @@ impl SparseBitmap {
     /// Returns `true` if the bitmap contains no values.
     #[inline]
     #[must_use]
-    pub(crate) fn is_empty(&self) -> bool {
+    pub(crate) const fn is_empty(&self) -> bool {
         self.count == 0
     }
 
     /// Returns the number of values in the bitmap.
     #[inline]
     #[must_use]
-    pub(crate) fn len(&self) -> u64 {
-        u64::from(self.count)
+    pub(crate) const fn len(&self) -> u64 {
+        self.count as u64
     }
 
     /// Returns `true` if the bitmap contains the given value.

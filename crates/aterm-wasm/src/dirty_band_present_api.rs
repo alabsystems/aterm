@@ -32,6 +32,7 @@ use aterm_wasm_abi::export;
 /// The innermost loop of the CPU present path: zipping `as_chunks_mut::<4>()` proves
 /// the bound once per band, so each pixel is one 4-byte store rather than four
 /// bounds-checked byte writes that block LLVM's store merging.
+#[inline]
 pub(crate) fn expand_rgba_band(pixels: &[u32], rgba: &mut [u8], start: usize, end: usize) {
     let end = end.min(pixels.len());
     let start = start.min(end);
@@ -52,6 +53,7 @@ pub(crate) fn expand_rgba_band(pixels: &[u32], rgba: &mut [u8], start: usize, en
 /// the u8 twin of `scroll_translate::translate_grid_band_in_place`, with the same
 /// convention (positive = up) and a direction-matched walk so no source row is read
 /// after it is overwritten.
+#[inline]
 pub(crate) fn shift_rgba_band(rgba: &mut [u8], w: usize, y0: usize, y1: usize, frac_px: i64) {
     if w == 0 || y0 >= y1 || frac_px == 0 {
         return;
@@ -78,6 +80,7 @@ pub(crate) fn shift_rgba_band(rgba: &mut [u8], w: usize, y0: usize, y1: usize, f
 }
 
 /// Full-frame expansion plus the single full band; also sizes the RGBA buffer.
+#[inline]
 pub(crate) fn expand_full(
     pixels: &[u32],
     rgba: &mut Vec<u8>,
@@ -93,6 +96,7 @@ pub(crate) fn expand_full(
 
 /// Merge runs of dirty grid rows into full-width `x, y, w, h` bands in `out`: row `r`
 /// spans `grid_top + r*cell_h ..+cell_h`, clamped to the frame height.
+#[inline]
 pub(crate) fn dirty_rows_to_bands(
     dirty: &[bool],
     grid_top: usize,

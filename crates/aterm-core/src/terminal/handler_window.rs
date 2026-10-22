@@ -17,11 +17,11 @@ use aterm_types::{WindowOperation, WindowResponse};
 
 /// Decode the title stack sub-parameter: 0/default=both, 1=icon, 2=window.
 #[inline]
-fn title_stack_targets(params: &[u16]) -> (bool, bool) {
-    match params.get(1).copied().unwrap_or(0) {
-        1 => (true, false), // Icon only
-        2 => (false, true), // Window only
-        _ => (true, true),  // Both (default)
+const fn title_stack_targets(params: &[u16]) -> (bool, bool) {
+    match params {
+        [_, 1, ..] => (true, false), // Icon only
+        [_, 2, ..] => (false, true), // Window only
+        _ => (true, true),           // Both (default)
     }
 }
 
@@ -202,7 +202,7 @@ impl TerminalHandler<'_> {
     }
 
     #[inline]
-    fn maximize_operation(sub: u16) -> Option<WindowOperation> {
+    const fn maximize_operation(sub: u16) -> Option<WindowOperation> {
         match sub {
             0 => Some(WindowOperation::RestoreMaximized),
             1 => Some(WindowOperation::MaximizeWindow),
@@ -213,7 +213,7 @@ impl TerminalHandler<'_> {
     }
 
     #[inline]
-    fn fullscreen_operation(sub: u16) -> Option<WindowOperation> {
+    const fn fullscreen_operation(sub: u16) -> Option<WindowOperation> {
         match sub {
             0 => Some(WindowOperation::UndoFullscreen),
             1 => Some(WindowOperation::EnterFullscreen),
@@ -286,6 +286,7 @@ impl TerminalHandler<'_> {
     /// else the grid times the host-reported cell box, else `None`. Shared by
     /// CSI 14 t and XTSMGRAPHICS's sixel geometry, both under the window-ops
     /// capability.
+    #[inline]
     pub(super) fn text_area_pixels(&mut self, cap: &WindowOpsCapability) -> Option<(u32, u32)> {
         match self.invoke_window_callback(WindowOperation::ReportTextAreaSizePixels, cap) {
             Some(WindowResponse::SizePixels { height, width }) => {
@@ -297,6 +298,7 @@ impl TerminalHandler<'_> {
 
     /// The text area in pixels, or `None` while no host has reported a cell
     /// box. `u32` because a `u16` grid times a `u16` cell does not fit `u16`.
+    #[inline]
     fn text_area_size_pixels(&self) -> Option<(u32, u32)> {
         let (cell_w, cell_h) = self.iterm2.host_cell_px()?;
         Some((
@@ -393,6 +395,7 @@ impl TerminalHandler<'_> {
     /// constructor is `pub(super)` and its seal private, so reaching this
     /// function implies the host authorized window operations. Taken by
     /// reference so one capability covers several calls in one dispatch.
+    #[inline]
     pub(super) fn invoke_window_callback(
         &mut self,
         op: WindowOperation,
@@ -407,6 +410,7 @@ impl TerminalHandler<'_> {
 
     /// Push current title(s) onto the title stack (`Arc<str>` clones, no
     /// allocation); a slot the push does not name is left unsaved (`None`).
+    #[inline]
     fn push_title(&mut self, icon: bool, window: bool) {
         if self.title.stack.len() >= TITLE_STACK_MAX_DEPTH {
             return;
@@ -458,6 +462,7 @@ impl TerminalHandler<'_> {
 
     /// Filter a title for reporting: strip control characters (ESC included)
     /// against title injection.
+    #[inline]
     fn filter_title_for_report(title: &str) -> String {
         title.chars().filter(|c| !c.is_control()).collect()
     }

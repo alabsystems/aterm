@@ -32,6 +32,7 @@ impl Cursor {
     }
 
     /// A cursor over the inside of `group`.
+    #[inline]
     #[must_use]
     pub fn of_group(group: &Group) -> Self {
         Cursor::new(group.stream(), group.span_close())
@@ -50,12 +51,14 @@ impl Cursor {
     }
 
     /// The next token, None-delimited groups included as written.
+    #[inline]
     #[must_use]
     pub fn peek_raw(&self) -> Option<&TokenTree> {
         self.rev.last()
     }
 
     /// The token `n` places ahead (0 is the next), as written.
+    #[inline]
     #[must_use]
     pub fn peek_raw_nth(&self, n: usize) -> Option<&TokenTree> {
         self.rev
@@ -65,11 +68,13 @@ impl Cursor {
     }
 
     /// Takes the next token as written.
+    #[inline]
     pub fn next_raw(&mut self) -> Option<TokenTree> {
         self.rev.pop()
     }
 
     /// The next token, after splicing None-delimited groups.
+    #[inline]
     pub fn peek(&mut self) -> Option<&TokenTree> {
         self.flatten();
         self.rev.last()
@@ -77,12 +82,14 @@ impl Cursor {
 
     /// Whether every token has been read (an empty None-group reads as
     /// nothing).
+    #[inline]
     pub fn is_empty(&mut self) -> bool {
         self.flatten();
         self.rev.is_empty()
     }
 
     /// The span of the next token, or the end span when there is none.
+    #[inline]
     pub fn span(&mut self) -> Span {
         match self.peek() {
             Some(tt) => tt.span(),
@@ -91,17 +98,20 @@ impl Cursor {
     }
 
     /// The span "unexpected end of input" points at.
+    #[inline]
     #[must_use]
-    pub fn end_span(&self) -> Span {
+    pub const fn end_span(&self) -> Span {
         self.end
     }
 
     /// Whether the next token is the punctuation `ch`.
+    #[inline]
     pub fn peek_punct(&mut self, ch: char) -> bool {
         matches!(self.peek(), Some(TokenTree::Punct(p)) if p.as_char() == ch)
     }
 
     /// Takes the next token if it is the punctuation `ch`.
+    #[inline]
     pub fn eat_punct(&mut self, ch: char) -> Option<Punct> {
         if self.peek_punct(ch) {
             match self.rev.pop() {
@@ -141,11 +151,13 @@ impl Cursor {
     }
 
     /// Whether the next token is the identifier `word` (a raw `r#word` is not).
+    #[inline]
     pub fn peek_keyword(&mut self, word: &str) -> bool {
         matches!(self.peek(), Some(TokenTree::Ident(i)) if i.to_string() == word)
     }
 
     /// Takes the next token if it is the identifier `word`.
+    #[inline]
     pub fn eat_keyword(&mut self, word: &str) -> Option<Ident> {
         if self.peek_keyword(word) {
             match self.rev.pop() {
@@ -338,6 +350,7 @@ impl Cursor {
     }
 
     /// Takes everything left, as written.
+    #[inline]
     #[must_use]
     pub fn rest(mut self) -> Vec<TokenTree> {
         self.rev.reverse();
@@ -349,6 +362,7 @@ impl Cursor {
 impl Iterator for Cursor {
     type Item = TokenTree;
 
+    #[inline]
     fn next(&mut self) -> Option<TokenTree> {
         self.flatten();
         self.rev.pop()
@@ -356,12 +370,14 @@ impl Iterator for Cursor {
 }
 
 /// Whether `tt` is the punctuation `ch`.
+#[inline]
 #[must_use]
 pub fn is_punct(tt: &TokenTree, ch: char) -> bool {
     matches!(tt, TokenTree::Punct(p) if p.as_char() == ch)
 }
 
 /// Whether `tt` is the identifier `word`.
+#[inline]
 #[must_use]
 pub fn is_keyword(tt: &TokenTree, word: &str) -> bool {
     matches!(tt, TokenTree::Ident(i) if i.to_string() == word)
@@ -393,6 +409,7 @@ const TAKES_OPERAND: &[&str] = &[
 ///
 /// Top level is outside every `<...>` the tokens open (see
 /// [`Cursor::take_run`]).
+#[inline]
 #[must_use]
 pub fn split_commas(tokens: Vec<TokenTree>) -> Vec<Vec<TokenTree>> {
     split_top(tokens, ',')

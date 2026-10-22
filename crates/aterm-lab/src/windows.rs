@@ -124,13 +124,15 @@ targo --unverified lab windows <verb> — the Windows runtime lane: a QEMU VM (h
                            its control socket (typed, echoed, resized, render=ok, a frame kept) that must draw on the
                            GPU on WARP, Windows' software Direct3D. Exit 0 pass, 1 a row failed, 3 NOT RUN.
                            Report and frames: $LAB_STATE/windows/
-  window [--arch aarch64|x86_64]... [--watch]
+  window [--arch aarch64|x86_64]... [--watch] [--cpu]
                            WB.3's runtime smoke per arch (both unless named) in lane's desktop session: a windowed
                            aterm-gui on WARP driven by the VM's USB keyboard and tablet: launched (per-monitor DPI aware),
                            typed into, Microsoft's Japanese IME composing and committing, resized by its frame, display
                            scaling changed under it (100 -> 150 %), moved to the second monitor and back, closed (Alt+F4,
                            exit 0), launched at 150 %. --watch logs the IME row's input as the session saw it (focus,
-                           keyboard layout, IME mode, keys held, windows shown). Exit 0 pass, 1 a row failed, 3 NOT RUN.
+                           keyboard layout, IME mode, keys held, windows shown). --cpu runs the rows on the CPU presenter
+                           (aterm-gui --cpu), each holding the frame aterm presented to the window's pixels as its DC
+                           holds them (GetDIBits). Exit 0 pass, 1 a row failed, 3 NOT RUN.
                            Report and screenshots: $LAB_STATE/windows/
   destroy                  stop the VM and delete it (disk, firmware variables, TPM, key); the images stay cached
 ";

@@ -7,7 +7,8 @@
 /// The longest name the specification allows.
 pub const MAX_NAME: usize = 255;
 
-fn is_element_char(b: u8) -> bool {
+#[inline]
+const fn is_element_char(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'_'
 }
 

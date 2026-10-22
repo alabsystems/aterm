@@ -167,6 +167,23 @@ pub fn tool_turn(body: &[u8], script: &J) -> Option<ToolTurn> {
     })
 }
 
+/// Whether a Responses request's conversation carries a tool's result back:
+/// a result item anywhere in its input — after its last person's message, or
+/// before one (the next prompt, a retry's error turn after an empty reply) —
+/// so a scripted call is made once a conversation
+/// ([`super::scripted_call`]), never again at each retry.
+#[must_use]
+pub fn results_answered(body: &[u8]) -> bool {
+    let Ok(j) = J::parse_bytes(body) else {
+        return false;
+    };
+    j.get("input")
+        .and_then(J::as_arr)
+        .unwrap_or_default()
+        .iter()
+        .any(is_result)
+}
+
 /// The last tool result a request carries, on one line (at most 200
 /// characters): what the person's answer to a box came back as.
 #[must_use]

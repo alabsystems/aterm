@@ -61,6 +61,7 @@ impl Scratch {
             home: Some(self.home()),
             exe: Some(self.release_exe()),
             rustup_home: Some(self.home().join(".rustup")),
+            login_rc: None,
             pass: Pass::Doctor,
         })
     }
@@ -848,4 +849,42 @@ fn the_front_door_routes_doctor_here_and_its_help_to_the_diagnostics() {
     assert!(!crate::routes_to_doctor("doctor", &os(&["--help"])));
     assert!(!crate::routes_to_doctor("doctor", &os(&["--json", "-h"])));
     assert!(!crate::routes_to_doctor("show-config", &[]));
+}
+
+/// `base.clt` reads a C toolchain verdict as the install's to fix only where the tools are
+/// missing: a refusing compiler is installed already, and one that did not answer is
+/// unknown.
+#[cfg(target_os = "macos")]
+#[test]
+fn base_clt_reads_a_missing_toolchain_as_the_install_s_and_nothing_else() {
+    use aterm_machines::init_clt::Found;
+    use atpkg::prereq::CcVerdict;
+    let cc = PathBuf::from("/usr/bin/cc");
+    assert!(matches!(
+        super::clt_found(&CcVerdict::NoDeveloperDir),
+        Found::Missing(_)
+    ));
+    assert!(matches!(
+        super::clt_found(&CcVerdict::NoDriver),
+        Found::Missing(_)
+    ));
+    assert!(matches!(
+        super::clt_found(&CcVerdict::Ready { driver: cc.clone() }),
+        Found::Present(_)
+    ));
+    assert!(matches!(
+        super::clt_found(&CcVerdict::Broken {
+            driver: cc.clone(),
+            why: "license".into()
+        }),
+        Found::Refuses(_)
+    ));
+    assert!(matches!(
+        super::clt_found(&CcVerdict::Unanswered { driver: cc }),
+        Found::Unknown(_)
+    ));
+    assert!(matches!(
+        super::clt_found(&CcVerdict::NotProbed),
+        Found::NotHere(_)
+    ));
 }

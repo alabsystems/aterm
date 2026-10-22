@@ -54,6 +54,7 @@ pub struct TerminalCapabilities {
 }
 
 impl Default for TerminalCapabilities {
+    #[inline]
     fn default() -> Self {
         Self::aterm_capabilities()
     }
@@ -61,6 +62,7 @@ impl Default for TerminalCapabilities {
 
 impl TerminalCapabilities {
     /// Get the full capabilities supported by aterm.
+    #[inline]
     #[must_use]
     pub const fn aterm_capabilities() -> Self {
         Self {

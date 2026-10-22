@@ -57,6 +57,7 @@ struct Prior {
 
 impl ShellIntegrationAuth {
     /// Create a fresh authorization state with no nonce authorized.
+    #[inline]
     pub(crate) const fn new() -> Self {
         Self {
             nonce: None,
@@ -68,7 +69,8 @@ impl ShellIntegrationAuth {
     }
 
     /// Authorize the 32-byte `nonce`, replacing any earlier one.
-    pub(crate) fn authorize(&mut self, nonce: [u8; 32]) {
+    #[inline]
+    pub(crate) const fn authorize(&mut self, nonce: [u8; 32]) {
         self.nonce = Some(nonce);
         self.awaiting_first_mark = false;
         self.typed_prior = None;
@@ -76,7 +78,8 @@ impl ShellIntegrationAuth {
 
     /// [`Self::authorize`] for a nonce the shell has not taken yet (`awaiting_first_mark`):
     /// it verifies marks now and is in use from the first mark that carries it.
-    pub(crate) fn authorize_on_first_mark(&mut self, nonce: [u8; 32]) {
+    #[inline]
+    pub(crate) const fn authorize_on_first_mark(&mut self, nonce: [u8; 32]) {
         self.nonce = Some(nonce);
         self.awaiting_first_mark = true;
         self.typed_prior = None;
@@ -85,11 +88,15 @@ impl ShellIntegrationAuth {
     /// [`Self::authorize_on_first_mark`] for a typed re-key, which can be taken back: the
     /// authorization it replaces is kept (`typed_prior`) until the host settles the key. A
     /// second typed re-key before the first is settled keeps the first one's prior.
-    pub(crate) fn authorize_rekey(&mut self, nonce: [u8; 32]) {
-        let prior = self.typed_prior.take().unwrap_or(Prior {
-            nonce: self.nonce,
-            awaiting_first_mark: self.awaiting_first_mark,
-        });
+    #[inline]
+    pub(crate) const fn authorize_rekey(&mut self, nonce: [u8; 32]) {
+        let prior = match self.typed_prior.take() {
+            Some(p) => p,
+            None => Prior {
+                nonce: self.nonce,
+                awaiting_first_mark: self.awaiting_first_mark,
+            },
+        };
         self.nonce = Some(nonce);
         self.awaiting_first_mark = true;
         self.typed_prior = Some(prior);
@@ -97,6 +104,7 @@ impl ShellIntegrationAuth {
 
     /// Whether `nonce` is the typed re-key authorized now, not yet settled and
     /// not yet taken by a mark.
+    #[inline]
     fn rekey_pending(&self, nonce: &[u8; 32]) -> bool {
         self.typed_prior.is_some()
             && self.awaiting_first_mark
@@ -107,6 +115,7 @@ impl ShellIntegrationAuth {
     /// whose line never ran authorizes nothing. `false`, changing nothing, when `nonce` is
     /// not the pending typed re-key: a mark already carried it (a working key is never
     /// moved), another authorization replaced it, or it was settled.
+    #[inline]
     pub(crate) fn withdraw_rekey(&mut self, nonce: &[u8; 32]) -> bool {
         if !self.rekey_pending(nonce) {
             return false;
@@ -122,6 +131,7 @@ impl ShellIntegrationAuth {
     /// the authorization it replaced is forgotten. The key stays not-in-use until its first
     /// mark, as after [`Self::authorize_on_first_mark`]. `false`, changing nothing, when
     /// `nonce` is not the pending typed re-key.
+    #[inline]
     pub(crate) fn settle_rekey(&mut self, nonce: &[u8; 32]) -> bool {
         if !self.rekey_pending(nonce) {
             return false;
@@ -137,19 +147,26 @@ impl ShellIntegrationAuth {
     /// ([`super::Terminal::checkpoint_carry`]), so a re-key the shell never took is not
     /// carried.
     #[must_use]
-    pub(crate) fn nonce_in_use(&self) -> Option<[u8; 32]> {
-        self.nonce.filter(|_| !self.awaiting_first_mark)
+    #[inline]
+    pub(crate) const fn nonce_in_use(&self) -> Option<[u8; 32]> {
+        if self.awaiting_first_mark {
+            None
+        } else {
+            self.nonce
+        }
     }
 
     /// OSC 133/633 sequences dropped so far, for host metrics.
     #[must_use]
-    pub(crate) fn dropped_count(&self) -> u64 {
+    #[inline]
+    pub(crate) const fn dropped_count(&self) -> u64 {
         self.dropped_count
     }
 
     /// OSC 133/633 sequences whose nonce verified so far, for the crash-restore journal.
     #[must_use]
-    pub(crate) fn verified_count(&self) -> u64 {
+    #[inline]
+    pub(crate) const fn verified_count(&self) -> u64 {
         self.verified_count
     }
 
@@ -192,6 +209,7 @@ impl ShellIntegrationAuth {
     /// a response other than `Execute`) drops and counts; `Allow` and `Fallback` (no policy
     /// or no matching rule) still require a valid nonce. The probe is keyed per subcommand
     /// ([`probe_subcommand`]), since a policy can name `"OSC 133;C"`.
+    #[inline]
     pub(super) fn verify_nonce_with_engine(
         &mut self,
         gate: super::policy_bridge::BridgeDecision,
@@ -212,6 +230,7 @@ impl ShellIntegrationAuth {
 /// it is valid UTF-8, `"A"` otherwise (including when absent). Shared with
 /// [`super::policy_gates`] so the compiled table uses the same key.
 #[must_use]
+#[inline]
 pub(super) fn probe_subcommand<'a>(params: &'a [&'a [u8]]) -> &'a str {
     params
         .get(1)
@@ -223,6 +242,7 @@ pub(super) fn probe_subcommand<'a>(params: &'a [&'a [u8]]) -> &'a str {
 /// [`probe_subcommand`]): the one definition, shared by the compiled gate table and its
 /// live fallback.
 #[must_use]
+#[inline]
 pub(super) fn probe_shell_integration(
     command: u32,
     subcommand: &str,
@@ -233,6 +253,7 @@ pub(super) fn probe_shell_integration(
 /// Scan OSC parameters from index 2 for an `id=<hex>` tag and return the hex
 /// (without `id=`). Only the first occurrence counts, as in VS Code's OSC 633
 /// parser.
+#[inline]
 fn find_nonce_hex<'a>(params: &'a [&'a [u8]]) -> Option<&'a [u8]> {
     params.get(2..)?.iter().find_map(|p| p.strip_prefix(b"id="))
 }
@@ -258,7 +279,7 @@ fn decode_hex_32(hex: &[u8]) -> Option<[u8; 32]> {
 /// Decode one ASCII hex digit: `(value, 0)`, or `(0, 1)` when invalid. Branch-free for the
 /// caller, so `decode_hex_32` does not leak the first invalid byte's position.
 #[inline]
-fn hex_digit(b: u8) -> (u8, u8) {
+const fn hex_digit(b: u8) -> (u8, u8) {
     match b {
         b'0'..=b'9' => (b - b'0', 0),
         b'a'..=b'f' => (b - b'a' + 10, 0),

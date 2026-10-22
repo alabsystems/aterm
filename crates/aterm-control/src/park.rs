@@ -51,6 +51,7 @@ impl Lane {
     /// there. It still slices, so a flag the park watches is read between
     /// slices, but it never asks after the caller.
     #[must_use]
+    #[inline]
     pub const fn ignoring_hangup(self) -> Lane {
         Lane {
             slice: self.slice,
@@ -59,7 +60,8 @@ impl Lane {
     }
 }
 
-fn never() -> bool {
+#[inline]
+const fn never() -> bool {
     false
 }
 

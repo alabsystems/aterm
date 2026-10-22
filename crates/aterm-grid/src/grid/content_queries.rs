@@ -13,6 +13,7 @@ impl Grid {
     /// The resolved character at a grid position, including non-BMP codepoints
     /// from the `CellExtras` overflow table (unlike `Cell::char()`).
     #[must_use]
+    #[inline]
     pub fn resolved_char(&self, row: u16, col: u16) -> Option<char> {
         let cell = self.cell(row, col)?;
         if cell.is_complex() {
@@ -127,6 +128,7 @@ impl Grid {
     /// `'\0'` at wide continuations, and `' '` for blanks; combining marks are
     /// dropped. Used for per-frame row diffing, where column indexing must
     /// survive wide chars. Reuses the caller's buffer.
+    #[inline]
     pub fn row_cols_into(&self, row: u16, out: &mut Vec<char>) -> u16 {
         self.row_cols_prefix_into(row, usize::MAX, out)
     }

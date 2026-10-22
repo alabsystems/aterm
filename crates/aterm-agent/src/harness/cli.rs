@@ -5574,7 +5574,7 @@ impl AccountsHost for LiveAccounts {
 /// would land in a live session's), and the page opened as `browser` says:
 /// the account's profile through the argv0 opener, Claude Code's default,
 /// or, over SSH, nothing (the opener with no profile: the paste-code flow).
-fn renew_command(
+pub(super) fn renew_command(
     program: &std::ffi::OsStr,
     home: &str,
     email: &str,
@@ -5635,7 +5635,7 @@ fn renew_flow_of(
 /// # Errors
 ///
 /// As [`auth_status_of`].
-fn status_in_home_within(
+pub(super) fn status_in_home_within(
     program: &std::ffi::OsStr,
     home: &str,
     var: &dyn Fn(&str) -> Option<OsString>,
@@ -5864,7 +5864,7 @@ pub const AUTH_CHECK_NO_USER: &str = "USER is not set";
 /// [`AUTH_CHECK_NO_USER`] when neither USER nor LOGNAME is set: a working login
 /// would then answer `loggedIn: false` and be recorded signed out (ending a pin
 /// on it).
-fn auth_check_env(
+pub(super) fn auth_check_env(
     var: &dyn Fn(&str) -> Option<OsString>,
 ) -> Result<Vec<(&'static str, OsString)>, String> {
     let named = ["USER", "LOGNAME"]
@@ -6401,11 +6401,20 @@ fn accounts_text(
             .map(|(label, why)| match why {
                 // The one reason a command of this verb's ends: named with it.
                 // (Only a row that names a directory is ever not enrolled.)
-                accounts::WhyNot::NotEnrolled => format!(
-                    "{label}: {} (no login made yet: run `aterm harness accounts {} {label}`)",
-                    why.as_str(),
-                    roster.row(label).map_or("login", sign_in_verb)
-                ),
+                accounts::WhyNot::NotEnrolled => match state
+                    .accounts
+                    .get(label)
+                    .and_then(|a| a.limited_until(now))
+                {
+                    Some(until) => {
+                        format!("{label}: {} (limited until {})", why.as_str(), rfc3339_utc(until))
+                    }
+                    None => format!(
+                        "{label}: {} (no login made yet: run `aterm harness accounts {} {label}`)",
+                        why.as_str(),
+                        roster.row(label).map_or("login", sign_in_verb)
+                    ),
+                },
                 _ => format!("{label}: {}", why_not_words(*why)),
             })
             .collect();
@@ -7455,7 +7464,7 @@ enum Renewal {
 /// or updated binary. `None` with no executable known or a link that cannot be
 /// made: the system's default browser opens the page (over SSH: `BROWSER`
 /// removed).
-fn opener_link(store: &accounts::Store, host: &dyn AccountsHost) -> Option<PathBuf> {
+pub(super) fn opener_link(store: &accounts::Store, host: &dyn AccountsHost) -> Option<PathBuf> {
     let exe = host.current_exe()?;
     let bin = store.dir.join("bin");
     aterm_types::fs_restricted::ensure_private_dir(&store.dir).ok()?;

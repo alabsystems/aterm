@@ -250,6 +250,7 @@ pub enum Handoff {
 /// The rows after the handoff: an open view is waited on; a refusal or a
 /// window nobody could reach falls back to this terminal; a request the
 /// window took and never answered exits 1, never a second editor.
+#[inline]
 #[must_use]
 pub fn after_handoff(handoff: Handoff) -> Face {
     match handoff {

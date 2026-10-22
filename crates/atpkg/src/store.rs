@@ -2028,18 +2028,17 @@ fn under_home(p: &Path, home: &Path) -> bool {
 }
 
 /// Commands a managed shim may never name, even though `bin/` is only appended to `PATH`:
-/// a tool named one of these is refused a shim (surfaced in `status.toml`), so a key
-/// compromise or an honest mistake cannot intercept core or security commands. Lower-cased.
+/// a tool named one of these, or one of [`SHELLS`], is refused a shim, so a key compromise
+/// or an honest mistake cannot intercept core or security commands. A client that meets one
+/// in a signed `exposes` records it in `status.toml`'s `refused_shims`
+/// ([`crate::status::RefusedShims`]), which `aterm pkg doctor`'s `base.pkg.refused` row
+/// names; the producer refuses to pack one. Lower-cased.
 const SENSITIVE_SHIMS: &[&str] = &[
     "sudo",
     "ssh",
     "scp",
     "sshd",
     "git",
-    "sh",
-    "bash",
-    "zsh",
-    "fish",
     "env",
     "sudo_askpass",
     "doas",
@@ -2072,6 +2071,55 @@ const SENSITIVE_SHIMS: &[&str] = &[
     "cat",
 ];
 
+/// The shells a shim may never be named for: a shim named for a shell would run inside
+/// every script whose `#!` names it, on any machine where that shell is not installed ahead
+/// of the managed `bin/` (most are absent from a stock macOS `PATH`). [`is_shell`] also
+/// refuses each one's `-preview` and versioned spellings (`pwsh-preview`, `bash5`,
+/// `pwsh-7.4`). A shell this list does not name is shimmed like any tool name. Lower-cased.
+const SHELLS: &[&str] = &[
+    "sh",
+    "bash",
+    "rbash",
+    "zsh",
+    "fish",
+    "pwsh",
+    "powershell",
+    "nu",
+    "dash",
+    "ash",
+    "ksh",
+    "mksh",
+    "oksh",
+    "pdksh",
+    "loksh",
+    "yash",
+    "tcsh",
+    "csh",
+    "elvish",
+    "xonsh",
+    "osh",
+    "ysh",
+    "ion",
+    "rc",
+    "es",
+    "busybox",
+];
+
+/// Whether the lower-cased `lower` names a shell: one of [`SHELLS`], alone, with
+/// `-preview`, or with a version (`5`, `-7.4`, `5.2.1`: an optional `-`, then a digit,
+/// then digits and dots).
+fn is_shell(lower: &str) -> bool {
+    SHELLS.iter().any(|shell| {
+        lower.strip_prefix(shell).is_some_and(|rest| {
+            let version = rest.strip_prefix('-').unwrap_or(rest);
+            rest.is_empty()
+                || rest == "-preview"
+                || (version.starts_with(|c: char| c.is_ascii_digit())
+                    && version.chars().all(|c| c.is_ascii_digit() || c == '.'))
+        })
+    })
+}
+
 /// The prefix of an alias shim: `alab-<tool>` is laid beside every `<tool>` shim of one of
 /// ALab's own programs and forwards to the same store executable
 /// ([`crate::activate::Aliases`]). ALab's bare tool names collide with other software
@@ -2082,8 +2130,14 @@ const SENSITIVE_SHIMS: &[&str] = &[
 /// alias.
 pub const ALIAS_PREFIX: &str = "alab-";
 
-/// Whether `name` may be installed as a `bin/` shim: non-empty, not `.`/`..`, free of `/`,
-/// `\` and NUL, and not on the `SENSITIVE_SHIMS` deny-list (case-insensitive). Both
+/// Whether `name` may be installed as a `bin/` shim: non-empty, plain ASCII, not `.`/`..`,
+/// free of `/`, `\` and NUL, not on the `SENSITIVE_SHIMS` deny-list and not a shell
+/// ([`SHELLS`]), both case-insensitively.
+///
+/// ASCII only, because the volume `bin/` lives on folds more than ASCII case: on macOS's
+/// default case-insensitive APFS a file named `pw\u{17F}h` (LATIN SMALL LETTER LONG S),
+/// `\u{FB01}sh` or `\u{212A}sh` (KELVIN SIGN) answers a lookup of `pwsh`, `fish` or `ksh`,
+/// so a deny-list compared after ASCII folding alone would be bypassed by a lookalike. Both
 /// separators are refused: on Windows a `\` in a manifest-supplied name makes `Path::join`
 /// traverse out of `bin/` (`..\..\evil`) and lets `..\git` dodge the deny-list;
 /// `linkmode::safe_component`, `ops::uninstall` and the other name gates refuse `\` too.
@@ -2094,6 +2148,7 @@ pub const ALIAS_PREFIX: &str = "alab-";
 #[must_use]
 pub fn shim_allowed(name: &str) -> bool {
     if name.is_empty()
+        || !name.is_ascii()
         || name == "."
         || name == ".."
         || name.contains('/')
@@ -2103,7 +2158,7 @@ pub fn shim_allowed(name: &str) -> bool {
         return false;
     }
     let lower = name.to_ascii_lowercase();
-    if SENSITIVE_SHIMS.contains(&lower.as_str()) {
+    if SENSITIVE_SHIMS.contains(&lower.as_str()) || is_shell(&lower) {
         return false;
     }
     match lower.strip_prefix(ALIAS_PREFIX) {
@@ -3013,6 +3068,63 @@ mod tests {
         // Sensitive commands are refused (case-insensitively).
         for bad in ["sudo", "SSH", "git", "sh", "env", "rustc", "Codesign"] {
             assert!(!shim_allowed(bad), "{bad} must be refused a shim");
+        }
+        // A shell is never shimmed, under any spelling, as an alias's base, or in its preview
+        // and versioned forms (design S13).
+        for shell in SHELLS {
+            for name in [
+                (*shell).to_string(),
+                shell.to_ascii_uppercase(),
+                format!("{ALIAS_PREFIX}{shell}"),
+                format!("{shell}-preview"),
+                format!("{shell}5"),
+                format!("{shell}-7.4"),
+            ] {
+                assert!(
+                    !shim_allowed(&name),
+                    "the shell {name} must be refused a shim"
+                );
+            }
+        }
+        for named in ["pwsh", "elvish", "xonsh", "mksh", "powershell", "busybox"] {
+            assert!(SHELLS.contains(&named), "{named} is on the list");
+        }
+        // A lookalike the case-insensitive volume answers for a shell's name (LONG S folds
+        // to `s`, the `fi` ligature to `fi`, KELVIN SIGN to `k`) is no tool name either.
+        for lookalike in [
+            "pw\u{17F}h",
+            "fi\u{17F}h",
+            "\u{FB01}sh",
+            "xon\u{17F}h",
+            "elvi\u{17F}h",
+            "\u{212A}sh",
+            "\u{17F}h",
+            "ba\u{17F}h",
+            "alab-pw\u{17F}h",
+            "caf\u{E9}",
+        ] {
+            assert!(
+                !shim_allowed(lookalike),
+                "{lookalike:?} is not plain ASCII and must be refused a shim"
+            );
+        }
+        // The control: a name that only begins or ends like a shell, or carries a version
+        // that is no shell's, is a tool name.
+        for ok in [
+            "nushell-lsp",
+            "dashboard",
+            "pwsh-fmt",
+            "fisher",
+            "kshrc-lint",
+            "nuget",
+            "ashes",
+            "rcfile",
+            "bash-lsp",
+            "zsh-5x",
+            "ion-lint",
+            "trust2",
+        ] {
+            assert!(shim_allowed(ok), "{ok} is no shell and should be allowed");
         }
         // Malformed shapes are refused.
         for bad in ["", ".", "..", "a/b", "x\0y"] {

@@ -69,6 +69,7 @@ pub struct DrivenInputWatch(Arc<AtomicU64>);
 impl DrivenInputWatch {
     /// The sink's [`DrivenInput`] now.
     #[must_use]
+    #[inline]
     pub fn get(&self) -> DrivenInput {
         DrivenInput(self.0.load(Ordering::Acquire))
     }
@@ -134,6 +135,7 @@ impl Default for BulkMeter {
 impl BulkMeter {
     /// A meter for a frame not yet begun.
     #[must_use]
+    #[inline]
     pub const fn new() -> Self {
         Self {
             sent: AtomicU64::new(0),
@@ -149,6 +151,7 @@ impl BulkMeter {
     /// sees the stop at its next recheck ([`Shared::PARK_RECHECK_MS`]); on
     /// Windows a write of the frame blocked inside ConPTY's `WriteFile` is
     /// cancelled now (`aterm_pty::release_stopped_writes`).
+    #[inline]
     pub fn request_stop(&self) {
         self.stop.store(true, Ordering::Release);
         #[cfg(windows)]
@@ -157,12 +160,14 @@ impl BulkMeter {
 
     /// Whether a stop was asked for.
     #[must_use]
+    #[inline]
     pub fn stop_requested(&self) -> bool {
         self.stop.load(Ordering::Acquire)
     }
 
     /// The frame's bytes sent, its size and its state, now.
     #[must_use]
+    #[inline]
     pub fn progress(&self) -> BulkProgress {
         let state = match self.state.load(Ordering::Acquire) {
             1 => BulkState::Writing,
@@ -370,6 +375,7 @@ pub struct WriteReceipt {
 }
 
 impl WriteReceipt {
+    #[inline]
     fn new(accepted: usize, order: Option<AcceptedOrder>) -> Self {
         debug_assert_eq!(accepted == 0, order.is_none());
         Self {
@@ -382,28 +388,32 @@ impl WriteReceipt {
     /// A direct-lane write that ended with `accepted` of `intended` bytes in
     /// the kernel: `direct` iff the frame completed (a peer-closed short write
     /// keeps the conservative `false`).
-    fn completed(accepted: usize, intended: usize, order: AcceptedOrder) -> Self {
+    #[inline]
+    const fn completed(accepted: usize, intended: usize, order: AcceptedOrder) -> Self {
         Self {
             accepted,
-            order: (accepted > 0).then_some(order),
+            order: if accepted > 0 { Some(order) } else { None },
             direct: accepted > 0 && accepted == intended,
         }
     }
 
     /// Whether the whole frame reached the kernel directly (see the field).
     #[must_use]
+    #[inline]
     pub const fn is_direct(self) -> bool {
         self.direct
     }
 
     /// Number of bytes accepted by this call.
     #[must_use]
+    #[inline]
     pub const fn accepted(self) -> usize {
         self.accepted
     }
 
     /// Accepted serialization/spill order, or `None` when no bytes were accepted.
     #[must_use]
+    #[inline]
     pub const fn order(self) -> Option<AcceptedOrder> {
         self.order
     }
@@ -467,6 +477,7 @@ impl WriteReceiptError {
     /// failing on a dead or closing session. The GUI tells the person once that
     /// input was not sent.
     #[must_use]
+    #[inline]
     pub const fn is_refused(&self) -> bool {
         self.refused
     }
@@ -474,18 +485,21 @@ impl WriteReceiptError {
     /// Number of bytes accepted before the error.
     #[must_use]
     #[cfg(test)]
+    #[inline]
     pub const fn accepted(&self) -> usize {
         self.receipt.accepted()
     }
 
     /// Accepted serialization/spill order, or `None` when no bytes moved.
     #[must_use]
+    #[inline]
     pub const fn order(&self) -> Option<AcceptedOrder> {
         self.receipt.order()
     }
 
     /// Recover the original I/O error without reclassification or wrapping.
     #[must_use]
+    #[inline]
     pub fn into_error(self) -> io::Error {
         self.error
     }

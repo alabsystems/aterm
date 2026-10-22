@@ -33,7 +33,7 @@
 
 use std::io::{ErrorKind, PipeReader, Read};
 use std::os::fd::{AsRawFd, RawFd};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use aterm_wayland::protocols::wayland::wl_data_device_manager::dnd_action;
 use aterm_wayland::selection::{DragEvent, Dropped};
@@ -263,11 +263,11 @@ pub(crate) fn set_nonblocking(pipe: &impl AsRawFd) -> std::io::Result<()> {
 }
 
 /// Parse a `text/uri-list` payload into local filesystem paths, mirroring the X11
-/// backend (`dnd.rs::parse_data`): frame raw entries before decoding, accept
-/// only `file://` URIs without a hostname, and skip comment lines (`#…`).
-/// Each path is canonicalised (resolving symlinks) as X11 does, but a path whose
-/// canonicalisation fails (e.g. the file was moved between drop and read) falls
-/// back to the decoded path instead of discarding the whole list.
+/// backend (`dnd.rs::local_paths`): frame raw entries before decoding, accept
+/// only `file://` URIs without a hostname, and skip comment lines (`#…`) and any
+/// entry that names no local file, keeping the rest. Each path is the one the
+/// source named: a symlink dropped is the link, not its target, and nothing reads
+/// the filesystem on the event loop's thread (this canonicalised each path).
 fn parse_uri_list(data: &[u8]) -> Vec<PathBuf> {
     let mut paths = Vec::new();
     for uri in uri_list_entries(data) {
@@ -282,8 +282,11 @@ fn parse_uri_list(data: &[u8]) -> Vec<PathBuf> {
         let Ok(decoded) = percent_decode_utf8(rest) else {
             continue;
         };
-        let path = Path::new(&decoded);
-        paths.push(path.canonicalize().unwrap_or_else(|_| path.to_path_buf()));
+        // A NUL (`%00`) is in no file's path.
+        if decoded.contains('\0') {
+            continue;
+        }
+        paths.push(PathBuf::from(decoded));
     }
     paths
 }
@@ -323,6 +326,19 @@ mod tests {
         assert_eq!(paths.len(), 1);
         assert!(paths[0].ends_with("ok/f"), "got {:?}", paths[0]);
         assert!(parse_uri_list(b"%66ile:///tmp/f\r\nfile://%2Ftmp/f\r\n").is_empty());
+    }
+
+    /// A dropped symlink is the link the source named, not its target. Negative
+    /// control: canonicalising each path, as this did, yields the target.
+    #[test]
+    fn parse_uri_list_keeps_a_symlink_as_named() {
+        let dir = aterm_tempfile::tempdir().expect("a scratch dir");
+        let target = dir.path().join("target.txt");
+        std::fs::write(&target, b"").expect("a file");
+        let link = dir.path().join("link.txt");
+        std::os::unix::fs::symlink(&target, &link).expect("a symlink");
+        let uri = format!("file://{}\r\nfile:///tmp/a%00b\r\n", link.display());
+        assert_eq!(parse_uri_list(uri.as_bytes()), [link]);
     }
 
     #[test]

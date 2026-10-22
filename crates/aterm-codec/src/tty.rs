@@ -36,6 +36,7 @@
 /// LRM, U+200F RLM), embeddings and overrides (U+202A-U+202E) and isolates
 /// (U+2066-U+2069), and the line and paragraph separators U+2028/U+2029.
 #[must_use]
+#[inline]
 pub const fn is_active(c: char) -> bool {
     let u = c as u32;
     u < 0x20
@@ -79,6 +80,7 @@ pub fn push_escape(out: &mut String, c: char) {
 
 /// Append `b` as `\xNN` (lowercase hex): a C0 control, DEL, or a byte that is
 /// not part of any UTF-8 character.
+#[inline]
 fn push_byte_escape(out: &mut String, b: u8) {
     out.push_str("\\x");
     crate::hex::push_lower(out, &[b]);
@@ -141,6 +143,7 @@ pub fn one_line(text: &str, cap: usize) -> String {
 
 /// The characters a terminal body escapes: [`is_active`] but for the line
 /// break and the tab, which a body keeps.
+#[inline]
 const fn needs_escape(c: char) -> bool {
     is_active(c) && c != '\n' && c != '\t'
 }
@@ -160,6 +163,7 @@ pub struct SafeStream {
 impl SafeStream {
     /// A stream with nothing held.
     #[must_use]
+    #[inline]
     pub const fn new() -> Self {
         Self {
             carry: [0; 3],
@@ -194,6 +198,7 @@ impl SafeStream {
 
     /// End the body: a character still cut is not one, so its bytes are
     /// escaped as `\xNN`.
+    #[inline]
     pub fn finish(&mut self, out: &mut String) {
         let held = self.held.min(self.carry.len());
         for &b in &self.carry[..held] {
@@ -202,6 +207,7 @@ impl SafeStream {
         self.held = 0;
     }
 
+    #[inline]
     fn hold(&mut self, rest: &[u8]) {
         let n = rest.len().min(self.carry.len());
         self.carry[..n].copy_from_slice(&rest[..n]);

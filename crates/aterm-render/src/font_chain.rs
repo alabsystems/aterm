@@ -44,7 +44,7 @@ pub enum Tier {
     Fallback = 2,
     /// The lazy monochrome symbol face (`Renderer::symbol_fallback_has`).
     Symbol = 3,
-    /// The colour-emoji face (`Renderer::color_font_has`); the colour-vs-text
+    /// The colour-emoji chain (`Renderer::color_font_has`); the colour-vs-text
     /// decision itself stays in [`crate::select_face`].
     Color = 4,
     /// The runtime system resolver's pathname lane (`RuntimeFallback::resolve`, memoized into

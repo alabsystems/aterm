@@ -157,18 +157,21 @@ pub struct TerminalSize {
 
 impl TerminalSize {
     /// Create a new terminal size.
+    #[inline]
     #[must_use]
     pub const fn new(rows: u16, cols: u16) -> Self {
         Self { rows, cols }
     }
 
     /// Number of rows.
+    #[inline]
     #[must_use]
     pub const fn rows(&self) -> u16 {
         self.rows
     }
 
     /// Number of columns.
+    #[inline]
     #[must_use]
     pub const fn cols(&self) -> u16 {
         self.cols
@@ -210,6 +213,7 @@ pub const DEFAULT_BACKGROUND: Rgb = Rgb::new(0, 0, 0);
 
 impl Rgb {
     /// Create a new RGB color.
+    #[inline]
     #[must_use]
     pub const fn new(r: u8, g: u8, b: u8) -> Self {
         Self { r, g, b }
@@ -266,6 +270,7 @@ impl std::ops::Mul<f32> for Rgb {
 
     // Skip: f32 multiply, clamp and saturating cast, the float-interval lane
     // (docs/TRUST_100PCT_PLAN.md). Delete it when a promoted seal proves this body.
+    #[inline]
     #[cfg_attr(trust_verify, trust::skip)]
     fn mul(self, rhs: f32) -> Self::Output {
         Self {
@@ -279,6 +284,7 @@ impl std::ops::Mul<f32> for Rgb {
 impl std::ops::Add for Rgb {
     type Output = Self;
 
+    #[inline]
     fn add(self, rhs: Self) -> Self::Output {
         Self {
             r: self.r.saturating_add(rhs.r),

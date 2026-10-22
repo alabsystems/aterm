@@ -106,36 +106,42 @@ pub fn from_value<T: DeserializeOwned>(value: Value) -> Result<T> {
 }
 
 /// Return the maximum container nesting depth enforced by the deserializer (`127`).
+#[inline]
 #[must_use]
 pub const fn recursion_limit() -> usize {
     127
 }
 
 /// Return `true` when `depth` is within the JSON container recursion limit (`<= 127`).
+#[inline]
 #[must_use]
 pub const fn within_recursion_limit(depth: usize) -> bool {
     depth <= 127
 }
 
 /// Return `true` when `b` is RFC 8259 JSON whitespace (`' '`, `'\t'`, `'\n'`, `'\r'`).
+#[inline]
 #[must_use]
 pub const fn is_json_whitespace_byte(b: u8) -> bool {
     matches!(b, b' ' | b'\t' | b'\n' | b'\r')
 }
 
 /// Return `true` when `b` is an unescaped RFC 8259 control byte (`0x00..=0x1F`).
+#[inline]
 #[must_use]
 pub const fn is_json_control_byte(b: u8) -> bool {
     b <= 0x1f
 }
 
 /// Return `true` when `code` is a UTF-16 high surrogate (`0xD800..=0xDBFF`).
+#[inline]
 #[must_use]
 pub const fn is_utf16_high_surrogate(code: u16) -> bool {
     code >= 0xd800 && code <= 0xdbff
 }
 
 /// Return `true` when `code` is a UTF-16 low surrogate (`0xDC00..=0xDFFF`).
+#[inline]
 #[must_use]
 pub const fn is_utf16_low_surrogate(code: u16) -> bool {
     code >= 0xdc00 && code <= 0xdfff
@@ -143,6 +149,7 @@ pub const fn is_utf16_low_surrogate(code: u16) -> bool {
 
 /// Combine a valid UTF-16 surrogate pair (`high` in `0xD800..=0xDBFF`, `low` in
 /// `0xDC00..=0xDFFF`) into its Unicode scalar value (`0x10000..=0x10FFFF`).
+#[inline]
 #[must_use]
 pub const fn decode_surrogate_pair(high: u16, low: u16) -> Option<u32> {
     if !is_utf16_high_surrogate(high) || !is_utf16_low_surrogate(low) {
@@ -154,6 +161,7 @@ pub const fn decode_surrogate_pair(high: u16, low: u16) -> Option<u32> {
 }
 
 /// Encode a JSON token span (`offset`, `len`, `line`, `col`) into 16 little-endian bytes.
+#[inline]
 #[must_use]
 pub const fn encode_json_span_le(offset: u32, len: u32, line: u32, col: u32) -> [u8; 16] {
     [
@@ -177,6 +185,7 @@ pub const fn encode_json_span_le(offset: u32, len: u32, line: u32, col: u32) -> 
 }
 
 /// Decode 16 little-endian bytes into a JSON token span (`offset`, `len`, `line`, `col`).
+#[inline]
 #[must_use]
 pub const fn decode_json_span_le(bytes: [u8; 16]) -> (u32, u32, u32, u32) {
     let offset = (bytes[0] as u32)

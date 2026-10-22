@@ -101,22 +101,25 @@ impl TerminalSearch {
     }
 
     /// The `ambiguous_width` policy match columns are measured under.
+    #[inline]
     #[must_use]
-    pub fn ambiguous_width(&self) -> AmbiguousWidth {
+    pub const fn ambiguous_width(&self) -> AmbiguousWidth {
         self.index.ambiguous_width()
     }
 
     /// The oldest line still retained; the searchable range is
     /// `[lowest_retained_line(), indexed_line_count())`.
+    #[inline]
     #[must_use]
-    pub fn lowest_retained_line(&self) -> usize {
+    pub const fn lowest_retained_line(&self) -> usize {
         self.index.lowest_retained_line()
     }
 
     /// Whether results may be incomplete due to eviction; see
     /// [`SearchIndex::results_may_be_incomplete`].
+    #[inline]
     #[must_use]
-    pub fn results_may_be_incomplete(&self) -> bool {
+    pub const fn results_may_be_incomplete(&self) -> bool {
         self.index.results_may_be_incomplete()
     }
 
@@ -395,9 +398,10 @@ impl TerminalSearch {
     }
 
     /// Get the number of indexed lines.
+    #[inline]
     #[must_use]
     #[doc(hidden)]
-    pub fn indexed_line_count(&self) -> usize {
+    pub const fn indexed_line_count(&self) -> usize {
         self.index.len()
     }
 

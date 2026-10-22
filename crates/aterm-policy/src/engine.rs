@@ -65,7 +65,8 @@ pub struct Decision {
 impl Decision {
     /// Build a `Decision` that came from the default path (no rule matched).
     #[must_use]
-    pub(crate) fn fell_through(response: Response) -> Self {
+    #[inline]
+    pub(crate) const fn fell_through(response: Response) -> Self {
         Self {
             response,
             matched_rule: None,
@@ -148,7 +149,8 @@ impl PolicyEngine {
 
     /// Borrow the underlying [`Policy`] — useful for introspection.
     #[must_use]
-    pub fn policy(&self) -> &Policy {
+    #[inline]
+    pub const fn policy(&self) -> &Policy {
         &self.policy
     }
 
@@ -256,6 +258,7 @@ impl PolicyEngine {
     /// `amount` is `u64` so the handler-side byte counts (up to a 64 KiB
     /// response) and the pair counts used by the OSC 4/21 handlers both
     /// fit without overflow.
+    #[inline]
     pub fn rate_limit_try_consume<T: TimeSource>(
         &mut self,
         id: &str,
@@ -274,6 +277,7 @@ impl PolicyEngine {
     /// [`RateLimitSlot::UNDECLARED`], which debits as "allow" — the same
     /// answer [`Self::rate_limit_try_consume`] gives them.
     #[must_use]
+    #[inline]
     pub fn rate_limit_slot(&self, id: &str) -> RateLimitSlot {
         self.limiters.slot(id)
     }
@@ -282,6 +286,7 @@ impl PolicyEngine {
     ///
     /// Identical semantics to [`Self::rate_limit_try_consume`], minus the
     /// per-call hash of the id.
+    #[inline]
     pub fn rate_limit_try_consume_slot<T: TimeSource>(
         &mut self,
         slot: RateLimitSlot,
@@ -294,6 +299,7 @@ impl PolicyEngine {
     /// Look up a [`RateLimit`] configuration by id. Returns `None` when
     /// the active policy does not declare a bucket with that id.
     #[must_use]
+    #[inline]
     pub fn rate_limit_config(&self, id: &str) -> Option<&RateLimit> {
         self.policy.rate_limits.iter().find(|cfg| cfg.id == id)
     }

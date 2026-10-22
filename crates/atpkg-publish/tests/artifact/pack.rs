@@ -306,6 +306,55 @@ fn a_bundle_only_program_and_a_declared_bin_that_did_not_build_are_refused() {
     assert!(err.to_string().contains("not built: ay-lsp"), "{err}");
 }
 
+/// A shell is never shimmed (design S13), so a pack exposing `fish` is refused: before
+/// anything is built when the declaration names it, before anything is staged when the
+/// name-token fallback picks it, and nothing is tarred or signed either way. The control is
+/// the same checkout and build declaring `ay` alone, which packs and the client verifies.
+#[test]
+fn a_pack_exposing_fish_is_refused_and_the_same_build_exposing_tools_packs() {
+    crate::shared::need_compressor();
+    let w = world("pack-fish");
+    let bins = || {
+        vec![
+            ("ay", bin_bytes(elf(EM_X86_64, 2, 1), "ay x86_64")),
+            ("fish", bin_bytes(elf(EM_X86_64, 2, 1), "fish x86_64")),
+        ]
+    };
+    let nothing_written = |w: &World| {
+        assert!(w.written(".toml").is_empty(), "{:?}", w.written(".toml"));
+        assert!(w.written(".tar.zst").is_empty());
+        assert!(w.written(".sig").is_empty());
+    };
+
+    let fish = metadata_json(&w.checkout, &["ay", "fish"], &[], &[], false);
+    let t = tools(&w, "aarch64-apple-darwin", fish, bins());
+    let err = pack::pack_with(&w.ctx, &w.request(X86_64_UNKNOWN_LINUX_GNU), &t)
+        .expect_err("a declared shell");
+    assert!(err.to_string().contains("ay exposes `fish`"), "{err}");
+    assert!(t.runs_of("build").is_empty(), "refused before the build");
+    nothing_written(&w);
+
+    let undeclared = metadata_json(&w.checkout, &[], &[], &[], false);
+    let t = tools(&w, "aarch64-apple-darwin", undeclared, bins());
+    let err = pack::pack_with(&w.ctx, &w.request(X86_64_UNKNOWN_LINUX_GNU), &t)
+        .expect_err("a shell the fallback picked");
+    assert!(err.to_string().contains("ay exposes `fish`"), "{err}");
+    assert_eq!(
+        t.runs_of("build").len(),
+        1,
+        "the fallback picks after the build"
+    );
+    nothing_written(&w);
+
+    let t = tools(&w, "aarch64-apple-darwin", declared(&w), bins());
+    let out =
+        pack::pack_with(&w.ctx, &w.request(X86_64_UNKNOWN_LINUX_GNU), &t).expect("tool names pack");
+    assert_eq!(out.exposes, vec!["ay"]);
+    let sig = out.signature.clone().expect("signed");
+    let parsed = client_verifies(&w.ctx, &out.manifest, &sig).expect("the client accepts it");
+    assert_eq!(parsed.exposes, vec!["ay"]);
+}
+
 #[test]
 fn the_declared_bundle_ships_unshimmed_and_build_args_reach_the_build() {
     crate::shared::need_compressor();

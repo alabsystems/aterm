@@ -62,6 +62,7 @@ pub enum Type {
 
 impl Type {
     /// `a` + `elem`.
+    #[inline]
     #[must_use]
     pub fn array(elem: Type) -> Self {
         Self::Array(Arc::new(elem))
@@ -69,20 +70,23 @@ impl Type {
 
     /// `a{kv}`. The caller keeps `key` basic; a value built over another key
     /// is refused by [`crate::Value::dict`] and the encoder.
+    #[inline]
     #[must_use]
     pub fn dict(key: Type, value: Type) -> Self {
         Self::Dict(Arc::new(key), Arc::new(value))
     }
 
     /// `(...)`.
+    #[inline]
     #[must_use]
     pub fn structure(fields: impl IntoIterator<Item = Type>) -> Self {
         Self::Struct(fields.into_iter().collect())
     }
 
     /// The boundary a value of this type starts on.
+    #[inline]
     #[must_use]
-    pub fn alignment(&self) -> usize {
+    pub const fn alignment(&self) -> usize {
         match self {
             Self::Byte | Self::Sig | Self::Variant => 1,
             Self::I16 | Self::U16 => 2,
@@ -93,8 +97,9 @@ impl Type {
     }
 
     /// Whether this type may key a dict entry.
+    #[inline]
     #[must_use]
-    pub fn is_basic(&self) -> bool {
+    pub const fn is_basic(&self) -> bool {
         !matches!(
             self,
             Self::Variant | Self::Array(_) | Self::Dict(..) | Self::Struct(_)
@@ -142,6 +147,7 @@ impl Type {
     }
 
     /// This type's signature.
+    #[inline]
     #[must_use]
     pub fn signature(&self) -> String {
         let mut out = String::new();
@@ -155,6 +161,7 @@ impl Type {
     ///
     /// [`Error::Invalid`] for a signature the specification forbids,
     /// [`Error::Unsupported`] for one that names a unix descriptor.
+    #[inline]
     pub fn parse(sig: &str) -> Result<Self> {
         parse_one(sig.as_bytes()).map_err(SigFault::refused)
     }
@@ -175,6 +182,7 @@ pub fn signature_of(types: &[Type]) -> String {
 /// # Errors
 ///
 /// As [`Type::parse`].
+#[inline]
 pub fn parse_signature(sig: &str) -> Result<Vec<Type>> {
     parse_many(sig.as_bytes()).map_err(SigFault::refused)
 }
@@ -188,14 +196,16 @@ pub(crate) enum SigFault {
 }
 
 impl SigFault {
-    pub(crate) fn refused(self) -> Error {
+    #[inline]
+    pub(crate) const fn refused(self) -> Error {
         match self {
             Self::Bad(what) => Error::Invalid(what),
             Self::Fd => Error::Unsupported("unix descriptors (type h)"),
         }
     }
 
-    pub(crate) fn on_wire(self, at: usize) -> Error {
+    #[inline]
+    pub(crate) const fn on_wire(self, at: usize) -> Error {
         match self {
             Self::Bad(what) => Error::malformed(what, at),
             Self::Fd => Error::Unsupported("unix descriptors (type h)"),
@@ -254,10 +264,12 @@ impl<'a> Parser<'a> {
         })
     }
 
+    #[inline]
     fn peek(&self) -> Option<u8> {
         self.sig.get(self.pos).copied()
     }
 
+    #[inline]
     fn open_struct(&mut self) -> std::result::Result<(), SigFault> {
         if self.structs >= MAX_STRUCT_DEPTH {
             return Err(SigFault::Bad("structs nested deeper than 32"));
@@ -266,6 +278,7 @@ impl<'a> Parser<'a> {
         Ok(())
     }
 
+    #[inline]
     fn close_struct(&mut self) {
         self.structs = self.structs.saturating_sub(1);
     }

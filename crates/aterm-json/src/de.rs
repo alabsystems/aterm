@@ -34,8 +34,9 @@ pub struct Deserializer<'de> {
 
 impl<'de> Deserializer<'de> {
     /// Build a deserializer over `input`.
+    #[inline]
     #[must_use]
-    pub fn from_slice(input: &'de [u8]) -> Self {
+    pub const fn from_slice(input: &'de [u8]) -> Self {
         Self {
             input,
             pos: 0,
@@ -46,7 +47,8 @@ impl<'de> Deserializer<'de> {
 
     /// As [`Self::from_slice`], but an integer literal that does not fit
     /// `u64`/`i64` is an ERROR rather than an `f64`.
-    pub(crate) fn exact(input: &'de [u8]) -> Self {
+    #[inline]
+    pub(crate) const fn exact(input: &'de [u8]) -> Self {
         Self {
             exact_integers: true,
             ..Self::from_slice(input)
@@ -61,16 +63,19 @@ impl<'de> Deserializer<'de> {
         self.err("unexpected end of JSON input")
     }
 
+    #[inline]
     fn peek(&self) -> Option<u8> {
         self.input.get(self.pos).copied()
     }
 
+    #[inline]
     fn bump(&mut self) {
         self.pos = self.pos.saturating_add(1);
     }
 
     /// Skip RFC 8259 whitespace: space, tab, newline, carriage return. Nothing
     /// else — a JSON comment is not whitespace, and neither is a form feed.
+    #[inline]
     fn skip_ws(&mut self) {
         while let Some(byte) = self.peek() {
             match byte {
@@ -80,6 +85,7 @@ impl<'de> Deserializer<'de> {
         }
     }
 
+    #[inline]
     fn peek_value(&mut self) -> Result<u8> {
         self.skip_ws();
         self.peek().ok_or_else(|| self.eof())
@@ -107,6 +113,7 @@ impl<'de> Deserializer<'de> {
         }
     }
 
+    #[inline]
     fn enter(&mut self) -> Result<()> {
         self.depth = self.depth.saturating_add(1);
         // As `serde_json`: 127 nested containers parse, 128 do not.
@@ -116,6 +123,7 @@ impl<'de> Deserializer<'de> {
         Ok(())
     }
 
+    #[inline]
     fn leave(&mut self) {
         self.depth = self.depth.saturating_sub(1);
     }
@@ -897,6 +905,7 @@ impl<'de> de::VariantAccess<'de> for EnumAccess<'_, 'de> {
 /// # Errors
 /// Any syntax error, any `Deserialize` failure, nesting past
 /// [`RECURSION_LIMIT`], or trailing data after the value.
+#[inline]
 pub fn from_slice<'de, T: serde::Deserialize<'de>>(input: &'de [u8]) -> Result<T> {
     let mut de = Deserializer::from_slice(input);
     let value = T::deserialize(&mut de)?;
@@ -909,6 +918,7 @@ pub fn from_slice<'de, T: serde::Deserialize<'de>>(input: &'de [u8]) -> Result<T
 ///
 /// # Errors
 /// As [`from_slice`].
+#[inline]
 pub fn from_str<'de, T: serde::Deserialize<'de>>(input: &'de str) -> Result<T> {
     from_slice(input.as_bytes())
 }

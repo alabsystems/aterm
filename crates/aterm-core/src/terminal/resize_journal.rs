@@ -108,6 +108,7 @@ impl ResizeReport {
     /// Rows this resize moved the painted content by (`revealed - demoted`; negative is up).
     /// Meaningful when `reflowed` is false. Rows the undo handed back are in `revealed`, so
     /// a quiet alt-screen flap sums to 0 as a primary-screen one does.
+    #[inline]
     #[must_use]
     pub fn shift(&self) -> i32 {
         i32::from(self.revealed) - i32::from(self.demoted)
@@ -116,6 +117,7 @@ impl ResizeReport {
     /// Rows this resize pushed off the bottom, net of the ones it put back
     /// there from the resize undo: positive for a shrink's bottom-push,
     /// negative for the grow that undid one.
+    #[inline]
     #[must_use]
     pub fn net_pushed(&self) -> i32 {
         i32::from(self.pushed) - i32::from(self.restored_bottom)
@@ -127,6 +129,7 @@ impl ResizeReport {
     /// output before the grow back, an alt switch, a reset or a checkpoint restore drops
     /// the undo. Whether a later grow handed them back is its
     /// `restored_top`/`restored_bottom`, which `cast drift` folds.
+    #[inline]
     #[must_use]
     pub fn lossy(&self) -> bool {
         self.alt
@@ -138,8 +141,9 @@ impl ResizeReport {
     /// screen was active and its content sequence did not move. Both halves of
     /// a flap that landed between two PTY reads adjoin; a resize the app drew
     /// in front of does not. Cursor moves are not content and do not count.
+    #[inline]
     #[must_use]
-    pub fn adjoins(&self, prev: &ResizeReport) -> bool {
+    pub const fn adjoins(&self, prev: &ResizeReport) -> bool {
         self.alt == prev.alt && self.content_seq_before == prev.content_seq
     }
 
@@ -147,8 +151,9 @@ impl ResizeReport {
     /// counter ([`Terminal::full_clear_count`], [`Terminal::screen_replaced_count`]) read
     /// later advanced past this report's. Both only grow, so a stale reading never passes
     /// for a heal; compare readings of one [`Terminal::resize_lifetime`] only.
+    #[inline]
     #[must_use]
-    pub fn healed_by(&self, full_clears: u64, screen_replaced: u64) -> bool {
+    pub const fn healed_by(&self, full_clears: u64, screen_replaced: u64) -> bool {
         full_clears > self.full_clears || screen_replaced > self.screen_replaced
     }
 }
@@ -175,6 +180,7 @@ pub struct RenderDebt {
 
 impl RenderDebt {
     /// A debt of rows only, `(shift, pushed)`.
+    #[inline]
     #[must_use]
     pub const fn of_rows(shift: i32, pushed: i32) -> Self {
         Self {
@@ -185,12 +191,14 @@ impl RenderDebt {
     }
 
     /// The rows owed, `(shift, pushed)`; `(0, 0)` when every row sits where it was drawn.
+    #[inline]
     #[must_use]
     pub const fn rows(self) -> (i32, i32) {
         (self.shift, self.pushed)
     }
 
     /// Anything is owed: a row sits away from where it was drawn, or a drawn cell is gone.
+    #[inline]
     #[must_use]
     pub const fn owed(self) -> bool {
         self.shift != 0 || self.pushed != 0 || self.cut != 0
@@ -199,6 +207,7 @@ impl RenderDebt {
     /// The debt after `report`, one more non-reflowed alternate-screen resize: each count
     /// adds that resize's. A cut counts only the drawn cells still on the screen, so a
     /// column a former cut emptied is never counted twice.
+    #[inline]
     #[must_use]
     pub fn after(self, report: &ResizeReport) -> Self {
         Self {
@@ -264,12 +273,14 @@ impl Default for ResizeJournal {
 }
 
 /// Ring slot of the report with ordinal `ordinal` (1-based).
+#[inline]
 fn slot(ordinal: u64) -> usize {
     usize::try_from(ordinal.wrapping_sub(1) % CAP_U64).unwrap_or_default()
 }
 
 impl ResizeJournal {
     /// Record `report` as the next resize and stamp its ordinal.
+    #[inline]
     fn push(&mut self, report: ResizeReport) {
         self.ordinal = self.ordinal.wrapping_add(1);
         if let Some(entry) = self.ring.get_mut(slot(self.ordinal)) {
@@ -297,7 +308,8 @@ impl ResizeJournal {
 /// visible screen? ED 2 is; ED 0 is from the home position only. ED 3 erases the scrollback
 /// and leaves every visible row in place (a clearing app sends it with ED 2, which counts).
 /// EL, ED 1 and DECSED never count.
-pub(super) fn is_full_clear(mode: u16, row: u16, col: u16) -> bool {
+#[inline]
+pub(super) const fn is_full_clear(mode: u16, row: u16, col: u16) -> bool {
     match mode {
         2 => true,
         0 => row == 0 && col == 0,
@@ -308,6 +320,7 @@ pub(super) fn is_full_clear(mode: u16, row: u16, col: u16) -> bool {
 impl Terminal {
     /// The pre-resize facts for this resize's [`ResizeReport`], taken by both resize entry
     /// points before either grid is resized.
+    #[inline]
     pub(super) fn resize_origin(&self, policy: ResizePolicy) -> ResizeOrigin {
         ResizeOrigin {
             native: matches!(policy, ResizePolicy::Native),
@@ -392,13 +405,15 @@ impl Terminal {
     /// scratch ([`RenderDebt`]): the rows its non-reflowed `ResizePolicy::Native` resizes
     /// moved and the drawn columns they cut. Zeroed by a full clear, an alternate-screen
     /// switch and a reset; exact however far the journal was overrun.
+    #[inline]
     #[must_use]
-    pub fn render_debt(&self) -> RenderDebt {
+    pub const fn render_debt(&self) -> RenderDebt {
         self.transient.render_debt
     }
 
     /// Carry a predecessor's render debt across a handoff: once, right after a checkpoint
     /// restore, and only while the alternate screen is up (the debt is about its cells).
+    #[inline]
     pub fn seed_render_debt(&mut self, debt: RenderDebt) {
         if self.modes.alternate_screen {
             self.transient.render_debt = debt;
@@ -410,6 +425,7 @@ impl Terminal {
     /// would append before revealing history, and the history lines grows revealed, which
     /// the next shrink would demote before trimming. The next resize then reveals or trims
     /// first, and runs as one pass over both axes, as an aterm before the hand-back did.
+    #[inline]
     pub fn forget_handback(&mut self) {
         self.grid.forget_handback();
         if let Some(parked) = self.alt_grid.as_mut() {
@@ -421,6 +437,7 @@ impl Terminal {
     /// alternate buffer entered after (`aterm_grid`'s [`ResizeLaw`]): an older law for the
     /// replay of a recording made under it (`cast drift`, from the recording's
     /// `aterm_resize_undo`).
+    #[inline]
     pub fn set_resize_law(&mut self, law: ResizeLaw) {
         self.grid.set_resize_law(law);
         if let Some(parked) = self.alt_grid.as_mut() {
@@ -429,6 +446,7 @@ impl Terminal {
     }
 
     /// The resize law the rows are laid out under ([`Self::set_resize_law`]).
+    #[inline]
     #[must_use]
     pub fn resize_law(&self) -> ResizeLaw {
         self.grid.resize_law()
@@ -437,16 +455,18 @@ impl Terminal {
     /// How many resizes this engine has applied (the newest ordinal, 0 before the first).
     /// Never reset, RIS included; a restored engine starts at 0 under a new
     /// [`resize_lifetime`](Self::resize_lifetime).
+    #[inline]
     #[must_use]
-    pub fn resize_ordinal(&self) -> u64 {
+    pub const fn resize_ordinal(&self) -> u64 {
         self.resize_journal.ordinal
     }
 
     /// This engine's lifetime token: unique among the engines this process built (a counter,
     /// never 0) and fixed for the engine's life. Ordinals, `content_seq` and the two heal
     /// counters compare only within one lifetime.
+    #[inline]
     #[must_use]
-    pub fn resize_lifetime(&self) -> u64 {
+    pub const fn resize_lifetime(&self) -> u64 {
         self.resize_journal.lifetime
     }
 
@@ -455,6 +475,7 @@ impl Terminal {
     /// everything retained, or the last ordinal read. A watermark past
     /// [`resize_ordinal`](Self::resize_ordinal) is from another engine lifetime, so it reads
     /// as 0 rather than hide the new engine's resizes.
+    #[inline]
     #[must_use]
     pub fn resize_journal_since(&self, ordinal: u64) -> (Vec<ResizeReport>, u64) {
         self.resize_journal.since(ordinal)
@@ -463,16 +484,18 @@ impl Terminal {
     /// Monotonic count of full clears processed: ED 2, and ED 0 issued with the
     /// cursor at the home position (ED 3, a scrollback erase, is not one).
     /// Never reset (RIS included).
+    #[inline]
     #[must_use]
-    pub fn full_clear_count(&self) -> u64 {
+    pub const fn full_clear_count(&self) -> u64 {
         self.transient.full_clears
     }
 
     /// Monotonic count of whole-screen replacements: every alternate-screen enter and exit
     /// (modes 47, 1047 and 1049, including a repeated 1049 set, which clears) and every full
     /// reset (RIS and [`Terminal::reset`]). Never reset.
+    #[inline]
     #[must_use]
-    pub fn screen_replaced_count(&self) -> u64 {
+    pub const fn screen_replaced_count(&self) -> u64 {
         self.transient.screen_replaced
     }
 }

@@ -1,0 +1,50 @@
+# claude-code 2.1.307 · MEASURED 2026-10-22, `aterm ctl text` of a private headless aterm (100x50, aterm 0.111.0) running the real Claude Code, launched by path with a scratch `CLAUDE_CONFIG_DIR`, a fake `apiKeyHelper` key and `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>` (a local stub of the API, crates/aterm-lab) · the Bash box over `Probe wrap-100-columns`, its command scripted into the lab's stub (one tool call)
+⏺ Tool call done.
+
+✻ Crunched for 0s · done 3:07 AM
+
+❯ [aterm harness] Autopilot is Cruise: keep going. Finish everything in hand, verify it and land
+  it, then keep hunting for what would make the work more complete and more correct. Never stop to
+  ask: put what only a person can give on a line starting NEEDS YOU: and carry on with everything
+  else.
+
+⏺ Tool call done.
+
+✻ Brewed for 0s · done 3:11 AM
+
+❯ [aterm harness] Autopilot is Cruise: keep going. Finish everything in hand, verify it and land
+  it, then keep hunting for what would make the work more complete and more correct. Never stop to
+  ask: put what only a person can give on a line starting NEEDS YOU: and carry on with everything
+  else.
+
+⏺ Tool call done.
+
+✻ Churned for 0s · done 3:19 AM
+
+❯ toolstart
+
+⏺ Bash(echo $(true) $(true) $(true) $(true) $(true) $(true) $(true) $(true) $(true) $(true) $(true)
+      $(true) $(true) $(true) $(true) $(true) $(true) $(true) $(true) $(t…)
+  ⎿  Waiting…
+
+────────────────────────────────────────────────────────────────────────────────────────────────────
+ Bash command
+ Probe wrap-100-columns
+╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+ │ echo $(true) $(true) $(true) $(true) $(true) $(true) $(true) $(true) $(true) $(true) $(true)
+ │ $(true) $(true) $(true) $(true) $(true) $(true) $(true) $(true) $(true) $(true) $(true) $(true)
+ │ $(true) $(true) $(true) $(true) $(true) $(true) $(true) $(true) $(true) $(true) $(true) $(true)
+ │ $(true) $(true) $(true) $(true) $(true) $(true) $(true) $(true) $(true) $(true) $(true) $(true)
+ │ $(true) $(true) $(true) $(true) $(true) $(true) $(true) $(true) $(true) $(true) $(true) $(true)
+ │ $(true) $(true) $(true) $(true) $(true) $(true)
+╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+ │ Dangerous rm operation not ruled out — too many command substitutions to analyze (65)
+ ⚠ Claude Code will automatically deny this request in 1:58, to avoid blocking progress on an
+ unattended session
+
+
+ Do you want to proceed?
+ ❯ 1. Yes
+   2. No
+
+ Esc to cancel · Tab to amend

@@ -144,8 +144,9 @@ impl ResetKind {
 
     /// The vendor's id of the kind (`CLe`; the dialog row's value is
     /// `cedar-ember-<id>`): what a tape and a log name it by.
+    #[inline]
     #[must_use]
-    pub fn word(self) -> &'static str {
+    pub const fn word(self) -> &'static str {
         match self {
             ResetKind::Session => "session",
             ResetKind::Weekly => "weekly",
@@ -209,9 +210,10 @@ impl ResetKind {
     /// 5-hour, weekly and full ones, which refill the limit the vendor offers
     /// them at. Never the Fable one, whose give-back is new in 2.1.304 and
     /// postdates the owner's switch.
+    #[inline]
     #[must_use]
-    pub fn takeable(self) -> bool {
-        self != ResetKind::Fable
+    pub const fn takeable(self) -> bool {
+        !matches!(self, ResetKind::Fable)
     }
 
     /// The confirmation's title: `Use a {kind}?`.

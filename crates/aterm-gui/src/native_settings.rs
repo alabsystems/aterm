@@ -36,7 +36,7 @@ use crate::native_app::{
     NativeAppModel, OperationId, PackagesOutcome, PackagesRequest, SemanticInput, TextInputEvent,
     ThemesOutcome, ThemesRequest, UndoTarget, UpdateCx, UpdateOutcome, UpdateRequest, ViewCx,
 };
-use crate::native_config_language::SearchRank;
+use crate::native_config_language::{MatchReach, SearchRank};
 use crate::native_ui::{
     ActionId, AuditedCustomNode, ButtonIcon, ButtonSpec, Control, ControlState, FACT_SEPARATOR,
     GroupSpec, Insets, Layout, Length, LogicalRect, RAINBOW_BANNER_AUDIT, RichTextSpec,
@@ -53,7 +53,7 @@ use crate::settings::SettingsState;
 use crate::settings_preview::{
     AppearancePreviewSpec, CursorPostFxSpec, CursorPreviewSpec, PreviewAnimation,
     PreviewCursorStyle, PreviewPause, PreviewScene, PreviewTerminalTheme, PreviewTrailStyle,
-    SettingsPreviewSpec, TypographyPreviewSpec,
+    SettingsPreviewSpec, StyleTrial, TypographyPreviewSpec,
 };
 use crate::update_screen::{UpdateProjection, UpdateState};
 use scroll::{ListItem, ScrollPlan, ScrollRun, SplitCard};
@@ -246,11 +246,13 @@ impl SettingsRoute {
     }
 
     /// Whether the rail lists a row for this route whatever page shows.
+    #[cfg(test)]
     pub(crate) const fn on_rail(self) -> bool {
         self.rail_parent().is_none()
     }
 
     /// How many PERMANENT rows the rail lists.
+    #[cfg(test)]
     fn rail_len() -> usize {
         Self::ALL
             .into_iter()
@@ -1558,9 +1560,10 @@ impl ChoicePicker {
             .filter(|text| !text.is_empty())
             .find(|text| {
                 let typed = text.to_lowercase();
+                let reach = self.filter_reach(&typed);
                 named
                     .iter()
-                    .all(|index| theme_choice_matches(&self.options[*index], &typed))
+                    .all(|index| theme_choice_matches(&self.options[*index], &typed, reach))
             })
     }
 
@@ -1628,13 +1631,26 @@ impl ChoicePicker {
             .unwrap_or(self.selected)
     }
 
+    /// How far the theme filter `query` (lowercased) reaches over this
+    /// picker's rows ([`MatchReach`]): word hits where any row has one, else
+    /// loose ones — "uvbox" still finds Gruvbox, and "dark" never adds a row
+    /// whose words only hold it inside one.
+    fn filter_reach(&self, query: &str) -> MatchReach {
+        MatchReach::of(
+            self.options
+                .iter()
+                .any(|option| theme_choice_matches(option, query, MatchReach::Words)),
+        )
+    }
+
     /// Re-run the theme filter after its text changed: the shown rows are the
-    /// ones [`theme_choice_matches`] admits, and the list goes back to its
-    /// top.
+    /// ones [`theme_choice_matches`] admits at the filter's reach, and the
+    /// list goes back to its top.
     fn refilter(&mut self) {
         let query = self.filter_text().trim().to_lowercase();
+        let reach = self.filter_reach(&query);
         self.shown = (0..self.options.len())
-            .filter(|index| theme_choice_matches(&self.options[*index], &query))
+            .filter(|index| theme_choice_matches(&self.options[*index], &query, reach))
             .collect();
         self.seed_named.clear();
         self.offset.set(0);
@@ -1706,15 +1722,17 @@ impl ThemeNaming {
     }
 }
 
-/// Whether a picker row answers the filter `query` (already lowercased):
-/// its label, catalog id, description or appearance, by the one match ladder
-/// Settings search uses. An empty query admits every row.
-fn theme_choice_matches(option: &ChoiceOption, query: &str) -> bool {
+/// Whether a picker row answers the filter `query` (already lowercased) at
+/// `reach` ([`ChoicePicker::filter_reach`]): its label, catalog id,
+/// description or appearance, by the one match ladder Settings search uses.
+/// An empty query admits every row.
+fn theme_choice_matches(option: &ChoiceOption, query: &str, reach: MatchReach) -> bool {
     if query.is_empty() {
         return true;
     }
-    let matches =
-        |candidate: &str| crate::native_config_language::candidate_match_score(candidate, query);
+    let matches = |candidate: &str| {
+        crate::native_config_language::candidate_match_score(candidate, query, reach)
+    };
     if matches(&option.label.to_lowercase()).is_some() {
         return true;
     }
@@ -2204,6 +2222,10 @@ pub(crate) struct SettingsViewState {
     /// was last seated, than leaves the control the person is on whole in
     /// its room ([`SettingsViewState::note_status_room`]).
     status_overrun: Cell<f32>,
+    /// A STATUS TALLER THAN ITS BAR SCROLLS IN IT ([`status_words_node`]):
+    /// the words it scrolls, how far down they are scrolled and how far they
+    /// can be, as the last render measured them.
+    status_scroll: RefCell<StatusScroll>,
     /// A control every render keeps in view until the list is scrolled: the
     /// one the keyboard just reached, or the row a change was just made on
     /// (a status bar the change brings up must not scroll it away).
@@ -2279,6 +2301,13 @@ pub(crate) struct SettingsViewState {
     /// The font rows whose names the terminal's last font generation could
     /// not find, published by the host with that generation.
     font_refusals: Vec<crate::native_font_catalog::FontRefusal>,
+    /// The font rows whose names the preview's font worker could not find,
+    /// read off the semantic font this render prepared
+    /// ([`Self::observe_semantic_font`]): the second of the two resolvers
+    /// that answer whether a family exists, so whichever answers first is
+    /// THE answer every surface gives in the same frame
+    /// ([`Self::font_refusal`]).
+    semantic_font_refusals: std::cell::RefCell<Vec<crate::native_font_catalog::FontRefusal>>,
 }
 
 /// `config.prepare_sparkle_runtime().consumer_capabilities()` for
@@ -2457,6 +2486,7 @@ impl SettingsViewState {
             status_extra: Cell::new(0.0),
             status_bar_most: Cell::new(None),
             status_overrun: Cell::new(0.0),
+            status_scroll: RefCell::new(StatusScroll::default()),
             page_reveal: None,
             list_carried: None,
             reveal_as: scroll::Reveal::Keep,
@@ -2471,6 +2501,7 @@ impl SettingsViewState {
             drawn_faces: None,
             font_text_entry: None,
             font_refusals: Vec::new(),
+            semantic_font_refusals: std::cell::RefCell::new(Vec::new()),
         };
         let fields = state.theme_seeded_fields(config, &Arc::clone(&state.assets.themes));
         state.set_fields(fields);
@@ -2658,19 +2689,13 @@ impl SettingsViewState {
         self.unverified_patch = None;
         self.invalidate_result_page_limit();
         self.follow_showcase_change(highlighted);
-        // Messages' scroll counts the LOG's stops, bounded by the plan its
-        // render records (ruling 264), never by the settings' field count:
-        // an aterm.toml change clamped a scroll deeper than that count back
-        // to it (ruling 441 (l)). The render clamps it to the plan it draws.
-        if self.route == SettingsRoute::Messages && self.search.trim().is_empty() {
-            return Ok(());
-        }
-        let limit = if self.route == SettingsRoute::Modified || !self.search.trim().is_empty() {
-            settings_field_result_count(self).saturating_sub(1)
-        } else {
-            self.legacy.fields.len().saturating_sub(1)
-        };
-        self.reduce_page_scroll(limit, SettingsPageScrollCommand::Absolute(self.page_scroll));
+        // EVERY LIST'S SCROLL COUNTS ITS OWN STOPS, bounded by the plan its
+        // render draws, never by the settings' field count: the render after
+        // this change clamps the scroll to that plan ([`Self::seat_scroll`]).
+        // Clamped here to the field count, a list holding stops that are not
+        // fields (Messages' log, ruling 441 (l); Modified's cards; a search's
+        // headings) was pulled back from where it was before any render had
+        // measured it.
         Ok(())
     }
 
@@ -2705,6 +2730,23 @@ impl SettingsViewState {
             self.drop_list_nudge();
         }
         self.page_scroll = settings_page_scroll_transition(self.page_scroll, limit, command);
+        // A SCROLL BY STOPS PASSES OVER A NOTE ITS ROW SHOWS WITH IT
+        // ([`scroll::ScrollPlan::passes_over`]): on in the scroll's way, or
+        // back to its row where the list ends there.
+        if let SettingsPageScrollCommand::Lines(lines) = command
+            && let Some(plan) = self.scroll_plan()
+        {
+            let end = limit.min(plan.limit());
+            let mut forward = lines > 0;
+            while plan.passes_over(self.page_scroll) {
+                forward &= self.page_scroll < end;
+                self.page_scroll = if forward {
+                    self.page_scroll + 1
+                } else {
+                    self.page_scroll - 1
+                };
+            }
+        }
     }
 
     /// Where this view's transient status line stands — what the host's
@@ -3058,13 +3100,73 @@ impl SettingsViewState {
         }
     }
 
-    /// The refusal of the name `key`'s row shows now, if the terminal could
-    /// not find it.
-    fn font_refusal(&self, key: &str) -> Option<&crate::native_font_catalog::FontRefusal> {
+    /// THE ONE VERDICT ON WHETHER THE NAME `key`'s ROW SHOWS EXISTS: the
+    /// refusal the terminal's font generation published for it, else the one
+    /// the preview's font worker found ([`Self::observe_semantic_font`]).
+    /// Two resolvers answer the same question at different times; the row's
+    /// note, the preview header's state, its value and its font pill all
+    /// read this, so they agree in every frame whichever answers first.
+    fn font_refusal(&self, key: &str) -> Option<crate::native_font_catalog::FontRefusal> {
         let shown = self.field_by_key(key)?.seed.as_deref()?.trim();
+        let matches = |refusal: &&crate::native_font_catalog::FontRefusal| {
+            refusal.key == key && refusal.family.trim() == shown
+        };
         self.font_refusals
             .iter()
-            .find(|refusal| refusal.key == key && refusal.family.trim() == shown)
+            .find(matches)
+            .cloned()
+            .or_else(|| {
+                self.semantic_font_refusals
+                    .borrow()
+                    .iter()
+                    .find(matches)
+                    .cloned()
+            })
+    }
+
+    /// Read the preview font worker's verdict off the semantic font this
+    /// render prepared: every candidate slot it could not resolve is a font
+    /// row's name not found ([`Self::font_refusal`]). A font for another
+    /// candidate, or none, says nothing.
+    fn observe_semantic_font(&self, prepared: Option<&crate::tray_raster::PreparedSemanticFont>) {
+        let refusals = prepared
+            .filter(|prepared| prepared.matches(&preview_font_candidate(self)))
+            .map(|prepared| {
+                crate::tray_raster::unresolved_slots(&prepared.snapshot.status)
+                    .into_iter()
+                    .filter_map(|(slot, family)| {
+                        Some(crate::native_font_catalog::FontRefusal {
+                            key: font_slot_key(slot)?,
+                            family,
+                            reason: crate::native_font_catalog::FontRefusalReason::NotFound,
+                            from_theme: None,
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        self.semantic_font_refusals.replace(refusals);
+    }
+
+    /// The font rows the terminal or the preview could not find, as the
+    /// preview's slots name them ([`crate::settings_preview`]'s font verdict).
+    fn refused_font_slots(&self) -> Vec<(&'static str, String)> {
+        [
+            prefs::EDIT_FONT_FAMILY,
+            prefs::EDIT_FONT_FAMILY_BOLD,
+            prefs::EDIT_FONT_FAMILY_ITALIC,
+            prefs::EDIT_FONT_FAMILY_BOLD_ITALIC,
+            prefs::EDIT_SYMBOL_FONT,
+            prefs::EDIT_EMOJI_FONT,
+        ]
+        .into_iter()
+        .filter_map(|key| {
+            let refusal = self.font_refusal(key)?;
+            let slot = key_font_slot(key)?;
+            (refusal.reason == crate::native_font_catalog::FontRefusalReason::NotFound)
+                .then_some((slot, refusal.family))
+        })
+        .collect()
     }
 
     /// Whether a font row takes a typed name now: after "Other…", or while it
@@ -3922,6 +4024,11 @@ impl SettingsViewState {
     /// switch on the page chose goes too, so the surface that replaces it
     /// draws the side the OS picks until its own switch says otherwise.
     fn page_replaced(&mut self) {
+        // The pointer's hover was resolved on the page that goes: the next
+        // motion resolves it on the one that comes. A Cursor Styles row left
+        // hovered was tried again on the way back, "Click to save", with
+        // nothing under the pointer.
+        self.common.hovered = None;
         self.messages_tag_menu = false;
         self.theme_preview_side = None;
         if self.route == SettingsRoute::Themes {
@@ -4009,6 +4116,49 @@ impl SettingsViewState {
         let after = (before + lines as f32 * pitch).clamp(0.0, self.navigation_scroll_limit.get());
         self.navigation_scroll.set(after);
         (after - before).abs() > 0.01
+    }
+
+    /// Whether a status's words scroll in their bar `lines` lines' way from
+    /// where they are ([`status_words_node`]): down short of their end, or
+    /// up short of their top.
+    fn status_scrolls_toward(&self, lines: i32) -> bool {
+        let scroll = self.status_scroll.borrow();
+        scroll.limit > 0.01
+            && if lines > 0 {
+                scroll.offset < scroll.limit - 0.01
+            } else {
+                lines < 0 && scroll.offset > 0.01
+            }
+    }
+
+    /// Whether the keyboard is on a status bar: on its words' box
+    /// ([`status_words_node`]), its Undo, or a button of the unsaved-draft
+    /// bar's ([`DraftBar`]).
+    fn status_bar_has_focus(&self) -> bool {
+        let Some(focus) = self.common.last_focus.as_ref().map(UiKey::as_str) else {
+            return false;
+        };
+        focus == "settings/undo"
+            || status_scroll_target(&UiKey::new(focus))
+            || (self.has_unsaved_field_drafts()
+                && DraftBar::of(self)
+                    .buttons
+                    .iter()
+                    .any(|button| button.key == focus))
+    }
+
+    /// Scroll a status's words in their bar `lines` lines (clamped to what
+    /// the last render measured, [`status_words_node`]); whether they
+    /// scroll there at all. A status whose words its bar shows whole does
+    /// not take the wheel: it goes to the page.
+    fn scroll_status(&mut self, lines: i32) -> Option<bool> {
+        let mut scroll = self.status_scroll.borrow_mut();
+        if scroll.limit <= 0.01 {
+            return None;
+        }
+        let before = scroll.offset;
+        scroll.offset = (before + lines as f32 * scroll.line).clamp(0.0, scroll.limit);
+        Some((scroll.offset - before).abs() > 0.01)
     }
 
     /// Move the sidebar's keyboard `lines` rows (clamped at both ends) and
@@ -4478,10 +4628,13 @@ impl SettingsViewState {
             return;
         }
         // A style being tried on the Cursor Styles page: Escape puts the
-        // preview back on the saved style, the keyboard with it.
+        // preview back on the saved style, the keyboard with it — from the
+        // pointer, from a row, and from the preview's own control, which
+        // keeps the style it was trying until Escape drops it.
         if cursor_style_trial(self).is_some() {
             let saved = saved_cursor_style(self);
             self.common.hovered = None;
+            self.preview_candidate.replace(None);
             if self
                 .common
                 .last_focus
@@ -5134,8 +5287,8 @@ impl SettingsApp {
             .strip_prefix("settings/search/page")
             .and_then(SettingsRoute::from_path)
         {
-            let query = view.search.trim().to_ascii_lowercase();
-            let focus = search_page_hits(view, &query)
+            let text = folded_search(view);
+            let focus = search_page_hits(view, SearchQuery::of(view, &text))
                 .into_iter()
                 .find(|hit| hit.route == route)
                 .and_then(|hit| hit.focus);
@@ -5171,8 +5324,8 @@ impl SettingsApp {
             let target = if let Some(ordinal) = manual_match {
                 // The key the card listed at that place: the editor opens on
                 // it, or offers to add it.
-                let query = view.search.trim().to_ascii_lowercase();
-                manual_search_matching_keys(view, &query)
+                let text = folded_search(view);
+                manual_search_matching_keys(view, SearchQuery::of(view, &text))
                     .into_iter()
                     .nth(ordinal)
                     .map(ConfigEditorTarget::Key)
@@ -8155,8 +8308,12 @@ impl SettingsApp {
     }
 }
 
+/// How many settings the page lists as fields (a test's count of a page's
+/// settings; no bound of the list, which counts its own stops).
+#[cfg(test)]
 fn settings_field_result_count(view: &SettingsViewState) -> usize {
-    let query = view.search.trim().to_ascii_lowercase();
+    let text = folded_search(view);
+    let query = SearchQuery::of(view, &text);
     let global_search = !query.is_empty();
     if !global_search && view.route == SettingsRoute::Home {
         return 0;
@@ -8180,14 +8337,14 @@ fn settings_field_result_count(view: &SettingsViewState) -> usize {
             !modified_only || view.is_explicit(field.key) || view.field_has_unsaved_draft(field.key)
         })
         .filter(|field| {
-            field_match_score_in(field, &query, &mut scratch, &view.assets.themes).is_some()
+            field_match_score_in(field, query, &mut scratch, &view.assets.themes).is_some()
         })
         .count();
     native
         // Only ever compared against zero here, so the boolean twin answers it
         // without materializing (and dropping) the whole match set.
-        + usize::from(global_search && manual_search_has_match(view, &query))
-        + search_page_hits(view, &query).len()
+        + usize::from(global_search && manual_search_has_match(view, query))
+        + search_page_hits(view, query).len()
         + if modified_only {
             // One row per selected key; labels and previews are decoration.
             authored_manual_override_keys(view).len()
@@ -9247,7 +9404,7 @@ fn manual_reset_schema_entry(
 /// "is there anything at all" answer cannot disagree about a single key.
 fn for_each_manual_schema_match(
     view: &SettingsViewState,
-    query: &str,
+    query: SearchQuery<'_>,
     mut visit: impl FnMut(&'static crate::native_config_language::ConfigSchemaEntry, SearchRank) -> bool,
 ) {
     let mut scratch = String::new();
@@ -9263,9 +9420,12 @@ fn for_each_manual_schema_match(
         {
             continue;
         }
-        let Some(score) =
-            crate::native_config_language::config_schema_match_score(entry, query, &mut scratch)
-        else {
+        let Some(score) = crate::native_config_language::config_schema_match_score(
+            entry,
+            query.text,
+            query.reach,
+            &mut scratch,
+        ) else {
             continue;
         };
         if !visit(entry, score) {
@@ -9278,7 +9438,7 @@ fn for_each_manual_schema_match(
 /// with its rank, stopping as soon as `visit` returns `false`.
 fn for_each_authored_manual_match(
     view: &SettingsViewState,
-    query: &str,
+    query: SearchQuery<'_>,
     mut visit: impl FnMut(&str, SearchRank) -> bool,
 ) {
     // The key selector, not the decorated rows: only `.key` is read, and this
@@ -9300,7 +9460,8 @@ fn for_each_authored_manual_match(
         folded.extend(key.chars().map(|character| character.to_ascii_lowercase()));
         if let Some(score) = crate::native_config_language::query_match_score(
             std::iter::once(folded.as_str()),
-            query,
+            query.text,
+            query.reach,
         ) && !visit(key, SearchRank::own(score))
         {
             return;
@@ -9312,7 +9473,7 @@ fn for_each_authored_manual_match(
 /// they have an audited native control. Search's card lists this key set,
 /// best match first, and each of its buttons opens the key at its place in
 /// it, so what a button says and what it opens cannot drift apart.
-fn manual_search_matching_keys(view: &SettingsViewState, query: &str) -> Vec<String> {
+fn manual_search_matching_keys(view: &SettingsViewState, query: SearchQuery<'_>) -> Vec<String> {
     if query.is_empty() {
         return Vec::new();
     }
@@ -9328,7 +9489,7 @@ fn manual_search_matching_keys(view: &SettingsViewState, query: &str) -> Vec<Str
     // Among equal ranks, a key the query starts comes first.
     let mut keys: Vec<(SearchRank, bool, String)> = matches
         .into_iter()
-        .map(|(key, score)| (score, !key.starts_with(query), key))
+        .map(|(key, score)| (score, !key.starts_with(query.text), key))
         .collect();
     keys.sort();
     keys.into_iter().map(|(_, _, key)| key).collect()
@@ -9337,7 +9498,7 @@ fn manual_search_matching_keys(view: &SettingsViewState, query: &str) -> Vec<Str
 /// Boolean twin of `manual_search_matching_keys` for the caller that asks only
 /// whether Search lists an aterm.toml card at all. Authored overrides only add
 /// keys, so an early `true` from the schema sweep is the full set's answer.
-fn manual_search_has_match(view: &SettingsViewState, query: &str) -> bool {
+fn manual_search_has_match(view: &SettingsViewState, query: SearchQuery<'_>) -> bool {
     if query.is_empty() {
         return false;
     }
@@ -9771,30 +9932,23 @@ fn native_advanced_key(key: &str) -> bool {
     native_advanced_effect(key).is_some()
 }
 
+/// The bound a scroll by the reducer is held to: the last first stop the
+/// page's list scrolls to, as the last render measured it.
+///
+/// A BOUND NO RENDER HAS MEASURED HOLDS NOTHING BACK: a navigation, an
+/// aterm.toml change, a focus move or a search takes the measured bound
+/// away, and the next render seats the list from scratch, clamping the
+/// scroll to the plan it draws ([`SettingsViewState::seat_scroll`]) — so an
+/// End, a wheel or an arrow that comes before that render scrolls as far as
+/// it asks and the render lands it on the list's real end. A guess (the
+/// page's field count, or none for a page of cards) was lower than the real
+/// bound wherever a list holds stops that are not fields — Appearance's
+/// Follow system and More themes rows, Top Settings' cards — and End clamped
+/// the scroll short there: the first End on Appearance stopped at Background
+/// material, on Top Settings it moved nothing, and only a second End, after
+/// a render had measured the page, reached the end.
 fn settings_page_scroll_limit(view: &SettingsViewState) -> usize {
-    // Every page's render records the last first stop its list scrolls to.
-    if let Some(limit) = view.result_page_limit.get() {
-        return limit;
-    }
-    // Before a render has measured the page, a bound that still admits the
-    // first gesture; the next render clamps to the real one.
-    if view.compact_navigation {
-        return SettingsRoute::rail_len().saturating_sub(1);
-    }
-    if view.search.trim().is_empty() {
-        match view.route {
-            SettingsRoute::About => return 1,
-            SettingsRoute::Home
-            | SettingsRoute::Manual
-            | SettingsRoute::TabColor
-            | SettingsRoute::Wallpaper
-            | SettingsRoute::SoftwareUpdate
-            | SettingsRoute::Packages
-            | SettingsRoute::Messages => return 0,
-            _ => {}
-        }
-    }
-    settings_field_result_count(view).saturating_sub(1)
+    view.result_page_limit.get().unwrap_or(usize::MAX)
 }
 
 impl SettingsApp {
@@ -9831,6 +9985,16 @@ impl SettingsApp {
             AppEvent::ScrollAt { lines, key } => {
                 if navigation_scroll_target(&key) {
                     if view.scroll_navigation(lines) {
+                        cx.repaint(crate::native_app::DamageRegion::All);
+                    }
+                    return EventResult::Handled;
+                }
+                // Over a status whose words scroll in their bar, the wheel
+                // scrolls them.
+                if status_scroll_target(&key)
+                    && let Some(moved) = view.scroll_status(lines)
+                {
+                    if moved {
                         cx.repaint(crate::native_app::DamageRegion::All);
                     }
                     return EventResult::Handled;
@@ -10222,6 +10386,18 @@ impl SettingsApp {
             // follows.
             AppEvent::StepFocus(lines) if view.showcase_steps_highlight() => {
                 view.step_highlight(lines.signum() as isize)
+            }
+            // THE KEYBOARD ON A STATUS BAR READS ITS WORDS: Up and Down on
+            // the bar's own buttons scroll words the bar cannot show at once
+            // a line at a time ([`status_words_node`]), to either end, then
+            // go on as they do anywhere else. Only the wheel over the bar
+            // reached them, and a keyboard alone saw the thumb but never
+            // the words under it.
+            AppEvent::StepFocus(lines)
+                if view.status_bar_has_focus() && view.status_scrolls_toward(lines) =>
+            {
+                view.scroll_status(lines);
+                true
             }
             // The Cursor Styles list has a current item: Up or Down from
             // outside the page's list lands on the saved style.
@@ -11351,38 +11527,59 @@ fn cursor_style_list_live(state: &SettingsViewState) -> bool {
 /// reads it; the list, its check mark and every other control keep showing
 /// what is saved.
 fn cursor_style_candidate(state: &SettingsViewState) -> Option<String> {
+    cursor_style_candidate_from(state).map(|(style, _)| style)
+}
+
+/// [`cursor_style_candidate`] and what brought it: the keyboard where the
+/// row it came from has the keyboard (Return activates exactly that row),
+/// the pointer where only the pointer is over it, and
+/// [`StyleTrial::Kept`] where the preview's own control has the keyboard
+/// and keeps the style it was showing.
+fn cursor_style_candidate_from(state: &SettingsViewState) -> Option<(String, StyleTrial)> {
     if !cursor_style_list_live(state) {
         return None;
     }
     let writing = state.writes_in_flight(prefs::EDIT_CURSOR_TRAIL_STYLE);
-    let found = [
-        state.common.hovered.as_ref(),
-        state.common.last_focus.as_ref(),
-    ]
-    .into_iter()
-    .flatten()
-    .filter(|key| writing || state.chosen_style_row.as_ref() != Some(*key))
-    .find_map(|key| cursor_style_for_row(state, key.as_str()));
+    let focus = state.common.last_focus.as_ref();
+    let found = [state.common.hovered.as_ref(), focus]
+        .into_iter()
+        .flatten()
+        .filter(|key| writing || state.chosen_style_row.as_ref() != Some(*key))
+        .find_map(|key| {
+            let source = if focus == Some(key) {
+                StyleTrial::Keyboard
+            } else {
+                StyleTrial::Pointer
+            };
+            cursor_style_for_row(state, key.as_str()).map(|style| (style, source))
+        });
     // Focusing the preview itself (its Pause/Play control) keeps the style it
     // was trying, rather than dropping back to the saved one. What it keeps
     // passed the chosen-row rule above, so a chosen row is never brought back.
-    let on_preview = state
-        .common
-        .last_focus
-        .as_ref()
-        .is_some_and(|focus| focus.as_str().starts_with("settings/preview"));
+    let on_preview = focus.is_some_and(|focus| focus.as_str().starts_with("settings/preview"));
     if found.is_none() && on_preview {
-        return state.preview_candidate.borrow().clone();
+        return state
+            .preview_candidate
+            .borrow()
+            .clone()
+            .map(|style| (style, StyleTrial::Kept));
     }
-    state.preview_candidate.replace(found.clone());
+    state
+        .preview_candidate
+        .replace(found.as_ref().map(|(style, _)| style.clone()));
     found
 }
 
 /// The style being TRIED: a [`cursor_style_candidate`] that is not the saved
 /// style, the value the preview shows unsaved.
 fn cursor_style_trial(state: &SettingsViewState) -> Option<String> {
-    cursor_style_candidate(state)
-        .filter(|candidate| !candidate.eq_ignore_ascii_case(&saved_cursor_style(state)))
+    cursor_style_trial_from(state).map(|(style, _)| style)
+}
+
+/// [`cursor_style_trial`] and what brought it ([`cursor_style_candidate_from`]).
+fn cursor_style_trial_from(state: &SettingsViewState) -> Option<(String, StyleTrial)> {
+    cursor_style_candidate_from(state)
+        .filter(|(candidate, _)| !candidate.eq_ignore_ascii_case(&saved_cursor_style(state)))
 }
 
 /// The style the Cursor Styles list checks: what the terminal draws now, so
@@ -11561,6 +11758,8 @@ fn trail_knob_context(
         classic_tinted: candidate_explicit_text(state, patch, prefs::EDIT_CURSOR_TRAIL_COLOR)
             .is_some()
             || aterm_effects::cursor_glow::GlowStyle::style_names_classic_mono(raw.trim()),
+        // A terminal's moves cross blank cells as well as text.
+        over_text: false,
     }
 }
 
@@ -11601,6 +11800,33 @@ fn font_slot_style(key: &str) -> (&'static str, &'static str) {
         prefs::EDIT_FONT_FAMILY_BOLD_ITALIC => ("a bold italic face", "Bold italic text"),
         _ => ("a bold face", "Bold text"),
     }
+}
+
+/// The font row a semantic font slot is named by (`regular` is the Font
+/// row); `None` for the fallback list, which is no one row's name.
+fn font_slot_key(slot: &str) -> Option<&'static str> {
+    Some(match slot {
+        "regular" => prefs::EDIT_FONT_FAMILY,
+        "bold" => prefs::EDIT_FONT_FAMILY_BOLD,
+        "italic" => prefs::EDIT_FONT_FAMILY_ITALIC,
+        "bold italic" => prefs::EDIT_FONT_FAMILY_BOLD_ITALIC,
+        "symbol" => prefs::EDIT_SYMBOL_FONT,
+        "emoji" => prefs::EDIT_EMOJI_FONT,
+        _ => return None,
+    })
+}
+
+/// [`font_slot_key`] the other way.
+fn key_font_slot(key: &str) -> Option<&'static str> {
+    Some(match key {
+        prefs::EDIT_FONT_FAMILY => "regular",
+        prefs::EDIT_FONT_FAMILY_BOLD => "bold",
+        prefs::EDIT_FONT_FAMILY_ITALIC => "italic",
+        prefs::EDIT_FONT_FAMILY_BOLD_ITALIC => "bold italic",
+        prefs::EDIT_SYMBOL_FONT => "symbol",
+        prefs::EDIT_EMOJI_FONT => "emoji",
+        _ => return None,
+    })
 }
 
 fn font_refusal_consequence(key: &str) -> &'static str {
@@ -12489,7 +12715,8 @@ fn renderer_preview_path(state: &SettingsViewState) -> &'static str {
 }
 
 fn focused_preview_key(state: &SettingsViewState) -> Option<String> {
-    let query = state.search.trim().to_ascii_lowercase();
+    let text = folded_search(state);
+    let query = SearchQuery::of(state, &text);
     // While searching, a focused control previews only if it is one of the
     // results: a preview never stands over results that do not include it.
     let previewable = |key: &str| {
@@ -12497,7 +12724,7 @@ fn focused_preview_key(state: &SettingsViewState) -> Option<String> {
             && (query.is_empty()
                 || (settings_field_is_visible(state, key, false, true)
                     && state.field_by_key(key).is_some_and(|field| {
-                        field_match_score(field, &query, &state.assets.themes).is_some()
+                        field_match_score(field, query, &state.assets.themes).is_some()
                     })))
     };
     let focused = state.common.last_focus.as_ref().map(UiKey::as_str);
@@ -12555,7 +12782,7 @@ fn focused_preview_key(state: &SettingsViewState) -> Option<String> {
                     && settings_field_is_visible(state, field.key, false, true)
             })
             .filter_map(|field| {
-                field_match_score(field, &query, &state.assets.themes).map(|score| (score, field))
+                field_match_score(field, query, &state.assets.themes).map(|score| (score, field))
             })
             .min_by_key(|(score, field)| {
                 (
@@ -12828,7 +13055,10 @@ fn renderer_preview(
     prepared_font: Option<&crate::tray_raster::PreparedSemanticFont>,
     width: SettingsWidth,
     maximum_height: f32,
+    preview_width: f32,
 ) -> Option<UiNode> {
+    // Measured at the width it is laid out at: its header wraps there, and
+    // every height below buys the lines it needs.
     let spec = renderer_preview_spec_with_font(
         state,
         phase_ms,
@@ -12836,7 +13066,8 @@ fn renderer_preview(
         terminal_font_px,
         terminal_scale,
         prepared_font,
-    )?;
+    )?
+    .with_measure_width(preview_width);
     let preview_path = renderer_preview_path(state);
     // A large size shows fewer whole rows; the card never grows past twice
     // its usual height, so the rows under it keep the page.
@@ -12852,16 +13083,7 @@ fn renderer_preview(
             .max(spec.minimum_height(48.0))
     };
     let key = format!("settings/preview{preview_path}");
-    let focused = state
-        .common
-        .last_focus
-        .as_ref()
-        .is_some_and(|focus| focus.as_str() == key);
-    Some(crate::settings_preview::preview_node(
-        key,
-        spec.with_focus_ring(focused),
-        height,
-    ))
+    Some(crate::settings_preview::preview_node(key, spec, height))
 }
 
 /// Build the one canonical preview spec used by semantic paint, introspection,
@@ -13256,14 +13478,16 @@ fn renderer_preview_spec_for_key_with_font(
             )
             .with_font_candidate(font_candidate)
             .with_prepared_font(prepared_font)
+            .with_refused_fonts(state.refused_font_slots())
             .with_appearance(appearance)
             .with_typography_candidate(typography)
             .with_post_fx(post_fx)
             .with_focus(focused_key, focused_value)
             .with_theme_sample(theme_sample)
             .with_style_trial(
-                focused_key == prefs::EDIT_CURSOR_TRAIL_STYLE
-                    && cursor_style_trial(state).is_some(),
+                cursor_style_trial_from(state)
+                    .filter(|_| focused_key == prefs::EDIT_CURSOR_TRAIL_STYLE)
+                    .map(|(_, source)| source),
             )
             .with_focused_effect(focused_row_idle_note(state, focused_key, motion))
             .with_focus_label(
@@ -13412,6 +13636,7 @@ fn wallpaper_preview(
     cx: &ViewCx<'_>,
     width: SettingsWidth,
     room: f32,
+    preview_width: f32,
 ) -> Option<(UiNode, f32)> {
     let wallpaper = preview_wallpaper(state)?;
     let mut spec = renderer_preview_spec_for_key_with_font(
@@ -13422,7 +13647,8 @@ fn wallpaper_preview(
         cx.terminal_font_px,
         cx.terminal_scale,
         cx.semantic_font.as_ref(),
-    )?;
+    )?
+    .with_measure_width(preview_width);
     spec.scene = PreviewScene::Wallpaper;
     spec.wallpaper = Some(wallpaper);
     spec.focused_value = wallpaper_words(state)
@@ -13545,6 +13771,25 @@ fn navigation_row_height(scale: f32) -> f32 {
 /// and the focus ring ever touch.
 const NAVIGATION_GAP: f32 = 2.0;
 
+/// Whether a scroll aimed at `key` is a status bar's ([`status_words_node`]):
+/// the bar, or the words it says (the plain status's, the unsaved-draft
+/// bar's).
+fn status_scroll_target(key: &UiKey) -> bool {
+    let key = key.as_str();
+    [
+        "settings/feedback",
+        "settings/status",
+        "settings/draft-recovery/status",
+    ]
+    .iter()
+    .any(|bar| {
+        key == *bar
+            || key
+                .strip_prefix(bar)
+                .is_some_and(|rest| rest.starts_with('/'))
+    })
+}
+
 /// Whether a scroll aimed at `key` is the sidebar's: its list, a row, a group
 /// heading or its title (its search field is the page's search).
 fn navigation_scroll_target(key: &UiKey) -> bool {
@@ -13570,6 +13815,10 @@ fn settings_tree(
     cx: &ViewCx<'_>,
 ) -> UiTree {
     state.page_window.set(None);
+    // The preview font worker's verdict first: every surface this render
+    // builds answers whether a font exists from one verdict
+    // ([`SettingsViewState::font_refusal`]).
+    state.observe_semantic_font(cx.semantic_font.as_ref());
     // Seated under a status's whole bar until the page says otherwise
     // ([`page`]).
     state.status_bar_most.set(None);
@@ -13587,6 +13836,9 @@ fn settings_tree(
         (width == SettingsWidth::Compact && SettingsWidth::Compact.row_height() > list + 0.01)
             .then_some(list),
     );
+    let _fields = FieldListRoom::set(Some(
+        (list - page_heading_height()).max(scaled_control_height()),
+    ));
     let watch_status_height = config_watch_status_bar_height(state);
     let available_height = (cx.viewport.height - watch_status_height).max(0.0);
     state.record_presented_width(width);
@@ -13763,6 +14015,7 @@ fn settings_search(state: &SettingsViewState, placeholder: &str) -> UiNode {
                     visual_value: None,
                     input: Some(state.search_input.projection()),
                     swatch: None,
+                    swatch_line: false,
                     trailing_hint: None,
                     description: None,
                     end_button: false,
@@ -14120,13 +14373,14 @@ fn compact_toolbar(
             .height(leading_height),
     );
     let mut children = vec![leading];
+    let mut under = None;
     if status_docked {
         // A docked status takes the title's place as it takes Search's; the
         // page's group keeps the route's name.
-        children.push(
-            compact_status_dock(state, viewport)
-                .expect("a docked compact status always has a watcher or feedback"),
-        );
+        let dock = compact_status_dock(state, viewport)
+            .expect("a docked compact status always has a watcher or feedback");
+        children.push(dock.dock);
+        under = dock.under;
     } else {
         // The title, where the toolbar carries it ([`compact_toolbar_titles`]),
         // sits between the leading button and Search.
@@ -14186,17 +14440,47 @@ fn compact_toolbar(
             )];
         }
     }
-    UiNode::new(
+    let toolbar = UiNode::new(
         "settings/compact-toolbar",
         UiContent::Group(GroupSpec::new("Settings toolbar").style(StyleRef::Secondary)),
-    )
-    .layout(
-        Layout::row()
-            .height(Length::Fixed(compact_header_height(state, viewport)))
-            .padding(Insets::symmetric(10.0, 8.0))
-            .gap(8.0),
-    )
-    .children(children)
+    );
+    let header = compact_header_height(state, viewport);
+    // A docked status's actions under its words stand across the toolbar,
+    // under its leading button too ([`compact_dock_layout`]).
+    let Some(under) = under else {
+        return toolbar
+            .layout(
+                Layout::row()
+                    .height(Length::Fixed(header))
+                    .padding(Insets::symmetric(10.0, 8.0))
+                    .gap(8.0),
+            )
+            .children(children);
+    };
+    // The words' row: the toolbar less its padding, the gap and the actions
+    // ([`compact_header_height`]).
+    let top = (header - 16.0 - 8.0 - fixed_height(&under)).max(scaled_control_height());
+    toolbar
+        .layout(
+            Layout::column()
+                .height(Length::Fixed(header))
+                .padding(Insets::symmetric(10.0, 8.0))
+                .gap(8.0),
+        )
+        .children(vec![
+            UiNode::new(
+                "settings/compact-toolbar/top",
+                UiContent::Group(GroupSpec::unlabeled(SemanticRole::Group)),
+            )
+            .layout(
+                Layout::row()
+                    .width(Length::Fill)
+                    .height(Length::Fixed(top))
+                    .gap(8.0),
+            )
+            .children(children),
+            under,
+        ])
 }
 
 /// The lines the Reset All question paints across a bar `room` wide: how
@@ -14261,7 +14545,7 @@ fn feedback_bar(
         // than the room the page keeps for a bar; else the buttons go on a
         // row under the words.
         let one_row = draft_bar_row_actions_width(&bar, room);
-        let visual_status = crate::native_ui::fit_native_status_label(&bar.visual, room);
+        let words = draft_bar_words(&bar, width, viewport);
         let mut actions = bar_actions(
             "settings/draft-recovery/actions",
             "Unsaved Settings draft recovery actions",
@@ -14305,21 +14589,29 @@ fn feedback_bar(
                         .height(if one_row.is_some() {
                             Length::Fill
                         } else {
-                            Length::Fixed(scaled_control_height())
+                            Length::Fixed(words.height)
                         }),
                 )
-                .children(vec![
+                .children(vec![if one_row.is_some() {
                     UiNode::new(
                         "settings/draft-recovery/status/visual",
                         UiContent::Text(TextSpec {
-                            text: visual_status,
+                            text: bar.visual.clone(),
                             role: SemanticRole::Status,
                             style: StyleRef::Plain,
                         }),
                     )
                     .layout(Layout::default().width(Length::Fill).height(Length::Fill))
-                    .paint_only(),
-                ]),
+                    .paint_only()
+                } else {
+                    status_words_node(
+                        state,
+                        "settings/draft-recovery/status/visual",
+                        &bar.visual,
+                        room,
+                        words.most,
+                    )
+                }]),
                 actions,
             ]),
         );
@@ -14403,6 +14695,7 @@ fn feedback_bar(
         )
         .layout(Layout::default().width(Length::Fill).height(words_height))
         .children(vec![status_words_node(
+            state,
             "settings/status/visual",
             feedback,
             bar.words_width,
@@ -14669,10 +14962,30 @@ fn bar_actions_height(buttons: &[BarButton], room: f32) -> f32 {
     match bar_button_fit(buttons, room) {
         BarFit::Stacked => {
             let rows = buttons.len().max(1) as f32;
-            rows * scaled_control_height() + 8.0 * (rows - 1.0)
+            buttons
+                .iter()
+                .map(|button| stacked_bar_button(button, room).1)
+                .sum::<f32>()
+                .max(scaled_control_height())
+                + 8.0 * (rows - 1.0)
         }
         BarFit::Row { .. } | BarFit::Shared => scaled_control_height(),
     }
+}
+
+/// A STACKED BAR BUTTON KEEPS ITS WORDS, as every button does
+/// ([`button_words_in`]): the words it paints across the bar `room` wide —
+/// on one line where they fit, else on lines at their words, else a word
+/// wider than the button broken with a hyphen — and how tall that makes
+/// it. Held to one touch row, the unsaved-draft dock beside the compact
+/// toolbar's back button at 2× text in a 22-column window painted
+/// "Rev…" and "Dis…".
+fn stacked_bar_button(button: &BarButton, room: f32) -> (String, f32) {
+    let words = button.words(false);
+    let spec = ButtonSpec::new(button.label.clone()).visual_label(words.clone());
+    let (words, lines) = button_words_in(&spec, &words, &[], room);
+    let height = crate::native_ui::native_button_height_for_lines(lines, scaled_control_height());
+    (words, height)
 }
 
 /// A status bar's actions as buttons laid out as they fit `room`
@@ -14701,16 +15014,23 @@ fn bar_actions(key: &str, label: &str, buttons: &[BarButton], room: f32) -> UiNo
         }
     );
     children.extend(buttons.iter().enumerate().map(|(index, button)| {
-        let (width, height) = match &fit {
-            BarFit::Row { widths, .. } => (Length::Fixed(widths[index]), Length::Fill),
-            BarFit::Shared => (Length::Fill, Length::Fill),
-            BarFit::Stacked => (Length::Fill, Length::Fixed(scaled_control_height())),
+        let (width, height, words) = match &fit {
+            BarFit::Row { widths, .. } => (
+                Length::Fixed(widths[index]),
+                Length::Fill,
+                button.words(qualified),
+            ),
+            BarFit::Shared => (Length::Fill, Length::Fill, button.words(qualified)),
+            BarFit::Stacked => {
+                let (words, height) = stacked_bar_button(button, room);
+                (Length::Fill, Length::Fixed(height), words)
+            }
         };
         UiNode::new(
             button.key,
             UiContent::Button(
                 Control::new(
-                    ButtonSpec::new(button.label.clone()).visual_label(button.words(qualified)),
+                    ButtonSpec::new(button.label.clone()).visual_label(words),
                     ActionId::new(button.key),
                 )
                 .style(button.style),
@@ -14884,6 +15204,40 @@ fn draft_bar_row_actions_width(bar: &DraftBar, room: f32) -> Option<f32> {
         })
 }
 
+/// How the unsaved-draft bar sets its words over its buttons
+/// ([`draft_bar_words`]).
+struct DraftBarWords {
+    /// The most lines of words it shows at once; more scroll
+    /// ([`status_words_node`]).
+    most: usize,
+    /// How tall its words' box is: their lines, or a control's row.
+    height: f32,
+}
+
+/// THE UNSAVED-DRAFT BAR'S WORDS OVER ITS BUTTONS ARE READ WHOLE, as every
+/// status is ([`status_word_lines`]): on the lines they take across the bar
+/// (inside its 8pt padding), no more of them at once than leaves its
+/// buttons in the window under the compact toolbar — the rest scroll in the
+/// bar ([`status_words_node`]). They were cut to one line: a refused draft
+/// in a 192pt window read "Scrollback limit was not saved.…", the
+/// sentence saying what to do — the part the bar exists to say — gone.
+fn draft_bar_words(bar: &DraftBar, width: SettingsWidth, viewport: LogicalRect) -> DraftBarWords {
+    let room = (viewport.width - settings_navigation_width(width) - 16.0).max(0.0);
+    let over = if width == SettingsWidth::Compact {
+        compact_toolbar_height()
+    } else {
+        0.0
+    };
+    let room_for_words =
+        viewport.height - over - 16.0 - 4.0 - bar_actions_height(&bar.buttons, room);
+    let most = (room_for_words / status_line_height()).floor().max(1.0) as usize;
+    let lines = status_word_lines(&bar.visual, room).len().clamp(1, most);
+    DraftBarWords {
+        most,
+        height: scaled_control_height().max(lines as f32 * status_line_height()),
+    }
+}
+
 fn feedback_bar_height(
     state: &SettingsViewState,
     width: SettingsWidth,
@@ -14896,8 +15250,11 @@ fn feedback_bar_height(
         if draft_bar_row_actions_width(&bar, room).is_some() {
             scaled_control_height()
         } else {
-            // The words' row, a gap and the actions, inside 8pt padding.
-            scaled_control_height() + 4.0 + bar_actions_height(&bar.buttons, room) + 16.0
+            // The words' lines, a gap and the actions, inside 8pt padding.
+            draft_bar_words(&bar, width, viewport).height
+                + 4.0
+                + bar_actions_height(&bar.buttons, room)
+                + 16.0
         }
     } else if state.reset_all_confirmation {
         // The question's lines, a gap and the actions, inside 10pt padding.
@@ -14941,70 +15298,6 @@ fn status_word_lines(text: &str, width: f32) -> Vec<String> {
 fn status_words_width(text: &str) -> f32 {
     let (px, face) = crate::native_ui::text_paint_metrics(SemanticRole::Status, StyleRef::Plain);
     crate::tray_raster::ui_text_width_for(face, text, px)
-}
-
-/// [`status_word_lines`], no more than `most` of them: where the bar holds
-/// fewer lines than the words take — the window under the toolbar (a
-/// phone-width window at 2× text), or the room the list keeps for the
-/// control the person is on ([`SettingsViewState::status_bar_most`]) — A
-/// STATUS GIVES UP ITS MIDDLE, NEVER ITS ENDS: what it is about and how it
-/// ended (a setting's name, then "turned on", or why it was not saved and
-/// what to do) stay, the least run of words (or of a path's folders) at its
-/// middle taken out for "…" ([`status_middle_cut`]); only where even its
-/// first and last word take more does its last line end in an ellipsis.
-/// Cut at its end, "Allow programs to read the clipboard turned on" read
-/// "Allow programs to read the clipboard…", and a failure lost why. The
-/// whole status stays the bar's semantic label.
-fn status_word_lines_at_most(text: &str, width: f32, most: usize) -> Vec<String> {
-    let mut lines = status_word_lines(text, width);
-    let most = most.max(1);
-    if lines.len() <= most {
-        return lines;
-    }
-    if let Some(cut) = status_middle_cut(text, |cut| status_word_lines(cut, width).len() <= most) {
-        return status_word_lines(&cut, width);
-    }
-    lines.truncate(most);
-    let (px, face) = crate::native_ui::text_paint_metrics(SemanticRole::Status, StyleRef::Plain);
-    if let Some(last) = lines.pop() {
-        lines.push(elide_wrapped_copy_tail(&last, px, face, width));
-    }
-    lines
-}
-
-/// `text` with the least run of its middle taken out for "…" that `fits`:
-/// its words, and a path's folders inside a word, are what it gives up, as
-/// many from each side of its middle, its first and last kept. `None` where
-/// even that does not fit.
-fn status_middle_cut(text: &str, fits: impl Fn(&str) -> bool) -> Option<String> {
-    // Where each word, or folder of a path, starts and ends.
-    let mut units = Vec::new();
-    let mut start = None;
-    for (at, c) in text.char_indices() {
-        let part = !(c.is_whitespace() || c == '/');
-        match (part, start) {
-            (true, None) => start = Some(at),
-            (false, Some(from)) => {
-                units.push((from, at));
-                start = None;
-            }
-            _ => {}
-        }
-    }
-    if let Some(from) = start {
-        units.push((from, text.len()));
-    }
-    let n = units.len();
-    (1..n.saturating_sub(1)).find_map(|taken| {
-        let first = (n - taken) / 2;
-        let last = first + taken - 1;
-        let cut = format!(
-            "{}\u{2026}{}",
-            &text[..units[first].0],
-            &text[units[last].1..]
-        );
-        fits(&cut).then_some(cut)
-    })
 }
 
 /// How many words a box `width` wide sets across two lines: the lines
@@ -15101,11 +15394,85 @@ fn plain_bar_layout(
     }
 }
 
+/// What a status bar's own scroll holds ([`SettingsViewState::status_scroll`]):
+/// the words it scrolls — new words start at their top — how far down they
+/// are, how far they can go, and one line's height, the step a wheel line
+/// takes.
+#[derive(Debug, Default)]
+struct StatusScroll {
+    text: String,
+    offset: f32,
+    limit: f32,
+    line: f32,
+}
+
+/// The room a status's scroll thumb keeps at the end of its lines
+/// ([`status_words_node`]): the thumb's 3pt and its 4pt inset, and a gap.
+const STATUS_THUMB_GUTTER: f32 = 10.0;
+
 /// `feedback`'s words as a status shows them in a box `width` wide (inside
 /// the bar's padding): one line filling the row where it is one, else a
 /// column of whole lines, each [`status_line_height`] tall, from the top.
-fn status_words_node(key: &str, feedback: &str, width: f32, most: usize) -> UiNode {
-    let lines = status_word_lines_at_most(feedback, width, most);
+///
+/// A STATUS IS NEVER CUT: where its lines are more than the bar shows
+/// (`most`: the window under the toolbar, or the room the list keeps for
+/// the control the person is on, [`SettingsViewState::status_bar_most`]),
+/// the bar shows `most` of them at a time and its words scroll in it — the
+/// wheel over the bar a line at a time ([`status_scroll_target`]), a thumb
+/// down its end saying where — every word of it on some line, from its
+/// first, a new status starting at its top. Its middle used to be taken
+/// out for "…": at 2× text in a 22-column window "Allow programs to read
+/// the clipboard turned on" read "Allow / programs to … / the clipboard /
+/// turned on", and a save that failed lost which change and which folder.
+/// The bar's semantic label says it whole.
+fn status_words_node(
+    state: &SettingsViewState,
+    key: &str,
+    feedback: &str,
+    width: f32,
+    most: usize,
+) -> UiNode {
+    status_words_node_at(state, key, feedback, width, most, status_line_height())
+}
+
+/// [`status_words_node`] with its lines `line_height` apart.
+fn status_words_node_at(
+    state: &SettingsViewState,
+    key: &str,
+    feedback: &str,
+    width: f32,
+    most: usize,
+    line_height: f32,
+) -> UiNode {
+    let most = most.max(1);
+    let mut lines = status_word_lines(feedback, width);
+    let scrolls = lines.len() > most;
+    if scrolls {
+        // The thumb's room at the lines' end.
+        lines = status_word_lines(feedback, (width - STATUS_THUMB_GUTTER).max(1.0));
+    }
+    // THE KEYBOARD REACHES WORDS THAT SCROLL: their box is a stop after the
+    // list (Up and Down on it scroll them, [`SettingsViewState::status_bar_has_focus`]),
+    // and stays one while the keyboard is on it — the bar then shows as
+    // many of them as the window holds, since no control of the list is
+    // the one the person is on. Only the wheel over the bar reached them,
+    // and a keyboard saw the thumb but never the words under it.
+    let words_key = format!("{key}/words");
+    let keyboard_on = state
+        .common
+        .last_focus
+        .as_ref()
+        .is_some_and(|focus| focus.as_str() == words_key);
+    let boxed = scrolls || (keyboard_on && lines.len() > 1);
+    {
+        let mut scroll = state.status_scroll.borrow_mut();
+        if scroll.text != feedback || !scrolls {
+            *scroll = StatusScroll {
+                text: feedback.to_string(),
+                ..StatusScroll::default()
+            };
+        }
+    }
     if lines.len() <= 1 {
         return UiNode::new(
             key,
@@ -15118,38 +15485,125 @@ fn status_words_node(key: &str, feedback: &str, width: f32, most: usize) -> UiNo
         .layout(Layout::default().width(Length::Fill).height(Length::Fill))
         .paint_only();
     }
-    let line_height = status_line_height();
-    UiNode::new(
+    let count = lines.len();
+    let line_nodes = lines
+        .into_iter()
+        .enumerate()
+        .map(|(index, text)| {
+            UiNode::new(
+                format!("{key}/line-{index}"),
+                UiContent::Text(TextSpec {
+                    text,
+                    role: SemanticRole::Status,
+                    style: StyleRef::Plain,
+                }),
+            )
+            .layout(
+                Layout::default()
+                    .width(Length::Fill)
+                    .height(Length::Fixed(line_height)),
+            )
+            .paint_only()
+        })
+        .collect();
+    let column = UiNode::new(
         key,
+        UiContent::Group(GroupSpec::unlabeled(SemanticRole::Group)),
+    );
+    if !boxed {
+        return column
+            .layout(
+                Layout::column()
+                    .width(Length::Fill)
+                    .height(Length::Fixed(count as f32 * line_height)),
+            )
+            .children(line_nodes)
+            .paint_only();
+    }
+    // Whole lines scrolled, so no edge slices one.
+    let shown = most.min(count) as f32 * line_height;
+    let content = count as f32 * line_height;
+    let offset = if scrolls {
+        let mut scroll = state.status_scroll.borrow_mut();
+        scroll.limit = content - shown;
+        scroll.line = line_height;
+        scroll.offset =
+            ((scroll.offset / line_height).round() * line_height).clamp(0.0, scroll.limit);
+        scroll.offset
+    } else {
+        0.0
+    };
+    let list = column
+        .layout(
+            Layout::column()
+                .width(Length::Fill)
+                .height(Length::Fixed(shown))
+                .scrolled(offset)
+                .clipped(),
+        )
+        .room(shown, false)
+        .children(line_nodes);
+    // Where the words are: a thumb down the box's end, in points.
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "points of a status a few lines tall, rounded"
+    )]
+    let share = format!(
+        "{},{},{}",
+        offset.round() as u32,
+        shown.round() as u32,
+        content.round() as u32
+    );
+    let thumb = UiNode::new(
+        format!("{key}/thumb"),
+        UiContent::Custom(crate::native_ui::AuditedCustomNode {
+            audit_id: crate::native_ui::MESSAGES_SCROLL_AUDIT,
+            role: SemanticRole::Group,
+            label: String::new(),
+            value: Some(share),
+            action: None,
+            focusable: false,
+            focused: false,
+            focus_visible: false,
+        }),
+    )
+    .layout(
+        Layout::default()
+            .width(Length::Fill)
+            .height(Length::Fixed(shown)),
+    )
+    .paint_only();
+    // The keyboard's stop on the words, over their box: it says them whole,
+    // and draws only the ring the keyboard on it wears.
+    let stop = UiNode::new(
+        words_key,
+        UiContent::Custom(crate::native_ui::AuditedCustomNode {
+            audit_id: crate::native_ui::MESSAGES_SCROLL_AUDIT,
+            role: SemanticRole::Status,
+            label: feedback.to_string(),
+            value: None,
+            action: None,
+            focusable: true,
+            focused: false,
+            focus_visible: false,
+        }),
+    )
+    .layout(
+        Layout::default()
+            .width(Length::Fill)
+            .height(Length::Fixed(shown)),
+    );
+    UiNode::new(
+        format!("{key}/scroll"),
         UiContent::Group(GroupSpec::unlabeled(SemanticRole::Group)),
     )
     .layout(
-        Layout::column()
+        Layout::default()
             .width(Length::Fill)
-            .height(Length::Fixed(lines.len() as f32 * line_height)),
+            .height(Length::Fixed(shown)),
     )
-    .children(
-        lines
-            .into_iter()
-            .enumerate()
-            .map(|(index, text)| {
-                UiNode::new(
-                    format!("{key}/line-{index}"),
-                    UiContent::Text(TextSpec {
-                        text,
-                        role: SemanticRole::Status,
-                        style: StyleRef::Plain,
-                    }),
-                )
-                .layout(
-                    Layout::default()
-                        .width(Length::Fill)
-                        .height(Length::Fixed(line_height)),
-                )
-                .paint_only()
-            })
-            .collect(),
-    )
+    .children(vec![list, thumb, stop])
     .paint_only()
 }
 
@@ -15226,12 +15680,16 @@ const DOCK_WORDS_MIN: f32 = 40.0;
 /// How a status lays out docked in the compact toolbar ([`compact_dock_layout`]).
 struct CompactDockLayout {
     dock_width: f32,
-    /// The reload warning's share beside the status.
+    /// The reload warning's share beside the status, which chooses its words
+    /// ([`compact_watch_status`]).
+    watcher_share: f32,
+    /// How wide the reload warning stands beside the status: its share, or
+    /// the width its words need where they need less.
     watcher_width: f32,
     /// The words' width, in the actions' row or over them.
     words_width: f32,
-    /// The actions' width beside the words; the dock's where they go under
-    /// the words.
+    /// The actions' width beside the words; the toolbar's where they go
+    /// under the words.
     actions_width: f32,
     /// The Search button's width and the gap before it, where it is drawn.
     search_width: f32,
@@ -15260,8 +15718,22 @@ fn compact_dock_layout(
     let (_, leading) = compact_toolbar_leading(state, viewport, true);
     let dock_width = (viewport.width - 20.0 - leading - 8.0).max(0.0);
     let scale = settings_text_scale();
-    let watcher_width = if watcher {
+    let watcher_share = if watcher {
         (80.0 * scale.min(1.25)).min(dock_width * 0.42)
+    } else {
+        0.0
+    };
+    // THE RELOAD WARNING TAKES WHAT ITS WORDS NEED, never more than its
+    // share: the rest is the status's. Held to its share whatever it said,
+    // "Reload" left a draft's "1 unsaved draft" 99pt at 2× text in a
+    // 286pt window, three lines that grew the toolbar over an open picker's
+    // choices.
+    let watcher_width = if watcher {
+        watcher_share.min(
+            compact_watch_words(state, watcher_share).map_or(watcher_share, |words| {
+                status_words_width(&words).ceil() + 1.0
+            }),
+        )
     } else {
         0.0
     };
@@ -15287,16 +15759,23 @@ fn compact_dock_layout(
             BarFit::Shared | BarFit::Stacked => None,
         },
     };
+    // ACTIONS UNDER THE WORDS TAKE THE TOOLBAR'S WIDTH, under its leading
+    // button too ([`compact_toolbar`]): held to the dock's column beside
+    // that button, a 22-column window at 2× text broke "Re-" / "view" and
+    // "Dis-" / "card" over two lines each and grew the toolbar to 322pt of
+    // the window's 348.
+    let toolbar_width = (viewport.width - 20.0).max(0.0);
     let Some(actions_width) = inline_actions else {
         let under = match actions {
-            DockActions::Buttons(buttons) => bar_actions_height(buttons, dock_width),
+            DockActions::Buttons(buttons) => bar_actions_height(buttons, toolbar_width),
             DockActions::Undo | DockActions::None => scaled_control_height(),
         };
         return CompactDockLayout {
             dock_width,
+            watcher_share,
             watcher_width,
             words_width: room,
-            actions_width: dock_width,
+            actions_width: toolbar_width,
             search_width: 0.0,
             under: Some(under),
         };
@@ -15322,6 +15801,7 @@ fn compact_dock_layout(
     };
     CompactDockLayout {
         dock_width,
+        watcher_share,
         watcher_width,
         words_width,
         actions_width,
@@ -15682,21 +16162,43 @@ fn compact_header_height(state: &SettingsViewState, viewport: LogicalRect) -> f3
     }
 }
 
-/// How tall a docked plain status's words are on the lines a words box
+/// How tall a docked status's words are on the lines a words box
 /// `words_width` wide sets them on (inside the status's 10pt inset,
-/// [`status_word_lines`]); nothing for any other status, which the dock
-/// sets on its one line (the draft bar's short words) or which takes the
-/// page where that would cut it (the Reset All question).
+/// [`status_word_lines`]): a plain status's, and the unsaved-draft bar's
+/// short words ("1 unsaved draft", which a 164pt window at 1× text cut to
+/// "1 unsaved…" and at 2× to "1…"); nothing for the Reset All question,
+/// which takes the page where one line would cut it
+/// ([`reset_all_question_takes_page`]).
 fn dock_words_height(state: &SettingsViewState, words_width: f32) -> f32 {
-    let Some(feedback) = state.bar_feedback().filter(|_| state.plain_status()) else {
+    let words = if state.has_unsaved_field_drafts() {
+        DraftBar::of(state).short
+    } else if let Some(feedback) = state.bar_feedback().filter(|_| state.plain_status()) {
+        feedback.clone()
+    } else {
         return 0.0;
     };
-    let lines = status_word_lines(feedback, (words_width - 10.0).max(0.0)).len();
+    let lines = status_word_lines(&words, (words_width - 10.0).max(0.0)).len();
     if lines <= 1 {
         0.0
     } else {
-        lines as f32 * status_line_height()
+        lines as f32 * dock_line_height()
     }
+}
+
+/// How far apart the compact toolbar's dock sets a plain status's lines:
+/// the bar's own spacing, or as close as lets two of them stand in the
+/// toolbar's row, never closer than the words' own height. Set at the bar's
+/// 22pt, two lines took 44pt of the row's 36 at 1× text, and a status one
+/// line too long for the row stood under the page instead, taking its room
+/// from the list's bottom — the switch just pressed there went up from
+/// under the pointer (Software Update at 80x26: 23pt, "Install updates
+/// automatically turned on · This copy can't update; the setting is saved"
+/// 1pt too wide for one line).
+fn dock_line_height() -> f32 {
+    let (px, _) = crate::native_ui::text_paint_metrics(SemanticRole::Status, StyleRef::Plain);
+    status_line_height()
+        .min((compact_toolbar_height() - 16.0) / 2.0)
+        .max((px * 1.3).ceil())
 }
 
 struct CompactFeedbackParts {
@@ -15729,21 +16231,17 @@ fn compact_feedback_parts(
                     ..Insets::default()
                 }),
         )
-        .children(vec![
-            UiNode::new(
-                format!("{key}/visual"),
-                UiContent::Text(TextSpec {
-                    text: crate::native_ui::fit_native_status_label(
-                        &preferred,
-                        (visual_width - 10.0).max(0.0),
-                    ),
-                    role: SemanticRole::Status,
-                    style: StyleRef::Plain,
-                }),
-            )
-            .layout(Layout::default().width(Length::Fill).height(Length::Fill))
-            .paint_only(),
-        ])
+        // Its words whole on the lines they take at the dock's spacing
+        // ([`dock_line_height`]), the toolbar grown for them
+        // ([`dock_words_height`]).
+        .children(vec![status_words_node_at(
+            state,
+            &format!("{key}/visual"),
+            &preferred,
+            (visual_width - 10.0).max(0.0),
+            usize::MAX,
+            dock_line_height(),
+        )])
     };
 
     if state.has_unsaved_field_drafts() {
@@ -15805,8 +16303,9 @@ fn compact_feedback_parts(
             .layout(Layout::default().width(Length::Fill).height(Length::Fill)),
         ])
     });
-    // Its words whole, on the lines they take, the toolbar grown for them
-    // ([`compact_header_height`]).
+    // Its words whole, on the lines they take at the dock's spacing
+    // ([`dock_line_height`]), the toolbar grown for them where they take
+    // more than its row ([`compact_header_height`]).
     let status = UiNode::new(
         "settings/status",
         UiContent::Group(GroupSpec {
@@ -15824,11 +16323,13 @@ fn compact_feedback_parts(
                 ..Insets::default()
             }),
     )
-    .children(vec![status_words_node(
+    .children(vec![status_words_node_at(
+        state,
         "settings/status/visual",
         feedback,
         (visual_width - 10.0).max(0.0),
         usize::MAX,
+        dock_line_height(),
     )]);
     Some(CompactFeedbackParts {
         status,
@@ -15871,17 +16372,23 @@ fn undo_button_label(state: &SettingsViewState) -> &'static str {
     }
 }
 
-fn compact_watch_status(state: &SettingsViewState, visual_width: f32) -> Option<UiNode> {
+/// The words the reload warning says docked in a share `visual_width`
+/// wide: where the dock gives it room, what is wrong, as the bar it stands
+/// in for does, elided at the dock's edge.
+fn compact_watch_words(state: &SettingsViewState, visual_width: f32) -> Option<String> {
     let status = state.config_watch_status.as_ref()?;
-    // Where the dock gives it room, the warning says what is wrong, as the
-    // bar it stands in for does, elided at the dock's edge.
-    let preferred = if visual_width < 110.0 {
+    Some(if visual_width < 110.0 {
         "Reload".to_string()
     } else if visual_width < 220.0 {
         "Reload warning".to_string()
     } else {
         format!("Reload warning: {status}")
-    };
+    })
+}
+
+fn compact_watch_status(state: &SettingsViewState, visual_width: f32) -> Option<UiNode> {
+    let status = state.config_watch_status.as_ref()?;
+    let preferred = compact_watch_words(state, visual_width)?;
     Some(
         UiNode::new(
             "settings/config-watch-status",
@@ -15919,7 +16426,18 @@ fn compact_watch_status(state: &SettingsViewState, visual_width: f32) -> Option<
     )
 }
 
-fn compact_status_dock(state: &SettingsViewState, viewport: LogicalRect) -> Option<UiNode> {
+/// The compact toolbar's dock ([`compact_toolbar`]), and the actions it
+/// lays under its words, where it does, for the toolbar to set across its
+/// whole width.
+struct CompactStatusDock {
+    dock: UiNode,
+    under: Option<UiNode>,
+}
+
+fn compact_status_dock(
+    state: &SettingsViewState,
+    viewport: LogicalRect,
+) -> Option<CompactStatusDock> {
     let feedback_present = state.has_unsaved_field_drafts()
         || state.reset_all_confirmation
         || state.bar_feedback().is_some();
@@ -15937,14 +16455,15 @@ fn compact_status_dock(state: &SettingsViewState, viewport: LogicalRect) -> Opti
         state.plain_status(),
         dock_plain_words(state),
     );
-    let watcher_width = if both {
-        layout.watcher_width
+    let (watcher_share, watcher_width) = if both {
+        (layout.watcher_share, layout.watcher_width)
     } else {
-        layout.dock_width
+        (layout.dock_width, layout.dock_width)
     };
-    let watcher = compact_watch_status(state, watcher_width);
+    let watcher = compact_watch_status(state, watcher_share);
     let parts = compact_feedback_parts(state, layout.words_width, layout.actions_width);
 
+    let mut under_actions = None;
     let content = match parts {
         None => watcher.expect("watcher-only dock"),
         Some(mut parts) => {
@@ -15969,12 +16488,13 @@ fn compact_status_dock(state: &SettingsViewState, viewport: LogicalRect) -> Opti
             // A control's row, or the lines a plain status's words take.
             let row = scaled_control_height().max(dock_words_height(state, layout.words_width));
             let layout_kind = if let Some(under) = layout.under {
-                // The actions go under the words, the toolbar grown for them.
+                // The actions go under the words, across the toolbar's whole
+                // width ([`compact_toolbar`]), the toolbar grown for them.
                 children[0].layout.height = Length::Fixed(row);
                 if let Some(mut actions) = parts.actions.take() {
                     actions.layout.width = Length::Fill;
                     actions.layout.height = Length::Fixed(under);
-                    children.push(actions);
+                    under_actions = Some(actions);
                 }
                 Layout::column()
             } else {
@@ -16007,14 +16527,15 @@ fn compact_status_dock(state: &SettingsViewState, viewport: LogicalRect) -> Opti
         }
     };
 
-    Some(
-        UiNode::new(
+    Some(CompactStatusDock {
+        dock: UiNode::new(
             "settings/status-dock",
             UiContent::Group(GroupSpec::new("Settings alerts and status")),
         )
         .layout(Layout::default().width(Length::Fill).height(Length::Fill))
         .children(vec![content]),
-    )
+        under: under_actions,
+    })
 }
 
 /// A rail destination's control, wearing the Packages attention badge
@@ -18514,6 +19035,24 @@ fn choice_picker_node(
     Some(choice_picker_card(state, picker, field, fit).0)
 }
 
+/// The square tile a compact landscape choice page shows its live preview
+/// in, beside the choices.
+const COMPACT_LANDSCAPE_PREVIEW: f32 = 96.0;
+
+/// The width a preview pinned in the page's own column is laid out at: the
+/// page's content measure for the layout it is shown in.
+fn page_preview_width(
+    state: &SettingsViewState,
+    width: SettingsWidth,
+    viewport: LogicalRect,
+) -> f32 {
+    settings_page_content_width(
+        viewport.width,
+        width,
+        PageLayout::shown(state).maximum(width),
+    )
+}
+
 /// Landscape compact picker: the live renderer specimen and the picker share
 /// the page side by side, the picker taking the page's whole height.
 fn compact_landscape_choice_page(
@@ -18525,7 +19064,11 @@ fn compact_landscape_choice_page(
     let picker = state.choice_picker.as_ref()?;
     let field = state.field_by_key(&picker.key)?;
     let page_width = settings_page_content_width(viewport_width, SettingsWidth::Compact, 720.0);
-    let preview_width = if preview.is_some() { 96.0 + 8.0 } else { 0.0 };
+    let preview_width = if preview.is_some() {
+        COMPACT_LANDSCAPE_PREVIEW + 8.0
+    } else {
+        0.0
+    };
     let height = budget.content_height.max(0.0);
     // The card keeps a little air inside its edge wherever the header and one
     // row of choices still fit with it.
@@ -18550,8 +19093,8 @@ fn compact_landscape_choice_page(
     picker_node.layout.width = Length::Fill;
     let mut children = Vec::new();
     if let Some(preview) = preview.as_mut() {
-        preview.layout.width = Length::Fixed(96.0);
-        preview.layout.height = Length::Fixed(96.0_f32.min(height));
+        preview.layout.width = Length::Fixed(COMPACT_LANDSCAPE_PREVIEW);
+        preview.layout.height = Length::Fixed(COMPACT_LANDSCAPE_PREVIEW.min(height));
     }
     children.extend(preview);
     children.push(picker_node);
@@ -18754,6 +19297,7 @@ fn theme_filter_node(
                         visual_value: None,
                         input: Some(extras.filter.projection()),
                         swatch: None,
+                        swatch_line: false,
                         trailing_hint: None,
                         description: None,
                         end_button: false,
@@ -20487,7 +21031,9 @@ fn top_preview(
     semantic_key: &str,
     height: f32,
     cx: &ViewCx<'_>,
+    preview_width: f32,
 ) -> Option<UiNode> {
+    // Measured at the width it is laid out at ([`renderer_preview`]).
     let spec = renderer_preview_spec_for_key_with_font(
         state,
         key,
@@ -20496,15 +21042,11 @@ fn top_preview(
         cx.terminal_font_px,
         cx.terminal_scale,
         cx.semantic_font.as_ref(),
-    )?;
-    let focused = state
-        .common
-        .last_focus
-        .as_ref()
-        .is_some_and(|focus| focus.as_str() == semantic_key);
+    )?
+    .with_measure_width(preview_width);
     Some(crate::settings_preview::preview_node(
         semantic_key,
-        spec.with_focus_ring(focused),
+        spec,
         height,
     ))
 }
@@ -20578,8 +21120,9 @@ fn top_preview_at(
     semantic_key: &str,
     height: f32,
     cx: &ViewCx<'_>,
+    preview_width: f32,
 ) -> Option<(UiNode, f32)> {
-    top_preview(state, key, semantic_key, height, cx).map(|mut node| {
+    top_preview(state, key, semantic_key, height, cx, preview_width).map(|mut node| {
         let height = match &node.content {
             UiContent::SettingsPreview(spec) => spec.whole_rows_at_most(height),
             _ => height,
@@ -20615,7 +21158,7 @@ fn top_cards(
         top_card_row(state, key, projected, width, text_width, true)
     };
     let preview = |key: &str, semantic_key: &str, height: f32| {
-        top_preview_at(state, key, semantic_key, height, cx)
+        top_preview_at(state, key, semantic_key, height, cx, text_width)
     };
     let compact = width == SettingsWidth::Compact;
 
@@ -20879,11 +21422,11 @@ fn top_card_row(
             wrap_segments(&mut row, key, text_width);
         }
         seat_stacked_reset(&mut row, &name, text_width);
-        // Its choice keeps its words, as a page's stacked row's does
-        // ([`fit_row_choice_label`]): "Automatic (SF Mono)" read "Auto…" and
-        // the theme "Def…" at 2× text on a phone-width card.
-        fit_row_choice_label(&mut row, text_width);
     }
+    // Its choice keeps its words, as a page's row's does
+    // ([`fit_row_button_words`]): "Automatic (SF Mono)" read "Auto…" and
+    // the theme "Def…" at 2× text on a phone-width card.
+    fit_row_button_words(&mut row, &name, text_width, stacked);
     let room = row_label_room(&row, stacked, text_width);
     let placement = lay_out_row_label(&mut row, &name, &tags, &worst, room, stacked, false);
     if direct {
@@ -21613,6 +22156,7 @@ fn cursor_styles_page(
         cx.semantic_font.as_ref(),
         width,
         steady_room,
+        page_preview_width(state, width, cx.viewport),
     );
     let natural = preview.as_ref().map_or(0.0, fixed_height);
     let floor = match preview.as_ref().map(|preview| &preview.content) {
@@ -22778,6 +23322,7 @@ fn wallpaper_page(state: &SettingsViewState, width: SettingsWidth, cx: &ViewCx<'
         cx,
         width,
         room - 2.0 * SETTINGS_GROUP_CARD_INSET - visual_height - 8.0,
+        text_width,
     ));
     // Why the file did not load, on its own line, wrapped so the reason is
     // never cut off.
@@ -22891,7 +23436,16 @@ fn top_settings_page(
             .map(|picker| picker.key.as_str());
         let preview = key.and_then(|key| {
             top_picker_previews(key)
-                .then(|| top_preview(state, key, "settings/top/choice-preview", 96.0, cx))
+                .then(|| {
+                    top_preview(
+                        state,
+                        key,
+                        "settings/top/choice-preview",
+                        96.0,
+                        cx,
+                        COMPACT_LANDSCAPE_PREVIEW,
+                    )
+                })
                 .flatten()
         });
         if let Some(mut page) = compact_landscape_choice_page(
@@ -22949,9 +23503,14 @@ fn top_settings_page(
                 - gap
                 - choice_picker_floor(themed, width);
             let natural = renderer_preview_height(width).min(132.0);
-            if let Some(mut preview) =
-                top_preview(state, key, "settings/top/choice-preview", natural, cx)
-            {
+            if let Some(mut preview) = top_preview(
+                state,
+                key,
+                "settings/top/choice-preview",
+                natural,
+                cx,
+                page_preview_width(state, width, cx.viewport),
+            ) {
                 let least = match &preview.content {
                     UiContent::SettingsPreview(spec) => spec.minimum_height(48.0),
                     _ => 48.0,
@@ -23106,9 +23665,11 @@ fn top_settings_grid(
     // specimen's last row is its card's foot, never part of a row of empty
     // terminal.
     let spec_of = |key: &str, semantic: &str| {
-        top_preview(state, key, semantic, natural, cx).and_then(|node| match node.content {
-            UiContent::SettingsPreview(spec) => Some(*spec),
-            _ => None,
+        top_preview(state, key, semantic, natural, cx, text_width).and_then(|node| {
+            match node.content {
+                UiContent::SettingsPreview(spec) => Some(*spec),
+                _ => None,
+            }
         })
     };
     let theme_spec = spec_of(prefs::EDIT_THEME, "settings/top/theme/preview");
@@ -23236,6 +23797,7 @@ fn top_text_band(
         "settings/top/text/preview",
         rows_height,
         cx,
+        half,
     )?;
     let body_height = rows_height.max(specimen_height);
     let card = top_split_card(
@@ -23322,14 +23884,15 @@ fn rainbow_banner_fits(width: SettingsWidth, cx: &ViewCx<'_>) -> bool {
 /// The Top Settings hero banner: a pastel rainbow arch cresting through star
 /// glints in a mint sky. Pure static decoration through the audited
 /// custom-node lowering ([`RAINBOW_BANNER_AUDIT`]) — no action, no focus, no
-/// animation frames requested; the semantic label names the scenery.
+/// animation frames requested, and nothing to say: it is paint only, so a
+/// screen reader never reads the scenery out as page content.
 fn rainbow_banner_node() -> UiNode {
     UiNode::new(
         "settings/top/rainbow",
         UiContent::Custom(AuditedCustomNode {
             audit_id: RAINBOW_BANNER_AUDIT,
             role: SemanticRole::Text,
-            label: "A rainbow arcs over the settings".to_string(),
+            label: String::new(),
             value: None,
             action: None,
             focusable: false,
@@ -23342,6 +23905,7 @@ fn rainbow_banner_node() -> UiNode {
             .width(Length::Fill)
             .height(Length::Fixed(RAINBOW_BANNER_HEIGHT)),
     )
+    .paint_only()
 }
 
 /// What the platform's file viewer is called.
@@ -24020,7 +24584,7 @@ fn page_drawn_control(key: &str, query: &str) -> Option<(SettingsRoute, String)>
 /// words or by a control it draws itself, whichever matches better (a tie goes
 /// to the page's own name). A result that names a control opens its page on
 /// that control.
-fn search_page_hits(state: &SettingsViewState, query: &str) -> Vec<PageHit> {
+fn search_page_hits(state: &SettingsViewState, query: SearchQuery<'_>) -> Vec<PageHit> {
     if query.is_empty() {
         return Vec::new();
     }
@@ -24032,7 +24596,8 @@ fn search_page_hits(state: &SettingsViewState, query: &str) -> Vec<PageHit> {
         if let Some(score) = crate::native_config_language::query_match_rank(
             std::iter::once(scratch.as_str()),
             route_keywords(route).iter().copied(),
-            query,
+            query.text,
+            query.reach,
         ) {
             hits.push(PageHit {
                 route,
@@ -24043,7 +24608,7 @@ fn search_page_hits(state: &SettingsViewState, query: &str) -> Vec<PageHit> {
         }
     }
     for field in &state.legacy.fields {
-        let Some((route, focus)) = page_drawn_control(field.key, query) else {
+        let Some((route, focus)) = page_drawn_control(field.key, query.text) else {
             continue;
         };
         let Some(score) = field_match_score_in(field, query, &mut scratch, &state.assets.themes)
@@ -24083,7 +24648,8 @@ fn search_page_hits(state: &SettingsViewState, query: &str) -> Vec<PageHit> {
             .map(|(alias, _)| *alias);
         let words = [scratch.as_str(), row.name].into_iter().chain(aliases);
         let Some(score) =
-            crate::native_config_language::query_match_score(words, query).map(SearchRank::own)
+            crate::native_config_language::query_match_score(words, query.text, query.reach)
+                .map(SearchRank::own)
         else {
             continue;
         };
@@ -24572,6 +25138,36 @@ thread_local! {
     /// While a compact page is built whose list cannot hold a stacked row:
     /// how tall that list is ([`large_text_rows_stack`], [`settings_tree`]).
     static ROWS_TOO_TALL_TO_STACK: Cell<Option<f32>> = const { Cell::new(None) };
+    /// While a page is built: the room its list has under its heading
+    /// ([`settings_tree`]), which a field's words on lines may take
+    /// ([`field_lines_most`]).
+    static FIELD_LIST_ROOM: Cell<Option<f32>> = const { Cell::new(None) };
+}
+
+/// [`FIELD_LIST_ROOM`] for one render, put back when it ends.
+struct FieldListRoom(Option<f32>);
+
+impl FieldListRoom {
+    fn set(room: Option<f32>) -> Self {
+        Self(FIELD_LIST_ROOM.with(|cell| cell.replace(room)))
+    }
+}
+
+impl Drop for FieldListRoom {
+    fn drop(&mut self) {
+        FIELD_LIST_ROOM.with(|cell| cell.set(self.0));
+    }
+}
+
+/// The most lines a field's words may take and the field still stand whole
+/// on a screen of its page's list ([`FIELD_LIST_ROOM`]): its one-line band
+/// and a line more for each; no bound outside a page's render.
+fn field_lines_most() -> usize {
+    let line = crate::native_ui::native_button_line_height();
+    let band = scaled_control_height();
+    FIELD_LIST_ROOM.with(Cell::get).map_or(usize::MAX, |room| {
+        ((room - band) / line).floor().max(0.0) as usize + 1
+    })
 }
 
 /// [`ROWS_TOO_TALL_TO_STACK`].
@@ -24614,14 +25210,15 @@ fn settings_fields_page(
     width: SettingsWidth,
     packages: &PackagesProjection,
 ) -> Vec<UiNode> {
-    let query = state.search.trim().to_ascii_lowercase();
+    let text = folded_search(state);
+    let query = SearchQuery::of(state, &text);
     let global_search = !query.is_empty();
     let manual_keys = if global_search {
-        manual_search_matching_keys(state, &query)
+        manual_search_matching_keys(state, query)
     } else {
         Vec::new()
     };
-    let page_hits = search_page_hits(state, &query);
+    let page_hits = search_page_hits(state, query);
     let manual_overrides = if modified_only && !global_search {
         authored_manual_overrides(state)
     } else {
@@ -24716,7 +25313,6 @@ fn settings_fields_page(
     } else {
         state.route.label()
     };
-    let subtitle = settings_fields_subtitle(state.route, global_search, modified_only);
     let mut scratch = String::new();
     let mut fields: Vec<(SearchRank, usize, &EditField)> = state
         .legacy
@@ -24748,20 +25344,58 @@ fn settings_fields_page(
                 && state.route == SettingsRoute::TextFonts)
         })
         .filter_map(|(index, field)| {
-            field_match_score_in(field, &query, &mut scratch, &state.assets.themes)
+            field_match_score_in(field, query, &mut scratch, &state.assets.themes)
                 .map(|score| (score, index, field))
         })
         .collect();
     // `sort_by_cached_key` builds each (not cheap) key once; with the
     // trailing `*index` tiebreaker the order is that of a stable sort.
-    fields.sort_by_cached_key(|(score, index, field)| {
-        (
-            *score,
-            prefs::section_of(field.key).order_index(),
-            prefs::group_of(field.key).1,
-            *index,
-        )
-    });
+    if global_search {
+        // A SEARCH'S RESULT GROUP IS ONE CARD: the groups in the order of
+        // their best rows, and in each its rows by their own ranks. Rows
+        // ranked across groups alone dealt one group out over several cards
+        // wherever another group's row ranked between two of its own ("code"
+        // drew Harness supervision twice, a Packages card between).
+        let group_of_row = |field: &EditField| {
+            let (name, order) = prefs::group_of(field.key);
+            (
+                prefs::section_of(field.key).order_index(),
+                order,
+                name,
+                settings_location(field.key),
+            )
+        };
+        let mut best = BTreeMap::new();
+        for (score, _, field) in &fields {
+            best.entry(group_of_row(field))
+                .and_modify(|best: &mut SearchRank| *best = (*best).min(*score))
+                .or_insert(*score);
+        }
+        fields.sort_by_cached_key(|(score, index, field)| {
+            let group = group_of_row(field);
+            (best[&group], group, *score, *index)
+        });
+    } else {
+        fields.sort_by_cached_key(|(score, index, field)| {
+            (
+                *score,
+                prefs::section_of(field.key).order_index(),
+                prefs::group_of(field.key).1,
+                *index,
+            )
+        });
+    }
+    // A search nothing starts a word with lists what holds it otherwise
+    // ([`MatchReach::Loose`]), and says so over the list: why in the
+    // subtitle, and that they are partial matches in the count, which every
+    // size draws.
+    let loose = query.reach == MatchReach::Loose
+        && !(fields.is_empty() && page_hits.is_empty() && manual_keys.is_empty());
+    let subtitle: std::borrow::Cow<'static, str> = if global_search && loose {
+        loose_search_subtitle(state.search.trim()).into()
+    } else {
+        settings_fields_subtitle(state.route, global_search, modified_only).into()
+    };
 
     if let Some(budget) = compact_budget
         && landscape
@@ -24777,6 +25411,7 @@ fn settings_fields_page(
                 cx.semantic_font.as_ref(),
                 SettingsWidth::Compact,
                 budget.content_height,
+                COMPACT_LANDSCAPE_PREVIEW,
             )
         });
         if let Some(page) =
@@ -24788,7 +25423,7 @@ fn settings_fields_page(
 
     let gap = settings_page_gap(state, width, cx.viewport);
     let body = settings_list_body_height(state, width, cx.viewport);
-    let (mut out, mut used) = pinned_heading(state, width, cx.viewport, gap, title, subtitle);
+    let (mut out, mut used) = pinned_heading(state, width, cx.viewport, gap, title, &subtitle);
     let preview_for = |maximum: f32| {
         show_renderer_preview_now
             .then(|| {
@@ -24801,6 +25436,7 @@ fn settings_fields_page(
                     cx.semantic_font.as_ref(),
                     width,
                     maximum,
+                    page_preview_width(state, width, cx.viewport),
                 )
             })
             .flatten()
@@ -24853,7 +25489,7 @@ fn settings_fields_page(
     let summary_text = if modified_only {
         Some(modified_count_summary(fields.len(), manual_overrides.len()))
     } else if global_search {
-        settings_count_summary(fields.len(), page_hits.len(), manual_keys.len())
+        search_count_summary(loose, fields.len(), page_hits.len(), manual_keys.len())
     } else {
         None
     };
@@ -25055,8 +25691,8 @@ fn settings_fields_page(
         {
             cursor += 1;
         }
-        // Relevance is the primary global-search sort key, so one semantic
-        // group can appear in several runs; each anchors on its first key.
+        // A search lists each group as one run (its rows sorted together,
+        // where its best row ranks); a run anchors on its first key.
         let anchor = key_fragment(fields[start].2.key);
         // Each row draws its own note; one several rows share, after the
         // last of them.
@@ -25343,6 +25979,7 @@ fn settings_fields_page(
             for (node, height) in finished.shared_note_stops(Some(footnote_room - head - 4.0)) {
                 plan.row(id, height + 4.0, Vec::new());
                 plan.set_ids(vec![node.key.clone()]);
+                plan.set_note(true);
                 stops.push(FieldStop::Under(Box::new(node)));
             }
             // The This Mac status is the stop after its row, Apply Now in it.
@@ -25752,20 +26389,24 @@ fn settings_empty_node(searching: bool, modified_only: bool, width: f32) -> Opti
     Some(node)
 }
 
-/// How many pages and settings a search lists. Keys only aterm.toml holds
-/// are the aterm.toml card's to name, so they are counted only where nothing
-/// else matched; a search that found nothing at all has no
-/// count, since the empty card says so.
+/// THE COUNT OF A SELECTION — a search's results, or Modified's — names
+/// every group of results the page draws, in the order it draws them: the
+/// pages, the settings, then the keys only aterm.toml holds (the caption
+/// that card and Modified's group carry), each where it holds any, joined
+/// by " · ". `None` where none holds any: a search that found nothing says
+/// so in its empty card. (The aterm.toml keys were counted only where
+/// nothing else matched, so "font" read "1 page · 12 settings" over a card
+/// of six keys no number named.)
 fn settings_count_summary(native_total: usize, pages: usize, toml_keys: usize) -> Option<String> {
-    let settings =
-        (native_total > 0).then(|| counted_value_label("setting", "settings", native_total));
-    let pages = (pages > 0).then(|| counted_value_label("page", "pages", pages));
-    match (pages, settings) {
-        (None, None) => (toml_keys > 0)
-            .then(|| counted_value_label("key in aterm.toml", "keys in aterm.toml", toml_keys)),
-        (Some(one), None) | (None, Some(one)) => Some(one),
-        (Some(pages), Some(settings)) => Some(format!("{pages} · {settings}")),
-    }
+    let parts: Vec<String> = [
+        (pages > 0).then(|| counted_value_label("page", "pages", pages)),
+        (native_total > 0).then(|| counted_value_label("setting", "settings", native_total)),
+        (toml_keys > 0).then(|| format!("{toml_keys} only in aterm.toml")),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    (!parts.is_empty()).then(|| parts.join(" · "))
 }
 
 /// A card of a settings list: row by row where it is a column of fixed rows
@@ -25814,6 +26455,8 @@ fn push_field_card(
                         .collect(),
                 );
                 plan.set_control_rows(split.control_rows(rows.clone()));
+                plan.set_control_spans(split.control_spans(rows.clone()));
+                plan.set_note(split.notes_only(rows.clone()));
                 plan.set_ink(split.ink(rows.clone()));
                 plan.set_ink_top(split.ink_top(rows.clone()));
                 plan.set_first_controls(split.first_controls(rows.clone()));
@@ -25842,18 +26485,34 @@ fn push_field_card(
     }
 }
 
+/// A search's count ([`settings_count_summary`]), which says its results are
+/// partial matches where the search is `loose` ([`MatchReach::Loose`]): the
+/// count is drawn at every size, the subtitle that says why not on a
+/// compact page.
+fn search_count_summary(
+    loose: bool,
+    native_total: usize,
+    pages: usize,
+    toml_keys: usize,
+) -> Option<String> {
+    let count = settings_count_summary(native_total, pages, toml_keys)?;
+    Some(if loose {
+        format!("{PARTIAL_MATCHES_LEAD}{count}")
+    } else {
+        count
+    })
+}
+
+/// What a loose search's count says before its numbers
+/// ([`search_count_summary`]).
+const PARTIAL_MATCHES_LEAD: &str = "Partial matches: ";
+
 /// What Modified lists: its settings rows, then the keys only aterm.toml
-/// holds.
+/// holds, by the one count a selection has ([`settings_count_summary`]);
+/// "Nothing changed" where it lists neither.
 fn modified_count_summary(settings: usize, manual_only: usize) -> String {
-    match (settings, manual_only) {
-        (0, 0) => "Nothing changed".to_string(),
-        (0, keys) => format!("{keys} only in aterm.toml"),
-        (settings, 0) => counted_value_label("setting", "settings", settings),
-        (settings, keys) => format!(
-            "{} · {keys} only in aterm.toml",
-            counted_value_label("setting", "settings", settings)
-        ),
-    }
+    settings_count_summary(settings, 0, manual_only)
+        .unwrap_or_else(|| "Nothing changed".to_string())
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -26436,9 +27095,10 @@ fn top_effect_press_leaves_serious_mode(
 /// A TOP EFFECT SWITCH UNDER SERIOUS MODE SAYS WHAT ITS PRESS DOES: one that
 /// reads Off turns on and turns Serious Mode off ([`SettingsApp::commit_top_effect_edits`]),
 /// so its note says so, on every page it shows on and whatever aterm.toml
-/// saves for it; one that reads On (Modified, which lists what aterm.toml
-/// says) is saved but held back, and its press turns it off. `None` outside
-/// Serious Mode, or for a patch that writes the switch itself.
+/// saves for it ([`top_effect_serious_press_note`]); one that reads On
+/// (Modified, which lists what aterm.toml says) is saved but held back, and
+/// its press turns it off. `None` outside Serious Mode, or for a patch that
+/// writes the switch itself.
 fn top_effect_serious_note(
     state: &SettingsViewState,
     patch: Option<&ConfigPatch>,
@@ -26448,26 +27108,34 @@ fn top_effect_serious_note(
     if !serious_mode_active(state, patch, motion) || patch_edits_key(patch, key) {
         return None;
     }
-    let (holds, visual) = if key == prefs::EDIT_TRAIL_SOUNDS {
-        ("silences sound", "Off: Serious Mode silences sound")
-    } else {
-        (
-            "hides playful effects",
-            "Off: Serious Mode hides playful effects",
-        )
+    Some(top_effect_serious_press_note(state, patch, key, motion).unwrap_or_else(serious_mode_note))
+}
+
+/// What the press of a Top effect switch that reads Off under Serious Mode
+/// does besides turning it on: it turns Serious Mode off
+/// ([`top_effect_press_leaves_serious_mode`]). A `Constraint`, not a reason
+/// the switch idles, so a platform that cannot play it says this too
+/// ([`setting_effect_projection`]): Music effects' press leaves Serious Mode
+/// where nothing can sound as well. `None` for any other key or press.
+fn top_effect_serious_press_note(
+    state: &SettingsViewState,
+    patch: Option<&ConfigPatch>,
+    key: &str,
+    motion: crate::native_app::ViewMotionCx,
+) -> Option<EffectDisclosure> {
+    let holds = match key {
+        prefs::EDIT_TRAIL_SOUNDS => "silences sound",
+        SPARKLE_WORDS_KEY | KEYWORD_KITTIES_KEY => "hides playful effects",
+        _ => return None,
     };
-    Some(
-        if top_effect_press_leaves_serious_mode(state, patch, key, motion) {
-            EffectDisclosure::new(
-                EffectNoteKind::Constraint,
-                format!("Off while Serious Mode {holds}; turning this on turns Serious Mode off"),
-                "Serious Mode",
-                visual,
-            )
-        } else {
-            serious_mode_note()
-        },
-    )
+    top_effect_press_leaves_serious_mode(state, patch, key, motion).then(|| {
+        EffectDisclosure::new(
+            EffectNoteKind::Constraint,
+            format!("Off while Serious Mode {holds}; turning this on turns Serious Mode off"),
+            "Serious Mode",
+            format!("Off: Serious Mode {holds}"),
+        )
+    })
 }
 
 fn serious_mode_note() -> EffectDisclosure {
@@ -28334,9 +29002,13 @@ fn setting_effect_projection(
         } else {
             // One reason a setting does nothing: where it cannot take effect in
             // this copy at all, that it would also wait on another setting adds
-            // nothing ("No effect" already says it).
+            // nothing ("No effect" already says it). What its press does to
+            // another setting is no such reason, and is said still: Music
+            // effects' press turns Serious Mode off where nothing can sound
+            // too, and that note went with the reason.
             if let Some(note) = platform_unavailability(state, patch, key, availability) {
                 notes.push(note);
+                notes.extend(top_effect_serious_press_note(state, patch, key, motion));
             } else if let Some(note) = parent_or_motion_inactivity(state, patch, key, motion) {
                 notes.push(note);
             }
@@ -31377,6 +32049,16 @@ fn machine_status_node(
             text_width,
         )
     }];
+    // Rosetta 2's line, only when there is something to say (missing, or unread).
+    if let Some(rosetta) = machine.rosetta.as_deref().filter(|_| !machine.tool_missing) {
+        items.push(line(
+            "settings/machine/rosetta",
+            rosetta,
+            SemanticRole::Status,
+            StyleRef::Primary,
+            text_width,
+        ));
+    }
     let applying = packages.busy == Some(PackagesBusy::MachineApply);
     // Without the package tool nothing is read or applied: the one line says so.
     let live = !machine.tool_missing;
@@ -32210,11 +32892,22 @@ fn finished_setting_row_as(
     if stacked {
         seat_stacked_reset(&mut row, &name, text_width);
     }
+    fit_row_button_words(&mut row, &name, text_width, stacked);
+    let unset = matches!(
+        field.kind,
+        EditKind::Text | EditKind::Color | EditKind::Float | EditKind::Integer
+    )
+    .then(|| unset_field_words(state, field))
+    .flatten();
+    fit_row_field_placeholder(
+        &mut row,
+        (&name, text_width, stacked),
+        unset
+            .as_deref()
+            .map(|words| (words, field.kind == EditKind::Color)),
+        field.seed.as_deref(),
+    );
     let label_width = row_label_room(&row, stacked, text_width);
-    if stacked {
-        fit_row_choice_label(&mut row, text_width);
-    }
-    fit_row_field_placeholder(&mut row, text_width);
     FinishedRow {
         row,
         key: field.key,
@@ -32248,9 +32941,10 @@ fn switch_tail(width: SettingsWidth, text_width: f32) -> Option<f32> {
     if width != SettingsWidth::Compact || compact_row_inline(&EditKind::Bool, text_width, true) {
         return Some(12.0);
     }
-    // The stacked control band: its spacer, the switch and Reset's place.
+    // The stacked control band: its spacer, the switch at its least and
+    // Reset's place ([`seat_stacked_switch_reset`]).
     stacked_switch_line_holds(
-        switch_control_width(text_width),
+        switch_control_width(text_width).min(crate::native_ui::switch_least_width()),
         reset_slot_width(),
         text_width,
     )
@@ -32294,9 +32988,23 @@ fn seat_stacked_reset(row: &mut UiNode, name: &str, text_width: f32) {
         return;
     };
     let room = one_line_label_room(line, text_width);
-    // The pieces [`row_name_lines`] breaks between ([`line_pieces`]).
+    // RESET SITS WHERE IT COSTS THE ROW LEAST: at the end of the label line
+    // while the lines the name takes beside it, over those it takes alone,
+    // cost no more than a line of Reset's own; else on a line of its own.
+    // Measured with the place Reset keeps, so a row seats Reset in one
+    // place empty or changed. Kept on the label line wherever a word fit
+    // beside it, at 2× text in a 38-column window Reset's 108pt place left
+    // "Supervise Gemini CLI sessions" 124pt, four lines where the line
+    // alone holds it on two; "256-colour palette" broke at its hyphen.
+    // A word the room cannot hold whole ([`line_pieces`]) is a cost no line
+    // of Reset's own outweighs.
     if pieces_fit(name, room, &row_label_width) {
-        return;
+        let beside = row_name_lines(name, room).len();
+        let alone = row_name_lines(name, text_width).len();
+        let cost = beside.saturating_sub(alone) as f32 * row_detail_line_height();
+        if cost <= fixed_height(line) + row.layout.gap + 0.01 {
+            return;
+        }
     }
     let mut line = row.children.remove(0);
     let key = line
@@ -32369,8 +33077,25 @@ fn seat_stacked_switch_reset(row: &mut UiNode, text_width: f32) {
         .children
         .iter()
         .position(|child| is_reset_place(child.key.as_str()));
+    // Decided by the switch at its least ([`crate::native_ui::switch_least_width`]):
+    // a switch narrower than its natural width, its track and its On/Off
+    // whole, beside its Reset leaves the name the whole label line. Decided
+    // by its natural width, a 38-column window at 2× text sent Reset's place
+    // to the label line and set "Supervise Gemini CLI sessions" a word to a
+    // line beside it, four lines where the line alone holds it on two.
+    let least = crate::native_ui::switch_least_width();
+    let least_line = line_width(controls)
+        - controls
+            .children
+            .iter()
+            .filter(|child| matches!(child.content, UiContent::Switch(_)))
+            .map(|child| match child.layout.width {
+                Length::Fixed(width) => (width - least).max(0.0),
+                _ => 0.0,
+            })
+            .sum::<f32>();
     let moved = match reset_at {
-        Some(at) if line_width(controls) > text_width + 0.01 => Some(controls.children.remove(at)),
+        Some(at) if least_line > text_width + 0.01 => Some(controls.children.remove(at)),
         _ => None,
     };
     // The switch takes what the line leaves it, never more than its natural
@@ -34116,8 +34841,8 @@ fn row_shown_value(state: &SettingsViewState, field: &EditField, modified_only: 
 /// switch says On or Off; a choice its picker's words, or its segment's
 /// where the row draws segments; a slider its readout; a font row the face
 /// it draws; a text row the value its empty field stands for, never the
-/// input hint after " — ". Words that already name the default ("Default",
-/// "platform default") take no mark. `aterm ctl settings unset` answers it
+/// input hint after " — ". Words that already name the default ("Default")
+/// take no mark. `aterm ctl settings unset` answers it
 /// after "now", on the side of a light/dark theme pair `system_dark` shows,
 /// naming the automatic font from `font_families` (the list Settings' font
 /// pickers were last given) as the font row does. `None` for a key no row
@@ -34619,6 +35344,7 @@ fn setting_row_parts_in(
                         swatch,
                         // The draft is the field's: it says so in the field,
                         // so typing never adds a line to the row.
+                        swatch_line: false,
                         trailing_hint: has_draft.then(|| UNSAVED_HINT.to_string()),
                         description: (!setting_description.is_empty())
                             .then(|| setting_description.clone()),
@@ -34859,6 +35585,56 @@ fn field_placeholder(state: &SettingsViewState, field: &EditField) -> (String, O
     (field.placeholder.clone(), None)
 }
 
+/// A ROW'S BUTTON KEEPS ITS WORDS ON EVERY FORM OF THE ROW: a stacked
+/// row's button is fitted to its column ([`fit_row_choice_label`]); a
+/// one-line row's (a choice, a font, the wallpaper Modified names) first
+/// takes from the name's column the width its whole words need, down to
+/// the name's floor ([`one_line_name_floor`], the name wrapping), then
+/// runs the same ladder ([`choice_words`]) in the width it has — its words
+/// on lines where one line cannot hold them, the row as much taller. Only
+/// a stacked row was fitted: a one-line font row at 2× text kept its fixed
+/// 375pt control and the painter elided "Automatic (SF Mono Light Italic)"
+/// to "Automatic (SF Mono Light…" — the word the row exists to state cut —
+/// beside a name column with room to spare, at every window width. A row
+/// that grows taller than a short list's screen stacks after all
+/// ([`finished_setting_row`]), where its column holds the words on a line.
+fn fit_row_button_words(row: &mut UiNode, name: &str, text_width: f32, stacked: bool) {
+    if stacked {
+        fit_row_choice_label(row, text_width);
+        return;
+    }
+    let spare = (one_line_label_room(row, text_width) - one_line_name_floor(name)).max(0.0);
+    let band = fixed_height(row) - row.layout.padding.top - row.layout.padding.bottom;
+    let Some(control) = row
+        .children
+        .get_mut(1)
+        .filter(|node| node.key.as_str().starts_with("settings/control/"))
+    else {
+        return;
+    };
+    let Length::Fixed(current) = control.layout.width else {
+        return;
+    };
+    let UiContent::Button(button) = &mut control.content else {
+        return;
+    };
+    let complete = button
+        .spec
+        .visual_label
+        .clone()
+        .unwrap_or_else(|| button.spec.label.clone());
+    // The button's own edges: its lead, its arrow, what its end wears.
+    let edges = current - crate::native_ui::text_button_label_room(&button.spec, current);
+    let need = crate::native_ui::native_button_label_width(&complete) + edges;
+    let width = current + (need - current).clamp(0.0, spare);
+    let lines = choice_words(&mut button.spec, &complete, width);
+    control.layout.width = Length::Fixed(width);
+    let grow = crate::native_ui::native_button_height_for_lines(lines, band) - band;
+    if grow > 0.01 {
+        grow_row(row, grow);
+    }
+}
+
 /// Fit a stacked row's choice button label to the row's `max_width` while
 /// its semantic label and value stay complete. Doing this before compilation
 /// distinguishes deliberate responsive copy from an accidental painter
@@ -34929,7 +35705,18 @@ fn choice_words(spec: &mut ButtonSpec, complete: &str, max_width: f32) -> usize 
         .strip_suffix(" (default)")
         .filter(|bare| !bare.is_empty())
         .map(str::to_string);
-    let forms: Vec<String> = std::iter::once(complete.to_string()).chain(bare).collect();
+    // A value that names a thing and then its facts ("sunset-over-the-
+    // bay.png · 1074 × 686") gives up the facts before the name.
+    let named = bare
+        .as_deref()
+        .unwrap_or(complete)
+        .split_once(FACT_SEPARATOR)
+        .map(|(name, _)| name.to_string())
+        .filter(|name| !name.is_empty());
+    let forms: Vec<String> = std::iter::once(complete.to_string())
+        .chain(bare)
+        .chain(named)
+        .collect();
     if let Some(words) = forms.iter().find(|words| fits(spec, words)) {
         spec.visual_label = Some(words.clone());
         return 1;
@@ -34973,14 +35760,46 @@ fn grow_row(row: &mut UiNode, grow: f32) {
 }
 
 /// A row's text field shows its placeholder fitted to the width the row
-/// gives the field ([`crate::native_ui::fit_native_field_placeholder`]): its
-/// fixed width on a one-line row, else (a stacked row's control line) the
-/// column less the fixed controls beside it. At every width and text size,
-/// so "Automatic (default)" reads "Automatic" in a narrow field instead of
-/// being cut mid-glyph; the semantic value keeps the whole words.
-fn fit_row_field_placeholder(row: &mut UiNode, text_width: f32) {
-    // How many more lines than one the placeholder takes, and how tall one is.
-    fn fit(node: &mut UiNode, room: f32) -> Option<usize> {
+/// gives the field ([`field_placeholder_lines`]): its width on a one-line
+/// row (grown toward its unset words), else (a stacked row's control line)
+/// the column less the fixed controls beside it. At every width and text
+/// size every word whole, on one line ("Automatic (default)" reads
+/// "Automatic") or on lines of the field, the row as much taller in every
+/// state; the semantic value keeps the whole words.
+fn fit_row_field_placeholder(
+    row: &mut UiNode,
+    (name, text_width, stacked): (&str, f32, bool),
+    unset: Option<(&str, bool)>,
+    held: Option<&str>,
+) {
+    // A ONE-LINE ROW'S FIELD TAKES THE WIDTH ITS UNSET WORDS NEED from the
+    // name's column, down to the name's floor ([`one_line_name_floor`]), as a
+    // row's button does ([`fit_row_button_words`]): measured on the words
+    // the field shows unset (`unset`), so a value written or typed into it
+    // never moves it.
+    if !stacked && let Some((unset, chip)) = unset {
+        let spare = (one_line_label_room(row, text_width) - one_line_name_floor(name)).max(0.0);
+        if let Some(control) = row
+            .children
+            .get_mut(1)
+            .filter(|node| node.key.as_str().starts_with("settings/control/"))
+            && let Length::Fixed(current) = control.layout.width
+            && matches!(control.content, UiContent::TextField(_))
+        {
+            let need = crate::native_ui::text_field_width_for(
+                &crate::native_ui::plain_placeholder(unset),
+                chip,
+            );
+            control.layout.width = Length::Fixed(current + (need - current).clamp(0.0, spare));
+        }
+    }
+    // How many more lines than one the field keeps for its words.
+    fn fit(
+        node: &mut UiNode,
+        room: f32,
+        unset: Option<(&str, bool)>,
+        held: Option<&str>,
+    ) -> Option<usize> {
         let siblings: f32 = node
             .children
             .iter()
@@ -34998,76 +35817,194 @@ fn fit_row_field_placeholder(row: &mut UiNode, text_width: f32) {
                     Length::Fixed(width) => width,
                     _ => room - siblings,
                 };
-                let swatch = field.spec.swatch.is_some();
-                let mut extra = 0;
-                if let Some(placeholder) = field.spec.placeholder.as_mut() {
-                    let fitted =
-                        crate::native_ui::fit_native_field_placeholder(placeholder, width, swatch);
-                    // WHERE NO ONE-LINE FORM KEEPS ITS WORDS WHOLE (a colour
-                    // field at 2× text in a 22-column window: "The…",
-                    // "Automa…"), its plain words go on lines of the field, a
-                    // word wider than it broken with a hyphen
-                    // ([`wrap_to_box`]), never cut; the row is as much taller.
-                    let plain = crate::native_ui::plain_placeholder(placeholder);
-                    // A path's ellipsis stands for whole folders
-                    // ([`crate::native_ui::path_forms`]); only its file's name
-                    // cut inside itself is a cut.
-                    let path = crate::native_ui::reads_as_path(placeholder);
-                    let cut_inside_a_word = if path {
-                        fitted.ends_with('\u{2026}')
-                    } else {
-                        fitted.strip_suffix('\u{2026}').is_some_and(|stem| {
-                            !plain
-                                .strip_prefix(stem)
-                                .is_some_and(|rest| rest.starts_with(char::is_whitespace))
-                        })
-                    };
-                    let px =
-                        crate::native_ui::native_type_px(crate::type_scale::TypeStep::Secondary)
-                            .get();
-                    let room = crate::native_ui::field_placeholder_room(width, swatch);
-                    let measure = |line: &str| crate::tray_raster::ui_text_width(line, px);
-                    // A COLOUR FIELD WHOSE WORDS ARE NOT WHOLE BESIDE ITS
-                    // CHIP, not one of them on a line of its own, shows its
-                    // colour alone, as a button that wears the colour it
-                    // names does ([`choice_words`]): the chip is what the
-                    // row is about, and the row's absent Reset says the
-                    // colour is the default. Its words went on lines beside
-                    // the chip and a word wider than what the chip left was
-                    // broken and cut: "Theme default" painted "The-" /
-                    // "me…" at 2× text in a 22-column window. The field's
-                    // value still says the words.
-                    let words_beside_chip = plain
-                        .split_whitespace()
-                        .all(|word| measure(word) <= room + crate::native_ui::TEXT_FIT_SLACK);
-                    if cut_inside_a_word && swatch && !path && !words_beside_chip {
-                        placeholder.clear();
-                    } else if cut_inside_a_word {
-                        let lines = if path {
-                            path_placeholder_lines(placeholder, room, &measure)
-                        } else {
-                            word_placeholder_lines(&plain, room, &measure)
-                        };
-                        extra = lines.len().saturating_sub(1);
-                        *placeholder = lines.join("\n");
-                    } else {
-                        *placeholder = fitted;
+                // A chip on a line of its own takes none of the words' width,
+                // and a line of the field's height.
+                let chip_line = field.spec.swatch_line;
+                let swatch = field.spec.swatch.is_some() && !chip_line;
+                let empty = field
+                    .spec
+                    .visual_value
+                    .as_deref()
+                    .unwrap_or_default()
+                    .is_empty()
+                    && field
+                        .spec
+                        .input
+                        .as_ref()
+                        .is_none_or(|input| input.text.is_empty());
+                let placeholder = field.spec.placeholder.clone();
+                let painted = placeholder
+                    .as_deref()
+                    .map(|placeholder| field_placeholder_lines(placeholder, width, swatch));
+                // The lines the field keeps whatever it holds: those its
+                // unset words take — beside a colour field's chip and
+                // without it, which a written colour brings and an unset one
+                // may not — so writing, clearing or typing into it never
+                // makes its row taller or shorter.
+                let kept = unset
+                    .map(|(unset, chip)| {
+                        [false, chip && !chip_line]
+                            .into_iter()
+                            .map(|swatch| field_placeholder_lines(unset, width, swatch).1)
+                            .max()
+                            .unwrap_or(1)
+                    })
+                    .unwrap_or(1);
+                // A VALUE IS WHOLE TOO: the value the key holds keeps the
+                // lines it takes whatever the field shows (typing into it
+                // never makes the row taller or shorter), and a value shown
+                // while the field is not being edited — the saved one, or a
+                // draft waiting — is set on the lines it takes
+                // ([`field_value_lines`]). Cut on one line, a shell named
+                // "nushell-nightly-build" read "nushel…" at 2× text in a
+                // 22-column window.
+                let words_room = crate::native_ui::text_field_words_room(field, width);
+                let kept = held
+                    .filter(|held| !held.is_empty())
+                    .map_or(kept, |held| kept.max(field_value_lines(held, words_room).1));
+                let mut lines = kept;
+                if let (Some((words, count)), Some(slot)) =
+                    (painted, field.spec.placeholder.as_mut())
+                {
+                    if empty {
+                        lines = lines.max(count);
                     }
+                    *slot = words;
                 }
-                return Some(extra);
+                if field.spec.input.is_none()
+                    && let Some(value) = field
+                        .spec
+                        .visual_value
+                        .as_mut()
+                        .filter(|value| !value.is_empty())
+                {
+                    let (shown, count) = field_value_lines(value, words_room);
+                    lines = lines.max(count);
+                    *value = shown;
+                }
+                return Some(lines.saturating_sub(1) + usize::from(chip_line));
             }
-            if let Some(extra) = fit(child, room) {
+            if let Some(extra) = fit(child, room, unset, held) {
                 return Some(extra);
             }
         }
         None
     }
-    if let Some(extra) = fit(row, text_width).filter(|extra| *extra > 0) {
+    if let Some(extra) = fit(row, text_width, unset, held).filter(|extra| *extra > 0) {
         grow_row(
             row,
             extra as f32 * crate::native_ui::native_button_line_height(),
         );
     }
+}
+
+/// `placeholder` as a text field `width` wide (with or without its colour
+/// `swatch`) paints it, and how many lines that takes:
+///
+/// NO WORD IS DROPPED WHERE THE ROW CAN GROW: one line only where it holds
+/// the words whole — all of them, or without the " (default)" the quiet
+/// tint says, or without the aside they end in. Else the plain words go on
+/// lines of the field, a word wider than it broken with a hyphen
+/// ([`wrap_to_box`]), as many as a screen of the list holds the field on
+/// ([`word_placeholder_lines`]). A one-line form of the leading words with
+/// "…" after them passed as whole: "Theme default" read "Theme…" at 1×
+/// text in a 22-column window, "platform default" "platform…" at 2× in 30
+/// columns, and "Brighter pale blue" "Brighter" / "pale…".
+fn field_placeholder_lines(placeholder: &str, width: f32, swatch: bool) -> (String, usize) {
+    let fitted = crate::native_ui::fit_native_field_placeholder(placeholder, width, swatch);
+    let plain = crate::native_ui::plain_placeholder(placeholder);
+    // A path's ellipsis stands for whole folders
+    // ([`crate::native_ui::path_forms`]); only its file's name cut inside
+    // itself is a cut.
+    let path = crate::native_ui::reads_as_path(placeholder);
+    let drops_words = if path {
+        fitted.ends_with('\u{2026}')
+    } else {
+        fitted != placeholder
+            && fitted != plain
+            && placeholder.strip_suffix(" (default)") != Some(fitted.as_str())
+    };
+    if !drops_words {
+        return (fitted, 1);
+    }
+    let px = crate::native_ui::native_type_px(crate::type_scale::TypeStep::Secondary).get();
+    let room = crate::native_ui::field_placeholder_room(width, swatch);
+    let measure = |line: &str| crate::tray_raster::ui_text_width(line, px);
+    // A COLOUR FIELD WHOSE WORDS ARE NOT WHOLE BESIDE ITS CHIP, not one of
+    // them on a line of its own, shows its colour alone, as a button that
+    // wears the colour it names does ([`choice_words`]): the chip is what
+    // the row is about, and the row's absent Reset says the colour is the
+    // default. Its words went on lines beside the chip and a word wider than
+    // what the chip left was broken and cut: "Theme default" painted "The-"
+    // / "me…" at 2× text in a 22-column window. The field's value still
+    // says the words.
+    let words_beside_chip = plain
+        .split_whitespace()
+        .all(|word| measure(word) <= room + crate::native_ui::TEXT_FIT_SLACK);
+    if swatch && !path && !words_beside_chip {
+        return (String::new(), 1);
+    }
+    let lines = if path {
+        path_placeholder_lines(placeholder, room, &measure)
+    } else {
+        word_placeholder_lines(&plain, room, &measure, field_lines_most())
+    };
+    let count = lines.len().max(1);
+    (lines.join("\n"), count)
+}
+
+/// A FIELD'S VALUE AS IT SHOWS WHILE IT IS NOT BEING EDITED, in a box
+/// `room` wide ([`crate::native_ui::text_field_words_room`]), and how many
+/// lines that takes: whole on one line where it fits; else on lines of the
+/// field — a path the longest of its forms two lines hold, its file's name
+/// whole ([`path_placeholder_lines`]); any other value broken between its
+/// words, a word wider than the box broken where the shared rule breaks it
+/// ([`wrap_to_box`]), as many lines as a screen of the list holds the field
+/// on ([`word_placeholder_lines`]). The field paints the lines as they are
+/// ([`crate::native_ui::TextFieldSpec::visual_value`]); its semantic value
+/// keeps the value.
+fn field_value_lines(value: &str, room: f32) -> (String, usize) {
+    let px = crate::native_ui::native_type_px(crate::type_scale::TypeStep::Secondary).get();
+    let measure = |line: &str| crate::tray_raster::ui_text_width(line, px);
+    // A value that holds its own line breaks is on its lines already.
+    if value.contains('\n') {
+        return (value.to_string(), value.split('\n').count());
+    }
+    if measure(value) <= room + crate::native_ui::TEXT_FIT_SLACK {
+        return (value.to_string(), 1);
+    }
+    let lines = if crate::native_ui::reads_as_path(value) {
+        path_placeholder_lines(value, room, &measure)
+    } else {
+        word_placeholder_lines(value, room, &measure, field_lines_most())
+    };
+    let count = lines.len().max(1);
+    (lines.join("\n"), count)
+}
+
+/// The words `field`'s text field shows while the key is unset — with its
+/// "(default)" — whatever it holds now: what it shows where it is unset,
+/// else the words its default reads as ([`modified_default_words`]) as the
+/// field would set them ([`field_placeholder`]). `None` where they are not
+/// known.
+fn unset_field_words(state: &SettingsViewState, field: &EditField) -> Option<String> {
+    if field.seed.is_none() {
+        return Some(field_placeholder(state, field).0);
+    }
+    let words = modified_default_words(state, field.key)?;
+    let placeholder = if words.contains("(default)") {
+        words
+    } else {
+        format!("{words} (default)")
+    };
+    let unset = EditField {
+        label: field.label,
+        key: field.key,
+        kind: field.kind,
+        seed: None,
+        placeholder,
+    };
+    Some(field_placeholder(state, &unset).0)
 }
 
 /// A PATH PLACEHOLDER ON LINES KEEPS ITS FIELD A FIELD: the longest of its
@@ -35096,23 +36033,31 @@ fn path_placeholder_lines(path: &str, room: f32, measure: &dyn Fn(&str) -> f32) 
         .unwrap_or_else(|| wrap_to_box(&tail, room, measure))
 }
 
-/// WORDS ON LINES KEEP THEIR FIELD A FIELD, as a path does
-/// ([`path_placeholder_lines`]): the words whole on the lines `room` gives
-/// them where two hold them, else the most leading whole words two lines
-/// hold with "…" saying more follows, else three. The fleet document's
-/// "ai-fleet.toml beside aterm.toml" (its words where Settings does not know
-/// aterm.toml's folder) took five lines at 2× text in a 22-column window on
-/// macOS and six in the Linux lane's Noto Sans, a field taller than the
-/// 348-pt window's list, whole on no screen; it now reads "ai-" /
-/// "fleet.toml" / "beside…". The field's semantic value keeps every word.
-fn word_placeholder_lines(plain: &str, room: f32, measure: &dyn Fn(&str) -> f32) -> Vec<String> {
+/// WORDS ON LINES, EVERY ONE OF THEM, WHILE THE FIELD STAYS A FIELD: the
+/// words whole on the lines `room` gives them where no more than `most`
+/// hold them — the lines a screen of the page's list holds the field on
+/// ([`field_lines_most`]) — else the most leading whole words `most` lines
+/// hold with "…" saying more follows. Capped at two or three lines
+/// whatever the room, "Brighter pale blue" read "Brighter" / "pale…" in a
+/// list with room for every word; the cap was for the fleet document's
+/// "ai-fleet.toml beside aterm.toml", which at 2× text in a 22-column
+/// window took more lines than a screen holds. The field's semantic value
+/// keeps every word.
+fn word_placeholder_lines(
+    plain: &str,
+    room: f32,
+    measure: &dyn Fn(&str) -> f32,
+    most: usize,
+) -> Vec<String> {
+    let most = most.max(1);
     let whole = wrap_to_box(plain, room, measure);
+    if whole.len() <= most {
+        return whole;
+    }
     let words: Vec<&str> = plain.split_whitespace().collect();
-    for most in [2, 3] {
-        if whole.len() <= most {
-            return whole;
-        }
-        let led = (1..words.len()).rev().find_map(|n| {
+    (1..words.len())
+        .rev()
+        .find_map(|n| {
             let lines = wrap_to_box(
                 &format!(
                     "{}{}",
@@ -35123,12 +36068,8 @@ fn word_placeholder_lines(plain: &str, room: f32, measure: &dyn Fn(&str) -> f32)
                 measure,
             );
             (lines.len() <= most).then_some(lines)
-        });
-        if let Some(lines) = led {
-            return lines;
-        }
-    }
-    whole
+        })
+        .unwrap_or(whole)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -36168,7 +37109,7 @@ fn line_pieces(text: &str) -> Vec<(&str, &str)> {
 /// neither fits at a character (a word with its hyphen, an identifier with
 /// none) — so no line paints past the box. Nothing is cut and nothing is
 /// dropped.
-fn wrap_to_box(text: &str, width: f32, measure: &dyn Fn(&str) -> f32) -> Vec<String> {
+pub(crate) fn wrap_to_box(text: &str, width: f32, measure: &dyn Fn(&str) -> f32) -> Vec<String> {
     wrap_to_box_marked(text, width, measure, "-")
 }
 
@@ -37033,17 +37974,12 @@ fn compact_update_summary(
         crate::tray_raster::ui_text_width_for(crate::widget::TextFace::UiBold, text, caption_px)
             <= identity_width + 0.5
     };
-    let title = titled.then(|| {
-        fit_native_bold_label(
-            if caption_fits("SOFTWARE UPDATE") {
-                "SOFTWARE UPDATE"
-            } else {
-                "UPDATE"
-            },
-            identity_width,
-            caption_px,
-        )
-    });
+    let title_words = if caption_fits("SOFTWARE UPDATE") {
+        "SOFTWARE UPDATE"
+    } else {
+        "UPDATE"
+    };
+    let title = titled.then(|| fit_native_bold_label(title_words, identity_width, caption_px));
     // A STAGE THE ENGINE HAS ALREADY FAILED TO APPLY IS NOT A CELEBRATION. The
     // accent is the same argument the wording makes: `failing_persistent` is the
     // ESCALATION verdict and stays quiet through the first two attempts, so "Not
@@ -37084,9 +38020,13 @@ fn compact_update_summary(
         detail_width,
     );
     // Whether every column holds its words whole: a summary that elides its
-    // headline or its state says less than the full card, so the page does not
-    // take it ([`update_page`]).
-    let whole = headline == headline_words
+    // caption, its headline or its state says less than the full card, whose
+    // caption wraps, so the page does not take it ([`update_page`]). The
+    // caption was left out, and where a face's bold "UPDATE" is wider than the
+    // identity column (Cantarell at 2× in a 30-column window) the summary
+    // painted "UPD…".
+    let whole = title.as_deref().is_none_or(|title| title == title_words)
+        && headline == headline_words
         && current == current_preferred
         && detail == compact_update_summary_detail(update);
     // The detail sentence is the card's line under this row
@@ -43430,20 +44370,87 @@ fn fixed_height(node: &UiNode) -> f32 {
     }
 }
 
+/// ONE SEARCH, ONE REACH: a Settings search as every surface that lists,
+/// counts or previews its results reads it — the query, trimmed and
+/// ASCII-lowercased, and how far it reaches ([`MatchReach`]). The reach is
+/// the whole search's, never a row's: word hits wherever any source the
+/// search lists has one (a visible setting, a page by its words or a control
+/// it draws, a cursor style, a key only aterm.toml holds), else loose hits
+/// too — so "cat" never adds "Continue A Turn" beside the settings that list
+/// the word cat, and "board", a word of no setting, still finds Keyboard &
+/// Input. Made once a pass ([`Self::of`]) and handed to the field list, the
+/// page results, the aterm.toml card, the count and the preview, so the list,
+/// the "N pages · M settings" line, the preview and the card agree.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct SearchQuery<'a> {
+    /// The query, trimmed and ASCII-lowercased; empty where nothing is typed.
+    pub(crate) text: &'a str,
+    /// The search's reach.
+    pub(crate) reach: MatchReach,
+}
+
+impl<'a> SearchQuery<'a> {
+    /// `text` (trimmed, ASCII-lowercased) as a search over `state`, at the
+    /// reach its results set: [`MatchReach::Words`] where any source the
+    /// search lists has a word hit, else [`MatchReach::Loose`].
+    pub(crate) fn of(state: &SettingsViewState, text: &'a str) -> Self {
+        let words = Self {
+            text,
+            reach: MatchReach::Words,
+        };
+        if text.is_empty() || search_has_a_result(state, words) {
+            words
+        } else {
+            Self {
+                text,
+                reach: MatchReach::Loose,
+            }
+        }
+    }
+
+    /// Whether nothing is typed.
+    fn is_empty(self) -> bool {
+        self.text.is_empty()
+    }
+}
+
+/// The trimmed, ASCII-lowercased text of `state`'s search field.
+fn folded_search(state: &SettingsViewState) -> String {
+    state.search.trim().to_ascii_lowercase()
+}
+
+/// Whether `query` lists anything at all: a visible setting, a page, or a key
+/// only aterm.toml holds — the very sources the search's lists draw, at its
+/// reach, stopping at the first.
+fn search_has_a_result(state: &SettingsViewState, query: SearchQuery<'_>) -> bool {
+    let mut scratch = String::new();
+    state
+        .legacy
+        .fields
+        .iter()
+        .filter(|field| settings_field_is_visible(state, field.key, false, true))
+        .any(|field| {
+            field_match_score_in(field, query, &mut scratch, &state.assets.themes).is_some()
+        })
+        || !search_page_hits(state, query).is_empty()
+        || manual_search_has_match(state, query)
+}
+
 /// Stable global-search rank ([`crate::native_config_language::query_match_score`]):
-/// exact prefix, then a word start, then a short acronym, every word of the
-/// query starting a word somewhere among the label, key and keywords.
-/// One-shot rank for callers outside a sweep; the sweeps use
-/// [`field_match_score_in`] so one scratch buffer serves the whole pass.
+/// a whole word before the start of one, the candidate's first word before a
+/// later one, every word of the query starting a word somewhere among the
+/// label, key and keywords (loose hits too under a loose search:
+/// [`SearchQuery`]). One-shot rank for callers outside a sweep; the sweeps
+/// use [`field_match_score_in`] so one scratch buffer serves the whole pass.
 fn field_match_score(
     field: &EditField,
-    query: &str,
+    query: SearchQuery<'_>,
     themes: &crate::app_config::ThemeCatalog,
 ) -> Option<SearchRank> {
     field_match_score_in(field, query, &mut String::new(), themes)
 }
 
-/// Rank `field` against an already-lowercased `query` (`None` = no match).
+/// Rank `field` against `query` (`None` = no match).
 ///
 /// `field.key` and every keyword from `keywords_of` are lowercase by construction
 /// (`editable_field_keys_are_unique_and_lowercase`), so only the mixed-case label
@@ -43451,10 +44458,11 @@ fn field_match_score(
 /// every keystroke.
 fn field_match_score_in(
     field: &EditField,
-    query: &str,
+    query: SearchQuery<'_>,
     scratch: &mut String,
     themes: &crate::app_config::ThemeCatalog,
 ) -> Option<SearchRank> {
+    use crate::native_config_language::{PREFIX_AT_WORD, candidate_match_score, past_the_start};
     if query.is_empty() {
         return Some(SearchRank::EVERY);
     }
@@ -43463,27 +44471,29 @@ fn field_match_score_in(
         return own;
     }
     // Theme names are the Theme row's corpus too: "nord" finds the Theme
-    // control, whose picker then opens filtered to it. A theme name ranks
-    // below the control's own words (it is a value, not the setting: a
-    // synonym, a rung down), and only where the query starts a word of it: a
-    // two-letter abbreviation that happens to be some theme's initials is not
-    // a search for it.
+    // control, whose picker then opens filtered to it. A theme name is a
+    // value the row holds, never what it is called (a synonym, ranked as a
+    // word inside the row's name: [`past_the_start`]), and it counts only
+    // where the query starts a word of it, at any reach: a two-letter
+    // abbreviation that happens to be some theme's initials, or letters
+    // inside a theme's name, are not a search for it — and the picker this
+    // row opens seeds its filter by names alone ([`ThemeNaming`]).
     let by_name = theme_search_names(themes)
         .filter_map(|name| {
-            crate::native_config_language::candidate_match_score(&name.to_lowercase(), query)
+            candidate_match_score(&name.to_lowercase(), query.text, MatchReach::Words)
         })
-        .filter(|score| *score < crate::native_config_language::ACRONYM_RUNG)
         .min()
-        .map(|score| SearchRank::synonym(score.saturating_add(1)));
+        .map(|rung| SearchRank::synonym(past_the_start(rung)));
     // A query that names a theme by the rule its picker seeds by ("nord
     // theme", "light gruvbox", "night tokyo": [`ThemeNaming`]) finds the row
-    // too, on the word-start rung a name reaches.
-    let named = ThemeNaming::of(query)
+    // too, on the last word rung a name reaches (every name word starts a
+    // word of the theme's name).
+    let named = ThemeNaming::of(query.text)
         .filter(|naming| {
             theme_search_entries(themes)
                 .any(|(label, id, appearance)| naming.names(label, id, Some(appearance)))
         })
-        .map(|_| SearchRank::synonym(2));
+        .map(|_| SearchRank::synonym(PREFIX_AT_WORD));
     own.into_iter().chain(by_name).chain(named).min()
 }
 
@@ -43514,7 +44524,7 @@ fn theme_search_names(themes: &crate::app_config::ThemeCatalog) -> impl Iterator
 
 fn field_own_match_score(
     field: &EditField,
-    query: &str,
+    query: SearchQuery<'_>,
     scratch: &mut String,
 ) -> Option<SearchRank> {
     scratch.clear();
@@ -43528,7 +44538,7 @@ fn field_own_match_score(
     // before what it lists as a synonym on the same rung ([`SearchRank`]).
     let own = [scratch.as_str(), field.key]
         .into_iter()
-        .chain(prefs::own_name_of(field.key));
+        .chain(prefs::own_names_of(field.key).into_iter().flatten());
     // The ladder lives once, in the config-schema authority, so Settings search and
     // Manual completion rank alike. Every candidate here is already lowercase (the
     // folded label; keys and keywords by construction), the precondition that ladder
@@ -43536,7 +44546,8 @@ fn field_own_match_score(
     crate::native_config_language::query_match_rank(
         own,
         prefs::keywords_of(field.key).iter().copied(),
-        query,
+        query.text,
+        query.reach,
     )
 }
 
@@ -43551,6 +44562,13 @@ fn update_page_subtitle(native_updater: bool) -> &'static str {
     } else {
         "Your version of aterm and how it updates."
     }
+}
+
+/// Search's subtitle where nothing starts a word with `typed`
+/// ([`MatchReach::Loose`]): why what it lists holds the query only inside a
+/// word or as initials, with the query as typed.
+fn loose_search_subtitle(typed: &str) -> String {
+    format!("No word starts with \u{201c}{typed}\u{201d}.")
 }
 
 /// A field page's one subtitle, the same at every width.

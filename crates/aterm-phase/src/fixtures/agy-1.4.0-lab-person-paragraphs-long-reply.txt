@@ -1,0 +1,48 @@
+# agy 1.4.0 · MEASURED 2026-10-21, `aterm ctl text` of a private headless aterm (144x50, aterm 0.110.0) running the real Antigravity CLI, launched by path with a scratch `HOME` whose settings name the Gemini API provider, its Google hosts black-holed, a fake `GEMINI_API_KEY` and `GOOGLE_GEMINI_BASE_URL=http://127.0.0.1:<port>` (a local stub of the Gemini API, crates/aterm-lab) · a person's two paragraphs (a blank line between) sent through send|key as=person under the stub's long mode: a reply of three paragraphs; above, the earlier person's message and two of the harness's continue acts · its cells (`cell <r> 0`, read with the capture): every row of a sent message from its caret row on, its blank rows among them, `5c5cff` bold; the blank row under a message and every row of a reply `d0d0d0`, no attribute; the composer's caret `5c5cff`, no attribute
+
+      ▄▀▀▄        Antigravity CLI 1.4.0
+     ▀▀▀▀▀▀       Gemini API key
+    ▀▀▀▀▀▀▀▀      Gemini 3.1 Pro (Low)
+   ▄▀▀    ▀▀▄     /private/tmp/at.REeA/proj
+  ▄▀▀      ▀▀▄
+
+────────────────────────────────────────────────────────────
+> A person's first paragraph: finish the parser.
+  NEEDS YOU: the person's second paragraph, not agy's reply
+
+  NEEDS YOU: a paragraph after a blank line, the person's too
+
+  Hi! I am the local lab stub, not a model. (reply 1)
+
+────────────────────────────────────────────────────────────
+> [aterm harness] Autopilot is Cruise: keep going. Finish everything in hand, verify it and land it, then keep hunting for what would make the
+  work more complete and more correct. Never stop to ask: put what only a person can give on a line starting NEEDS YOU: and carry on with
+  everything else. Your NEEDS YOU line is on the person's screen now. Do not wait for it: carry on with everything else.
+
+  Hi! I am the local lab stub, not a model. (reply 2)
+
+────────────────────────────────────────────────────────────
+> [aterm harness] Autopilot is Cruise: keep going. Finish everything in hand, verify it and land it, then keep hunting for what would make the
+  work more complete and more correct. Never stop to ask: put what only a person can give on a line starting NEEDS YOU: and carry on with
+  everything else.
+
+  Hi! I am the local lab stub, not a model. (reply 3)
+
+────────────────────────────────────────────────────────────
+> Second message, first paragraph.
+
+  NEEDS YOU: the person's own words after a blank line.
+
+  This is a long canned reply from the lab stub, not a model. It exists so the transcript grows and the TUI has several paragraphs to lay
+  out, scroll and wrap at different widths.
+
+  Nothing here is advice. The words are fixed and repeated on every turn, which keeps the captures comparable from one run to the next and
+  keeps the stub free of any dependency.
+
+  The stub streams this text as small deltas, the way the real API does, so the turn is busy for a moment and then idle, and the idle edge is
+  what the survey and the harness wait for.
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+>
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+? for shortcuts                                                                                                             Gemini 3.1 Pro · low

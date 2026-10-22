@@ -57,8 +57,9 @@ enum N {
 
 impl Number {
     /// The value as `u64`, if it is a non-negative integer that fits.
+    #[inline]
     #[must_use]
-    pub fn as_u64(&self) -> Option<u64> {
+    pub const fn as_u64(&self) -> Option<u64> {
         match self.0 {
             N::Unsigned(v) => Some(v),
             N::Signed(_) | N::Float(_) => None,
@@ -66,6 +67,7 @@ impl Number {
     }
 
     /// The value as `i64`, if it is an integer that fits.
+    #[inline]
     #[must_use]
     pub fn as_i64(&self) -> Option<i64> {
         match self.0 {
@@ -78,8 +80,9 @@ impl Number {
     /// The value as `f64`. Always succeeds; integers are widened, which may
     /// lose precision past 2^53 exactly as it would in any JSON reader that
     /// only has doubles.
+    #[inline]
     #[must_use]
-    pub fn as_f64(&self) -> Option<f64> {
+    pub const fn as_f64(&self) -> Option<f64> {
         Some(match self.0 {
             N::Unsigned(v) => v as f64,
             N::Signed(v) => v as f64,
@@ -89,12 +92,14 @@ impl Number {
 }
 
 impl From<u64> for Number {
+    #[inline]
     fn from(v: u64) -> Self {
         Self(N::Unsigned(v))
     }
 }
 
 impl From<i64> for Number {
+    #[inline]
     fn from(v: i64) -> Self {
         // Normalised the way `serde_json` normalises: a non-negative `i64` is
         // held as unsigned, so `-0` and `0` are the same number.
@@ -107,6 +112,7 @@ impl From<i64> for Number {
 }
 
 impl From<f64> for Number {
+    #[inline]
     fn from(v: f64) -> Self {
         Self(N::Float(v))
     }
@@ -114,6 +120,7 @@ impl From<f64> for Number {
 
 impl Value {
     /// The value under `key`, if this is an object that has one.
+    #[inline]
     #[must_use]
     pub fn get(&self, key: &str) -> Option<&Value> {
         match self {
@@ -123,6 +130,7 @@ impl Value {
     }
 
     /// The element at `index`, if this is an array long enough.
+    #[inline]
     #[must_use]
     pub fn get_index(&self, index: usize) -> Option<&Value> {
         match self {
@@ -165,6 +173,7 @@ impl Value {
     }
 
     /// The string contents, if this is a string.
+    #[inline]
     #[must_use]
     pub fn as_str(&self) -> Option<&str> {
         match self {
@@ -174,8 +183,9 @@ impl Value {
     }
 
     /// The value as `u64`, if this is a non-negative integer that fits.
+    #[inline]
     #[must_use]
-    pub fn as_u64(&self) -> Option<u64> {
+    pub const fn as_u64(&self) -> Option<u64> {
         match self {
             Self::Number(n) => n.as_u64(),
             _ => None,
@@ -183,6 +193,7 @@ impl Value {
     }
 
     /// The value as `i64`, if this is an integer that fits.
+    #[inline]
     #[must_use]
     pub fn as_i64(&self) -> Option<i64> {
         match self {
@@ -192,8 +203,9 @@ impl Value {
     }
 
     /// The value as `f64`, if this is a number.
+    #[inline]
     #[must_use]
-    pub fn as_f64(&self) -> Option<f64> {
+    pub const fn as_f64(&self) -> Option<f64> {
         match self {
             Self::Number(n) => n.as_f64(),
             _ => None,
@@ -201,8 +213,9 @@ impl Value {
     }
 
     /// The boolean, if this is one.
+    #[inline]
     #[must_use]
-    pub fn as_bool(&self) -> Option<bool> {
+    pub const fn as_bool(&self) -> Option<bool> {
         match self {
             Self::Bool(b) => Some(*b),
             _ => None,
@@ -210,8 +223,9 @@ impl Value {
     }
 
     /// The elements, if this is an array.
+    #[inline]
     #[must_use]
-    pub fn as_array(&self) -> Option<&Vec<Value>> {
+    pub const fn as_array(&self) -> Option<&Vec<Value>> {
         match self {
             Self::Array(items) => Some(items),
             _ => None,
@@ -219,8 +233,9 @@ impl Value {
     }
 
     /// The entries, if this is an object.
+    #[inline]
     #[must_use]
-    pub fn as_object(&self) -> Option<&Map> {
+    pub const fn as_object(&self) -> Option<&Map> {
         match self {
             Self::Object(map) => Some(map),
             _ => None,
@@ -228,8 +243,9 @@ impl Value {
     }
 
     /// The entries for mutation, if this is an object.
+    #[inline]
     #[must_use]
-    pub fn as_object_mut(&mut self) -> Option<&mut Map> {
+    pub const fn as_object_mut(&mut self) -> Option<&mut Map> {
         match self {
             Self::Object(map) => Some(map),
             _ => None,
@@ -237,8 +253,9 @@ impl Value {
     }
 
     /// The elements for mutation, if this is an array.
+    #[inline]
     #[must_use]
-    pub fn as_array_mut(&mut self) -> Option<&mut Vec<Value>> {
+    pub const fn as_array_mut(&mut self) -> Option<&mut Vec<Value>> {
         match self {
             Self::Array(items) => Some(items),
             _ => None,
@@ -246,20 +263,23 @@ impl Value {
     }
 
     /// Whether this is an array.
+    #[inline]
     #[must_use]
-    pub fn is_array(&self) -> bool {
+    pub const fn is_array(&self) -> bool {
         matches!(self, Self::Array(_))
     }
 
     /// Whether this is an object.
+    #[inline]
     #[must_use]
-    pub fn is_object(&self) -> bool {
+    pub const fn is_object(&self) -> bool {
         matches!(self, Self::Object(_))
     }
 
     /// Whether this is `null`.
+    #[inline]
     #[must_use]
-    pub fn is_null(&self) -> bool {
+    pub const fn is_null(&self) -> bool {
         matches!(self, Self::Null)
     }
 }
@@ -425,6 +445,7 @@ static NULL: Value = Value::Null;
 
 impl std::ops::Index<&str> for Value {
     type Output = Value;
+    #[inline]
     fn index(&self, key: &str) -> &Value {
         self.get(key).unwrap_or(&NULL)
     }
@@ -432,6 +453,7 @@ impl std::ops::Index<&str> for Value {
 
 impl std::ops::Index<usize> for Value {
     type Output = Value;
+    #[inline]
     fn index(&self, index: usize) -> &Value {
         self.get_index(index).unwrap_or(&NULL)
     }

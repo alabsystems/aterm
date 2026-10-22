@@ -17,6 +17,7 @@ pub trait Dimensions {
     fn columns(&self) -> usize;
 
     /// Index for the last column.
+    #[inline]
     #[must_use]
     // Skip: a default method dispatching to `Self::columns()`; `Dimensions` is public and
     // implemented downstream (aterm-grid's `Grid`), so the callee is unknowable here.
@@ -26,6 +27,7 @@ pub trait Dimensions {
     }
 
     /// Topmost line in history.
+    #[inline]
     #[must_use]
     // Skip: open-world dispatch, as `last_column`.
     #[cfg_attr(trust_verify, trust::skip)]
@@ -36,6 +38,7 @@ pub trait Dimensions {
     }
 
     /// Bottommost line in the viewport.
+    #[inline]
     #[must_use]
     // Skip: open-world dispatch, as `last_column`.
     #[cfg_attr(trust_verify, trust::skip)]
@@ -45,6 +48,7 @@ pub trait Dimensions {
     }
 
     /// Number of lines in scrollback history.
+    #[inline]
     #[must_use]
     // Skip: open-world dispatch, as `last_column`.
     #[cfg_attr(trust_verify, trust::skip)]
@@ -55,14 +59,17 @@ pub trait Dimensions {
 
 /// `Dimensions` for `(lines, columns)` tuples, with no scrollback.
 impl Dimensions for (usize, usize) {
+    #[inline]
     fn total_lines(&self) -> usize {
         self.0
     }
 
+    #[inline]
     fn screen_lines(&self) -> usize {
         self.0
     }
 
+    #[inline]
     fn columns(&self) -> usize {
         self.1
     }
@@ -82,12 +89,14 @@ impl fmt::Display for Line {
 }
 
 impl From<usize> for Line {
+    #[inline]
     fn from(value: usize) -> Self {
         Self(value.min(i32::MAX as usize) as i32)
     }
 }
 
 impl From<i32> for Line {
+    #[inline]
     fn from(value: i32) -> Self {
         Self(value)
     }
@@ -96,6 +105,7 @@ impl From<i32> for Line {
 impl Add<i32> for Line {
     type Output = Self;
 
+    #[inline]
     fn add(self, rhs: i32) -> Self::Output {
         Self(self.0.saturating_add(rhs))
     }
@@ -104,6 +114,7 @@ impl Add<i32> for Line {
 impl Sub<i32> for Line {
     type Output = Self;
 
+    #[inline]
     fn sub(self, rhs: i32) -> Self::Output {
         Self(self.0.saturating_sub(rhs))
     }
@@ -112,6 +123,7 @@ impl Sub<i32> for Line {
 impl Add<usize> for Line {
     type Output = Self;
 
+    #[inline]
     fn add(self, rhs: usize) -> Self::Output {
         let rhs_clamped = rhs.min(i32::MAX as usize) as i32;
         Self(self.0.saturating_add(rhs_clamped))
@@ -121,6 +133,7 @@ impl Add<usize> for Line {
 impl Sub<usize> for Line {
     type Output = Self;
 
+    #[inline]
     fn sub(self, rhs: usize) -> Self::Output {
         let rhs_clamped = rhs.min(i32::MAX as usize) as i32;
         Self(self.0.saturating_sub(rhs_clamped))
@@ -130,6 +143,7 @@ impl Sub<usize> for Line {
 impl Add<Line> for Line {
     type Output = Self;
 
+    #[inline]
     fn add(self, rhs: Line) -> Self::Output {
         Self(self.0.saturating_add(rhs.0))
     }
@@ -138,18 +152,21 @@ impl Add<Line> for Line {
 impl Sub<Line> for Line {
     type Output = i32;
 
+    #[inline]
     fn sub(self, rhs: Line) -> Self::Output {
         self.0.saturating_sub(rhs.0)
     }
 }
 
 impl std::ops::SubAssign<i32> for Line {
+    #[inline]
     fn sub_assign(&mut self, rhs: i32) {
         self.0 = self.0.saturating_sub(rhs);
     }
 }
 
 impl std::ops::AddAssign<i32> for Line {
+    #[inline]
     fn add_assign(&mut self, rhs: i32) {
         self.0 = self.0.saturating_add(rhs);
     }
@@ -168,6 +185,7 @@ impl fmt::Display for Column {
 }
 
 impl From<usize> for Column {
+    #[inline]
     fn from(value: usize) -> Self {
         Self(value)
     }
@@ -176,6 +194,7 @@ impl From<usize> for Column {
 impl Add<usize> for Column {
     type Output = Self;
 
+    #[inline]
     fn add(self, rhs: usize) -> Self::Output {
         Self(self.0.saturating_add(rhs))
     }
@@ -184,6 +203,7 @@ impl Add<usize> for Column {
 impl Sub<usize> for Column {
     type Output = Self;
 
+    #[inline]
     fn sub(self, rhs: usize) -> Self::Output {
         Self(self.0.saturating_sub(rhs))
     }
@@ -192,18 +212,21 @@ impl Sub<usize> for Column {
 impl Sub<Column> for Column {
     type Output = usize;
 
+    #[inline]
     fn sub(self, rhs: Column) -> Self::Output {
         self.0.saturating_sub(rhs.0)
     }
 }
 
 impl std::ops::AddAssign<usize> for Column {
+    #[inline]
     fn add_assign(&mut self, rhs: usize) {
         self.0 = self.0.saturating_add(rhs);
     }
 }
 
 impl std::ops::SubAssign<usize> for Column {
+    #[inline]
     fn sub_assign(&mut self, rhs: usize) {
         self.0 = self.0.saturating_sub(rhs);
     }

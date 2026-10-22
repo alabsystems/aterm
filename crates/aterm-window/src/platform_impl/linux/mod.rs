@@ -82,7 +82,7 @@ impl ApplicationName {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct PlatformSpecificWindowAttributes {
     pub name: Option<ApplicationName>,
     /// The launcher's startup-notification token (`DESKTOP_STARTUP_ID` on X11,
@@ -91,12 +91,9 @@ pub struct PlatformSpecificWindowAttributes {
     /// with it. An aterm addition back onto the fork's cut of upstream's
     /// `startup_notify` (only this consuming half).
     pub activation_token: Option<String>,
-}
-
-impl Default for PlatformSpecificWindowAttributes {
-    fn default() -> Self {
-        Self { name: None, activation_token: None }
-    }
+    /// The X11 window's background (`0x00RRGGBB`) and top-left gravity
+    /// (`platform::x11::WindowAttributesExtX11`). An aterm addition.
+    pub x11_background: Option<u32>,
 }
 
 #[cfg(x11_platform)]
@@ -425,6 +422,11 @@ impl Window {
         x11_or_wayland!(match self; Window(w) => w.focus_window())
     }
 
+    #[inline]
+    pub fn focus_window_with_activation_token(&self, token: &str) {
+        x11_or_wayland!(match self; Window(w) => w.focus_window_with_activation_token(token))
+    }
+
     pub fn request_user_attention(&self, request_type: Option<UserAttentionType>) {
         x11_or_wayland!(match self; Window(w) => w.request_user_attention(request_type))
     }
@@ -556,6 +558,11 @@ unsafe extern "C" fn x_error_callback(
             }
         };
 
+        // A GLX request's error is the GL renderer's (`XConnection::glx_major`).
+        if xconn.glx_major == Some(error.request_code) {
+            tracing::warn!("X11 error of a GLX request: {:#?}", error);
+            return 0;
+        }
         tracing::error!("X11 error: {:#?}", error);
         *xconn.latest_error.lock().unwrap() = Some(error);
     }

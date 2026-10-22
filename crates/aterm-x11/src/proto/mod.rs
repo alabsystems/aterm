@@ -24,6 +24,7 @@ use std::marker::PhantomData;
 pub mod event;
 pub mod randr;
 pub mod shm;
+pub mod sync;
 pub mod xinput;
 pub mod xproto;
 

@@ -76,6 +76,7 @@ impl TerminalHandler<'_> {
     }
 
     /// The XTGETTCAP error reply, `DCS 0 + r ST`.
+    #[inline]
     fn xtgettcap_invalid_response(&mut self, cap: &ResponseCapability) {
         self.send_response(cap, b"\x1bP0+r\x1b\\");
     }

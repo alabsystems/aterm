@@ -47,6 +47,9 @@ const CW: u16 = 15;
 const CH: u16 = 28;
 /// The pet's top chase speed (`kitty_pet::MAX_SPEED`, columns per second).
 const MAX_SPEED: f32 = 26.0;
+/// The fastest the pet ever gallops (`kitty_pet::TOP_SPEED_MAX`, columns per
+/// second): the chase follows a live caret run's pace past [`MAX_SPEED`].
+const TOP_SPEED: f32 = 48.0;
 /// A gait's art drawn again this soon after the cat left it is a flicker.
 const FLICKER_MS: u64 = 350;
 /// An unconfirmed guess expires (`aterm_predict`'s `GLITCH_FLOOR_MS`, the
@@ -130,8 +133,15 @@ struct Knobs {
     /// The composer's upper rule reserved from end to end, as the host
     /// reserved its tint until 2026-10-20 (`PetChrome::note_painted`): no
     /// stand on the composer's first line, so the cat rests under the
-    /// composer while it is typed, beside the chips.
+    /// composer while it is typed, beside the chips. Since the escort
+    /// passes under the host's chrome over its line
+    /// (`PetBrain::console_escorting`) it walks that line instead.
     rule_walled: bool,
+    /// The composer's first line itself reserved from end to end: no stand
+    /// on it for the escort either, so the cat rests under the composer,
+    /// beside the chips, as `rule_walled` sent it until the escort passed
+    /// under the chrome over its line.
+    line_walled: bool,
 }
 
 impl Knobs {
@@ -143,6 +153,7 @@ impl Knobs {
         chips: false,
         brand: false,
         rule_walled: false,
+        line_walled: false,
     };
 }
 
@@ -330,6 +341,9 @@ impl Host {
         }
         if let Some((top, _)) = rules.filter(|_| self.knobs.rule_walled) {
             chips.push(PetRect::new(top as f32, 0.0, 1.0, cols));
+        }
+        if let Some((top, _)) = rules.filter(|_| self.knobs.line_walled) {
+            chips.push(PetRect::new(top as f32 + 1.0, 0.0, 1.0, cols));
         }
         let reserve = match self.knobs.reserve {
             Reserve::Ink => PetReserve {
@@ -522,6 +536,15 @@ fn full_transcript_composer_take() -> Vec<(u64, Rec)> {
 /// and the program's frame lands 15 ms later; at the right edge the composer
 /// grows a line, its bottom rule and the footer pushed a row down.
 fn bracketed_composer_take() -> Vec<(u64, Rec)> {
+    bracketed_composer_typing(
+        "in fact, i would like for the model use sigma section to be hidden by default but can be enabled. i do not really need to know that info at all, and the footer stays",
+        0,
+    )
+}
+
+/// [`bracketed_composer_take`]'s composer with `text` typed into it, then
+/// `rest` milliseconds with no key.
+fn bracketed_composer_typing(text: &str, rest: u64) -> Vec<(u64, Rec)> {
     const COLS: usize = 120;
     let rule = "─".repeat(COLS);
     let footer = "  ⏵⏵ auto mode on (shift+tab to cycle)";
@@ -561,13 +584,15 @@ fn bracketed_composer_take() -> Vec<(u64, Rec)> {
     screen.push_str("\x1b[3;1H  ▘▘ ▝▝    /private/tmp/lab/proj");
     ev.push((0, Rec::Out(screen.into_bytes())));
     ev.push((10, Rec::Out(frame(""))));
-    let text = "in fact, i would like for the model use sigma section to be hidden by default but can be enabled. i do not really need to know that info at all, and the footer stays";
     let mut t = 1_000;
     for (n, ch) in text.chars().enumerate() {
         ev.push((t, Rec::In(ch.to_string().into_bytes())));
         let draft: String = text.chars().take(n + 1).collect();
         ev.push((t + 15, Rec::Out(frame(&draft))));
         t += 85;
+    }
+    if rest > 0 {
+        ev.push((t + rest, Rec::Out(Vec::new())));
     }
     ev
 }
@@ -585,7 +610,8 @@ struct Motion {
     /// (`content-ride`): `(ms, dx, dy, rows the bottom rule moved)`.
     rides: Vec<(u64, f32, f32, i64)>,
     /// One-present moves no locomotion makes: half a row or more, or
-    /// sideways faster than the top chase speed. A ride is not one.
+    /// sideways faster than the fastest gallop ([`TOP_SPEED`]). A ride is not
+    /// one.
     jumps: Vec<(u64, f32, f32)>,
     /// The gait art going back to the cycle it left within [`FLICKER_MS`]:
     /// `(ms, the gait it went back to, ms it was away)`.
@@ -724,7 +750,7 @@ fn motion(shots: &[Shot], frame_ms: u64) -> Motion {
             && s.frame.alpha > 0
             && !airborne(&prev.frame)
             && !airborne(&s.frame)
-            && (dy.abs() >= 0.5 || dx.abs() > MAX_SPEED * dt + 0.02)
+            && (dy.abs() >= 0.5 || dx.abs() > TOP_SPEED * dt + 0.02)
         {
             m.jumps.push((s.ms, dx, dy));
         }
@@ -972,12 +998,12 @@ fn a_stand_between_two_legs_lasts_a_stride() {
 }
 
 /// The composer grows a line under a cat that rests beside aterm's footer
-/// chips. Typing a long prompt in Claude Code with the composer's upper rule
-/// reserved whole (the harness's tint was, until 2026-10-20: `Knobs::
-/// rule_walled`), the stand on the composer's first line reaches into the
-/// upper rule, so the cat rests under the composer, its head beside the
-/// chips' rule; at the wrap the composer grows a line, and the rule and the
-/// chips come down onto the cat's head. The console law stepped it aside: in one
+/// chips. Typing a long prompt in Claude Code with no stand on the
+/// composer's first line (`Knobs::line_walled`; the upper rule reserved
+/// whole did it until the escort passed under the chrome over its line), the
+/// cat rests under the composer, its head beside the chips' rule; at the
+/// wrap the composer grows a line, and the rule and the chips come down onto
+/// the cat's head. The console law stepped it aside: in one
 /// present, 28 px down and 19 px left at the owner's 15x28 cell (2026-10-20,
 /// review of `fix/kitty-jitter`, the generating take at every wrap). Now the
 /// body rides down with the rows round it, the rows they moved and not a
@@ -992,7 +1018,7 @@ fn the_pet_rides_the_composer_down_when_its_chips_come_onto_it() {
         let take = Take { rows, ..TAKES[0] };
         let knobs = Knobs {
             chips: true,
-            rule_walled: true,
+            line_walled: true,
             ..Knobs::SHIPPED
         };
         let h = Host::replay(&take, knobs);
@@ -1082,6 +1108,10 @@ fn the_pet_walks_the_composer_line_beside_its_caret_over_the_chips() {
     );
 }
 
+/// The cat's width in tenths of a column at the owner's cell: the 1.7-row
+/// body at its aspect, `1.7 × 28 × 244 / 148 / 15` (`kitty_pet::art_cols`).
+const BODY_COLS_X10: u16 = 52;
+
 /// How far (columns) a cat walking beside the caret may be from it: the
 /// escort's lead past the caret (`kitty_pet::STATION_LEAD` and the keep-ahead,
 /// at most `LEAD_MAX`), its own width, and its lag behind a burst.
@@ -1109,9 +1139,13 @@ const STAND_REACH: f32 = 12.0;
 /// every frame one closed DEC 2026 bracket, the hidden caret it finished at
 /// was taken two presents late (`companion::HIDDEN_REST`, kept for moves no
 /// bracket closes): at the wrap the stale caret sent the cat hopping down
-/// to the new line's far end before it bounded back. After each wrap, while
-/// the caret stays on the new line: one flight, and it comes down ahead of
-/// the caret.
+/// to the new line's far end before it bounded back. And typed up to the
+/// margin, the cat hopped back over the caret onto the words just typed
+/// before the wrap's bound: two flights at every line end (2026-10-21, the
+/// owner's "jumping"; b884fc3b31's hop, outside the window this law watched
+/// until then). From the caret coming within a body of the margin to three
+/// seconds past each wrap, while the caret stays on the new line: one
+/// flight, and it comes down ahead of the caret.
 #[test]
 fn a_wrap_typed_through_is_one_bound() {
     let harness = Knobs {
@@ -1196,12 +1230,23 @@ fn a_wrap_typed_through_is_one_bound() {
             .collect();
         assert!(!wraps.is_empty(), "{name}: the take must wrap: {wraps:?}");
         for &at in &wraps {
-            // From the present before the wrap (a flight launched on the
-            // wrap's own present is the wrap's) for three seconds, while the
-            // caret stays on the line it wrapped to (a submit after it sends
-            // the cat elsewhere).
+            // From the caret coming within a body of the margin on the line
+            // it wraps from (the stand ahead of it hangs off there, where the
+            // cat used to hop back over it before the wrap's bound) for three
+            // seconds past the wrap, while the caret stays on the line it
+            // wrapped to (a submit after it sends the cat elsewhere).
             let (start, line) = (shots[at].ms, shots[at].caret.0);
-            let after: Vec<&Shot> = std::iter::once(&shots[at - 1])
+            let from_row = shots[at - 1].caret.0;
+            let body = f32::from(BODY_COLS_X10) / 10.0;
+            let mut zone = at - 1;
+            while zone > 0
+                && shots[zone - 1].caret.0 == from_row
+                && f32::from(shots[zone - 1].caret.1) + 1.0 + body > f32::from(*cols)
+            {
+                zone -= 1;
+            }
+            let after: Vec<&Shot> = shots[zone.saturating_sub(1)..at]
+                .iter()
                 .chain(
                     shots
                         .iter()
@@ -1236,5 +1281,557 @@ fn a_wrap_typed_through_is_one_bound() {
                 landed.caret
             );
         }
+    }
+}
+
+/// A FLIGHT ACROSS THE HOST'S CHROME NEVER BLINKS OUT. With aterm's chips on
+/// the composer's lower rule and the harness's mark and switch on its upper
+/// one, the bound that follows Claude Code's caret along the composer at the
+/// take's start crosses the switch for longer than the visibility hold's
+/// dwell. Judged like a body that stays, it faded to nothing in mid-air and
+/// came back eight cells on: a teleport (2026-10-21, the owner's harness on).
+/// A body in the air is passing, as the placement law already held: from
+/// every launch of a body on glass to its landing, no present draws it at
+/// zero presence, over every take and host the wrap law replays.
+///
+/// NEGATIVE CONTROL (as run, the hold judging the body in the air): 23 blank
+/// presents in the take-start flight of the generating take with the harness.
+#[test]
+fn a_flight_across_the_hosts_chrome_never_blinks_out() {
+    let harness = Knobs {
+        chips: true,
+        brand: true,
+        ..Knobs::SHIPPED
+    };
+    let chips = Knobs {
+        chips: true,
+        ..Knobs::SHIPPED
+    };
+    let window = Take {
+        name: "bracketed",
+        src: "",
+        rows: 40,
+        cols: 120,
+    };
+    let runs: [(&str, Knobs, Option<SyntheticTake>); 6] = [
+        ("generating", Knobs::SHIPPED, None),
+        ("generating, chips", chips, None),
+        ("generating, harness", harness, None),
+        (
+            "windowed frames, harness",
+            harness,
+            Some(bracketed_composer_take),
+        ),
+        (
+            "full transcript, harness",
+            harness,
+            Some(full_transcript_composer_take),
+        ),
+        (
+            "windowed frames",
+            Knobs::SHIPPED,
+            Some(bracketed_composer_take),
+        ),
+    ];
+    let cases = crate::common::par_map(&runs, |&(name, knobs, events)| {
+        let h = match events {
+            None => Host::replay(&TAKES[0], knobs),
+            Some(events) => Host::replay_events(&window, knobs, events()),
+        };
+        (name, h.shots)
+    });
+    let mut flights = 0;
+    for (name, shots) in &cases {
+        let mut blank: Vec<u64> = Vec::new();
+        let mut lit_launch = false;
+        for w in shots.windows(2) {
+            let (prev, s) = (&w[0], &w[1]);
+            if s.frame.action == PetAction::Leap && prev.frame.action != PetAction::Leap {
+                lit_launch = prev.frame.lane_alpha > 0;
+                flights += usize::from(lit_launch);
+            }
+            if s.frame.action == PetAction::Leap && lit_launch && s.frame.lane_alpha == 0 {
+                blank.push(s.ms);
+            }
+        }
+        assert!(
+            blank.is_empty(),
+            "{name}: {} presents in the air drew the cat at zero presence: {:?}",
+            blank.len(),
+            &blank[..blank.len().min(8)]
+        );
+    }
+    assert!(flights > 10, "the takes fly ({flights} flights)");
+}
+
+/// THE CAT WALKS THE COMPOSER'S LINE BESIDE ITS CARET UNDER THE HARNESS
+/// SWITCH. With the harness on, aterm draws its switch on the composer's
+/// upper rule over the line's last forty cells, and reserves it as its
+/// chrome. The cat's 1.7-row body standing on the line reaches into that
+/// rule, and judged by the whole box every stand under the switch was
+/// refused: the cat waited on the line short of the switch, at col 79, for
+/// six seconds while the caret ran on to col 118, and caught up only at the
+/// wrap's bound (2026-10-21, the owner's own setup). The escort passes under
+/// the host's chrome over its line (the switch drawn over it, as text is):
+/// typed on past the switch's first column to the wrap, at every present
+/// the cat's feet are on the caret's row and its body within
+/// [`STAND_REACH`] columns of the caret.
+///
+/// NEGATIVE CONTROL (as run on the parent commit): presents 30 to 40
+/// columns behind the caret, the cat waiting at col 79.
+#[test]
+fn the_pet_walks_the_composer_line_beside_its_caret_under_the_harness_switch() {
+    let knobs = Knobs {
+        chips: true,
+        brand: true,
+        ..Knobs::SHIPPED
+    };
+    let h = Host::replay(&TAKES[0], knobs);
+    let switch_from = h.cols - 2 - BRAND_SWITCH_COLS;
+    let line: Vec<&Shot> = h
+        .shots
+        .iter()
+        .skip_while(|s| s.caret.1 < switch_from)
+        .take_while(|s| s.caret.1 >= switch_from)
+        .filter(|s| s.frame.alpha > 0 && s.frame.action != PetAction::Leap)
+        .collect();
+    assert!(
+        line.len() > 100,
+        "the take types the line on past the switch: {}",
+        line.len()
+    );
+    let off: Vec<(u64, (u16, u16), f32, f32)> = line
+        .iter()
+        .filter(|s| {
+            (s.frame.row - f32::from(s.caret.0)).abs() >= 0.5
+                || (s.frame.col - f32::from(s.caret.1)).abs() > STAND_REACH
+        })
+        .map(|s| (s.ms, s.caret, s.frame.col, s.frame.row))
+        .collect();
+    assert!(
+        off.is_empty(),
+        "{} presents off the caret's line or farther than {STAND_REACH} columns from it: {:?}",
+        off.len(),
+        &off[..off.len().min(6)]
+    );
+}
+
+/// THE CAT NEVER PARKS ON THE HOST'S CHROME. Typed up under the harness
+/// switch, the cat walks the composer's line beside the caret, passing under
+/// the switch; the hand stops there and the cat comes to rest. It does not
+/// rest under the switch: it walks, on the line and with no flight, to the
+/// nearest stand clear of it, and its body covers no cell of the host's
+/// chrome once it is settled there. Negative control: stopped short of the
+/// switch, it rests beside the caret where it stood.
+#[test]
+fn the_pet_never_parks_under_the_hosts_chrome() {
+    let knobs = Knobs {
+        chips: true,
+        brand: true,
+        ..Knobs::SHIPPED
+    };
+    let window = Take {
+        name: "bracketed",
+        src: "",
+        rows: 40,
+        cols: 120,
+    };
+    let words = "the quick brown fox jumps over the lazy dog ".repeat(3);
+    for (typed, under) in [(100usize, true), (60, false)] {
+        let text: String = words.chars().take(typed).collect();
+        let h = Host::replay_events(&window, knobs, bracketed_composer_typing(&text, 4_000));
+        // The last key's echo (`bracketed_composer_typing`: from 1 s, 85 ms
+        // a key, echoed 15 ms later).
+        let last_key = 1_000 + 85 * (typed as u64 - 1) + 15;
+        let rest: Vec<&Shot> = h.shots.iter().filter(|s| s.ms > last_key).collect();
+        let flights = rest
+            .windows(2)
+            .filter(|w| {
+                w[1].frame.action == PetAction::Leap && w[0].frame.action != PetAction::Leap
+            })
+            .count();
+        let end = rest.last().expect("the rest is presented");
+        let switch = (
+            f32::from(window.cols) - 2.0 - f32::from(BRAND_SWITCH_COLS),
+            f32::from(window.cols) - 2.0,
+        );
+        let (x0, x1, y0, _) = end
+            .frame
+            .body_px(CW, CH, window.cols, window.rows)
+            .expect("the cat is on glass");
+        let (c0, c1) = (x0 as f32 / f32::from(CW), x1 as f32 / f32::from(CW));
+        let head_row = y0.div_euclid(i32::from(CH)) as usize;
+        let top_rule = end.rule.map(|r| r - 2);
+        let under_switch = top_rule == Some(head_row) && c1 > switch.0 && c0 < switch.1;
+        assert_eq!(
+            flights, 0,
+            "typed to {typed}: the rest is walked to: {flights} flights"
+        );
+        assert!(
+            end.frame.action.settled() && !under_switch,
+            "typed to {typed}: at rest {:?} at ({:.2}, {}), cols {c0:.2}..{c1:.2} under the switch \
+             ({:.0}..{:.0} on row {top_rule:?})",
+            end.frame.action,
+            end.frame.col,
+            end.frame.row,
+            switch.0,
+            switch.1
+        );
+        if !under {
+            assert!(
+                (end.frame.col - typed as f32).abs() < STAND_REACH,
+                "control: stopped short of the switch, it rests by the caret (col {:.2})",
+                end.frame.col
+            );
+        }
+    }
+}
+
+/// The shortest time a pose may be on glass between two others
+/// (`kitty_pet::STILL_SECS`: two 60 Hz frames less half of one), in
+/// milliseconds: two presents at 60 Hz, four at 120 Hz. Under it, a pose is a
+/// flash.
+const POSE_MS: u64 = 25;
+
+/// Each pose run between two others as `(ms it began, before, pose, after, ms
+/// on glass)`, by the art's family: a leg's cycle (the walk's, the amble's,
+/// the run's) is one family, as are the flight's frames and the gather's.
+/// Only a run bounded on both sides is counted; a hidden body is skipped.
+fn pose_runs(shots: &[Shot]) -> Vec<(u64, String, String, String, u64)> {
+    let family = |s: &Shot| {
+        let id = aterm_effects::pet_glyphs_gen::PET_GLYPHS[s.frame.pose as usize].id;
+        match id
+            .trim_end_matches(|c: char| c.is_ascii_digit())
+            .trim_end_matches('_')
+        {
+            "pet_walk" | "pet_lwalk" | "pet_run" => "leg".to_string(),
+            "pet_launch" | "pet_leap_rise" | "pet_leap" | "pet_hop" | "pet_apex"
+            | "pet_leap_descend" => "air".to_string(),
+            "pet_crouch" | "pet_crouch_wiggle" => "crouch".to_string(),
+            other => other.to_string(),
+        }
+    };
+    let shots: Vec<&Shot> = shots.iter().filter(|s| s.frame.alpha > 0).collect();
+    let fams: Vec<String> = shots.iter().map(|s| family(s)).collect();
+    let mut runs = Vec::new();
+    let mut i = 1;
+    while i < shots.len() {
+        if fams[i] == fams[i - 1] {
+            i += 1;
+            continue;
+        }
+        let mut j = i;
+        while j + 1 < shots.len() && fams[j + 1] == fams[i] {
+            j += 1;
+        }
+        if j + 1 < shots.len() {
+            runs.push((
+                shots[i].ms,
+                fams[i - 1].clone(),
+                fams[i].clone(),
+                fams[j + 1].clone(),
+                shots[j + 1].ms - shots[i].ms,
+            ));
+        }
+        i = j + 1;
+    }
+    runs
+}
+
+/// NO POSE IS A ONE-FRAME FLASH: wherever the cat changes pose, the pose it
+/// takes is on glass at least [`POSE_MS`] before the next one, over every take
+/// at 120 and 60 Hz, echo as recorded and 150 ms late, with and without the
+/// harness's chrome; and a stand beside a leg lasts a stride ([`STRIDE_MS`]).
+/// Measured 2026-10-21 on these replays before the fix, 1 to 4 flashes in
+/// each: a wake's seat, a landing's seat or a play bow drawn one present
+/// before the leap; the notice's turned head squared after one frame when a
+/// wrap took the jump for its own flight; a fright that ended half a cell
+/// from its stand ran one frame of the gallop and stood; a face-on seat rows
+/// above the caret slid toward the caret's column and walked one frame back;
+/// a run's planted stand drawn two presents under the console's contact
+/// brace; a blink the caret's jump cut short.
+#[test]
+fn no_pose_is_a_one_frame_flash() {
+    // The measure: only a run bounded on both sides is counted, a leg's
+    // cycle is one pose.
+    let mut control = Host::new(&TAKES[0], Knobs::SHIPPED);
+    control.present();
+    let first = control.shots[0];
+    use aterm_effects::pet_glyphs_gen::PetGlyphId::{PetRun0, PetRun1, PetSit, PetStand};
+    let shots: Vec<Shot> = [PetSit, PetRun0, PetRun1, PetStand, PetSit, PetSit]
+        .into_iter()
+        .enumerate()
+        .map(|(i, pose)| Shot {
+            ms: i as u64 * 8,
+            frame: PetFrame {
+                pose,
+                alpha: 255,
+                ..first.frame
+            },
+            ..first
+        })
+        .collect();
+    let measured: Vec<(u64, &str, u64)> = pose_runs(&shots)
+        .iter()
+        .map(|(at, _, pose, _, dur)| (*at, if pose == "leg" { "leg" } else { "stand" }, *dur))
+        .collect();
+    assert_eq!(measured, [(8, "leg", 16), (24, "stand", 8)]);
+
+    let harness = Knobs {
+        chips: true,
+        brand: true,
+        ..Knobs::SHIPPED
+    };
+    let runs: Vec<(usize, u64, u64, Knobs)> = (0..TAKES.len())
+        .flat_map(|take| {
+            [(8, 0), (16, 0), (8, 150), (16, 150)].into_iter().flat_map(
+                move |(frame_ms, echo_ms)| {
+                    [Knobs::SHIPPED, harness].into_iter().map(move |k| {
+                        (
+                            take,
+                            frame_ms,
+                            echo_ms,
+                            Knobs {
+                                frame_ms,
+                                echo_ms,
+                                ..k
+                            },
+                        )
+                    })
+                },
+            )
+        })
+        .collect();
+    let seen = crate::common::par_map(&runs, |&(take, frame_ms, echo_ms, knobs)| {
+        let h = Host::replay(&TAKES[take], knobs);
+        (take, frame_ms, echo_ms, knobs.brand, pose_runs(&h.shots))
+    });
+    let mut changes = 0;
+    for (take, frame_ms, echo_ms, brand, runs) in &seen {
+        changes += runs.len();
+        let flashes: Vec<_> = runs
+            .iter()
+            .filter(|(_, before, pose, after, dur)| {
+                let stand = pose == "pet_stand" || pose == "pet_stand_ear";
+                *dur < POSE_MS
+                    || (stand && (before == "leg" || after == "leg") && (*dur as f32) < STRIDE_MS)
+            })
+            .collect();
+        assert!(
+            flashes.is_empty(),
+            "{} at {frame_ms} ms a frame, echo +{echo_ms} ms{}: {} of {} poses flashed \
+             (ms it began, before, pose, after, ms on glass): {:?}",
+            TAKES[*take].name,
+            if *brand { ", harness" } else { "" },
+            flashes.len(),
+            runs.len(),
+            &flashes[..flashes.len().min(6)]
+        );
+    }
+    assert!(changes > 400, "the takes change pose ({changes} changes)");
+}
+
+/// Each place the body on the ground turned back within 600 ms of setting out
+/// (half a cell or more each way), while the caret went one way only from
+/// 600 ms before to 300 ms after: `(ms it set out, from col, to col)`. A
+/// landing (its skid) and the air are not the ground's.
+fn turns_against_the_writing(shots: &[Shot]) -> Vec<(u64, f32, f32)> {
+    let ground: Vec<&Shot> = shots
+        .iter()
+        .filter(|s| {
+            s.frame.alpha > 0
+                && s.frame.lift == 0.0
+                && !matches!(s.frame.action, PetAction::Leap | PetAction::Land)
+        })
+        .collect();
+    let at = |s: &Shot| f32::from(s.caret.0) * 1_000.0 + f32::from(s.caret.1);
+    let mut turns = Vec::new();
+    let Some(first) = ground.first() else {
+        return turns;
+    };
+    let (mut dir, mut anchor, mut since) = (0.0f32, first.frame.col, first.ms);
+    for (i, g) in ground.iter().enumerate().skip(1) {
+        let prev = ground[i - 1];
+        if g.ms - prev.ms > 100 || (g.frame.row - prev.frame.row).abs() > 0.3 {
+            (dir, anchor, since) = (0.0, g.frame.col, g.ms);
+            continue;
+        }
+        let d = g.frame.col - anchor;
+        if d.abs() < 0.5 {
+            continue;
+        }
+        if dir != 0.0 && d.signum() != dir && g.ms - since <= 600 {
+            let window: Vec<f32> = shots
+                .iter()
+                .filter(|s| s.ms + 600 >= since && s.ms <= g.ms + 300)
+                .map(at)
+                .collect();
+            let one_way =
+                window.windows(2).all(|w| w[1] >= w[0]) || window.windows(2).all(|w| w[1] <= w[0]);
+            let moved = window.first() != window.last();
+            if one_way && moved {
+                turns.push((since, anchor, g.frame.col));
+            }
+        }
+        (dir, anchor, since) = (d.signum(), g.frame.col, g.ms);
+    }
+    turns
+}
+
+/// THE PET NEVER TURNS BACK WHILE THE WRITING RUNS ONE WAY. Typed toward a
+/// cat a little ahead of its stand (resting past the harness's mark on the
+/// composer's upper rule, walking to that rest as the hand begins), the cat
+/// waits for the writing and sets out with it. Called back to the stand it
+/// ran toward the caret as the writing began and turned round a moment later
+/// to run with it, five cells back and round again, and with a late echo it
+/// set off at the key and turned when the echo moved the caret (2026-10-22,
+/// the owner's generating replay with the harness on). Over the generating
+/// take with and without aterm's chrome, at 120 and 60 Hz, the echo as
+/// recorded and 150 ms late.
+///
+/// NEGATIVE CONTROL (as run, the cat called back to its stand): with the
+/// harness, three turns at 60 Hz (13.8, 14.0 and 46.6 s), and one at the
+/// late echo's first key.
+#[test]
+fn the_pet_never_turns_back_while_the_writing_runs_one_way() {
+    let harness = Knobs {
+        chips: true,
+        brand: true,
+        ..Knobs::SHIPPED
+    };
+    let chips = Knobs {
+        chips: true,
+        ..Knobs::SHIPPED
+    };
+    let runs: Vec<(&str, Knobs)> = [
+        ("shipped", Knobs::SHIPPED),
+        ("chips", chips),
+        ("harness", harness),
+    ]
+    .into_iter()
+    .flat_map(|(name, k)| {
+        [(8u64, 0u64), (16, 0), (16, 150)]
+            .into_iter()
+            .map(move |(frame_ms, echo_ms)| {
+                (
+                    name,
+                    Knobs {
+                        frame_ms,
+                        echo_ms,
+                        ..k
+                    },
+                )
+            })
+    })
+    .collect();
+    let seen = crate::common::par_map(&runs, |&(name, knobs)| {
+        let h = Host::replay(&TAKES[0], knobs);
+        (name, knobs, turns_against_the_writing(&h.shots))
+    });
+    for (name, knobs, turns) in &seen {
+        assert!(
+            turns.is_empty(),
+            "{name} at {} ms a frame, echo +{} ms: the cat turned back while the caret went one \
+             way (ms, from col, to col): {turns:?}",
+            knobs.frame_ms,
+            knobs.echo_ms
+        );
+    }
+}
+
+/// A FLIGHT THAT LANDS INTO WRITING TOUCHES DOWN. A bound that comes down
+/// while the hand types on (the hand began typing into the composer the cat
+/// was flying to, or typed on across the composer's wrap) lands on the run:
+/// a touch-down, and the chase takes the caret up again. Landed as a bound's
+/// heavy stop, the cat skidded back against the writing and sat out 400 ms of
+/// landing while the caret was typed on past it (2026-10-22, the owner's
+/// generating replay, the windowed composer and the long insert). Over every
+/// take and the
+/// synthetic composers, with and without the harness: a landing with three
+/// keys typed forward in the 600 ms before it lasts no longer than a
+/// touch-down (`kitty_pet::TOUCH_LAND_DUR`, 130 ms, and a frame) and never
+/// slides against the writing.
+///
+/// NEGATIVE CONTROL (as run, the landing chosen at launch): the generating
+/// take's bound across the composer's wrap held its landing 408 ms and slid
+/// 0.8 cells back against the writing.
+#[test]
+fn a_flight_that_lands_into_writing_touches_down() {
+    let harness = Knobs {
+        chips: true,
+        brand: true,
+        ..Knobs::SHIPPED
+    };
+    let window = Take {
+        name: "bracketed",
+        src: "",
+        rows: 40,
+        cols: 120,
+    };
+    let mut runs: Vec<(&str, Knobs, Option<usize>, Option<SyntheticTake>)> = Vec::new();
+    for (kn, k) in [("shipped", Knobs::SHIPPED), ("harness", harness)] {
+        for take in 0..TAKES.len() {
+            runs.push((kn, k, Some(take), None));
+        }
+        runs.push((kn, k, None, Some(bracketed_composer_take)));
+        runs.push((kn, k, None, Some(full_transcript_composer_take)));
+    }
+    let seen = crate::common::par_map(&runs, |&(kn, knobs, take, events)| {
+        let (name, h) = match (take, events) {
+            (Some(t), _) => (TAKES[t].name, Host::replay(&TAKES[t], knobs)),
+            (None, Some(e)) => (
+                "windowed composer",
+                Host::replay_events(&window, knobs, e()),
+            ),
+            _ => unreachable!("a take or a synthetic composer"),
+        };
+        let shots = &h.shots;
+        let mut bad = Vec::new();
+        for i in 1..shots.len() {
+            let (prev, s) = (&shots[i - 1], &shots[i]);
+            if !(prev.frame.action == PetAction::Leap && s.frame.action == PetAction::Land) {
+                continue;
+            }
+            // Three keys typed forward along the caret's row, each within
+            // 600 ms of the last, the last within 600 ms of the landing.
+            let mut keys = 0;
+            let mut last = s.ms;
+            for w in shots[..=i].windows(2).rev() {
+                if w[1].caret == w[0].caret {
+                    continue;
+                }
+                let forward = w[1].caret.0 == w[0].caret.0
+                    && w[1].caret.1 > w[0].caret.1
+                    && w[1].caret.1 - w[0].caret.1 <= 2;
+                if !forward || last - w[1].ms > 600 {
+                    break;
+                }
+                keys += 1;
+                last = w[1].ms;
+            }
+            if keys < 3 {
+                continue;
+            }
+            let end = shots[i..]
+                .iter()
+                .position(|x| x.frame.action != PetAction::Land)
+                .map_or(shots.len() - 1, |k| i + k);
+            let held = shots[end].ms - s.ms;
+            let back = shots[i..end]
+                .iter()
+                .map(|x| s.frame.col - x.frame.col)
+                .fold(0.0f32, f32::max);
+            if held > 130 + 2 * knobs.frame_ms || back > 0.1 {
+                bad.push((s.ms, held, back));
+            }
+        }
+        (kn, name, bad)
+    });
+    for (kn, name, bad) in &seen {
+        assert!(
+            bad.is_empty(),
+            "{name}, {kn}: landings into writing held or slid back (ms, ms held, cells back): \
+             {bad:?}"
+        );
     }
 }

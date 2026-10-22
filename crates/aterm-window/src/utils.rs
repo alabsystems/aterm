@@ -19,6 +19,7 @@ pub(crate) struct Lazy<T> {
 }
 
 impl<T> Lazy<T> {
+    #[inline]
     pub const fn new(f: fn() -> T) -> Self {
         Self { cell: OnceLock::new(), init: f }
     }

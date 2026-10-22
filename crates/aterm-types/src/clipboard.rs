@@ -22,7 +22,9 @@ pub enum ClipboardSelection {
 
 impl ClipboardSelection {
     /// Parse a selection character.
-    pub fn from_char(c: char) -> Option<Self> {
+    #[inline]
+    #[must_use]
+    pub const fn from_char(c: char) -> Option<Self> {
         // Explicit digit arms, not `c as u8 - b'0'`: the Trust model checker refutes the
         // guarded subtraction.
         match c {
@@ -43,7 +45,9 @@ impl ClipboardSelection {
     }
 
     /// Convert to selection character.
-    pub fn to_char(self) -> char {
+    #[inline]
+    #[must_use]
+    pub const fn to_char(self) -> char {
         match self {
             ClipboardSelection::Clipboard => 'c',
             ClipboardSelection::Primary => 'p',
@@ -53,7 +57,7 @@ impl ClipboardSelection {
                 // Clamp by branch and a saturating add that cannot saturate: no panic path
                 // for the Trust model checker to refute.
                 let n = if n < 8 { n } else { 7 };
-                char::from(b'0'.saturating_add(n))
+                b'0'.saturating_add(n) as char
             }
         }
     }

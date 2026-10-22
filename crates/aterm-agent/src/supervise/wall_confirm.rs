@@ -1533,6 +1533,10 @@ pub(super) fn same_rows(a: &[String], b: &[String]) -> bool {
 /// transcript, gets no act).
 pub(super) const OWNER_ROWS: u64 = 400;
 
+/// The rows [`Session::rows_up_to_at`] read above the screen, oldest first,
+/// and the absolute row of the screen's first row (`None` on the alternate
+/// screen, whose archive has no absolute rows).
+pub(super) type RowsAbove = (Vec<String>, Option<u64>);
 impl<C: Ctl> Session<'_, C> {
     /// THE WALL OF `reading` CONFIRMED, or taken out of it (module docs). At
     /// a decision's read ([`Check::Decide`]) a Claude Code's wall (not its
@@ -2362,8 +2366,21 @@ impl<C: Ctl> Session<'_, C> {
         rows: &[String],
         stop: &dyn Fn(&str) -> bool,
     ) -> Result<Option<Vec<String>>, Fail> {
+        Ok(self.rows_up_to_at(rows, stop)?.map(|(above, _)| above))
+    }
+
+    /// [`Self::rows_up_to`], and the ABSOLUTE ROW of the screen's first row
+    /// (`search`'s `screen_first=`, `line`'s coordinates), the rows above it
+    /// counting down from it: what a reader of their cells addresses (`cell
+    /// abs=<n>`). `None` for it on the alternate screen, whose archive has no
+    /// such rows.
+    pub(super) fn rows_up_to_at(
+        &mut self,
+        rows: &[String],
+        stop: &dyn Fn(&str) -> bool,
+    ) -> Result<Option<RowsAbove>, Fail> {
         if self.alt_screen_now()? {
-            return self.archived_up_to(rows, stop);
+            return Ok(self.archived_up_to(rows, stop)?.map(|above| (above, None)));
         }
         let screen_first = |s: &mut Self| -> Result<Option<u64>, Fail> {
             let r = s.call(&["search"])?;
@@ -2380,7 +2397,7 @@ impl<C: Ctl> Session<'_, C> {
         // No history above the screen: nothing to read, and nothing read to
         // hold against the screen again.
         if first == 0 {
-            return Ok(Some(Vec::new()));
+            return Ok(Some((Vec::new(), Some(first))));
         }
         let mut above = Vec::new();
         let mut at = first;
@@ -2409,7 +2426,7 @@ impl<C: Ctl> Session<'_, C> {
             return Ok(None);
         }
         above.reverse();
-        Ok(Some(above))
+        Ok(Some((above, Some(first))))
     }
 
     /// The rows of the ALTERNATE screen's archive right above the screen

@@ -92,10 +92,12 @@ pub(crate) struct Map {
 }
 
 impl Map {
-    pub(crate) fn global_mask(&self) -> u32 {
+    #[inline]
+    pub(crate) const fn global_mask(&self) -> u32 {
         self.global_mask
     }
 
+    #[inline]
     fn feature(&self, tag: Tag) -> Option<&FeatureMap> {
         self.features
             .binary_search_by_key(&tag, |f| f.tag)
@@ -103,14 +105,17 @@ impl Map {
             .and_then(|i| self.features.get(i))
     }
 
+    #[inline]
     pub(crate) fn get_1_mask(&self, tag: Tag) -> u32 {
         self.feature(tag).map_or(0, |f| f.one_mask)
     }
 
-    pub(crate) fn stages(&self) -> &[StageMap] {
-        &self.stages
+    #[inline]
+    pub(crate) const fn stages(&self) -> &[StageMap] {
+        self.stages.as_slice()
     }
 
+    #[inline]
     pub(crate) fn stage_lookups(&self, stage: usize) -> &[LookupMap] {
         let start = stage
             .checked_sub(1)

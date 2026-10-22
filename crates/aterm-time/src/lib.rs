@@ -92,6 +92,7 @@ macro_rules! wasm_clock_host {
 /// before the epoch has no one right answer, so each caller writes its own
 /// fallback.
 #[must_use]
+#[inline]
 pub fn since_epoch() -> Option<Duration> {
     let Ok(d) = SystemTime::now().duration_since(UNIX_EPOCH) else {
         return None;
@@ -101,6 +102,7 @@ pub fn since_epoch() -> Option<Duration> {
 
 /// Whole seconds since the Unix epoch ([`since_epoch`]), `None` before it.
 #[must_use]
+#[inline]
 pub fn unix_secs() -> Option<u64> {
     since_epoch().map(|d| d.as_secs())
 }
@@ -108,6 +110,7 @@ pub fn unix_secs() -> Option<u64> {
 /// Milliseconds since the Unix epoch ([`since_epoch`]), saturating at
 /// `u64::MAX`; `None` before it.
 #[must_use]
+#[inline]
 pub fn unix_millis() -> Option<u64> {
     since_epoch().map(duration_to_millis_saturating)
 }
@@ -125,6 +128,7 @@ pub const MICROS_PER_SEC: u64 = 1_000_000;
 
 /// Convert a [`Duration`] to whole milliseconds, saturating at `u64::MAX`.
 #[must_use]
+#[inline]
 pub const fn duration_to_millis_saturating(d: Duration) -> u64 {
     let secs_ms = d.as_secs().saturating_mul(MILLIS_PER_SEC);
     let sub_ms = (d.subsec_nanos() / NANOS_PER_MILLI) as u64;
@@ -133,6 +137,7 @@ pub const fn duration_to_millis_saturating(d: Duration) -> u64 {
 
 /// Convert a [`Duration`] to whole microseconds, saturating at `u64::MAX`.
 #[must_use]
+#[inline]
 pub const fn duration_to_micros_saturating(d: Duration) -> u64 {
     let secs_us = d.as_secs().saturating_mul(MICROS_PER_SEC);
     let sub_us = (d.subsec_nanos() / NANOS_PER_MICRO) as u64;
@@ -142,6 +147,7 @@ pub const fn duration_to_micros_saturating(d: Duration) -> u64 {
 /// Split whole milliseconds since epoch into `(secs, subsec_nanos)` where
 /// `subsec_nanos < 1_000_000_000`.
 #[must_use]
+#[inline]
 pub const fn split_millis_to_secs_nanos(millis: u64) -> (u64, u32) {
     let secs = millis / MILLIS_PER_SEC;
     let rem_ms = (millis % MILLIS_PER_SEC) as u32;
@@ -151,6 +157,7 @@ pub const fn split_millis_to_secs_nanos(millis: u64) -> (u64, u32) {
 /// Split whole microseconds since epoch into `(secs, subsec_nanos)` where
 /// `subsec_nanos < 1_000_000_000`.
 #[must_use]
+#[inline]
 pub const fn split_micros_to_secs_nanos(micros: u64) -> (u64, u32) {
     let secs = micros / MICROS_PER_SEC;
     let rem_us = (micros % MICROS_PER_SEC) as u32;
@@ -160,6 +167,7 @@ pub const fn split_micros_to_secs_nanos(micros: u64) -> (u64, u32) {
 /// Construct a [`Duration`] from `(secs, subsec_nanos)`, rejecting
 /// non-canonical `subsec_nanos >= 1_000_000_000`.
 #[must_use]
+#[inline]
 pub const fn duration_from_canonical_parts(secs: u64, subsec_nanos: u32) -> Option<Duration> {
     if subsec_nanos >= NANOS_PER_SEC {
         return None;
@@ -171,6 +179,7 @@ pub const fn duration_from_canonical_parts(secs: u64, subsec_nanos: u32) -> Opti
 /// a 12-byte little-endian wire representation. Returns `None` if
 /// `subsec_nanos >= 1_000_000_000`.
 #[must_use]
+#[inline]
 pub const fn encode_timestamp_96_le(secs: u64, subsec_nanos: u32) -> Option<[u8; 12]> {
     if subsec_nanos >= NANOS_PER_SEC {
         return None;
@@ -194,6 +203,7 @@ pub const fn encode_timestamp_96_le(secs: u64, subsec_nanos: u32) -> Option<[u8;
 /// Decode a 12-byte little-endian `(secs: u64, subsec_nanos: u32)` wire
 /// timestamp, rejecting non-canonical `subsec_nanos >= 1_000_000_000`.
 #[must_use]
+#[inline]
 pub const fn decode_timestamp_96_le(wire: &[u8; 12]) -> Option<(u64, u32)> {
     let secs = (wire[0] as u64)
         | ((wire[1] as u64) << 8)
@@ -217,6 +227,7 @@ pub const fn decode_timestamp_96_le(wire: &[u8; 12]) -> Option<(u64, u32)> {
 /// a 12-byte big-endian wire representation. Returns `None` if
 /// `subsec_nanos >= 1_000_000_000`.
 #[must_use]
+#[inline]
 pub const fn encode_timestamp_96_be(secs: u64, subsec_nanos: u32) -> Option<[u8; 12]> {
     if subsec_nanos >= NANOS_PER_SEC {
         return None;
@@ -240,6 +251,7 @@ pub const fn encode_timestamp_96_be(secs: u64, subsec_nanos: u32) -> Option<[u8;
 /// Decode a 12-byte big-endian `(secs: u64, subsec_nanos: u32)` wire
 /// timestamp, rejecting non-canonical `subsec_nanos >= 1_000_000_000`.
 #[must_use]
+#[inline]
 pub const fn decode_timestamp_96_be(wire: &[u8; 12]) -> Option<(u64, u32)> {
     let secs = ((wire[0] as u64) << 56)
         | ((wire[1] as u64) << 48)
@@ -262,6 +274,7 @@ pub const fn decode_timestamp_96_be(wire: &[u8; 12]) -> Option<(u64, u32)> {
 /// Advance a monotonic millisecond watermark `last_ms` given an observed
 /// `candidate_ms`, never moving backward.
 #[must_use]
+#[inline]
 pub const fn monotonic_watermark_ms(last_ms: u64, candidate_ms: u64) -> u64 {
     if candidate_ms > last_ms {
         candidate_ms
@@ -272,6 +285,7 @@ pub const fn monotonic_watermark_ms(last_ms: u64, candidate_ms: u64) -> u64 {
 
 /// Remaining milliseconds until `deadline_ms` at `now_ms` (`0` if expired).
 #[must_use]
+#[inline]
 pub const fn deadline_remaining_ms(now_ms: u64, deadline_ms: u64) -> u64 {
     deadline_ms.saturating_sub(now_ms)
 }

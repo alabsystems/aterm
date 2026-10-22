@@ -46,6 +46,7 @@ impl<T: ClassType> Retained<T> {
     /// # Safety
     /// `id` must be a +1 reference to a live instance of `T`'s class (or a
     /// subclass), or null.
+    #[inline]
     #[must_use]
     pub unsafe fn from_owned(id: Id) -> Option<Self> {
         NonNull::new(id.cast::<T>()).map(|ptr| Self {
@@ -58,6 +59,7 @@ impl<T: ClassType> Retained<T> {
     ///
     /// # Safety
     /// `id` must be a live instance of `T`'s class (or a subclass), or null.
+    #[inline]
     #[must_use]
     pub unsafe fn retain(id: Id) -> Option<Self> {
         // SAFETY: `id` is live or null; `crate::Obj::retain` null-checks and
@@ -70,11 +72,12 @@ impl<T: ClassType> Retained<T> {
     /// The raw `id`, borrowed. Does not transfer ownership.
     #[inline]
     #[must_use]
-    pub fn as_id(&self) -> Id {
+    pub const fn as_id(&self) -> Id {
         Id::from_ptr(self.ptr.as_ptr().cast())
     }
 
     /// A second +1 handle to the same object.
+    #[inline]
     #[must_use]
     pub fn clone_retained(&self) -> Self {
         // SAFETY: `self` holds a live +1, so the pointer is a live instance;
@@ -83,6 +86,7 @@ impl<T: ClassType> Retained<T> {
     }
 
     /// Give up ownership without releasing — the caller inherits the +1.
+    #[inline]
     #[must_use]
     pub fn into_raw(self) -> Id {
         let id = self.as_id();
@@ -95,6 +99,7 @@ impl<T: ClassType> Retained<T> {
     /// The typed twin of [`crate::Obj::autorelease`]: what a declared method
     /// returning an object owes its caller (objc2's `#[method_id]`), e.g. the
     /// `NSToolbarDelegate` item returns.
+    #[inline]
     #[must_use]
     pub fn autorelease(self) -> Id {
         // SAFETY: `into_raw` hands over the one +1 without releasing;

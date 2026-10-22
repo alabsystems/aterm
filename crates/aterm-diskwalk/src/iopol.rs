@@ -67,6 +67,7 @@ pub fn set_thread_materialize_policy(policy: MaterializePolicy) -> Result<(), i3
 /// # Errors
 ///
 /// The errno, for the caller to log; startup proceeds either way.
+#[inline]
 pub fn main_thread_never_materializes() -> Result<(), i32> {
     set_thread_materialize_policy(MaterializePolicy::Off)
 }

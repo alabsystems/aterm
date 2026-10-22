@@ -41,6 +41,7 @@ use aterm_time::Instant;
 
 /// The predictor's one clock read, for every export below: the real monotonic
 /// clock, or the instant a test pinned ([`pin_clock`]).
+#[inline]
 fn clock() -> Instant {
     #[cfg(test)]
     if let Some(at) = PINNED_CLOCK.with(std::cell::Cell::get) {
@@ -77,6 +78,7 @@ pub(crate) struct PredRows {
 impl PredRows {
     /// Refill the extracted row from visible row `row` of `term`: the frame's
     /// own extraction of it (`Terminal::logical_row_into`).
+    #[inline]
     fn read(&mut self, term: &Terminal, row: u16) {
         self.logical = term.logical_row_into(
             usize::from(row),
@@ -92,6 +94,7 @@ impl PredRows {
     /// the implicit blank. The press's row and the reconcile's observe both read
     /// through here, so the tail guard compares like with like (aterm-gui's
     /// `predict_seen` is the native twin).
+    #[inline]
     fn seen(&self, col: usize) -> Seen {
         let Some(cell) = self.cells.get(col) else {
             return Seen::Blank;

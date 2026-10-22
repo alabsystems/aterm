@@ -35,6 +35,7 @@ pub mod hardware;
 pub mod init;
 pub mod init_accounts;
 pub mod init_activation;
+pub mod init_clt;
 pub mod init_github;
 pub mod init_preferences;
 pub mod init_secrets;

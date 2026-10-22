@@ -7453,8 +7453,8 @@ fn a_gemini_workers_own_restart_is_relaunched_whoever_typed_before_it() {
     assert_eq!(relaunched, ["s-g"], "its own restart: attempted");
     assert_eq!(
         left,
-        ["crashed"],
-        "owed as a crash is, for the lane to tell apart"
+        ["restarted"],
+        "owed as a crash is, kept as its own restart for the lane (R2 of the review of 3a4586a01e)"
     );
     // Its first try waits out the person's grace, which its line holds for
     // (live: tries at 1, 10 and 60 s held, the next ten minutes on).
@@ -40170,6 +40170,34 @@ fn the_first_disk_reading_runs_beside_the_host_start() {
         got.as_deref(),
         Some(state.as_path()),
         "the caller's state directory"
+    );
+}
+
+/// `agents_auto_prime = false` gates the Claude Code defaults (`base.agents.claude-defaults`,
+/// docs/DESIGN-init-system-2026-10-20.md §4.2): the window's sweep leaves a settings file
+/// with no legacy hook byte for byte as it was. NEGATIVE CONTROL: on, the same sweep adds
+/// the defaults to the same file.
+#[test]
+fn agents_auto_prime_off_leaves_the_claude_settings_byte_identical() {
+    let home = aterm_tempfile::TempDir::new().expect("scratch home");
+    let settings = home.path().join(".claude/settings.json");
+    std::fs::create_dir_all(settings.parent().unwrap()).unwrap();
+    let mine = b"{\n    \"model\":   \"opus\",\n  \"theme\": \"dark\"\n}\n";
+    std::fs::write(&settings, mine).unwrap();
+
+    sweep_claude_settings_in(home.path(), false);
+    assert_eq!(std::fs::read(&settings).unwrap(), mine, "nothing written");
+    let backups: Vec<_> = std::fs::read_dir(settings.parent().unwrap())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+    assert_eq!(backups.len(), 1, "no backup either: {backups:?}");
+
+    sweep_claude_settings_in(home.path(), true);
+    let primed = std::fs::read_to_string(&settings).unwrap();
+    assert!(
+        primed.contains("\"effortLevel\"") && primed.contains("\"model\""),
+        "on, the defaults join the person's own: {primed}"
     );
 }
 

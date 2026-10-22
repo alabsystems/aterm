@@ -371,6 +371,12 @@ pub struct KnobContext {
     /// The classic wake draws its one-colour face (a trail colour is set, or
     /// the old `classic mono` spelling is saved).
     pub classic_tinted: bool,
+    /// The move crosses letters only (a shell's completion over the text it
+    /// prints): on a dark ground Fire's streak lays no light over a line of
+    /// text and its meteor ignores `Length`, so the path `Length` cuts shows
+    /// nowhere. `false` is a move over blank cells, where every style that
+    /// reads `Length` shows it.
+    pub over_text: bool,
 }
 
 impl KnobContext {
@@ -385,6 +391,7 @@ impl KnobContext {
             bar,
             ring: true,
             classic_tinted: true,
+            over_text: false,
         }
     }
 }
@@ -424,7 +431,8 @@ impl GlowStyle {
         match knob {
             TrailKnob::Length => match self {
                 RainbowKitty | Laser | Beam | Water => false,
-                Lumen | Sparkle | Phaser | Fire | Comet | Classic => true,
+                Fire => !(ctx.over_text && ctx.dark),
+                Lumen | Sparkle | Phaser | Comet | Classic => true,
             },
             // On a light ground only Lumen (its glow behind the caret) and
             // Classic (its crown as one ink mark on the caret's row) draw a
@@ -456,6 +464,7 @@ impl GlowStyle {
                 bar: false,
                 ring: false,
                 classic_tinted: false,
+                over_text: false,
             },
         )
     }

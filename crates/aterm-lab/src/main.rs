@@ -35,8 +35,14 @@
 //!
 //! # Where things are
 //!
-//! State is untracked, in `$LAB_STATE` (default `target/real-claude-lab/` of
-//! the checkout): `runs/<tag>/` a lab that is up, `logs/<tag>-<time>/` what
+//! State is untracked, in `$LAB_STATE` (default
+//! `/private/tmp/at.lab-<uid>/<checkout>-<hash>/`, one per checkout, outside
+//! every home: the jail fences the homes' contents whole, and the harness's
+//! tape store opens each directory from `/` down to a run's state root, so a
+//! `LAB_STATE` inside a home is refused; the default is made this user's
+//! private directory, a link or another user's directory in its place
+//! refused; macOS clears `/private/tmp` of what nobody used for days, so a
+//! `LAB_STATE` keeps what must last): `runs/<tag>/` a lab that is up, `logs/<tag>-<time>/` what
 //! `down` keeps (stub log, the tripwire's log with the account masked, the
 //! egress witness, the harness journal, the jail profile, the aterm log, the
 //! relay's log, the settings witness's log, and what the [`stats`] readers read: Claude Code's debug log,
@@ -146,7 +152,7 @@
 //! `aterm.toml`, so a root key applies), `LAB_COLS`/`LAB_LINES`, `LAB_SCALE`,
 //! `LAB_PROXY=dead` (the proxy at the dead port 9), `LAB_CLAUDE`, `LAB_CODEX`,
 //! `LAB_CODEX_MODEL` (Codex's `model`), `LAB_GEMINI`, `LAB_AGY`, `LAB_MUSE`, `LAB_ATERM`, `LAB_STATE` (checked
-//! first: never in the owner's data, never with a quote or a backslash, never
+//! first: never inside a home, never with a quote or a backslash, never
 //! relative), `LAB_INSTANCE_ENV='TMPDIR=/tmp ATERM_DEBUG_PASTE_FILE=…'`
 //! (variables for the lab's OWN instance alone, at `up` and at every relaunch
 //! of it, recorded in `env.sh`: `TMPDIR` and the `ATERM_DEBUG_*` dev seams
@@ -205,17 +211,17 @@
 //!   quiet. A control-socket write never counts as a person.
 //! * Claude Code takes more than five seconds to re-read settings: wait nine
 //!   after `settings` before the turn that needs the rule.
-//! * A project made under the scratch home sits wherever `LAB_STATE` does; in a
-//!   linked worktree that is inside the repository, and Claude Code reads the
-//!   MAIN checkout's `.claude/settings.local.json` for it. Set `LAB_STATE`
-//!   outside every repository before making one there.
+//! * A project made under the scratch home sits wherever `LAB_STATE` does (the
+//!   default is outside every repository); a `LAB_STATE` in a linked
+//!   worktree is inside the repository, and Claude Code reads the MAIN
+//!   checkout's `.claude/settings.local.json` for it.
 //! * `down` ends everything in the lab's jail, found by its mark (an orphan, a
 //!   Claude the harness relaunched, a codex-run's leftover too), and the witness
 //!   last, once the jail is empty.
 //!
 //! # Outside any lab
 //!
-//! Five verbs start a private aterm of their own, with no jail and no stub
+//! These verbs start a private aterm of their own, with no jail and no stub
 //! ([`instance`]: a scratch HOME and XDG dirs, the automatic lanes off, the
 //! control socket its only door, a lifeline):
 //!
@@ -237,6 +243,11 @@
 //!   round trip), in the single pane and then a split pane, holding every
 //!   frame that painted a prediction to the screen the far end's own output
 //!   settles to ([`predict_live`]); `--headless` runs the press path alone;
+//! * `aos-repair` opens ONE window and runs Aos M2's live repair in it: the
+//!   momentum glow attached under the demonstration fault, typed hot, witnessed
+//!   stranded past its cold instant by reads that repaint nothing, repaired to
+//!   the shipped code, then cleared, and fresh keys cleared again with no
+//!   further replay ([`aos_repair`]); `--control` is the shipped code alone;
 //! * `codex-alab-proof` proves the codex-alab native harness end to end on
 //!   the real package ([`codex_alab_proof`], its jail, fake model and
 //!   stand-ins in [`codex_rig`], its scripted model in [`codex_alab_model`]):
@@ -290,6 +301,8 @@
 
 #[cfg(target_os = "macos")]
 mod abrew_admission;
+#[cfg(target_os = "macos")]
+mod aos_repair;
 #[cfg(target_os = "macos")]
 mod band;
 #[cfg(target_os = "macos")]
@@ -492,7 +505,7 @@ usage: targo --unverified lab <command> [tag] [args]   (tag defaults to $LAB_TAG
                                  LAB_FIRST_RUN=1 LAB_RESTORE=1 LAB_HARNESS_KEYS='continue = false' LAB_ATERM_TOML LAB_COLS LAB_LINES
                                  LAB_SCALE LAB_PROXY=dead LAB_CLAUDE=/path/to/claude LAB_CODEX=/path/to/codex
                                  LAB_GEMINI=/path/to/gemini LAB_AGY=/path/to/agy LAB_MUSE=/path/to/muse
-                                 LAB_ATERM=/physical/path/to/aterm LAB_STATE=/absolute/dir
+                                 LAB_ATERM=/physical/path/to/aterm LAB_STATE=/absolute/dir/outside/every/home
                                  LAB_INSTANCE_ENV='TMPDIR=/abs ATERM_DEBUG_<NAME>=V ATERM_DEV_<NAME>=V': handed to the lab's
                                  own instance at every launch of it, recorded at up; TMPDIR and dev seams only, never a name
                                  the lab sets;
@@ -659,7 +672,7 @@ usage: targo --unverified lab <command> [tag] [args]   (tag defaults to $LAB_TAG
                                  step=done:landing past the waits and busy:another-sweep). A hold or Land the live
                                  instance's journal never carries on the tab within 30 s fails the run before aterm ends
                                  (1); a tab under Land before --land or --land-open sets it cannot run (3).
-  forever --harness <claude|gemini|agy|muse|all> [--mode land|cruise|both|cover|cap|wall|wall-hid|wall-day|wall-climb] [--chains a,b] [--no-surfaces] [--window] [tag] [--keep]   FOREVER LAND and FOREVER
+  forever --harness <claude|gemini|agy|muse|all> [--mode land|cruise|both|cover|cap|wall|wall-hid|wall-day|wall-climb|resid|ladder] [--chains a,b] [--no-surfaces] [--window] [tag] [--keep]   FOREVER LAND and FOREVER
                                  CRUISE live on a supervised harness: the real TUI on a lab of its own (all: one after
                                  another, <tag>-<harness>), a tab per scenario chain, each in a scratch git repository
                                  pushed to a local bare origin and left as the chain says, its Autopilot set, the stub
@@ -877,6 +890,13 @@ Outside any lab (no jail, no stub):
                                  the WCAG contrast of a frame's cells as JSON (ink and ground from its clean twin), its
                                  caret against the page and the pixels the effects changed outside it; reads the
                                  sidecars trail-gallery writes; exit 1 when a threshold fails, 2 usage or file; --help
+  aos-repair [--aterm PATH] [--control] [--keep] [--out DIR]
+                                 OPENS A WINDOW: Aos M2's live repair on one private windowed aterm (a debug build): the
+                                 momentum glow attached under the demo-stranded-settle fault, 24 keys typed, the stranded
+                                 glow witnessed past its cold instant by reads that repaint nothing, `aos repair
+                                 code=shipped`, the clearing frame, 12 fresh keys that clear by themselves (~25 s);
+                                 --control attaches the shipped code and requires it to clear by itself; one result line;
+                                 exit 0 every gate passed, 1 a gate failed, 2 usage, 3 not run; --help
   resource-attribution [--aterm PATH]  private two-tab delegated resource check
   presence-flap --window|--headless [--aterm PATH] [--client PATH] [--phases \"A H B D T X\"] [--trials N] [--keep]
                                  OPENS A WINDOW: one private windowed aterm running a Claude-Code-shaped stand-in, driven
@@ -1106,6 +1126,7 @@ fn dispatch(cmd: &str, args: &[String]) -> Res {
         "disk-lane" => disk_lane::cmd_disk_lane(args),
         "trail-gallery" => trail_gallery::cmd_trail_gallery(args),
         "trail-contrast" => trail_contrast::cmd_trail_contrast(args),
+        "aos-repair" => aos_repair::cmd_aos_repair(args),
         "presence-flap" => presence::cmd_presence_flap(args),
         "meta-keys" => meta_keys::cmd_meta_keys(args),
         "predict-live" => predict_live::cmd_predict_live(args),
@@ -1130,13 +1151,17 @@ fn dispatch(cmd: &str, args: &[String]) -> Res {
 }
 
 /// Before anything is made: the owner's home must be known (the account's,
-/// or `HOME`'s), and the state dir must be quotable in a sandbox profile and
-/// must not sit in the data of any home the jail guards.
+/// or `HOME`'s), and the state dir must be quotable in a sandbox profile,
+/// must sit outside every home the jail guards (whose fence its runs'
+/// tapes could not get through: [`paths::Paths::need_state_outside`]), and,
+/// when it is the default one, is made this user's private directory
+/// ([`paths::Paths::need_state`], which every verb that makes something in
+/// the state dir goes through, one this check skips among them).
 #[cfg(target_os = "macos")]
 fn check_state_dir() -> Result<(), Fail> {
     let p = paths::paths();
-    p.need_state()?;
     let homes = p.need_guarded_homes()?;
+    p.need_state_outside(&homes)?;
     let s = p.state.to_string_lossy();
     if !paths::profile_safe(&s) {
         return Err(Fail::die(format!(
@@ -1148,6 +1173,7 @@ fn check_state_dir() -> Result<(), Fail> {
             "LAB_STATE may not sit inside the owner's data ({s})"
         )));
     }
+    p.need_state()?;
     Ok(())
 }
 
@@ -1202,7 +1228,9 @@ fn main() -> std::process::ExitCode {
                     // calling shell inherited from them before any thread starts.
                     sys::forget_env(paths::forgotten);
                     sys::confine_env();
-                    // These read files or print and make nothing: no state dir to check.
+                    // These read files or print and make nothing: no state dir to check
+                    // (`fleet-sim` writes its record through `need_state`, which makes the
+                    // default private first).
                     let r = if matches!(
                         cmd.as_str(),
                         "" | "help"

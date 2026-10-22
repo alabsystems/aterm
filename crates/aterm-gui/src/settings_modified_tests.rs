@@ -1754,8 +1754,11 @@ fn a_reset_that_leaves_a_keyword_toy_held_off_says_it_is_still_off() {
 /// Top Settings, Sound, search and Modified, saved On or Off, a Music
 /// effects, Sparkle words or Keyword kitties switch that reads Off says that
 /// turning it on turns Serious Mode off, and its press writes Serious Mode
-/// away. Negative control: Music effects saved On on Modified reads On, is
-/// "inactive" because of Serious Mode, and its press keeps Serious Mode.
+/// away, where nothing can sound as well (Linux, Windows: the note beside
+/// "Audio unavailable"). Negative control: Music effects saved On on
+/// Modified reads On, is "inactive" because of Serious Mode (or of no audio
+/// output), never says its press turns Serious Mode off, and its press keeps
+/// Serious Mode.
 #[test]
 fn every_top_effect_switch_under_serious_mode_says_what_its_press_does() {
     let leaves = |patch: &ConfigPatch| {
@@ -1829,8 +1832,18 @@ fn every_top_effect_switch_under_serious_mode_says_what_its_press_does() {
         SettingsAvailability::for_state(state),
         state.presented_motion.get(),
     );
+    // Held back by Serious Mode — or, where nothing can sound
+    // (`trail_audio::output_available`), by that, the one reason a setting
+    // does nothing that its row gives.
     assert!(
-        effect_note_contains(&effect, "Currently inactive because Serious Mode"),
+        effect_note_contains(
+            &effect,
+            if crate::trail_audio::output_available() {
+                "Currently inactive because Serious Mode"
+            } else {
+                "Cursor-trail audio output is unavailable on this platform"
+            }
+        ) && !effect_note_contains(&effect, "turns Serious Mode off"),
         "{effect:?}"
     );
     let (patch, _) = lab
@@ -2377,7 +2390,7 @@ fn a_written_setting_is_the_same_row_in_search_and_modified() {
             "{key}: Search draws a row iff Modified does"
         );
         assert_eq!(
-            manual_search_matching_keys(lab.state(), key)
+            manual_search_matching_keys(lab.state(), SearchQuery::of(lab.state(), key))
                 .iter()
                 .any(|listed| listed == key),
             toml,

@@ -124,6 +124,7 @@ pub struct HolderRepr {
 
 impl HolderRepr {
     /// Whether no mark, anchor or seed uncertainty needs carrying.
+    #[inline]
     #[must_use]
     pub fn is_empty(&self) -> bool {
         *self == Self::default()

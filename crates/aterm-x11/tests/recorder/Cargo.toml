@@ -31,5 +31,5 @@ publish = false
 [workspace]
 
 [dependencies]
-x11rb-protocol = { version = "=0.13.2", default-features = false, features = ["std", "shm", "resource_manager", "randr", "xinput"] }
+x11rb-protocol = { version = "=0.13.2", default-features = false, features = ["std", "shm", "resource_manager", "randr", "sync", "xinput"] }
 x11rb = { version = "=0.13.2", default-features = false }

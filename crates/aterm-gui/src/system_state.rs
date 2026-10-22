@@ -1085,6 +1085,7 @@ impl SystemStateApp {
                         visual_value: None,
                         input: Some(input.clone()),
                         swatch: None,
+                        swatch_line: false,
                         trailing_hint: None,
                         description: None,
                         end_button: false,

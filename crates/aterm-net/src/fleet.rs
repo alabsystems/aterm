@@ -213,6 +213,7 @@ pub enum FleetScope {
 
 impl FleetScope {
     /// The scope's word on the wire.
+    #[inline]
     #[must_use]
     pub const fn word(self) -> &'static str {
         match self {
@@ -222,6 +223,7 @@ impl FleetScope {
     }
 
     /// The scope a wire word names, if this aterm knows it.
+    #[inline]
     #[must_use]
     pub fn from_word(word: &str) -> Option<Self> {
         [Self::Facts, Self::Content]
@@ -271,6 +273,7 @@ pub enum FleetOp {
 
 impl FleetOp {
     /// The op's word on the wire.
+    #[inline]
     #[must_use]
     pub const fn word(self) -> &'static str {
         match self {
@@ -282,6 +285,7 @@ impl FleetOp {
     }
 
     /// The op a wire word names, if this aterm knows it.
+    #[inline]
     #[must_use]
     pub fn from_word(word: &str) -> Option<Self> {
         [Self::Survey, Self::Book, Self::Join, Self::Drive]
@@ -328,6 +332,7 @@ impl FleetSecret {
     }
 
     /// The key a dialer proves the op `word` with: `join` has its own.
+    #[inline]
     fn dialer_key(&self, word: &str) -> &[u8; 32] {
         if word == FleetOp::Join.word() {
             &self.join
@@ -386,6 +391,7 @@ impl NodeKey {
     pub const LEN: usize = 32;
 
     /// The key's bytes.
+    #[inline]
     #[must_use]
     pub const fn bytes(&self) -> &[u8; Self::LEN] {
         &self.0
@@ -501,12 +507,14 @@ impl NodeIdentity {
     }
 
     /// Its node id.
+    #[inline]
     #[must_use]
     pub fn node(&self) -> &str {
         &self.node
     }
 
     /// Its public key.
+    #[inline]
     #[must_use]
     pub const fn key(&self) -> NodeKey {
         self.key
@@ -551,6 +559,7 @@ enum Signer {
 }
 
 impl Signer {
+    #[inline]
     const fn label(self) -> &'static [u8] {
         match self {
             Self::Dialer => b"aterm-fleet/v2 node dialer",
@@ -684,6 +693,7 @@ pub enum FleetError {
 
 impl FleetError {
     /// Whether a socket deadline, not the peer, ended a read or write.
+    #[inline]
     fn is_deadline(&self) -> bool {
         match self {
             Self::Tls(e) | Self::Io(e) => matches!(

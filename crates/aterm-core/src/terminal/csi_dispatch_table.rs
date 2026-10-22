@@ -106,7 +106,7 @@ const TABLE_SIZE: usize = 126;
 /// - `0x00` = no intermediates (standard CSI)
 /// - `0x01` = `?$` (two-byte DEC private mode request)
 #[inline]
-pub(crate) fn encode_intermediates(intermediates: &[u8]) -> u8 {
+pub(crate) const fn encode_intermediates(intermediates: &[u8]) -> u8 {
     match intermediates {
         [] => 0x00,
         [b'?', b'$'] => 0x01,
@@ -117,8 +117,8 @@ pub(crate) fn encode_intermediates(intermediates: &[u8]) -> u8 {
 
 /// Compute the hash index for a CSI key.
 #[inline]
-pub(crate) fn csi_hash(intermediate_enc: u8, final_byte: u8) -> usize {
-    let key = (u32::from(intermediate_enc) << 8) | u32::from(final_byte);
+pub(crate) const fn csi_hash(intermediate_enc: u8, final_byte: u8) -> usize {
+    let key = (intermediate_enc as u32) << 8 | final_byte as u32;
     (key.wrapping_mul(HASH_A).wrapping_add(HASH_B) >> HASH_C) as usize % TABLE_SIZE
 }
 

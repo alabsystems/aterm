@@ -24,6 +24,7 @@ pub struct Lookup<'a> {
 }
 
 impl<'a> FromSlice<'a> for Lookup<'a> {
+    #[inline]
     fn parse(data: &'a [u8]) -> Option<Self> {
         let mut s = Stream::new(data);
         let kind = s.read::<u16>()?;
@@ -73,12 +74,13 @@ impl core::fmt::Debug for LookupSubtables<'_> {
 impl<'a> LookupSubtables<'a> {
     /// Returns a number of items in the LookupSubtables.
     #[inline]
-    pub fn len(&self) -> u16 {
+    pub const fn len(&self) -> u16 {
         self.offsets.len()
     }
 
     /// Checks if there are any items.
-    pub fn is_empty(&self) -> bool {
+    #[inline]
+    pub const fn is_empty(&self) -> bool {
         self.offsets.is_empty()
     }
 
@@ -89,6 +91,7 @@ impl<'a> LookupSubtables<'a> {
     /// or [`SubstitutionSubtable`](crate::gsub::SubstitutionSubtable).
     ///
     /// Technically, we can enforce it at compile time, but it makes code too convoluted.
+    #[inline]
     pub fn get<T: LookupSubtable<'a>>(&self, index: u16) -> Option<T> {
         let offset = self.offsets.get(index)?.to_usize();
         let data = self.data.get(offset..)?;
@@ -99,7 +102,8 @@ impl<'a> LookupSubtables<'a> {
     ///
     /// We cannot use `IntoIterator` here, because we have to use user-provided base type.
     #[allow(clippy::should_implement_trait)]
-    pub fn into_iter<T: LookupSubtable<'a>>(self) -> LookupSubtablesIter<'a, T> {
+    #[inline]
+    pub const fn into_iter<T: LookupSubtable<'a>>(self) -> LookupSubtablesIter<'a, T> {
         LookupSubtablesIter {
             data: self,
             index: 0,
@@ -119,6 +123,7 @@ pub struct LookupSubtablesIter<'a, T: LookupSubtable<'a>> {
 impl<'a, T: LookupSubtable<'a>> Iterator for LookupSubtablesIter<'a, T> {
     type Item = T;
 
+    #[inline]
     fn next(&mut self) -> Option<Self::Item> {
         if self.index < self.data.len() {
             self.index += 1;
@@ -137,13 +142,13 @@ pub struct LookupFlags(pub u16);
 #[rustfmt::skip]
 #[allow(missing_docs)]
 impl LookupFlags {
-    #[inline] pub fn right_to_left(self) -> bool { self.0 & 0x0001 != 0 }
-    #[inline] pub fn ignore_base_glyphs(self) -> bool { self.0 & 0x0002 != 0 }
-    #[inline] pub fn ignore_ligatures(self) -> bool { self.0 & 0x0004 != 0 }
-    #[inline] pub fn ignore_marks(self) -> bool { self.0 & 0x0008 != 0 }
-    #[inline] pub fn ignore_flags(self) -> bool { self.0 & 0x000E != 0 }
-    #[inline] pub fn use_mark_filtering_set(self) -> bool { self.0 & 0x0010 != 0 }
-    #[inline] pub fn mark_attachment_type(self) -> u8 { ((self.0 & 0xFF00) >> 8) as u8 }
+    #[inline] pub const fn right_to_left(self) -> bool { self.0 & 0x0001 != 0 }
+    #[inline] pub const fn ignore_base_glyphs(self) -> bool { self.0 & 0x0002 != 0 }
+    #[inline] pub const fn ignore_ligatures(self) -> bool { self.0 & 0x0004 != 0 }
+    #[inline] pub const fn ignore_marks(self) -> bool { self.0 & 0x0008 != 0 }
+    #[inline] pub const fn ignore_flags(self) -> bool { self.0 & 0x000E != 0 }
+    #[inline] pub const fn use_mark_filtering_set(self) -> bool { self.0 & 0x0010 != 0 }
+    #[inline] pub const fn mark_attachment_type(self) -> u8 { ((self.0 & 0xFF00) >> 8) as u8 }
 }
 
 impl FromData for LookupFlags {
@@ -155,6 +160,7 @@ impl FromData for LookupFlags {
     }
 }
 
+#[inline]
 pub(crate) fn parse_extension_lookup<'a, T: 'a>(
     data: &'a [u8],
     parse: impl FnOnce(&'a [u8], u16) -> Option<T>,

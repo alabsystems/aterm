@@ -48,6 +48,7 @@ pub enum RowVerdict {
 
 impl From<bool> for RowVerdict {
     /// The verdict of a matcher that always finishes.
+    #[inline]
     fn from(matched: bool) -> Self {
         if matched {
             RowVerdict::Match
@@ -70,11 +71,13 @@ pub trait RowMatch: Send + Sync + std::fmt::Debug {
     fn verdict(&self, row: &str) -> RowVerdict;
 
     /// The scan showed that `row` matches. An undecided row does not.
+    #[inline]
     fn matches(&self, row: &str) -> bool {
         self.verdict(row) == RowVerdict::Match
     }
 
     /// The scan showed that `row` does not match. An undecided row does not.
+    #[inline]
     fn clears(&self, row: &str) -> bool {
         self.verdict(row) == RowVerdict::NoMatch
     }
@@ -102,7 +105,8 @@ pub enum RowRange {
 impl RowRange {
     /// Whether visible row `idx` is in range.
     #[must_use]
-    fn contains(self, idx: usize) -> bool {
+    #[inline]
+    const fn contains(self, idx: usize) -> bool {
         match self {
             RowRange::All => true,
             RowRange::Span { start, end } => idx >= start && idx <= end,
@@ -113,7 +117,8 @@ impl RowRange {
     /// empty range scans nothing, which is never evidence of a clear surface,
     /// so `RowsClear` will not latch on it.
     #[must_use]
-    pub fn covers_any(self, visible_rows: usize) -> bool {
+    #[inline]
+    pub const fn covers_any(self, visible_rows: usize) -> bool {
         self.on_grid(visible_rows).is_some()
     }
 
@@ -121,11 +126,24 @@ impl RowRange {
     /// `visible_rows` rows (the range intersected with `0..visible_rows`), or
     /// `None` when it covers none.
     #[must_use]
-    fn on_grid(self, visible_rows: usize) -> Option<(usize, usize)> {
+    #[inline]
+    const fn on_grid(self, visible_rows: usize) -> Option<(usize, usize)> {
         match self {
-            RowRange::All => visible_rows.checked_sub(1).map(|last| (0, last)),
+            RowRange::All => match visible_rows.checked_sub(1) {
+                Some(last) => Some((0, last)),
+                None => None,
+            },
             RowRange::Span { start, end } => {
-                (start <= end && start < visible_rows).then(|| (start, end.min(visible_rows - 1)))
+                if start <= end && start < visible_rows {
+                    let last = if end < visible_rows - 1 {
+                        end
+                    } else {
+                        visible_rows - 1
+                    };
+                    Some((start, last))
+                } else {
+                    None
+                }
             }
         }
     }
@@ -179,13 +197,13 @@ pub enum WatcherSpec {
 
 impl WatcherSpec {
     #[inline]
-    fn is_row(&self) -> bool {
+    const fn is_row(&self) -> bool {
         self.row_range().is_some()
     }
 
     /// The visible rows a row predicate reads; `None` for the scalar predicates.
     #[inline]
-    fn row_range(&self) -> Option<RowRange> {
+    const fn row_range(&self) -> Option<RowRange> {
         match self {
             WatcherSpec::RowMatches { rows, .. } | WatcherSpec::RowsClear { rows, .. } => {
                 Some(*rows)
@@ -203,7 +221,7 @@ impl WatcherSpec {
     /// `IdleFor` is arm-relative (see [`WatcherSet::arm`]), and `BlockComplete`
     /// latching at arm would fire `await block` on the previous block.
     #[inline]
-    fn needs_arm_eval(&self) -> bool {
+    const fn needs_arm_eval(&self) -> bool {
         matches!(
             self,
             WatcherSpec::RowMatches { .. }
@@ -244,6 +262,7 @@ pub trait SurfaceSource {
 
 /// The first visible row of `source` in `range` that `matcher` accepts: the
 /// surface-agnostic core of `RowMatches`.
+#[inline]
 #[must_use]
 pub fn first_matching_row(
     source: &dyn SurfaceSource,
@@ -256,6 +275,7 @@ pub fn first_matching_row(
 
 /// Whether any pre-collected visible row in `range` is shown to match
 /// `matcher`: the `RowMatches` scan. Stops at the first hit.
+#[inline]
 #[must_use]
 fn any_row_matches(rows: &[Option<String>], matcher: &dyn RowMatch, range: RowRange) -> bool {
     rows.iter().enumerate().any(|(idx, cell)| {
@@ -266,6 +286,7 @@ fn any_row_matches(rows: &[Option<String>], matcher: &dyn RowMatch, range: RowRa
 /// Whether every pre-collected visible row in `range` is shown not to match `matcher`: the
 /// `RowsClear` scan. A row the matcher could not decide keeps the range from reading clear (see
 /// [`RowMatch`]); a row with no text has nothing to match. Stops at the first row not clear.
+#[inline]
 #[must_use]
 fn every_row_clear(rows: &[Option<String>], matcher: &dyn RowMatch, range: RowRange) -> bool {
     rows.iter().enumerate().all(|(idx, cell)| {
@@ -329,6 +350,7 @@ pub struct WatcherSet {
 const DEFAULT_CAP: usize = 256;
 
 impl Default for WatcherSet {
+    #[inline]
     fn default() -> Self {
         Self::with_capacity(DEFAULT_CAP)
     }
@@ -336,6 +358,7 @@ impl Default for WatcherSet {
 
 impl WatcherSet {
     /// A set bounded to `cap` concurrently-armed watchers.
+    #[inline]
     #[must_use]
     pub fn with_capacity(cap: usize) -> Self {
         Self {
@@ -355,9 +378,10 @@ impl WatcherSet {
     }
 
     /// The screen generation the kernel last saw (`ActivityClock::epoch`).
+    #[inline]
     #[must_use]
     #[cfg(test)]
-    pub fn seen_epoch(&self) -> u64 {
+    pub const fn seen_epoch(&self) -> u64 {
         self.clock.epoch
     }
 
@@ -365,8 +389,9 @@ impl WatcherSet {
     /// saw: another grid, another generation, or a higher seq on the same one.
     /// The one change test, shared by the row-scan gate and
     /// [`observe_screen`](Self::observe_screen).
+    #[inline]
     #[must_use]
-    pub fn is_advance(&self, seq: u64, alt: bool, epoch: u64) -> bool {
+    pub const fn is_advance(&self, seq: u64, alt: bool, epoch: u64) -> bool {
         alt != self.clock.alt || epoch != self.clock.epoch || seq > self.clock.last_seq
     }
 
@@ -423,11 +448,13 @@ impl WatcherSet {
     }
 
     /// Remove a watcher (its observer went away). Idempotent.
+    #[inline]
     pub fn disarm(&mut self, id: WatchId) {
         self.watchers.retain(|w| w.id != id);
     }
 
     /// Non-blocking: has `id` latched? `None` if pending or unknown.
+    #[inline]
     #[must_use]
     pub fn poll(&self, id: WatchId) -> Option<Satisfaction> {
         self.watchers
@@ -438,7 +465,8 @@ impl WatcherSet {
 
     /// Seed the activity baseline so the first `observe_screen` after arming does not
     /// read a phantom advance. Monotone: never lowers an existing baseline.
-    pub fn seed_seq(&mut self, seq: u64) {
+    #[inline]
+    pub const fn seed_seq(&mut self, seq: u64) {
         if self.clock.last_seq < seq {
             self.clock.last_seq = seq;
         }
@@ -448,7 +476,8 @@ impl WatcherSet {
     /// generation: a new grid or generation sets the baseline rather than
     /// raising it, since monotonicity only holds within one generation of one
     /// buffer.
-    pub fn seed_screen(&mut self, seq: u64, alt: bool, epoch: u64) {
+    #[inline]
+    pub const fn seed_screen(&mut self, seq: u64, alt: bool, epoch: u64) {
         if alt != self.clock.alt || epoch != self.clock.epoch {
             self.clock.alt = alt;
             self.clock.epoch = epoch;
@@ -460,6 +489,7 @@ impl WatcherSet {
 
     /// Whether an un-latched `BlockComplete` watcher is armed; gates the
     /// O(blocks) shell-integration walk in `observe_at`.
+    #[inline]
     #[must_use]
     pub fn has_block_complete(&self) -> bool {
         self.watchers
@@ -470,6 +500,7 @@ impl WatcherSet {
     /// The soonest pending `IdleFor` / `MomentumBelow` deadline, which the
     /// arming `await`/`ready` verb uses to bound its `Subscription::wait` park.
     /// `None` when no un-latched deadline watcher is armed.
+    #[inline]
     #[must_use]
     pub fn next_deadline(&self) -> Option<Instant> {
         self.watchers
@@ -717,6 +748,7 @@ impl super::Terminal {
 
     /// Convenience for the common row predicate: latch when any visible row in
     /// `rows` matches `matcher` (built in `aterm-observe`).
+    #[inline]
     #[must_use]
     pub fn watch_rows(
         &mut self,
@@ -729,6 +761,7 @@ impl super::Terminal {
 
     /// The inverse of [`watch_rows`](Self::watch_rows): latch when no visible row
     /// in `rows` matches `matcher` (`await gone`). Level-triggered.
+    #[inline]
     #[must_use]
     pub fn watch_rows_gone(
         &mut self,
@@ -740,34 +773,40 @@ impl super::Terminal {
     }
 
     /// Non-blocking: has watcher `id` latched? `None` if pending or unknown.
+    #[inline]
     #[must_use]
     pub fn watch_poll(&self, id: WatchId) -> Option<Satisfaction> {
         self.watchers.poll(id)
     }
 
     /// Remove a watcher. Idempotent.
+    #[inline]
     pub fn watch_disarm(&mut self, id: WatchId) {
         self.watchers.disarm(id);
     }
 
     /// The soonest pending deadline ([`WatcherSet::next_deadline`]).
+    #[inline]
     #[must_use]
     pub fn watch_next_deadline(&self) -> Option<Instant> {
         self.watchers.next_deadline()
     }
 
     /// Host-driven deadline firing ([`WatcherSet::expire`]).
+    #[inline]
     pub fn watch_expire(&mut self, now: Instant) -> bool {
         self.watchers.expire(now)
     }
 
     /// Idle hold: while the host consumes none of this terminal's output,
     /// restart every pending `IdleFor` at `now` ([`WatcherSet::restart_idle`]).
+    #[inline]
     pub fn watch_restart_idle(&mut self, now: Instant) {
         self.watchers.restart_idle(now);
     }
 
     /// `true` iff any watcher is armed (the producer's wake fan-out gate).
+    #[inline]
     #[must_use]
     pub fn watchers_armed(&self) -> bool {
         self.watchers.has_armed()
@@ -777,9 +816,11 @@ impl super::Terminal {
 /// The local engine is a [`SurfaceSource`]. (Inherent methods shadow the trait
 /// methods, so these do not recurse.)
 impl SurfaceSource for super::Terminal {
+    #[inline]
     fn content_seq(&self) -> u64 {
         self.content_seq()
     }
+    #[inline]
     fn newest_block_complete(&self) -> bool {
         self.all_blocks().last().is_some_and(|b| {
             matches!(
@@ -788,9 +829,11 @@ impl SurfaceSource for super::Terminal {
             )
         })
     }
+    #[inline]
     fn rows(&self) -> usize {
         self.rows() as usize
     }
+    #[inline]
     fn row_text(&self, idx: usize) -> Option<String> {
         let mut s = String::new();
         self.live_row_text_into(idx, &mut s).then_some(s)
@@ -802,6 +845,7 @@ impl super::Terminal {
     /// offset: the frame the control protocol's `text` and the input fence's `if-fp=`
     /// read, where [`Terminal::row_text_into`](super::Terminal::row_text_into) follows
     /// the person's scroll. `false` for a row past the screen.
+    #[inline]
     fn live_row_text_into(&self, idx: usize, out: &mut String) -> bool {
         if idx >= usize::from(self.grid.rows()) {
             out.clear();

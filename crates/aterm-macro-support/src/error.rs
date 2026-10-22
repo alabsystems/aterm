@@ -47,6 +47,7 @@ impl Error {
     }
 
     /// The message, as the compiler will print it.
+    #[inline]
     #[must_use]
     pub fn message(&self) -> &str {
         &self.message
@@ -92,27 +93,32 @@ pub struct Errors {
 
 impl Errors {
     /// An empty collection.
+    #[inline]
     #[must_use]
     pub fn new() -> Self {
         Errors::default()
     }
 
     /// Records `error`.
+    #[inline]
     pub fn push(&self, error: Error) {
         self.list.borrow_mut().push(error);
     }
 
     /// Records an error at `span`.
+    #[inline]
     pub fn at(&self, span: Span, message: impl Display) {
         self.push(Error::new(span, message));
     }
 
     /// Records an error from `start` to `end`.
+    #[inline]
     pub fn spanned(&self, start: Span, end: Span, message: impl Display) {
         self.push(Error::spanned(start, end, message));
     }
 
     /// Whether nothing has been recorded.
+    #[inline]
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.list.borrow().is_empty()

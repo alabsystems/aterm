@@ -81,7 +81,7 @@ impl Limits {
     // #[inline] so the MIR crosses the crate boundary and callers' Trust gates
     // (aterm-pty) verify this body instead of assuming an absent callee.
     #[inline]
-    pub fn shell_default() -> Self {
+    pub const fn shell_default() -> Self {
         Limits {
             cpu_seconds: None,
             // macOS refuses (`EINVAL`) any `RLIMIT_AS` below the process's
@@ -114,7 +114,7 @@ impl Limits {
     /// 8192.
     #[must_use]
     #[inline]
-    pub fn contained() -> Self {
+    pub const fn contained() -> Self {
         Limits {
             binding: true,
             ..Self::shell_default()
@@ -127,9 +127,18 @@ impl Limits {
     /// Go and the sanitizers reserve far beyond resident use, so any finite cap
     /// breaks real programs while bounding nothing. This mode confines through
     /// the capability gate; [`Self::shell_default`] is the hardened opt-in.
+    #[inline]
     #[must_use]
-    pub fn inherit() -> Self {
-        Limits::default()
+    pub const fn inherit() -> Self {
+        Limits {
+            cpu_seconds: None,
+            address_space: None,
+            file_size: None,
+            open_files: None,
+            active_processes: None,
+            restrict_ui: false,
+            binding: false,
+        }
     }
 
     /// Apply these limits to the current process. Call in the child, after
@@ -195,6 +204,7 @@ impl Limits {
     }
 
     /// True when every numeric limit is `None` and `restrict_ui` is `false`.
+    #[inline]
     #[must_use]
     pub const fn is_unrestricted(&self) -> bool {
         self.cpu_seconds.is_none()
@@ -207,6 +217,7 @@ impl Limits {
 
     /// Combine two [`Limits`] policies by taking the stricter (smaller) bound
     /// for each resource and the boolean OR of `restrict_ui` and `binding`.
+    #[inline]
     #[must_use]
     pub const fn merge_stricter(self, other: Self) -> Self {
         const fn min_opt_u64(a: Option<u64>, b: Option<u64>) -> Option<u64> {
@@ -246,6 +257,7 @@ impl Limits {
     /// - bytes `18..26`: `file_size` (`0` when absent)
     /// - bytes `26..34`: `open_files` (`0` when absent)
     /// - bytes `34..38`: `active_processes` (`0` when absent)
+    #[inline]
     #[must_use]
     pub const fn encode_wire_le(&self) -> [u8; 38] {
         let mut mask = 0u8;
@@ -300,6 +312,7 @@ impl Limits {
     /// Decode a canonical 38-byte little-endian [`Limits`] wire frame,
     /// rejecting unknown mask/flag bits or non-zero payload fields when the
     /// corresponding presence bit is clear.
+    #[inline]
     #[must_use]
     pub const fn decode_wire_le(wire: &[u8; 38]) -> Option<Self> {
         let mask = wire[0];

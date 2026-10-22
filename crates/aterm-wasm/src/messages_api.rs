@@ -113,13 +113,15 @@ pub(crate) fn pct_encode(s: &str) -> String {
 }
 
 /// A packed `0x00RRGGBB` colour as sRGB bytes.
-fn rgb(c: u32) -> [u8; 3] {
+#[inline]
+const fn rgb(c: u32) -> [u8; 3] {
     [(c >> 16) as u8, (c >> 8) as u8, c as u8]
 }
 
 /// A page's number (a message id or a log cursor, which JS holds as a
 /// `number`) as a whole count: negative, fractional-below-one or not a
 /// number is 0.
+#[inline]
 fn whole(n: f64) -> u64 {
     if n.is_finite() && n >= 1.0 {
         n as u64
@@ -132,7 +134,8 @@ fn whole(n: f64) -> u64 {
 /// one) stack from `grid_top`; `None` above them. Float-free (the caller converts)
 /// because the verifier models no function holding an `f64`; it proves the
 /// subtraction, not the division.
-fn band_row(y: usize, grid_top: usize, cell_h: usize) -> Option<usize> {
+#[inline]
+const fn band_row(y: usize, grid_top: usize, cell_h: usize) -> Option<usize> {
     if y < grid_top {
         return None;
     }
@@ -143,6 +146,7 @@ fn band_row(y: usize, grid_top: usize, cell_h: usize) -> Option<usize> {
 /// The tick's reply ([`WebTerminal::messages_tick`]): bit 0, the band
 /// changed; bit 1, its row count did. A function of its own because the
 /// verifier cannot model the tick's body, so only here is the shift proved.
+#[inline]
 fn tick_bits(changed: bool, rows_moved: bool) -> u32 {
     u32::from(changed || rows_moved) | (u32::from(rows_moved) << 1)
 }
@@ -259,6 +263,7 @@ impl WebBand {
 
     /// The look the band draws in: moving only while the page is visible and
     /// allows motion, graded unless forced colours own it. Never frozen.
+    #[inline]
     fn look(&self) -> Look {
         drive::look(LookIn {
             motion_allowed: self.motion_ok,
@@ -270,11 +275,13 @@ impl WebBand {
 
     /// How a `cols`-wide page lays the band out ([`Lay::web`]): links withheld
     /// until the page has a Details view, and no `$HOME` to abbreviate.
+    #[inline]
     fn lay(&self, cols: usize) -> Lay {
         Lay::web(cols, self.details)
     }
 
     /// The inks the rows are painted with (the field's doc).
+    #[inline]
     fn derive_inks(&self) -> BandInks {
         match self.forced {
             Some(hc) => BandInks::forced(hc),
@@ -283,6 +290,7 @@ impl WebBand {
     }
 
     /// A new page theme (packed `0x00RRGGBB`).
+    #[inline]
     pub(crate) fn set_theme(&mut self, fg: u32, bg: u32, cursor: u32) {
         self.theme = ThemeInks {
             bg: rgb(bg),
@@ -294,6 +302,7 @@ impl WebBand {
 
     /// A configured palette slot changed: slots 4 and 6 are the meter's
     /// borrowed hues, slots 1 and 3 the seeds of the error and warn inks.
+    #[inline]
     pub(crate) fn set_palette_color(&mut self, index: u8, c: [u8; 3]) {
         match index {
             1 => self.ansi.red = c,
@@ -306,12 +315,14 @@ impl WebBand {
     }
 
     /// The committed row count — the rows the frame reserves.
+    #[inline]
     pub(crate) fn committed(&self) -> usize {
         usize::from(self.center.committed_rows())
     }
 
     /// The geometry a `cols`-wide band is painted onto: the frame, its cells
     /// `pad` px in.
+    #[inline]
     fn geometry(cols: usize, cell_w: usize, pad: usize) -> Geometry {
         Geometry {
             win_w: cols * cell_w + 2 * pad,
@@ -428,12 +439,14 @@ impl WebBand {
 
     /// Hand a drained prepend back to the pool, undoing the last frame's prepend on the
     /// kept scratch so an echo frame under a band keeps the damage-scoped refill.
+    #[inline]
     pub(crate) fn undo(&mut self, dst: &mut RenderInput, engine_rows: usize) -> bool {
         dst.undo_host_row_prepend(engine_rows, &mut self.pool, POOL_CAP)
     }
 
     /// The band row and column under frame pixel `(x, y)`: the band's rows stack from
     /// `m.grid_top`, and the column is `Geometry::cell_at`. `None` off the band.
+    #[inline]
     fn cell_under(&self, x: f64, y: f64, cols: usize, m: BandMetrics) -> Option<(usize, usize)> {
         if !(x >= 0.0 && y >= 0.0) {
             return None;
@@ -449,6 +462,7 @@ impl WebBand {
 
     /// What a press at band `(row, col)` lands on, through the layout the
     /// painter drew (the kept one while the view is prepared at `cols`).
+    #[inline]
     fn hit(&self, row: usize, col: usize, cols: usize) -> Hit {
         match self.view.layout() {
             Some(p) if self.view.is_prepared(&self.center, cols) => p.hit(row, col),
@@ -459,7 +473,8 @@ impl WebBand {
     /// The chip a pointer on `hit` lights: a capsule (the `Details ›`
     /// included); on the row body and the overflow row, with a Details view,
     /// the link a press there follows. Nothing where a press does nothing.
-    fn hover_target(&self, hit: Hit) -> Option<HoverTarget> {
+    #[inline]
+    const fn hover_target(&self, hit: Hit) -> Option<HoverTarget> {
         match hit {
             Hit::Capsule(_, k) => Some(HoverTarget::Capsule(k)),
             Hit::Details(_) => Some(HoverTarget::Capsule(ActionIndex::DETAILS)),
@@ -621,6 +636,7 @@ impl page::Host for WebDesk {
 /// A page's `Date.prototype.getTimezoneOffset()` (minutes, positive west of UTC) as
 /// the engine's offset in seconds east of UTC. Junk (not a number, or a day or more
 /// either way) reads as UTC.
+#[inline]
 fn utc_offset_s(timezone_offset_min: f64) -> i64 {
     if timezone_offset_min.is_finite() && timezone_offset_min.abs() < 1440.0 {
         // The sign flips in the float (exact, and `round` is symmetric), so
@@ -632,6 +648,7 @@ fn utc_offset_s(timezone_offset_min: f64) -> i64 {
 }
 
 /// The wall clock's reading as the engine's stamp.
+#[inline]
 fn wall_now() -> WallStamp {
     let unix_ms = aterm_time::SystemTime::now()
         .duration_since(aterm_time::UNIX_EPOCH)
@@ -999,6 +1016,7 @@ impl WebTerminal {
     /// Its emissions stay placed without the band (the compose translates them), but the
     /// page's pointer arrives in canvas pixels, band included, so the pet's hit rect is
     /// read against where this frame draws the grid.
+    #[inline]
     pub(crate) fn hand_band_to_effects(&mut self) {
         let px = u16::try_from(self.band_height_px()).unwrap_or(u16::MAX);
         self.effects.set_host_rows_px(px);

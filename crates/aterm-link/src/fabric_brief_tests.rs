@@ -281,12 +281,31 @@ fn the_brief_reads_its_words_within_their_bounds() {
         "1024".to_string(),
         "--budget".to_string(),
         "500".to_string(),
+        "--json".to_string(),
     ])
     .expect("reads");
     assert_eq!(
-        (o.sid.as_deref(), o.node.as_deref(), o.window, o.budget),
-        (Some("s-a"), Some("n-1"), Some(1024), Some(500))
+        (
+            o.sid.as_deref(),
+            o.node.as_deref(),
+            o.window,
+            o.budget,
+            o.json
+        ),
+        (Some("s-a"), Some("n-1"), Some(1024), Some(500), true)
     );
+    assert!(
+        !BriefOpts::parse(&[]).expect("reads").json,
+        "text by default"
+    );
+    // The Overview's read (aterm-gui `overview_fabric::ChildRunner::brief`,
+    // after `fabric brief`): the machine form at the budget's ceiling.
+    let overview: Vec<String> = ["--json", "--budget", "100000"]
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect();
+    let o = BriefOpts::parse(&overview).expect("the Overview's read is the brief's");
+    assert_eq!((o.json, o.budget), (true, Some(100_000)));
     for bad in [
         vec!["--window", "0"],
         vec!["--window", "2000000"],
@@ -504,4 +523,317 @@ fn a_window_below_the_retained_floor_reads_from_it() {
     let last = offs[offs.len() - 1];
     assert_eq!((r.from, r.head), (offs[1], last + 1));
     assert_eq!(r.sessions.len(), 1, "the session it kept the rest of");
+}
+
+/// A session of epoch 1 in an approval box (`box=<tool>`): its open, an agent
+/// run, a turn, and the box open, each record `at` plus its own ms.
+fn in_approval(at: u64, tool: &str) -> Log {
+    let mut log = Log::new(1);
+    let t = |ms: u64| Stamp::new(at + ms, ms);
+    log.open_session(
+        Kind::Spawn,
+        Src::Aterm,
+        Conf::Exact,
+        Actor::Aterm,
+        Fields::new(),
+        t(0),
+    )
+    .expect("opens");
+    let run = log
+        .open(Open::new(Kind::Agent, Src::Status, Conf::Strong), t(1))
+        .expect("the run");
+    let turn = log
+        .open(
+            Open::new(Kind::Turn, Src::Screen, Conf::Strong).under(run),
+            t(2),
+        )
+        .expect("the turn");
+    let tool = Fields::new()
+        .word(aterm_slog::Key::Box, tool)
+        .expect("a box word");
+    log.open(
+        Open::new(Kind::Approval, Src::Screen, Conf::Strong)
+            .under(turn)
+            .fields(tool),
+        t(3),
+    )
+    .expect("the box");
+    log
+}
+
+/// `--json`'s per-session keys, the closed schema (the module doc).
+const SCHEMA: [&str; 12] = [
+    "node", "sid", "this", "ep", "need", "detail", "open", "mail_in", "mail_out", "last_seq",
+    "age_s", "partial",
+];
+
+/// The keys the machine form names itself: no session log key bears them.
+/// Every other key it prints must be a key the bus may carry.
+const DERIVED: [&str; 8] = [
+    "node", "sid", "this", "ep", "level", "last_seq", "age_s", "partial",
+];
+
+fn json_of(text: &str) -> aterm_json::Value {
+    aterm_json::from_str(text).unwrap_or_else(|e| panic!("one JSON object: {e}: {text}"))
+}
+
+fn sessions_of(v: &aterm_json::Value) -> &Vec<aterm_json::Value> {
+    v.get("sessions")
+        .and_then(aterm_json::Value::as_array)
+        .expect("a sessions array")
+}
+
+fn json_opts() -> BriefOpts {
+    BriefOpts {
+        json: true,
+        ..BriefOpts::default()
+    }
+}
+
+/// THE MACHINE FORM (session log Phase 6 step 6E-6): a two-session fold
+/// renders ONE object whose `sessions` hold each session in the closed
+/// schema, newest first. The one in its approval box says
+/// `"need":"approval:bash"` with its open path run, turn and step; the one
+/// whose command failed says `"need":"failure"`, on the node this host's
+/// state dir names (`this`); each with its mail counts, the text brief's
+/// own `as_of` as its `last_seq`, and its age. NEGATIVE CONTROL, run: a
+/// renderer that drops `age_s` fails it.
+#[test]
+fn the_json_brief_holds_each_session_in_its_closed_schema() {
+    let now = 1_760_000_100_000;
+    let mut appr = in_approval(1_760_000_060_000, "bash");
+    let mut failed = session(1, 1_760_000_000_000);
+    let r = read_of(&[
+        ("n-2", "s-f", bodies(&mut failed)),
+        ("n-1", "s-a", bodies(&mut appr)),
+    ]);
+    let text = render_json(&cfg(), &json_opts(), &r, now, Some("n-2"));
+    assert!(text.contains(r#""need":"approval:bash""#), "{text}");
+    assert!(!text.contains('\n'), "one line: {text}");
+    let v = json_of(&text);
+    assert_eq!(v.get("v").and_then(aterm_json::Value::as_u64), Some(2));
+    assert_eq!(v.get("more").and_then(aterm_json::Value::as_u64), Some(0));
+    let sessions = sessions_of(&v);
+    assert_eq!(sessions.len(), 2, "{text}");
+    for s in sessions {
+        let keys: Vec<&str> = s
+            .as_object()
+            .expect("a session object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        let mut want = SCHEMA.to_vec();
+        want.sort_unstable();
+        assert_eq!(keys, want, "the closed schema: {text}");
+    }
+    // The text brief's own reading of each, for its `as_of`.
+    let plain = render(&cfg(), &BriefOpts::default(), &r, now);
+    let as_of = |sid: &str| -> u64 {
+        plain
+            .lines()
+            .find(|l| l.starts_with(&format!("@{sid}@")))
+            .and_then(|l| l.split(' ').find_map(|t| t.strip_prefix("as_of=")))
+            .and_then(|n| n.parse().ok())
+            .unwrap_or_else(|| panic!("{sid}'s as_of: {plain}"))
+    };
+    let get = |s: &aterm_json::Value, k: &str| s.get(k).cloned().expect(k);
+    let (a, f) = (&sessions[0], &sessions[1]);
+    assert_eq!(
+        (get(a, "node"), get(a, "sid"), get(a, "this"), get(a, "ep")),
+        (
+            aterm_json::Value::from("n-1"),
+            aterm_json::Value::from("s-a"),
+            aterm_json::Value::from(false),
+            aterm_json::Value::from(1u64)
+        ),
+        "the newest first: {text}"
+    );
+    assert_eq!(get(a, "need").as_str(), Some("approval:bash"));
+    assert!(get(a, "detail").is_null());
+    let open: Vec<(String, String)> = get(a, "open")
+        .as_array()
+        .expect("the open path")
+        .iter()
+        .map(|n| {
+            let w = |k: &str| n.get(k).and_then(aterm_json::Value::as_str).expect(k);
+            (w("level").to_string(), w("kind").to_string())
+        })
+        .collect();
+    let want: Vec<(String, String)> = [("run", "agent"), ("turn", "turn"), ("step", "approval")]
+        .iter()
+        .map(|(l, k)| ((*l).to_string(), (*k).to_string()))
+        .collect();
+    assert_eq!(open, want, "{text}");
+    assert_eq!(get(a, "last_seq").as_u64(), Some(as_of("s-a")));
+    assert_eq!(
+        get(a, "age_s").as_u64(),
+        Some(39),
+        "100 s less the box's 60.003 s"
+    );
+    assert_eq!(
+        (get(a, "mail_in").as_u64(), get(a, "mail_out").as_u64()),
+        (Some(0), Some(0))
+    );
+    assert_eq!(get(a, "partial").as_array().map(Vec::len), Some(0));
+    assert_eq!(
+        (get(f, "sid").as_str(), get(f, "this").as_bool()),
+        (Some("s-f"), Some(true))
+    );
+    assert_eq!(get(f, "need").as_str(), Some("failure"));
+    assert_eq!(get(f, "open").as_array().map(Vec::len), Some(0), "{text}");
+    assert_eq!(get(f, "last_seq").as_u64(), Some(as_of("s-f")));
+    assert_eq!(get(f, "age_s").as_u64(), Some(99));
+}
+
+/// THE MACHINE FORM NAMES ONLY AN OBSERVED NEED (step 6E-6, as the text
+/// brief; D1): a `need` mark is a claim (`src=mark conf=claim`), which any
+/// process holding a cap on a node can put on the bus, so a session whose
+/// only need is a claim says `"need":null` — no consumer of the stream (the
+/// Overview's fabric group, a program deciding from it) takes a claim for
+/// what the session needs — and a claim beside an observed failure leaves
+/// `"need":"failure"`. The local fold holds each claim as its session's top
+/// need (the precondition). NEGATIVE CONTROL, run: the top need of any kind
+/// (`top_need`) prints the claim and fails it.
+#[test]
+fn the_json_brief_names_no_claimed_need() {
+    let at = 1_760_000_000_000;
+    let claim = |log: &mut Log, ms: u64| {
+        log.mark(
+            Mark::new(Kind::Need, Src::Mark, Conf::Claim)
+                .by(Actor::Ctl)
+                .fields(
+                    Fields::new()
+                        .word(aterm_slog::Key::Word, "help")
+                        .expect("a need word"),
+                ),
+            Stamp::new(at + ms, ms),
+        )
+        .expect("a claim");
+    };
+    let mut only = Log::new(1);
+    only.open_session(
+        Kind::Spawn,
+        Src::Aterm,
+        Conf::Exact,
+        Actor::Aterm,
+        Fields::new(),
+        Stamp::new(at, 0),
+    )
+    .expect("opens");
+    claim(&mut only, 5);
+    assert_eq!(
+        only.fold().state().top_need().map(|n| n.word),
+        Some("help"),
+        "PRECONDITION: the claim is the session's top need"
+    );
+    let mut beside = session(1, at);
+    claim(&mut beside, 5);
+    let r = read_of(&[
+        ("n-1", "s-only", bodies(&mut only)),
+        ("n-1", "s-beside", bodies(&mut beside)),
+    ]);
+    let text = render_json(&cfg(), &json_opts(), &r, at + 60_000, None);
+    assert!(!text.contains("help"), "{text}");
+    let v = json_of(&text);
+    let need = |sid: &str| -> aterm_json::Value {
+        sessions_of(&v)
+            .iter()
+            .find(|s| s.get("sid").and_then(aterm_json::Value::as_str) == Some(sid))
+            .and_then(|s| s.get("need").cloned())
+            .unwrap_or_else(|| panic!("{sid}'s need: {text}"))
+    };
+    assert!(need("s-only").is_null(), "a claim alone: {text}");
+    assert_eq!(need("s-beside").as_str(), Some("failure"), "{text}");
+}
+
+/// NO HOST OR CONTENT FIELD (step 6E-6, as the text brief): a session whose
+/// log holds a cwd, a title, a label's text and a mail's party — host and
+/// content facts, each a sentinel — renders a machine form that holds none
+/// of them, and every key it prints is either one of the schema's own names
+/// or a session log key the bus may carry (wire, or wire-meta). NEGATIVE
+/// CONTROL, run: a renderer that prints the run's `cwd` fails the tier check.
+#[test]
+fn the_json_brief_prints_no_host_or_content_field() {
+    let mut log = in_approval(1_760_000_000_000, "bash");
+    let t = Stamp::new(1_760_000_000_010, 10);
+    let planted = [
+        (Kind::Title, aterm_slog::Key::Title, "QZP6SECRET2"),
+        (Kind::Label, aterm_slog::Key::Text, "QZP6SECRET3"),
+        (Kind::Mail, aterm_slog::Key::From, "QZP6SECRET4"),
+    ];
+    for (kind, key, sentinel) in planted {
+        let f = Fields::new().text(key, sentinel).expect("a text field");
+        log.mark(Mark::new(kind, Src::Screen, Conf::Strong).fields(f), t)
+            .expect("a mark");
+    }
+    let cwd = Fields::new()
+        .text(aterm_slog::Key::Cwd, "/tmp/QZP6SECRET1")
+        .expect("a cwd");
+    log.open(
+        Open::new(Kind::Cmd, Src::Shell, Conf::Strong).fields(cwd),
+        t,
+    )
+    .expect("a command with its cwd");
+    let r = read_of(&[("n-1", "s-a", bodies(&mut log))]);
+    let text = render_json(&cfg(), &json_opts(), &r, 1_760_000_001_000, None);
+    assert!(!text.contains("QZP6SECRET"), "{text}");
+    let v = json_of(&text);
+    let sessions = sessions_of(&v);
+    assert_eq!(sessions.len(), 1, "{text}");
+    fn keys(v: &aterm_json::Value, out: &mut Vec<String>) {
+        if let Some(m) = v.as_object() {
+            for (k, v) in m {
+                out.push(k.clone());
+                keys(v, out);
+            }
+        } else if let Some(a) = v.as_array() {
+            for v in a {
+                keys(v, out);
+            }
+        }
+    }
+    let mut printed = Vec::new();
+    keys(&sessions[0], &mut printed);
+    for k in &printed {
+        let carried = aterm_slog::Key::from_word(k).is_some_and(|key| key.tier() <= Tier::WireMeta);
+        assert!(
+            DERIVED.contains(&k.as_str()) || carried,
+            "`{k}` is no key the bus carries: {text}"
+        );
+    }
+}
+
+/// THE MACHINE FORM IS HELD TO THE BUDGET (step 6E-6): sixty sessions under
+/// a small budget print newest first while their objects fit, `used` never
+/// past `budget`, and the rest are counted `more`. NEGATIVE CONTROL, run: a
+/// renderer that prints every object passes the budget.
+#[test]
+fn the_json_brief_is_held_to_the_budget() {
+    let items: Vec<(String, Vec<String>)> = (0..60)
+        .map(|i| {
+            let mut log = session(1, 1_760_000_000_000 + i);
+            (format!("s-{i:02}"), bodies(&mut log))
+        })
+        .collect();
+    let refs: Vec<(&str, &str, Vec<String>)> = items
+        .iter()
+        .map(|(sid, b)| ("n-1", sid.as_str(), b.clone()))
+        .collect();
+    let r = read_of(&refs);
+    let opts = BriefOpts {
+        budget: Some(300),
+        ..json_opts()
+    };
+    let text = render_json(&cfg(), &opts, &r, 1_760_000_001_000, None);
+    let v = json_of(&text);
+    let n = |k: &str| v.get(k).and_then(aterm_json::Value::as_u64).expect(k);
+    assert!(n("used") <= 300, "{text}");
+    let sessions = sessions_of(&v);
+    assert!(!sessions.is_empty(), "{text}");
+    assert_eq!(sessions.len() as u64 + n("more"), 60, "{text}");
+    assert_eq!(
+        sessions[0].get("sid").and_then(aterm_json::Value::as_str),
+        Some("s-59"),
+        "the newest first"
+    );
 }

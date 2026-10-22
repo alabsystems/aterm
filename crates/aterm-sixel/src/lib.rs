@@ -106,25 +106,29 @@ pub struct SixelImage {
 
 impl SixelImage {
     /// Image width in pixels.
+    #[inline]
     #[must_use]
     pub const fn width(&self) -> usize {
         self.width
     }
 
     /// Image height in pixels.
+    #[inline]
     #[must_use]
     pub const fn height(&self) -> usize {
         self.height
     }
 
     /// Packed `0xAARRGGBB` pixels, row-major, length `width * height`.
+    #[inline]
     #[must_use]
-    pub fn pixels(&self) -> &[u32] {
-        &self.pixels
+    pub const fn pixels(&self) -> &[u32] {
+        self.pixels.as_slice()
     }
 
     /// Number of grid rows this image spans given a cell height in pixels.
     /// Always at least 1 for a non-empty image.
+    #[inline]
     #[must_use]
     pub const fn rows_spanned(&self, cell_h: u16) -> usize {
         let ch = cell_h as usize;
@@ -141,6 +145,7 @@ impl SixelImage {
 
     /// Number of grid columns this image spans given a cell width in pixels.
     /// Always at least 1 for a non-empty image.
+    #[inline]
     #[must_use]
     pub const fn cols_spanned(&self, cell_w: u16) -> usize {
         let cw = cell_w as usize;
@@ -216,6 +221,7 @@ enum ParamMode {
 }
 
 impl Default for SixelDecoder {
+    #[inline]
     fn default() -> Self {
         Self::new()
     }
@@ -223,6 +229,7 @@ impl Default for SixelDecoder {
 
 impl SixelDecoder {
     /// A fresh, inactive decoder with the default VT340 16-color palette.
+    #[inline]
     #[must_use]
     pub fn new() -> Self {
         Self {
@@ -268,6 +275,7 @@ impl SixelDecoder {
     }
 
     /// Feed one sixel data byte.
+    #[inline]
     pub fn put(&mut self, byte: u8) {
         if !self.active {
             return;
@@ -385,6 +393,7 @@ impl SixelDecoder {
 
     /// Abort the current sequence, dropping all buffers without allocating a
     /// copy. Used when a DCS is interrupted (parser reset, CAN, budget blown).
+    #[inline]
     pub fn abort(&mut self) {
         self.active = false;
         self.release();
@@ -394,38 +403,44 @@ impl SixelDecoder {
     ///
     /// Counts the packed raster (4 bytes/px); the "set" bit lives in each
     /// pixel's alpha byte, so there is no separate mask buffer to charge.
+    #[inline]
     #[must_use]
-    pub fn pixel_alloc_bytes(&self) -> usize {
+    pub const fn pixel_alloc_bytes(&self) -> usize {
         self.raster
             .len()
             .saturating_mul(core::mem::size_of::<u32>())
     }
 
     /// Returns `true` if the decoder is currently between `hook` and `unhook`/`abort`.
+    #[inline]
     #[must_use]
     pub const fn is_active(&self) -> bool {
         self.active
     }
 
     /// Returns the currently selected palette register (`0..MAX_COLOR_REGISTERS`).
+    #[inline]
     #[must_use]
     pub const fn current_color(&self) -> usize {
         self.current_color
     }
 
     /// Returns the current write column (`x`) and band top (`band_top`).
+    #[inline]
     #[must_use]
     pub const fn cursor_pos(&self) -> (usize, usize) {
         (self.x, self.band_top)
     }
 
     /// Returns the exclusive maximum painted coordinates `(max_x, max_y)`.
+    #[inline]
     #[must_use]
     pub const fn painted_extent(&self) -> (usize, usize) {
         (self.max_x, self.max_y)
     }
 
     /// Returns the DECGRA declared raster dimensions `(declared_w, declared_h)`.
+    #[inline]
     #[must_use]
     pub const fn declared_dimensions(&self) -> (usize, usize) {
         (self.declared_w, self.declared_h)
@@ -448,6 +463,7 @@ impl SixelDecoder {
     }
 
     /// Begin collecting params for a new introducer, finishing any prior one.
+    #[inline]
     fn start_params(&mut self, mode: ParamMode) {
         self.finish_params();
         self.params.clear();
@@ -458,7 +474,11 @@ impl SixelDecoder {
     /// defines a color, `"` declares raster geometry, and `!` stashes the repeat
     /// count in `pending_repeat` for the upcoming data byte. Idempotent; clears
     /// `mode` to `None`.
+    #[inline]
     fn finish_params(&mut self) {
+        if self.mode == ParamMode::None && self.params.is_empty() {
+            return;
+        }
         match self.mode {
             ParamMode::Color => self.apply_color(),
             ParamMode::Raster => self.apply_raster(),
@@ -502,6 +522,7 @@ impl SixelDecoder {
     }
 
     /// `"Pan;Pad;Ph;Pv` — record declared raster geometry.
+    #[inline]
     fn apply_raster(&mut self) {
         // Record `[Pan, Pad, Ph, Pv]`'s `Ph` (width) and `Pv` (height) without
         // pre-sizing `raster`: `emit_sixel` grows the buffer on demand so all
@@ -513,6 +534,7 @@ impl SixelDecoder {
     }
 
     /// `!Pn` — stash the repeat count for the next data byte.
+    #[inline]
     fn apply_repeat(&mut self) {
         self.pending_repeat = self.params.first().copied().unwrap_or(0);
     }
@@ -725,6 +747,7 @@ impl SixelDecoder {
 }
 
 /// Scale an `0..=100` percent component to `0..=255`.
+#[inline]
 #[must_use]
 pub const fn scale_pct(v: u32) -> u32 {
     let v = if v > 100 { 100 } else { v };
@@ -735,18 +758,21 @@ pub const fn scale_pct(v: u32) -> u32 {
 }
 
 /// Pack an RGB-percent triple (`0..=100` each) into `0x00RRGGBB`.
+#[inline]
 #[must_use]
 pub const fn rgb_percent(r: u32, g: u32, b: u32) -> u32 {
     (scale_pct(r) << 16) | (scale_pct(g) << 8) | scale_pct(b)
 }
 
 /// Returns `true` if `byte` is a sixel data character (`0x3F..=0x7E`, `?`..=`~`).
+#[inline]
 #[must_use]
 pub const fn is_sixel_data_byte(byte: u8) -> bool {
     byte >= 0x3F && byte <= 0x7E
 }
 
 /// Decodes a sixel data byte (`0x3F..=0x7E`) into its 6-bit pixel column mask (`0..=63`).
+#[inline]
 #[must_use]
 pub const fn sixel_data_bits(byte: u8) -> Option<u8> {
     if byte >= 0x3F && byte <= 0x7E {
@@ -757,24 +783,28 @@ pub const fn sixel_data_bits(byte: u8) -> Option<u8> {
 }
 
 /// Encodes a 6-bit pixel column mask (`bits & 0x3F`) into a sixel data byte (`0x3F..=0x7E`).
+#[inline]
 #[must_use]
 pub const fn encode_sixel_data_byte(bits: u8) -> u8 {
     0x3F + (bits & 0x3F)
 }
 
 /// Returns the bit mask (`1 << row`) for a row within a 6-pixel sixel band (`0..6`), or `0` if out of range.
+#[inline]
 #[must_use]
 pub const fn sixel_row_mask(row: usize) -> u8 {
     if row < 6 { SIXEL_ROW_MASKS[row] } else { 0 }
 }
 
 /// Returns `true` if `row` (`0..6`) is set in the 6-bit column mask `bits`.
+#[inline]
 #[must_use]
 pub const fn sixel_bit_is_set(bits: u8, row: usize) -> bool {
     (bits & sixel_row_mask(row)) != 0
 }
 
 /// Clamps a color register index to `0..MAX_COLOR_REGISTERS`.
+#[inline]
 #[must_use]
 pub const fn clamp_color_register(reg: usize) -> usize {
     let max_idx = MAX_COLOR_REGISTERS.saturating_sub(1);
@@ -782,6 +812,7 @@ pub const fn clamp_color_register(reg: usize) -> usize {
 }
 
 /// Clamps a raster dimension to `0..=SIXEL_MAX_DIMENSION`.
+#[inline]
 #[must_use]
 pub const fn clamp_sixel_dimension(dim: usize) -> usize {
     if dim > SIXEL_MAX_DIMENSION {
@@ -792,6 +823,7 @@ pub const fn clamp_sixel_dimension(dim: usize) -> usize {
 }
 
 /// Validates and computes `width * height` for a sixel raster within [`SIXEL_MAX_DIMENSION`] and [`SIXEL_MAX_PIXELS`].
+#[inline]
 #[must_use]
 pub const fn checked_sixel_pixel_count(width: usize, height: usize) -> Option<usize> {
     if width == 0 || height == 0 || width > SIXEL_MAX_DIMENSION || height > SIXEL_MAX_DIMENSION {
@@ -806,6 +838,7 @@ pub const fn checked_sixel_pixel_count(width: usize, height: usize) -> Option<us
 }
 
 /// Validates and computes the packed-RGBA byte size (`width * height * 4`) within [`SIXEL_MAX_IMAGE_BYTES`].
+#[inline]
 #[must_use]
 pub const fn checked_sixel_image_bytes(width: usize, height: usize) -> Option<usize> {
     let Some(total) = checked_sixel_pixel_count(width, height) else {
@@ -820,12 +853,14 @@ pub const fn checked_sixel_image_bytes(width: usize, height: usize) -> Option<us
 }
 
 /// Packs an opaque `(r, g, b)` pixel into `0xFFRRGGBB`.
+#[inline]
 #[must_use]
 pub const fn pack_argb_pixel(r: u8, g: u8, b: u8) -> u32 {
     0xFF00_0000 | ((r as u32) << 16) | ((g as u32) << 8) | (b as u32)
 }
 
 /// Unpacks a `0xAARRGGBB` pixel into `(a, r, g, b)`.
+#[inline]
 #[must_use]
 pub const fn unpack_argb_channels(pixel: u32) -> (u8, u8, u8, u8) {
     (
@@ -837,6 +872,7 @@ pub const fn unpack_argb_channels(pixel: u32) -> (u8, u8, u8, u8) {
 }
 
 /// Encodes a `0xAARRGGBB` pixel into 4 little-endian bytes `[b, g, r, a]`.
+#[inline]
 #[must_use]
 pub const fn encode_argb_pixel_le(pixel: u32) -> [u8; 4] {
     [
@@ -848,6 +884,7 @@ pub const fn encode_argb_pixel_le(pixel: u32) -> [u8; 4] {
 }
 
 /// Decodes 4 little-endian bytes `[b, g, r, a]` into a `0xAARRGGBB` pixel.
+#[inline]
 #[must_use]
 pub const fn decode_argb_pixel_le(bytes: [u8; 4]) -> u32 {
     (bytes[0] as u32)
@@ -857,6 +894,7 @@ pub const fn decode_argb_pixel_le(bytes: [u8; 4]) -> u32 {
 }
 
 /// Encodes a 4-word sixel raster header `(width, height, color_reg, repeat)` into 16 little-endian bytes.
+#[inline]
 #[must_use]
 pub const fn encode_sixel_header_le(
     width: u32,
@@ -885,6 +923,7 @@ pub const fn encode_sixel_header_le(
 }
 
 /// Decodes 16 little-endian bytes into a 4-word sixel raster header `(width, height, color_reg, repeat)`.
+#[inline]
 #[must_use]
 pub const fn decode_sixel_header_le(bytes: [u8; 16]) -> (u32, u32, u32, u32) {
     let width = (bytes[0] as u32)

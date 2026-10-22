@@ -1,0 +1,95 @@
+schema = 2
+
+[[windows]]
+rows = 30
+cols = 200
+active_tab = 0
+outer_x = 96
+outer_y = 48
+inner_px = [1400, 420]
+active_item = 0
+
+[windows.show]
+fullscreen = false
+minimized = false
+z_order = 0
+key = true
+
+[[windows.tabs]]
+kind = "split"
+dir = "horizontal"
+ratio = 0.5
+
+[windows.tabs.first]
+kind = "leaf"
+cwd = "/home/dev/src/aterm"
+title = "zsh"
+focused = true
+local_id = 0
+
+[windows.tabs.second]
+kind = "leaf"
+cwd = "/home/dev"
+title = "ssh"
+focused = false
+local_id = 1
+
+[[windows.tabs]]
+kind = "leaf"
+cwd = "/home/dev/src"
+title = "vim"
+focused = true
+local_id = 2
+
+[[windows.tab_order]]
+kind = "terminal"
+index = 0
+
+[[windows.tab_order]]
+kind = "terminal"
+index = 1
+
+[[windows.restored_tabs]]
+focused_path = ["first"]
+zoomed = false
+
+[windows.restored_tabs.root]
+node = "split"
+axis = "vertical"
+ratio = 0.5
+
+[windows.restored_tabs.root.first]
+node = "leaf"
+
+[windows.restored_tabs.root.first.view]
+kind = "terminal"
+cwd = "/home/dev/src/aterm"
+title = "zsh"
+local_id = 0
+sid = "s-00000000010000000000"
+log_ep = 1792657852
+
+[windows.restored_tabs.root.second]
+node = "leaf"
+
+[windows.restored_tabs.root.second.view]
+kind = "terminal"
+cwd = "/home/dev"
+title = "ssh"
+local_id = 1
+sid = "s-00000000010000010101"
+log_ep = 1792657853
+
+[[windows.restored_tabs]]
+zoomed = false
+
+[windows.restored_tabs.root]
+node = "leaf"
+
+[windows.restored_tabs.root.view]
+kind = "terminal"
+cwd = "/home/dev/src"
+title = "vim"
+local_id = 2
+sid = "s-00000000010000020202"
+log_ep = 1792657854

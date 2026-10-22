@@ -22,6 +22,7 @@ pub(crate) enum FilterResult {
 
 /// The platform tree's filter: every node but a text run, which is part of
 /// its document's text (unless it holds the focus).
+#[inline]
 pub(crate) fn common_filter(node: &Node) -> FilterResult {
     if node.is_focused() {
         return FilterResult::Include;

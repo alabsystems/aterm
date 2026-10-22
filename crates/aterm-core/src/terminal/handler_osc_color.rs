@@ -30,7 +30,8 @@ pub(super) enum DynamicColorSlot {
 
 impl DynamicColorSlot {
     /// Parse from OSC 10/11/12 offset index (0=fg, 1=bg, 2=cursor).
-    pub(super) fn from_index(index: usize) -> Option<Self> {
+    #[inline]
+    pub(super) const fn from_index(index: usize) -> Option<Self> {
         match index {
             0 => Some(Self::Foreground),
             1 => Some(Self::Background),
@@ -40,7 +41,8 @@ impl DynamicColorSlot {
     }
 
     /// Parse from a case-insensitive color name (OSC 21 / kitty protocol).
-    pub(super) fn from_name(name: &str) -> Option<Self> {
+    #[inline]
+    pub(super) const fn from_name(name: &str) -> Option<Self> {
         if name.eq_ignore_ascii_case("foreground") {
             return Some(Self::Foreground);
         }
@@ -54,7 +56,8 @@ impl DynamicColorSlot {
     }
 
     /// The [`ColorTarget`](super::ColorTarget) a change of this slot notes.
-    pub(super) fn color_target(self) -> super::ColorTarget {
+    #[inline]
+    pub(super) const fn color_target(self) -> super::ColorTarget {
         match self {
             Self::Foreground => super::ColorTarget::Foreground,
             Self::Background => super::ColorTarget::Background,
@@ -78,6 +81,7 @@ const MAX_OSC21_ECHO_KEY_BYTES: usize = 64;
 
 /// Whether an unrecognised OSC 21 key may be echoed in a `key=?` reply: only
 /// the spelling kitty's key names use (ASCII letters, digits, `_`, `-`), short.
+#[inline]
 fn osc_21_key_is_echoable(key: &str) -> bool {
     key.len() <= MAX_OSC21_ECHO_KEY_BYTES
         && key
@@ -90,6 +94,7 @@ impl TerminalHandler<'_> {
     /// engine's `"palette"` `per_sequence_max`, or
     /// [`LEGACY_PALETTE_PER_SEQUENCE_MAX`] without an engine. A policy value of
     /// 0 ("disabled") also falls back, so the handler always has a cap.
+    #[inline]
     pub(super) fn palette_per_sequence_cap(&self) -> usize {
         if let Some(cfg) = self.policy.rate_limit_config("palette")
             && cfg.per_sequence_max > 0
@@ -102,6 +107,7 @@ impl TerminalHandler<'_> {
     /// Debit the policy engine's `"palette"` bucket by one response pair;
     /// `true` when permitted. Without an engine this returns `true` and the
     /// per-sequence cap is the only bound.
+    #[inline]
     fn palette_rate_limit_consume_one(&mut self) -> bool {
         let clock = aterm_policy::limits::SystemClock;
         self.policy
@@ -568,6 +574,7 @@ impl TerminalHandler<'_> {
 
     /// Reset the selection background color (OSC 117) to the default
     /// selection appearance.
+    #[inline]
     pub(super) fn reset_selection_background(&mut self) {
         self.color.selection_background = self.color.configured_selection_background;
         self.note_color_change(super::ColorTarget::SelectionBackground);
@@ -575,12 +582,14 @@ impl TerminalHandler<'_> {
 
     /// Reset the selection foreground color (OSC 119) to the default selection
     /// appearance.
+    #[inline]
     pub(super) fn reset_selection_foreground(&mut self) {
         self.color.selection_foreground = self.color.configured_selection_foreground;
         self.note_color_change(super::ColorTarget::SelectionForeground);
     }
 
     /// Reset a dynamic color to its default (OSC 110/111/112).
+    #[inline]
     pub(super) fn reset_dynamic_color(&mut self, index: usize) {
         if let Some(slot) = DynamicColorSlot::from_index(index) {
             self.reset_dynamic_color_slot(slot);
@@ -588,18 +597,20 @@ impl TerminalHandler<'_> {
     }
 
     /// Get the current color for a dynamic color slot.
-    pub(super) fn get_dynamic_color(&self, slot: DynamicColorSlot) -> Rgb {
+    #[inline]
+    pub(super) const fn get_dynamic_color(&self, slot: DynamicColorSlot) -> Rgb {
         match slot {
             DynamicColorSlot::Foreground => self.color.default_foreground,
             DynamicColorSlot::Background => self.color.default_background,
-            DynamicColorSlot::Cursor => self
-                .color
-                .cursor_color
-                .unwrap_or(self.color.default_foreground),
+            DynamicColorSlot::Cursor => match self.color.cursor_color {
+                Some(color) => color,
+                None => self.color.default_foreground,
+            },
         }
     }
 
     /// Set a dynamic color and note the change.
+    #[inline]
     pub(super) fn set_dynamic_color(&mut self, slot: DynamicColorSlot, color: Rgb) {
         match slot {
             DynamicColorSlot::Foreground => self.color.default_foreground = color,
@@ -611,6 +622,7 @@ impl TerminalHandler<'_> {
 
     /// Reset a dynamic color to its theme-configured default (`configured_*`,
     /// set by `apply_config`) and note the change.
+    #[inline]
     fn reset_dynamic_color_slot(&mut self, slot: DynamicColorSlot) {
         match slot {
             DynamicColorSlot::Foreground => {
@@ -631,6 +643,7 @@ impl TerminalHandler<'_> {
     /// the host's `palette_refused_callback` (a theme script sends dozens), so
     /// a theme tool that silently did nothing (base16-shell, pywal, `theme.sh`)
     /// can be traced.
+    #[inline]
     fn note_palette_set_refused(&mut self) {
         if self.color.palette_set_refused {
             return;
@@ -643,6 +656,7 @@ impl TerminalHandler<'_> {
 
     /// Record an OSC color set or reset of `target`: make it authoritative for
     /// owned render snapshots and repaint.
+    #[inline]
     pub(super) fn note_color_change(&mut self, target: super::ColorTarget) {
         // Once OSC touches a color, the terminal's value is authoritative for
         // owned render snapshots; `Terminal::new` leaves these unset so a

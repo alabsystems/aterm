@@ -158,10 +158,13 @@ impl Places {
     }
 }
 
-/// What the shell side of the environment says: `$SHELL`, `$PATH`, `$MANPATH`.
+/// What the shell side of the environment says: the login shell, `$PATH`, `$MANPATH`.
 #[derive(Clone, Debug, Default)]
 pub struct ShellEnv {
-    /// `$SHELL`.
+    /// The account's login shell, as the account record names it
+    /// ([`crate::hooks::login_shell`]), never `$SHELL`, which a wrapper, a test or a parent
+    /// process may set: the PATH block goes in the rc that shell reads ([`rc_target`]), the
+    /// one file `base.shell.rc` creates too (docs/DESIGN-init-system-2026-10-20.md §4.2).
     pub shell: Option<String>,
     /// `$PATH`.
     pub path: Option<OsString>,
@@ -172,13 +175,13 @@ pub struct ShellEnv {
 impl ShellEnv {
     fn of_process() -> Self {
         Self {
-            shell: std::env::var("SHELL").ok(),
+            shell: crate::hooks::login_shell().map(|shell| shell.to_string_lossy().into_owned()),
             path: std::env::var_os("PATH"),
             manpath: std::env::var("MANPATH").ok(),
         }
     }
 
-    /// The shell's name: `$SHELL`'s last component.
+    /// The shell's name: the login shell's last component.
     fn shell_name(&self) -> &str {
         self.shell
             .as_deref()
@@ -1178,9 +1181,11 @@ fn without_block(text: &str) -> Option<String> {
 // ---------------------------------------------------------------------------------------
 
 /// The profile the managed PATH block lands in for `env`'s shell — the ONE election the
-/// plan and the write share — or `None` for a shell this does not know, which is told,
-/// never guessed at (a wrong line in a login file is worse than none).
-fn rc_target(p: &Places, env: &ShellEnv) -> Option<PathBuf> {
+/// plan and the write share, and the one a pass's login rc comes from
+/// ([`crate::hooks::login_rc`], fed the account record's shell) — or `None` for a shell
+/// this does not know, which is told, never guessed at (a wrong line in a login file is
+/// worse than none).
+pub(crate) fn rc_target(p: &Places, env: &ShellEnv) -> Option<PathBuf> {
     match env.shell_name() {
         "zsh" => Some(p.home.join(".zshrc")),
         // macOS terminals spawn LOGIN shells, and login bash reads ~/.bash_profile (then

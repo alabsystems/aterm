@@ -16,11 +16,13 @@ use std::process::ExitCode;
 use std::sync::{Arc, Mutex, PoisonError};
 
 /// The local setup's command-line help.
-pub const USAGE: &str = "aterm init [--plan | --check] [--json]\n\
+pub const USAGE: &str = "aterm init [--plan | --check] [--json] [--only <item,...>]\n\
     First restore what aterm lays for this account (the installed commands and\n\
     their ~/.local/bin links, the shell integration, the reroute stubs, the\n\
-    rustup link, exec roots), as bare `aterm doctor` does; this part runs over\n\
-    SSH too. Then, at this Mac's console only,\n\
+    rustup link, exec roots), as bare `aterm doctor` does, and install Apple's\n\
+    Command Line Tools when they are missing (base.clt: one sudo password prompt\n\
+    in this terminal); this part runs over SSH too. Then, at this Mac's console\n\
+    only,\n\
     configure this macOS login: Caps Lock as Control, Natural scrolling off,\n\
     no widgets, only aterm, System Settings and Safari pinned in the Dock,\n\
     sign out of Messages and FaceTime, and keep rustup's offline docs (rust-docs,\n\
@@ -37,6 +39,9 @@ pub const USAGE: &str = "aterm init [--plan | --check] [--json]\n\
     --plan    Report the changes without applying them.\n\
     --check   Read only; exit nonzero if anything still needs attention.\n\
     --json    Print the per-setting report as JSON.\n\
+    --only    Run only the base items named (an id such as base.clt or\n\
+              base.shell.rc, a family such as shell or pkg, or base), and no\n\
+              setting of this login.\n\
     --help    Show this help without inspecting or changing the Mac.\n\
 \n\
     Exit: 0 done; 75 only what an install pass's store lock held back is left;\n\
@@ -56,11 +61,36 @@ struct Options {
     action: Action,
     json: bool,
     help: bool,
+    /// `--only` words: the base items kept ([`aterm_converge::select`]); empty runs all.
+    only: Vec<String>,
 }
 
 fn options(args: &[OsString]) -> Result<Options, String> {
     let mut options = Options::default();
-    for arg in args {
+    let mut args = args.iter();
+    while let Some(arg) = args.next() {
+        let only = match arg.to_str() {
+            Some("--only") => Some(
+                args.next()
+                    .and_then(|words| words.to_str())
+                    .ok_or("--only takes a comma-separated list of base items")?,
+            ),
+            Some(arg) => arg.strip_prefix("--only="),
+            None => None,
+        };
+        if let Some(words) = only {
+            let words: Vec<String> = words
+                .split(',')
+                .map(str::trim)
+                .filter(|word| !word.is_empty())
+                .map(str::to_owned)
+                .collect();
+            if words.is_empty() {
+                return Err("--only takes a comma-separated list of base items".into());
+            }
+            options.only.extend(words);
+            continue;
+        }
         match arg.to_str() {
             Some("--help" | "-h") => options.help = true,
             Some("--json") => options.json = true,
@@ -83,14 +113,18 @@ fn options(args: &[OsString]) -> Result<Options, String> {
 
 /// The base layer `aterm init` runs before its own items (design §4.2, S5): the
 /// packages' repair items, composed by the front door (`crates/aterm`), which links the
-/// crate that defines them. Base items require only the account, so they run over SSH
-/// too; the workstation items need this Mac's console.
+/// crate that defines them, and `base.clt` over atpkg's C toolchain probe. Base items
+/// require only the account, so they run over SSH too; the workstation items need this
+/// Mac's console.
 pub struct Base {
     /// The items, in run order.
     pub items: Vec<Box<dyn aterm_converge::Item>>,
     /// What keeps them safe to apply (the store lock), held while they run and released
-    /// before the workstation items.
+    /// before `base.clt` and the workstation items.
     pub held: Option<Box<dyn std::any::Any>>,
+    /// `base.clt` ([`crate::init_clt`]), run once the lock is released: its apply waits on
+    /// a person's password.
+    pub clt: Option<crate::init_clt::CommandLineTools>,
 }
 
 impl Base {
@@ -100,6 +134,39 @@ impl Base {
         Self {
             items: Vec::new(),
             held: None,
+            clt: None,
+        }
+    }
+
+    /// The `--only` words that name none of these items (`aterm_converge::selects`: an
+    /// id, a family, a layer), for the surface to refuse before anything is read.
+    #[must_use]
+    pub fn unnamed(&self, only: &[String]) -> Vec<String> {
+        only.iter()
+            .filter(|word| {
+                !self.items.iter().any(|item| {
+                    aterm_converge::selects(word, &item.id(), item.family(), Some(item.layer()))
+                }) && !self
+                    .clt
+                    .as_ref()
+                    .is_some_and(|_| crate::init_clt::selected(word))
+            })
+            .cloned()
+            .collect()
+    }
+
+    /// These items narrowed to `only` ([`aterm_converge::select`]); every item when it is
+    /// empty.
+    #[must_use]
+    pub fn narrowed(self, only: &[String]) -> Self {
+        if only.is_empty() {
+            return self;
+        }
+        let Self { items, held, clt } = self;
+        Self {
+            items: aterm_converge::select(items, only).0,
+            held,
+            clt: clt.filter(|_| only.iter().any(|word| crate::init_clt::selected(word))),
         }
     }
 }
@@ -118,23 +185,41 @@ pub fn main_entry(args: Vec<OsString>, base: &dyn Fn(bool) -> Base) -> ExitCode 
         print!("{USAGE}");
         return ExitCode::SUCCESS;
     }
+    // Every `--only` word names a base item, or nothing is read (the items are composed,
+    // not probed).
+    let unnamed = base(false).unnamed(&options.only);
+    if !unnamed.is_empty() {
+        eprintln!(
+            "aterm init: --only {} names no base item (an id such as base.clt or base.shell.rc, \
+             a family such as shell or pkg, or base)\n{USAGE}",
+            unnamed.join(",")
+        );
+        return ExitCode::from(2);
+    }
     if !crate::sessions::is_live_account() {
         eprintln!("aterm init: run in your own macOS login and home directory");
         return ExitCode::FAILURE;
     }
     let sys = Live::new();
     let result = sys.journal().and_then(|mut journal| {
-        let ctx = local_context(&sys)?;
         let mode = if options.action == Action::Apply {
             Mode::Apply
         } else {
             Mode::Plan
         };
-        let groups = prepare_groups(&sys, &ctx, mode)?;
+        // `--only` runs base items alone: no setting of this login is read or asked about,
+        // and no keyboard list either.
+        let (ctx, groups) = if options.only.is_empty() {
+            let ctx = local_context(&sys)?;
+            let groups = prepare_groups(&sys, &ctx, mode)?;
+            (ctx, groups)
+        } else {
+            (context_for(&sys, WorkstationGroup::Accounts)?, Vec::new())
+        };
         run(
             &sys,
             &ctx,
-            base(mode == Mode::Apply),
+            base(mode == Mode::Apply).narrowed(&options.only),
             &groups,
             mode,
             journal.as_mut(),
@@ -279,18 +364,48 @@ pub struct Workstation {
     ctx: Ctx,
     items: Vec<Box<dyn Item>>,
     snapshots: Option<Vec<PreferenceSnapshot>>,
+    /// The items this pass leaves alone ([`Workstation::hold`]), by id.
+    held: Vec<(String, Hold)>,
 }
 
 type PreferenceSnapshot = Vec<(Target, Read<PValue>)>;
 
-/// The shared engine's rows and the backed-up preferences whose mutation it attempted.
+/// How a pass leaves an item alone ([`Workstation::hold`]). Either way an item that already
+/// reads as wanted stays `Ok`, and nothing of a held item is applied, refreshed or journaled.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Hold {
+    /// Its change is not made in this pass: one that would change reads `Blocked`, naming
+    /// what it reads now and this line ([`aterm_converge::held_back`]).
+    Back(String),
+    /// It made its change once and was changed since: one that would change reads
+    /// `NotApplicable`, naming what it reads now and this line, so nothing is wrong and
+    /// nothing is to do ([`aterm_converge::left_as_is`]).
+    AsIs(String),
+}
+
+/// The shared engine's rows and the items whose change it reached.
 #[derive(Debug)]
 pub struct WorkstationRun {
     /// The common probe/apply/read-back results.
     pub rows: Vec<ItemReport>,
-    /// Before-images admitted by the snapshot guard immediately before mutation.
-    /// A refused plan contributes nothing, so its external changes stay untouched.
-    pub attempted_preferences: Vec<(Target, Read<PValue>)>,
+    /// Each item whose apply or refresh ran, in run order. A refused plan, a held item
+    /// and an apply that stood aside contribute nothing: none of them changed anything.
+    pub attempts: Vec<Attempt>,
+}
+
+/// One item whose apply or refresh this pass ran.
+#[derive(Debug, Clone)]
+pub struct Attempt {
+    /// The item's id, as its row has it.
+    pub id: String,
+    /// Whether its read-back verified the change: the row ended `Ok`, `Changed` or
+    /// `NotApplicable`. An attempt that did not verify may still have changed the machine
+    /// (a write that failed after it took, a consumer that rewrote what was written).
+    pub verified: bool,
+    /// The before-images the snapshot guard admitted for it immediately before its
+    /// mutation, including a write that failed after partially taking effect. Empty
+    /// for an item with no preference keys and for a pass that took no snapshot.
+    pub preferences: Vec<(Target, Read<PValue>)>,
 }
 
 impl Workstation {
@@ -304,6 +419,12 @@ impl Workstation {
         let mut changes = Vec::new();
         let mut snapshots = Vec::new();
         for item in &self.items {
+            // A held item changes nothing in this pass ([`Workstation::hold`]): no key of
+            // it is backed up for, or activated after, a change nobody makes.
+            if self.held.iter().any(|(id, _)| *id == item.id()) {
+                snapshots.push(Vec::new());
+                continue;
+            }
             let snapshot = item.preference_changes(sys, &self.ctx)?;
             for (target, read) in &snapshot {
                 if changes.iter().any(|(saved, _)| saved == target) {
@@ -343,6 +464,36 @@ impl Workstation {
         self.run_recording_with(sys, mode, journal.as_mut())
     }
 
+    /// Leave the items `held` names alone in this pass, each as its [`Hold`] says: nothing
+    /// of one is applied, refreshed, backed up ([`Workstation::preference_changes`]) or
+    /// journaled, and one that already reads as wanted stays `Ok`. Call it before
+    /// [`Workstation::preference_changes`]. An unattended caller names the items whose
+    /// own earlier attempt it will not repeat, so a retry on its timer is not the same
+    /// change, relaunch and rollback again.
+    pub fn hold(&mut self, held: &[(String, Hold)]) {
+        self.held = held.to_vec();
+    }
+
+    /// A pass over `items` at a context of no account and no host facts: for a caller's
+    /// tests of what it does with a pass's rows and attempts.
+    #[cfg(any(test, debug_assertions))]
+    #[must_use]
+    pub fn of(items: Vec<Box<dyn Item>>) -> Self {
+        Self {
+            ctx: Ctx {
+                facts: HostFacts::default(),
+                users: Vec::new(),
+                console: None,
+                host_name: String::new(),
+                cache_dir: PathBuf::new(),
+                disrupt: true,
+            },
+            items,
+            snapshots: None,
+            held: Vec::new(),
+        }
+    }
+
     fn run_recording_with(
         self,
         sys: &dyn System,
@@ -350,54 +501,78 @@ impl Workstation {
         journal: &mut dyn Journal,
     ) -> Result<WorkstationRun, String> {
         let attempted = Arc::new(Mutex::new(Vec::new()));
-        let items = match self.snapshots {
-            None => self.items,
-            Some(snapshots) => self
-                .items
-                .into_iter()
-                .zip(snapshots)
-                .map(|(inner, before)| {
-                    Box::new(SnapshotGuard {
-                        inner,
-                        before,
-                        attempted: Arc::clone(&attempted),
-                    }) as Box<dyn Item>
-                })
-                .collect(),
-        };
-        let bound = crate::engine::bind(
+        let mut snapshots = self.snapshots.map(Vec::into_iter);
+        let items: Vec<Box<dyn Item>> = self
+            .items
+            .into_iter()
+            .map(|inner| {
+                Box::new(Guard {
+                    before: snapshots.as_mut().and_then(Iterator::next),
+                    inner,
+                    attempted: Arc::clone(&attempted),
+                }) as Box<dyn Item>
+            })
+            .collect();
+        let bound: Vec<_> = crate::engine::bind(
             items
                 .iter()
                 .map(|item| (item.as_ref(), workstation_place(Class::Preference))),
             sys,
             &self.ctx,
-        );
+        )
+        .into_iter()
+        .flat_map(|item| {
+            let id = item.id();
+            match self.held.iter().find(|(held, _)| *held == id) {
+                None => vec![item],
+                Some((_, Hold::Back(why))) => aterm_converge::held_back(vec![item], why),
+                Some((_, Hold::AsIs(why))) => aterm_converge::left_as_is(vec![item], why),
+            }
+        })
+        .collect();
         let rows =
             aterm_converge::run(&bound, mode, journal).map_err(|refused| refused.to_string())?;
-        let attempted_preferences = attempted
+        let attempted = attempted
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .clone();
-        Ok(WorkstationRun {
-            rows,
-            attempted_preferences,
-        })
+        let attempts = attempted
+            .into_iter()
+            .filter_map(|(id, preferences)| {
+                let row = rows.iter().find(|row| row.id == id)?;
+                // An apply that stood aside changed nothing (`Item::stood_aside`).
+                row.stood_aside.is_none().then_some(Attempt {
+                    verified: matches!(
+                        row.outcome,
+                        Outcome::Ok | Outcome::Changed | Outcome::NotApplicable
+                    ),
+                    id,
+                    preferences,
+                })
+            })
+            .collect();
+        Ok(WorkstationRun { rows, attempts })
     }
 }
 
-/// The shared item still owns its policy and mutation. This wrapper only checks
-/// that the durable recovery record describes the values it is about to replace.
-struct SnapshotGuard {
+/// The shared item still owns its policy and mutation. This wrapper checks that the
+/// durable recovery record describes the values it is about to replace, and records which
+/// items reached mutation.
+struct Guard {
     inner: Box<dyn Item>,
-    before: PreferenceSnapshot,
-    attempted: Arc<Mutex<PreferenceSnapshot>>,
+    /// The before-images saved for recovery; `None` when the pass took no snapshot.
+    before: Option<PreferenceSnapshot>,
+    attempted: Arc<Mutex<Vec<(String, PreferenceSnapshot)>>>,
 }
 
-impl SnapshotGuard {
+impl Guard {
     fn validate(&self, sys: &dyn System, ctx: &Ctx) -> Result<(), String> {
+        let Some(before) = &self.before else {
+            return Ok(());
+        };
         let current = self.inner.preference_changes(sys, ctx)?;
-        if current.len() == self.before.len()
-            && self.before.iter().all(|(target, before)| {
+        if current.len() == before.len()
+            && before.iter().all(|(target, before)| {
                 let mut matching = current.iter().filter(|(now, _)| now == target);
                 matching
                     .next()
@@ -412,19 +587,27 @@ impl SnapshotGuard {
     }
 
     fn record_attempt(&self) {
+        let id = self.inner.id();
         let mut attempted = self
             .attempted
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        for (target, read) in &self.before {
-            if !attempted.iter().any(|(saved, _)| saved == target) {
-                attempted.push((target.clone(), read.clone()));
-            }
+        if !attempted.iter().any(|(saved, _)| *saved == id) {
+            attempted.push((id, self.before.clone().unwrap_or_default()));
         }
+    }
+
+    /// Undo [`Guard::record_attempt`] for an item whose refresh had nothing to do.
+    fn forget_attempt(&self) {
+        let id = self.inner.id();
+        self.attempted
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .retain(|(saved, _)| *saved != id);
     }
 }
 
-impl Item for SnapshotGuard {
+impl Item for Guard {
     fn id(&self) -> String {
         self.inner.id()
     }
@@ -454,7 +637,11 @@ impl Item for SnapshotGuard {
             return Some(Err(why));
         }
         self.record_attempt();
-        self.inner.refresh(sys, ctx)
+        let refreshed = self.inner.refresh(sys, ctx);
+        if refreshed.is_none() {
+            self.forget_attempt();
+        }
+        refreshed
     }
     fn revert(&self) -> Option<String> {
         self.inner.revert()
@@ -534,6 +721,7 @@ pub fn prepare_workstation_selected(
             },
             items: Vec::new(),
             snapshots: None,
+            held: Vec::new(),
         });
     }
     let ctx = context_for_selected(sys, group, selected)?;
@@ -547,6 +735,7 @@ pub fn prepare_workstation_selected(
         ctx,
         items,
         snapshots: None,
+        held: Vec::new(),
     })
 }
 
@@ -576,6 +765,7 @@ pub fn run_initial_spotlight(
         ctx: ctx.clone(),
         items: crate::init_spotlight::items(ctx)?,
         snapshots: None,
+        held: Vec::new(),
     }
     .run(sys, mode)
 }
@@ -711,10 +901,18 @@ fn run<'a>(
         at_console: ctx.console.is_some(),
         ..aterm_converge::Scope::EVERY
     };
-    let Base { items, held } = base;
+    let Base { items, held, clt } = base;
     let mut rows = aterm_converge::run_scoped(&items, mode, scope, journal, &mut |_| {})
         .map_err(|refused| refused.to_string())?;
     drop(held);
+    // `base.clt` once the lock is gone: its apply waits on a person's password.
+    if let Some(clt) = &clt {
+        let bound = crate::engine::bind([(clt as &dyn Item, crate::init_clt::place())], sys, ctx);
+        rows.extend(
+            aterm_converge::run_scoped(&bound, mode, scope, journal, &mut |_| {})
+                .map_err(|refused| refused.to_string())?,
+        );
+    }
     // No workstation item waits on a base item (they name none), so the two passes order
     // as the one did.
     let bound = crate::engine::bind(
@@ -1090,6 +1288,7 @@ mod tests {
             ],
             ctx: ctx(&[user("alice", 501)]),
             snapshots: None,
+            held: Vec::new(),
         };
         let rows = pass.run_recording(&sys, Mode::Apply).unwrap().rows;
         assert_eq!(rows[0].outcome, Outcome::Changed, "{rows:?}");
@@ -1103,6 +1302,250 @@ mod tests {
             })
             .collect();
         assert_eq!(ids, ["init.test.changes"]);
+    }
+
+    /// An item whose probes answer from a list (the last one repeats), counting its applies
+    /// and its runtime refreshes; with `aside`, each apply stands aside on it.
+    struct Counted {
+        id: &'static str,
+        probes: Mutex<Vec<Probe>>,
+        applies: Arc<std::sync::atomic::AtomicU32>,
+        refreshes: Arc<std::sync::atomic::AtomicU32>,
+        aside: Option<aterm_converge::StoodAside>,
+        /// The preference keys it would change ([`Item::preference_changes`]).
+        keys: Vec<(Target, Read<PValue>)>,
+    }
+
+    impl Counted {
+        fn boxed(
+            id: &'static str,
+            probes: Vec<Probe>,
+        ) -> (Box<dyn Item>, [Arc<std::sync::atomic::AtomicU32>; 2]) {
+            Self::aside(id, probes, None)
+        }
+
+        fn aside(
+            id: &'static str,
+            probes: Vec<Probe>,
+            aside: Option<aterm_converge::StoodAside>,
+        ) -> (Box<dyn Item>, [Arc<std::sync::atomic::AtomicU32>; 2]) {
+            let counts = [Arc::default(), Arc::default()];
+            let item = Box::new(Self {
+                id,
+                probes: Mutex::new(probes),
+                applies: Arc::clone(&counts[0]),
+                refreshes: Arc::clone(&counts[1]),
+                aside,
+                keys: Vec::new(),
+            });
+            (item, counts)
+        }
+    }
+
+    impl Item for Counted {
+        fn id(&self) -> String {
+            self.id.into()
+        }
+        fn family(&self) -> &'static str {
+            "test"
+        }
+        fn title(&self) -> String {
+            self.id.into()
+        }
+        fn probe(&self, _: &dyn System, _: &Ctx) -> Probe {
+            let mut probes = self.probes.lock().unwrap();
+            if probes.len() > 1 {
+                probes.remove(0)
+            } else {
+                probes[0].clone()
+            }
+        }
+        fn apply(&self, _: &dyn System, _: &Ctx) -> Result<(), String> {
+            self.applies
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+        fn refresh(&self, _: &dyn System, _: &Ctx) -> Option<Result<(), String>> {
+            self.refreshes
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Some(Ok(()))
+        }
+        fn stood_aside(&self) -> Option<aterm_converge::StoodAside> {
+            self.aside.clone()
+        }
+        fn preference_changes(
+            &self,
+            _: &dyn System,
+            _: &Ctx,
+        ) -> Result<Vec<(Target, Read<PValue>)>, String> {
+            Ok(self.keys.clone())
+        }
+    }
+
+    /// A held item's keys are no before-images of the pass: nothing of it changes, so
+    /// nothing of it is backed up for, or relaunched after, the pass, and a pass that
+    /// dies part way leaves no record naming a key nobody wrote. Negative control:
+    /// dropping the held skip of `Workstation::preference_changes` lists the Dock key.
+    #[test]
+    fn a_held_item_has_no_before_images() {
+        let alice = user("alice", 501);
+        let item = |id: &'static str, domain: &str| {
+            Box::new(Counted {
+                id,
+                probes: Mutex::new(vec![change()]),
+                applies: Arc::default(),
+                refreshes: Arc::default(),
+                aside: None,
+                keys: vec![(Target::user(domain, "k", &alice), Read::Absent)],
+            }) as Box<dyn Item>
+        };
+        let mut pass = Workstation {
+            items: vec![
+                item("init.test.dock", "com.apple.dock"),
+                item("init.test.widgets", "com.apple.WindowManager"),
+            ],
+            ctx: ctx(std::slice::from_ref(&alice)),
+            snapshots: None,
+            held: Vec::new(),
+        };
+        pass.hold(&[("init.test.dock".into(), Hold::Back("held".into()))]);
+        let before = pass.preference_changes(&Fake::root()).unwrap();
+        let domains: Vec<&str> = before.iter().map(|(t, _)| t.domain.as_str()).collect();
+        assert_eq!(domains, ["com.apple.WindowManager"]);
+        assert_eq!(
+            pass.snapshots.as_ref().map(Vec::len),
+            Some(2),
+            "one snapshot per item, in item order"
+        );
+    }
+
+    /// The ids of the fake's journal lines, in order.
+    fn journaled_ids(sys: &Fake) -> Vec<String> {
+        let text =
+            String::from_utf8(sys.written(Fake::JOURNAL).expect("the fake's journal")).unwrap();
+        text.lines()
+            .map(|line| {
+                let line: aterm_json::Value = aterm_json::from_str(line).unwrap();
+                line["id"].as_str().unwrap().to_owned()
+            })
+            .collect()
+    }
+
+    /// A held item that would change probes `Blocked` (held back) or `NotApplicable` (left
+    /// as it is), naming what it reads now and the caller's line, and is neither applied,
+    /// refreshed nor journaled, and one that already reads correct stays `Ok`, while the
+    /// items not held run as before; only the items whose apply or refresh ran are
+    /// attempts, each saying whether it verified. Negative control: not wrapping a held
+    /// item in `run_recording_with` applies and journals it.
+    #[test]
+    fn a_held_item_changes_nothing_and_only_reached_items_are_attempts() {
+        use std::sync::atomic::Ordering;
+        let sys = Fake::root();
+        let (held, held_counts) = Counted::boxed("init.test.held", vec![change()]);
+        let (held_ok, held_ok_counts) = Counted::boxed("init.test.held-ok", vec![ok()]);
+        let (as_is, as_is_counts) = Counted::boxed("init.test.as-is", vec![change()]);
+        let (free, free_counts) = Counted::boxed("init.test.free", vec![change(), ok()]);
+        let (fails, fails_counts) = Counted::boxed("init.test.fails", vec![change()]);
+        let mut pass = Workstation {
+            items: vec![
+                held,
+                held_ok,
+                as_is,
+                free,
+                fails,
+                Listed::boxed("init.test.right", vec![ok()]),
+            ],
+            ctx: ctx(&[user("alice", 501)]),
+            snapshots: None,
+            held: Vec::new(),
+        };
+        pass.hold(&[
+            (
+                "init.test.held".into(),
+                Hold::Back("held by the test".into()),
+            ),
+            (
+                "init.test.held-ok".into(),
+                Hold::Back("held by the test".into()),
+            ),
+            ("init.test.as-is".into(), Hold::AsIs("changed since".into())),
+        ]);
+        let run = pass.run_recording(&sys, Mode::Apply).unwrap();
+        let outcome = |id: &str| {
+            let row = run.rows.iter().find(|row| row.id == id).unwrap();
+            (row.outcome, row.why.clone())
+        };
+        assert_eq!(
+            outcome("init.test.held"),
+            (
+                Outcome::Blocked,
+                Some("a; not changed: held by the test".into())
+            )
+        );
+        assert_eq!(outcome("init.test.held-ok").0, Outcome::Ok);
+        assert_eq!(
+            outcome("init.test.as-is"),
+            (
+                Outcome::NotApplicable,
+                Some("a; left as it is: changed since".into())
+            )
+        );
+        assert_eq!(outcome("init.test.free").0, Outcome::Changed);
+        assert_eq!(outcome("init.test.fails").0, Outcome::Failed);
+        let counts = |counts: &[Arc<std::sync::atomic::AtomicU32>; 2]| {
+            counts.each_ref().map(|count| count.load(Ordering::SeqCst))
+        };
+        assert_eq!(counts(&held_counts), [0, 0], "a held change never runs");
+        assert_eq!(counts(&held_ok_counts), [0, 0], "nor a held refresh");
+        assert_eq!(counts(&as_is_counts), [0, 0], "nor one left as it is");
+        assert_eq!(counts(&free_counts), [1, 0]);
+        assert_eq!(counts(&fails_counts), [1, 0]);
+        assert_eq!(journaled_ids(&sys), ["init.test.free", "init.test.fails"]);
+        let attempts: Vec<(&str, bool)> = run
+            .attempts
+            .iter()
+            .map(|attempt| (attempt.id.as_str(), attempt.verified))
+            .collect();
+        assert_eq!(
+            attempts,
+            [("init.test.free", true), ("init.test.fails", false)],
+            "an Ok item with no refresh, and a held one, reached nothing"
+        );
+    }
+
+    /// An apply that stood aside (a permission not granted yet: the account sign-out
+    /// without Accessibility) changed nothing, so it is no attempt: an unattended caller
+    /// that holds what did not verify must not hold it, and retries it once the grant
+    /// lands. Negative control: dropping the `stood_aside` filter of `run_recording_with`
+    /// reports it an unverified attempt.
+    #[test]
+    fn an_apply_that_stood_aside_is_no_attempt() {
+        let sys = Fake::root();
+        let (aside, counts) = Counted::aside(
+            "init.test.aside",
+            vec![change()],
+            Some(aterm_converge::StoodAside::Permission(
+                "Accessibility is not granted".into(),
+            )),
+        );
+        let (fails, _) = Counted::boxed("init.test.fails", vec![change()]);
+        let pass = Workstation {
+            items: vec![aside, fails],
+            ctx: ctx(&[user("alice", 501)]),
+            snapshots: None,
+            held: Vec::new(),
+        };
+        let run = pass.run_recording(&sys, Mode::Apply).unwrap();
+        let row = run
+            .rows
+            .iter()
+            .find(|row| row.id == "init.test.aside")
+            .unwrap();
+        assert_eq!(row.outcome, Outcome::Blocked, "{row:?}");
+        assert!(row.stood_aside.is_some(), "{row:?}");
+        assert_eq!(counts[0].load(std::sync::atomic::Ordering::SeqCst), 1);
+        let attempts: Vec<&str> = run.attempts.iter().map(|a| a.id.as_str()).collect();
+        assert_eq!(attempts, ["init.test.fails"], "{:?}", run.attempts);
     }
 
     #[test]
@@ -1209,6 +1652,7 @@ mod tests {
                 applied: Arc::clone(&applied),
             })],
             held: Some(Box::new(Held(Arc::clone(&released)))),
+            clt: None,
         };
         let groups = vec![(
             vec![Box::new(Sees {
@@ -1372,12 +1816,13 @@ mod tests {
                 items: crate::init_trackpad::items(&ctx).unwrap(),
                 ctx,
                 snapshots: None,
+                held: Vec::new(),
             };
             pass.preference_changes(&sys).unwrap();
             let recording = pass
                 .run_recording_with(&sys, Mode::Apply, &mut NoJournal)
                 .unwrap();
-            assert!(recording.attempted_preferences.is_empty());
+            assert!(recording.attempts.is_empty());
             let rows = recording.rows;
             assert_eq!(rows[0].outcome, Outcome::Failed);
             assert!(rows[0].why.as_ref().unwrap().contains("recovery snapshot"));
@@ -1412,12 +1857,15 @@ mod tests {
             items: crate::init_trackpad::items(&ctx).unwrap(),
             ctx,
             snapshots: None,
+            held: Vec::new(),
         };
         assert_eq!(pass.preference_changes(&sys).unwrap().len(), 1);
         let recording = pass
             .run_recording_with(&sys, Mode::Apply, &mut NoJournal)
             .unwrap();
-        assert_eq!(recording.attempted_preferences.len(), 1);
+        assert_eq!(recording.attempts.len(), 1);
+        assert!(recording.attempts[0].verified);
+        assert_eq!(recording.attempts[0].preferences.len(), 1);
         let rows = recording.rows;
         assert_eq!(rows[0].outcome, Outcome::Changed, "{rows:?}");
         assert_eq!(
@@ -1447,6 +1895,7 @@ mod tests {
             ctx,
             items,
             snapshots: None,
+            held: Vec::new(),
         };
         assert!(
             pass.preference_changes(&sys)
@@ -1465,9 +1914,111 @@ mod tests {
             Options {
                 action: Action::Check,
                 json: true,
-                help: false
+                help: false,
+                only: Vec::new(),
             }
         );
+        // `--only` takes a list, in either spelling, and refuses an empty one.
+        assert_eq!(
+            options(&[
+                "--only".into(),
+                "base.clt".into(),
+                "--only=shell,pkg".into()
+            ])
+            .unwrap()
+            .only,
+            ["base.clt", "shell", "pkg"]
+        );
+        assert!(options(&["--only".into()]).is_err());
+        assert!(options(&["--only=".into()]).is_err());
+    }
+
+    /// `--only` keeps the base items its words name, `base.clt` among them, and a word that
+    /// names none is the surface's to refuse (`unnamed`) before anything runs.
+    #[test]
+    fn only_narrows_the_base_layer_and_names_the_words_it_does_not_know() {
+        let base = || Base {
+            items: vec![Box::new(BaseItem {
+                probes: Mutex::new(vec![ok()]),
+                applied: std::sync::Arc::default(),
+            }) as Box<dyn aterm_converge::Item>],
+            held: None,
+            clt: Some(crate::init_clt::CommandLineTools::new(
+                Box::new(|_: &dyn System| crate::init_clt::Found::Present("cc".into())),
+                PathBuf::from("/Applications/aterm.app/Contents/MacOS/aterm"),
+            )),
+        };
+        assert_eq!(
+            base().unnamed(&["base.clt".into(), "pkg".into(), "base".into()]),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            base().unnamed(&["workstation".into(), "base.cl".into()]),
+            ["workstation", "base.cl"]
+        );
+        let clt = base().narrowed(&["base.clt".into()]);
+        assert!(clt.items.is_empty() && clt.clt.is_some());
+        let pkg = base().narrowed(&["pkg".into()]);
+        assert_eq!(pkg.items.len(), 1);
+        assert!(pkg.clt.is_none());
+        let all = base().narrowed(&[]);
+        assert!(all.items.len() == 1 && all.clt.is_some());
+    }
+
+    /// `base.clt` runs in init's base pass after what the base layer holds is released (its
+    /// apply waits on a password), as an elevated base item; with no terminal it is
+    /// `Blocked` on `aterm init --only base.clt` and nothing runs.
+    #[test]
+    fn base_clt_runs_after_the_base_hold_is_released_and_blocks_without_a_terminal() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        struct Held(Arc<AtomicBool>);
+        impl Drop for Held {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+        let released = Arc::new(AtomicBool::new(false));
+        let saw = Arc::new(Mutex::new(Vec::new()));
+        let base = Base {
+            items: Vec::new(),
+            held: Some(Box::new(Held(Arc::clone(&released)))),
+            clt: Some(crate::init_clt::CommandLineTools::new(
+                {
+                    let (released, saw) = (Arc::clone(&released), Arc::clone(&saw));
+                    Box::new(move |_: &dyn System| {
+                        saw.lock().unwrap().push(released.load(Ordering::SeqCst));
+                        crate::init_clt::Found::Missing("no developer directory".into())
+                    })
+                },
+                PathBuf::from("/Applications/aterm.app/Contents/MacOS/aterm"),
+            )),
+        };
+        let alice = user("alice", 501);
+        let ctx = Ctx {
+            console: None,
+            ..ctx(&[alice])
+        };
+        let sys = Fake::default();
+        let rows = run(&sys, &ctx, base, &[], Mode::Apply, &mut NoJournal).unwrap();
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        let row = &rows[0];
+        assert_eq!(row.id, crate::init_clt::ID);
+        assert_eq!(row.outcome, Outcome::Blocked, "{row:?}");
+        assert_eq!(row.layer, Some(Layer::Base));
+        assert_eq!(row.class, Some(Class::Elevate));
+        assert!(
+            row.why
+                .as_deref()
+                .is_some_and(|why| why.ends_with("run `aterm init --only base.clt` in a terminal")),
+            "{row:?}"
+        );
+        let saw = saw.lock().unwrap();
+        assert!(
+            !saw.is_empty() && saw.iter().all(|&released| released),
+            "{saw:?}"
+        );
+        assert!(sys.calls().is_empty(), "{:?}", sys.calls());
     }
 
     #[test]
@@ -1529,6 +2080,7 @@ mod tests {
                     applied: std::sync::Arc::clone(&applied),
                 })],
                 held: None,
+                clt: None,
             };
             let groups = if at_console {
                 vec![(

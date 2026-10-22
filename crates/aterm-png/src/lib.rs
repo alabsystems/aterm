@@ -89,6 +89,7 @@ pub enum ColorType {
 impl ColorType {
     /// Samples per pixel.
     #[must_use]
+    #[inline]
     pub const fn samples(self) -> usize {
         match self {
             Self::Grayscale | Self::Indexed => 1,
@@ -100,6 +101,7 @@ impl ColorType {
 
     /// Parse an IHDR colour-type byte. `None` for the reserved values 1, 5 and
     /// anything above 6 — a file using one is malformed, not merely exotic.
+    #[inline]
     const fn from_u8(v: u8) -> Option<Self> {
         match v {
             0 => Some(Self::Grayscale),
@@ -115,6 +117,7 @@ impl ColorType {
     /// (specification table 11.1) — the pairing is NOT free, and accepting an
     /// illegal pair would mean computing a scanline stride the file does not
     /// have.
+    #[inline]
     const fn allows_depth(self, depth: BitDepth) -> bool {
         match self {
             Self::Grayscale => true,
@@ -146,12 +149,14 @@ pub enum BitDepth {
 impl BitDepth {
     /// The depth as a bit count.
     #[must_use]
+    #[inline]
     pub const fn bits(self) -> u32 {
         self as u32
     }
 
     /// Parse an IHDR bit-depth byte; `None` for any value that is not a legal
     /// PNG depth.
+    #[inline]
     const fn from_u8(v: u8) -> Option<Self> {
         match v {
             1 => Some(Self::One),
@@ -179,6 +184,7 @@ pub enum SrgbRenderingIntent {
 }
 
 impl SrgbRenderingIntent {
+    #[inline]
     const fn from_u8(v: u8) -> Option<Self> {
         match v {
             0 => Some(Self::Perceptual),
@@ -209,6 +215,7 @@ impl Transformations {
     /// Fold 16-bit samples to 8-bit by keeping the high byte.
     pub const STRIP_16: Self = Self(2);
 
+    #[inline]
     const fn contains(self, other: Self) -> bool {
         self.0 & other.0 == other.0
     }
@@ -216,6 +223,7 @@ impl Transformations {
 
 impl std::ops::BitOr for Transformations {
     type Output = Self;
+    #[inline]
     fn bitor(self, rhs: Self) -> Self {
         Self(self.0 | rhs.0)
     }
@@ -239,12 +247,14 @@ pub struct Limits {
 }
 
 impl Limits {
+    #[inline]
     pub(crate) const fn encoded_bytes(self) -> usize {
         self.bytes.saturating_mul(4).saturating_add(64 * 1024)
     }
 }
 
 impl Default for Limits {
+    #[inline]
     fn default() -> Self {
         // 64 MiB default output ceiling.
         Self {
@@ -294,6 +304,7 @@ pub struct OutputInfo {
 impl OutputInfo {
     /// Total bytes of the produced image.
     #[must_use]
+    #[inline]
     pub const fn buffer_size(&self) -> usize {
         self.line_size * self.height as usize
     }
@@ -420,9 +431,13 @@ pub(crate) const SIGNATURE: [u8; 8] = [0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A,
 /// rounded up to a whole byte (PNG pads each scanline to a byte boundary).
 /// `None` on overflow, so a hostile header cannot wrap the stride to a small
 /// number and get a short buffer treated as a big image.
-pub(crate) fn row_bytes(width: u32, samples: usize, depth: u32) -> Option<usize> {
-    let bits = (width as usize)
-        .checked_mul(samples)?
-        .checked_mul(depth as usize)?;
+#[inline]
+pub(crate) const fn row_bytes(width: u32, samples: usize, depth: u32) -> Option<usize> {
+    let Some(w_samples) = (width as usize).checked_mul(samples) else {
+        return None;
+    };
+    let Some(bits) = w_samples.checked_mul(depth as usize) else {
+        return None;
+    };
     Some(bits.div_ceil(8))
 }

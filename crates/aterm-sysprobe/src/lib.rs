@@ -62,12 +62,15 @@
 //! The macOS arm (the private `macos` module) reads libproc, `sysctlbyname`,
 //! Mach host and processor statistics and the IORegistry (the private
 //! `iokit` module's declarations, held to the SDK by `tests/iokit_sdk.rs`).
-//! The Linux arm reads `/proc` and `/sys` through std alone ([`linux`]'s
-//! parsers are pure functions over `&str`, and its [`linux::Root`] readers
-//! read under any root directory, so both compile and are tested on every
-//! platform against fixture trees). The Windows arm (the private `win`
-//! module, 64-bit Windows) calls kernel32 and ntdll and hands every buffer
-//! to [`windows`]'s decoders, which are pure and tested on every platform.
+//! The Linux arm reads `/proc` and `/sys` through std ([`linux`]'s parsers
+//! are pure functions over `&str`, and its [`linux::Root`] readers read
+//! under any root directory, so both compile and are tested on every
+//! platform against fixture trees), and an NVIDIA card's busy figure
+//! through NVML (the private `nvml` module, `libnvidia-ml.so.1` opened at
+//! run time by aterm-dl), which only the system root asks. The Windows arm
+//! (the private `win` module, 64-bit Windows) calls kernel32 and ntdll and
+//! hands every buffer to [`windows`]'s decoders, which are pure and tested
+//! on every platform.
 //! The volumes, file identities, path spellings and other processes'
 //! parameters are read through the private `win_paths` module's `kernel32`
 //! and `ntdll` declarations (each struct held to the SDK's layout by a test),
@@ -106,6 +109,8 @@ pub mod linux;
 mod machine;
 #[cfg(target_os = "macos")]
 mod macos;
+#[cfg(target_os = "linux")]
+mod nvml;
 pub mod paths;
 #[cfg(windows)]
 pub mod peb;
@@ -151,6 +156,7 @@ pub enum MemoryLevel {
 
 impl MemoryLevel {
     /// Return the canonical lowercase name (`"normal"`, `"warn"`, `"critical"`).
+    #[inline]
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -161,12 +167,14 @@ impl MemoryLevel {
     }
 
     /// Return `true` when memory pressure is above `Normal` (`Warn` or `Critical`).
+    #[inline]
     #[must_use]
     pub const fn is_elevated(self) -> bool {
         !matches!(self, Self::Normal)
     }
 
     /// Return `true` when memory pressure is `Critical`.
+    #[inline]
     #[must_use]
     pub const fn is_critical(self) -> bool {
         matches!(self, Self::Critical)
@@ -443,6 +451,7 @@ pub struct GroupMemory {
 
 impl GroupMemory {
     /// Encode this `GroupMemory` reading into 16 little-endian bytes (`pgid`, `measured`, `footprint_mib`).
+    #[inline]
     #[must_use]
     pub const fn encode_le(self) -> [u8; 16] {
         [
@@ -466,6 +475,7 @@ impl GroupMemory {
     }
 
     /// Decode 16 little-endian bytes into a `GroupMemory` reading.
+    #[inline]
     #[must_use]
     pub const fn decode_le(bytes: [u8; 16]) -> Self {
         let pgid = (bytes[0] as u32)
@@ -549,12 +559,14 @@ pub struct MachineMemory {
 
 impl MachineMemory {
     /// Return `available_mib.saturating_add(used_mib)`.
+    #[inline]
     #[must_use]
     pub const fn total_estimated_mib(self) -> u64 {
         self.available_mib.saturating_add(self.used_mib)
     }
 
     /// Encode this `MachineMemory` reading into 16 little-endian bytes (`available_mib`, `used_mib`).
+    #[inline]
     #[must_use]
     pub const fn encode_le(self) -> [u8; 16] {
         [
@@ -578,6 +590,7 @@ impl MachineMemory {
     }
 
     /// Decode 16 little-endian bytes into a `MachineMemory` reading.
+    #[inline]
     #[must_use]
     pub const fn decode_le(bytes: [u8; 16]) -> Self {
         let available_mib = (bytes[0] as u64)
@@ -635,6 +648,7 @@ pub fn machine_memory() -> Option<MachineMemory> {
 /// which `vm_stat` prints apart). Never more than `physical_mib` where that
 /// is known: a purgeable page may also sit on the inactive queue, so the sum
 /// can count one twice. `None` for a zero page size.
+#[inline]
 #[must_use]
 pub const fn available_mib_of(
     free: u64,
@@ -726,6 +740,7 @@ pub struct SwapMeter {
 
 impl SwapMeter {
     /// A meter that has read nothing.
+    #[inline]
     #[must_use]
     pub const fn new() -> Self {
         Self {
@@ -846,6 +861,7 @@ pub(crate) fn utf8_prefix(bytes: &[u8]) -> &str {
 /// Memory in use, MiB, as Activity Monitor's `Memory Used` counts it: app
 /// memory (internal pages less purgeable ones) plus wired plus the pages the
 /// compressor occupies, from `HOST_VM_INFO64`. `None` for a zero page size.
+#[inline]
 #[must_use]
 pub const fn used_mib_of(
     internal: u64,
@@ -871,6 +887,7 @@ pub const fn used_mib_of(
 
 /// `kern.memorystatus_vm_pressure_level` as a level: 1 normal, 2 warn,
 /// 4 critical; anything else unknown.
+#[inline]
 #[must_use]
 pub const fn pressure_of(level: i64) -> Option<MemoryLevel> {
     match level {

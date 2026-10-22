@@ -13,27 +13,37 @@ pub struct SecretBytes(Vec<u8>);
 
 impl SecretBytes {
     /// Take ownership of `bytes`.
-    pub fn new(bytes: Vec<u8>) -> Self {
+    #[inline]
+    #[must_use]
+    pub const fn new(bytes: Vec<u8>) -> Self {
         SecretBytes(bytes)
     }
 
     /// The bytes.
-    pub fn as_slice(&self) -> &[u8] {
-        &self.0
+    #[inline]
+    #[must_use]
+    pub const fn as_slice(&self) -> &[u8] {
+        self.0.as_slice()
     }
 
     /// The bytes as UTF-8, if they are.
+    #[inline]
+    #[must_use]
     pub fn as_str(&self) -> Option<&str> {
         std::str::from_utf8(&self.0).ok()
     }
 
     /// The length in bytes.
-    pub fn len(&self) -> usize {
+    #[inline]
+    #[must_use]
+    pub const fn len(&self) -> usize {
         self.0.len()
     }
 
     /// True when there are no bytes.
-    pub fn is_empty(&self) -> bool {
+    #[inline]
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
         self.0.is_empty()
     }
 }

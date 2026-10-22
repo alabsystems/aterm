@@ -80,8 +80,9 @@ impl ImportFormat {
     ];
 
     /// The user-facing name of the format.
+    #[inline]
     #[must_use]
-    pub fn label(self) -> &'static str {
+    pub const fn label(self) -> &'static str {
         match self {
             ImportFormat::Native => "aterm",
             ImportFormat::Kitty => "kitty",
@@ -541,6 +542,7 @@ pub fn sanitize_text(text: &str) -> Option<String> {
 }
 
 /// `text` without a leading byte-order mark.
+#[inline]
 fn strip_bom(text: &str) -> &str {
     text.strip_prefix('\u{feff}').unwrap_or(text)
 }
@@ -582,6 +584,7 @@ fn parse_foreign_colour(value: &str) -> Option<Rgb> {
 }
 
 /// `value` without one pair of matching surrounding `"` or `'` quotes.
+#[inline]
 fn unquote(value: &str) -> &str {
     for quote in ['"', '\''] {
         if let Some(inner) = value
@@ -625,6 +628,7 @@ enum Slot {
 
 /// The colour names of the 8 ANSI slots, as Alacritty and Windows Terminal
 /// spell them (`magenta` / `purple` both name slot 5).
+#[inline]
 fn ansi_name_index(name: &str) -> Option<usize> {
     Some(match name {
         "black" => 0,

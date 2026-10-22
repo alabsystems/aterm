@@ -806,6 +806,10 @@ fn a_window_seed_asks_no_index_and_a_typed_one_does() {
             .env_remove("ATPKG_REGISTRY")
             .env_remove("RUSTUP_HOME")
             .env_remove("ATERM_CHILD")
+            // The typed seed's HEADs retry the dropped proxy after curl's own backoff,
+            // 1 s and 2 s; a thousandth of it here (the debug build's fast-timers seam):
+            // what is pinned is that the proxy was asked, not how long the retries took.
+            .env(aterm_types::domain::ENV_DEV_FAST_TIMERS, "1")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())

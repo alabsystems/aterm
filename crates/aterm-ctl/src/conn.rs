@@ -176,11 +176,13 @@ struct Reply {
 }
 
 impl Reply {
+    #[inline]
     fn is_ok(&self) -> bool {
         self.status == "OK" || self.status.starts_with("OK ")
     }
 
     /// Everything after `OK ` (empty for a bare `OK`).
+    #[inline]
     fn tail(&self) -> &str {
         self.status.strip_prefix("OK ").unwrap_or("")
     }

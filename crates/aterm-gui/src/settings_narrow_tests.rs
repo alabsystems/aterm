@@ -356,6 +356,154 @@ fn a_narrow_slider_sets_its_readout_over_its_track() {
     });
 }
 
+/// A SLIDER'S READOUT IS MEASURED IN THE FACE IT PAINTS IN, AND ENDS AT ITS
+/// EDGE (the round-14 audit): the cursor trail's "24 cells" and "0.6 cells"
+/// in the 126pt control a 22-column window gives a stacked slider at 2×
+/// text, and every readout beside a wide track, stand flush right — the
+/// painted text's right edge on the readout's end — and the fit audit
+/// passes them. Measured in the mono face with a floor of 0.62 em a
+/// character while painted in the UI face, "24 cells" was reported 109pt
+/// in a 104pt slot (overflow=true) while its glyphs took 73pt, and it stood
+/// flush left, 32pt short of the edge "260 ms" ends on.
+#[test]
+fn a_slider_readout_is_measured_in_its_face_and_ends_at_its_edge() {
+    at_each_text_scale(&[1.0, 2.0], "slider readout", |scale| {
+        let _ = view_cx();
+        let theme = aterm_render::Theme::default();
+        let height = 46.0 * scale.min(1.4);
+        for width in [126.0, 600.0] {
+            for display in ["24 cells", "0.6 cells", "512 cells", "260 ms", "100%"] {
+                let rect = LogicalRect::new(0.0, 0.0, width, height);
+                let slider = UiContent::Slider(
+                    Control::new(
+                        SliderSpec {
+                            label: "Trail length".to_string(),
+                            step: 1.0,
+                            display_value: display.to_string(),
+                            description: None,
+                            track: None,
+                        },
+                        ActionId::new("trail"),
+                    )
+                    .value(SemanticValue::Number {
+                        value: 24.0,
+                        minimum: 1.0,
+                        maximum: 512.0,
+                    }),
+                );
+                let compiled = UiTree::new(UiNode::new("trail", slider))
+                    .compile(rect)
+                    .expect("the slider compiles");
+                let context = format!("{scale}\u{d7} {width}pt {display}");
+                let audit = compiled
+                    .text_fit_audit_line(&UiKey::new("trail"))
+                    .expect("the readout is audited");
+                assert!(audit.contains(" overflow=false "), "{context}: {audit}");
+                let geometry = crate::native_ui::slider_geometry(rect);
+                let prims = compiled.tray(theme, 14.0).prims;
+                let (x, size, face) = prims
+                    .iter()
+                    .find_map(|prim| match prim {
+                        crate::widget::DrawPrim::Text { s, x, px, face, .. } if s == display => {
+                            Some((*x, *px, *face))
+                        }
+                        _ => None,
+                    })
+                    .unwrap_or_else(|| panic!("{context}: the readout is painted"));
+                let right = x + crate::tray_raster::ui_text_width_for(face, display, size);
+                assert!(
+                    (right - geometry.value_right).abs() <= 0.5,
+                    "{context}: ends at {right:.1}, the readout's end is {:.1}",
+                    geometry.value_right
+                );
+                assert!(
+                    x >= geometry.value_left - 0.01,
+                    "{context}: starts in its slot"
+                );
+            }
+        }
+    });
+}
+
+/// A RESET'S PLACE NEVER COSTS A NAME MORE THAN A LINE OF ITS OWN (the
+/// round-14 audit): on every page at 30, 38 and 42 columns, 1× and 2× text,
+/// a stacked row's name — beside the Reset (or the place it keeps) at its
+/// label line's end — takes at most one line more than the label line
+/// alone sets it on: where it would take more, Reset has a line of its own,
+/// or a switch row's Reset follows the switch, narrowed toward its least.
+/// At 38 columns and 2× text Reset's empty 108pt place left "Supervise
+/// Gemini CLI sessions" 124pt, a word to a line — four lines where the line
+/// alone holds it on two — and "Allow programs to read the window title and
+/// size" seven for three.
+#[test]
+fn a_reset_place_never_costs_a_name_more_than_a_line_of_its_own() {
+    at_each_text_scale(&[1.0, 2.0], "reset seat", |scale| {
+        let mut faults = Vec::new();
+        let mut rows = 0;
+        for width in [234.0, 290.0, 318.0] {
+            for route in SettingsRoute::ALL {
+                for screen in screens_of(|_, _| {}, route, width, 600.0) {
+                    for row in screen
+                        .paint
+                        .iter()
+                        .filter(|node| !node.peek && node.key.as_str().starts_with("settings/row/"))
+                    {
+                        let Some(key) = row.key.as_str().splitn(4, '/').nth(3) else {
+                            continue;
+                        };
+                        let stacked = screen.paint.iter().any(|node| {
+                            node.key.as_str() == format!("settings/label-line/{key}")
+                                || node.key.as_str() == format!("settings/reset-line/{key}")
+                                || node.key.as_str() == format!("settings/controls/{key}")
+                        });
+                        let Some(name) = screen
+                            .semantic(&row.key)
+                            .map(|node| node.label.clone())
+                            .filter(|_| stacked)
+                        else {
+                            continue;
+                        };
+                        let prefix = format!("settings/label/{key}/visual/line-");
+                        let lines: Vec<String> = screen
+                            .paint
+                            .iter()
+                            .filter(|node| node.key.as_str().starts_with(&prefix))
+                            .filter_map(|node| match &node.content {
+                                UiContent::Text(text) => Some(text.text.clone()),
+                                _ => None,
+                            })
+                            .collect();
+                        let squeeze = |text: &str| text.split_whitespace().collect::<String>();
+                        // Rows whose label line paints the name alone.
+                        if lines.is_empty() || squeeze(&lines.concat()) != squeeze(&name) {
+                            continue;
+                        }
+                        rows += 1;
+                        let alone = row_name_lines(&name, row.rect.width).len();
+                        if lines.len() > alone + 1 {
+                            faults.push(format!(
+                                "{scale}\u{d7} {width} {}: {name:?} on {} lines, {alone} alone: \
+                                 {lines:?}",
+                                route.label(),
+                                lines.len()
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        assert!(rows > 0, "{scale}\u{d7}: stacked rows are drawn");
+        faults.sort();
+        faults.dedup();
+        assert!(
+            faults.is_empty(),
+            "{} rows:\n{}",
+            faults.len(),
+            faults.join("\n")
+        );
+    });
+}
+
 /// A STACKED CHOICE KEEPS ITS WORDS (the round-9 narrow sweep): a stacked
 /// row's choice button paints its whole choice where it fits, else the
 /// choice without its "(default)", else either with the arrow given up, else
@@ -740,87 +888,6 @@ fn the_compact_toolbar_keeps_its_words() {
     });
 }
 
-/// A CLI'S DETAIL LINE CUTS A PATH HONESTLY (item A5 of the round-9 narrow
-/// sweep): on a one-line row, a detail that names a path (a copy aterm does
-/// not manage) keeps the path's tail — the binary and its folder — and cuts
-/// its middle, the words around it whole where they fit; the words before it
-/// cut at a word where they do not; never the path's last component. A line
-/// with no path is cut back to a joint or a word. The end of the line used to
-/// go, the path's tail first; the row's accessible name says it whole. A
-/// PATH WITH A SPACE IN IT (`~/Library/Application Support/…`, where aterm's
-/// own copies live) is the look's whole path: found by the next space, it
-/// was "…/Library/Application", its binary and the words after it gone.
-#[test]
-fn a_cli_detail_cuts_a_path_honestly() {
-    at_each_text_scale(&[1.0, 2.0], "path tail", |scale| {
-        let _ = view_cx();
-        let (px, face) =
-            crate::native_ui::text_paint_metrics(SemanticRole::Status, StyleRef::Quiet);
-        let width_of = |text: &str| crate::tray_raster::ui_text_width_for(face, text, px);
-        let cases = [
-            (
-                "/Users//someone/.local/share/tools/bin/claude",
-                "not installed by aterm (a copy it does not manage is at \
-                 /Users//someone/.local/share/tools/bin/claude)",
-                "/bin/claude",
-            ),
-            (
-                "/Users//someone/Library/Application Support/aterm/pkg/reroute/agy",
-                "not installed by aterm (a copy it does not manage is at \
-                 /Users//someone/Library/Application Support/aterm/pkg/reroute/agy) \
-                 (not measured in this build)",
-                "/reroute/agy",
-            ),
-        ];
-        for (path, detail, tail) in cases {
-            let binary = tail.rsplit('/').next().expect("a binary");
-            let whole = width_of(detail);
-            for fraction in [0.95_f32, 0.8, 0.6, 0.45, 0.3, 0.2] {
-                let width = whole * fraction;
-                let context = format!("{scale}\u{d7} {binary} {width:.0}pt");
-                let line = ai_page::fit_keeping_path_tail(detail, Some(path), width);
-                assert!(width_of(&line) <= width + 0.01, "{context}: {line:?} fits");
-                assert!(
-                    line.contains(&format!("/{binary}")) || line == binary,
-                    "{context}: the binary is never cut: {line:?}"
-                );
-                assert!(
-                    !line.contains("Application\u{2026}") && !line.ends_with("Application"),
-                    "{context}: a folder with a space is never the path's end: {line:?}"
-                );
-                if line.contains(tail) {
-                    assert!(
-                        line.contains('\u{2026}'),
-                        "{context}: an honest cut: {line:?}"
-                    );
-                }
-            }
-            // Where the line holds the words and the path's tail, it keeps them.
-            let roomy = ai_page::fit_keeping_path_tail(detail, Some(path), whole * 0.8);
-            assert!(
-                roomy.starts_with("not installed by aterm (a copy it does not manage is at ")
-                    && roomy.contains(&format!("{tail})")),
-                "{scale}\u{d7}: {roomy:?}"
-            );
-            // What follows the path stays where it fits.
-            if detail.ends_with("(not measured in this build)") {
-                assert!(
-                    roomy.ends_with(") (not measured in this build)"),
-                    "{scale}\u{d7}: {roomy:?}"
-                );
-            }
-        }
-        // No path: back to a joint, never inside a word where a word fits.
-        let facts = "ok \u{b7} signed in (Max) \u{b7} served 2 h ago";
-        let cut = ai_page::fit_keeping_path_tail(
-            facts,
-            None,
-            width_of("ok \u{b7} signed in (Max) \u{b7} \u{2026}") + 1.0,
-        );
-        assert_eq!(cut, "ok \u{b7} signed in (Max) \u{b7} \u{2026}");
-    });
-}
-
 /// A STACKED CLI ROW'S DETAIL IS WHOLE: on a compact page each CLI's state
 /// and fact wrap to the column — a path at its folders — never cut ("signed-
 /// ou…" at 2× text on a phone-width page).
@@ -1189,46 +1256,446 @@ fn search_results_and_modified_keep_their_words() {
     });
 }
 
+/// AN EMPTY FIELD DROPS NO WORD WHERE ITS ROW CAN GROW (the round-14
+/// audit): every empty text field on Appearance, Terminal and Cursor Styles
+/// (the comet's trail colours too) at 22 and 30 columns, 1×, 1.5× and 2×
+/// text, paints every word of its placeholder — less only the "(default)"
+/// the quiet tint says and the aside it ends in — on one line or on lines of
+/// the field, never "…" for words it leaves out — a colour field whose
+/// words are not whole beside its chip sets the chip on a line of its own
+/// under them, and still shows its colour. "Theme default" read "Theme…"
+/// (and at 2× in 22 columns the field showed its chip alone), "platform
+/// default" "platform…", "Pale blue (default)" "Pale…", and "Brighter pale
+/// blue (default)" "Brighter" / "pale…", the row free to grow.
+#[test]
+fn an_empty_field_drops_no_word_where_its_row_can_grow() {
+    at_each_text_scale(&[1.0, 1.5, 2.0], "placeholder words", |scale| {
+        let mut faults = Vec::new();
+        let mut fields = 0;
+        for (route, source) in [
+            (SettingsRoute::Appearance, ""),
+            (SettingsRoute::Terminal, ""),
+            (
+                SettingsRoute::CursorStyles,
+                "cursor_trail_style = \"comet\"\n",
+            ),
+        ] {
+            for width in [178.0, 234.0] {
+                let mut lab = super::modified::Lab::new(source);
+                lab.state_mut().navigate(route);
+                let mut page = 0;
+                loop {
+                    lab.state_mut().page_scroll = page;
+                    lab.state_mut().page_reveal = None;
+                    let screen = lab.compile(width, 348.0);
+                    for node in &screen.paint {
+                        let UiContent::TextField(field) = &node.content else {
+                            continue;
+                        };
+                        if !node.key.as_str().starts_with("settings/control/")
+                            || field.spec.input.is_some()
+                            || !field
+                                .spec
+                                .visual_value
+                                .as_deref()
+                                .unwrap_or_default()
+                                .is_empty()
+                        {
+                            continue;
+                        }
+                        let SemanticValue::Text(value) = &field.value else {
+                            continue;
+                        };
+                        let painted = field.spec.placeholder.clone().unwrap_or_default();
+                        fields += 1;
+                        let context = format!(
+                            "{scale}\u{d7} {width} {} {}",
+                            route.label(),
+                            node.key.as_str()
+                        );
+                        // A colour field still shows its colour: beside its
+                        // words, or on a line of its own under them.
+                        let themed = [
+                            prefs::EDIT_FOREGROUND,
+                            prefs::EDIT_BACKGROUND,
+                            prefs::EDIT_CURSOR_COLOR,
+                            prefs::EDIT_SELECTION_COLOR,
+                        ]
+                        .iter()
+                        .any(|key| node.key.as_str() == format!("settings/control/{key}"));
+                        if themed && field.spec.swatch.is_none() {
+                            faults.push(format!("{context}: its colour is not shown"));
+                        }
+                        let read = painted_words(&painted);
+                        let plain = crate::native_ui::plain_placeholder(value);
+                        if painted.contains('\u{2026}')
+                            || plain.split_whitespace().any(|word| !read.contains(word))
+                        {
+                            faults.push(format!("{context}: {painted:?} of {value:?}"));
+                        }
+                    }
+                    let limit = lab.state().result_page_limit.get().unwrap_or(0);
+                    if page >= limit {
+                        break;
+                    }
+                    page += 1;
+                }
+            }
+        }
+        assert!(fields > 0, "{scale}\u{d7}: empty fields are drawn");
+        faults.sort();
+        faults.dedup();
+        assert!(
+            faults.is_empty(),
+            "{} fields:\n{}",
+            faults.len(),
+            faults.join("\n")
+        );
+    });
+}
+
+/// A FIELD'S VALUE IS WHOLE WHERE ITS ROW CAN GROW (the round-14 review):
+/// a value wider than its field — a shell named by a hyphenated word, a
+/// shell's path — paints every letter while the field is not being edited,
+/// on the lines it takes (a path the longest of its forms two lines hold,
+/// its program's name whole), the field as tall as they are; editing it
+/// leaves the row as tall. A value one line holds stays on one line. It
+/// was cut on one line: "nushell-nightly-build" read "nushel…" at 2× text
+/// in a 22-column window, the path's program "…e-zsh".
+#[test]
+fn a_fields_value_is_whole_where_its_row_can_grow() {
+    let bare = |text: &str| {
+        text.chars()
+            .filter(|c| !c.is_whitespace() && *c != '-')
+            .collect::<String>()
+    };
+    at_each_text_scale(&[1.0, 1.5, 2.0], "field values", |scale| {
+        let mut wrapped = 0;
+        for (value, path) in [
+            ("nushell-nightly-build", false),
+            ("/opt/homebrew/Cellar/zsh/5.9/bin/login-zsh", true),
+        ] {
+            for width in [178.0, 234.0, 744.0] {
+                let mut lab = super::modified::Lab::new(&format!("shell = \"{value}\"\n"));
+                lab.state_mut().navigate(SettingsRoute::Modified);
+                let key = UiKey::new("settings/control/shell");
+                let context = format!("{scale}\u{d7} {width}pt {value}");
+                let rest = lab.compile(width, 2_000.0);
+                let painted = rest
+                    .text_fit_audit_line(&key)
+                    .unwrap_or_else(|| panic!("{context}: the field is drawn"));
+                assert!(painted.contains(" overflow=false "), "{context}: {painted}");
+                let shown = painted
+                    .split(" painted=\"")
+                    .nth(1)
+                    .map(|rest| rest.trim_end().trim_end_matches('"').replace("\\n", "\n"))
+                    .expect("painted words");
+                let lines = shown.split('\n').count();
+                let row = rest
+                    .paint
+                    .iter()
+                    .find(|node| node.key == key)
+                    .map(|node| node.rect)
+                    .expect("the field's rect");
+                if path {
+                    // Its program's name whole: the path whole, or its
+                    // folders given up for "…" only where two lines do not
+                    // hold it, the name's folder kept where they hold it
+                    // ([`path_placeholder_lines`]).
+                    assert!(
+                        bare(&shown).ends_with(&bare("/login-zsh"))
+                            && (lines <= 2 || shown.starts_with('\u{2026}')),
+                        "{context}: {shown:?}"
+                    );
+                } else {
+                    assert_eq!(bare(&shown), bare(value), "{context}: {shown:?}");
+                    assert!(!shown.contains('\u{2026}'), "{context}: {shown:?}");
+                }
+                if width >= 744.0 && !path {
+                    assert_eq!(lines, 1, "{context}: one line holds it: {shown:?}");
+                }
+                assert!(
+                    row.height + 0.5
+                        >= lines as f32 * crate::native_ui::native_button_line_height(),
+                    "{context}: the field holds its {lines} lines: {row:?}"
+                );
+                wrapped += usize::from(lines > 1);
+                // Editing it keeps the row's height.
+                let _ = lab.invoke(
+                    "settings/set/shell",
+                    Some(SemanticInput::TextPosition {
+                        byte: 0,
+                        extend: false,
+                    }),
+                );
+                let editing = lab.compile(width, 2_000.0);
+                let field = editing
+                    .paint
+                    .iter()
+                    .find(|node| node.key == key)
+                    .expect("the field is drawn");
+                assert!(
+                    matches!(&field.content, UiContent::TextField(control) if control.spec.input.is_some()),
+                    "{context}: the field is being edited"
+                );
+                assert!(
+                    (field.rect.height - row.height).abs() < 0.5,
+                    "{context}: editing keeps its height: {:?} vs {row:?}",
+                    field.rect
+                );
+            }
+        }
+        assert!(
+            wrapped > 0,
+            "{scale}\u{d7}: a narrow field sets its value on lines"
+        );
+    });
+}
+
+/// A FIELD'S CHIP ON A LINE OF ITS OWN TAKES NONE OF ITS WORDS' WIDTH
+/// ([`crate::native_ui::TextFieldSpec::swatch_line`]): the words have the
+/// field's whole text box, over the chip's line, and the chip is drawn at
+/// the field's end on that line, under them. NEGATIVE CONTROL: beside the
+/// words the chip takes its 30pt off their room.
+#[test]
+fn a_fields_chip_on_its_own_line_takes_none_of_its_words_width() {
+    at_each_text_scale(&[2.0], "chip line", |_| {
+        let _ = view_cx();
+        let theme = aterm_render::Theme::default();
+        let line = crate::native_ui::native_button_line_height();
+        let field = |swatch_line: bool| {
+            UiContent::TextField(Control::new(
+                TextFieldSpec {
+                    label: "Foreground".to_string(),
+                    placeholder: Some("Theme".to_string()),
+                    secret: false,
+                    visual_value: Some(String::new()),
+                    input: None,
+                    swatch: Some([0x20, 0x40, 0x80]),
+                    swatch_line,
+                    trailing_hint: None,
+                    description: None,
+                    end_button: false,
+                },
+                ActionId::new("foreground"),
+            ))
+        };
+        let height = scaled_control_height() + line;
+        let rect = LogicalRect::new(0.0, 0.0, 118.0, height);
+        let available = |compiled: &crate::native_ui::CompiledUi| {
+            let audit = compiled
+                .text_fit_audit_line(&UiKey::new("foreground"))
+                .expect("the field is audited");
+            let value = audit
+                .split(" available=")
+                .nth(1)
+                .and_then(|rest| rest.split(' ').next())
+                .and_then(|number| number.parse::<f32>().ok())
+                .expect("its room");
+            (audit, value)
+        };
+        let own = UiTree::new(UiNode::new("foreground", field(true)))
+            .compile(rect)
+            .expect("compiles");
+        let (audit, room) = available(&own);
+        assert!(audit.contains(" overflow=false "), "{audit}");
+        assert!(
+            (room - (118.0 - 20.0)).abs() < 0.5,
+            "the whole text box: {audit}"
+        );
+        let chip = own
+            .tray(theme, 14.0)
+            .prims
+            .into_iter()
+            .find_map(|prim| match prim {
+                crate::widget::DrawPrim::Panel { x, y, w, .. }
+                    if (w - crate::native_ui::TEXT_FIELD_SWATCH_SIZE).abs() < 0.01 =>
+                {
+                    Some((x, y))
+                }
+                _ => None,
+            })
+            .expect("the chip is drawn");
+        assert!(
+            chip.1 >= height - line - 0.5,
+            "on the line under the words: {chip:?} in {height}"
+        );
+        assert!(chip.0 > 118.0 - 40.0, "at the field's end: {chip:?}");
+        // NEGATIVE CONTROL: beside the words, the chip takes its room.
+        let beside = UiTree::new(UiNode::new("foreground", field(false)))
+            .compile(rect)
+            .expect("compiles");
+        let (_, room) = available(&beside);
+        assert!((room - (118.0 - 20.0 - 30.0)).abs() < 0.5, "{room}");
+    });
+}
+
+/// A FIELD'S HINT STANDS AT THE END OF ITS TEXT BOX (the round-14 review):
+/// the "Unsaved" a colour field with a refused draft says at its end ends
+/// where the box its words have ends — at the field's end where the chip
+/// stands on a line of its own, a chip's width before it where the chip
+/// stands beside the words — so it never stands over them. The painter
+/// took a chip's width off the hint's line for any field with a chip, and
+/// the hint stood 30pt into the words of a field whose chip had a line of
+/// its own.
+#[test]
+fn a_fields_hint_stands_at_the_end_of_its_text_box() {
+    at_each_text_scale(&[1.0, 2.0], "hint at the box's end", |scale| {
+        let _ = view_cx();
+        let theme = aterm_render::Theme::default();
+        let line = crate::native_ui::native_button_line_height();
+        for swatch_line in [true, false] {
+            let control = Control::new(
+                TextFieldSpec {
+                    label: "Background".to_string(),
+                    placeholder: Some("Theme".to_string()),
+                    secret: false,
+                    visual_value: Some("zz".to_string()),
+                    input: None,
+                    swatch: Some([0x20, 0x40, 0x80]),
+                    swatch_line,
+                    trailing_hint: Some("Unsaved".to_string()),
+                    description: None,
+                    end_button: false,
+                },
+                ActionId::new("background"),
+            );
+            let height = scaled_control_height() + line;
+            let rect = LogicalRect::new(0.0, 0.0, 260.0, height);
+            let geometry = crate::native_ui::text_field_geometry(
+                &control,
+                rect,
+                crate::native_ui::native_type_px(crate::type_scale::TypeStep::Secondary).get(),
+            );
+            let compiled = UiTree::new(UiNode::new("background", UiContent::TextField(control)))
+                .compile(rect)
+                .expect("compiles");
+            let (x, px) = compiled
+                .tray(theme, 14.0)
+                .prims
+                .into_iter()
+                .find_map(|prim| match prim {
+                    crate::widget::DrawPrim::Text { s, x, px, .. } if s == "Unsaved" => {
+                        Some((x, px))
+                    }
+                    _ => None,
+                })
+                .expect("the hint is drawn");
+            let context = format!("{scale}\u{d7} chip line {swatch_line}");
+            assert!(
+                x >= geometry.text_right + crate::native_ui::TEXT_FIELD_SWATCH_GAP - 0.5,
+                "{context}: the hint at {x:.1} stands after the words' box, which ends at {:.1}",
+                geometry.text_right
+            );
+            let end = x + crate::tray_raster::ui_text_width("Unsaved", px);
+            let box_end = if swatch_line {
+                260.0 - crate::native_ui::TEXT_FIELD_HORIZONTAL_PADDING
+            } else {
+                260.0
+                    - crate::native_ui::TEXT_FIELD_HORIZONTAL_PADDING
+                    - crate::native_ui::TEXT_FIELD_SWATCH_SIZE
+                    - crate::native_ui::TEXT_FIELD_SWATCH_GAP
+            };
+            assert!(
+                (end - box_end).abs() < 0.5,
+                "{context}: the hint ends at {end:.1}, its box at {box_end:.1}"
+            );
+        }
+    });
+}
+
+/// A NARROW FIELD GIVES UP ITS HINT, NEVER ITS WORDS (the round-14 review):
+/// at 2× text in a 22- or 24-column window a refused draft's field paints
+/// its value whole and no "Unsaved" beside it — the page's draft bar says
+/// the draft waits, and the field's description says it — where beside the
+/// hint its words would keep less than the hint takes; a field with room
+/// for both paints both. The hint left "abc" 8pt of its box, the value
+/// painted nowhere (audit overflow=true).
+#[test]
+fn a_narrow_field_gives_up_its_hint_never_its_words() {
+    at_each_text_scale(&[2.0], "hint or words", |_| {
+        for (width, hinted) in [(178.0, false), (192.0, false), (744.0, true)] {
+            let mut lab = super::modified::Lab::new("");
+            lab.state_mut().navigate(SettingsRoute::Terminal);
+            let _ = lab.compile(width, 432.0);
+            let _ = lab.invoke(
+                &format!("settings/set/{}", prefs::EDIT_SCROLLBACK),
+                Some(SemanticInput::Text("abc".to_string())),
+            );
+            let compiled = lab.compile(width, 432.0);
+            let key = UiKey::new(format!("settings/control/{}", prefs::EDIT_SCROLLBACK));
+            let context = format!("2\u{d7} {width}pt");
+            let audit = compiled
+                .text_fit_audit_line(&key)
+                .unwrap_or_else(|| panic!("{context}: the field is drawn"));
+            assert!(
+                audit.contains(" overflow=false ") && audit.contains("abc"),
+                "{context}: its words whole: {audit}"
+            );
+            let painted = compiled
+                .tray(aterm_render::Theme::default(), 14.0)
+                .prims
+                .into_iter()
+                .any(|prim| matches!(prim, crate::widget::DrawPrim::Text { s, .. } if s == "Unsaved"));
+            assert_eq!(painted, hinted, "{context}: the hint");
+        }
+    });
+}
+
 /// THE FLEET FIELD'S WORDS KEEP IT A FIELD (the round-7 Linux lane): where
 /// Settings does not know aterm.toml's folder, the field says "ai-fleet.toml
-/// beside aterm.toml", which went on five lines at 2× text in a 22-column
-/// window on macOS and six in Noto Sans, a field 229pt tall in a 348pt
-/// window's 222pt list, whole on no screen. Now the most leading whole words
-/// two lines hold, "…" after them, else three, at every narrow width.
+/// beside aterm.toml", which goes on five lines at 2× text in a 22-column
+/// window; once that was a field 229pt tall in a 222pt list, whole on no
+/// screen. Every word stands on the field's lines wherever a screen of the
+/// list holds them ([`field_lines_most`]) — capped at two or three lines,
+/// it read "ai-" / "fleet.toml" / "beside…" in a list with room for all —
+/// and the field is whole on some screen, at every narrow width, 24 and 36
+/// rows tall.
 #[test]
 fn the_fleet_fields_words_keep_it_a_field() {
     at_each_text_scale(&[1.0, 2.0], "fleet words", |scale| {
         for width in NARROW_WIDTHS {
-            let context = format!("{scale}\u{d7} {width}");
-            let (mut runtime, instance, view) = every_page_runtime();
-            {
-                // Where aterm.toml is is not known: the field says it in words.
-                let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
-                    unreachable!()
-                };
-                state.arm_config_file(None, None, ConfigFileArm::inert());
-            }
-            go_to_route(&mut runtime, instance, view, SettingsRoute::Ai);
-            let key = UiKey::new(format!("settings/control/{}", prefs::EDIT_AI_FLEET));
-            let mut seen = false;
-            each_screen(
-                &mut runtime,
-                instance,
-                view,
-                &view_cx_at(width, 516.0),
-                |screen, _| {
-                    let Some(node) = screen.paint.iter().find(|node| node.key == key) else {
-                        return;
+            for height in NARROW_HEIGHTS {
+                let context = format!("{scale}\u{d7} {width}x{height}");
+                let (mut runtime, instance, view) = every_page_runtime();
+                {
+                    // Where aterm.toml is is not known: the field says it in
+                    // words.
+                    let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+                        unreachable!()
                     };
-                    seen = true;
-                    let painted = painted_text(node).unwrap_or_default();
-                    assert!(
-                        painted.lines().count() <= 3,
-                        "{context}: the fleet field paints {painted:?}"
-                    );
-                },
-            );
-            assert!(seen, "{context}: the fleet field is on the page");
+                    state.arm_config_file(None, None, ConfigFileArm::inert());
+                }
+                go_to_route(&mut runtime, instance, view, SettingsRoute::Ai);
+                let key = UiKey::new(format!("settings/control/{}", prefs::EDIT_AI_FLEET));
+                let (mut seen, mut whole) = (false, false);
+                each_screen(
+                    &mut runtime,
+                    instance,
+                    view,
+                    &view_cx_at(width, height),
+                    |screen, _| {
+                        let Some(node) = screen
+                            .paint
+                            .iter()
+                            .find(|node| node.key == key && !node.peek)
+                        else {
+                            return;
+                        };
+                        seen = true;
+                        whole |= node.clip.height >= node.rect.height - 0.5;
+                        let painted = painted_text(node).unwrap_or_default();
+                        let read = painted_words(&painted).replace(['\n', ' '], "");
+                        assert!(
+                            !painted.contains('\u{2026}')
+                                && read == "ai-fleet.tomlbesideaterm.toml",
+                            "{context}: the fleet field paints {painted:?}"
+                        );
+                    },
+                );
+                assert!(seen, "{context}: the fleet field is on the page");
+                assert!(whole, "{context}: the field is whole on some screen");
+            }
         }
     });
 }
@@ -2684,8 +3151,9 @@ fn an_identifier_no_line_holds_breaks_with_no_mark_in_it() {
 /// it, in a 22-column window at 2× text: a colour row's Choose… paints
 /// "Choose" (its trailing "…" given up, [`button_words_in`]) where
 /// "Choose…" is wider than the button and "Choose" is not; a colour field
-/// whose words cannot be whole beside its chip shows the chip alone
-/// ([`fit_row_field_placeholder`]); and a stacked Messages head's title runs
+/// whose words cannot be whole beside its chip sets the chip on a line of
+/// its own and keeps its words whole (`add_color_chooser`); and a stacked
+/// Messages head's title runs
 /// past its chevron, which stands on the head's first row
 /// ([`messages_stacked_width`]), so "Antigravity" is whole and the title is
 /// not cut. NEGATIVE CONTROL: Appearance painted "Choo-" / "se…" and "The-"
@@ -2716,10 +3184,18 @@ fn a_short_word_is_never_broken_in_a_control_with_room_for_it() {
             &view_cx_at(178.0, 488.0),
             |screen, top| {
                 for node in screen.paint.iter().filter(|node| !node.peek) {
-                    let UiContent::TextField(field) = &node.content else {
+                    let UiContent::TextField(_) = &node.content else {
                         continue;
                     };
-                    if field.spec.swatch.is_none() {
+                    let colour = [
+                        prefs::EDIT_FOREGROUND,
+                        prefs::EDIT_BACKGROUND,
+                        prefs::EDIT_CURSOR_COLOR,
+                        prefs::EDIT_SELECTION_COLOR,
+                    ]
+                    .iter()
+                    .any(|key| node.key.as_str() == format!("settings/control/{key}"));
+                    if !colour {
                         continue;
                     }
                     let Some(painted) = painted_text(node) else {
@@ -2727,9 +3203,10 @@ fn a_short_word_is_never_broken_in_a_control_with_room_for_it() {
                     };
                     fields += 1;
                     assert!(
-                        painted
-                            .lines()
-                            .all(|line| !line.ends_with('-') && !line.ends_with('\u{2026}')),
+                        !painted.is_empty()
+                            && painted
+                                .lines()
+                                .all(|line| !line.ends_with('-') && !line.ends_with('\u{2026}')),
                         "screen {top}: {} paints {painted:?}",
                         node.key.as_str()
                     );
@@ -3155,6 +3632,7 @@ fn a_path_field_keeps_its_file_name() {
             visual_value: Some(path.to_string()),
             input: None,
             swatch: None,
+            swatch_line: false,
             trailing_hint: None,
             description: None,
             end_button: false,

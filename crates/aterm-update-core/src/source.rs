@@ -99,6 +99,7 @@ pub fn pick_slug(origin: &str, value: Option<&str>, default: &str) -> String {
 /// Whether `s` is safe to interpolate into a GitHub URL as one path segment: non-empty, at
 /// most 100 bytes, not `.`/`..`, and only `A–Z a–z 0–9 . _ -`. A URL-safety allowlist, not a
 /// GitHub-name validator: a URL-safe name that is no real repo simply 404s.
+#[inline]
 #[must_use]
 pub fn is_valid_slug(s: &str) -> bool {
     !s.is_empty()

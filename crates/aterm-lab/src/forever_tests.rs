@@ -716,11 +716,11 @@ fn the_coverage_modes_pick_their_chains() {
         [LandP, Cap, LandQ].map(Chain::orchestrated),
         [Some(ORCHESTRATED), Some(RESUMED), None]
     );
-    assert_eq!(Chain::every().len(), 29);
+    assert_eq!(Chain::every().len(), 33);
     assert!(
         Chain::every()
             .iter()
-            .all(|c| !c.instant() || Chain::ALL.contains(c))
+            .all(|c| !c.instant() || Chain::ALL.contains(c) || Chain::RESID.contains(c))
     );
     // the wall alone, on every harness: the stub draws each one's own wall
     assert_eq!(Chain::of_mode(Mode::Wall), [Wall]);
@@ -6298,6 +6298,959 @@ fn every_chain_and_scenario_of_the_pass_has_its_window_wants() {
     }
     // a coverage chain is held to none (not judged on the window in 5c)
     assert!(!wanted(Chain::LandQ, Scenario::L12));
+}
+
+// ---------------------------------------------------------------------------
+// THE RESIDUALS, LIVE (`--mode resid`, `--mode ladder`)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn the_residual_modes_pick_their_chains_and_script_them() {
+    use Chain::*;
+    assert_eq!(
+        Chain::of_mode(Mode::Resid),
+        [InstantCruise, InstantPerson, SameWords, ToolEnd, Off]
+    );
+    assert_eq!(Chain::of_mode(Mode::Ladder), [Ladder, Off]);
+    // F3 where a turn can end on a tool's row: not on agy, which asks again
+    assert_eq!(
+        Chain::of_mode_on(Mode::Resid, Harness::Agy),
+        [InstantCruise, InstantPerson, SameWords, Off]
+    );
+    for h in [Harness::Claude, Harness::Gemini, Harness::Muse] {
+        assert_eq!(
+            Chain::of_mode_on(Mode::Resid, h),
+            Chain::of_mode(Mode::Resid),
+            "{h:?}"
+        );
+        assert_eq!(tool_end_out_of_reach(h), None, "{h:?}");
+    }
+    assert!(tool_end_out_of_reach(Harness::Agy).is_some());
+    let v = |a: &[&str]| a.iter().map(|s| (*s).to_string()).collect::<Vec<_>>();
+    for (w, m) in [("resid", Mode::Resid), ("ladder", Mode::Ladder)] {
+        let a = parse_args(&v(&["--harness", "gemini", "--mode", w]))
+            .unwrap()
+            .unwrap();
+        assert_eq!(a.mode, m);
+        assert_eq!(m.walled(), None);
+    }
+    // F18's person's prompt is a person's; P4P's, its negative control in the
+    // same run, the control socket's
+    assert!(InstantPerson.asks().is_some() && InstantPerson.asks_as_person());
+    assert!(InstantCruise.asks().is_some() && !InstantCruise.asks_as_person());
+    assert_eq!(InstantPerson.scenarios(), [Scenario::F18]);
+    assert_eq!(
+        SameWords.scenarios(),
+        [Scenario::Rewrap, Scenario::SameWords]
+    );
+    assert_eq!(ToolEnd.scenarios(), [Scenario::F3]);
+    assert_eq!(Ladder.scenarios(), [Scenario::Ladder]);
+    // none's landing is its scenario: F3's is the first point, not the landing
+    assert!(!ToolEnd.lands() && !SameWords.lands() && !Ladder.lands());
+    assert_eq!(
+        [InstantPerson, SameWords, ToolEnd, Ladder].map(Chain::autopilot),
+        ["cruise", "cruise", "land", "cruise"]
+    );
+    assert!(InstantPerson.instant() && SameWords.instant() && ToolEnd.instant());
+    assert!(!Ladder.instant());
+    assert_eq!(Ladder.limit_ms(), LADDER_LIMIT_MS);
+    assert_eq!(SameWords.orchestrated(), Some(SAME_TURN));
+    // F18 is scripted as P4P is: the person's prompt answered at once
+    let ask = InstantPerson.asks().unwrap();
+    assert_eq!(
+        reply(InstantPerson, &[DONE_CHECK, ask.as_str()]).as_deref(),
+        Some(ASK_REPLY)
+    );
+    assert_eq!(reply(InstantPerson, &[]).as_deref(), Some(DONE_CLAIM));
+    // SAME: every turn, the orchestrator's too, answered with the very words
+    // of the reply before it, under its own opener carrying the long token
+    assert_eq!(reply(SameWords, &[]).as_deref(), Some(WORK));
+    assert_eq!(reply(SameWords, &[SAME_TURN]).as_deref(), Some(WORK));
+    assert!(SameWords.prompt().contains(LONG_TOKEN));
+    // one composer row at the window's width, two at the resized one
+    let len = SameWords.prompt().chars().count();
+    assert!(len <= 120 && len > usize::from(RESIZED.0) + 8, "{len}");
+    assert!(!LONG_TOKEN.contains(' ') && SAME_TURN.contains(SAME_TURN_KEY));
+    assert!(!SAME_TURN.contains(LONG_TOKEN));
+    // F3: the prompt's call answered with no words; Land's acts clean
+    assert_eq!(reply(ToolEnd, &[]).as_deref(), Some(TOOL_AFTER));
+    assert_eq!(reply(ToolEnd, &[LAND]).as_deref(), Some(CLEAN));
+    assert_eq!(reply(ToolEnd, &[LAND, LAND_NUDGE]).as_deref(), Some(CLEAN));
+    // LADDER: every turn short and plain, paced
+    assert_eq!(reply(Ladder, &[]).as_deref(), Some(WORK));
+    assert_eq!(reply(Ladder, &[CONTINUE_TEXT]).as_deref(), Some(WORK));
+    // the ladder's scale reaches the instance as a dev seam the lab hands it
+    assert_eq!(ladder_env(), "ATERM_DEV_LADDER_SCALE=0.125");
+    assert!(crate::lab::instance_env(&ladder_env()).is_ok());
+}
+
+#[test]
+fn the_tool_ended_turn_is_scripted_per_harness_on_its_prompts_rule_alone() {
+    let dirs: Vec<PathBuf> = Chain::RESID
+        .iter()
+        .map(|c| PathBuf::from(format!("/w/{}", c.name())))
+        .collect();
+    for (h, name) in [
+        (Harness::Claude, "Read"),
+        (Harness::Gemini, "read_file"),
+        (Harness::Agy, "view_file"),
+        (Harness::Muse, "read_file"),
+    ] {
+        let sp = spec_on(&Chain::RESID, h, &dirs);
+        let rules = sp.get("replies").and_then(J::as_arr).unwrap();
+        let tooled: Vec<&J> = rules.iter().filter(|r| r.get("tool").is_some()).collect();
+        assert_eq!(tooled.len(), 1, "{h:?}");
+        assert_eq!(
+            tooled[0].get("when").and_then(J::as_str),
+            Some(Chain::ToolEnd.token().as_str())
+        );
+        // the prompt's first request answered with the call …
+        let first = crate::stub::with_reply(sp.clone(), &[Chain::ToolEnd.prompt()]);
+        let (n, input) = crate::stub::scripted_call(&first, false).expect("the call");
+        assert_eq!(n, name, "{h:?}");
+        let path = |k: &str| input.get(k).and_then(J::as_str).map(str::to_string);
+        match h {
+            Harness::Muse => assert_eq!(path("path").as_deref(), Some("README.md")),
+            Harness::Agy => {
+                assert_eq!(
+                    path("AbsolutePath").as_deref(),
+                    Some("/w/tool-end/README.md")
+                );
+                assert!(path("toolSummary").is_some() && path("toolAction").is_some());
+            }
+            _ => assert_eq!(path("file_path").as_deref(), Some("/w/tool-end/README.md")),
+        }
+        // … and the request carrying its result back with no words
+        assert_eq!(crate::stub::scripted_call(&first, true), None);
+        assert_eq!(first.get("text").and_then(J::as_str), Some(TOOL_AFTER));
+        // no other turn calls: Land's act is answered in words
+        let land =
+            crate::stub::with_reply(sp.clone(), &[Chain::ToolEnd.prompt(), LAND.to_string()]);
+        assert_eq!(crate::stub::scripted_call(&land, false), None);
+        // nor another chain's prompt
+        let other = crate::stub::with_reply(sp.clone(), &[Chain::SameWords.prompt()]);
+        assert_eq!(crate::stub::scripted_call(&other, false), None);
+    }
+    // a run without F3's chain is scripted as before
+    assert_eq!(
+        spec_on(&Chain::LADDER, Harness::Claude, &dirs[..2]),
+        spec(&Chain::LADDER)
+    );
+}
+
+#[test]
+fn each_apis_reader_tells_a_request_carrying_a_tools_result_back() {
+    use crate::stub::{gemini, messages_answered, muse};
+    // Messages: the newest user message a tool_result
+    let called = br#"{"messages": [
+        {"role": "user", "content": [{"type": "text", "text": "go"}]},
+        {"role": "assistant", "content": [{"type": "tool_use", "id": "t1", "name": "Read", "input": {}}]},
+        {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t1", "content": "r"}]}
+    ]}"#;
+    assert!(messages_answered(called));
+    // ONCE A CONVERSATION (the review of `b9/resid3`): a result carried back
+    // by any request of it — a later message of the conversation, a retry
+    // after a user-role error turn (agy's 1.4.0 shape, which looped 2501
+    // calls) — is answered, so the call is never made again
+    let asked = br#"{"messages": [
+        {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t1", "content": "r"}]},
+        {"role": "assistant", "content": "ok"},
+        {"role": "user", "content": [{"type": "text", "text": "next"}]}
+    ]}"#;
+    assert!(messages_answered(asked));
+    let retried = br#"{"messages": [
+        {"role": "user", "content": [{"type": "text", "text": "go"}]},
+        {"role": "assistant", "content": [{"type": "tool_use", "id": "t1", "name": "Read", "input": {}}]},
+        {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t1", "content": "r"}]},
+        {"role": "assistant", "content": [{"type": "text", "text": ""}]},
+        {"role": "user", "content": [{"type": "text", "text": "Error: the model's output was empty, please try again"}]}
+    ]}"#;
+    assert!(messages_answered(retried));
+    // NEGATIVE CONTROLS: no result in the conversation yet
+    let unanswered = br#"{"messages": [
+        {"role": "user", "content": [{"type": "text", "text": "go"}]},
+        {"role": "assistant", "content": [{"type": "tool_use", "id": "t1", "name": "Read", "input": {}}]},
+        {"role": "user", "content": [{"type": "text", "text": "Error: try again"}]}
+    ]}"#;
+    assert!(!messages_answered(unanswered));
+    assert!(!messages_answered(b"not json"));
+    // Gemini: the last content holds a functionResponse (Gemini CLI's user
+    // content, agy's model one)
+    let g = |last: &str| {
+        format!(
+            r#"{{"contents": [{{"role": "user", "parts": [{{"text": "go"}}]}}, {{"role": "model", "parts": [{{"functionCall": {{"name": "read_file"}}}}]}}, {last}]}}"#
+        )
+        .into_bytes()
+    };
+    assert!(gemini::results_answered(&g(
+        r#"{"role": "user", "parts": [{"functionResponse": {"name": "read_file"}}]}"#
+    )));
+    assert!(gemini::results_answered(&g(
+        r#"{"role": "model", "parts": [{"functionResponse": {"name": "view_file"}}]}"#
+    )));
+    assert!(!gemini::results_answered(&g(
+        r#"{"role": "user", "parts": [{"text": "next"}]}"#
+    )));
+    // answered once, then a turn the agent sent of its own (agy's error after
+    // an empty reply): never called again
+    let retried = br#"{"contents": [{"role": "user", "parts": [{"text": "go"}]}, {"role": "model", "parts": [{"functionCall": {"name": "view_file"}}]}, {"role": "model", "parts": [{"functionResponse": {"name": "view_file"}}]}, {"role": "user", "parts": [{"text": "Error: model output error: model output must contain either output text or tool calls, these cannot both be empty, please try again"}]}]}"#;
+    assert!(gemini::results_answered(retried));
+    // Responses: a result anywhere in the conversation's input, a person's
+    // message after it (a later turn, a retry's error) or a reminder aside
+    let r = |tail: &str| {
+        format!(
+            r#"{{"input": [{{"type": "message", "role": "user", "content": [{{"type": "input_text", "text": "go"}}]}}, {{"type": "function_call", "name": "read_file"}}{tail}]}}"#
+        )
+        .into_bytes()
+    };
+    assert!(!muse::results_answered(&r("")));
+    assert!(muse::results_answered(&r(
+        r#", {"type": "function_call_output", "output": "r"}"#
+    )));
+    assert!(muse::results_answered(&r(
+        r#", {"type": "function_call_output", "output": "r"}, {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "<system-reminder>x</system-reminder>"}]}"#
+    )));
+    assert!(muse::results_answered(&r(
+        r#", {"type": "function_call_output", "output": "r"}, {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "next"}]}"#
+    )));
+    // NEGATIVE CONTROL: the call made, a person's message after it, no
+    // result in
+    assert!(!muse::results_answered(&r(
+        r#", {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "Error: try again"}]}"#
+    )));
+}
+
+/// A standing one-short-turn back-off due at `due` (ms past [`T0`]) told
+/// again at `t` under `seq` — a re-read of its point.
+fn retold(t: i64, seq: u32, due: i64) -> (i64, String) {
+    j(
+        t,
+        &format!(
+            "WAITING seq={seq} until={} 1 short turn(s) in a row: 2 min back-off",
+            stamp(due)
+        ),
+    )
+}
+
+/// A turn-end back-off journaled at `t` (after [`T0`]): its point's `seq`,
+/// `streak` short turns, due `step` ms later (the stamp cut to its second).
+fn backoff(t: i64, seq: u32, streak: u32, step: i64) -> (i64, String) {
+    let words = if step < 120_000 {
+        format!("{} s", step / 1000)
+    } else {
+        format!("{} min", step / 60_000)
+    };
+    j(
+        t,
+        &format!(
+            "WAITING seq={seq} until={} {streak} short turn(s) in a row: {words} back-off",
+            stamp(t + step)
+        ),
+    )
+}
+
+/// F18 as a live run that passes it records it: P4P's record up to the
+/// person's Enter at +127 s, typed as a person types it (a stamp), its
+/// instant reply read at +127.9 s and LEFT to them there, `task=theirs`, and
+/// nothing typed in the 282 s watched after it.
+fn person_instant() -> Seen {
+    let mut s = instant_cruised();
+    s.journal.truncate(5);
+    s.ledger.truncate(1);
+    s.journal
+        .push(j(127_900, &format!("EVENT idle seq=3 {ASK_REPLY}")));
+    s.journal.push(j(
+        127_950,
+        "LEFT seq=3 rule=left-to-person@v1 a person's own exchange (their message, answered within 10 min): nothing is typed until the next turn ends",
+    ));
+    s.ledger
+        .push(row(127_950, RULE_LEFT, "skipped", "", LEFT_REASON));
+    s.status.push(status(129_000, "theirs", "cruise"));
+    s.asked_ms = Some(T0 + 127_000);
+    s.end_ms = T0 + 410_000;
+    s.cover.ask_stamp = Some("1300".to_string());
+    s.cover.window_stub = Some(StubSeen {
+        baseline: 1,
+        read: 1,
+        new_turns: 0,
+    });
+    s
+}
+
+#[test]
+fn f18_passes_only_where_the_persons_instant_turn_is_left_to_them() {
+    let f18 = |s: &Seen| one(Chain::InstantPerson, s, "claude", Scenario::F18);
+    let (w, why) = f18(&person_instant());
+    assert_eq!(w, "PASS", "{why}");
+    assert!(why.contains("left-to-person@v1"), "{why}");
+    // the standing back-off told again after the Enter at a re-read of its
+    // point, under the re-read's own seq (its streak and due): no turn
+    // judged there (the review of `b9/resid3`)
+    let retold_at = |s: &mut Seen, due: i64| {
+        s.journal[4] = j(
+            121_700,
+            &format!(
+                "WAITING seq=2 until={} 2 short turn(s) in a row: 4 min back-off",
+                stamp(361_700)
+            ),
+        );
+        s.journal.insert(5, j(127_400, "EVENT idle seq=9 -"));
+        s.journal.insert(
+            6,
+            j(
+                127_500,
+                &format!(
+                    "WAITING seq=9 until={} 2 short turn(s) in a row: 4 min back-off",
+                    stamp(due)
+                ),
+            ),
+        );
+    };
+    let mut s = person_instant();
+    retold_at(&mut s, 361_700);
+    let (w, why) = f18(&s);
+    assert_eq!(w, "PASS", "{why}");
+    // NEGATIVE CONTROL: another due there is a back-off of its own
+    let mut s = person_instant();
+    retold_at(&mut s, 367_500);
+    let (w, why) = f18(&s);
+    assert_eq!(w, "FAIL", "{why}");
+    assert!(
+        why.contains("JUDGED AS A TURN OF THE CONVERSATION"),
+        "{why}"
+    );
+    // NEGATIVE CONTROLS. Judged as a turn of the conversation, as a control
+    // socket's prompt is (P4P's record on a person's prompt)
+    let mut s = person_instant();
+    s.journal[6] = j(
+        128_000,
+        "WAITING seq=3 until=x 3 short turn(s) in a row: 8 min back-off",
+    );
+    let (w, why) = f18(&s);
+    assert_eq!(w, "FAIL", "{why}");
+    assert!(
+        why.contains("JUDGED AS A TURN OF THE CONVERSATION"),
+        "{why}"
+    );
+    // F18 ITSELF: the instant turn missed, and the standing back-off's act
+    // typed into the person's exchange at its due
+    let mut s = person_instant();
+    s.journal.truncate(6);
+    s.ledger.truncate(1);
+    s.status.pop();
+    s.journal.push(j(
+        361_700,
+        "CONTINUED seq=2 rule=continue-done-check@v1 [aterm harness] x",
+    ));
+    s.ledger
+        .push(typed(361_700, "continue-done-check@v1", DONE_CHECK));
+    let (w, why) = f18(&s);
+    assert_eq!(w, "FAIL", "{why}");
+    assert!(why.contains("TYPED into the person's exchange"), "{why}");
+    // left, and typed all the same; a ledger act alone
+    let mut s = person_instant();
+    s.journal.push(j(
+        361_700,
+        "CONTINUED seq=2 rule=continue@v1 [aterm harness] x",
+    ));
+    assert_eq!(f18(&s).0, "FAIL");
+    let mut s = person_instant();
+    s.ledger.push(typed(361_700, "continue@v1", CONTINUE_TEXT));
+    assert_eq!(f18(&s).0, "FAIL");
+    // left past the take window, the face never theirs, a DONE, the stub
+    // saw a harness text, a need raised
+    let mut s = person_instant();
+    s.journal[6].0 = T0 + 158_000;
+    let (w, why) = f18(&s);
+    assert_eq!(w, "FAIL", "{why}");
+    assert!(why.contains("not as the reply showed"), "{why}");
+    let mut s = person_instant();
+    s.status.pop();
+    assert_eq!(f18(&s).0, "FAIL");
+    let mut s = person_instant();
+    s.journal.push(j(128_100, "DONE seq=3 rule=land@v1 x"));
+    assert_eq!(f18(&s).0, "FAIL");
+    let mut s = person_instant();
+    s.cover.window_stub = Some(StubSeen {
+        baseline: 1,
+        read: 2,
+        new_turns: 1,
+    });
+    assert_eq!(f18(&s).0, "FAIL");
+    let mut s = person_instant();
+    s.meta.push(needs_meta(130_000, "claude"));
+    assert_eq!(f18(&s).0, "FAIL");
+    // nothing at all after the Enter: past the unjudged deadline, lost
+    let mut s = person_instant();
+    s.journal.truncate(6);
+    s.ledger.truncate(1);
+    s.status.pop();
+    s.end_ms = T0 + 430_000;
+    let (w, why) = f18(&s);
+    assert_eq!(w, "FAIL", "{why}");
+    assert!(why.contains("PERSISTENCE LOST"), "{why}");
+    s.end_ms = T0 + 400_000;
+    assert_eq!(f18(&s).0, "UNOBSERVED");
+    // LEFT, task=theirs and quiet do not prove the reply was read.
+    let mut s = person_instant();
+    s.journal.remove(5);
+    assert_eq!(f18(&s).0, "UNOBSERVED");
+    let mut s = person_instant();
+    s.journal[5] = j(127_900, "EVENT idle seq=3 -");
+    assert_eq!(f18(&s).0, "UNOBSERVED");
+    // UNOBSERVED: watched under 270 s after the LEFT, the stub unread, a read
+    // that saw the turn run (no instant turn), no person's hand, never typed
+    let mut s = person_instant();
+    s.end_ms = T0 + 300_000;
+    assert_eq!(f18(&s).0, "UNOBSERVED");
+    let mut s = person_instant();
+    s.cover.window_stub = None;
+    assert_eq!(f18(&s).0, "UNOBSERVED");
+    let mut s = person_instant();
+    s.ledger.push(row(
+        127_400,
+        aterm_agent::supervise::approvals::RULE_TURN_RAN,
+        "waiting",
+        "",
+        "the turn ran",
+    ));
+    let (w, why) = f18(&s);
+    assert_eq!(w, "UNOBSERVED", "{why}");
+    assert!(why.contains("a read saw the turn run"), "{why}");
+    for stamp in [None, Some("-")] {
+        let mut s = person_instant();
+        s.cover.ask_stamp = stamp.map(str::to_string);
+        let (w, why) = f18(&s);
+        assert_eq!(w, "UNOBSERVED", "{why}");
+        assert!(why.contains("no person's hand"), "{why}");
+    }
+    let mut s = person_instant();
+    s.asked_ms = None;
+    assert_eq!(f18(&s).0, "UNOBSERVED");
+    s.ask_refused_ms = Some(T0 + 127_000);
+    let (w, why) = f18(&s);
+    assert_eq!(w, "UNOBSERVED", "{why}");
+    assert!(why.contains("not taken by the composer"), "{why}");
+    // THE NEGATIVE CONTROL IN THE SAME RUN: the control socket's prompt
+    // judged as a turn of the conversation passes P4P, and its record LEFT
+    // fails it (no person's hand typed it)
+    assert_eq!(
+        one(
+            Chain::InstantCruise,
+            &instant_asked(),
+            "claude",
+            Scenario::P4P
+        )
+        .0,
+        "PASS"
+    );
+    let mut s = person_instant();
+    s.journal.truncate(7);
+    assert_eq!(
+        one(Chain::InstantCruise, &s, "claude", Scenario::P4P).0,
+        "FAIL"
+    );
+}
+
+/// `same-words` as a live run that passes it records it: its first reply
+/// judged at +5 s (one short turn, due +125 s), the tab resized at +10.2 s
+/// and its screen read again at +11 s with nothing judged, the first point's
+/// back-off told again there under the re-read's own `seq=` (as
+/// `r3-res-claude`, agy and Muse Code journaled it), the orchestrator's turn
+/// at +40.3 s answered with the same words, judged at +44 s as its own point
+/// (two short turns, a 4 min step), its act at that due.
+fn same_words() -> Seen {
+    Seen {
+        journal: vec![
+            j(5_000, &format!("EVENT idle seq=1 {WORK}")),
+            backoff(5_100, 1, 1, 120_000),
+            j(11_000, &format!("EVENT idle seq=2 {WORK}")),
+            retold(11_100, 2, 125_100),
+            j(44_000, &format!("EVENT idle seq=3 {WORK}")),
+            backoff(44_100, 3, 2, 240_000),
+            j(
+                284_400,
+                "CONTINUED seq=3 rule=continue@v1 [aterm harness] Autopilot is Cruise: keep going",
+            ),
+        ],
+        ledger: vec![
+            point(5_000, 1),
+            point(44_000, 2),
+            typed(284_400, "continue@v1", CONTINUE_TEXT),
+        ],
+        status: vec![status(1_000, "open", "cruise")],
+        meta: vec![no_meta(1_000)],
+        end_ms: T0 + 305_000,
+        cover: Cover {
+            resized: Some((
+                T0 + 10_200,
+                "resize 62 104: OK (exit 0); dims OK 62 104 1040 1302 session=3 cell_w=10"
+                    .to_string(),
+            )),
+            turn_ms: Some(T0 + 40_300),
+            ..Cover::default()
+        },
+        ..Seen::default()
+    }
+}
+
+#[test]
+fn the_rewrapped_opener_is_judged_once_and_the_same_words_turn_as_its_own_point() {
+    let f1f2 = |s: &Seen| one(Chain::SameWords, s, "agy", Scenario::Rewrap);
+    let same = |s: &Seen| one(Chain::SameWords, s, "agy", Scenario::SameWords);
+    let (w, why) = f1f2(&same_words());
+    assert_eq!(w, "PASS", "{why}");
+    let (w, why) = same(&same_words());
+    assert_eq!(w, "PASS", "{why}");
+    // F2 ITSELF: the re-wrapped opener judged again, a short turn more
+    let mut s = same_words();
+    s.journal[3] = backoff(11_100, 2, 2, 240_000);
+    s.ledger.insert(1, point(11_000, 2));
+    let (w, why) = f1f2(&s);
+    assert_eq!(w, "FAIL", "{why}");
+    assert!(why.contains("JUDGED AGAIN"), "{why}");
+    // …or a back-off of another point told there, no record written
+    let mut s = same_words();
+    s.journal[3] = backoff(11_100, 2, 2, 240_000);
+    let (w, why) = f1f2(&s);
+    assert_eq!(w, "FAIL", "{why}");
+    assert!(why.contains("a back-off of another point"), "{why}");
+    // the first point's own back-off told again, under its own seq too: no
+    // fault
+    let mut s = same_words();
+    s.journal.insert(4, (T0 + 25_100, s.journal[1].1.clone()));
+    assert_eq!(f1f2(&s).0, "PASS");
+    // THE BACK-OFF DROPPED (`r3-res-gemini`): the re-wrapped frame read as
+    // no words and decided nothing — no back-off told there, no due
+    // standing, though nothing was judged or typed
+    let mut s = same_words();
+    s.journal[2] = j(11_000, "EVENT idle seq=2 -");
+    s.journal.remove(3);
+    let (w, why) = f1f2(&s);
+    assert_eq!(w, "FAIL", "{why}");
+    assert!(why.contains("BACK-OFF DROPPED"), "{why}");
+    // …told again at the first re-read but not at the second
+    let mut s = same_words();
+    s.journal.insert(4, j(20_000, "EVENT idle seq=4 -"));
+    let (w, why) = f1f2(&s);
+    assert_eq!(w, "FAIL", "{why}");
+    assert!(why.contains("BACK-OFF DROPPED"), "{why}");
+    // an act with nothing submitted
+    let mut s = same_words();
+    s.journal.insert(
+        4,
+        j(30_000, "CONTINUED seq=2 rule=continue@v1 [aterm harness] x"),
+    );
+    let (w, why) = f1f2(&s);
+    assert_eq!(w, "FAIL", "{why}");
+    assert!(why.contains("with nothing submitted"), "{why}");
+    // A successful resize and a later judged turn do not prove the resized
+    // opener was read. A busy read does not observe a turn-end point either.
+    for busy in [false, true] {
+        let mut s = same_words();
+        s.journal.drain(2..4);
+        if busy {
+            s.journal.insert(2, j(11_000, "EVENT busy seq=2 -"));
+        }
+        assert_eq!(f1f2(&s).0, "UNOBSERVED");
+        assert_eq!(same(&s).0, "PASS");
+    }
+    // UNOBSERVED: never resized, a resize that did not take, watched under 20 s
+    let mut s = same_words();
+    s.cover.resized = None;
+    assert_eq!(f1f2(&s).0, "UNOBSERVED");
+    let mut s = same_words();
+    s.cover.resized = Some((
+        T0 + 10_200,
+        "resize 62 104: ERR (exit 1); dims OK 50 144 ".into(),
+    ));
+    assert_eq!(f1f2(&s).0, "UNOBSERVED");
+    let mut s = same_words();
+    s.cover.turn_ms = Some(T0 + 25_000);
+    assert_eq!(f1f2(&s).0, "UNOBSERVED");
+    // F1 ITSELF: the same words under another opener taken for the turn
+    // before them — the old point's streak and due kept, acted on at it
+    let mut s = same_words();
+    s.journal[5] = (
+        T0 + 44_100,
+        format!(
+            "WAITING seq=3 until={} 1 short turn(s) in a row: 2 min back-off",
+            stamp(125_100)
+        ),
+    );
+    s.journal[6].0 = T0 + 125_300;
+    s.ledger[2].ts = T0 + 125_300;
+    s.ledger[1] = point(44_000, 1);
+    let (w, why) = same(&s);
+    assert_eq!(w, "FAIL", "{why}");
+    assert!(why.contains("names 1 short turn(s), not 2"), "{why}");
+    assert!(why.contains("no later"), "{why}");
+    // …or no back-off decided at it, the old one's act typed
+    let mut s = same_words();
+    s.journal.remove(5);
+    s.journal[5].0 = T0 + 125_300;
+    s.ledger[2].ts = T0 + 125_300;
+    let (w, why) = same(&s);
+    assert_eq!(w, "FAIL", "{why}");
+    assert!(why.contains("at no point judged at its reply"), "{why}");
+    // nothing after the turn: past the due and a minute lost, before it unobserved
+    let mut s = same_words();
+    s.journal.pop();
+    s.ledger.pop();
+    s.end_ms = T0 + 346_000;
+    let (w, why) = same(&s);
+    assert_eq!(w, "FAIL", "{why}");
+    assert!(why.contains("PERSISTENCE LOST"), "{why}");
+    s.end_ms = T0 + 300_000;
+    assert_eq!(same(&s).0, "UNOBSERVED");
+    let mut s = same_words();
+    s.cover.turn_ms = None;
+    assert_eq!(same(&s).0, "UNOBSERVED");
+}
+
+/// `tool-end` as a live run that passes it records it: the first reply's
+/// call run (its result carried back), the turn ended on the tool's row and
+/// judged at +6 s (one short turn, 2 min), Land's act at that due, its clean
+/// defense landing the task.
+fn tool_ended() -> Seen {
+    Seen {
+        journal: vec![
+            j(6_000, "EVENT idle seq=1 ⏺ Read(README.md)"),
+            backoff(6_100, 1, 1, 120_000),
+            j(
+                126_400,
+                "CONTINUED seq=1 rule=land@v1 [aterm harness] Autopilot is Land:",
+            ),
+            j(129_000, "EVENT idle seq=2 Nothing left: the parser"),
+            j(129_000, "DONE seq=2 rule=land@v1 x"),
+        ],
+        ledger: vec![
+            point(6_000, 1),
+            typed(126_400, "land@v1", LAND),
+            task_done(129_000),
+        ],
+        status: vec![
+            status(1_000, "open", "land"),
+            status(130_000, "landed", "land"),
+        ],
+        meta: vec![no_meta(1_000)],
+        task: vec![j(1_000, "OK task -")],
+        end_ms: T0 + 429_000,
+        cover: Cover {
+            tool_results: Some(1),
+            first_screen: Some((
+                T0 + 6_500,
+                vec!["⏺ Read(README.md)".into(), "  ⎿  Read 3 lines".into()],
+            )),
+            ..Cover::default()
+        },
+        ..Seen::default()
+    }
+}
+
+#[test]
+fn f3_passes_only_where_the_tool_ended_first_turn_is_judged() {
+    let f3 = |s: &Seen| one(Chain::ToolEnd, s, "claude", Scenario::F3);
+    let (w, why) = f3(&tool_ended());
+    assert_eq!(w, "PASS", "{why}");
+    assert!(why.contains("Read(README.md)"), "{why}");
+    // F3 ITSELF: the tool-ended turn taken for a launch's frame, never judged
+    let mut s = tool_ended();
+    s.journal.truncate(1);
+    s.ledger.clear();
+    s.status.truncate(1);
+    s.end_ms = T0 + 340_000;
+    let (w, why) = f3(&s);
+    assert_eq!(w, "FAIL", "{why}");
+    assert!(why.contains("NEVER JUDGED"), "{why}");
+    assert!(why.contains("PERSISTENCE LOST"), "{why}");
+    s.end_ms = T0 + 250_000;
+    assert_eq!(f3(&s).0, "UNOBSERVED");
+    // judged a short turn late (a frame before it counted)
+    let mut s = tool_ended();
+    s.journal[1] = backoff(6_100, 1, 2, 240_000);
+    s.journal[2].0 = T0 + 246_400;
+    s.ledger[1].ts = T0 + 246_400;
+    let (w, why) = f3(&s);
+    assert_eq!(w, "FAIL", "{why}");
+    assert!(why.contains("names 2 short turn(s), not 1"), "{why}");
+    // an act with no back-off before it
+    let mut s = tool_ended();
+    s.journal.remove(1);
+    assert_eq!(f3(&s).0, "FAIL");
+    // judged, and nothing typed past its due and a minute
+    let mut s = tool_ended();
+    s.journal.truncate(2);
+    s.ledger.truncate(1);
+    s.end_ms = T0 + 190_000;
+    let (w, why) = f3(&s);
+    assert_eq!(w, "FAIL", "{why}");
+    assert!(why.contains("PERSISTENCE LOST"), "{why}");
+    s.end_ms = T0 + 150_000;
+    assert_eq!(f3(&s).0, "UNOBSERVED");
+    // THE LANDING (the review of `b9/resid3`): the land act typed at its
+    // due, and its clean defense landed nothing — past the window, a FAIL;
+    // inside it, unobserved
+    let mut s = tool_ended();
+    s.journal.truncate(4);
+    s.ledger.truncate(2);
+    s.status.truncate(1);
+    let (w, why) = f3(&s);
+    assert_eq!(w, "FAIL", "{why}");
+    assert!(why.contains("LANDED NOTHING"), "{why}");
+    s.end_ms = T0 + 140_000;
+    let (w, why) = f3(&s);
+    assert_eq!(w, "UNOBSERVED", "{why}");
+    assert!(why.contains("not landed yet"), "{why}");
+    // the call never run: the turn did not end on a tool's row
+    for n in [None, Some(0)] {
+        let mut s = tool_ended();
+        s.cover.tool_results = n;
+        let (w, why) = f3(&s);
+        assert_eq!(w, "UNOBSERVED", "{why}");
+        assert!(why.contains("never ran"), "{why}");
+    }
+}
+
+/// `ladder` as a live run under the seam at `scale` records it: seven points,
+/// each one short turn more, each step the ladder's at that scale, each act
+/// 0.3 s past its due and its reply judged 3 s after.
+fn laddered(scale: f64) -> Seen {
+    laddered_late(scale, 0, 0)
+}
+
+/// [`laddered`] with the act after step `late` typed `extra` ms later.
+fn laddered_late(scale: f64, late: u32, extra: i64) -> Seen {
+    let mut s = Seen {
+        status: vec![status(1_000, "open", "cruise")],
+        meta: vec![no_meta(1_000)],
+        ..Seen::default()
+    };
+    let mut t = 5_000;
+    for n in 1..=LADDER_STEPS {
+        let step = ladder_step_ms(n, scale);
+        s.journal.push(j(t, &format!("EVENT idle seq={n} {WORK}")));
+        s.journal.push(backoff(t + 100, n, n, step));
+        s.ledger.push(point(t, n));
+        let due = (T0 + t + 100 + step).div_euclid(1000) * 1000 - T0;
+        if n < LADDER_STEPS {
+            let act = due + 300 + if n == late { extra } else { 0 };
+            s.journal.push(j(
+                act,
+                &format!("CONTINUED seq={n} rule=continue@v1 [aterm harness] x"),
+            ));
+            s.ledger.push(typed(act, "continue@v1", CONTINUE_TEXT));
+            t = act + 3_000;
+        } else {
+            s.end_ms = T0 + t + 10_000;
+        }
+    }
+    s
+}
+
+#[test]
+fn the_ladder_passes_only_where_its_steps_double_to_the_cap_each_act_at_its_due() {
+    let lad = |s: &Seen| one(Chain::Ladder, s, "gemini", Scenario::Ladder);
+    let good = laddered(LADDER_SCALE);
+    let (w, why) = lad(&good);
+    assert_eq!(w, "PASS", "{why}");
+    assert!(why.contains("from 15 s to the 450 s cap"), "{why}");
+    let steps = ladder_steps(&good, T0);
+    assert_eq!(steps.len(), LADDER_STEPS as usize);
+    assert_eq!(
+        steps.iter().map(|s| s.streak).collect::<Vec<_>>(),
+        [1, 2, 3, 4, 5, 6, 7]
+    );
+    // the whole scaled ladder fits its watch
+    assert!(good.end_ms - T0 < LADDER_LIMIT_MS);
+    // NEGATIVE CONTROLS. The seam not taken: the shipped ladder's first step
+    let (w, why) = lad(&laddered(1.0));
+    assert_eq!(w, "FAIL", "{why}");
+    assert!(why.contains("the seam not taken"), "{why}");
+    // a step that does not double (the fourth at the third's), one past the cap
+    for (i, bad) in [(3, 60_000), (6, 900_000), (2, 30_000)] {
+        let mut s = laddered(LADDER_SCALE);
+        let k = s
+            .journal
+            .iter()
+            .position(|(_, l)| l.starts_with(&format!("WAITING seq={} ", i + 1)))
+            .unwrap();
+        let at = s.journal[k].0 - T0;
+        s.journal[k] = backoff(
+            at,
+            u32::try_from(i + 1).unwrap(),
+            u32::try_from(i + 1).unwrap(),
+            bad,
+        );
+        let (w, why) = lad(&s);
+        assert_eq!(w, "FAIL", "step {}: {why}", i + 1);
+    }
+    // a streak out of its order
+    let mut s = laddered(LADDER_SCALE);
+    let k = s
+        .journal
+        .iter()
+        .position(|(_, l)| l.starts_with("WAITING seq=3 "))
+        .unwrap();
+    s.journal[k].1 = s.journal[k]
+        .1
+        .replace(" 3 short turn(s)", " 2 short turn(s)");
+    let (w, why) = lad(&s);
+    assert_eq!(w, "FAIL", "{why}");
+    assert!(why.contains("step 3"), "{why}");
+    // NOTHING TYPED (the review of `b9/resid3`): seven well-formed steps, each
+    // a point judged again with no act between — a redraw counted as a
+    // short turn — climbs nothing
+    let mut s = laddered(LADDER_SCALE);
+    s.journal.retain(|(_, l)| !l.starts_with("CONTINUED "));
+    s.ledger.retain(|r| r.rule != "continue@v1");
+    assert_eq!(ladder_steps(&s, T0).len(), LADDER_STEPS as usize);
+    let (w, why) = lad(&s);
+    assert_eq!(w, "FAIL", "{why}");
+    assert!(why.contains("NOTHING TYPED after step 1"), "{why}");
+    // …or one act missing, between the fourth step and the fifth
+    let mut s = laddered(LADDER_SCALE);
+    s.journal
+        .retain(|(_, l)| !l.starts_with("CONTINUED seq=4 "));
+    let (w, why) = lad(&s);
+    assert_eq!(w, "FAIL", "{why}");
+    assert!(why.contains("NOTHING TYPED after step 4"), "{why}");
+    // a step told again at a re-read of its point, under the re-read's own
+    // seq (its streak and due): no step of its own, no fault
+    let mut s = laddered(LADDER_SCALE);
+    let k = s
+        .journal
+        .iter()
+        .position(|(_, l)| l.starts_with("WAITING seq=3 "))
+        .unwrap();
+    let (t3, l3) = s.journal[k].clone();
+    s.journal.insert(
+        k + 1,
+        (
+            t3 + 4_000,
+            l3.replacen("WAITING seq=3 ", "WAITING seq=33 ", 1),
+        ),
+    );
+    assert_eq!(ladder_steps(&s, T0).len(), LADDER_STEPS as usize);
+    let (w, why) = lad(&s);
+    assert_eq!(w, "PASS", "{why}");
+    // an act a minute and a half past its due
+    let (w, why) = lad(&laddered_late(LADDER_SCALE, 2, 90_000));
+    assert_eq!(w, "FAIL", "{why}");
+    assert!(why.contains("past its due"), "{why}");
+    // an act before its due (the chain's own fault, every scenario fails)
+    let mut s = laddered(LADDER_SCALE);
+    let k = s
+        .journal
+        .iter()
+        .position(|(_, l)| l.starts_with("CONTINUED seq=5 "))
+        .unwrap();
+    s.journal[k].0 -= 60_000;
+    let (w, why) = lad(&s);
+    assert_eq!(w, "FAIL", "{why}");
+    assert!(why.contains("BEFORE the due its back-off named"), "{why}");
+    // five steps: past the fifth's due and a minute with nothing typed, lost;
+    // before it, unobserved
+    let mut s = laddered(LADDER_SCALE);
+    let k = s
+        .journal
+        .iter()
+        .position(|(_, l)| l.starts_with("CONTINUED seq=5 "))
+        .unwrap();
+    let fifth_due = s.journal[k].0;
+    s.journal.truncate(k);
+    s.ledger.retain(|r| r.ts < fifth_due);
+    s.end_ms = fifth_due + 61_000;
+    let (w, why) = lad(&s);
+    assert_eq!(w, "FAIL", "{why}");
+    assert!(why.contains("PERSISTENCE LOST"), "{why}");
+    s.end_ms = fifth_due - 10_000;
+    let (w, why) = lad(&s);
+    assert_eq!(w, "UNOBSERVED", "{why}");
+    assert!(why.contains("5 of 7 steps"), "{why}");
+}
+
+#[test]
+fn the_judges_ladder_is_the_products_own_scaled() {
+    use aterm_agent::supervise::ladder::doubling;
+    for scale in [1.0, 0.5, LADDER_SCALE] {
+        let t = turn_end::TurnEndTiming::default().ladder_scaled(scale);
+        for n in 1..=9_u32 {
+            let d = doubling(t.short_backoff, n - 1, t.short_backoff_max);
+            assert_eq!(
+                ladder_step_ms(n, scale),
+                i64::try_from(d.as_millis()).unwrap(),
+                "{scale} {n}"
+            );
+        }
+    }
+    assert_eq!(
+        (1..=LADDER_STEPS)
+            .map(|n| ladder_step_ms(n, LADDER_SCALE) / 1000)
+            .collect::<Vec<_>>(),
+        [15, 30, 60, 120, 240, 450, 450]
+    );
+}
+
+#[test]
+fn the_backoff_helpers_read_a_points_own_decision() {
+    let s = Seen {
+        journal: vec![
+            backoff(1_000, 1, 1, 120_000),
+            j(5_000, "EVENT idle seq=2 x"),
+            // the standing back-off told again keeps its seq
+            (T0 + 21_000, backoff(1_000, 1, 1, 120_000).1),
+            backoff(30_000, 4, 2, 240_000),
+            j(
+                40_000,
+                "WAITING seq=5 until=x the worker to take the continue@v1 act",
+            ),
+        ],
+        ..Seen::default()
+    };
+    assert_eq!(
+        own_backoff_after(&s, T0 + 2_000).map(|(t, _)| *t),
+        Some(T0 + 30_000)
+    );
+    assert_eq!(own_backoff_after(&s, T0 + 30_000), None);
+    // the standing back-off told again under a re-read's own seq (its streak
+    // and due): no decision of a point of its own, no ladder step
+    let mut again = Seen {
+        journal: s.journal.clone(),
+        ..Seen::default()
+    };
+    again.journal.insert(3, retold(22_000, 3, 121_000));
+    assert_eq!(
+        own_backoff_after(&again, T0 + 2_000).map(|(t, _)| *t),
+        Some(T0 + 30_000)
+    );
+    assert_eq!(
+        ladder_steps(&again, T0)
+            .iter()
+            .map(|st| (st.streak, st.at - T0))
+            .collect::<Vec<_>>(),
+        [(1, 1_000), (2, 30_000)]
+    );
+    // NEGATIVE CONTROL: the same streak under another due is a decision of
+    // its own
+    again.journal[3] = retold(22_000, 3, 142_000);
+    assert_eq!(
+        own_backoff_after(&again, T0 + 2_000).map(|(t, _)| *t),
+        Some(T0 + 22_000)
+    );
+    assert_eq!(
+        ladder_steps(&s, T0)
+            .iter()
+            .map(|st| (st.streak, st.at - T0))
+            .collect::<Vec<_>>(),
+        [(1, 1_000), (2, 30_000)]
+    );
+    assert_eq!(backoff_streak(&s.journal[3].1), Some(2));
+    assert_eq!(backoff_streak(&s.journal[4].1), None);
+    assert_eq!(
+        backoff_streak("WAITING seq=9 until=2026-10-21T00:00:00Z the usage-session resets"),
+        None
+    );
 }
 
 // ---- W2 on Gemini CLI (its dialog's Stop) and Claude Code (Esc, then `/rename`)

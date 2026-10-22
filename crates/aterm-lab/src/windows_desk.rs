@@ -42,11 +42,14 @@ pub const HELPER_PATH: &str = r"C:\lane\desk\desk.ps1";
 /// - `scale <name> <steps>`: that monitor's display scaling set to `steps`
 ///   above its recommended one (Settings' list, 25 % apart from 100 %); then
 ///   `monitors`;
-/// - `launch <bin-dir> <dir> <config-base64>`: `aterm-gui --control-sock
-///   <dir>\aterm.sock -e powershell.exe -NoLogo -NoProfile` with
-///   `XDG_CONFIG_HOME` and `ATERM_STATE_HOME` in `<dir>`, its stdout and
-///   stderr kept there; its pid written to `<dir>\pid`, then its exit status
-///   to `<dir>\exit` when it ends.
+/// - `launch <bin-dir> <dir> <config-base64> [word]...`: `aterm-gui
+///   --control-sock <dir>\aterm.sock [word]... -e powershell.exe -NoLogo
+///   -NoProfile` with `XDG_CONFIG_HOME` and `ATERM_STATE_HOME` in `<dir>`,
+///   its stdout and stderr kept there; its pid written to `<dir>\pid`, then
+///   its exit status to `<dir>\exit` when it ends;
+/// - `readback <pid> <class> <ppm>`: the client area of `pid`'s window of
+///   `class` as its DC holds it (`BitBlt` into a bitmap, then `GetDIBits`),
+///   written as a binary PPM: the pixels a CPU present put on the window.
 ///
 /// The display scaling is read and set through `DisplayConfigGetDeviceInfo`
 /// and `DisplayConfigSetDeviceInfo` with the packet types Settings uses (-3
@@ -62,7 +65,11 @@ if ($verb -eq 'launch') {
   [IO.File]::WriteAllBytes("$d\cfg\aterm\aterm.toml", [Convert]::FromBase64String($args[3]))
   $env:XDG_CONFIG_HOME = "$d\cfg"
   $env:ATERM_STATE_HOME = "$d\state"
-  $p = Start-Process -FilePath "$bin\aterm-gui.exe" -ArgumentList '--control-sock', "$d\aterm.sock", '-e', 'powershell.exe', '-NoLogo', '-NoProfile' -PassThru -RedirectStandardOutput "$d\stdout.log" -RedirectStandardError "$d\stderr.log"
+  # Words after the config are aterm-gui's own (`--cpu`), before `-e`.
+  $extra = @()
+  if ($args.Count -gt 4) { $extra = @($args[4..($args.Count - 1)]) }
+  $argv = @('--control-sock', "$d\aterm.sock") + $extra + @('-e', 'powershell.exe', '-NoLogo', '-NoProfile')
+  $p = Start-Process -FilePath "$bin\aterm-gui.exe" -ArgumentList $argv -PassThru -RedirectStandardOutput "$d\stdout.log" -RedirectStandardError "$d\stderr.log"
   # Without its handle opened while it runs, the process object has no exit code.
   $null = $p.Handle
   Set-Content -Path "$d\pid" -Value $p.Id
@@ -76,6 +83,7 @@ using System.Runtime.InteropServices;
 using System.Text;
 public static class LaneDesk {
   [StructLayout(LayoutKind.Sequential)] public struct RECT { public int L, T, R, B; }
+  [StructLayout(LayoutKind.Sequential)] public struct POINT { public int X, Y; }
   [StructLayout(LayoutKind.Sequential)] public struct LUID { public uint Low; public int High; }
   [StructLayout(LayoutKind.Sequential)] public struct HDR { public int type; public int size; public LUID adapter; public uint id; }
   [StructLayout(LayoutKind.Sequential)] public struct DpiGet { public HDR h; public int min; public int cur; public int max; }
@@ -92,6 +100,9 @@ public static class LaneDesk {
   [DllImport("user32.dll")] static extern bool IsWindowVisible(IntPtr h);
   [DllImport("user32.dll")] static extern bool GetWindowRect(IntPtr h, out RECT r);
   [DllImport("user32.dll")] static extern bool GetClientRect(IntPtr h, out RECT r);
+  [DllImport("user32.dll")] static extern bool ClientToScreen(IntPtr h, ref POINT p);
+  [DllImport("user32.dll")] static extern bool SetWindowPos(IntPtr h, IntPtr after, int x, int y, int cx, int cy, uint flags);
+  [DllImport("user32.dll")] static extern int GetSystemMetrics(int i);
   [DllImport("user32.dll")] static extern uint GetDpiForWindow(IntPtr h);
   [DllImport("user32.dll")] static extern IntPtr GetForegroundWindow();
   [DllImport("user32.dll", CharSet=CharSet.Unicode)] static extern int GetClassNameW(IntPtr h, StringBuilder s, int n);
@@ -117,6 +128,16 @@ public static class LaneDesk {
   [DllImport("kernel32.dll")] static extern IntPtr OpenProcess(uint access, bool inherit, uint pid);
   [DllImport("kernel32.dll")] static extern bool GetProcessInformation(IntPtr h, int cls, ref PMI info, uint size);
   [DllImport("kernel32.dll")] static extern bool CloseHandle(IntPtr h);
+  [DllImport("user32.dll")] static extern IntPtr GetDC(IntPtr h);
+  [DllImport("user32.dll")] static extern int ReleaseDC(IntPtr h, IntPtr dc);
+  [DllImport("gdi32.dll")] static extern IntPtr CreateCompatibleDC(IntPtr dc);
+  [DllImport("gdi32.dll")] static extern IntPtr CreateCompatibleBitmap(IntPtr dc, int w, int h);
+  [DllImport("gdi32.dll")] static extern IntPtr SelectObject(IntPtr dc, IntPtr o);
+  [DllImport("gdi32.dll")] static extern bool BitBlt(IntPtr dc, int x, int y, int w, int h, IntPtr src, int sx, int sy, uint rop);
+  [StructLayout(LayoutKind.Sequential)] public struct BIH { public int size; public int w; public int h; public short planes; public short bits; public int comp; public int image; public int xppm; public int yppm; public int used; public int important; }
+  [DllImport("gdi32.dll")] static extern int GetDIBits(IntPtr dc, IntPtr bmp, uint start, uint lines, [Out] byte[] bits, ref BIH info, uint usage);
+  [DllImport("gdi32.dll")] static extern bool DeleteObject(IntPtr o);
+  [DllImport("gdi32.dll")] static extern bool DeleteDC(IntPtr dc);
   const int PATH = 72, MODE = 64;
   // QDC_ONLY_ACTIVE_PATHS; SDC_APPLY | SDC_USE_SUPPLIED_DISPLAY_CONFIG | SDC_SAVE_TO_DATABASE | SDC_ALLOW_CHANGES.
   const uint QDC = 2, SDC = 0x80 | 0x20 | 0x200 | 0x400;
@@ -158,6 +179,69 @@ public static class LaneDesk {
   }
 
   static string Hex(int v) { return v < 0 ? "-" : v.ToString("x"); }
+
+  // The client area of `pid`'s window of class `cls` as its DC holds it: copied
+  // into a bitmap (BitBlt, SRCCOPY), read by GetDIBits as 32-bit top-down BI_RGB,
+  // written to `path` as a binary PPM.
+  public static string Readback(uint pid, string cls, string path) {
+    var h = ClassWindow(pid, cls);
+    if (h == IntPtr.Zero) return "error=no-window";
+    RECT c; GetClientRect(h, out c);
+    int w = c.R, ht = c.B;
+    if (w <= 0 || ht <= 0) return "error=client-" + w + "x" + ht;
+    var wdc = GetDC(h);
+    var dc = CreateCompatibleDC(wdc);
+    var bmp = CreateCompatibleBitmap(wdc, w, ht);
+    var held = SelectObject(dc, bmp);
+    bool blit = BitBlt(dc, 0, 0, w, ht, wdc, 0, 0, 0x00CC0020);
+    SelectObject(dc, held);
+    var info = new BIH(); info.size = Marshal.SizeOf(typeof(BIH)); info.w = w; info.h = -ht; info.planes = 1; info.bits = 32;
+    var bits = new byte[w * ht * 4];
+    int lines = GetDIBits(dc, bmp, 0, (uint)ht, bits, ref info, 0);
+    DeleteObject(bmp); DeleteDC(dc); ReleaseDC(h, wdc);
+    if (!blit || lines != ht) return "error=readback blit=" + blit + " lines=" + lines;
+    var head = Encoding.ASCII.GetBytes("P6\n" + w + " " + ht + "\n255\n");
+    var rgb = new byte[w * ht * 3];
+    for (int i = 0; i < w * ht; i++) { rgb[i * 3] = bits[i * 4 + 2]; rgb[i * 3 + 1] = bits[i * 4 + 1]; rgb[i * 3 + 2] = bits[i * 4]; }
+    using (var f = System.IO.File.Create(path)) { f.Write(head, 0, head.Length); f.Write(rgb, 0, rgb.Length); }
+    return "readback " + Place(h);
+  }
+
+  // Where a window's client area is: its size, its top-left on the virtual screen,
+  // and the virtual screen's rectangle (SM_X/Y/CX/CYVIRTUALSCREEN).
+  static string Place(IntPtr h) {
+    RECT c; GetClientRect(h, out c);
+    var p = new POINT(); ClientToScreen(h, ref p);
+    int x = GetSystemMetrics(76), y = GetSystemMetrics(77);
+    return "client=" + c.R + "x" + c.B + " at=" + p.X + "," + p.Y + " screen=" + x + "," + y + "," + (x + GetSystemMetrics(78)) + "," + (y + GetSystemMetrics(79));
+  }
+
+  public static string Where(uint pid, string cls) {
+    var h = ClassWindow(pid, cls);
+    return h == IntPtr.Zero ? "error=no-window" : "place " + Place(h);
+  }
+
+  // Move `pid`'s window of class `cls` up or down so its client area's top is at
+  // screen row `top`, its size and z-order kept, not activated.
+  public static string Move(uint pid, string cls, int top) {
+    var h = ClassWindow(pid, cls);
+    return h == IntPtr.Zero ? "error=no-window" : MoveTo(h, top);
+  }
+
+  // Move `pid`'s window of class `cls` up until its client area's top `rows`
+  // rows are above the virtual screen's top edge, as `move` does.
+  public static string Lift(uint pid, string cls, int rows) {
+    var h = ClassWindow(pid, cls);
+    return h == IntPtr.Zero ? "error=no-window" : MoveTo(h, GetSystemMetrics(77) - rows);
+  }
+
+  static string MoveTo(IntPtr h, int top) {
+    RECT r; GetWindowRect(h, out r);
+    var p = new POINT(); ClientToScreen(h, ref p);
+    // SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE.
+    if (!SetWindowPos(h, IntPtr.Zero, r.L, r.T + top - p.Y, 0, 0, 0x1 | 0x4 | 0x10)) return "error=SetWindowPos";
+    return "place " + Place(h);
+  }
 
   static IntPtr ClassWindow(uint pid, string cls) {
     IntPtr found = IntPtr.Zero;
@@ -314,6 +398,10 @@ switch ($verb) {
   'primary' { [LaneDesk]::Primary($args[1]); Start-Sleep -Seconds 2; [LaneDesk]::Monitors() }
   'scale' { [LaneDesk]::Scale($args[1], [int]$args[2]); Start-Sleep -Seconds 1; [LaneDesk]::Monitors() }
   'watch' { [LaneDesk]::Watch([uint32]$args[1], $args[2], [int]$args[3], $args[4]) }
+  'readback' { [LaneDesk]::Readback([uint32]$args[1], $args[2], $args[3]) }
+  'place' { [LaneDesk]::Where([uint32]$args[1], $args[2]) }
+  'move' { [LaneDesk]::Move([uint32]$args[1], $args[2], [int]$args[3]) }
+  'lift' { [LaneDesk]::Lift([uint32]$args[1], $args[2], [int]$args[3]) }
   default { throw "desk.ps1: unknown verb '$verb'" }
 }
 "##;
@@ -429,6 +517,54 @@ pub fn parse_windows(text: &str) -> Vec<Window> {
             })
         })
         .collect()
+}
+
+/// Where a window's client area is, as a `readback`, `place` or `move` line
+/// says it: `client=<w>x<h> at=<x>,<y> screen=<l>,<t>,<r>,<b>`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Place {
+    /// The client area's size.
+    pub client: (usize, usize),
+    /// Its top-left on the virtual screen.
+    pub at: (i32, i32),
+    /// The virtual screen: the rectangle every monitor lies in. Windows
+    /// draws no window pixel outside it.
+    pub screen: Rect,
+}
+
+impl Place {
+    /// The part of the client area inside the virtual screen, in client
+    /// coordinates (`l..r` columns, `t..b` rows), or `None` when none of it
+    /// is.
+    #[must_use]
+    pub fn on_screen(&self) -> Option<Rect> {
+        let (w, h) = (
+            i32::try_from(self.client.0).ok()?,
+            i32::try_from(self.client.1).ok()?,
+        );
+        let r = Rect {
+            l: (self.screen.l - self.at.0).max(0),
+            t: (self.screen.t - self.at.1).max(0),
+            r: (self.screen.r - self.at.0).min(w),
+            b: (self.screen.b - self.at.1).min(h),
+        };
+        (r.l < r.r && r.t < r.b).then_some(r)
+    }
+}
+
+/// The [`Place`] a `readback`, `place` or `move` line names.
+#[must_use]
+pub fn parse_place(text: &str) -> Option<Place> {
+    let line = text
+        .lines()
+        .find(|l| l.starts_with("readback ") || l.starts_with("place "))?;
+    let (w, h) = word(line, "client")?.split_once('x')?;
+    let (x, y) = word(line, "at")?.split_once(',')?;
+    Some(Place {
+        client: (w.parse().ok()?, h.parse().ok()?),
+        at: (x.parse().ok()?, y.parse().ok()?),
+        screen: Rect::parse(word(line, "screen")?)?,
+    })
 }
 
 /// The class aterm's window registers (winit's, named by aterm).
@@ -646,6 +782,51 @@ mod tests {
         assert_eq!(m[1].scale, None);
         assert_eq!(m[1].rect.width(), 800);
         assert_eq!(m[1].adapter, "Microsoft Basic Display Adapter");
+
+        assert_eq!(parse_place("error=no-window\r\n"), None);
+        // The launch at 150 %'s window as the lane found it: 12 client rows past
+        // the virtual screen's bottom edge.
+        let cut = parse_place("readback client=1076x939 at=239,273 screen=0,0,2720,1200\r\n")
+            .expect("a place");
+        assert_eq!(cut.client, (1076, 939));
+        assert_eq!(cut.at, (239, 273));
+        assert_eq!(
+            cut.on_screen(),
+            Some(Rect {
+                l: 0,
+                t: 0,
+                r: 1076,
+                b: 927
+            })
+        );
+        let whole = parse_place("place client=1076x939 at=239,261 screen=0,0,2720,1200\r\n")
+            .expect("a place");
+        assert_eq!(
+            whole.on_screen(),
+            Some(Rect {
+                l: 0,
+                t: 0,
+                r: 1076,
+                b: 939
+            })
+        );
+        let left = parse_place("place client=100x50 at=-30,-10 screen=0,0,1920,1200")
+            .and_then(|p| p.on_screen());
+        assert_eq!(
+            left,
+            Some(Rect {
+                l: 30,
+                t: 10,
+                r: 100,
+                b: 50
+            })
+        );
+        assert_eq!(
+            parse_place("place client=100x50 at=3000,0 screen=0,0,1920,1200")
+                .and_then(|p| p.on_screen()),
+            None
+        );
+        assert_eq!(parse_place("readback client=1116x996\r\n"), None);
     }
 
     #[test]
@@ -700,7 +881,17 @@ mod tests {
             "C:\\lane\\desk\\x86_64-2"
         );
         // Every verb the run sends is one the helper answers.
-        for verb in ["'windows'", "'monitors'", "'primary'", "'scale'", "'watch'"] {
+        for verb in [
+            "'windows'",
+            "'monitors'",
+            "'primary'",
+            "'scale'",
+            "'watch'",
+            "'readback'",
+            "'place'",
+            "'move'",
+            "'lift'",
+        ] {
             assert!(HELPER.contains(&format!("  {verb} {{")), "{verb}");
         }
     }

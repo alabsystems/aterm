@@ -226,7 +226,7 @@ The window harness's readers by hand
 .BR "aterm link" ", " "aterm fabric"
 Mail between this machine's sessions and people (the fabric bus).
 .TP
-.B aterm fabric brief \fR[\fB@\fIsid\fR[\fB@\fInode\fR]] [\fB\-\-window\fR \fIrecords\fR] [\fB\-\-budget\fR \fItokens\fR]
+.B aterm fabric brief \fR[\fB@\fIsid\fR[\fB@\fInode\fR]] [\fB\-\-window\fR \fIrecords\fR] [\fB\-\-budget\fR \fItokens\fR] [\fB\-\-json\fR]
 The fleet's session logs folded from the bus alone (no control socket): each
 session's open run and turn, its needs and recent turns, marked
 .B partial
@@ -245,6 +245,12 @@ held to
 .B \-\-budget
 tokens; the sessions past it are counted
 .BR more=sessions: .
+.B \-\-json
+prints the same fold as one JSON object for a program: one object per
+session, of ids, closed words and counts only (its node and face, the need
+word and its detail, the open path's levels and kinds, its mail counts, its
+last seq and how many seconds old its newest record is), held to the same
+budget.
 It shows the session logs of a node whose bridge mirrors them: by default
 .RB ( "[fabric] log = \(dqauto\(dq" )
 once its broker retains them, as

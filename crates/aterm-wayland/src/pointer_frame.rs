@@ -30,10 +30,12 @@ pub struct AxisScroll {
 
 impl AxisScroll {
     /// Whether nothing moved along this axis.
+    #[inline]
     pub fn is_none(&self) -> bool {
         *self == Self::default()
     }
 
+    #[inline]
     fn merge(&mut self, other: &Self) {
         self.absolute += other.absolute;
         self.discrete += other.discrete;
@@ -161,7 +163,8 @@ fn on_axis(axis: u32, set: impl FnOnce(&mut AxisScroll)) -> Option<(AxisScroll, 
 
 impl<S: Copy + PartialEq> Frames<S> {
     /// The state of a fresh `wl_pointer` of `version`.
-    pub fn new(version: u32) -> Frames<S> {
+    #[inline]
+    pub const fn new(version: u32) -> Frames<S> {
         Frames {
             version,
             surface: None,
@@ -173,17 +176,20 @@ impl<S: Copy + PartialEq> Frames<S> {
     }
 
     /// The serial of the newest `enter`.
-    pub fn latest_enter(&self) -> Option<u32> {
+    #[inline]
+    pub const fn latest_enter(&self) -> Option<u32> {
         self.latest_enter
     }
 
     /// The serial of the newest `button`, pressed or released.
-    pub fn latest_button(&self) -> Option<u32> {
+    #[inline]
+    pub const fn latest_button(&self) -> Option<u32> {
         self.latest_button
     }
 
     /// The surface the pointer is on.
-    pub fn surface(&self) -> Option<S> {
+    #[inline]
+    pub const fn surface(&self) -> Option<S> {
         self.surface
     }
 

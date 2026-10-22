@@ -1,0 +1,50 @@
+# claude-code 2.1.308 · MEASURED 2026-10-21, `aterm ctl text` of a private headless aterm (144x50, aterm 0.110.0) running the real Claude Code, launched by path with a scratch `CLAUDE_CONFIG_DIR`, a fake `apiKeyHelper` key and `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>` (a local stub of the API, crates/aterm-lab) · default (manual) mode, a one-line command with 65 command substitutions and an rm: the vendor's circuit-breaker note under the dashed rules, opening not ruled out —; approve=none
+
+⏺ Bash(touch z)
+  ⎿  Interrupted · What should Claude do instead?
+
+✻ Churned for 0s · done 10:59 PM
+
+❯ hi
+
+⏺ Hi! I am the local lab stub, not a model. (reply 10)
+
+✻ Churned for 0s · done 10:59 PM
+
+❯ toolstart
+
+⏺ Updated plan
+  ⎿  /plan to preview
+
+⏺ User approved Claude's plan
+  ⎿  Plan saved to: ~/.claude/plans/hi-iterative-iverson.md · /plan to edit
+     Plan
+
+     1. Create plan.txt holding ok.
+
+⏺ Tool call done.
+
+✻ Churned for 0s · done 11:01 PM
+
+❯ toolstart
+
+⏺ Bash(true $(true) $(true) $(true) $(true) $(true) $(true) $(true) $(true) $(true) $(true) $(true) $(true) $(true) $(true) $(true) $(true)
+      $(true) $(true) $(true) $(t…)
+  ⎿  Waiting…
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+ Bash command
+ Remove zz-none after 65 substitutions
+╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+ │ true $(true) $(true) $(true) $(true) $(true) $(true) $(true) $(true) $(true) $(true) $(true) $(true) $(true) $(true) $(true) $(true) $(true)
+ │ $(true) $(true) $(true) $(true) $(true) $(true) $(true) $(true) $(true) $(true) $(true) $(true) $(true) $(true) $(true) $(true) $(true)
+ │ $(true) $(true) $(true) $(true) $(true) $(true) $(true) $(true) $(true) $(true) $(true) $(true) $(true) $(true) $(true) $(true) $(true)
+ │ $(true) $(true) $(true) $(true) $(true) $(true) $(true) $(true) $(true) $(true) $(true) $(true) $(true) $(true); rm -f zz-none
+╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+ │ Dangerous rm operation not ruled out — too many command substitutions to analyze (65)
+
+ Do you want to proceed?
+ ❯ 1. Yes
+   2. No
+
+ Esc to cancel · Tab to amend

@@ -30,6 +30,7 @@ const NEVER_ALLOW_SCHEMES: &[&str] = &["javascript", "data", "file", "vbscript",
 /// and [`HyperlinkAuth::authorize_scheme`] so a minted scheme is always
 /// reachable by the gate and vice versa.
 #[must_use]
+#[inline]
 pub(crate) fn is_rfc3986_scheme_shape(scheme: &str) -> bool {
     let mut chars = scheme.chars();
     let Some(first) = chars.next() else {
@@ -43,6 +44,7 @@ pub(crate) fn is_rfc3986_scheme_shape(scheme: &str) -> bool {
 
 /// Whether `lowered` (already ASCII-lowercased) hits the never-allow set,
 /// including trailing scheme-charset padding (`javascript.`, `data+`).
+#[inline]
 fn is_never_allowed(lowered: &str) -> bool {
     let trimmed = lowered.trim_end_matches(['+', '-', '.']);
     NEVER_ALLOW_SCHEMES.contains(&trimmed)
@@ -63,6 +65,7 @@ pub(crate) struct HyperlinkAuth {
 }
 
 impl Default for HyperlinkAuth {
+    #[inline]
     fn default() -> Self {
         Self::new()
     }
@@ -104,6 +107,7 @@ impl HyperlinkAuth {
 
     /// Remove `scheme` from the extra allowlist (case-insensitive), restoring
     /// the default posture for it. Removing an absent scheme is a no-op.
+    #[inline]
     pub(crate) fn revoke_scheme(&mut self, scheme: &str) {
         self.extra_schemes
             .retain(|s| !s.eq_ignore_ascii_case(scheme));

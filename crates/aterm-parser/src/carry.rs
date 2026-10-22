@@ -96,6 +96,7 @@ pub struct ParserCarry {
 impl ParserCarry {
     /// Whether this carry is a Ground parser holding nothing — what a fresh
     /// parser already is, so a checkpoint records no carry for it.
+    #[inline]
     #[must_use]
     pub fn is_ground(&self) -> bool {
         *self == Self::default()
@@ -284,6 +285,7 @@ impl Parser {
     /// SOS, PM, `DcsIgnore` and a discarded CSI lose nothing (the live parser
     /// swallows them too), and a DCS header is carried as itself. `false` at
     /// Ground and in `DcsPassthrough`. A pure read.
+    #[inline]
     #[must_use]
     pub fn carry_swallows_sequence(&self) -> bool {
         match self.state {
@@ -297,6 +299,7 @@ impl Parser {
     /// picture a graphics stream's next frame replaces: an APC string with its
     /// consumer started (kitty graphics) or an OSC 1337 payload (an inline
     /// image). An OSC 52 write or any other OSC is not. A pure read.
+    #[inline]
     #[must_use]
     pub fn carry_swallows_picture(&self) -> bool {
         self.carry_swallows_sequence()

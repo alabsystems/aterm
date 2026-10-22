@@ -10,7 +10,7 @@ impl Grid {
     /// Get the absolute row counter (monotonically increasing).
     #[must_use]
     #[inline]
-    pub fn absolute_row_counter(&self) -> u64 {
+    pub const fn absolute_row_counter(&self) -> u64 {
         self.storage.absolute_row_counter
     }
 
@@ -55,11 +55,12 @@ impl Grid {
     /// Convert visible coordinates to absolute row number.
     /// Formula: `absolute_row_counter - visible_rows + visible_row`.
     #[must_use]
-    pub fn visible_to_absolute(&self, visible_row: u16) -> u64 {
+    #[inline]
+    pub const fn visible_to_absolute(&self, visible_row: u16) -> u64 {
         self.storage
             .absolute_row_counter
-            .saturating_sub(u64::from(self.storage.visible_rows))
-            .saturating_add(u64::from(visible_row))
+            .saturating_sub(self.storage.visible_rows as u64)
+            .saturating_add(visible_row as u64)
     }
 
     /// The absolute row number of the oldest retained line (history index 0).
@@ -67,6 +68,7 @@ impl Grid {
     ///
     /// Formula: `absolute_row_counter - visible_rows - scrollback_lines()`.
     #[must_use]
+    #[inline]
     pub fn oldest_absolute_row(&self) -> u64 {
         self.storage
             .absolute_row_counter
@@ -81,7 +83,7 @@ impl Grid {
     /// find anchors) are recomputed before use.
     #[must_use]
     #[inline]
-    pub fn history_renumber_epoch(&self) -> u64 {
+    pub const fn history_renumber_epoch(&self) -> u64 {
         self.storage.history_renumber_epoch
     }
 
@@ -89,10 +91,11 @@ impl Grid {
     /// `absolute_row_counter - visible_rows - display_offset`. The reference
     /// point for prompt-to-prompt navigation.
     #[must_use]
-    pub fn top_visible_absolute_row(&self) -> u64 {
+    #[inline]
+    pub const fn top_visible_absolute_row(&self) -> u64 {
         self.storage
             .absolute_row_counter
-            .saturating_sub(u64::from(self.storage.visible_rows))
+            .saturating_sub(self.storage.visible_rows as u64)
             .saturating_sub(self.storage.display_offset as u64)
     }
 

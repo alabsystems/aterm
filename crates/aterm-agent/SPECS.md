@@ -510,7 +510,7 @@ claim-verb-classes	contract	claim::{is_input,is_write,busy_holder}	is_input ⇔ 
 classify-sound	refinement	classify_command, classify_command_with, and its scanners	read_only ⇒ under a Clean model of zsh/bash every program run is a read in ReadSet (or an allowed python3 script), no redirect writes, no assignment binds an evaluated parameter, no expansion evaluates unspelled text, nesting bounded.	1,3,5,7,10,14	40/40
 classify-precise-on-read-grammar	contract	classify_command, classify_command_with	Every line of the read grammar G (lists and compounds of ReadSet heads with literal words, operand-position expansions, read-only redirects and substitutions in G) is read_only: the classifier is not trivially false.	1,3,5,7,10,14	1/1
 classify-except-rm	contract	classify_except_rm, is_mktemp_guard, assignment_hazard, redirect_hazard	read_only ⇒ classify-sound holds with the rm/mktemp/assignment-only segments removed, none of those has a hazard or a write redirect; equal to classify_command_with on lines without such segments.	1,3,5,7,10	1/1
-plain-zsh-line-grammar	contract	plain_zsh_line	Ok ⇔ the line is in the regular language L_plain (no expansion, special redirect, reserved first word or control char outside single quotes); no such line expands under ShellSem.	1,3,5,7,13	1/1
+plain-zsh-line-grammar	contract	classify::{plain_zsh_line,plain_zsh,plain_dollar,substitution_close}	Ok ⇔ the line is in the language L_plain: no special redirect, reserved first word or control char outside single quotes, and every `$` one of `$NAME` or `${NAME}` (ASCII name, letter or `_` first) or a `$(…)` whose text is itself in L_plain one level deeper (no newline, comment, backtick or backslash in it; at most PLAIN_NEST deep), none followed by `[`, `:`, `(`, `{` or a non-ASCII char; `$((` refused. Under ShellSem's zsh (Bash tool setopt, inert startup) such a line expands no further than its bash reading: a parameter read unsplit and unglobbed, a substitution split and unglobbed.	1,3,5,7,13	2/2
 glob-match-fnmatch	equivalence	glob_match	glob_match(p,t) ⇔ t ∈ L(p) with * any string (including /) and ? one char.	1,3,5,7	1/1
 python-allowlist	contract	segment_head (python3 arm), DEFAULT_PYTHON_ALLOW, glob_match	The default allowlist is empty; `python3 p` reads iff p has no .. and no expansion and matches an allowed glob; every other python3 form refuses.	1,3,5,7	2/2
 strip-quotes-shape	contract	strip_quotes	Quoted spans become "" (substitutions inside double quotes kept after a mark), \( \) unescaped, everything else kept; idempotent on its output.	1,3,7	1/1
@@ -552,6 +552,10 @@ approval-never-spends	invariant	policy::approval::{decide,never_spends,kept_or_b
 approval-one-shot-only	invariant	policy::approval::{decide,once_choice,Role,decide_box,kept_or_bought,kept_for_good,allow_once}	Every press is the one-shot allow, the specific option a named rule picks, or a decline's No; never a standing grant (an option kept for good by its role, Persist, its label, settles_later or a whole-label kept_answer, or its rows, Opt::kept: a run of its unnumbered block's label rows that takes in one of its own spells a kept_answer whole, or, ending the block's rows as a frame half drawn may, the first two words or more of one (kept_answer_head), however a narrow pane's wrap left its label joined, a term kept as defence in depth since the reader reads such an option Persist whenever it reads roles - every option of an MCP server dialog, and under any title, its roles read or withheld, the one-server dialog's three answers, the several-server dialog's `Enable selected` and the Chrome setup's `Continue with browser tools` - is refused by the press gate whatever rule picked it); a grant-only box is declined; a role-less box escalates, and so does a box read with no role a press is chosen by, only standing ones (Role::standing: an unnumbered block a rest that opens with no capital blanks), no yes of it taken by its label. The standing answers given are the folder-trust dialog's and the autocompact offer's (its own rule, by the owner's direction). Carved out: a consent onto usage credits (credits_consent) under `[harness] usage_credits` is its own rule's, `credits-consent@v1` — a model's `Continue with <M>`, which Claude Code keeps for good per model and account, the owner's opt-in — and never logged as allow-once@v1.	1,3,5,7,12	12/15
 approval-level-monotone	contract	policy::approval::{decide,decide_safe,decide_box,rm_breaker_warn}	None escalates every permission box; whatever Safe approves All presses the same way (unproven presses marked); Safe approves an unproven rm breaker with a warning unless rm_breaker_ask; non-default shells and remote boxes are never proven.	1,2,3,4,5,12	8/8
 approval-safe-bash-sound	contract	policy::approval::{bash,read_only_every_reading,plain_under_zsh,shell_models_hold,git_reads_clear}, classify_command_with	Safe approves a Bash box only out of bypass, with no vendor note, local, default shell, every reading read-only, plain under zsh, and every git read clear.	1,3,4,5,7,12	9/9
+approval-breaker-read-only-sound	contract	policy::approval::{breaker_read_only,command_readings,names_a_removal,read_only_every_reading,plain_under_zsh,shell_models_hold,git_reads_clear}, policy::box_command::drawn_as	RULE_BREAKER_READ_ONLY approves only the TooManySubstitutions breaker with its own two-option Yes/No, under Safe in any mode, when no reading names rm or rmdir as a word in any case and every reading is read-only, plain under zsh, startup-modelled and git-clear; its readings are every join of the screen's rows, or the transcript's one command alone iff drawn_as(box, rows, command) holds; the press is option 1 under row_guard(the first command row).	1,3,4,5,7,12	4/7
+box-command-render-join	contract	policy::box_command::{barred_rows,wrap_line,wrap_word,drawn_as,may_prove}	barred_rows(c,W)=Ok ⇔ W ≥ 8 ∧ c ⊆ printable ASCII ∪ {⏎}; its rows are each line of c wrapped as wrap-ansi {hard, trim:false} at W, each continuation row less one leading blank. drawn_as(p,rows,c)=Ok ⇔ may_prove(p) (a whole Claude Bash box, gutter, head, footer, no origin, the too-many breaker) ∧ the rows between its first and last dashed rule, trimmed at the end, equal trim_end(" │ "+r) for r ∈ barred_rows(c, |top rule|−4).	1,3,12	4/5
+box-command-pending-call	contract	policy::box_command::{pending_bash,ancestor}	Ok(call) ⇔ exactly one main-chain tool_use stands with no result (sidechain and non-user/assistant rows are ignored; a tool_result in any main-chain user row of the tail answers its call wherever it is written; a user row with no result ends every call written before it in the file unless it is on that call row's parentUuid chain within the tail, its own turn's prompt), not in spent, and it is a Bash call whose input.command is a string.	1,3,7	3/3
+box-command-loop-settle	contract	Session::box_command, approval_loop::decide_box, policy::box_command::{wanted,SETTLE_STEPS}, policy::box_call::{LAG_TRIES,LAG_STEP}	The loop asks for a box's transcript call only where wanted(program, p, escalates) holds: Claude Code's box, may_prove(p), and the screen's readings escalate (asked last). It retries a file naming none up to LAG_TRIES steps; a call is taken only when the same id and command stand alone and waiting at two reads at least SETTLE_STEPS·LAG_STEP apart, the first at the call's first sighting on the box's mount (box_seen, forgotten at a new mount): at the sighting the loop sleeps out the settle and reads again; a later decision on the mount takes it with one read and no sleep, so its press is fenced on a fresh read. A call taken is spent when its box leaves or a mount begins, and answers no later box.	1,2,3,5,7,8,11	4/4
 approval-rm-breaker-sound	contract	rm_breaker::resolve, resolvable_breaker, classify_except_rm, is_mktemp_guard, decide (rm arm)	RULE_RM_BREAKER approves only in bypass with cwd known and scratch roots, every operand resolving (through links) strictly inside a scratch root or a guarded mktemp dir, the rest of the line read-only, and no rebinding hazard; anything else escalates under Safe.	1,3,4,5,7,8,10	8/8
 approval-read-rule	contract	policy::approval::{read_box,read_readings,default_secrets,vendor_distrusts,forced_read}, probe_live::{never_listed,hidden_twin_within}	A Read box is approved iff it offers its folder grant and every reading (as written and canonical) is under a read root and no secret rule; the hidden-twin directory walk never lists inside another app's data or a file-provider domain (`APP_DATA_ROOTS`, `FILE_PROVIDER_ROOTS`).	1,3,5,7,8	4/4
 approval-trust-dialog	contract	decide (trust arm), RULE_TRUST_DIALOG, RULE_TRUST_ANY	Safe trusts only Claude's dialog (aterm answers no Codex box), for the session's own folder under a trust root (none by default), its options exactly an exit and a trust; full power trusts any folder, unproven.	1,3,4,12	4/5
@@ -1835,20 +1839,24 @@ src/supervise/classify_tests.rs	a_for_loop_over_a_zsh_arithmetic_variable_is_not
 src/supervise/classify_tests.rs	a_git_argument_this_check_cannot_read_is_refused_before_the_double_dash	classify-sound	
 src/supervise/classify_tests.rs	a_glob_qualifier_that_can_run_a_command_is_not_a_read	classify-sound	
 src/supervise/classify_tests.rs	a_parameter_zsh_runs_is_a_hazard	classify-sound	
+src/supervise/classify_tests.rs	a_plain_line_admits_only_the_expansions_zsh_takes_no_further_than_bash	plain-zsh-line-grammar	classify-sound
 src/supervise/classify_tests.rs	a_plain_line_expands_nothing	plain-zsh-line-grammar	
 src/supervise/classify_tests.rs	a_program_word_is_judged_only_at_a_head	classify-sound	
 src/supervise/classify_tests.rs	a_python_path_cannot_step_out_of_the_allowlist	python-allowlist	
 src/supervise/classify_tests.rs	a_redirect_on_a_left_out_segment_is_judged	classify-except-rm	
 src/supervise/classify_tests.rs	a_redirect_or_a_dash_before_the_name_does_not_hide_it	classify-sound	
+src/supervise/classify_tests.rs	a_reserved_word_behind_an_assignment_or_a_redirect_is_a_program	classify-sound	
 src/supervise/classify_tests.rs	a_subscript_on_a_special_parameter_is_refused	classify-sound	
 src/supervise/classify_tests.rs	a_substitution_is_a_word_of_the_command_around_it	classify-sound	
 src/supervise/classify_tests.rs	a_tied_array_is_assigned_as_its_scalar	classify-sound	
 src/supervise/classify_tests.rs	a_unicode_escape_in_a_printf_format_may_be_a_conversion	classify-sound	
 src/supervise/classify_tests.rs	a_word_after_a_closing_brace_is_a_command	classify-sound	
 src/supervise/classify_tests.rs	a_wrapper_cannot_launder_the_program_it_runs	classify-sound	
+src/supervise/classify_tests.rs	an_arithmetic_evaluation_is_refused_whole	classify-sound	
 src/supervise/classify_tests.rs	an_awk_or_sed_program_from_a_parameter_is_not_read	classify-sound	
 src/supervise/classify_tests.rs	an_expansion_in_an_option_slot_is_refused_quoted_or_not	classify-sound	
 src/supervise/classify_tests.rs	an_extended_glob_word_may_become_a_flag_or_a_name	classify-sound	
+src/supervise/classify_tests.rs	an_option_after_time_is_the_time_programs_own	classify-sound	
 src/supervise/classify_tests.rs	arithmetic_that_can_expand_a_subscript_is_not_a_read	classify-sound	
 src/supervise/classify_tests.rs	aterm_forms_are_judged_by_their_full_subform	classify-sound	
 src/supervise/classify_tests.rs	awk_programs_and_sed_scripts_are_read_not_dropped	classify-sound	
@@ -1872,6 +1880,7 @@ src/supervise/classify_tests.rs	the_measured_bypasses_are_not_read_only	classify
 src/supervise/classify_tests.rs	the_python_allowlist_is_opt_in	python-allowlist	
 src/supervise/classify_tests.rs	the_session_corpus_classifies_as_the_manager_did	classify-sound	
 src/supervise/classify_tests.rs	the_write_forms_of_system_reads_are_refused	classify-sound	
+src/supervise/classify_tests.rs	what_a_wrapper_or_time_runs_is_never_a_keyword	classify-sound	
 src/supervise/classify_tests.rs	zsh_arithmetic_that_can_run_a_command_is_not_a_read	classify-sound	
 src/supervise/config.rs	the_autocompact_offer_key_reads_a_size_or_off	config-power-lattice	
 src/supervise/config.rs	a_disk_knob_under_harness_is_the_disk_readers_not_an_unknown_key	config-retired-and-agent-keys	
@@ -1990,6 +1999,7 @@ src/supervise/policy/approval_tests.rs	a_read_box_with_no_folder_grant_is_the_ow
 src/supervise/policy/approval_tests.rs	a_read_only_box_is_approved_outside_bypass_and_never_in_it	approval-safe-bash-sound	
 src/supervise/policy/approval_tests.rs	a_read_outside_cwd_is_approved_under_an_allowed_root_unless_it_is_a_secret	approval-read-rule	
 src/supervise/policy/approval_tests.rs	a_read_through_a_symlink_is_judged_where_it_leads	approval-read-rule	
+src/supervise/policy/approval_tests.rs	a_removal_is_rm_or_rmdir_as_a_word_in_any_case	approval-breaker-read-only-sound	
 src/supervise/policy/approval_tests.rs	a_reset_confirmation_is_never_answered_yes_at_any_level	approval-never-spends	
 src/supervise/policy/approval_tests.rs	a_row_that_cannot_be_a_wrap_ends_the_command	approval-command-readings	
 src/supervise/policy/approval_tests.rs	a_sed_edit_box_under_a_bash_specifier_rule_or_bash_hook_is_held_at_every_level	approval-owner-review-held	
@@ -2002,6 +2012,7 @@ src/supervise/policy/approval_tests.rs	a_wrapped_non_shell_owner_review_is_never
 src/supervise/policy/approval_tests.rs	a_write_on_a_second_row_is_not_laundered_by_the_space_join	approval-safe-bash-sound	
 src/supervise/policy/approval_tests.rs	a_yes_is_never_taken_by_its_label_under_a_rest_that_opens_with_no_capital	approval-one-shot-only	
 src/supervise/policy/approval_tests.rs	an_answer_kept_for_good_by_its_label_is_never_taken_under_a_lowercase_rest	approval-dialog-rules	
+src/supervise/policy/approval_tests.rs	an_arithmetic_assignment_is_no_read_in_a_plain_bash_box	approval-safe-bash-sound	classify-sound
 src/supervise/policy/approval_tests.rs	an_rm_breaker_on_scratch_is_approved_in_bypass_under_its_row_guard	approval-rm-breaker-sound	
 src/supervise/policy/approval_tests.rs	an_rm_breaker_through_a_link_out_of_scratch_escalates	approval-rm-breaker-sound	
 src/supervise/policy/approval_tests.rs	an_unproven_rm_breaker_under_safe_is_approved_with_a_warning	approval-level-monotone	
@@ -2051,10 +2062,20 @@ src/supervise/policy/approval_tests.rs	the_press_gate_refuses_each_kept_mcp_answ
 src/supervise/policy/approval_tests.rs	the_reset_rule_takes_only_the_one_reset_on_offer_and_never_a_fable_row	approval-limit-dialog	
 src/supervise/policy/approval_tests.rs	the_rest_of_an_rm_breaker_line_must_read	approval-rm-breaker-sound	
 src/supervise/policy/approval_tests.rs	the_session_paused_dialog_switches_to_the_fallback	approval-dialog-rules	
+src/supervise/policy/approval_tests.rs	the_too_many_box_is_judged_on_the_transcripts_command_where_it_draws_as_the_box	approval-breaker-read-only-sound	box-command-render-join
+src/supervise/policy/approval_tests.rs	the_too_many_breaker_over_a_proven_read_is_approved_under_its_rule	approval-breaker-read-only-sound	approval-level-monotone
 src/supervise/policy/approval_tests.rs	the_twin_scan_never_lists_inside_another_apps_data	approval-read-rule	
 src/supervise/policy/approval_tests.rs	trust_roots_are_read_from_the_config_spelling	approval-roots	
 src/supervise/policy/approval_tests.rs	under_zsh_only_a_plain_line_is_a_proven_read	approval-safe-bash-sound	
 src/supervise/policy/approval_tests.rs	with_no_trust_root_only_the_system_roots_are_read	approval-read-rule	
+src/supervise/policy/box_command_tests.rs	a_call_written_before_its_own_prompt_row_is_still_waiting	box-command-pending-call	
+src/supervise/policy/box_command_tests.rs	a_command_drawing_fewer_or_more_rows_than_the_box_is_not_the_box	box-command-render-join	
+src/supervise/policy/box_command_tests.rs	a_result_row_takes_its_call_away_and_leaves_the_next	box-command-pending-call	
+src/supervise/policy/box_command_tests.rs	every_measured_capture_draws_as_its_own_calls_command	box-command-render-join	
+src/supervise/policy/box_command_tests.rs	only_the_main_agents_whole_too_many_box_is_matched_to_a_command	box-command-render-join	
+src/supervise/policy/box_command_tests.rs	the_call_waiting_is_the_transcripts_one_pending_bash_call	box-command-pending-call	
+src/supervise/policy/box_command_tests.rs	the_transcript_is_read_only_for_claudes_too_many_box_the_screen_escalates	box-command-loop-settle	
+src/supervise/policy/box_command_tests.rs	the_wrap_drops_one_blank_at_a_wrap_and_breaks_a_wide_word	box-command-render-join	
 src/supervise/policy/claude_settings_tests.rs	a_hook_matcher_matches_bash_as_claude_code_matches_it	hook-matcher	
 src/supervise/policy/claude_settings_tests.rs	a_linked_worktree_reads_the_main_worktrees_local_settings	settings-chain-order	
 src/supervise/policy/claude_settings_tests.rs	a_managed_preference_domain_is_a_document_this_reader_cannot_see	managed-preferences	
@@ -2506,6 +2527,7 @@ src/supervise/run_engine_tests.rs	a_stop_in_any_wait_ends_the_hosted_run_before_
 src/supervise/run_engine_tests.rs	a_survey_that_left_under_typed_text_is_not_said_dismissed	survey-press-refines-model	
 src/supervise/run_engine_tests.rs	a_taken_box_redrawn_before_it_leaves_is_pressed_once	press-landing-and-retry	
 src/supervise/run_engine_tests.rs	a_ticking_default_no_box_whose_enter_is_not_taken_is_pressed_once	press-landing-and-retry	
+src/supervise/run_engine_tests.rs	a_too_many_box_the_screen_proves_reads_no_transcript	box-command-loop-settle	approval-breaker-read-only-sound
 src/supervise/run_engine_tests.rs	a_trust_dialog_under_a_shell_with_no_osc7_is_decided_by_the_agents_own_folder	loop-applies-decision	
 src/supervise/run_engine_tests.rs	a_turn_end_the_host_let_go_is_decided_again	host-turn-end-protocol	
 src/supervise/run_engine_tests.rs	a_turn_the_host_typed_is_no_short_turn_of_the_workers	host-turn-end-protocol	
@@ -2535,6 +2557,7 @@ src/supervise/run_engine_tests.rs	the_hosts_step_is_taken_at_the_idle_point_and_
 src/supervise/run_engine_tests.rs	the_limit_options_dialog_waits_for_the_reset_by_itself	limit-dialog-wait-row	
 src/supervise/run_engine_tests.rs	the_loop_says_which_guard_withheld_the_point_the_host_asked_for	idle-point-classification	
 src/supervise/run_engine_tests.rs	the_mcp_server_dialogs_badge_says_every_answer_is_kept_at_every_level	approval-dialog-rules	
+src/supervise/run_engine_tests.rs	the_measured_too_many_box_is_pressed_on_the_transcripts_command_in_the_loop	box-command-loop-settle	approval-breaker-read-only-sound
 src/supervise/run_engine_tests.rs	the_owners_subagent_rm_box_is_pressed_once_by_the_hosts_default	loop-applies-decision	
 src/supervise/run_engine_tests.rs	the_probes_gate_reads_a_refused_wall_as_it_was_decided	usage-probe-refines-model	
 src/supervise/run_engine_tests.rs	the_rm_breaker_is_approved_under_a_scratch_root_and_escalated_otherwise	loop-applies-decision	
@@ -2542,6 +2565,8 @@ src/supervise/run_engine_tests.rs	the_same_box_back_after_its_declines_is_declin
 src/supervise/run_engine_tests.rs	the_sessions_foreground_group_is_read_off_the_roster	session-group	
 src/supervise/run_engine_tests.rs	the_sessions_word_decides_its_question_dialog_over_the_switch	question-priority-resolution	
 src/supervise/run_engine_tests.rs	the_text_press_refuses_a_host_that_cannot_fence_it_and_an_enter_it_did_not_earn	question-text-safety	
+src/supervise/run_engine_tests.rs	the_ticking_too_many_box_is_pressed_on_the_transcripts_settled_command	box-command-loop-settle	approval-breaker-read-only-sound
+src/supervise/run_engine_tests.rs	the_too_many_breaker_over_a_proven_read_is_ledgered_under_its_rule	approval-breaker-read-only-sound	
 src/supervise/run_engine_tests.rs	the_trust_dialog_is_answered_by_a_confirmed_focus_move_then_enter	focus-choice-refines-model	
 src/supervise/run_engine_tests.rs	the_trust_dialog_is_never_entered_unconfirmed	focus-choice-refines-model	
 src/supervise/run_engine_tests.rs	tier1_a_decline_keystroke_goes_only_where_the_model_allows	decline-keys-refines-model	

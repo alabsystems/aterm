@@ -127,7 +127,8 @@ impl UnderlineStyle {
     /// Resolve the packed underline bits to a single variant. The composite styles
     /// share bits with the singletons (DOTTED = UNDERLINE|CURLY, DASHED =
     /// DOUBLE|CURLY), so they are tested before the singletons.
-    fn from_flags(cflags: CellFlags) -> Self {
+    #[inline]
+    const fn from_flags(cflags: CellFlags) -> Self {
         if cflags.contains(CellFlags::DOTTED_UNDERLINE) {
             Self::Dotted
         } else if cflags.contains(CellFlags::DASHED_UNDERLINE) {
@@ -239,6 +240,7 @@ pub struct RenderCell {
 /// unconditionally. Colors are black on black: a `Default` cell is a
 /// placeholder, and real frame paths resolve colors through the live palette.
 impl Default for RenderCell {
+    #[inline]
     fn default() -> Self {
         Self {
             ch: ' ',
@@ -296,6 +298,7 @@ impl Terminal {
     /// resolved through [`color_resolve`](super::color_resolve) (see the module docs). Empty
     /// for out-of-range rows.
     #[must_use]
+    #[inline]
     pub fn render_row(&self, row: usize) -> Vec<RenderCell> {
         let mut out = Vec::new();
         self.render_row_into(row, &mut out);
@@ -305,6 +308,7 @@ impl Terminal {
     /// Like [`render_row`](Self::render_row), but fills a caller-owned `out` (cleared first) so
     /// a caller scanning many rows reuses one buffer. It is the one code path, so the result is
     /// byte-identical; out-of-range rows leave `out` empty.
+    #[inline]
     pub fn render_row_into(&self, row: usize, out: &mut Vec<RenderCell>) {
         self.render_row_into_impl(row, out, None, false);
     }
@@ -350,6 +354,7 @@ impl Terminal {
     /// with the live [`cell_grapheme`](Self::cell_grapheme) glyph. Identical to
     /// `render_row` at `display_offset == 0`.
     #[must_use]
+    #[inline]
     pub fn render_row_at_screen(&self, screen_row: usize) -> Vec<RenderCell> {
         let mut out = Vec::new();
         self.render_row_at_screen_into(screen_row, &mut out);
@@ -360,6 +365,7 @@ impl Terminal {
     /// (cleared first); the allocating form delegates here. The socket introspection gather
     /// (`aterm-gui`'s `gather_styled_frame`) walks every visible row per `screen` read and
     /// `subscribe cells` push with the `Terminal` mutex held, reusing one buffer.
+    #[inline]
     pub fn render_row_at_screen_into(&self, screen_row: usize, out: &mut Vec<RenderCell>) {
         self.render_row_into_impl(screen_row, out, None, true);
     }
@@ -368,10 +374,6 @@ impl Terminal {
     /// for the emoji-cluster and combining-mark classification.
     /// [`cell_frame_into`](Self::cell_frame_into) passes it so that extraction shares this
     /// loop's one [`CellExtra`](aterm_grid::CellExtra) read per cell.
-    #[allow(
-        clippy::too_many_lines,
-        reason = "single per-cell resolution pass (colors + decorations + emoji/combining extraction) over a row"
-    )]
     fn render_row_into_impl(
         &self,
         row: usize,
@@ -398,7 +400,33 @@ impl Terminal {
         } else {
             grid.visible_row_view(visible_row)
         };
+        self.render_view_into(&view, out, extras_out);
+    }
 
+    /// The HISTORY row `rev_idx` lines above the live screen (0 = the newest scrolled-off
+    /// line) into render-ready cells, as [`render_row_at_screen_into`](Self::render_row_at_screen_into)
+    /// resolves a live row and whatever the viewport shows: socket introspection's `cell
+    /// abs=<n>` reads a history row's colours and decorations here, so they pair with the
+    /// live frame's reads of the screen. `out` is left empty for a row the history does not
+    /// hold.
+    pub fn render_history_row_into(&self, rev_idx: usize, out: &mut Vec<RenderCell>) {
+        out.clear();
+        let view = self.grid().history_row_view(rev_idx);
+        self.render_view_into(&view, out, None);
+    }
+
+    /// The per-cell resolution pass of [`render_row_into_impl`](Self::render_row_into_impl)
+    /// over one resolved row `view` (`out` and `extras_out` cleared by the caller).
+    #[allow(
+        clippy::too_many_lines,
+        reason = "single per-cell resolution pass (colors + decorations + emoji/combining extraction) over a row"
+    )]
+    fn render_view_into(
+        &self,
+        view: &aterm_grid::VisibleRowView<'_>,
+        out: &mut Vec<RenderCell>,
+        mut extras_out: Option<ExtrasOut<'_>>,
+    ) {
         let palette = self.color_palette();
         let default_fg = self.default_foreground();
         let default_bg = self.default_background();
@@ -958,6 +986,7 @@ impl Terminal {
     /// The snapshot's [`snapshot_seq`](crate::render::RenderInput::snapshot_seq)
     /// is [`damage_epoch`](Self::damage_epoch), read under the caller's lock,
     /// so a later `damage_epoch()` detects staleness.
+    #[inline]
     pub fn cell_frame_into(
         &mut self,
         scratch: &mut crate::render::RenderInput,
@@ -1640,7 +1669,7 @@ impl Terminal {
 /// a flag pair), or a tag character (U+E0020–U+E007F, a 🏴 subdivision flag).
 /// VS15/VS16 are presentation selectors, not sequence markers.
 #[inline]
-fn is_emoji_sequence_marker(c: char) -> bool {
+const fn is_emoji_sequence_marker(c: char) -> bool {
     matches!(
         c as u32,
         0x200D | 0x20E3 | 0x1F3FB..=0x1F3FF | 0x1F1E6..=0x1F1FF | 0xE0020..=0xE007F
@@ -1654,12 +1683,13 @@ fn is_emoji_sequence_marker(c: char) -> bool {
 /// Supplement and the reserved gaps) is Default_Ignorable_Code_Point throughout. Filtering in
 /// this one frame builder, which both renderers consume, keeps CPU/GPU parity.
 #[inline]
-fn draws_no_glyph(c: char) -> bool {
+const fn draws_no_glyph(c: char) -> bool {
     matches!(c as u32, 0xFE0E | 0xFE0F | 0xE0000..=0xE0FFF)
 }
 
 /// `0x00RRGGBB`: the packing of the snapshot's colour scalars and the apron fingerprint.
-fn pack_rgb(c: aterm_types::Rgb) -> u32 {
+#[inline]
+const fn pack_rgb(c: aterm_types::Rgb) -> u32 {
     u32::from_be_bytes([0, c.r, c.g, c.b])
 }
 

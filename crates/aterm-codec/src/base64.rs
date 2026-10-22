@@ -111,6 +111,7 @@ impl std::error::Error for EncodeError {}
 ///
 /// Returns [`EncodeError::InputTooLarge`] if `input` is longer than
 /// [`crate::MAX_INPUT_LEN`].
+#[inline]
 pub fn encode(input: &[u8]) -> Result<String, EncodeError> {
     let mut out = String::new();
     encode_into(&mut out, input)?;
@@ -121,7 +122,8 @@ pub fn encode(input: &[u8]) -> Result<String, EncodeError> {
 /// `None` above [`crate::MAX_INPUT_LEN`], exactly the lengths [`encode_into`]
 /// refuses.
 #[must_use]
-pub fn encoded_len(input_len: usize) -> Option<usize> {
+#[inline]
+pub const fn encoded_len(input_len: usize) -> Option<usize> {
     if input_len > crate::MAX_INPUT_LEN {
         return None;
     }
@@ -186,6 +188,7 @@ pub fn encode_into(out: &mut String, input: &[u8]) -> Result<(), EncodeError> {
 ///
 /// Returns [`DecodeError`] if the input contains invalid characters or has
 /// an invalid length.
+#[inline]
 pub fn decode(input: &str) -> Result<Vec<u8>, DecodeError> {
     decode_with_table(input.as_bytes(), &STANDARD_DECODE)
 }
@@ -208,13 +211,14 @@ pub fn decode(input: &str) -> Result<Vec<u8>, DecodeError> {
 /// Returns [`DecodeError`] if the input is over [`crate::MAX_INPUT_LEN`],
 /// contains a byte outside the standard alphabet, is not canonically padded, or
 /// is a non-canonical spelling of its output.
+#[inline]
 pub fn decode_strict(input: &[u8]) -> Result<Vec<u8>, DecodeError> {
     decode_strict_with_table(input, &STANDARD_DECODE)
 }
 
 /// The four alphabet symbols of the 24-bit group `n`, high sextet first.
 #[inline]
-fn sextets(n: u32) -> [u8; 4] {
+const fn sextets(n: u32) -> [u8; 4] {
     let alphabet = STANDARD_ALPHABET;
     [
         alphabet[((n >> 18) & 0x3F) as usize],
@@ -381,7 +385,7 @@ fn decode_strict_with_table(input: &[u8], table: &[u8; 256]) -> Result<Vec<u8>, 
 }
 
 #[inline]
-fn decode_byte(table: &[u8; 256], byte: u8, pos: usize) -> Result<u8, DecodeError> {
+const fn decode_byte(table: &[u8; 256], byte: u8, pos: usize) -> Result<u8, DecodeError> {
     let val = table[byte as usize];
     if val == 0xFF {
         Err(DecodeError::InvalidByte(pos, byte))

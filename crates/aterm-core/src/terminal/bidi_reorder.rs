@@ -164,6 +164,7 @@ impl Terminal {
     /// order the frame applies them (it reorders the stored cells, then doubles
     /// them). The one painted-to-logical mapping a front end's pointer takes: the
     /// GUI's selection press and link probes, and a web host's `link_at`.
+    #[inline]
     #[must_use]
     pub fn painted_cell_logical(&self, row: u16, col: u16) -> (u16, bool) {
         use crate::grid::LineSize;
@@ -316,6 +317,7 @@ impl Terminal {
 /// cells before anything is gathered. `Cell::char` is the packed codepoint, or
 /// U+FFFD for a complex cell (which passes, and [`render_scalars`] resolves),
 /// so a row this rejects is one the renderer leaves in logical order.
+#[inline]
 fn may_reorder(view: &VisibleRowView<'_>) -> bool {
     (0..view.len()).any(|c| view.cell(c).is_some_and(|cell| cell.char() >= '\u{0590}'))
 }
@@ -363,6 +365,7 @@ fn row_logical_order(view: &VisibleRowView<'_>, cols: u16) -> (String, Vec<usize
 
 /// Column `col`'s text in a row read: nothing for a wide glyph's continuation
 /// or a column past the row.
+#[inline]
 fn push_text(view: &VisibleRowView<'_>, col: u16, out: &mut String) {
     if !view.is_wide_continuation(col)
         && let Some(cell) = view.cell(col)
@@ -375,6 +378,7 @@ fn push_text(view: &VisibleRowView<'_>, col: u16, out: &mut String) {
 /// flags to the visual→logical cell permutation, keeping
 /// wide-glyph pairs together (see [`aterm_bidi::reorder_cells_with_classes`]).
 /// `autodetect` is DECSET 2501.
+#[inline]
 #[must_use]
 pub fn compute_visual_order_cells(
     mode: BiDiMode,
@@ -441,6 +445,7 @@ fn visual_order_cells_into(
 /// an LTR paragraph and `AutoRtl` an RTL one; with it `Auto` runs UAX #9 P2/P3 and
 /// `AutoRtl` does too when a strong L/R/AL character is present (else `Rtl`). SCP 1/2
 /// (`Ltr`/`Rtl`) force their direction.
+#[inline]
 fn base_direction_from_classes(
     dir: ParagraphDirection,
     autodetect: bool,

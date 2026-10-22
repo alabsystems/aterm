@@ -771,8 +771,8 @@ fn drawn_whole(page: &crate::native_ui::CompiledUi, key: &str) -> bool {
 /// KEYBOARD (the final check of 2026-10-20, F1): at 2× text on the lab's
 /// narrow page (504 × 628 pt, and heights about it), three sessions and
 /// `land_at` set, the list paged to the `Every session` row, whose block
-/// with its Timer open is taller than the room under SESSIONS · CONTINUED's
-/// caption. PRESSING TIMER opens it in view: `at 18:00`, its last choice,
+/// with its Timer open is taller than the room under the SESSIONS caption
+/// the list keeps over it. PRESSING TIMER opens it in view: `at 18:00`, its last choice,
 /// drawn whole and live. THE KEYBOARD, the list back at the row's own seat
 /// (no nudge, nothing revealed — as Home and Page Down leave it): focus on
 /// `at 18:00` scrolls the list into the row until it is drawn whole — under
@@ -912,7 +912,7 @@ fn block_of(
 /// whole. Opening the Timer scrolls the list into the row so its last
 /// choice shows (F1); closing it lets that scroll go, so the closed row —
 /// its name, its state line, its buttons — is drawn whole again where it
-/// was, never left under SESSIONS · CONTINUED's caption. A session row's
+/// was, never left under the SESSIONS caption the list keeps over it. A session row's
 /// Timer the same. NEGATIVE CONTROL: the opening did scroll the Every row
 /// (its block drawn higher with the Timer open than closed) on some page;
 /// with the scroll kept after the close (the first fix of F1), the closed

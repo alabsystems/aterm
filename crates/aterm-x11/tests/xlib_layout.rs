@@ -56,6 +56,9 @@ fn layouts() -> Vec<Layout> {
         layout!(XDestroyWindowEvent, "XDestroyWindowEvent" {
             type_ = "type", serial, send_event, display, event, window
         }),
+        layout!(XUnmapEvent, "XUnmapEvent" {
+            type_ = "type", serial, send_event, display, event, window, from_configure
+        }),
         layout!(XMapEvent, "XMapEvent" {
             type_ = "type", serial, send_event, display, event, window, override_redirect
         }),
@@ -166,6 +169,7 @@ fn constants() -> Vec<(&'static str, i64)> {
         ("Expose", i64::from(e::EXPOSE)),
         ("VisibilityNotify", i64::from(e::VISIBILITY_NOTIFY)),
         ("DestroyNotify", i64::from(e::DESTROY_NOTIFY)),
+        ("UnmapNotify", i64::from(e::UNMAP_NOTIFY)),
         ("MapNotify", i64::from(e::MAP_NOTIFY)),
         ("ReparentNotify", i64::from(e::REPARENT_NOTIFY)),
         ("ConfigureNotify", i64::from(e::CONFIGURE_NOTIFY)),

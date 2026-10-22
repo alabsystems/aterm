@@ -31,6 +31,7 @@ const MAX_MATCHES_PER_STEP: usize = 4_096;
 static NEXT_BUDGETED_SEARCH_CURSOR: AtomicU64 = AtomicU64::new(1);
 
 #[allow(deprecated)] // Trust renamed this to try_update; stable x86 slice still exposes fetch_update.
+#[inline]
 fn allocate_cursor(counter: &AtomicU64) -> Option<u64> {
     counter
         .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
@@ -66,6 +67,7 @@ impl std::fmt::Display for BudgetedSearchError {
 impl std::error::Error for BudgetedSearchError {}
 
 impl From<SearchOptionsError> for BudgetedSearchError {
+    #[inline]
     fn from(value: SearchOptionsError) -> Self {
         Self::SearchOptions(value)
     }
@@ -402,6 +404,7 @@ impl Terminal {
             project = "conformance_budgeted_search::project_cancel"
         )
     )]
+    #[inline]
     pub fn cancel_budgeted_search(&mut self) {
         self.budgeted_search = None;
     }

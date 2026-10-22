@@ -2593,41 +2593,64 @@ pub fn harness_agy_exit_witness_model() -> Model {
 /// killed and `137` its parent killed — crashes; `41`, `42`, `52` a start it
 /// refused (no credential; an unknown id, another project's session, a
 /// duplicate id; its config) — never a crash; any other status names nothing
-/// measured (the parent ignores SIGTERM, SIGHUP and SIGINT). No file names a
-/// process's session and none is held open, so its session is the ONE
-/// session header of its project begun since it started, within the window
-/// its own lands in (each launch, each resume's duplicate and each `/clear`
-/// writes one), while no other session's file moved since: anything else
-/// names none. And its own `--resume` loads the newest of the session's
-/// files, which after two resumes with no turn between is an empty
+/// measured (the parent ignores SIGTERM, SIGHUP and SIGINT). But a `42` from
+/// a launch under its own `--session-id` whose session the start-time rule
+/// names is ITS OWN RESTART (`/settings`, IDE trust, the folder-trust
+/// dialog: exit `199`, its argv run again) met by the id its first start
+/// wrote (`ExitKind::Restarted`, measured with and without a first turn):
+/// resumed on that session by id as a crash is, and quietly — nothing typed
+/// after it. No file names a process's session and none is held open, so its
+/// session is the ONE session header of its project begun since it started,
+/// within the window its own lands in (each launch, each resume's duplicate
+/// and each `/clear` writes one), while no other session's file moved since:
+/// anything else names none. And its own `--resume` loads the newest of the
+/// session's files, which after two resumes with no turn between is an empty
 /// duplicate: the resume is typed only where a read-only fold of those files
-/// says it loads every turn.
+/// says it loads every turn. A session that took no turn is resumed only on
+/// its own restart of a launch that carried no first prompt (the measured
+/// folder-trust restart before any turn); a crash's leaves nothing to bring
+/// back, and a restart's whose first prompt was never sent would drop it.
 ///
 /// For ONE exit of ONE Gemini CLI: `exit` 0 it runs, 1 its child killed
 /// (`1`), 2 a graceful way out, 3 a refused start, 4 a status with no word in
-/// the table, 5 its parent killed (`137`); `rule` what the start-time rule
-/// sees — 0 its own header alone since its start, 1 a second header since (a
-/// `/clear`, another launch), 2 its own header never written and another
-/// launch's begun past the window, 3 an in-TUI `/resume` onto an older
-/// session (a switch onto it, no header) with a start's background summary
-/// written after the switch; `dup` its resume would load an empty
-/// duplicate; `word` the shell has drawn the status of the block it ran in;
-/// `later` a later command's block is the newest since; `seen` the look has
-/// decided and `kept` what it found (1 a crash, 2 a clean end, 3 no verdict —
-/// read again at the attempt — 4 a refusal); `decided` 0 no attempt yet, 1
-/// relaunched, 2 left (told, never typed). The world stands still once
-/// decided.
+/// the table, 5 its parent killed (`137`), 6 its own restart refused for the
+/// `--session-id` its first start wrote (`42`); `rule` what the start-time
+/// rule sees — 0 its own header alone since its start, 1 a second header
+/// since (a `/clear`, another launch), 2 its own header never written and
+/// another launch's begun past the window, 3 an in-TUI `/resume` onto an
+/// older session (a switch onto it, no header) with a start's background
+/// summary written after the switch; `dup` its resume would load an empty
+/// duplicate; `turnless` the session took no turn in any of its files;
+/// `prompt` the launch carried a first prompt (every worker's launch is
+/// under its own `--session-id`, prompted or not); `word` the shell has
+/// drawn the status of the block it ran in; `later` a later command's block
+/// is the newest since; `seen` the look has decided and `kept` what it found
+/// (1 a crash, 2 a clean end, 3 no verdict — read again at the attempt — 4
+/// a refusal, 5 its own restart: `relaunch::ExitRecord::Restarted`, the
+/// word that told it kept, as the shell may draw it no more by the
+/// attempt); `decided` 0 no attempt yet, 1 relaunched, 2 left (told, never
+/// typed); `cont` the relaunch typed its continuation after the line. The
+/// world stands still once decided.
 ///
 /// `TheirsIsLeft`: a graceful way out is never relaunched.
 /// `ARefusalIsNeverRetried`: a refused start is never relaunched.
-/// `NothingRelaunchedOnAGuess`: only a crash is relaunched.
-/// `ACrashReadAtItsExitIsRelaunched`: a crash whose shell drew its word, its
-/// session named and its resume safe, is never left. `NoUniqueWitnessNoRelaunch`:
+/// `NothingRelaunchedOnAGuess`: only a crash, or its own restart, is
+/// relaunched. `ACrashReadAtItsExitIsRelaunched`: a crash whose shell drew
+/// its word — at its exit, or still at the attempt — its session named,
+/// holding a turn and its resume safe, is never left.
+/// `AnOwnRestartIsResumed`: its own restart so read, its session named and
+/// its resume safe, is never left — with no turn too, but for a launch whose
+/// first prompt would be dropped. `ARestartTypesNothingAfter`:
+/// its own restart's relaunch types no continuation.
+/// `ACrashRelaunchedIsContinued`: a crash's relaunch types its continuation
+/// after its line. `NoUniqueWitnessNoRelaunch`:
 /// nothing is relaunched where the start-time rule names no one session.
 /// `NeverIntoAnEmptyCopy`: nothing is relaunched where its resume would load
-/// a copy missing its turns.
+/// a copy missing its turns. `NoTurnResumedButABareRestart`: a session that
+/// took no turn is relaunched only on its own restart of a launch with no
+/// first prompt.
 ///
-/// `Buggy = 1` adds three looks and four attempts, each dead at `Buggy = 0`
+/// `Buggy = 1` adds four looks and eight attempts, each dead at `Buggy = 0`
 /// and caught alone: the exit LOOKED AT AS CLAUDE CODE'S, its own record (its
 /// session file, which every way out leaves) surviving read as a crash
 /// (`LookAsClaude`: `Graceful`, `ShellWord`, `LookAsClaude`, `Decide`
@@ -2637,9 +2660,11 @@ pub fn harness_agy_exit_witness_model() -> Model {
 /// CHILD'S DEATH READ AS A REFUSAL, Muse Code's table (whose `1` is a start
 /// it refused) on Gemini CLI's (whose `1` is its child killed:
 /// `ChildDeathAsRefusal`: `Crash`, `ShellWord`, `ChildDeathAsRefusal`,
-/// `Decide` leaves it — `ACrashReadAtItsExitIsRelaunched`); A NON-UNIQUE
-/// WITNESS TRUSTED, the first header since its start read as its session
-/// whatever came after (`NonUniqueTrusted`: `SecondHeader`, `Crash`,
+/// `Decide` leaves it — `ACrashReadAtItsExitIsRelaunched`); A RESTART READ AS
+/// A REFUSAL, the status alone (`RestartAsRefusal`: `Restart`, `ShellWord`,
+/// `RestartAsRefusal`, `Decide` leaves it — `AnOwnRestartIsResumed`); A
+/// NON-UNIQUE WITNESS TRUSTED, the first header since its start read as its
+/// session whatever came after (`NonUniqueTrusted`: `SecondHeader`, `Crash`,
 /// `ShellWord`, `Look`, `NonUniqueTrusted` — `NoUniqueWitnessNoRelaunch`); A
 /// LATE HEADER TRUSTED, the one header since its start read as its own
 /// however long after it was begun (`LateHeaderTrusted`: `LateHeader`,
@@ -2648,10 +2673,26 @@ pub fn harness_agy_exit_witness_model() -> Model {
 /// `/resume` read only as a file's last record, so the summary after it
 /// hides it (`SwitchHiddenBySummary`: `SwitchedBehindSummary`, `Crash`,
 /// `ShellWord`, `Look`, `SwitchHiddenBySummary` —
-/// `NoUniqueWitnessNoRelaunch`); and THE PRE-CHECK SKIPPED, the resume typed
+/// `NoUniqueWitnessNoRelaunch`); THE PRE-CHECK SKIPPED, the resume typed
 /// whatever it would load (`PrecheckSkipped`: `Duplicate`, `Crash`,
-/// `ShellWord`, `Look`, `PrecheckSkipped` — `NeverIntoAnEmptyCopy`). Tier-1
-/// (aterm-agent `harness/upgrade_gemini_drive_tests.rs`,
+/// `ShellWord`, `Look`, `PrecheckSkipped` — `NeverIntoAnEmptyCopy`); A
+/// TURNLESS RESTART LEFT, the pre-check's no turn read as nothing to resume
+/// for its own bare restart too — the lane before 2026-10-21, which left the
+/// measured folder-trust restart at Gemini CLI's error (`TurnlessRestartLeft`:
+/// `NoTurn`, `Restart`, `ShellWord`, `Look`, `TurnlessRestartLeft` —
+/// `AnOwnRestartIsResumed`); NO TURN RESUMED, a session with no turn resumed
+/// whatever ended it (`TurnlessResumed`: `NoTurn`, `Crash`, `ShellWord`,
+/// `Look`, `TurnlessResumed` — `NoTurnResumedButABareRestart`); A GONE WORD
+/// READ AS A RESTART, the lane of 3a4586a01e: a crash whose word another
+/// block hid by the attempt resumed as its own restart wherever its `42`
+/// would have been one — every worker's `--session-id` launch — quietly,
+/// and with no turn too (`GoneWordReadAsRestart`: `Crash`, `ShellWord`,
+/// `Look`, `Later`, `GoneWordReadAsRestart` — `ACrashRelaunchedIsContinued`;
+/// the review of 3a4586a01e, R2); and A RESTART CONTINUED, its relaunch
+/// typing a crash's continuation into the session a person restarted
+/// (`RestartContinued`: `Restart`, `ShellWord`, `Look`, `RestartContinued` —
+/// `ARestartTypesNothingAfter`). Tier-1 (aterm-agent
+/// `harness/upgrade_gemini_drive_tests.rs`,
 /// `tier1_the_real_gemini_exit_read_conforms_to_the_model`) replays every look
 /// and every attempt of the model through the real `look_at_exit`,
 /// `exit_record` and `after_exit` over a stand-in tab, the blocks and the
@@ -2666,11 +2707,14 @@ pub fn harness_gemini_exit_witness_model() -> Model {
             var exit = 0;
             var rule = 0;
             var dup = 0;
+            var turnless = 0;
+            var prompt = 0;
             var word = 0;
             var later = 0;
             var seen = 0;
             var kept = 0;
             var decided = 0;
+            var cont = 0;
 
             action Crash when (exit == 0) {
                 exit = 1;
@@ -2687,6 +2731,9 @@ pub fn harness_gemini_exit_witness_model() -> Model {
             action ParentKilled when (exit == 0) {
                 exit = 5;
             }
+            action Restart when (exit == 0) {
+                exit = 6;
+            }
             action SecondHeader when (exit == 0 && rule == 0) {
                 rule = 1;
             }
@@ -2699,6 +2746,12 @@ pub fn harness_gemini_exit_witness_model() -> Model {
             action Duplicate when (exit == 0 && dup == 0) {
                 dup = 1;
             }
+            action NoTurn when (exit == 0 && turnless == 0) {
+                turnless = 1;
+            }
+            action Prompted when (exit > 0 && prompt == 0 && seen == 0) {
+                prompt = 1;
+            }
             action ShellWord when (exit > 0 && word == 0 && decided == 0) {
                 word = 1;
             }
@@ -2710,10 +2763,14 @@ pub fn harness_gemini_exit_witness_model() -> Model {
                 kept = if (exit == 1 || exit == 5) {
                     1
                 } else {
-                    if exit == 2 {
-                        2
+                    if (exit == 6 && rule == 0) {
+                        5
                     } else {
-                        if exit == 3 { 4 } else { 3 }
+                        if exit == 2 {
+                            2
+                        } else {
+                            if (exit == 3 || exit == 6) { 4 } else { 3 }
+                        }
                     }
                 };
             }
@@ -2733,67 +2790,111 @@ pub fn harness_gemini_exit_witness_model() -> Model {
                 seen = 1;
                 kept = 4;
             }
+            action RestartAsRefusal when (Buggy == 1 && exit == 6 && seen == 0 && word == 1 && later == 0) {
+                seen = 1;
+                kept = 4;
+            }
             action Decide when (seen == 1 && decided == 0) {
-                decided = if ((kept == 1 || (kept == 3 && word == 1 && later == 0 && (exit == 1 || exit == 5)))
-                    && rule == 0
-                    && dup == 0)
-                {
+                decided = if ((kept == 1 || kept == 5 || (kept == 3 && word == 1 && later == 0 && (exit == 1 || exit == 5 || exit == 6))) && rule == 0 && (dup == 0 || turnless == 1) && (turnless == 0 || (exit == 6 && prompt == 0))) {
                     1
                 } else {
                     2
                 };
+                cont = if ((kept == 1 || kept == 5 || (kept == 3 && word == 1 && later == 0 && (exit == 1 || exit == 5 || exit == 6))) && rule == 0 && (dup == 0 || turnless == 1) && (turnless == 0 || (exit == 6 && prompt == 0)) && exit <= 5) { 1 } else { 0 };
             }
             action NonUniqueTrusted when (Buggy == 1 && seen == 1 && decided == 0 && rule == 1) {
-                decided = if ((kept == 1 || (kept == 3 && word == 1 && later == 0 && (exit == 1 || exit == 5)))
-                    && dup == 0)
-                {
+                decided = if ((kept == 1 || kept == 5 || (kept == 3 && word == 1 && later == 0 && (exit == 1 || exit == 5 || exit == 6))) && (dup == 0 || turnless == 1) && (turnless == 0 || (exit == 6 && prompt == 0))) {
                     1
                 } else {
                     2
                 };
             }
             action LateHeaderTrusted when (Buggy == 1 && seen == 1 && decided == 0 && rule == 2) {
-                decided = if ((kept == 1 || (kept == 3 && word == 1 && later == 0 && (exit == 1 || exit == 5)))
-                    && dup == 0)
-                {
+                decided = if ((kept == 1 || kept == 5 || (kept == 3 && word == 1 && later == 0 && (exit == 1 || exit == 5 || exit == 6))) && (dup == 0 || turnless == 1) && (turnless == 0 || (exit == 6 && prompt == 0))) {
                     1
                 } else {
                     2
                 };
             }
             action SwitchHiddenBySummary when (Buggy == 1 && seen == 1 && decided == 0 && rule == 3) {
-                decided = if ((kept == 1 || (kept == 3 && word == 1 && later == 0 && (exit == 1 || exit == 5)))
-                    && dup == 0)
-                {
+                decided = if ((kept == 1 || kept == 5 || (kept == 3 && word == 1 && later == 0 && (exit == 1 || exit == 5 || exit == 6))) && (dup == 0 || turnless == 1) && (turnless == 0 || (exit == 6 && prompt == 0))) {
                     1
                 } else {
                     2
                 };
             }
             action PrecheckSkipped when (Buggy == 1 && seen == 1 && decided == 0 && dup == 1) {
-                decided = if ((kept == 1 || (kept == 3 && word == 1 && later == 0 && (exit == 1 || exit == 5)))
-                    && rule == 0)
-                {
+                decided = if ((kept == 1 || kept == 5 || (kept == 3 && word == 1 && later == 0 && (exit == 1 || exit == 5 || exit == 6))) && rule == 0 && (turnless == 0 || (exit == 6 && prompt == 0))) {
                     1
                 } else {
                     2
                 };
             }
+            action TurnlessRestartLeft when (Buggy == 1 && seen == 1 && decided == 0 && exit == 6 && turnless == 1) {
+                decided = 2;
+            }
+            action TurnlessResumed when (Buggy == 1 && seen == 1 && decided == 0 && turnless == 1) {
+                decided = if ((kept == 1 || kept == 5 || (kept == 3 && word == 1 && later == 0 && (exit == 1 || exit == 5 || exit == 6))) && rule == 0) {
+                    1
+                } else {
+                    2
+                };
+            }
+            action GoneWordReadAsRestart when (Buggy == 1 && seen == 1 && decided == 0 && kept == 1 && later == 1) {
+                decided = if (rule == 0 && (dup == 0 || turnless == 1) && (turnless == 0 || prompt == 0)) {
+                    1
+                } else {
+                    2
+                };
+                cont = 0;
+            }
+            action RestartContinued when (Buggy == 1 && seen == 1 && decided == 0 && exit == 6) {
+                decided = if ((kept == 1 || kept == 5 || (kept == 3 && word == 1 && later == 0 && (exit == 1 || exit == 5 || exit == 6))) && rule == 0 && (dup == 0 || turnless == 1) && (turnless == 0 || (exit == 6 && prompt == 0))) {
+                    1
+                } else {
+                    2
+                };
+                cont = if ((kept == 1 || kept == 5 || (kept == 3 && word == 1 && later == 0 && (exit == 1 || exit == 5 || exit == 6))) && rule == 0 && (dup == 0 || turnless == 1) && (turnless == 0 || (exit == 6 && prompt == 0))) { 1 } else { 0 };
+            }
 
             invariant TheirsIsLeft: exit <= 1 || exit > 2 || decided == 0 || decided == 2;
             invariant ARefusalIsNeverRetried: exit <= 2 || exit > 3 || decided == 0 || decided == 2;
-            invariant NothingRelaunchedOnAGuess: decided == 0 || decided == 2 || exit == 1 || exit == 5;
+            invariant NothingRelaunchedOnAGuess: decided == 0
+                || decided == 2
+                || exit == 1
+                || exit == 5
+                || exit == 6;
             invariant ACrashReadAtItsExitIsRelaunched: exit == 0
                 || exit == 2
                 || exit == 3
                 || exit == 4
-                || word == 0
-                || later == 1
+                || exit == 6
+                || ((kept <= 0 || kept > 1) && (word == 0 || later == 1))
                 || rule > 0
                 || dup == 1
+                || turnless == 1
                 || decided <= 1;
+            invariant AnOwnRestartIsResumed: exit <= 5
+                || ((kept <= 4 || kept > 5) && (word == 0 || later == 1))
+                || rule > 0
+                || (dup == 1 && turnless == 0)
+                || (turnless == 1 && prompt == 1)
+                || decided <= 1;
+            invariant ARestartTypesNothingAfter: exit <= 5 || cont == 0;
+            invariant ACrashRelaunchedIsContinued: exit == 0
+                || exit == 2
+                || exit == 3
+                || exit == 4
+                || exit == 6
+                || decided == 0
+                || decided == 2
+                || cont == 1;
             invariant NoUniqueWitnessNoRelaunch: rule == 0 || decided == 0 || decided == 2;
-            invariant NeverIntoAnEmptyCopy: dup == 0 || decided == 0 || decided == 2;
+            invariant NeverIntoAnEmptyCopy: dup == 0 || turnless == 1 || decided == 0 || decided == 2;
+            invariant NoTurnResumedButABareRestart: turnless == 0
+                || decided == 0
+                || decided == 2
+                || (exit == 6 && prompt == 0);
         }
     }
 }

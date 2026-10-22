@@ -96,6 +96,7 @@ bitflags! {
 impl TermMode {
     /// Build a `TermMode` from the keyboard-relevant state only: `APP_CURSOR`, `APP_KEYPAD`,
     /// `VT52_MODE`, the five kitty flags and the three xterm flags.
+    #[inline]
     #[must_use]
     pub fn from_keyboard_state(
         app_cursor: bool,
@@ -145,6 +146,7 @@ impl TermMode {
     }
 
     /// Project the keyboard-relevant flags into the encoder-facing `KeyboardMode`.
+    #[inline]
     #[must_use]
     pub fn to_keyboard_mode(self) -> super::KeyboardMode {
         use super::KeyboardMode;

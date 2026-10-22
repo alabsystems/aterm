@@ -90,6 +90,7 @@ impl Utf8Prefix {
     };
 
     /// The bytes held, lead first.
+    #[inline]
     pub(crate) fn as_slice(&self) -> &[u8] {
         self.bytes.get(..usize::from(self.len)).unwrap_or(&[])
     }
@@ -161,11 +162,14 @@ impl Utf8Prefix {
     }
 
     /// The length of the sequence the prefix begins, or `0` for none.
-    pub(crate) fn expected(self) -> u8 {
+    #[inline]
+    pub(crate) const fn expected(self) -> u8 {
         if self.len == 0 {
             0
+        } else if let Some(len) = utf8_sequence_len(self.bytes[0]) {
+            len
         } else {
-            utf8_sequence_len(self.bytes[0]).unwrap_or(0)
+            0
         }
     }
 }

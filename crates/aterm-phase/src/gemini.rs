@@ -199,6 +199,14 @@
 //! Google answers a key that is no key (`API_KEY_INVALID`), are
 //! [`WallKind::Auth`]; any other is [`WallKind::ApiError`] by the status it
 //! carries. Neither 401 nor 400 is retried, and neither draws a dialog.
+//! What a turn ended on is read above Gemini CLI's own notices about the
+//! folder's trust ([`trust_notices_above`]): `⚠  Note: This folder is still
+//! trusted because …`, `ℹ This folder is untrusted, … will not be applied
+//! for this folder.` with its `/permissions` row, and `ℹ Skipping project
+//! agents due to untrusted folder. …` are drawn when a session starts (or
+//! its trust level changes), under the reply it resumed: chrome, not a
+//! reply that cut the turn's last words (measured on a worker aterm
+//! resumed after its own restart: [`fixtures::LAB_RESUMED_TRUST_NOTICES`]).
 //!
 //! **LEAVING.** `/quit` draws a farewell box (`Agent powering down.
 //! Goodbye!`, the session's stats, `To resume this session: gemini --resume
@@ -485,7 +493,12 @@ pub const PASTE_FOLD_UNITS: usize = 500;
 /// 538-character relaunch continuation drawn ` > [Pasted Text: 538 chars]`,
 /// the cursor past it ([`fixtures::FOLDED_PASTE`]). A second chip of the same
 /// text in one draft gains ` #2`; the harness types into an empty composer
-/// only. `None`: the composer draws the text itself.
+/// only. `None`: the composer draws the text itself. A RAW WRITE IS NO
+/// PASTE: bytes sent without the paste brackets (the fenced write's raw
+/// `send`) reach the composer key by key and are drawn as typed words
+/// whatever their length — MEASURED: 600 and 1600 characters of one line,
+/// no chip ([`fixtures::LAB_RAW_SEND_600`], [`fixtures::LAB_RAW_SEND_1600`]),
+/// as the bundle reads a chip only off a paste event.
 #[must_use]
 pub fn folded_paste(text: &str) -> Option<String> {
     let text = text.replace("\r\n", "\n").replace('\r', "\n");
@@ -588,7 +601,55 @@ fn ended_on(rows: &[String]) -> Option<(usize, usize)> {
     if status_of(rows, f) == Status::Spinner {
         return None;
     }
-    Some((last_user(rows, end).map_or(0, |u| u + 1), end))
+    let from = last_user(rows, end).map_or(0, |u| u + 1);
+    Some((from, trust_notices_above(rows, from, end)))
+}
+
+/// The first words of Gemini CLI's notices about the folder's trust (bundle:
+/// the trust level's `Note: This folder is still trusted because …` warning,
+/// the startup's untrusted-folder info, the agent loader's feedback).
+const TRUST_NOTICES: [&str; 3] = [
+    anchor_text("gemini.notice.still_trusted"),
+    anchor_text("gemini.notice.untrusted"),
+    anchor_text("gemini.notice.agents_skipped"),
+];
+
+/// THE END OF WHAT A TURN ENDED ON, above Gemini CLI's trust notices (module
+/// header): walking up from row `end` (the status row) to row `from`, each
+/// block of rows that is one notice — a `⚠ ` or `ℹ ` head in column 0 whose
+/// words, with the rows it wrapped onto two columns in, begin with one of
+/// [`TRUST_NOTICES`] — and the blank rows around it are left out. Any other
+/// row stops the walk: a cancel, an error and every other notice are still
+/// what the turn ended on.
+fn trust_notices_above(rows: &[String], from: usize, end: usize) -> usize {
+    let mut end = end;
+    loop {
+        let Some(last) = (from..end).rev().find(|&i| !blank(&rows[i])) else {
+            return end;
+        };
+        let mut head = last;
+        while head > from && !blank(&rows[head - 1]) {
+            head -= 1;
+        }
+        let Some(said) = rows[head]
+            .strip_prefix("⚠ ")
+            .or_else(|| rows[head].strip_prefix("ℹ "))
+        else {
+            return end;
+        };
+        if rows[head + 1..=last].iter().any(|r| leading_spaces(r) < 2) {
+            return end;
+        }
+        let words = std::iter::once(said)
+            .chain(rows[head + 1..=last].iter().map(String::as_str))
+            .map(crate::text::trim)
+            .collect::<Vec<_>>()
+            .join(" ");
+        if !TRUST_NOTICES.iter().any(|n| words.starts_with(n)) {
+            return end;
+        }
+        end = head;
+    }
 }
 
 /// Gemini CLI's logo row naming its build: `Gemini CLI v0.46.0`.
@@ -1601,6 +1662,16 @@ pub mod fixtures {
     /// Ctrl+O to expand pasted text` on the status row (the forever lab's
     /// relaunched worker, 2026-10-21).
     pub const FOLDED_PASTE: &str = include_str!("fixtures/gemini-0.46.0-folded-paste.txt");
+    /// A raw `send` of 600 characters of one line (`[lab raw send] this is a
+    /// long raw write …` repeated), unsent: drawn as words wrapped over five
+    /// rows of the composer, no chip ([`super::folded_paste`]).
+    pub const LAB_RAW_SEND_600: &str = include_str!("fixtures/gemini-0.46.0-lab-raw-send-600.txt");
+    /// A raw `send` of 1600 characters of the same line, unsent: drawn as
+    /// words over the composer's ten rows, its first rows scrolled inside
+    /// the composer, no chip ([`super::folded_paste`]; the lab's idle
+    /// manager tab, 2026-10-22).
+    pub const LAB_RAW_SEND_1600: &str =
+        include_str!("fixtures/gemini-0.46.0-lab-raw-send-1600.txt");
     /// A fresh composer with a `GEMINI.md` loaded: `1 GEMINI.md file` on the
     /// approval mode's row.
     pub const IDLE_CONTEXT: &str = include_str!("fixtures/gemini-0.46.0-idle-context.txt");
@@ -1620,6 +1691,13 @@ pub mod fixtures {
     /// Which do you prefer (1 or 2)?`.
     pub const REPLY_WRAPPED_50: &str =
         include_str!("fixtures/gemini-0.46.0-lab-reply-wrapped-50col.txt");
+    /// A worker aterm relaunched on its session after its own restart (the
+    /// harness tape's whole read): its defense `✦ Nothing left: …`, then
+    /// Gemini CLI's trust notices — `⚠  Note: This folder is still trusted
+    /// because a parent folder is trusted.` and `ℹ This folder is untrusted,
+    /// …` with its `/permissions` row — above the status row.
+    pub const LAB_RESUMED_TRUST_NOTICES: &str =
+        include_str!("fixtures/gemini-0.46.0-lab-resumed-trust-notices.txt");
     /// A turn thinking: the spinner on the status row, the thought's subject.
     pub const BUSY_THINKING: &str = include_str!("fixtures/gemini-0.46.0-busy-thinking.txt");
     /// The same turn streaming its reply under `Thinking...`.

@@ -98,6 +98,7 @@ pub enum OriginTag {
 impl OriginTag {
     /// Numeric rank used by [`Self::dominates`]. Lower number = more trusted.
     #[must_use]
+    #[inline]
     pub const fn trust_rank(self) -> u8 {
         match self {
             Self::Host => 0,
@@ -122,6 +123,7 @@ impl OriginTag {
     ///         return rule.response
     /// ```
     #[must_use]
+    #[inline]
     pub const fn dominates(self, required: OriginTag) -> bool {
         self.trust_rank() <= required.trust_rank()
     }
@@ -154,6 +156,7 @@ pub enum Profile {
 impl Profile {
     /// Return the canonical PascalCase profile name (`"Permissive"`, `"Standard"`, `"Hardened"`).
     #[must_use]
+    #[inline]
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Permissive => "Permissive",
@@ -164,6 +167,7 @@ impl Profile {
 
     /// Return the numeric strictness rank (`0 = Permissive`, `1 = Standard`, `2 = Hardened`).
     #[must_use]
+    #[inline]
     pub const fn strictness_rank(self) -> u8 {
         match self {
             Self::Permissive => 0,
@@ -174,6 +178,7 @@ impl Profile {
 
     /// Return `true` when `self` is at least as strict as `other`.
     #[must_use]
+    #[inline]
     pub const fn is_at_least_as_strict_as(self, other: Self) -> bool {
         self.strictness_rank() >= other.strictness_rank()
     }
@@ -208,6 +213,7 @@ pub enum Response {
 impl Response {
     /// Return the canonical snake_case response name.
     #[must_use]
+    #[inline]
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Drop => "drop",
@@ -220,12 +226,14 @@ impl Response {
 
     /// Return `true` when this response immediately permits execution (`Execute` or `Rewrite`).
     #[must_use]
+    #[inline]
     pub const fn allows_execution(self) -> bool {
         matches!(self, Self::Execute | Self::Rewrite)
     }
 
     /// Return `true` when this response drops the sequence (`Drop` or `Warn`).
     #[must_use]
+    #[inline]
     pub const fn is_drop(self) -> bool {
         matches!(self, Self::Drop | Self::Warn)
     }
@@ -315,6 +323,7 @@ impl RateLimit {
     /// Encode rate-limit numeric parameters (`capacity_bytes`, `refill_per_second`,
     /// `per_sequence_max`, `schema_version`) into 16 little-endian bytes.
     #[must_use]
+    #[inline]
     pub const fn encode_params_le(
         capacity_bytes: u32,
         refill_per_second: u32,
@@ -343,6 +352,7 @@ impl RateLimit {
 
     /// Decode 16 little-endian bytes into rate-limit numeric parameters.
     #[must_use]
+    #[inline]
     pub const fn decode_params_le(bytes: [u8; 16]) -> (u32, u32, u32, u32) {
         let cap = (bytes[0] as u32)
             | ((bytes[1] as u32) << 8)
@@ -400,6 +410,7 @@ impl Policy {
     ///
     /// Returns [`aterm_toml::ser::Error`] if the policy contains a shape the TOML
     /// serializer cannot represent. No built-in profile does.
+    #[inline]
     pub fn to_toml(&self) -> Result<String, aterm_toml::ser::Error> {
         aterm_toml::to_string(self)
     }

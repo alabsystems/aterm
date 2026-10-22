@@ -60,6 +60,7 @@ fn unique_name(prefix: &str) -> String {
 ///
 /// The `_` arm is unreachable for masked inputs; it exists so the function
 /// is total (no panic path) under verification.
+#[inline]
 #[must_use]
 pub const fn hex_digit(nibble: u64) -> char {
     match nibble {
@@ -83,6 +84,7 @@ pub const fn hex_digit(nibble: u64) -> char {
 }
 
 /// Encode a temporary directory seed (`rand_u64`, `pid`, `counter`) into 16 LE bytes.
+#[inline]
 #[must_use]
 pub const fn encode_temp_seed_le(rand_u64: u64, pid: u32, counter: u32) -> [u8; 16] {
     [
@@ -106,6 +108,7 @@ pub const fn encode_temp_seed_le(rand_u64: u64, pid: u32, counter: u32) -> [u8; 
 }
 
 /// Decode 16 LE bytes into a temporary directory seed (`rand_u64`, `pid`, `counter`).
+#[inline]
 #[must_use]
 pub const fn decode_temp_seed_le(bytes: [u8; 16]) -> (u64, u32, u32) {
     let rand_u64 = (bytes[0] as u64)
@@ -347,6 +350,7 @@ impl TempDir {
     }
 
     /// The directory's path.
+    #[inline]
     #[must_use]
     pub fn path(&self) -> &Path {
         &self.path
@@ -354,6 +358,7 @@ impl TempDir {
 
     /// Keep the directory and its contents after this guard is consumed. The caller
     /// takes responsibility for removing the returned path.
+    #[inline]
     #[must_use]
     pub fn keep(mut self) -> PathBuf {
         std::mem::take(&mut self.path)
@@ -373,6 +378,7 @@ impl Drop for TempDir {
 }
 
 impl AsRef<Path> for TempDir {
+    #[inline]
     fn as_ref(&self) -> &Path {
         &self.path
     }
@@ -386,9 +392,10 @@ pub struct Builder {
 
 impl Builder {
     /// Create a new builder with default options.
+    #[inline]
     #[must_use]
-    pub fn new() -> Self {
-        Self::default()
+    pub const fn new() -> Self {
+        Self { prefix: None }
     }
 
     /// Set the prefix for the temporary name. Path separators and Windows
@@ -406,6 +413,7 @@ impl Builder {
     ///
     /// A native `match` rather than `as_deref().unwrap_or(".tmp")`, whose std
     /// bodies the verifier's lowered bundle lacks.
+    #[inline]
     fn prefix_str(&self) -> &str {
         match &self.prefix {
             Some(p) => p.as_str(),

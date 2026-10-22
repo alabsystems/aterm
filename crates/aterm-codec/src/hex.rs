@@ -37,6 +37,7 @@ pub(crate) const fn digit_lower(n: u8) -> char {
 }
 
 /// Uppercase hex digit for a nibble, as [`digit_lower`].
+#[inline]
 const fn digit_upper(n: u8) -> char {
     match n & 0x0f {
         0 => '0',
@@ -71,6 +72,7 @@ pub fn push_lower(out: &mut String, bytes: &[u8]) {
 
 /// The lowercase hex spelling of `bytes` (`2 * bytes.len()` characters).
 #[must_use]
+#[inline]
 pub fn encode_lower(bytes: &[u8]) -> String {
     // The capacity is a hint only; `saturating_mul` keeps it overflow-free.
     let mut out = String::with_capacity(bytes.len().saturating_mul(2));
@@ -80,6 +82,7 @@ pub fn encode_lower(bytes: &[u8]) -> String {
 
 /// The uppercase hex spelling of `bytes`: byte-identical to `{b:02X}` per byte.
 #[must_use]
+#[inline]
 pub fn encode_upper(bytes: &[u8]) -> String {
     let mut out = String::with_capacity(bytes.len().saturating_mul(2));
     for &b in bytes {
@@ -92,6 +95,7 @@ pub fn encode_upper(bytes: &[u8]) -> String {
 /// The value (`0..=15`) of one ASCII hex digit of either case, or `None`. Same
 /// as `char::to_digit(16)`, with provably underflow-free arithmetic.
 #[must_use]
+#[inline]
 pub const fn nibble(c: u8) -> Option<u8> {
     match c {
         b'0'..=b'9' => Some(c - b'0'),
@@ -102,6 +106,7 @@ pub const fn nibble(c: u8) -> Option<u8> {
 }
 
 /// The byte two hex digits spell, high digit first.
+#[inline]
 const fn byte(hi: u8, lo: u8) -> Option<u8> {
     match (nibble(hi), nibble(lo)) {
         // Masks are no-ops; shift-or equals `* 16 +` without an overflow
@@ -116,6 +121,7 @@ const fn byte(hi: u8, lo: u8) -> Option<u8> {
 /// `false` for any other length or any non-hex digit; `out` may then hold a
 /// partial decode, so a caller discards it.
 #[must_use]
+#[inline]
 pub fn decode_into(text: &[u8], out: &mut [u8]) -> bool {
     // `out.len() * 2` written overflow-free: a real slice can never be long
     // enough to overflow, so `checked_mul` is behavior-identical.
@@ -134,6 +140,7 @@ pub fn decode_into(text: &[u8], out: &mut [u8]) -> bool {
 /// Decode an even number of hex digits of either case: `None` for an odd
 /// length or a non-hex digit, `Some(empty)` for empty input.
 #[must_use]
+#[inline]
 pub fn decode_vec(text: &[u8]) -> Option<Vec<u8>> {
     let (pairs, rest) = text.as_chunks::<2>();
     if !rest.is_empty() {
@@ -148,6 +155,7 @@ pub fn decode_vec(text: &[u8]) -> Option<Vec<u8>> {
 
 /// Whether `text` is exactly `len` lowercase hex digits (`0-9a-f`).
 #[must_use]
+#[inline]
 pub fn is_lower(text: &str, len: usize) -> bool {
     if text.len() != len {
         return false;
@@ -162,6 +170,7 @@ pub fn is_lower(text: &str, len: usize) -> bool {
 
 /// Whether `text` is exactly `len` hex digits of either case.
 #[must_use]
+#[inline]
 pub fn is_hex(text: &str, len: usize) -> bool {
     if text.len() != len {
         return false;

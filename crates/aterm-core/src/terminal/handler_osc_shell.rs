@@ -27,6 +27,7 @@ const MAX_START_ROOTS: usize = 32;
 
 impl TerminalHandler<'_> {
     /// Parse shell integration OSC params into (command_char, absolute_row, col).
+    #[inline]
     fn parse_shell_osc(&self, params: &[&[u8]]) -> Option<(char, u64, u16)> {
         let code = params.get(1).and_then(|p| std::str::from_utf8(p).ok())?;
         let cmd = code.chars().next()?;
@@ -154,6 +155,7 @@ impl TerminalHandler<'_> {
     }
 
     /// Parse exit code from OSC params (used by both 133 D and 633 D).
+    #[inline]
     fn parse_exit_code(params: &[&[u8]]) -> i32 {
         params
             .get(2)
@@ -289,6 +291,7 @@ impl TerminalHandler<'_> {
     /// (others are dropped and counted); an attached policy engine's Deny drops it
     /// first. With the bit clear (default) every mark passes. Returns whether to
     /// dispatch.
+    #[inline]
     fn shell_nonce_gate_ok(&mut self, command: u32, params: &[&[u8]]) -> bool {
         if !self.modes.require_shell_integration_nonce {
             return true;
@@ -486,6 +489,7 @@ impl TerminalHandler<'_> {
     /// (`status integration_rev=`). Recorded only under the nonce gate, so the
     /// value is the shell's word, not a program's output; anything but 16
     /// lowercase hex digits (a script folder's address) is ignored.
+    #[inline]
     fn record_integration_rev(&mut self, value: &str) {
         if !self.modes.require_shell_integration_nonce
             || !crate::shell_integration::is_integration_rev(value)

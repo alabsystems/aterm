@@ -42,6 +42,7 @@ pub struct XtermKeyboardState {
 
 impl XtermKeyboardState {
     /// Create a new default state.
+    #[inline]
     #[must_use]
     pub const fn new() -> Self {
         Self {
@@ -53,12 +54,14 @@ impl XtermKeyboardState {
     /// Get the modifyOtherKeys value.
     ///
     /// Returns `None` if disabled, or `Some(level)` where level is 0-2.
+    #[inline]
     #[must_use]
     pub const fn modify_other_keys(&self) -> Option<u8> {
         self.modify_other_keys
     }
 
     /// Get the formatOtherKeys value.
+    #[inline]
     #[must_use]
     pub const fn format_other_keys(&self) -> u8 {
         self.format_other_keys
@@ -67,6 +70,7 @@ impl XtermKeyboardState {
     /// Set modifyOtherKeys value (XTMODKEYS: CSI > 4 ; Pv m).
     ///
     /// Values are clamped to 0-2 per xterm spec.
+    #[inline]
     pub fn set_modify_other_keys(&mut self, value: u8) {
         self.modify_other_keys = Some(value.min(2));
     }
@@ -74,6 +78,7 @@ impl XtermKeyboardState {
     /// Reset modifyOtherKeys to default (XTMODKEYS: CSI > 4 m).
     ///
     /// Sets the value to 0 (no modification) but keeps it enabled.
+    #[inline]
     pub fn reset_modify_other_keys(&mut self) {
         self.modify_other_keys = Some(0);
     }
@@ -81,6 +86,7 @@ impl XtermKeyboardState {
     /// Disable modifyOtherKeys (XTMODKEYS: CSI > 4 n).
     ///
     /// Corresponds to xterm resource value -1.
+    #[inline]
     pub fn disable_modify_other_keys(&mut self) {
         self.modify_other_keys = None;
     }
@@ -88,16 +94,19 @@ impl XtermKeyboardState {
     /// Set formatOtherKeys value (XTFMTKEYS: CSI > 4 ; Pv f).
     ///
     /// Values are clamped to 0-1 per xterm spec.
+    #[inline]
     pub fn set_format_other_keys(&mut self, value: u8) {
         self.format_other_keys = value.min(1);
     }
 
     /// Reset formatOtherKeys to default (XTFMTKEYS: CSI > 4 f).
+    #[inline]
     pub fn reset_format_other_keys(&mut self) {
         self.format_other_keys = 0;
     }
 
     /// Reset all xterm keyboard state to defaults.
+    #[inline]
     pub fn reset(&mut self) {
         self.modify_other_keys = Some(0);
         self.format_other_keys = 0;

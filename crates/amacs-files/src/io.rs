@@ -90,7 +90,9 @@ impl JournalSecret {
         (bytes != [0; JOURNAL_SECRET_LEN]).then_some(Self(bytes))
     }
 
-    pub fn as_bytes(&self) -> &[u8; JOURNAL_SECRET_LEN] {
+    #[inline]
+    #[must_use]
+    pub const fn as_bytes(&self) -> &[u8; JOURNAL_SECRET_LEN] {
         &self.0
     }
 }
@@ -155,6 +157,8 @@ impl DiskEncoding {
     };
 
     /// Whether a save writes the text's bytes unchanged.
+    #[inline]
+    #[must_use]
     pub const fn is_plain(self) -> bool {
         !self.bom && matches!(self.eol, LineEnding::Lf)
     }

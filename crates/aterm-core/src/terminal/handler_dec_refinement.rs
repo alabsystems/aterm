@@ -16,6 +16,7 @@ impl TerminalHandler<'_> {
             project = "aterm_core::terminal::terminal_modes_conformance::project_modes"
         )
     )]
+    #[inline]
     fn enable_application_cursor_keys(&mut self) {
         self.modes.application_cursor_keys = true;
     }
@@ -28,6 +29,7 @@ impl TerminalHandler<'_> {
             project = "aterm_core::terminal::terminal_modes_conformance::project_modes"
         )
     )]
+    #[inline]
     fn disable_application_cursor_keys(&mut self) {
         self.modes.application_cursor_keys = false;
     }
@@ -40,6 +42,7 @@ impl TerminalHandler<'_> {
             project = "aterm_core::terminal::terminal_modes_conformance::project_modes"
         )
     )]
+    #[inline]
     fn enable_origin_mode(&mut self) {
         self.modes.origin_mode = true;
         let region = self.grid.scroll_region();
@@ -59,6 +62,7 @@ impl TerminalHandler<'_> {
             project = "aterm_core::terminal::terminal_modes_conformance::project_modes"
         )
     )]
+    #[inline]
     fn disable_origin_mode(&mut self) {
         self.modes.origin_mode = false;
         self.grid.set_cursor(0, 0);
@@ -72,6 +76,7 @@ impl TerminalHandler<'_> {
             project = "aterm_core::terminal::terminal_modes_conformance::project_modes"
         )
     )]
+    #[inline]
     fn enable_auto_wrap(&mut self) {
         self.modes.auto_wrap = true;
         // pending_wrap is untouched: xterm srm_DECAWM only flips the flag (charproc.c). A
@@ -87,6 +92,7 @@ impl TerminalHandler<'_> {
             project = "aterm_core::terminal::terminal_modes_conformance::project_modes"
         )
     )]
+    #[inline]
     fn disable_auto_wrap(&mut self) {
         self.modes.auto_wrap = false;
         // pending_wrap is untouched (see enable_auto_wrap): with DECAWM off the next print
@@ -101,6 +107,7 @@ impl TerminalHandler<'_> {
             project = "aterm_core::terminal::terminal_modes_conformance::project_modes"
         )
     )]
+    #[inline]
     fn show_cursor(&mut self) {
         if !self.modes.cursor_visible {
             self.modes.cursor_visible = true;
@@ -119,6 +126,7 @@ impl TerminalHandler<'_> {
             project = "aterm_core::terminal::terminal_modes_conformance::project_modes"
         )
     )]
+    #[inline]
     fn hide_cursor(&mut self) {
         if self.modes.cursor_visible {
             self.modes.cursor_visible = false;
@@ -135,6 +143,7 @@ impl TerminalHandler<'_> {
             project = "aterm_core::terminal::terminal_modes_conformance::project_modes"
         )
     )]
+    #[inline]
     fn enable_focus_reporting(&mut self) {
         self.modes.focus_reporting = true;
     }
@@ -147,6 +156,7 @@ impl TerminalHandler<'_> {
             project = "aterm_core::terminal::terminal_modes_conformance::project_modes"
         )
     )]
+    #[inline]
     fn disable_focus_reporting(&mut self) {
         self.modes.focus_reporting = false;
     }
@@ -161,6 +171,7 @@ impl TerminalHandler<'_> {
             project = "aterm_core::terminal::terminal_modes_conformance::project_modes"
         )
     )]
+    #[inline]
     fn enable_utf8_mouse_encoding(&mut self) {
         self.modes.mouse_encoding = MouseEncoding::Utf8;
     }
@@ -171,6 +182,7 @@ impl TerminalHandler<'_> {
             reason = "clears only its own UTF-8 encoding; the SGR 1006 fact the model tracks is unchanged"
         )
     )]
+    #[inline]
     fn disable_utf8_mouse_encoding(&mut self) {
         if self.modes.mouse_encoding == MouseEncoding::Utf8 {
             self.modes.mouse_encoding = MouseEncoding::X10;
@@ -186,6 +198,7 @@ impl TerminalHandler<'_> {
             project = "aterm_core::terminal::terminal_modes_conformance::project_modes"
         )
     )]
+    #[inline]
     fn enable_urxvt_mouse_encoding(&mut self) {
         self.modes.mouse_encoding = MouseEncoding::Urxvt;
     }
@@ -196,6 +209,7 @@ impl TerminalHandler<'_> {
             reason = "clears only its own URXVT encoding; the SGR 1006 fact the model tracks is unchanged"
         )
     )]
+    #[inline]
     fn disable_urxvt_mouse_encoding(&mut self) {
         if self.modes.mouse_encoding == MouseEncoding::Urxvt {
             self.modes.mouse_encoding = MouseEncoding::X10;
@@ -211,6 +225,7 @@ impl TerminalHandler<'_> {
             project = "aterm_core::terminal::terminal_modes_conformance::project_modes"
         )
     )]
+    #[inline]
     fn enable_sgr_pixel_mouse_encoding(&mut self) {
         self.modes.mouse_encoding = MouseEncoding::SgrPixel;
     }
@@ -221,6 +236,7 @@ impl TerminalHandler<'_> {
             reason = "clears only its own SGR pixel encoding; the SGR 1006 fact the model tracks is unchanged"
         )
     )]
+    #[inline]
     fn disable_sgr_pixel_mouse_encoding(&mut self) {
         if self.modes.mouse_encoding == MouseEncoding::SgrPixel {
             self.modes.mouse_encoding = MouseEncoding::X10;
@@ -290,6 +306,7 @@ impl TerminalHandler<'_> {
             project = "aterm_core::terminal::terminal_modes_conformance::project_modes"
         )
     )]
+    #[inline]
     fn enable_insert_mode(&mut self) {
         self.modes.insert_mode = true;
     }
@@ -302,6 +319,7 @@ impl TerminalHandler<'_> {
             project = "aterm_core::terminal::terminal_modes_conformance::project_modes"
         )
     )]
+    #[inline]
     fn disable_insert_mode(&mut self) {
         self.modes.insert_mode = false;
     }
@@ -314,6 +332,7 @@ impl TerminalHandler<'_> {
             project = "aterm_core::terminal::terminal_modes_conformance::project_modes"
         )
     )]
+    #[inline]
     fn enable_new_line_mode(&mut self) {
         self.modes.new_line_mode = true;
     }
@@ -326,6 +345,7 @@ impl TerminalHandler<'_> {
             project = "aterm_core::terminal::terminal_modes_conformance::project_modes"
         )
     )]
+    #[inline]
     fn disable_new_line_mode(&mut self) {
         self.modes.new_line_mode = false;
     }
@@ -338,6 +358,7 @@ impl TerminalHandler<'_> {
             reason = "the TerminalModes model does not model VT52 compatibility (DECANM mode 2)"
         )
     )]
+    #[inline]
     pub(super) fn set_vt52_mode(&mut self, enabled: bool) {
         // Leaving VT52 (ESC <) resets the character sets (VT220), so G0 line drawing from
         // VT52 graphics mode (ESC F) does not persist into ANSI mode.
@@ -381,6 +402,7 @@ impl TerminalHandler<'_> {
             reason = "the TerminalModes model does not model reverse video (DECSCNM mode 5)"
         )
     )]
+    #[inline]
     fn set_reverse_video(&mut self, enabled: bool) {
         // Unchanged: no full-screen redraw.
         if self.modes.reverse_video == enabled {
@@ -409,6 +431,7 @@ impl TerminalHandler<'_> {
             project = "aterm_core::terminal::terminal_modes_conformance::project_modes"
         )
     )]
+    #[inline]
     fn set_cursor_blink(&mut self, enabled: bool) {
         // Mode 12 is the blink bit of `cursor_style`, not a second flag beside it: the
         // renderer blinks from `cursor_style` alone, so moving only `modes.cursor_blink` would
@@ -430,6 +453,7 @@ impl TerminalHandler<'_> {
             reason = "the TerminalModes model does not model reverse wraparound (DECSET 45)"
         )
     )]
+    #[inline]
     fn set_reverse_wraparound(&mut self, enabled: bool) {
         self.modes.reverse_wraparound = enabled;
     }
@@ -440,6 +464,7 @@ impl TerminalHandler<'_> {
             reason = "the TerminalModes model does not model left/right margin mode (DECLRMM mode 69)"
         )
     )]
+    #[inline]
     fn set_left_right_margin_mode(&mut self, enabled: bool) {
         self.modes.left_right_margin_mode = enabled;
         if !enabled {
@@ -453,6 +478,7 @@ impl TerminalHandler<'_> {
             reason = "the TerminalModes model does not model DECSDM (Sixel Display Mode, mode 80)"
         )
     )]
+    #[inline]
     fn set_sixel_display_mode(&mut self, enabled: bool) {
         self.modes.sixel_display_mode = enabled;
     }
@@ -463,6 +489,7 @@ impl TerminalHandler<'_> {
             reason = "the TerminalModes model does not model alternate scroll (DECSET 1007)"
         )
     )]
+    #[inline]
     fn set_alternate_scroll(&mut self, enabled: bool) {
         self.modes.alternate_scroll = enabled;
     }
@@ -473,6 +500,7 @@ impl TerminalHandler<'_> {
             reason = "the TerminalModes model does not model application keypad (DECKPAM/DECKPNM)"
         )
     )]
+    #[inline]
     pub(super) fn set_application_keypad(&mut self, enabled: bool) {
         self.modes.application_keypad = enabled;
     }
@@ -486,6 +514,7 @@ impl TerminalHandler<'_> {
             reason = "the TerminalModes model does not model BiDi arrow swap (DECSET 1243)"
         )
     )]
+    #[inline]
     fn set_bidi_arrow_swap(&mut self, enabled: bool) {
         self.modes.bidi_arrow_swap = enabled;
     }
@@ -496,6 +525,7 @@ impl TerminalHandler<'_> {
             reason = "the TerminalModes model does not model BiDi box mirroring (DECSET 2500)"
         )
     )]
+    #[inline]
     fn set_bidi_box_mirroring(&mut self, enabled: bool) {
         if self.modes.bidi_box_mirroring != enabled {
             self.modes.bidi_box_mirroring = enabled;
@@ -510,6 +540,7 @@ impl TerminalHandler<'_> {
             reason = "the TerminalModes model does not model BiDi autodetection (DECSET 2501)"
         )
     )]
+    #[inline]
     fn set_bidi_autodetection(&mut self, enabled: bool) {
         if self.modes.bidi_autodetection != enabled {
             self.modes.bidi_autodetection = enabled;
@@ -525,6 +556,7 @@ impl TerminalHandler<'_> {
             reason = "the TerminalModes model does not model BDSM (ANSI mode 8, Bidirectional Support Mode)"
         )
     )]
+    #[inline]
     fn set_bidi_support_mode(&mut self, set: bool) {
         use crate::config::BiDiMode;
         let new_mode = if set {
@@ -543,6 +575,7 @@ impl TerminalHandler<'_> {
     /// The current state of a DEC private mode, for XTSAVE/XTRESTORE. It must cover every mode
     /// `handle_decrqm` reports, or `CSI ? Ps s`/`r` is a silent no-op answering like a working
     /// one; `xtsave_covers_every_mode_decrqm_reports` walks the pair.
+    #[inline]
     pub(super) fn query_dec_mode(&self, mode: u16) -> Option<bool> {
         Some(match mode {
             1 => self.modes.application_cursor_keys,

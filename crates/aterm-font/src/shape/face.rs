@@ -61,6 +61,8 @@ pub struct ShapeFace<'a> {
 
 impl<'a> ShapeFace<'a> {
     /// Wraps `face`, at whatever variation instance it was given.
+    #[inline]
+    #[must_use]
     pub fn new(face: Face<'a>) -> Self {
         let cmap_subtable = find_best_cmap_subtable(&face);
         ShapeFace {
@@ -71,21 +73,27 @@ impl<'a> ShapeFace<'a> {
     }
 
     /// Parses face `index` of `data` and wraps it at its default instance.
+    #[inline]
+    #[must_use]
     pub fn from_slice(data: &'a [u8], index: u32) -> Option<Self> {
         Face::parse(data, index).ok().map(Self::new)
     }
 
     /// The face read.
-    pub fn face(&self) -> &Face<'a> {
+    #[inline]
+    #[must_use]
+    pub const fn face(&self) -> &Face<'a> {
         &self.face
     }
 
-    pub(crate) fn gsub(&self) -> Option<&LayoutTable<'a>> {
+    #[inline]
+    pub(crate) const fn gsub(&self) -> Option<&LayoutTable<'a>> {
         self.face.tables().gsub.as_ref()
     }
 
     /// Lookup `index`; `None` when it does not parse, and for every lookup
     /// when the face's `GSUB` is refused.
+    #[inline]
     pub(crate) fn gsub_lookup(&self, index: LookupIndex) -> Option<&SubstLookup<'a>> {
         self.gsub_lookups()?.get(usize::from(index))?.as_ref()
     }
@@ -118,11 +126,13 @@ impl<'a> ShapeFace<'a> {
             .as_deref()
     }
 
+    #[inline]
     pub(crate) fn has_glyph(&self, c: u32) -> bool {
         self.get_nominal_glyph(c).is_some()
     }
 
     /// The glyph `c` maps to through the preferred `cmap` subtable.
+    #[inline]
     pub(crate) fn get_nominal_glyph(&self, mut c: u32) -> Option<GlyphId> {
         let index = self.cmap_subtable?;
         let subtable = self.face.tables().cmap?.subtables.get(index)?;
@@ -145,11 +155,13 @@ impl<'a> ShapeFace<'a> {
         }
     }
 
+    #[inline]
     pub(crate) fn glyph_variation_index(&self, c: char, vs: char) -> Option<GlyphId> {
         self.face.glyph_variation_index(c, vs)
     }
 
     /// The horizontal advance at the face's instance, in font units.
+    #[inline]
     pub(crate) fn glyph_h_advance(&self, glyph: GlyphId) -> i32 {
         let face = &self.face;
         if face.is_variable()
@@ -171,6 +183,7 @@ impl<'a> ShapeFace<'a> {
     }
 
     /// `GDEF`'s class for `glyph` as glyph props (0 with no `GDEF`).
+    #[inline]
     pub(crate) fn glyph_props(&self, glyph: GlyphId) -> u16 {
         use crate::gdef::GlyphClass;
         let Some(table) = self.face.tables().gdef else {
@@ -187,6 +200,7 @@ impl<'a> ShapeFace<'a> {
         }
     }
 
+    #[inline]
     pub(crate) fn has_glyph_classes(&self) -> bool {
         self.face
             .tables()
@@ -194,6 +208,7 @@ impl<'a> ShapeFace<'a> {
             .is_some_and(|table| table.has_glyph_classes())
     }
 
+    #[inline]
     pub(crate) fn is_mark_glyph(&self, glyph: GlyphId, set_index: u16) -> bool {
         self.face
             .tables()
@@ -229,10 +244,11 @@ impl<'a> SubstLookup<'a> {
 }
 
 /// How many entries (glyphs or ranges) `coverage` lists.
-fn coverage_len(coverage: &Coverage<'_>) -> u64 {
+#[inline]
+const fn coverage_len(coverage: &Coverage<'_>) -> u64 {
     match *coverage {
-        Coverage::Format1 { glyphs } => u64::from(glyphs.len()),
-        Coverage::Format2 { records } => u64::from(records.len()),
+        Coverage::Format1 { glyphs } => glyphs.len() as u64,
+        Coverage::Format2 { records } => records.len() as u64,
     }
 }
 

@@ -55,7 +55,8 @@ pub(super) enum XtsmgraphicsItem {
 }
 
 impl XtsmgraphicsItem {
-    fn from_u16(value: u16) -> Option<Self> {
+    #[inline]
+    const fn from_u16(value: u16) -> Option<Self> {
         match value {
             1 => Some(Self::ColorRegisters),
             2 => Some(Self::SixelGeometry),
@@ -76,7 +77,8 @@ pub(super) enum XtsmgraphicsAction {
 }
 
 impl XtsmgraphicsAction {
-    fn from_u16(value: u16) -> Option<Self> {
+    #[inline]
+    const fn from_u16(value: u16) -> Option<Self> {
         match value {
             1 => Some(Self::Read),
             2 => Some(Self::Reset),

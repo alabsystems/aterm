@@ -127,6 +127,7 @@ fn root(key: &str) -> &str {
 
 /// Whether key `key` is `dir` or lies under it, component by component
 /// (`C:\AB` is not under `C:\A`). Both are [`windows_key`]s.
+#[inline]
 #[must_use]
 pub fn key_under(key: &str, dir: &str) -> bool {
     key.strip_prefix(dir)

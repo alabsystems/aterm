@@ -415,6 +415,7 @@ impl TransientState {
 
     /// Bytes owed to the PTY peer: the replies and the reports, which share
     /// [`super::MAX_RESPONSE_BUFFER_SIZE`].
+    #[inline]
     pub(super) fn owed_len(&self) -> usize {
         self.response_buffer
             .len()
@@ -425,6 +426,7 @@ impl TransientState {
     /// [`super::MAX_RESPONSE_BUFFER_SIZE`]: every caller writes past
     /// `send_response`'s rate limit, so a toggle flood or a resize storm
     /// against a host that does not drain must not grow it. Whether it went in.
+    #[inline]
     pub(super) fn push_report(&mut self, report: &[u8]) -> bool {
         let fits = self.owed_len().saturating_add(report.len()) <= super::MAX_RESPONSE_BUFFER_SIZE;
         if fits {
@@ -435,7 +437,7 @@ impl TransientState {
 
     /// Recompute the cached `has_transient_extras` flag.
     #[inline]
-    pub(super) fn update_has_transient_extras(&mut self) {
+    pub(super) const fn update_has_transient_extras(&mut self) {
         self.has_transient_extras =
             self.current_hyperlink.is_some() || self.current_underline_color.is_some();
     }
@@ -548,16 +550,19 @@ impl OscEventQueue {
     }
 
     /// Remove and return the oldest event.
+    #[inline]
     pub(super) fn pop_front(&mut self) -> Option<(u32, String)> {
         let event = self.events.pop_front()?;
         self.bytes -= event.1.len();
         Some(event)
     }
 
+    #[inline]
     pub(super) fn is_empty(&self) -> bool {
         self.events.is_empty()
     }
 
+    #[inline]
     pub(super) fn clear(&mut self) {
         self.events.clear();
         self.bytes = 0;
@@ -645,6 +650,7 @@ impl KittyAnimation {
 
     /// Whether it steps frames on its own: not stopped, more than one frame,
     /// some frame with a gap (a gapless frame is never shown), and loops left.
+    #[inline]
     pub(super) fn plays(&self) -> bool {
         self.state != KittyPlayState::Stopped
             && self.frames.len() > 1
@@ -758,6 +764,7 @@ pub(super) enum KittyParent {
 
 impl KittyParent {
     /// The key a relative placement of `parent` follows.
+    #[inline]
     pub(super) const fn of(parent: aterm_grid::KittyPlacementTag) -> Self {
         if parent.placement_id == 0 {
             Self::Serial {
@@ -773,6 +780,7 @@ impl KittyParent {
     }
 
     /// The parent's image id.
+    #[inline]
     pub(super) const fn image_id(self) -> u32 {
         match self {
             Self::Named { image_id, .. } | Self::Serial { image_id, .. } => image_id,
@@ -780,13 +788,14 @@ impl KittyParent {
     }
 
     /// Whether `tag` is this parent.
-    pub(super) fn names(self, tag: &aterm_grid::KittyPlacementTag) -> bool {
+    #[inline]
+    pub(super) const fn names(self, tag: &aterm_grid::KittyPlacementTag) -> bool {
         match self {
             Self::Named {
                 image_id,
                 placement_id,
             } => tag.image_id == image_id && tag.placement_id == placement_id,
-            Self::Serial { serial, .. } => tag.serial == serial,
+            Self::Serial { serial, .. } => tag.serial.get() == serial.get(),
         }
     }
 }

@@ -377,14 +377,27 @@ pub struct Probes {
     /// ([`claude_defaults_state`]) — or `None` when this report does not read that
     /// file (the default: a fixture has no Claude settings).
     pub claude_defaults: Option<Result<Vec<(&'static str, DefaultState)>, String>>,
+    /// Whether a window adds those defaults at all: `agents_auto_prime`
+    /// ([`crate::config::parse_agents_auto_prime`]), default true. Off, an unset key stays
+    /// unset and (10h) says so instead of promising the window's write.
+    pub claude_auto_prime: bool,
     /// Whether this aterm is on macOS's Developer Tools list ([`crate::devtools::facts`]),
     /// or `None` when this report does not read it (the default: a fixture reads no
     /// machine, and off macOS there is no list).
     pub devtools: Option<crate::devtools::Facts>,
+    /// Rosetta 2 as read ([`crate::machine::rosetta_posture`]) and whether `[machine]
+    /// rosetta` wants it, or `None` when this report does not read it (the default: a
+    /// fixture reads no machine).
+    pub rosetta: Option<(crate::machine::RosettaPosture, bool)>,
     /// The directories on the active Trust build's physical chain that `targo trust`
     /// refuses ([`probe_trust_chain`]), or `None` when this report does not walk it (the
     /// default: a fixture's store sits under a temp dir whose own chain is the machine's).
     pub trust_chain: Option<TrustChainProbe>,
+    /// The rc the account's login shell reads ([`crate::hooks::account_login_rc`]: the
+    /// account record's shell, never `$SHELL`), the one rc a pass creates when it is absent,
+    /// so (6b) says what becomes of it; `None` when it reads no rc atpkg wires (the
+    /// default: a fixture's home has no login shell).
+    pub login_rc: Option<&'static str>,
 }
 
 /// What [`probe_trust_chain`] found on the active Trust build's chain.
@@ -658,8 +671,11 @@ impl Default for Probes {
             index_head: false,
             cc: None,
             claude_defaults: None,
+            claude_auto_prime: true,
             devtools: None,
+            rosetta: None,
             trust_chain: None,
+            login_rc: None,
         }
     }
 }
@@ -1281,11 +1297,20 @@ fn rows_reading(layout: &Layout, devtools: Option<crate::devtools::Facts>) -> Ve
         ignored_prefix: cfg.ignored_prefix.clone(),
         retired_env: retired_opt_outs_exported(),
         claude_defaults: home.as_deref().and_then(probe_claude_settings),
+        claude_auto_prime: crate::config::load_agents_auto_prime(),
         stub_env: crate::reroute::StubEnv::of_process(),
         index_head: crate::index_probe::probes_this_source(),
         cc: Some(crate::prereq::probe(path.as_deref())),
         devtools,
+        // One `stat`, where it applies; the switch from the same table the apply reads.
+        rosetta: crate::machine::ROSETTA_APPLIES.then(|| {
+            (
+                crate::machine::rosetta_posture(&crate::machine::SystemRosetta),
+                crate::config::cached_machine().rosetta(),
+            )
+        }),
         trust_chain: probe_trust_chain(layout),
+        login_rc: home.as_deref().and_then(crate::hooks::account_login_rc),
     };
     report_with(
         layout,
@@ -1981,8 +2006,28 @@ pub(crate) fn read(
                 continue;
             };
             let name = e.file_name().to_string_lossy().into_owned();
-            let id = c::of(c::SHIMS, &name);
             let title = format!("the bin/ shim {name}");
+            // A shim into the store under a name no shim may carry: an older atpkg laid it
+            // before the name joined the deny-list (design S13). Its own row, never a
+            // broken shim: the shim sweep removes it (`aterm pkg repair`, and the base
+            // relay at the end of every install or update pass).
+            if crate::activate::refused_name_shim(layout, &name, &shim).is_some() {
+                f.push(Finding::change(
+                    c::of(c::REFUSED_SHIM, &name),
+                    Class::Relay,
+                    title,
+                    format!(
+                        "bin shim {} forwards into the store under a name no shim may carry \
+                         (a shell or another core command) \u{2014} an older atpkg laid it, and \
+                         the shim sweep removes it",
+                        shim.display()
+                    ),
+                    "absent",
+                    Remedy::Repair,
+                ));
+                continue;
+            }
+            let id = c::of(c::SHIMS, &name);
             match crate::store::presence(&target) {
                 crate::store::Presence::Present => {}
                 crate::store::Presence::Absent => f.push(
@@ -2011,11 +2056,62 @@ pub(crate) fn read(
         }
     }
 
+    let active = crate::ops::active_builds(layout);
+
+    // (4b) The exposed names refused a shim (design S13): a signed `exposes` naming a shell,
+    // another command a shim must never intercept, or no tool name at all. The landing laid
+    // no shim for it and recorded it ([`crate::status::record_refused_shims`]) under its
+    // build; the row says the entry of the build `store/<program>/current` names, so a
+    // program whose every name was refused, and so has no shim, is still read, and a build
+    // staged beside it says nothing until a flip makes it current. A note, never a change:
+    // the publisher signed the name, and nothing on this machine changes it.
+    let title = "the tools refused a shim";
+    match crate::status::read_checked(layout) {
+        Err(why) => f.push(Finding::unread(
+            c::REFUSED,
+            Class::Person,
+            title,
+            format!(
+                "status.toml could not be read ({why}), so which exposed names were refused \
+                 a shim is unknown"
+            ),
+        )),
+        Ok(record) => {
+            let refused: Vec<(&String, &crate::status::RefusedShims)> = record
+                .as_ref()
+                .map(|s| {
+                    s.refused_shims
+                        .keys()
+                        .filter_map(|program| {
+                            let build = crate::alab::current_build(layout, program)?;
+                            Some((program, s.refused_for(program, build)?))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            for (program, r) in &refused {
+                f.push(Finding::note(
+                    c::of(c::REFUSED, program),
+                    Class::Person,
+                    format!("{program}'s tools refused a shim"),
+                    refused_line(program, r),
+                ));
+            }
+            if refused.is_empty() && !active.is_empty() {
+                f.push(Finding::ok(
+                    c::REFUSED,
+                    Class::Person,
+                    title,
+                    "no landing recorded an exposed name refused a shim for an active build",
+                ));
+            }
+        }
+    }
+
     // (5) Active-build store integrity. Each program whose store tree is missing or
     // incomplete is its own row, whose remedy is its one structural repair (`install
     // <program>`), so the next act names one instead of a menu. No count here: (11) says
     // how many programs are active, from the tally that also counts a dev-linked program.
-    let active = crate::ops::active_builds(layout);
     let mut store_broken = false;
     for (program, build) in &active {
         let bd = layout.build_dir(program, *build);
@@ -2546,14 +2642,19 @@ pub(crate) fn read(
                 }
             }
         }
-        // (6b) rc wiring: one row per rc file that exists (atpkg never creates one), telling
+        // (6b) rc wiring: one row per rc file that exists, and one for the login shell's rc
+        // when it is absent (`hooks::absent_login_rc`: the one rc a pass creates), telling
         // wired, opted out and consent-fenced apart. `rc_wiring` reads six named files, among
         // them install.sh's two bash login profiles (`hooks::INSTALL_SH_PROFILES`), so a Mac
-        // wired by install.sh is not called unwired; when none sources shell.d the note names
-        // the six (`hooks::rc_files_read`) instead of calling the machine aterm-only.
+        // wired by install.sh is not called unwired; when none sources shell.d and no pass is
+        // about to make the login rc, the note names the six (`hooks::rc_files_read`)
+        // instead of calling the machine aterm-only.
         #[cfg(unix)]
         {
             let wiring = crate::hooks::rc_wiring(home);
+            let absent = probes
+                .login_rc
+                .and_then(|rc| crate::hooks::absent_login_rc(home, rc).map(|state| (rc, state)));
             let names = |want: crate::hooks::RcState| -> Vec<String> {
                 wiring
                     .iter()
@@ -2587,6 +2688,46 @@ pub(crate) fn read(
                         elsewhere.join(", ")
                     ),
                 ));
+            }
+            if let Some((rc, state)) = absent {
+                let id = c::of(c::RC, rc);
+                let title = format!("~/{rc}");
+                match state {
+                    crate::hooks::RcState::Unwired => f.push(Finding::change(
+                        id,
+                        Class::Relay,
+                        title,
+                        format!(
+                            "~/{rc} does not exist, and your login shell reads it (the next \
+                             install or update pass, or `aterm pkg repair`, creates it holding \
+                             atpkg's block)"
+                        ),
+                        "sources ~/.aterm/shell.d",
+                        Remedy::Repair,
+                    )),
+                    crate::hooks::RcState::OptedOut => f.push(Finding::note(
+                        id,
+                        Class::Asked,
+                        title,
+                        format!(
+                            "~/{rc}: you deleted the one atpkg made for your login shell — \
+                             opted out, left absent by every install and update pass (`aterm \
+                             pkg repair` makes it again)"
+                        ),
+                    )),
+                    crate::hooks::RcState::ConsentFenced => f.push(Finding::note(
+                        id,
+                        Class::Person,
+                        title,
+                        format!(
+                            "~/{rc} is absent and its folder resolves under one macOS guards \
+                             with a consent dialog, so no atpkg pass makes it; source \
+                             ~/.aterm/shell.d from your login shell's rc yourself, or reach the \
+                             tools with `aterm <tool>`"
+                        ),
+                    )),
+                    crate::hooks::RcState::Wired | crate::hooks::RcState::SourcedElsewhere => {}
+                }
             }
             for (rc, state) in &wiring {
                 let id = c::of(c::RC, rc);
@@ -2626,7 +2767,8 @@ pub(crate) fn read(
                     )),
                 }
             }
-            if wired.is_empty() && elsewhere.is_empty() {
+            let login_rc_coming = matches!(absent, Some((_, crate::hooks::RcState::Unwired)));
+            if wired.is_empty() && elsewhere.is_empty() && !login_rc_coming {
                 let checked: Vec<String> = crate::hooks::rc_files_read()
                     .map(|rc| format!("~/{rc}"))
                     .collect();
@@ -2753,6 +2895,23 @@ pub(crate) fn read(
             "Universal Control",
             state.doctor_row(policy),
             "disabled",
+            Remedy::Command(String::from("aterm pkg machine apply")),
+        ));
+    }
+
+    // (7d) Rosetta 2 (macOS on Apple silicon): read by one `stat`, installed by the apply
+    // (never here); a warning only while the apply would install it, with that next step.
+    if let Some(row) = probes
+        .rosetta
+        .and_then(|(posture, wanted)| posture.doctor_row(wanted))
+    {
+        f.push(Finding::of_row(
+            c::ROSETTA,
+            // An Apple install, fetched from Apple when macOS does not keep it on disk.
+            Class::Install,
+            "Rosetta 2",
+            row,
+            "installed",
             Remedy::Command(String::from("aterm pkg machine apply")),
         ));
     }
@@ -3463,6 +3622,17 @@ pub(crate) fn read(
                         how: format!("remove \"{key}\" from ~/.claude/settings.json"),
                     },
                 )),
+                // `agents_auto_prime = false`: no window adds it (aterm-gui's sweep), so
+                // the key is the person's to set, and nothing is wrong.
+                DefaultState::Unset if !probes.claude_auto_prime => f.push(Finding::ok(
+                    id,
+                    Class::Person,
+                    title,
+                    format!(
+                        "claude: {key} is unset and stays so — agents_auto_prime = false in \
+                         aterm.toml, so aterm adds none of its defaults"
+                    ),
+                )),
                 DefaultState::Unset => {
                     let want = CLAUDE_DEFAULTS
                         .iter()
@@ -3916,6 +4086,35 @@ fn env_drift_line(
         shim.display(),
         crate::vendor_direct::display_build(program, build),
         declared.spelled()
+    )
+}
+
+/// (4b)'s sentence for `program`, whose build `r.build` was refused a shim for each of
+/// `r.names`: each name quoted and escaped (a refused name may be no tool name at all, a
+/// control byte included), the uncounted rest said as a number.
+fn refused_line(program: &str, r: &crate::status::RefusedShims) -> String {
+    let mut names: Vec<String> = r
+        .names
+        .iter()
+        .take(crate::status::MAX_REFUSED_RECORDED)
+        .map(|name| format!("`{}`", name.escape_debug()))
+        .collect();
+    let shown = u64::try_from(names.len()).unwrap_or(u64::MAX);
+    if r.count > shown {
+        names.push(format!("{} more", r.count - shown));
+    }
+    let one = r.count <= 1;
+    format!(
+        "{} exposes {}, {} no shim may carry (a shell, another core command, or no tool name) \
+         \u{2014} {} no shim here, so typed in a shell {} never {} {program}'s copy; its \
+         signed manifest names {}, and nothing on this machine changes that",
+        crate::vendor_direct::display_build(program, r.build),
+        names.join(", "),
+        if one { "a name" } else { "names" },
+        if one { "it has" } else { "they have" },
+        if one { "it" } else { "they" },
+        if one { "runs" } else { "run" },
+        if one { "it" } else { "them" },
     )
 }
 

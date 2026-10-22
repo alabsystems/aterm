@@ -2521,6 +2521,8 @@ impl App {
             return false;
         };
         raster.presented = true;
+        // The committed frame is the one under the pointer now.
+        self.refresh_native_hover_for_frame(wid);
         true
     }
 
@@ -2637,6 +2639,90 @@ impl App {
             self.invalidate_native_view_cache(wid, target, crate::native_app::DamageRegion::All);
             self.request_redraw_all_windows();
         }
+    }
+
+    /// What a pointer at `(x, y)` over window `wid` hovers on the native frame
+    /// on glass: the presented leaf's control under it, its view, the
+    /// generation that frame was drawn at, whether it is a text field and
+    /// whether its press looks first; `None` over the pane header, the tab
+    /// strip, no control, or a frame its view has since moved past.
+    fn native_hover_hit(
+        &self,
+        wid: WindowId,
+        geom: PointerGeometry,
+        x: f64,
+        y: f64,
+        over_pane_header: bool,
+    ) -> Option<(
+        crate::tab_model::ViewId,
+        u64,
+        crate::native_ui::UiKey,
+        bool,
+        bool,
+    )> {
+        if over_pane_header || self.strip_col_at_with(wid, geom, x, y).is_some() {
+            return None;
+        }
+        self.retained_native_leaf_at_pointer(wid, x, y)
+            .and_then(|(artifact, local_x, local_y)| {
+                let hit = artifact.compiled.hit_test(local_x, local_y)?.clone();
+                let is_text = artifact
+                    .compiled
+                    .semantic(&hit.key)
+                    .is_some_and(|node| node.role == crate::native_ui::SemanticRole::TextField);
+                Some((
+                    artifact.view,
+                    artifact.generation,
+                    hit.key,
+                    is_text,
+                    hit.look_first,
+                ))
+            })
+            .filter(|(target, generation, ..)| {
+                self.native_runtime.view_generation(*target) == Some(*generation)
+            })
+    }
+
+    /// A WHEEL'S PAGE IS HOVERED WHERE THE POINTER IS ON THE FRAME IT LEFT:
+    /// hover is resolved on pointer motion, and a wheel moves a native page
+    /// with no motion after it (macOS sends its `CursorMoved` BEFORE the
+    /// scroll, on the old frame), so the control the pointer had been over
+    /// went on looking hovered and what reads the hover went on claiming it —
+    /// Cursor Styles previewed the row the pointer had left, saying "Click to
+    /// save", while a click there saved the row scrolled under it. Called
+    /// where a native frame reaches glass (or is committed, with none): after
+    /// a wheel moved the page (the window's `native_rehover`), once the
+    /// frame on glass is the page as it now stands, the pointer is
+    /// hit-tested on it as the motion path does, through the one hover owner.
+    /// The pointer is the person's here, as with any motion; a page the
+    /// keyboard moved keeps the keyboard's claim (a Cursor Styles row it
+    /// moved to takes over from a resting pointer until the pointer moves).
+    pub(crate) fn refresh_native_hover_for_frame(&mut self, wid: WindowId) {
+        let Some((_, front)) = self.active_native_view(wid) else {
+            return;
+        };
+        let Some(ws) = self.windows.get(&wid) else {
+            return;
+        };
+        if !ws.native_rehover || !ws.pointer_position_known {
+            return;
+        }
+        let (x, y) = ws.last_cursor_px;
+        // Only a frame of the page as it now stands: a stale one waits.
+        let current = self.active_visible_leaf_plan(wid).is_some_and(|plan| {
+            self.retained_native_leaf_artifact_from_plan(wid, front, true, &plan)
+                .is_some()
+        });
+        if !current {
+            return;
+        }
+        let geom = self.pointer_geometry(wid);
+        let over_pane_header = self.pane_header_at_with(wid, geom, x, y).is_some();
+        let hit = self.native_hover_hit(wid, geom, x, y, over_pane_header);
+        if let Some(ws) = self.windows.get_mut(&wid) {
+            ws.native_rehover = false;
+        }
+        self.apply_native_hover(wid, hit.map(|(view, _, key, ..)| (view, key)));
     }
 
     /// Where window `wid`'s pointer is, read back from the pixel the last
@@ -3213,6 +3299,7 @@ impl App {
         // this window holds. Cleared before the strip-hover early return.
         ws.pointer_position_known = false;
         ws.hover_grid_owned = false;
+        ws.native_rehover = false;
         // The band's lit chip is the same shape of stale claim as the strip's.
         let band_lit = ws.band_hover.take().is_some();
         // A resize handle's cursor is the window system's to change once the pointer
@@ -4046,6 +4133,9 @@ impl App {
             // grid arm: every earlier return hands the pointer to another owner, for which
             // the frame-time refresh must not resolve (`hover_grid_owned`).
             ws.hover_grid_owned = false;
+            // This motion resolves a native view's hover itself, on the frame
+            // on glass ([`Self::refresh_native_hover_for_frame`]).
+            ws.native_rehover = false;
         }
         // This window's own frame (`crate::client_frame`): a bare-band press becoming a
         // move, and the resize handles at the window's edges, ahead of every surface
@@ -4133,30 +4223,7 @@ impl App {
                 let _ =
                     self.native_editor_pointer_select(wid, target_view, byte, true, visible_lines);
             }
-            let native_hover = if over_pane_header
-                || self.strip_col_at_with(wid, geom, x, y).is_some()
-            {
-                None
-            } else {
-                self.retained_native_leaf_at_pointer(wid, x, y).and_then(
-                    |(artifact, local_x, local_y)| {
-                        let hit = artifact.compiled.hit_test(local_x, local_y)?.clone();
-                        let is_text = artifact.compiled.semantic(&hit.key).is_some_and(|node| {
-                            node.role == crate::native_ui::SemanticRole::TextField
-                        });
-                        Some((
-                            artifact.view,
-                            artifact.generation,
-                            hit.key,
-                            is_text,
-                            hit.look_first,
-                        ))
-                    },
-                )
-            };
-            let native_hover = native_hover.filter(|(target, generation, ..)| {
-                self.native_runtime.view_generation(*target) == Some(*generation)
-            });
+            let native_hover = self.native_hover_hit(wid, geom, x, y, over_pane_header);
             if let Some(ws) = self.windows.get_mut(&wid) {
                 ws.native_rest = NativePointerRest::after_motion(
                     ws.native_rest.take(),
@@ -6616,6 +6683,11 @@ impl App {
             }
             if native_page {
                 let signed = if up { -lines } else { lines };
+                // The page moves under the still pointer: its next frame on
+                // glass is hovered where the pointer then is.
+                if let Some(ws) = self.windows.get_mut(&wid) {
+                    ws.native_rehover = true;
+                }
                 // Aimed at what the pointer is over, so a page with a second
                 // scrolling region (Settings' sidebar) scrolls that one.
                 let event = match self.native_scroll_target(wid) {
@@ -6871,8 +6943,13 @@ pub(crate) fn open_url_external(url: &str) {
             .arg(url)
             .spawn(),
     );
+    // The press's time goes with it, so the browser's window may come forward.
     #[cfg(all(not(test), target_os = "linux"))]
-    drop(aterm_uds::spawnfd::command("xdg-open").arg(url).spawn());
+    drop(
+        crate::startup_token::for_a_press(aterm_uds::spawnfd::command("xdg-open"))
+            .arg(url)
+            .spawn(),
+    );
     #[cfg(all(not(test), windows))]
     open_url_windows(url);
 }
@@ -7398,6 +7475,86 @@ mod tests {
         assert_eq!(app.pointer_reply(cell), Ok(PointerAt::Absent));
     }
 
+    /// A NATIVE PAGE SCROLLED UNDER A STILL POINTER IS HOVERED WHERE THE
+    /// POINTER NOW IS (review of audit r14 PV8): hover was resolved on pointer
+    /// motion alone, and a wheel moves the page with no motion after it (on
+    /// macOS its `CursorMoved` comes first, on the old frame), so the row the
+    /// pointer had been over stayed hovered and Cursor Styles went on trying
+    /// it, saying "Click to save", while a click there saved the row
+    /// scrolled under it. After a wheel over the style list, the hovered
+    /// control is the one the pointer is over in the frame the wheel left,
+    /// and the preview tries that row's style. CONTROL: before the wheel,
+    /// the pointer's row is hovered.
+    #[test]
+    fn a_page_scrolled_under_a_still_pointer_is_hovered_where_it_now_is() {
+        use super::{NativePointerTarget, PointerAt, WheelUnit};
+        let (mut app, wid, view) =
+            settings_at_1000_by_600(crate::native_settings::SettingsRoute::CursorStyles);
+        let compiled = app.compiled_native_ui(wid).expect("the page compiles");
+        let row = compiled
+            .focus_order
+            .iter()
+            .filter(|key| key.as_str().starts_with("settings/cursor-style/"))
+            .nth(1)
+            .cloned()
+            .expect("a style row");
+        let hovered = |app: &crate::App| {
+            app.native_runtime
+                .view_state(view)
+                .and_then(|state| state.common().hovered.clone())
+                .map(|key| key.as_str().to_string())
+        };
+        app.pointer_cmd(PointerAction::MoveNative(NativePointerTarget::Key(
+            row.as_str().to_string(),
+        )))
+        .expect("the move aims at the row");
+        assert_eq!(
+            hovered(&app).as_deref(),
+            Some(row.as_str()),
+            "CONTROL: the row is hovered"
+        );
+        let cell = app
+            .pointer_cmd(PointerAction::Wheel {
+                dx: 0.0,
+                dy: 3.0,
+                unit: WheelUnit::Lines,
+                aim: None,
+            })
+            .expect("the wheel scrolls the list");
+        let under = match app.pointer_reply(cell) {
+            Ok(PointerAt::Native { key, .. }) => key,
+            other => panic!("a native answer: {other:?}"),
+        };
+        assert_ne!(
+            under.as_deref(),
+            Some(row.as_str()),
+            "the wheel moved the list under the pointer"
+        );
+        assert_eq!(hovered(&app), under, "hovered where the pointer now is");
+        let tried = app
+            .compiled_native_ui(wid)
+            .expect("the page compiles")
+            .paint
+            .iter()
+            .find_map(|node| match &node.content {
+                crate::native_ui::UiContent::SettingsPreview(spec) => {
+                    Some(spec.cursor.effective_trail_style_raw().to_string())
+                }
+                _ => None,
+            })
+            .expect("the preview");
+        let shown = under
+            .as_deref()
+            .and_then(|key| key.strip_prefix("settings/cursor-style/"))
+            .map(|style| style.replace('-', " "));
+        if let Some(shown) = shown {
+            assert!(
+                tried.eq_ignore_ascii_case(&shown),
+                "the preview tries {tried:?}, the row under the pointer is {shown:?}"
+            );
+        }
+    }
+
     /// A headless App whose 1,000×600 window has Settings open at `route`:
     /// the sidebar beside a list.
     fn settings_at_1000_by_600(
@@ -7770,14 +7927,16 @@ mod tests {
     }
 
     /// THE WHEEL OVER AN OPEN PICKER, BY THE WHEEL'S OWN PATH: the theme
-    /// picker opened by a click scrolls under `pointer wheel` and the tile
-    /// the pointer hovered is no longer hovered once the list moved; at the
-    /// end the wheel turns toward nothing moves, and the tile, still under the
-    /// pointer, stays hovered (the wheel cleared it there too, so a tile under
-    /// a still pointer lost its wash until the pointer moved).
+    /// picker opened by a click scrolls under `pointer wheel`, and once the
+    /// list moved the tile the pointer hovered is no longer hovered: the one
+    /// scrolled under the pointer is, on the frame the wheel left (review of
+    /// audit r14 PV8: a hover that outlived its frame); at the end the wheel
+    /// turns toward nothing moves, and the tile, still under the pointer,
+    /// stays hovered (the wheel cleared it there too, so a tile under a still
+    /// pointer lost its wash until the pointer moved).
     #[test]
-    fn a_wheel_over_an_open_picker_clears_the_hover_only_when_the_list_moves() {
-        use super::{NativePointerTarget, WheelUnit};
+    fn a_wheel_over_an_open_picker_moves_the_hover_only_when_the_list_moves() {
+        use super::{NativePointerTarget, PointerAt, WheelUnit};
         use crate::native_app::AppViewState;
         let (mut app, wid, view) =
             settings_at_1000_by_600(crate::native_settings::SettingsRoute::Appearance);
@@ -7818,31 +7977,39 @@ mod tests {
         assert!(app.pointer_cmd(wheel(-1.0)).is_ok());
         assert_eq!(tiles(&app), top, "the list was at its top");
         assert_eq!(hovered(&app), Some(tile.clone()), "nothing moved under it");
-        // Down, the list moves and the tile is no longer under the pointer.
-        assert!(app.pointer_cmd(wheel(1.0)).is_ok());
+        // Down, the list moves and the tile is no longer under the pointer:
+        // the one now under it is hovered.
+        let cell = app.pointer_cmd(wheel(1.0)).expect("the wheel scrolls");
         assert_ne!(tiles(&app), top, "the list scrolled");
-        assert_eq!(hovered(&app), None, "the hover went with the move");
+        let under = match app.pointer_reply(cell) {
+            Ok(PointerAt::Native { key, .. }) => key,
+            other => panic!("a native answer: {other:?}"),
+        };
+        assert_ne!(under.as_deref(), Some(tile.as_str()), "the tile moved away");
+        assert_eq!(hovered(&app), under, "the hover went with the move");
     }
 
     /// THE WHEEL PUTS A PRESS'S NUDGE BACK ON THE LIST'S STOPS, BY THE WHEEL'S
-    /// OWN PATH: a click on a switch the list's bottom edge cuts scrolls the
-    /// list by the switch's hidden part (the press nudge,
-    /// `settings_scroll::ScrollPlan::press_seat_span`), and the list holds that
-    /// place; a `pointer wheel` one line down then shows the screen one stop
-    /// on that an un-nudged wheel shows, and one line up at the top shows the
-    /// top again, as it was before the press.
+    /// OWN PATH: a click on a switch the list's room's edge cuts — the
+    /// screen's peek, a picture fading from its top — scrolls the list by the
+    /// switch's part under that edge (the press nudge,
+    /// `settings_scroll::ScrollPlan::press_seat_span`), whole and live under
+    /// the pointer, turning nothing, and the list holds that place; a
+    /// `pointer wheel` one line down then shows the screen one stop on that
+    /// an un-nudged wheel shows, and one line up at the top shows the top
+    /// again, as it was before the press.
     /// NEGATIVE CONTROL: `pointer status` after the press scrolls nothing, so
     /// the nudge stands until the wheel turns.
     #[test]
     fn a_pointer_wheel_puts_a_press_nudge_back_on_the_lists_stops() {
         use super::{NativePointerTarget, WheelUnit};
+        use crate::native_ui::LogicalRect;
         let wheel = |dy: f64| PointerAction::Wheel {
             dx: 0.0,
             dy,
             unit: WheelUnit::Lines,
             aim: None,
         };
-        let aim = |key: &str| PointerAction::MoveNative(NativePointerTarget::Key(key.into()));
         // Where each control the list's room shows live sits (the strip under
         // the room only pictures the stops after it, under a status bar the
         // click's change can bring up).
@@ -7857,9 +8024,10 @@ mod tests {
                 .map(|node| (node.key.as_str().to_string(), node.rect.y, node.rect.height))
                 .collect::<Vec<_>>()
         };
-        // Security at `size`, and a switch the list's bottom edge cuts there:
-        // its top live inside the list's room, the rest under the edge; with
-        // its top and its hidden part.
+        // Security at `size`, and a switch the list's room's edge cuts there:
+        // the screen's peek, fading from its top, its picture over what shows
+        // (a press there is the list's); with its top and where its picture
+        // shows.
         let security = |size| {
             let (app, wid, _) = settings_sized_in(
                 crate::App::headless_for_test(),
@@ -7872,51 +8040,77 @@ mod tests {
                 .iter()
                 .filter(|node| matches!(node.content, crate::native_ui::UiContent::Switch(_)))
                 .find_map(|node| {
-                    let live = compiled.hits.iter().find(|hit| hit.key == node.key)?.rect;
-                    (live.y == node.rect.y
-                        && live.height > 4.0
-                        && live.height + 0.5 < node.rect.height)
-                        .then(|| {
-                            (
-                                node.key.as_str().to_string(),
-                                node.rect.y,
-                                node.rect.height - live.height,
-                            )
-                        })
+                    let picture = compiled
+                        .list_pictures
+                        .iter()
+                        .find(|picture| picture.key == node.key)?
+                        .rect;
+                    (compiled.hits.iter().all(|hit| hit.key != node.key)
+                        && picture.y == node.rect.y
+                        && picture.height > 4.0
+                        && node.fade.is_some_and(|(top, _)| top <= node.rect.y + 0.5))
+                    .then(|| (node.key.as_str().to_string(), node.rect, picture))
                 })?;
             Some((app, wid, cut))
         };
-        // The press on the cut switch: the list moves up by its hidden part,
-        // so the switch shows whole.
-        let press = |app: &mut crate::App, wid, (cut, y0, hidden): &(String, f32, f32)| {
-            let at = app.pointer_cmd(aim(cut)).expect("the pointer moves");
-            assert!(
-                matches!(
-                    app.pointer_reply(at),
-                    Ok(super::PointerAt::Native { key: Some(ref on), .. }) if on == cut
-                ),
-                "the pointer is on the switch's live part"
-            );
-            assert!(app.pointer_cmd(PointerAction::Click).is_ok());
-            let nudged = place(app, wid);
-            let y1 = nudged
-                .iter()
-                .find(|(key, ..)| key == cut)
-                .map(|(_, y, _)| *y)
-                .expect("the switch is listed");
-            assert!(
-                (y0 - y1 - hidden).abs() < 0.5,
-                "nudged up by its hidden part {hidden}: {y0} -> {y1}"
-            );
-            nudged
-        };
+        // The press on the switch's picture, at its top: the list moves up by
+        // the switch's part under the room's edge, so the switch shows whole
+        // and live at that edge, and turns nothing.
+        let press =
+            |app: &mut crate::App,
+             wid,
+             (cut, rect, picture): &(String, LogicalRect, LogicalRect)| {
+                let (x, y) = (picture.x + picture.width / 2.0, picture.y + 2.0);
+                assert!(
+                    app.pointer_cmd(PointerAction::MoveNative(NativePointerTarget::Point(x, y)))
+                        .is_ok()
+                );
+                let on = app
+                    .compiled_native_ui(wid)
+                    .expect("the page compiles")
+                    .paint
+                    .iter()
+                    .find_map(|node| match &node.content {
+                        crate::native_ui::UiContent::Switch(control)
+                            if node.key.as_str() == cut =>
+                        {
+                            Some(control.value.clone())
+                        }
+                        _ => None,
+                    })
+                    .expect("the switch is drawn");
+                assert!(app.pointer_cmd(PointerAction::Click).is_ok());
+                let nudged = place(app, wid);
+                let y1 = nudged
+                    .iter()
+                    .find(|(key, ..)| key == cut)
+                    .map(|(_, y, _)| *y)
+                    .expect("the switch is live now");
+                assert!(
+                    y1 < rect.y - 0.5,
+                    "{cut}: nudged up by its part under the room's edge, not by a stop: {rect:?} -> {y1}"
+                );
+                let compiled = app.compiled_native_ui(wid).expect("the page compiles");
+                assert_eq!(
+                    compiled
+                        .semantic(&crate::native_ui::UiKey::new(cut.as_str()))
+                        .map(|node| node.value.clone()),
+                    Some(on),
+                    "it turned nothing"
+                );
+                nudged
+            };
         let mut checked = 0;
         for size in [(600, 360), (640, 400), (738, 418), (800, 480), (1_000, 600)] {
             let Some((mut app, wid, cut)) = security(size) else {
                 continue;
             };
             let top = place(&app, wid);
-            assert!(app.pointer_cmd(aim(&cut.0)).is_ok());
+            let (x, y) = (cut.2.x + cut.2.width / 2.0, cut.2.y + 2.0);
+            assert!(
+                app.pointer_cmd(PointerAction::MoveNative(NativePointerTarget::Point(x, y)))
+                    .is_ok()
+            );
             assert!(app.pointer_cmd(wheel(1.0)).is_ok());
             let one_on = place(&app, wid);
             assert_ne!(one_on, top, "{size:?}: the wheel scrolled the list");

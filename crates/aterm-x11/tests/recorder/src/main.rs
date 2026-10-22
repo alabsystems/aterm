@@ -685,6 +685,66 @@ fn requests() {
             deviceid: 2,
         },
     );
+    sync_requests();
+}
+
+/// An INT64 as x11rb-protocol's SYNC holds one: the high half, then the low.
+fn int64(value: i64) -> x11rb_protocol::protocol::sync::Int64 {
+    x11rb_protocol::protocol::sync::Int64 {
+        hi: (value >> 32) as i32,
+        lo: value as u32,
+    }
+}
+
+/// SYNC's counter requests, at major opcode 134 (Xwayland's and Xorg's).
+fn sync_requests() {
+    use x11rb_protocol::protocol::sync;
+    req_major(
+        "sync_initialize",
+        134,
+        sync::InitializeRequest {
+            desired_major_version: 3,
+            desired_minor_version: 1,
+        },
+    );
+    req_major(
+        "sync_create_counter",
+        134,
+        sync::CreateCounterRequest {
+            id: 0x0060_0007,
+            initial_value: int64(0),
+        },
+    );
+    req_major(
+        "sync_set_counter",
+        134,
+        sync::SetCounterRequest {
+            counter: 0x0060_0007,
+            value: int64((5 << 32) | 0x8000_0001),
+        },
+    );
+    req_major(
+        "sync_set_counter_negative",
+        134,
+        sync::SetCounterRequest {
+            counter: 0x0060_0007,
+            value: int64(-2),
+        },
+    );
+    req_major(
+        "sync_query_counter",
+        134,
+        sync::QueryCounterRequest {
+            counter: 0x0060_0007,
+        },
+    );
+    req_major(
+        "sync_destroy_counter",
+        134,
+        sync::DestroyCounterRequest {
+            counter: 0x0060_0007,
+        },
+    );
 }
 
 fn render_property(r: &GetPropertyReply) -> String {
@@ -1009,7 +1069,43 @@ fn replies() {
         )
     });
     randr_xinput_replies();
+    sync_replies();
     setups();
+}
+
+fn sync_replies() {
+    use x11rb_protocol::protocol::sync;
+    let v = sync::InitializeReply {
+        sequence: 3,
+        length: 0,
+        major_version: 3,
+        minor_version: 1,
+    };
+    reply::<sync::InitializeReply>("sync_initialize", &wire(v.serialize().to_vec()), |r| {
+        format!(
+            "major_version={} minor_version={}",
+            r.major_version, r.minor_version
+        )
+    });
+    let render = |r: &sync::QueryCounterReply| {
+        format!(
+            "counter_value={}",
+            (i64::from(r.counter_value.hi) << 32) | i64::from(r.counter_value.lo)
+        )
+    };
+    for (name, value) in [
+        ("sync_query_counter", (5 << 32) | 0x8000_0001),
+        ("sync_query_counter_negative", -2),
+        ("sync_query_counter_min", i64::MIN),
+        ("sync_query_counter_max", i64::MAX),
+    ] {
+        let q = sync::QueryCounterReply {
+            sequence: 4,
+            length: 0,
+            counter_value: int64(value),
+        };
+        reply::<sync::QueryCounterReply>(name, &wire(q.serialize().to_vec()), render);
+    }
 }
 
 fn render_modes(modes: &[x11rb_protocol::protocol::randr::ModeInfo]) -> String {

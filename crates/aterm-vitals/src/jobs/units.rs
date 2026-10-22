@@ -119,6 +119,11 @@ struct Job {
     named: Option<NamedWait>,
     named_progress: Option<u64>,
     busy_since: Option<u64>,
+    /// This tick it held the foreground at the person's own terminal read:
+    /// `tty-raw` or `tty-password` named from a mode word stamped after its
+    /// last terminal output, with no key queued, whatever its class
+    /// ([`demand_of`]).
+    person_read: bool,
     row: Option<JobRow>,
 }
 
@@ -694,6 +699,7 @@ impl Jobs {
                 elsewhere: &elsewhere,
             };
             let wait = wait::name_job(&scene, &jf, &leaves, (shell_pid, shell_name));
+            job.person_read = matches!(wait.name, WaitName::TtyRaw | WaitName::TtyPassword);
 
             // A Tier B naming holds until progress or exit.
             if job.named.is_some() && job.track.last_progress_ms != job.named_progress {
@@ -828,7 +834,13 @@ impl Jobs {
             r
         };
         let findings = self.findings(tick, &sweep);
-        let demand = demand_of(&rows);
+        let at_person: BTreeSet<(u64, &str)> = self
+            .jobs
+            .iter()
+            .filter(|j| j.person_read && j.exited_ms.is_none())
+            .map(|j| (j.key.tab, j.id.as_str()))
+            .collect();
+        let demand = demand_of(&rows, &at_person);
         let mut lanes_off = Vec::new();
         if !tick.lanes.kqueue_detail {
             lanes_off.push("lane_off:kqueue_detail");
@@ -989,6 +1001,7 @@ impl Job {
             named: None,
             named_progress: None,
             busy_since: None,
+            person_read: false,
             row: None,
         }
     }
@@ -1027,6 +1040,7 @@ impl Job {
             named: None,
             named_progress: None,
             busy_since: None,
+            person_read: false,
             row: None,
         }
     }
@@ -1395,17 +1409,27 @@ fn named_standing(
 }
 
 /// How soon to look again: fast while anything runs or can accrue, slow for
-/// legitimate waits that are not the person's, idle otherwise.
-fn demand_of(rows: &[JobRow]) -> Demand {
+/// legitimate waits that are not the person's, idle otherwise. A job that
+/// holds the foreground at the person's own terminal read (`at_person`: its
+/// tab and id, [`Job::person_read`]) is the person's wait even while it
+/// makes progress the terminal does not show (a full-screen program at its
+/// prompt appending to its own log, as agy 1.4.0 does every 5 s while its
+/// telemetry is refused): it can accrue nothing while it reads keys, so it
+/// is watched again at its next terminal output (the host's edge), as the
+/// design's "a session parked at a raw-mode prompt: 0 job samples until its
+/// next PTY output" says; one that stalls or spins is still watched fast.
+fn demand_of(rows: &[JobRow], at_person: &BTreeSet<(u64, &str)>) -> Demand {
     let mut d = Demand::Idle;
     for r in rows.iter().filter(|r| r.verdict != Verdict::Exited) {
-        if r.class == Class::Running
+        let reads_keys = at_person.contains(&(r.tab, r.id.as_str()));
+        if (r.class == Class::Running && !reads_keys)
             || r.verdict == Verdict::Stuck
             || matches!(r.standing, Some(Standing::Capable | Standing::Capped))
         {
             return Demand::Fast;
         }
-        let person = matches!(r.verdict, Verdict::WaitingYou | Verdict::Parked)
+        let person = reads_keys
+            || matches!(r.verdict, Verdict::WaitingYou | Verdict::Parked)
             || r.wait.as_ref().is_some_and(|w| {
                 matches!(
                     w.name,

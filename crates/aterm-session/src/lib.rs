@@ -43,7 +43,8 @@ pub use id::{LaunchNonce, SessionId, is_minted_sid};
 
 /// Lowercase-hex digit for a nibble (low 4 bits). A branch table keeps this
 /// free of arithmetic panic obligations.
-fn hex_digit(n: u8) -> char {
+#[inline]
+const fn hex_digit(n: u8) -> char {
     match n & 0x0f {
         0 => '0',
         1 => '1',
@@ -81,6 +82,7 @@ pub(crate) fn hex(bytes: &[u8]) -> String {
 /// `char::from(c).to_digit(16)` but in provably underflow-free `u8` arithmetic.
 /// This crate keeps its own hex helpers instead of `aterm_codec::hex` because
 /// its proved count needs their bodies in the verification bundle.
+#[inline]
 pub(crate) const fn hex_nibble(c: u8) -> Option<u8> {
     match c {
         b'0'..=b'9' => Some(c - b'0'),

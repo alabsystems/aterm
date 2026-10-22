@@ -19125,7 +19125,24 @@ fn account_wall_live(
         return ("no-clock", None);
     };
     let roster = accounts::default_roster_path();
-    account_wall_at((home, &state, roster.as_deref()), sid, agent, settled, now)
+    if let Some(roster_path) = roster.as_deref() {
+        let _ = aterm_agent::harness::accounts_sync::sync_if_missing_live(
+            home,
+            &state,
+            roster_path,
+            now,
+        );
+    }
+    let res = account_wall_at((home, &state, roster.as_deref()), sid, agent, settled, now);
+    if let Some(roster_path) = roster.as_deref() {
+        aterm_agent::harness::accounts_sync::auto_renew_next_account(
+            home,
+            &state,
+            roster_path,
+            now,
+        );
+    }
+    res
 }
 
 /// [`account_wall_live`] over the places it is given (`(home, harness state root, roster
@@ -23551,16 +23568,42 @@ fn agent_landing_told(host: HostHandle, agent: Program) -> Box<dyn FnMut() + Sen
 /// resolved) cost the main thread about 5 M instructions inside every
 /// launch's `config_join`, and each agent with a marker of its own added its
 /// share (2026-10-20). The marks are taken as they stand when the thread
-/// starts, a few ms later than the main thread would have; a pull of the
+/// starts, a few ms later than the main thread would have, and before the
+/// accounts' upkeep ([`maintain_accounts_live`]) runs; a pull of the
 /// trigger before the thread sets it is covered by the loop's first look
 /// ([`activation_loop`] looks at the accounts before its first wait, and a
 /// shutdown already asked ends the loop before it).
+fn maintain_accounts_live() {
+    let Some(home) = aterm_primer::home_dir() else {
+        return;
+    };
+    let Some(state) = harness_state() else {
+        return;
+    };
+    let Some(roster) = accounts::default_roster_path() else {
+        return;
+    };
+    let Some(now) = aterm_time::unix_secs().and_then(|now| i64::try_from(now).ok()) else {
+        return;
+    };
+    let _ = aterm_agent::harness::accounts_sync::sync_if_missing_live(&home, &state, &roster, now);
+    aterm_agent::harness::accounts_sync::auto_renew_next_account(&home, &state, &roster, now);
+}
+
 fn spawn_activation_wake(host: HostHandle) {
     spawn_activation_wake_with(host, |host| {
+        // The marks before the accounts' upkeep: what stands when they are taken is the
+        // baseline, never news, and the upkeep can take seconds (`claude auth status`, a
+        // login staged), so a notice that landed while it ran went unseen for good.
         let mut wake = activation_wake(host);
+        maintain_accounts_live();
         (
             Some(wake.trigger()),
-            Box::new(move || wake.wait(WAKE_FALLBACK)),
+            Box::new(move || {
+                let newer = wake.wait(WAKE_FALLBACK);
+                maintain_accounts_live();
+                newer
+            }),
         )
     });
 }
@@ -23847,29 +23890,42 @@ pub(crate) fn log_act(store: &Store, sid: &str, kind: &str, step: &str) {
 ///
 /// Then, in the same thread (both passes rewrite the one file, and two racing writers could
 /// each back up and replace the other's result), add the Claude Code defaults the owner runs
-/// with where they are unset ([`aterm_primer::CLAUDE_DEFAULTS`]: the top-effort mode,
-/// `xhigh`, the surveys and the drafted-feedback card quiet, autocompaction at 400k tokens),
-/// leaving any value a person set as it is.
-pub(crate) fn sweep_legacy_hooks() {
+/// with where they are unset when `auto_prime` (the `agents_auto_prime` setting) is on
+/// ([`sweep_claude_settings_in`]).
+pub(crate) fn sweep_legacy_hooks(auto_prime: bool) {
     let Some(home) = aterm_primer::home_dir() else {
         return;
     };
     let _ = std::thread::Builder::new()
         .name(format!("{THREAD_PREFIX}hook-sweep"))
-        .spawn(move || {
-            match aterm_primer::remove_aterm_hooks_in(&home) {
-                Ok(aterm_primer::HookRemoval::Nothing) => {}
-                Ok(removal) => {
-                    aterm_log::info!("harness: legacy Claude hooks removed: {removal:?}");
-                }
-                Err(e) => aterm_log::warn!("harness: legacy Claude hooks left in place: {e}"),
-            }
-            match aterm_primer::add_claude_defaults_in(&home) {
-                Ok(aterm_primer::DefaultsWrite::Nothing) => {}
-                Ok(added) => aterm_log::info!("harness: Claude Code defaults added: {added:?}"),
-                Err(e) => aterm_log::warn!("harness: Claude Code defaults not added: {e}"),
-            }
-        });
+        .spawn(move || sweep_claude_settings_in(&home, auto_prime));
+}
+
+/// The sweep's two passes over `<home>/.claude/settings.json`, in order: the legacy hooks
+/// go whatever `auto_prime` says; the Claude Code defaults the owner runs with
+/// ([`aterm_primer::CLAUDE_DEFAULTS`]: the top-effort mode, `xhigh`, the surveys and the
+/// drafted-feedback card quiet, autocompaction at 400k tokens) are added where unset only
+/// when `auto_prime` is on (`base.agents.claude-defaults`, docs/DESIGN-init-system-2026-10-
+/// 20.md §4.2): `agents_auto_prime = false` is the owner's word that aterm adds nothing
+/// of its own to an agent's files, so a file with no legacy hook stays byte for byte as it
+/// was. A value a person set is always left as it is.
+pub(crate) fn sweep_claude_settings_in(home: &std::path::Path, auto_prime: bool) {
+    match aterm_primer::remove_aterm_hooks_in(home) {
+        Ok(aterm_primer::HookRemoval::Nothing) => {}
+        Ok(removal) => {
+            aterm_log::info!("harness: legacy Claude hooks removed: {removal:?}");
+        }
+        Err(e) => aterm_log::warn!("harness: legacy Claude hooks left in place: {e}"),
+    }
+    if !auto_prime {
+        aterm_log::debug!("harness: Claude Code defaults left alone (agents_auto_prime = false)");
+        return;
+    }
+    match aterm_primer::add_claude_defaults_in(home) {
+        Ok(aterm_primer::DefaultsWrite::Nothing) => {}
+        Ok(added) => aterm_log::info!("harness: Claude Code defaults added: {added:?}"),
+        Err(e) => aterm_log::warn!("harness: Claude Code defaults not added: {e}"),
+    }
 }
 
 #[cfg(any(test, feature = "bench-support"))]

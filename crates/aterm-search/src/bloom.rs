@@ -34,7 +34,7 @@ pub struct BloomFilter {
 
 impl BloomFilter {
     #[inline]
-    fn requested_bits_for_capacity(expected_items: usize) -> usize {
+    const fn requested_bits_for_capacity(expected_items: usize) -> usize {
         // Not `Ord::max`, which the Trust L0 gate treats as opaque.
         let bits = expected_items.saturating_mul(10);
         if bits < 64 { 64 } else { bits }
@@ -60,7 +60,7 @@ impl BloomFilter {
     const MAX_U64S: usize = Self::MAX_BITS / 64;
 
     #[inline]
-    fn storage_layout(requested_bits: usize) -> (usize, usize) {
+    const fn storage_layout(requested_bits: usize) -> (usize, usize) {
         // Explicit comparisons (not `max`/`min`/`div_ceil`) so the Trust L0 gate's
         // interval reasoning carries the bounds to the multiply and the allocation;
         // the division result is opaque to it.
@@ -137,6 +137,7 @@ impl BloomFilter {
     }
 
     /// Insert bytes into the bloom filter.
+    #[inline]
     pub fn insert_bytes(&mut self, bytes: &[u8]) {
         let (h1, h2) = Self::hash_pair(bytes);
 
@@ -159,6 +160,7 @@ impl BloomFilter {
     }
 
     /// Check if bytes might be in the set.
+    #[inline]
     #[must_use]
     pub(crate) fn might_contain_bytes(&self, bytes: &[u8]) -> bool {
         let (h1, h2) = Self::hash_pair(bytes);
@@ -187,8 +189,9 @@ impl BloomFilter {
     }
 
     /// Get the number of items inserted.
+    #[inline]
     #[must_use]
-    pub fn item_count(&self) -> usize {
+    pub const fn item_count(&self) -> usize {
         self.count
     }
 
@@ -213,6 +216,7 @@ impl BloomFilter {
 
     /// Returns `true` when the estimated false positive rate exceeds 50%: the filter
     /// then passes most queries and should be rebuilt or resized.
+    #[inline]
     #[must_use]
     pub fn is_saturated(&self) -> bool {
         self.estimated_fpr() > 0.5
@@ -227,17 +231,19 @@ impl BloomFilter {
     /// Two FNV-1a hashes in one pass, combined as h_i = h1 + i*h2
     /// (Kirsch-Mitzenmacher).
     #[inline]
-    fn hash_pair(bytes: &[u8]) -> (u64, u64) {
+    const fn hash_pair(bytes: &[u8]) -> (u64, u64) {
         // h1 is plain FNV-1a; h2 starts from a rotated seed and is rotated at the end.
         let mut h1 = FNV64_OFFSET;
         let mut h2 = FNV64_OFFSET.rotate_left(17); // Different seed
 
-        for &b in bytes {
-            let b64 = u64::from(b);
+        let mut idx = 0usize;
+        while idx < bytes.len() {
+            let b64 = bytes[idx] as u64;
             h1 ^= b64;
             h1 = h1.wrapping_mul(FNV64_PRIME);
             h2 ^= b64;
             h2 = h2.wrapping_mul(FNV64_PRIME);
+            idx += 1;
         }
 
         // Final mixing for h2 to ensure independence
@@ -248,7 +254,7 @@ impl BloomFilter {
 
     /// Get the bit index for the i-th hash function.
     #[inline]
-    fn get_bit_index(&self, h1: u64, h2: u64, i: usize) -> usize {
+    const fn get_bit_index(&self, h1: u64, h2: u64, i: usize) -> usize {
         let combined = h1.wrapping_add((i as u64).wrapping_mul(h2));
         #[allow(
             clippy::cast_possible_truncation,

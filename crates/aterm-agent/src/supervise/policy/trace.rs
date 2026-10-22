@@ -24,7 +24,7 @@
 //! traces (`Fx::tracing`).
 //!
 //! **Named by rule id.** A step that decided by a rule names it
-//! ([`TraceStep::rule`]: `read-only@classify-v3`, `continue@v1`); a check
+//! ([`TraceStep::rule`]: `read-only@classify-v4`, `continue@v1`); a check
 //! that has no rule of its own — a gate that hands the box to a person, a
 //! level's rules that proved nothing, the press gate overruling an answer —
 //! is named by the check ([`TraceStep::check`]). The decision a trace ends

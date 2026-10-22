@@ -2395,3 +2395,109 @@ fn a_long_paste_is_drawn_as_its_chip() {
         assert_eq!(reader.folded_paste(&text), None, "{:?}", reader.program());
     }
 }
+
+/// GEMINI CLI'S TRUST NOTICES ARE CHROME UNDER A REPLY
+/// ([`trust_notices_above`]): on the screen of a worker aterm relaunched on
+/// its session after its own restart (measured), the defense `✦ Nothing
+/// left: …` stands above `⚠  Note: This folder is still trusted because …`
+/// and `ℹ This folder is untrusted, …` with its `/permissions` row; the
+/// turn's last words are the defense, whole, and the turn is the Land act's.
+/// The notices wrapped in a narrow pane are cut the same way, and a cancel
+/// above them still ends the turn. NEGATIVE CONTROLS: a notice of other words
+/// in the same place is what the turn ended on (no last words), and so is a
+/// trust notice's head with a row in column 0 under it.
+#[test]
+fn trust_notices_under_a_resumed_reply_are_chrome() {
+    let rows = screen(LAB_RESUMED_TRUST_NOTICES);
+    assert!(provenance(LAB_RESUMED_TRUST_NOTICES).is_some_and(|p| p.contains("MEASURED")));
+    let defense = "Nothing left: the parser is committed and pushed to origin/main.";
+    assert_eq!(said_tail(&rows).as_deref(), Some(defense));
+    assert!(said_whole(&rows) && turn_whole(&rows));
+    assert!(
+        turn_opened_by(&rows).is_some_and(|m| m.starts_with("[aterm harness] Autopilot is Land")),
+        "{:?}",
+        turn_opened_by(&rows)
+    );
+    let r = gemini(LAB_RESUMED_TRUST_NOTICES);
+    assert_eq!(r.said_tail.as_deref(), Some(defense));
+    assert_eq!(r.phase, Phase::Idle);
+    // Wrapped in a narrow pane: the rows each notice wrapped onto, two in.
+    let untrusted = rows
+        .iter()
+        .position(|r| r.starts_with("ℹ This folder is untrusted"))
+        .expect("the untrusted notice");
+    let mut narrow = rows.clone();
+    narrow.splice(
+        untrusted..=untrusted,
+        [
+            "ℹ This folder is untrusted, project settings, hooks, MCPs,".to_string(),
+            "  and GEMINI.md files will not be applied for this folder.".to_string(),
+        ],
+    );
+    assert_eq!(said_tail(&narrow).as_deref(), Some(defense));
+    // A cancel above the notices still ends the turn as a person's stop.
+    let mut cancelled = rows.clone();
+    let reply = rows
+        .iter()
+        .rposition(|r| r.starts_with("✦ Nothing left"))
+        .expect("the defense");
+    cancelled.splice(
+        reply + 1..reply + 1,
+        ["".to_string(), "ℹ Request cancelled.".to_string()],
+    );
+    cancelled.drain(cancelled.len() - 2..);
+    assert!(interrupted(&cancelled));
+    // NEGATIVE CONTROL: a notice of other words where the trust notice was.
+    let other = edited(
+        &rows,
+        "⚠  Note:",
+        "⚠  Note: the loop detector stopped this turn.",
+    );
+    assert_eq!(said_tail(&other), None);
+    // NEGATIVE CONTROL: a row in column 0 under a trust notice's head.
+    let mut broken = rows.clone();
+    broken[untrusted + 1] = "Use the /permissions command to change the trust level.".to_string();
+    assert_eq!(said_tail(&broken), None);
+}
+
+/// A RAW WRITE IS NO PASTE ([`folded_paste`]): 600 and 1600 characters of
+/// one line sent raw (the fenced write's `send`, no paste brackets) are drawn
+/// in the composer as the words typed, wrapped over its rows (measured), so the
+/// fenced write's comparison of the composer with its words holds past the
+/// fold's 500 units. NEGATIVE CONTROL: the same text written as one paste
+/// folds into a chip, as the harness's measured 538-character paste did.
+#[test]
+fn a_raw_send_longer_than_the_fold_is_drawn_as_words() {
+    assert!(provenance(LAB_RAW_SEND_600).is_some_and(|p| p.contains("MEASURED")));
+    let phrase =
+        "[lab raw send] this is a long raw write of plain words to measure the paste fold ";
+    let sent: String = phrase.repeat(8).chars().take(600).collect();
+    let squash = |t: &str| t.chars().filter(|c| !c.is_whitespace()).collect::<String>();
+    let rows = screen(LAB_RAW_SEND_600);
+    let (_, lines) = composer_draft(&rows).expect("the composer");
+    assert!(lines.len() >= 5, "{lines:?}");
+    assert_eq!(squash(&lines.concat()), squash(&sent));
+    assert!(lines.iter().all(|l| !l.contains("[Pasted Text")));
+    // NEGATIVE CONTROL: as one paste it folds.
+    assert_eq!(
+        folded_paste(&sent).as_deref(),
+        Some("[Pasted Text: 600 chars]")
+    );
+    let (_, chip) = composer_draft(&screen(FOLDED_PASTE)).expect("the composer");
+    assert!(chip[0].starts_with("[Pasted Text: 538 chars]"), "{chip:?}");
+    // 1600 characters (measured): words again, the composer's ten rows
+    // holding the text's end, its first rows scrolled inside the composer;
+    // as one paste it folds.
+    assert!(provenance(LAB_RAW_SEND_1600).is_some_and(|p| p.contains("MEASURED")));
+    let long: String = phrase.repeat(30).chars().take(1600).collect();
+    let (_, lines) = composer_draft(&screen(LAB_RAW_SEND_1600)).expect("the composer");
+    assert_eq!(lines.len(), 10, "{lines:?}");
+    assert!(lines.iter().all(|l| !l.contains("[Pasted Text")));
+    let drawn = squash(&lines.concat());
+    assert!(squash(&long).ends_with(&drawn), "{drawn}");
+    assert!(drawn.len() > squash(&sent).len(), "past the 600's words");
+    assert_eq!(
+        folded_paste(&long).as_deref(),
+        Some("[Pasted Text: 1600 chars]")
+    );
+}

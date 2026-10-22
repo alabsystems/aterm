@@ -50,6 +50,7 @@ pub const ALIAS_TABLE: &[AliasEntry] = &[
 
 /// Look up an alias by name. Case-sensitive (TOML authors must match exactly).
 #[must_use]
+#[inline]
 pub fn lookup(alias: &str) -> Option<&'static AliasEntry> {
     ALIAS_TABLE.iter().find(|e| e.alias == alias)
 }

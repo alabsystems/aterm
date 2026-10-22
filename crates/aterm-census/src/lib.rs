@@ -736,6 +736,13 @@ fn parse_source_fns(text: &str, rel: &str, out: &mut Vec<GuiFn>) {
             i += 1;
             continue;
         };
+        // A declaration (an extern block's import, a trait's required method)
+        // has no body: read as one, it would run to the next `<indent>}` and
+        // swallow the fns after it.
+        if is_bodyless_declaration(&lines, i) {
+            i += 1;
+            continue;
+        }
         // The body ends at the first later line that is exactly `<indent>}`.
         // A def line with balanced braces (`fn f() { … }`) is the whole body;
         // otherwise a one-line fn would swallow the following fns.
@@ -767,6 +774,28 @@ fn parse_source_fns(text: &str, rel: &str, out: &mut Vec<GuiFn>) {
         });
         i = end + 1;
     }
+}
+
+/// Whether the fn definition starting at `at` is a body-less declaration: its
+/// signature reaches a `;` before it ever reaches a `{`.
+pub(crate) fn is_bodyless_declaration(lines: &[&str], at: usize) -> bool {
+    // Only a `;` at bracket depth 0 ends a signature: `fn table() -> [f32; 256] {`
+    // has one inside its return type.
+    let mut depth = 0i32;
+    for line in lines.iter().skip(at).take(24) {
+        for b in strip_line_comment(line).bytes() {
+            match b {
+                // Only `()` and `[]`: counting `<`/`>` would let the `>` of
+                // `->` decrement on every signature.
+                b'(' | b'[' => depth += 1,
+                b')' | b']' => depth -= 1,
+                b'{' if depth <= 0 => return false,
+                b';' if depth <= 0 => return true,
+                _ => {}
+            }
+        }
+    }
+    false
 }
 
 /// The identifier ending exactly at byte offset `end` in `s` (the receiver before
@@ -1611,6 +1640,61 @@ mod tests {
         // `Fn(` in a where-clause / bound is not a definition.
         assert!(parse_fn_def("    where F: Fn(u16) -> bool,").is_none());
         assert!(parse_fn_def("        let f = default_fn(x);").is_none());
+    }
+
+    /// A body-less declaration (an extern block's import, a trait's required
+    /// method) is no fn: the fns after it stay themselves, each with its own
+    /// body, and the declaration contributes none.
+    #[test]
+    fn a_bodyless_declaration_does_not_swallow_the_fns_after_it() {
+        let src = "\
+extern \"system\" {
+    fn GetDC(hwnd: isize) -> isize;
+    fn ReleaseDC(
+        hwnd: isize,
+        dc: isize,
+    ) -> i32;
+}
+
+pub trait Present {
+    fn present(&mut self, rects: &[u32; 4]) -> bool;
+}
+
+impl Present for Gdi {
+    fn present(&mut self, rects: &[u32; 4]) -> bool {
+        let dc = unsafe { GetDC(self.hwnd) };
+        blit(dc, rects)
+    }
+}
+
+fn blit(dc: isize, rects: &[u32; 4]) -> bool {
+    term_lock(&TERM).resize(rects[0], rects[1]);
+    dc != 0
+}
+
+fn table() -> [f32; 256] {
+    [0.0; 256]
+}
+";
+        let mut fns = Vec::new();
+        parse_source_fns(src, "x.rs", &mut fns);
+        let spans: Vec<(&str, &str)> = fns
+            .iter()
+            .map(|f| (f.name.as_str(), f.span.as_str()))
+            .collect();
+        assert_eq!(
+            spans,
+            [
+                ("present", "x.rs:14"),
+                ("blit", "x.rs:20"),
+                ("table", "x.rs:25")
+            ],
+            "each defined fn is its own item; no declaration is one"
+        );
+        // `present`'s body ends at its own close and `blit`'s holds its hop.
+        assert_eq!(fns[0].body.len(), 4);
+        assert!(fns[1].body.iter().any(|l| l.contains("term_lock(")));
+        assert_eq!(fns[2].body.len(), 3);
     }
 
     #[test]

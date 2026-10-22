@@ -311,6 +311,7 @@ impl CursorStateHandler<'_> {
 
     /// Handle SL — Scroll Left (CSI Ps SP @): scroll the scroll region left by
     /// Pn columns within the horizontal margins; blanks fill at the right.
+    #[inline]
     pub(super) fn handle_sl(&mut self, params: &[u16]) {
         let n = params.first().copied().unwrap_or(1).max(1);
         self.grid.set_cursor_template(
@@ -322,6 +323,7 @@ impl CursorStateHandler<'_> {
 
     /// Handle SR — Scroll Right (CSI Ps SP A): scroll the scroll region right by
     /// Pn columns within the horizontal margins; blanks fill at the left.
+    #[inline]
     pub(super) fn handle_sr(&mut self, params: &[u16]) {
         let n = params.first().copied().unwrap_or(1).max(1);
         self.grid.set_cursor_template(
@@ -333,6 +335,7 @@ impl CursorStateHandler<'_> {
 
     /// Handle DECSCA (`CSI Ps " q`): Ps 1 protects the characters written next
     /// from DECSED/DECSEL; any other value (default 0) does not.
+    #[inline]
     pub(super) fn handle_decsca(&mut self, params: &[u16]) {
         let mode = params.first().copied().unwrap_or(0);
         self.style.protected = mode == 1;
@@ -345,6 +348,7 @@ impl CursorStateHandler<'_> {
     ///
     /// VT510 performs a soft reset on a level change; like xterm, this only
     /// updates the level.
+    #[inline]
     pub(super) fn handle_decscl(&mut self, params: &[u16]) {
         let Some(&first) = params.first() else {
             return;
@@ -364,6 +368,7 @@ impl CursorStateHandler<'_> {
 
     /// Handle DECSED (`CSI ? Ps J`): ED over unprotected cells only (Ps 0 to the
     /// end of the screen, 1 from its start, 2 all of it).
+    #[inline]
     pub(super) fn handle_selective_erase_display(&mut self, params: &[u16]) {
         let mode = params.first().copied().unwrap_or(0);
         match mode {
@@ -376,6 +381,7 @@ impl CursorStateHandler<'_> {
 
     /// Handle DECSEL (`CSI ? Ps K`): EL over unprotected cells only (Ps 0 to the
     /// end of the line, 1 from its start, 2 all of it).
+    #[inline]
     pub(super) fn handle_selective_erase_line(&mut self, params: &[u16]) {
         let mode = params.first().copied().unwrap_or(0);
         match mode {
@@ -405,6 +411,7 @@ impl CursorStateHandler<'_> {
             project = "aterm_core::terminal::terminal_modes_conformance::project_modes"
         )
     )]
+    #[inline]
     pub(super) fn handle_decscusr(&mut self, params: &[u16]) {
         let mode = params.first().copied().unwrap_or(0);
         if let Some(style) = CursorStyle::from_param(mode) {
@@ -426,6 +433,7 @@ impl CursorStateHandler<'_> {
     /// (<https://terminal-wg.pages.freedesktop.org/bidi/recommendation/escape-sequences.html>):
     /// 0 the default (`Auto`: LTR, with first-strong detection only while DECSET
     /// 2501 is set), 1 LTR, 2 RTL.
+    #[inline]
     pub(super) fn handle_scp(&mut self, params: &[u16]) {
         use aterm_types::ParagraphDirection;
 

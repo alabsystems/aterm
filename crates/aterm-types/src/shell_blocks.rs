@@ -166,40 +166,56 @@ impl OutputBlock {
     }
 
     /// Check if this block is complete (has finished executing).
+    #[inline]
     #[must_use]
-    pub fn is_complete(&self) -> bool {
-        self.state == BlockState::Complete
+    pub const fn is_complete(&self) -> bool {
+        matches!(self.state, BlockState::Complete)
     }
 
     /// Check if the command in this block succeeded (exit code 0).
+    #[inline]
     #[must_use]
-    pub fn succeeded(&self) -> bool {
-        self.exit_code == Some(0)
+    pub const fn succeeded(&self) -> bool {
+        matches!(self.exit_code, Some(0))
     }
 
     /// Check if the command in this block failed (exit code != 0).
+    #[inline]
     #[must_use]
-    pub fn failed(&self) -> bool {
+    pub const fn failed(&self) -> bool {
         matches!(self.exit_code, Some(code) if code != 0)
     }
 
     /// Absolute `(start, end_exclusive)` rows of the command portion of this
     /// block.
+    #[inline]
     #[must_use]
-    pub fn command_rows(&self) -> Option<(u64, u64)> {
-        let start = self.command_start_row?;
-        let end = self
-            .output_start_row
-            .unwrap_or(self.end_row.unwrap_or(start.saturating_add(1)));
+    pub const fn command_rows(&self) -> Option<(u64, u64)> {
+        let Some(start) = self.command_start_row else {
+            return None;
+        };
+        let end = match self.output_start_row {
+            Some(row) => row,
+            None => match self.end_row {
+                Some(row) => row,
+                None => start.saturating_add(1),
+            },
+        };
         Some((start, end))
     }
 
     /// Absolute `(start, end_exclusive)` rows of the output portion of this
     /// block.
+    #[inline]
     #[must_use]
-    pub fn output_rows(&self) -> Option<(u64, u64)> {
-        let start = self.output_start_row?;
-        let end = self.end_row.unwrap_or(start.saturating_add(1));
+    pub const fn output_rows(&self) -> Option<(u64, u64)> {
+        let Some(start) = self.output_start_row else {
+            return None;
+        };
+        let end = match self.end_row {
+            Some(row) => row,
+            None => start.saturating_add(1),
+        };
         Some((start, end))
     }
 }

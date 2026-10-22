@@ -3070,7 +3070,9 @@ impl StatusObserver {
     }
 
     /// Whether `session`'s foreground program should be (re-)named now: its
-    /// group just changed (`group_changed`), an unknown name has reached its
+    /// group just changed (`group_changed`), it has never been asked for while
+    /// unnamed (`first_unnamed`: a restored session whose foreground group was
+    /// adopted before the first status sweep), an unknown name has reached its
     /// bounded retry deadline, a one-shot known-name confirmation is due, or
     /// the screen moved and the last naming is older than [`PROGRAM_RECHECK`]
     /// (an `exec` in place). Call before
@@ -3087,10 +3089,12 @@ impl StatusObserver {
             return true;
         }
         self.agents.get(&session).is_some_and(|w| {
+            let first_unnamed = program.is_none() && w.resolved_at.is_none();
             let confirmation_due = program.is_some_and(|p| aterm_phase::program_of(p).is_none())
                 && w.pgid > 0
                 && w.deferred_name_recheck_at.is_some_and(|at| now >= at);
-            confirmation_due
+            first_unnamed
+                || confirmation_due
                 || w.resolved_at.is_some_and(|at| {
                     let age = now.saturating_duration_since(at);
                     (program.is_none()

@@ -163,6 +163,20 @@ pub enum CanvasInk {
     Pane,
 }
 
+/// The flying head's seat for a frame ([`EffectsPipeline::route_flying_head`]):
+/// the target the emitter's placement follower approaches. The host prepares
+/// the animated placement to obtain the actual word-cat avoidance rectangle.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct FlyingSeat {
+    /// Whole rows lifted above the caret's row, for the host's
+    /// [`crate::word_decorations::KittyCursorLayout::lift`].
+    pub lift: f32,
+    /// The target seat `(x0, x1, y0, y1)` in grid pixels, right and
+    /// bottom exclusive: the shipped footprint moved to the seat behind the
+    /// caret or a row up. `None` when no flying head is seated this frame.
+    pub px: Option<(i32, i32, i32, i32)>,
+}
+
 /// A snapshot rescan inside a word pass: the episodes it finds are born at
 /// `birth`, and `cursor` is the live input caret whose collision forms stay
 /// provisional (`None` for settled content, such as a history viewport).
@@ -960,6 +974,11 @@ impl EffectsPipeline {
     ///    until 2026-10-20, which the follower excludes, so a seat that rose to
     ///    the row above, or came back down, moved the head a whole row in one
     ///    present.)
+    ///
+    /// Returns the target seat ([`FlyingSeat`]): its lift and rect. The host
+    /// then prepares the actual animated placement before the word pass and
+    /// carries it through emission. The target alone does not cover a body
+    /// still following an old seat or moving through a fold leg.
     #[inline]
     pub fn route_flying_head(
         &mut self,
@@ -969,13 +988,13 @@ impl EffectsPipeline {
         geom: EffectGeom,
         cat_frame: &mut crate::kitty_cursor::CatFrame,
         animate: bool,
-    ) -> f32 {
+    ) -> FlyingSeat {
         use crate::rainbow_kitty::companion::{
             self as companion, Body, BodyImpulse, CompanionAdmission, Reaction, SeatQuery,
         };
         if self.cursor.glow.v2_status().is_none() {
             self.flying_sky_row = None;
-            return 0.0;
+            return FlyingSeat::default();
         }
         let body = companion::body_for(CompanionAdmission {
             duty,
@@ -1013,7 +1032,7 @@ impl EffectsPipeline {
         }
         let Body::Flying { cell } = body else {
             self.flying_sky_row = None;
-            return 0.0;
+            return FlyingSeat::default();
         };
         let Some(rest) =
             self.decos
@@ -1026,7 +1045,7 @@ impl EffectsPipeline {
                 })
         else {
             self.flying_sky_row = None;
-            return 0.0;
+            return FlyingSeat::default();
         };
         let ink = |row: u16, col: u16| -> Option<bool> {
             cells
@@ -1066,7 +1085,15 @@ impl EffectsPipeline {
             let lead_cells = dx as f32 / f32::from(geom.cell_w);
             cat_frame.pose.lead += if facing_left { -lead_cells } else { lead_cells };
         }
-        f32::from(seat.lift_rows)
+        FlyingSeat {
+            lift: f32::from(seat.lift_rows),
+            px: Some((
+                seat.x,
+                seat.x + i32::from(seat.w),
+                seat.y,
+                seat.y + i32::from(seat.h),
+            )),
+        }
     }
 
     /// The flying head at its resolved placement.

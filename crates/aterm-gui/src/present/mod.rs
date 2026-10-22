@@ -13,7 +13,7 @@
 //! macOS gets [`mac::MacCpuPresenter`] (CoreGraphics + CoreAnimation); Linux
 //! gets [`linux::LinuxPresenter`] (MIT-SHM on X11, `wl_shm` on Wayland,
 //! first-party since LW.6 of docs/AUDIT-third-party-2026-10-15.md); Windows gets
-//! [`softbuffer_surface::SoftbufferPresenter`] until its GDI presenter (LW.3).
+//! [`win32::Win32Presenter`] (GDI, first-party since LW.3).
 //! The `cfg`-selected [`CpuSurface`] alias resolves to one concrete type per
 //! cell, so the per-frame path has no vtable; the traits make a method added to
 //! one backend and not the other a compile error.
@@ -37,10 +37,10 @@ pub(crate) mod mac;
 pub(crate) mod scripted;
 #[cfg(target_os = "linux")]
 mod shm_mem;
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
-pub(crate) mod softbuffer_surface;
 #[cfg(target_os = "linux")]
 pub(crate) mod wayland;
+#[cfg(windows)]
+pub(crate) mod win32;
 #[cfg(target_os = "linux")]
 pub(crate) mod x11;
 
@@ -50,16 +50,16 @@ pub(crate) type CpuSurface = mac::MacCpuPresenter;
 /// The CPU present backend for this cell: X11 or Wayland, by the window's server.
 #[cfg(all(target_os = "linux", not(test)))]
 pub(crate) type CpuSurface = linux::LinuxPresenter;
-/// The CPU present backend for this cell: `softbuffer`.
-#[cfg(all(not(any(target_os = "macos", target_os = "linux")), not(test)))]
-pub(crate) type CpuSurface = softbuffer_surface::SoftbufferPresenter;
+/// The CPU present backend for this cell: GDI.
+#[cfg(all(windows, not(test)))]
+pub(crate) type CpuSurface = win32::Win32Presenter;
 /// The test build's CPU surface: the platform presenter, or a scripted one a
 /// headless test installs to drive the real present path ([`scripted`]).
 #[cfg(test)]
 pub(crate) type CpuSurface = scripted::TestCpuSurface;
 
 /// One damaged region of a presented frame, in surface pixels with the origin
-/// at the top-left; same fields and meaning as `softbuffer::Rect`. The extents
+/// at the top-left; the fields and meaning of softbuffer's `Rect`. The extents
 /// are non-zero because a zero-area damage rectangle is not a well-specified
 /// no-op across backends.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -98,6 +98,14 @@ pub(crate) trait CpuPresenter: Sized {
     /// Acquire the next frame buffer. May block on compositor ownership, which
     /// is why the caller starts its copy timer only after this returns.
     fn buffer_mut(&mut self) -> Result<Self::Buffer<'_>, Self::Error>;
+
+    /// Whether the window system asks for part of the window to be drawn again
+    /// (Windows' update region: rows the window gained after its last present,
+    /// say), which the next present owes even when the frame is unchanged.
+    /// `false` where the compositor keeps the window's last frame.
+    fn owes_repaint(&self) -> bool {
+        false
+    }
 }
 
 /// One acquired CPU frame: a `[u32]` of `width * height` words in

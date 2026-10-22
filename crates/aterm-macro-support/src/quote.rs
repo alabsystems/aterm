@@ -28,48 +28,56 @@ pub trait ToTokens {
 }
 
 impl ToTokens for TokenStream {
+    #[inline]
     fn to_tokens(&self, out: &mut Vec<TokenTree>) {
         out.extend(self.clone());
     }
 }
 
 impl ToTokens for TokenTree {
+    #[inline]
     fn to_tokens(&self, out: &mut Vec<TokenTree>) {
         out.push(self.clone());
     }
 }
 
 impl ToTokens for Ident {
+    #[inline]
     fn to_tokens(&self, out: &mut Vec<TokenTree>) {
         out.push(TokenTree::Ident(self.clone()));
     }
 }
 
 impl ToTokens for Literal {
+    #[inline]
     fn to_tokens(&self, out: &mut Vec<TokenTree>) {
         out.push(TokenTree::Literal(self.clone()));
     }
 }
 
 impl ToTokens for Punct {
+    #[inline]
     fn to_tokens(&self, out: &mut Vec<TokenTree>) {
         out.push(TokenTree::Punct(self.clone()));
     }
 }
 
 impl ToTokens for Group {
+    #[inline]
     fn to_tokens(&self, out: &mut Vec<TokenTree>) {
         out.push(TokenTree::Group(self.clone()));
     }
 }
 
 impl<T: ToTokens + ?Sized> ToTokens for &T {
+    #[inline]
     fn to_tokens(&self, out: &mut Vec<TokenTree>) {
         (**self).to_tokens(out);
     }
 }
 
 impl<T: ToTokens> ToTokens for Option<T> {
+    #[inline]
     fn to_tokens(&self, out: &mut Vec<TokenTree>) {
         if let Some(value) = self {
             value.to_tokens(out);
@@ -78,6 +86,7 @@ impl<T: ToTokens> ToTokens for Option<T> {
 }
 
 impl<T: ToTokens> ToTokens for [T] {
+    #[inline]
     fn to_tokens(&self, out: &mut Vec<TokenTree>) {
         for value in self {
             value.to_tokens(out);
@@ -86,12 +95,14 @@ impl<T: ToTokens> ToTokens for [T] {
 }
 
 impl<T: ToTokens> ToTokens for Vec<T> {
+    #[inline]
     fn to_tokens(&self, out: &mut Vec<TokenTree>) {
         self.as_slice().to_tokens(out);
     }
 }
 
 impl ToTokens for bool {
+    #[inline]
     fn to_tokens(&self, out: &mut Vec<TokenTree>) {
         let word = if *self { "true" } else { "false" };
         out.push(TokenTree::Ident(Ident::new(word, Span::call_site())));
@@ -125,12 +136,14 @@ pub fn join<T: ToTokens>(items: &[T], separator: char, trailing: bool) -> TokenS
 ///
 /// A template that does not lex, or a hole with no binding, is a bug in the
 /// macro; it comes out as a `compile_error!` naming the template.
+#[inline]
 #[must_use]
 pub fn quote(template: &str, vars: &[(&str, &dyn ToTokens)]) -> TokenStream {
     expand(template, None, vars)
 }
 
 /// [`quote`], with every template token at `span` (the holes keep theirs).
+#[inline]
 #[must_use]
 pub fn quote_spanned(span: Span, template: &str, vars: &[(&str, &dyn ToTokens)]) -> TokenStream {
     expand(template, Some(span), vars)
@@ -222,6 +235,7 @@ pub fn respan(stream: TokenStream, span: Span) -> TokenStream {
 }
 
 /// A `{ ... }` group around `inner`, at the call site.
+#[inline]
 #[must_use]
 pub fn braced(inner: TokenStream) -> TokenTree {
     TokenTree::Group(Group::new(Delimiter::Brace, inner))

@@ -42,6 +42,7 @@ impl Tier {
     /// by the hand-written `Debug`/`Display` impls so they can format through
     /// [`std::fmt::Formatter::write_str`] (a single static-string write) rather
     /// than the `write!`/`format_args!` machinery.
+    #[inline]
     #[must_use]
     const fn name(self) -> &'static str {
         match self {
@@ -112,6 +113,7 @@ impl<E> Cap<E> {
 // Capabilities are copyable witnesses. Hand-written (not derived) so the impls
 // add no spurious `E: Clone`/`E: Copy` bound: `E` is a phantom effect marker.
 impl<E> Clone for Cap<E> {
+    #[inline]
     fn clone(&self) -> Self {
         *self
     }
@@ -160,6 +162,7 @@ impl Authority {
     /// (`aterm-census --guards`) keeps every shipped call in those two crates.
     #[cfg(any(test, feature = "launcher-mint"))]
     #[doc(hidden)]
+    #[inline]
     #[must_use]
     pub const unsafe fn root_authority() -> Authority {
         Authority { _seal: Seal }

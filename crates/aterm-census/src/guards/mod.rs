@@ -37,6 +37,7 @@
 //! | `flock-door`        | an `flock` the clippy lint cannot name |
 //! | `supervise-fx`      | a clock read, a sleep, the pid, a delivery, the goal record or the ledger by path that skips the supervisor's `Fx` door; a look at the filesystem, a process, the kernel, the zone or the environment that skips a derived door (the policy probe or `Fx`'s) |
 //! | `bridge-fx`         | a clock read in the fabric bridge (`Instant::now`, `SystemTime::now`, `.elapsed()`) that skips its `Fx` door, the deterministic simulation's |
+//! | `aos-step-clock`    | a clock read, a sleep or a random draw (`getrandom`, `rand`, a `RandomState`-keyed map) in the Aos step code (aterm-aos, aterm-effects' `aos_momentum` and `cursor_momentum`, and the `cursor_glow`, `effect_util`, `color_math` and `rainbow_kitty/ribbon` helpers their step calls), which a replay of the recorded inputs could not reproduce |
 //! | `store-current`     | a store `current` path run unresolved |
 //! | `key-material`      | a master phrase on the key surface, a key file in the checkout |
 //! | `capture-privacy`   | in an encoded test capture's decoded bytes (a pty log's hex, a `.reads` file's escapes), what the export forbids in text, a home path, a banner's plan or a session id |
@@ -71,6 +72,7 @@ use crate::lex::{Lexed, lex};
 use crate::{CensusOutcome, Floor};
 
 mod agent_gate;
+mod aos_step;
 mod bridge_fx;
 mod captures;
 mod doors;
@@ -132,6 +134,7 @@ pub const GUARDS: &[Rule] = &[
     rules::FLOCK_DOOR,
     rules::SUPERVISE_FX,
     bridge_fx::BRIDGE_FX,
+    aos_step::AOS_STEP_CLOCK,
     rules::STORE_CURRENT,
     keys::KEY_MATERIAL,
     captures::CAPTURE_PRIVACY,

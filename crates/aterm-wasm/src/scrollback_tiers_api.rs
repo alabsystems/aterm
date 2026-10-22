@@ -29,6 +29,7 @@ pub(crate) const RENDER_DRAIN_BATCH_LINES: usize = 2_048;
 
 /// Build a wasm terminal with default tiered scrollback and frame-boundary
 /// compression offload enabled.
+#[inline]
 pub(crate) fn tiered_terminal(rows: u16, cols: u16) -> Terminal {
     let mut term = TerminalBuilder::new()
         .size(rows, cols)
@@ -40,6 +41,7 @@ pub(crate) fn tiered_terminal(rows: u16, cols: u16) -> Terminal {
 
 /// Register the freshly built pane in the module-global budget, configured at
 /// the store's own construction-default byte budget.
+#[inline]
 pub(crate) fn register_budget_share(term: &Terminal) -> ScrollbackBudgetShare {
     let configured = term
         .scrollback()
@@ -51,6 +53,7 @@ impl WebTerminal {
     /// Frame-boundary scrollback maintenance, called by `render()`: apply a
     /// changed global-budget share, then promote one bounded batch of staged
     /// lines into the store (which enforces the byte budget as it grows).
+    #[inline]
     pub(crate) fn drain_compress_backlog_on_render(&mut self) {
         if let Some(bytes) = self.budget_share.pending_effective() {
             // Enforcement errors surface as watermark pressure, never a panic

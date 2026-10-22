@@ -10,12 +10,14 @@
 pub(crate) struct OutlineWork(Option<u32>);
 
 impl Default for OutlineWork {
+    #[inline]
     fn default() -> Self {
         Self(Some(65_536))
     }
 }
 
 impl OutlineWork {
+    #[inline]
     pub(crate) fn take(&mut self) -> Option<()> {
         #[cfg(all(any(test, debug_assertions), not(trust_verify)))]
         note(|s| s.outline_steps += 1);
@@ -23,7 +25,8 @@ impl OutlineWork {
         self.0.map(|_| ())
     }
 
-    pub(crate) fn exhausted(&self) -> bool {
+    #[inline]
+    pub(crate) const fn exhausted(&self) -> bool {
         self.0.is_none()
     }
 }
@@ -54,8 +57,10 @@ pub(crate) struct LayoutWork {
 
 impl LayoutWork {
     /// The budget for `traversals` traversals of a table of `len` bytes.
-    pub(crate) fn for_table(len: usize, traversals: u64) -> Self {
-        let one = (len as u64).saturating_mul(8).max(16_384);
+    #[inline]
+    pub(crate) const fn for_table(len: usize, traversals: u64) -> Self {
+        let one = (len as u64).saturating_mul(8);
+        let one = if one < 16_384 { 16_384 } else { one };
         Self {
             left: core::cell::Cell::new(one.saturating_mul(traversals)),
             refused: core::cell::Cell::new(false),
@@ -64,6 +69,7 @@ impl LayoutWork {
 
     /// Spends `units`; `None`, and refused from then on, when they are not
     /// left.
+    #[inline]
     pub(crate) fn spend(&self, units: u64) -> Option<()> {
         match self.left.get().checked_sub(units) {
             Some(left) if !self.refused.get() => {
@@ -80,6 +86,7 @@ impl LayoutWork {
     /// Whether a walk ran past the budget. Only the hinter asks, so it is
     /// built where the hinter is (`autohint`'s cfg).
     #[cfg(any(feature = "hint", debug_assertions))]
+    #[inline]
     pub(crate) fn refused(&self) -> bool {
         self.refused.get()
     }
@@ -115,6 +122,7 @@ std::thread_local! {
 }
 
 #[cfg(all(any(test, debug_assertions), not(trust_verify)))]
+#[inline]
 pub(crate) fn note(charge: impl FnOnce(&mut Spent)) {
     SPENT.with(|cell| {
         let mut spent = cell.get();

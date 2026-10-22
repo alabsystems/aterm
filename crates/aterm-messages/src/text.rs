@@ -42,9 +42,12 @@ pub(crate) fn sanitize(s: &str, cap: usize) -> String {
 /// and the variation selectors are not here: emoji sequences, joining scripts
 /// and ideographic variants need them; a surface that drops the joiners too
 /// says so.
+#[inline]
 #[must_use]
-pub fn is_hidden_char(c: char) -> bool {
-    c.is_control()
+pub const fn is_hidden_char(c: char) -> bool {
+    // `char::is_control` (general category Cc), spelled out: it is not a
+    // `const fn` on stable Rust, which the cross cells build with.
+    matches!(c, '\u{0}'..='\u{1f}' | '\u{7f}'..='\u{9f}')
         || matches!(
             c,
             '\u{00ad}' // SOFT HYPHEN
@@ -68,7 +71,7 @@ pub fn is_hidden_char(c: char) -> bool {
                 | '\u{e0000}'..='\u{e007f}' // the tag block
         )
         // The noncharacters at the end of every plane (U+xFFFE, U+xFFFF).
-        || u32::from(c) & 0xfffe == 0xfffe
+        || (c as u32) & 0xfffe == 0xfffe
 }
 
 /// A character the band and the presence row strip: [`is_hidden_char`] and
@@ -76,7 +79,8 @@ pub fn is_hidden_char(c: char) -> bool {
 /// could hide inside (and the log page copies them to a clipboard), and the
 /// row paints one character per cell, where a joiner would only fold the
 /// glyph after it out of sight.
-pub(crate) fn is_stripped(c: char) -> bool {
+#[inline]
+pub(crate) const fn is_stripped(c: char) -> bool {
     is_hidden_char(c) || matches!(c, '\u{200c}' | '\u{200d}')
 }
 
@@ -174,6 +178,7 @@ pub fn split_sentence(s: &str, cap: usize) -> Vec<String> {
 }
 
 /// Character count — the width function the tests inject.
+#[inline]
 #[must_use]
 pub fn char_width(s: &str) -> usize {
     s.chars().count()
@@ -723,6 +728,17 @@ mod tests {
                 shape_detail(&installed, cap).chars().count() <= cap,
                 "cap {cap}"
             );
+        }
+    }
+
+    /// `is_hidden_char` spells out `char::is_control` (not a `const fn` on
+    /// stable Rust): every control character is hidden, at every code point.
+    #[test]
+    fn every_control_character_is_hidden() {
+        for c in (0..=u32::from(char::MAX)).filter_map(char::from_u32) {
+            if c.is_control() {
+                assert!(is_hidden_char(c), "{c:?}");
+            }
         }
     }
 

@@ -86,12 +86,14 @@ impl fmt::Display for Error {
 
 impl Error {
     /// Return `true` when this error is `Error::Unsupported`.
+    #[inline]
     #[must_use]
     pub const fn is_unsupported(&self) -> bool {
         matches!(self, Self::Unsupported { .. })
     }
 
     /// Return `true` when this error is `Error::MissingSymbol`.
+    #[inline]
     #[must_use]
     pub const fn is_missing_symbol(&self) -> bool {
         matches!(self, Self::MissingSymbol { .. })
@@ -100,6 +102,7 @@ impl Error {
 
 /// Encode dynamic-library symbol-table counts (`required_total`, `required_loaded`,
 /// `optional_total`, `optional_loaded`) into 16 little-endian bytes.
+#[inline]
 #[must_use]
 pub const fn encode_dl_table_counts_le(
     required_total: u32,
@@ -128,6 +131,7 @@ pub const fn encode_dl_table_counts_le(
 }
 
 /// Decode 16 little-endian bytes into dynamic-library symbol-table counts.
+#[inline]
 #[must_use]
 pub const fn decode_dl_table_counts_le(bytes: [u8; 16]) -> (u32, u32, u32, u32) {
     let req_tot = (bytes[0] as u32)
@@ -191,12 +195,16 @@ impl Library {
     }
 
     /// The soname that loaded.
-    pub fn soname(&self) -> &'static CStr {
+    #[inline]
+    #[must_use]
+    pub const fn soname(&self) -> &'static CStr {
         self.soname
     }
 
     /// The address of `symbol`, or `None` when the library does not export
     /// it. Function or data: the caller knows which and what type.
+    #[inline]
+    #[must_use]
     pub fn symbol(&self, symbol: &CStr) -> Option<NonNull<c_void>> {
         #[cfg(target_os = "linux")]
         {
@@ -211,6 +219,7 @@ impl Library {
 
     /// [`Library::symbol`], with absence an [`Error::MissingSymbol`]. The
     /// table rows read through it.
+    #[inline]
     pub fn require(&self, symbol: &'static CStr) -> Result<NonNull<c_void>, Error> {
         self.symbol(symbol).ok_or(Error::MissingSymbol {
             library: self.soname,

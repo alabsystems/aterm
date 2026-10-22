@@ -91,6 +91,7 @@ pub struct RecordList<'a, T: RecordListItem<'a>> {
 }
 
 impl<'a, T: RecordListItem<'a>> RecordList<'a, T> {
+    #[inline]
     fn parse(data: &'a [u8]) -> Option<Self> {
         let mut s = Stream::new(data);
         let count = s.read::<u16>()?;
@@ -103,16 +104,19 @@ impl<'a, T: RecordListItem<'a>> RecordList<'a, T> {
     }
 
     /// Returns a number of items in the RecordList.
-    pub fn len(&self) -> u16 {
+    #[inline]
+    pub const fn len(&self) -> u16 {
         self.records.len()
     }
 
     /// Checks that RecordList is empty.
-    pub fn is_empty(&self) -> bool {
+    #[inline]
+    pub const fn is_empty(&self) -> bool {
         self.records.is_empty()
     }
 
     /// Returns RecordList value by index.
+    #[inline]
     pub fn get(&self, index: u16) -> Option<T> {
         let record = self.records.get(index)?;
         self.data
@@ -124,11 +128,13 @@ impl<'a, T: RecordListItem<'a>> RecordList<'a, T> {
     /// (the autohinter's script and feature selection reads tags alone, as
     /// read-fonts does).
     #[cfg(any(feature = "hint", debug_assertions))]
+    #[inline]
     pub(crate) fn tag(&self, index: u16) -> Option<Tag> {
         self.records.get(index).map(|record| record.tag)
     }
 
     /// Returns RecordList value by [`Tag`].
+    #[inline]
     pub fn find(&self, tag: Tag) -> Option<T> {
         let record = self
             .records
@@ -140,6 +146,7 @@ impl<'a, T: RecordListItem<'a>> RecordList<'a, T> {
     }
 
     /// Returns RecordList value index by [`Tag`].
+    #[inline]
     pub fn index(&self, tag: Tag) -> Option<u16> {
         self.records
             .binary_search_by(|record| record.tag.cmp(&tag))
@@ -170,6 +177,7 @@ pub struct RecordListIter<'a, T: RecordListItem<'a>> {
 impl<'a, T: RecordListItem<'a>> Iterator for RecordListIter<'a, T> {
     type Item = T;
 
+    #[inline]
     fn next(&mut self) -> Option<Self::Item> {
         if self.index < self.list.len() {
             self.index += 1;

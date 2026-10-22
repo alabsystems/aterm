@@ -637,10 +637,18 @@ pub struct World {
     /// ([`World::boot_opts`]). NOT the tier aterm opens its guarded broker at
     /// by default — ordered, at a 100 ms horizon, since the 2026-10-20 re-gate
     /// (`aterm_link::durability::default_for`) — so these worlds prove the
-    /// bridge over strict acks, and the ordered tier's own behaviour (the
-    /// barrier, the horizon's flush, the escalation table's held head, the
-    /// notifier's wait) is the ordered suite's (`ordered.rs`, `notify.rs`)
-    /// and the bench's default arm's. A restarted broker keeps it.
+    /// bridge over strict acks. The ordered tier's own behaviour (the
+    /// barrier, the escalation table's held head, the notifier's wait) is
+    /// the ordered suite's — this directory's `ordered.rs` and `notify.rs`,
+    /// whose worlds' brokers run at no horizon — and aterm-link's own
+    /// notifier tests (`crates/aterm-link/src/notify.rs`), every one at no
+    /// horizon but the one named next. The horizon's own flush is astream's
+    /// `ordered_tier::the_horizon_flushes_an_idle_broker_on_its_timer` and
+    /// `a_long_horizon_flushes_nothing_early` (`broker.ordered-tier`), and,
+    /// at aterm's 100 ms, that aterm-link unit test,
+    /// `notify::tests::in_follow_mode_the_horizon_alone_pages_an_attention_row`;
+    /// the bench's default arm waits for it (`fabric_bench/run.rs`'s
+    /// `await_durable`, a perf lane only). A restarted broker keeps it.
     pub opts: OpenOptions,
     /// Whether this world's broker retains its log by aterm's default rules
     /// ([`open_broker`]): every world's does but [`World::without_retention`]'s.
@@ -797,12 +805,25 @@ impl World {
         Self::boot_full(tag, &[], &[], None, &[], None, opts)
     }
 
-    /// [`World::boot_opts`] with extra environment for the bridge child: the
-    /// fabric bench's ping-pong arm turns the bridge's wait tally on
-    /// (`aterm_link::wait_tally::SEAM`) in a world of its own, so no other
-    /// world's bridge runs with it.
-    pub fn boot_opts_with(tag: &str, opts: OpenOptions, env: &[(&str, &str)]) -> Self {
-        Self::boot_full(tag, &[], env, None, &[], None, opts)
+    /// THE FABRIC BENCH'S ARM, whole: this world's broker opened with `opts`
+    /// ([`World::boot_opts`]), RETAINED by aterm's default rules or not
+    /// (`retained`: [`open_broker`] or [`open_broker_unretained`]), with extra
+    /// `serve` flags for the bridge (`--log off`) and extra environment for
+    /// the `aterm` instance, which the bridge child it launches inherits: the
+    /// ping-pong arm's wait tally (`aterm_link::wait_tally::SEAM`, read by the
+    /// bridge) and the handoff arm's quit seam (`ATERM_DEBUG_QUIT_BYE`, read
+    /// by the instance, `aterm-gui` `fabric_launch.rs`). The bench measures
+    /// what ships — retained, the bridge's `--log` left at `auto` — unless
+    /// the arm names otherwise. [`World::without_retention`] is its strict,
+    /// unretained case.
+    pub fn boot_arm(
+        tag: &str,
+        opts: OpenOptions,
+        retained: bool,
+        extra_serve_flags: &[&str],
+        env: &[(&str, &str)],
+    ) -> Self {
+        Self::boot_inner(tag, &[], env, None, extra_serve_flags, None, opts, retained)
     }
 
     /// [`World::boot`] with the node's cap file holding `grants(node)` instead
@@ -820,42 +841,17 @@ impl World {
     }
 
     /// A world whose broker keeps NO retention rules: a broker from before
-    /// astream's R4 ([`open_broker_unretained`]), the named unretaining case
-    /// (ruling U24). Restarted, it stays unretained.
+    /// astream's R4, or one `aterm link broker` serves when its rules cannot
+    /// be set ([`open_broker_unretained`]), the named unretaining case (ruling
+    /// U24). Restarted, it stays unretained.
     pub fn without_retention(tag: &str) -> Self {
-        Self::boot_retained(
+        Self::boot_arm(
             tag,
-            &[],
-            &[],
             broker_opts(aterm_link::durability::Durability::Strict),
             false,
+            &[],
+            &[],
         )
-    }
-
-    /// [`World::without_retention`] with extra `serve` flags and environment
-    /// for the bridge child.
-    pub fn without_retention_flags(
-        tag: &str,
-        extra_serve_flags: &[&str],
-        env: &[(&str, &str)],
-    ) -> Self {
-        Self::boot_retained(
-            tag,
-            extra_serve_flags,
-            env,
-            broker_opts(aterm_link::durability::Durability::Strict),
-            false,
-        )
-    }
-
-    fn boot_retained(
-        tag: &str,
-        extra_serve_flags: &[&str],
-        env: &[(&str, &str)],
-        opts: OpenOptions,
-        retained: bool,
-    ) -> Self {
-        Self::boot_inner(tag, &[], env, None, extra_serve_flags, None, opts, retained)
     }
 
     fn boot_full(
@@ -1257,6 +1253,52 @@ impl World {
             .into_owned();
         let token = World::wait_for_token_of(&sock, &mut child, &self.tmp.join("sibling.log"));
         Sibling { child, sock, token }
+    }
+
+    /// A SUCCESSOR INSTANCE on this world's node: one more headless `aterm`
+    /// ARMED with this world's own fabric command — the same broker, cap file
+    /// and `--state`, so its bridge is a second bridge on the one state dir —
+    /// in a runtime dir of its own (`run-<n>`), so its control socket is its
+    /// own and the world's stays where it is. Its bridge finds the dir held
+    /// and STANDS BY (`link down reason=state-locked`, trying the lock every
+    /// second) until the holder exits, then carries the node: the bridges'
+    /// half of a seamless update's successor, which a headless instance
+    /// cannot reach by updating. `env` reaches the instance and its bridge.
+    pub fn successor_instance(&self, n: usize, env: &[(&str, &str)]) -> Successor {
+        let fabric = std::fs::read_to_string(self.tmp.join("fabric.cmd"))
+            .expect("this world's fabric command");
+        let run = self.tmp.join(format!("run-{n}"));
+        std::fs::create_dir_all(run.join("aterm")).expect("the successor's runtime dir");
+        let sock = run.join("aterm/aterm.sock").to_string_lossy().into_owned();
+        assert_sock_fits(&sock);
+        let log_path = self.tmp.join(format!("successor-{n}.log"));
+        let log = std::fs::File::create(&log_path).expect("successor log");
+        let err = log.try_clone().expect("successor log clone");
+        let mut cmd = Command::new(aterm_to_launch());
+        prepare_gui_environment(&mut cmd);
+        cmd.arg("--headless")
+            .env("HOME", scratch_home(&self.tmp))
+            .env("TMPDIR", &self.tmp)
+            .env("XDG_RUNTIME_DIR", &run)
+            .env("XDG_CONFIG_HOME", self.tmp.join("cfg"))
+            .env("SHELL", "/bin/sh")
+            .args(["--lines", "40", "--columns", "120"])
+            .env("ATERM_FABRIC_COMMAND", fabric.trim())
+            .stdin(Stdio::null())
+            .stdout(log)
+            .stderr(err);
+        for (k, v) in env {
+            cmd.env(k, v);
+        }
+        arm_lifeline(&mut cmd, &self.tmp);
+        let mut child = cmd.spawn().expect("launch a successor aterm --headless");
+        let token = World::wait_for_token_of(&sock, &mut child, &log_path);
+        Successor {
+            child: Some(child),
+            sock,
+            token,
+            log: log_path,
+        }
     }
 
     /// This session's `inbox` rows (`--peek`, so the watermarks do not move).
@@ -1767,6 +1809,61 @@ impl Drop for Sibling {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
+    }
+}
+
+/// A successor instance ([`World::successor_instance`]): killed and reaped
+/// with the test unless [`Successor::take`] hands it to the [`World`] it
+/// succeeds, which then tears it down as its own.
+pub struct Successor {
+    child: Option<Child>,
+    /// Its control socket, in its own runtime dir.
+    pub sock: String,
+    /// Its Owner token.
+    pub token: String,
+    /// Where its stdout and stderr go (its bridge's too).
+    pub log: PathBuf,
+}
+
+impl Successor {
+    /// A fresh authenticated control connection to it.
+    pub fn ctl(&self) -> Ctl {
+        connect(&self.sock, &self.token).expect("connect to the successor aterm")
+    }
+
+    /// Every session it hosts, as `(local, sid, nonce)`.
+    pub fn sessions(&self) -> Vec<(u64, String, String)> {
+        let reply = self
+            .ctl()
+            .request("sessions")
+            .unwrap_or_else(|e| panic!("sessions on the successor: {e}"));
+        session_rows(&reply)
+    }
+
+    /// Its `fabric status` header, or empty when it does not answer.
+    pub fn fabric_status(&self) -> String {
+        connect(&self.sock, &self.token)
+            .and_then(|mut c| c.request("fabric status"))
+            .map(|r| r.header().to_string())
+            .unwrap_or_default()
+    }
+
+    /// Make it `w`'s own instance: its process, its control socket, its token
+    /// and its log replace the ones `w` held, whose process must be gone.
+    pub fn take(mut self, w: &mut World) {
+        w.gui = self.child.take();
+        w.ctl_sock = std::mem::take(&mut self.sock);
+        w.token = std::mem::take(&mut self.token);
+        w.gui_log = std::mem::take(&mut self.log);
+    }
+}
+
+impl Drop for Successor {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
     }
 }
 

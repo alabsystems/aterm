@@ -444,7 +444,7 @@ fn cli_rows(
     }
     let mut placed = placed.into_iter().peekable();
     for (row, key) in ai.clis.iter().zip(&keys) {
-        rows.push(cli_status_row(row, width, inner));
+        rows.push(cli_status_row(row, width, inner, row_room));
         if placed
             .peek()
             .is_some_and(|switch| switch.key == key.as_str())
@@ -470,15 +470,41 @@ fn quiet_line(key: &str, text: &str, width: f32) -> (UiNode, f32) {
 }
 
 /// One CLI's status row: its name and version over its state and fact
-/// (fitted to the text column; the row's group carries both whole), and its
+/// (each wrapped whole to the text column; the row's group carries both), and its
 /// Sign in or Install where it needs a person. A row on a line where the
 /// measure allows; stacked on a compact page.
-fn cli_status_row(row: &AiCliRow, width: SettingsWidth, inner: f32) -> (UiNode, f32) {
+///
+/// A ONE-LINE ROW TALLER THAN A SCREEN STACKS (`row_room`, what one row of
+/// the card may take): its words over its button, a column the list lists
+/// a line at a time, so every line of it is whole on some screen — a row
+/// cannot be listed in parts, and at 2× text in a 182pt-tall window its
+/// fact's lines beside Install stood taller than the list.
+fn cli_status_row(
+    row: &AiCliRow,
+    width: SettingsWidth,
+    inner: f32,
+    row_room: f32,
+) -> (UiNode, f32) {
+    let stacked = width == SettingsWidth::Compact;
+    let laid = cli_status_row_as(row, width, inner, stacked);
+    if !stacked && laid.1 > row_room + 0.01 {
+        return cli_status_row_as(row, width, inner, true);
+    }
+    laid
+}
+
+/// [`cli_status_row`] on one line beside its button, or stacked
+/// (`compact`): its words over its button, each the column's width.
+fn cli_status_row_as(
+    row: &AiCliRow,
+    width: SettingsWidth,
+    inner: f32,
+    compact: bool,
+) -> (UiNode, f32) {
     let scale = settings_text_scale();
     let title_height = 22.0_f32.max(18.0 * scale);
     let detail_height = 18.0_f32.max(16.0 * scale);
     let control_height = scaled_control_height();
-    let compact = width == SettingsWidth::Compact;
     let key = format!("ai/cli/{}", row.id);
     let button = row.act.map(|act| {
         let label = act.label();
@@ -515,11 +541,14 @@ fn cli_status_row(row: &AiCliRow, width: SettingsWidth, inner: f32) -> (UiNode, 
                     } else {
                         Length::Fixed(button_width)
                     })
-                    .height(if compact {
-                        Length::Fixed(control_height)
+                    // Beside words on lines, the band a one-line row's
+                    // control has, at the row's top: never stretched down
+                    // a row its words make taller.
+                    .height(Length::Fixed(if compact {
+                        control_height
                     } else {
-                        Length::Fill
-                    }),
+                        width.row_height() - 8.0
+                    })),
             ),
             button_width,
         )
@@ -532,78 +561,30 @@ fn cli_status_row(row: &AiCliRow, width: SettingsWidth, inner: f32) -> (UiNode, 
         }
         _ => inner,
     };
-    let text = |suffix: &str, text: String, role: SemanticRole, style: StyleRef, height: f32| {
-        UiNode::new(
-            format!("{key}/{suffix}"),
-            UiContent::Text(TextSpec { text, role, style }),
-        )
-        .layout(
-            Layout::default()
-                .width(Length::Fill)
-                .height(Length::Fixed(height)),
-        )
-        .paint_only()
-    };
-    // The name and version, and whether it is the preferred one: whole on
-    // one line where it fits; on a stacked row wrapped to the column; beside
-    // a button, the facts after the name dropped at a " · " joint before the
-    // name itself is cut ("Claude Code · p…").
-    let (title, title_height) = if compact {
-        wrapped_words_node(
-            &format!("{key}/title"),
-            &row.title,
-            (SemanticRole::Text, StyleRef::Primary),
-            text_width,
-            title_height,
-        )
-    } else {
-        let (px, face) =
-            crate::native_ui::text_paint_metrics(SemanticRole::Text, StyleRef::Primary);
-        let fits = |line: &str| {
-            crate::tray_raster::ui_text_width_for(face, line, px)
-                <= text_width + crate::native_ui::TEXT_FIT_SLACK
-        };
-        let parts = row.title.split(FACT_SEPARATOR).collect::<Vec<_>>();
-        let words = (1..=parts.len())
-            .rev()
-            .map(|kept| parts[..kept].join(FACT_SEPARATOR))
-            .find(|words| fits(words))
-            .unwrap_or_else(|| crate::native_ui::fit_native_text_label(&row.title, text_width));
-        (
-            text(
-                "title",
-                words,
-                SemanticRole::Text,
-                StyleRef::Primary,
-                title_height,
-            ),
-            title_height,
-        )
-    };
+    // THE NAME AND THE FACT ARE WHOLE ON EVERY ROW: each wrapped to the
+    // text column ([`wrapped_words_node`]) — between words, a path at its
+    // folders — and the row as tall as its lines, on a stacked row and on a
+    // one-line row beside its button alike. A one-line row cut its fact to
+    // one line: at 2× text in a 1564pt window (the page's 720pt measure, a
+    // 434pt column beside Install and Reset's place) it read "not installed
+    // by aterm (a… …/reroute/claude)", two ellipses, the words saying what
+    // sits at that path gone, while the card's health line wrapped.
+    let (title, title_height) = wrapped_words_node(
+        &format!("{key}/title"),
+        &row.title,
+        (SemanticRole::Text, StyleRef::Primary),
+        text_width,
+        title_height,
+    );
     let title = title.paint_only();
-    // A stacked row's detail wraps to the column, whole, a path at its
-    // folders; a one-line row's is cut honestly ([`fit_keeping_path_tail`]).
-    let (detail, detail_height) = if compact {
-        let (node, height) = wrapped_words_node(
-            &format!("{key}/detail"),
-            &row.detail,
-            (SemanticRole::Status, StyleRef::Quiet),
-            text_width,
-            detail_height,
-        );
-        (node.paint_only(), height)
-    } else {
-        (
-            text(
-                "detail",
-                fit_keeping_path_tail(&row.detail, row.path.as_deref(), text_width),
-                SemanticRole::Status,
-                StyleRef::Quiet,
-                detail_height,
-            ),
-            detail_height,
-        )
-    };
+    let (detail, detail_height) = wrapped_words_node(
+        &format!("{key}/detail"),
+        &row.detail,
+        (SemanticRole::Status, StyleRef::Quiet),
+        text_width,
+        detail_height,
+    );
+    let detail = detail.paint_only();
     let label = format!("{}: {}", row.title, row.detail);
     if compact {
         let mut children = vec![title, detail];
@@ -654,102 +635,6 @@ fn cli_status_row(row: &AiCliRow, width: SettingsWidth, inner: f32) -> (UiNode, 
             .children(children),
         height,
     )
-}
-
-/// A CLI'S DETAIL LINE, ONE LINE, CUT HONESTLY (item A5 of the round-9
-/// narrow sweep): `text` whole where it fits `width` in the quiet status type
-/// it paints in; else, where it names `path` (a copy aterm does not manage,
-/// [`crate::ai_screen::AiCli::path`]), the path cut in its middle, its tail
-/// kept — the binary's name and its folder (`/Users/…/bin/claude`, then
-/// `…/bin/claude`) — the words around it whole; else the words before the
-/// path cut at a word, then the path's tail; and never the path's last
-/// component cut. A line with no path is cut at a joint or a word. The row's
-/// accessible name says it whole. The end of the line used to go, the path's
-/// tail — the part that says where the copy is — first; and a path found by
-/// looking for the next space lost everything after "Application" of
-/// `~/Library/Application Support/…`, its binary included.
-pub(super) fn fit_keeping_path_tail(text: &str, path: Option<&str>, width: f32) -> String {
-    let (px, face) = crate::native_ui::text_paint_metrics(SemanticRole::Status, StyleRef::Quiet);
-    let fits = |line: &str| {
-        crate::tray_raster::ui_text_width_for(face, line, px)
-            <= width + crate::native_ui::TEXT_FIT_SLACK
-    };
-    if fits(text) {
-        return text.to_string();
-    }
-    let Some((start, path)) = path
-        .filter(|path| !path.is_empty())
-        .and_then(|path| text.find(path).map(|at| (at, path)))
-    else {
-        return cut_at_joint_or_word(text, width, &fits);
-    };
-    let (before, after) = (&text[..start], &text[start + path.len()..]);
-    // The path's shorter forms, longest first ([`crate::native_ui::path_forms`]).
-    let forms: Vec<String> = crate::native_ui::path_forms(path)
-        .into_iter()
-        .map(|(form, _, _)| form)
-        .collect();
-    let shortest = forms.last().cloned().unwrap_or_else(|| path.to_string());
-    if let Some(line) = forms
-        .iter()
-        .map(|form| format!("{before}{form}{after}"))
-        .find(|line| fits(line))
-    {
-        return line;
-    }
-    // The words before the path cut back a word at a time, and what follows
-    // it kept where it fits: a `)` that closes the path's sentence only where
-    // the words kept open it, and what the line says after that ("(not
-    // measured in this build)") before it is given up.
-    let words = before.split_whitespace().collect::<Vec<_>>();
-    let rest = after.strip_prefix(')').unwrap_or(after);
-    for kept in (1..words.len()).rev() {
-        let lead = words[..kept].join(" ");
-        let opened = lead.matches('(').count() > lead.matches(')').count();
-        let closes: [&str; 2] = if opened { [after, ")"] } else { [rest, ""] };
-        if let Some(line) = closes
-            .iter()
-            .map(|close| format!("{lead}\u{2026} {shortest}{close}"))
-            .find(|line| fits(line))
-        {
-            return line;
-        }
-    }
-    if fits(&shortest) {
-        return shortest;
-    }
-    // Not even the tail with its folder: the binary's name, whole.
-    path[crate::native_ui::path_name_start(path)..].to_string()
-}
-
-/// A line with no path cut honestly: back to its last ` · ` joint that fits
-/// with ` · …` after it, saying facts follow ("ok · signed in (Max) · …");
-/// else back to its last whole word with `…` after it; never inside a word
-/// where a word fits.
-fn cut_at_joint_or_word(text: &str, width: f32, fits: &dyn Fn(&str) -> bool) -> String {
-    let parts = text.split(FACT_SEPARATOR).collect::<Vec<_>>();
-    if let Some(line) = (1..parts.len())
-        .rev()
-        .map(|kept| {
-            format!(
-                "{}{FACT_SEPARATOR}\u{2026}",
-                parts[..kept].join(FACT_SEPARATOR)
-            )
-        })
-        .find(|line| fits(line))
-    {
-        return line;
-    }
-    let words = text.split_whitespace().collect::<Vec<_>>();
-    (1..words.len())
-        .rev()
-        .map(|kept| {
-            let lead = words[..kept].join(" ");
-            let lead = lead.trim_end_matches(FACT_SEPARATOR.trim()).trim_end();
-            format!("{lead}\u{2026}")
-        })
-        .find(|line| fits(line))
-        .unwrap_or_else(|| crate::native_ui::fit_native_status_label(text, width))
 }
 
 /// The page's action under the THIS MACHINE card: Refresh, busy while a look
