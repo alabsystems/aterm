@@ -2321,7 +2321,7 @@ setup_aterm() { # <verb> <bin-dir> <store-dir> <app-dir>...
 # is how the uninstall sweep knows one, whatever its name. A hand copy of
 # aterm_types::argv0::ALIASES (crates/aterm-types/src/argv0.rs): a name added
 # there is added here.
-STORE_ALIASES="aterm-cli aterm-ctl atpkg abrew atpkg-abrew aterm-fleet aterm-drive aterm-askpass aterm-link aterm-gui amacs"
+STORE_ALIASES="aterm-cli aterm-ctl atpkg abrew atpkg-abrew agh aterm-fleet aterm-drive aterm-askpass aterm-link aterm-gui amacs"
 
 # _dir_split <path> <head-var> <tail-var>: the deepest directory on <path> that
 # exists, resolved (cd -P), and the part below it still to be created, without
