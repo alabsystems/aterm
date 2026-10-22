@@ -306,7 +306,7 @@ impl AdoptionProof {
 /// already in scope in `run_handoff_worker`), and forks otherwise, so an older
 /// successor is never handed descriptors it has no code to receive.
 ///
-/// A REFUSAL NAMES ITS INPUT (warm successor P6, finding 2): an unstamped
+/// A REFUSAL NAMES ITS INPUT (warm successor P6): an unstamped
 /// build's `unknown` commit used to come back as a bare `None`, which the
 /// outgoing process reported as "handoff identity set exceeds the proof
 /// format" — the session count's words over a refusal of the commit.
@@ -1662,7 +1662,7 @@ impl WireCaps {
     /// both directions of a hop. An older successor from
     /// [`RELAXED_CONSUMER_FROM_BUILD`] on admits this build's ceilings, but
     /// what it restores beyond the screen is not known from here, so it is
-    /// handed no parser or output state (round eight's lead U24: such a hop
+    /// handed no parser or output state (such a hop
     /// was priced as v0.91.0's, and a pane past 32 Ki cells crossed blank).
     #[must_use]
     #[cfg(any(unix, test))]
@@ -5506,7 +5506,7 @@ pub(crate) const EXIT_SUCCESSOR_PASSING: i32 = 75;
 /// Whether a successor that refused its target leaves with [`EXIT_SUCCESSOR_PASSING`] instead
 /// of the ordinary refusal's clean `0`.
 ///
-/// THE FIELD SHAPE (round four, plan item 2): on the download lane the outgoing
+/// THE FIELD SHAPE (plan item 2): on the download lane the outgoing
 /// process launched ITS OWN image, which boot-applied the staged build and
 /// re-exec'd into it (a fork-lane child, or a successor an older build launches,
 /// still does; since 2026-10-19 the launched lane's parent swaps first,
@@ -6786,8 +6786,8 @@ const fn follows_policy_without_saying_so(build: u64) -> bool {
     build >= FIRST_POLICY_FOLLOWING_BUILD && build < FIRST_WITHHELD_SAYING_BUILD
 }
 
-/// THE SUCCESSOR'S OWN REQUEST, read back (round eight of the update audit,
-/// finding 87): whether the handoff policy THIS build's bundle seals asked the
+/// THE SUCCESSOR'S OWN REQUEST, read back:
+/// whether the handoff policy THIS build's bundle seals asked the
 /// producer that wrote `outgoing_build` to carry no scrollback (`carry =
 /// "visible"` or `"repaint"`, `aterm_update_core::handoff_policy`), for a
 /// producer that would follow it and could not say so.
@@ -7191,7 +7191,7 @@ fn take_incoming_from_as(env: &mut HandoffEnv, shape: ReceiverShape) -> Incoming
                     loader: rec.loader,
                     // The history carry, imported after Commit.
                     history,
-                    // THE STANDING HALTS (round four, item 3): the rows as the
+                    // THE STANDING HALTS: the rows as the
                     // record carried them, one per origin, read FAIL-CLOSED at
                     // the seed (`spawn::seed_adopted_fabric`) — whatever rung
                     // the screen crossed at, and whether or not the proof

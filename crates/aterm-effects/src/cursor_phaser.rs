@@ -159,7 +159,7 @@ impl CursorPhaser {
     /// the blink cadence.
     #[inline]
     #[must_use]
-    pub fn is_active(&self) -> bool {
+    pub const fn is_active(&self) -> bool {
         self.energy > SETTLED_ENERGY
     }
 

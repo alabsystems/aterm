@@ -190,8 +190,8 @@ fn a_vendor_answer_is_kept_only_as_a_whole_label() {
     assert_eq!((steps, target), (1, AnswerTarget::Option(2)), "{d:?}");
 }
 
-/// A security alert's model switch stays on the current model (owner ruling,
-/// 2026-10-16): Claude Code's `Model switch` dialog, raised because the
+/// A security alert's model switch stays on the current model (owner ruling):
+/// Claude Code's `Model switch` dialog, raised because the
 /// model's safeguards flagged a message, is answered with its `Stay on <model>`
 /// option — never auto-downgraded — instead of escalated. Its `1. Switch
 /// automatically` option would otherwise be `kept` for a person ([`kept`]).

@@ -1434,7 +1434,7 @@ fn the_disk_report_names_nothing_removable_by_default_and_is_journalled() {
     assert_eq!(rows.lines().count(), 2, "{rows}");
 }
 
-/// THE VERB HOLDS THE SYSTEM'S ERROR BOXES OFF (wave 3's soundness review,
+/// THE VERB HOLDS THE SYSTEM'S ERROR BOXES OFF (
 /// its first finding): `aterm harness disk` canonicalizes its roots and the
 /// tabs' directories and walks build directories, and on Windows a query of
 /// an empty card reader or optical drive otherwise puts a box on the
@@ -7143,7 +7143,7 @@ fn the_sweep_rows_say_why_each_build_cache_went() {
     let tmp = tmp_dir("sweep-why");
     let state = tmp.path().join("state");
     let path = Path::new("/c/ws/.cargo-build");
-    let cases: [(Unused, &[&str]); 4] = [
+    let cases: [(Unused, &[&str]); 5] = [
         (
             Unused::Gone {
                 idle: std::time::Duration::from_secs(26 * 3_600),
@@ -7165,6 +7165,13 @@ fn the_sweep_rows_say_why_each_build_cache_went() {
                 after: RECLAIM_STALE,
             },
             &["2 incremental", "5 unit", "3d"],
+        ),
+        (
+            Unused::Tooling {
+                idle: std::time::Duration::from_secs(40 * 86_400),
+                after: atpkg::build_cache::RECLAIM_IDLE,
+            },
+            &["40d", "30d", "verify provision"],
         ),
     ];
     for (why, _) in cases {

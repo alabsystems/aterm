@@ -23,7 +23,7 @@
 //! closes along that path: a tracker that splits one turn into two, or
 //! supersedes its own turn, is not the model's.
 //!
-//! Inputs (phase 5, ruling T1): the host ADMITS an input under the lock it
+//! Inputs: the host ADMITS an input under the lock it
 //! takes before a byte (`TurnTracker::admit`) and ACCEPTS it after the write
 //! (`TurnTracker::accept`), the model's `AdmitCtl` or `AdmitHarness` (by
 //! the input's actor, phase 6, 6A-5) and `Accept`, one in flight
@@ -1398,7 +1398,7 @@ fn turn_tracker_conformance_rejects_early_and_unknown_closes() {
     );
 }
 
-/// NEGATIVE CONTROLS for the transcript (rulings S2, S4): a turn end never
+/// NEGATIVE CONTROLS for the transcript: a turn end never
 /// closes a turn the screen's wall is open under (the wall's need outlives
 /// it), and a refutation shuts the wall and its settle together.
 #[test]
@@ -1475,7 +1475,7 @@ fn turn_tracker_conformance_rejects_tx_closes_that_take_a_wall() {
     assert_eq!(project(&rig, None)["cw"], 12);
 }
 
-/// NEGATIVE CONTROLS for who dismissed a box (ruling T1): each mutant's
+/// NEGATIVE CONTROLS for who dismissed a box: each mutant's
 /// successor, hand-built from a real state, is one the model refuses, the
 /// `Buggy = 2` family's mutant admits, and its law breaks; the real tracker
 /// takes the model's step from the same state instead.

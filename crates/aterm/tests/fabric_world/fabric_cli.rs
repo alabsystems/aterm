@@ -841,8 +841,8 @@ fn publish(sock: &str, records: &[(String, String)]) -> Vec<u64> {
         .collect()
 }
 
-/// **`aterm link broker` OPENS WITH THE ONE CONSTRUCTOR** (session log Phase 6
-/// step 6E-2, ruling U24): the production broker binary retains its log by
+/// **`aterm link broker` OPENS WITH THE ONE CONSTRUCTOR**:
+/// the production broker binary retains its log by
 /// `aterm_link::broker_rules::default_rules` and its `Hello` advertises
 /// exactly them, as the world's in-process broker does
 /// (`broker_retention`'s test); a restart, on the same log, sets them again

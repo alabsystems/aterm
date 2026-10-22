@@ -6,7 +6,7 @@
 //! trait so the writer and the reader run the same on a real directory
 //! ([`PinnedJournalFs`]) and on a test's ([`MemFs`], with faults injected).
 //!
-//! The rules (rulings R2, R3, R9, R10):
+//! The rules:
 //! - The directory is `<logs>/session-log`, pinned (`crate::pinned_dir`):
 //!   every operation is relative to the retained descriptor, so a symlink
 //!   anywhere in the path, or a directory swapped in later, is never
@@ -200,7 +200,7 @@ mod real {
         /// `<logs>/session-log`, pinned. `create`: the writer's, which makes
         /// it (0700) when absent and resets a wider mode on its own; a reader
         /// passes `false` and gets `Ok(None)` for a directory that does not
-        /// exist, creating nothing (ruling R10). A symlink, a non-directory
+        /// exist, creating nothing. A symlink, a non-directory
         /// or another user's directory is an `Err`.
         pub(crate) fn open(logs: &Path, create: bool) -> io::Result<Option<PinnedJournalFs>> {
             let logs = match PinnedDir::open_resolved(logs) {

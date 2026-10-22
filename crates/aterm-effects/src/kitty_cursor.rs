@@ -389,7 +389,7 @@ impl CatFrame {
     /// head (S115), Enter's maneki celebration.
     #[must_use]
     #[inline]
-    pub fn render_look(&self) -> KittyLook {
+    pub const fn render_look(&self) -> KittyLook {
         // The goodbye face waits until the fade is visible: the flourish is rolled at the LOW
         // crossing while alpha is still ~255 and a revive resets `exit`, so an immediate swap
         // would flash one full-opacity frame. `Startled` shares the S121 art but is no exit.
@@ -645,11 +645,11 @@ impl CursorCat {
     /// letting it survive the fence would make the sprite jump to an unrelated
     /// cell.
     #[inline]
-    pub fn retire_unowned_cursor_motion(&mut self) {
+    pub const fn retire_unowned_cursor_motion(&mut self) {
         if self.collection_hello || self.sing > 0.0 || matches!(self.state, State::Hidden) {
             return;
         }
-        self.momentum = TypingMomentum::default();
+        self.momentum.reset();
         self.sustain = 0.0;
         self.run_keys = 0;
         self.last = None;
@@ -821,7 +821,7 @@ impl CursorCat {
     /// keeps its own gate); a latched look lands here. The FadeOut revive is the same
     /// appearance and keeps the latched look.
     #[inline]
-    fn summon(&mut self, now: Instant) {
+    const fn summon(&mut self, now: Instant) {
         self.sustain = 0.0;
         self.run_keys = 0;
         self.colors = None;
@@ -981,7 +981,7 @@ impl CursorCat {
     /// to 1.0, since holding a key at repeat cadence is the celebration's premise; an armed
     /// celebration skips the dwell but still owes [`MIN_RUN_KEYS`].
     #[inline]
-    pub fn set_singing(&mut self, now: Instant, sync: SingSync) {
+    pub const fn set_singing(&mut self, now: Instant, sync: SingSync) {
         self.sing = if sync.drive.is_finite() {
             sync.drive.clamp(0.0, 1.0)
         } else {
@@ -1007,12 +1007,16 @@ impl CursorCat {
     /// While on screen it parks until the next appearance (a mid-fade revive is the same
     /// appearance); while hidden it applies at once. [`Self::on_collect`] replaces it at once.
     #[inline]
-    pub fn set_look(&mut self, look: KittyLook) {
+    pub const fn set_look(&mut self, look: KittyLook) {
         let look = look.normalized();
         if self.is_active() || self.collection_hello {
             // On screen (or a paused hello is outstanding): defer. A sync matching the
             // current look clears the slot.
-            self.pending_look = (look != self.look).then_some(look);
+            self.pending_look = if !look.eq_const(&self.look) {
+                Some(look)
+            } else {
+                None
+            };
         } else {
             self.look = look;
             self.pending_look = None;
@@ -1093,9 +1097,12 @@ impl CursorCat {
     }
 
     #[inline]
-    fn collection_sample_time(&self, now: Instant) -> Instant {
+    const fn collection_sample_time(&self, now: Instant) -> Instant {
         if self.collection_hello {
-            self.collection_paused_at.unwrap_or(now)
+            match self.collection_paused_at {
+                Some(paused) => paused,
+                None => now,
+            }
         } else {
             now
         }
@@ -1409,7 +1416,7 @@ impl CursorCat {
     /// Settle a finished flight or collection hello back to `State::Hidden`,
     /// applying any parked look and clearing per-appearance state.
     #[inline]
-    fn settle_hidden(&mut self) {
+    const fn settle_hidden(&mut self) {
         self.state = State::Hidden;
         self.flight = None;
         self.fold = None;
@@ -1555,8 +1562,14 @@ impl CursorCat {
     /// Freeze the first footprint palette sample of this visible episode, so later frames
     /// keep the same atlas tile when the colours beneath the cat change.
     #[inline]
-    pub fn colors_for_episode(&mut self, sampled: CatColorKey) -> CatColorKey {
-        *self.colors.get_or_insert(sampled)
+    pub const fn colors_for_episode(&mut self, sampled: CatColorKey) -> CatColorKey {
+        match self.colors {
+            Some(c) => c,
+            None => {
+                self.colors = Some(sampled);
+                sampled
+            }
+        }
     }
 
     /// The already-frozen palette, if any: the host checks it before its footprint walk,

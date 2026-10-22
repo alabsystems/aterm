@@ -678,7 +678,7 @@ fn a_repainted_session_keeps_its_ledger_and_archive_rows() {
     staged.teardown();
 }
 
-/// Round eight, finding 73: a session this receiver degrades because its
+/// a session this receiver degrades because its
 /// screen meta did not parse adopts onto a blank engine — no checkpoint at
 /// all, the one degrade that has none — and keeps its archive rows as well
 /// as its ledger. The engine is put back by the product's own call

@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE CODEX ROLLOUT TAP (session log 5G-3; plan amendment A1, step 6D-3b;
-//! ruling T15): the reader that hands a codex-alab's own rollout to the
+//! THE CODEX ROLLOUT TAP (plan amendment A1):
+//! the reader that hands a codex-alab's own rollout to the
 //! Codex step fold ([`super::codex_steps`]), so the session log takes its
 //! turns, tools, tokens and usage wall as it takes a Claude Code
 //! transcript's. The host keeps one per session on its own thread
@@ -38,13 +38,13 @@
 //! floor (the latest of the run's floor, its open and the process's start,
 //! [`RolloutTap::arm`]) are history: folded, never queued. A file replaced
 //! at its path (another identity) or cut below where the read stood is bound
-//! again, fed from its first byte, and is history up to its length then
-//! (ruling S1), unless it is the very file the watermark names; so is a file
+//! again, fed from its first byte, and is history up to its length then,
+//! unless it is the very file the watermark names; so is a file
 //! at the path the watermark names under another identity, whichever tap
 //! binds it.
 //!
 //! Nothing is kept of a row but what the fold keeps (ids, a tool's bounded
-//! name, class words, numbers: ruling S6); the gate reads the first row
+//! name, class words, numbers); the gate reads the first row
 //! through the same key-only projection, so the base instructions it holds
 //! are validated, never materialized.
 
@@ -315,7 +315,7 @@ impl RolloutTap {
     /// Find the thread's rollout, hold its first row to the [`gate`], and
     /// bind the fold to it at the build it names. The seed: the run's
     /// watermark on this very file; else the file's length when the file
-    /// replaced one read before (ruling S1: history up to where it stands)
+    /// replaced one read before (history up to where it stands)
     /// — one this tap bound, or the one at the path the watermark names,
     /// whichever tap read it; else none (a file no watermark names: the
     /// floor makes what it held before the process history). The file

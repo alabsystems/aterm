@@ -834,13 +834,17 @@ mod tests {
         assert!(!term.drain_bell(), "flag is cleared after draining");
     }
 
-    /// BELS UNDER 100 MS APART RING ONCE, as `status bells=` says of its
+    /// BELS RING AT MOST ONCE PER 100 MS, as `status bells=` says of its
     /// count: the throttle, on the batch's clock, comes before the bell
     /// callback the host counts, so one write's `\a\a\a` and a second write
-    /// 99 ms later are one bell. NEGATIVE CONTROL: a BEL 100 ms after the
-    /// first rings again.
+    /// 99 ms later are one bell, and a flood (a BEL every 60 ms for 1.2 s)
+    /// rings once each time 100 ms have passed since the last bell that rang
+    /// — at 0, 120, … 1200 ms, 11 bells for 21 BELs — never once for the
+    /// whole flood. NEGATIVE CONTROLS: a BEL 100 ms after the first rings
+    /// again, and the flood's BELs at 60, 180, … 1140 ms, each under 100 ms
+    /// past the last that rang, do not.
     #[test]
-    fn bels_under_a_hundred_ms_apart_ring_once() {
+    fn bels_ring_at_most_once_per_hundred_ms() {
         use std::sync::Arc;
         use std::sync::atomic::{AtomicU64, Ordering};
         use std::time::Duration;
@@ -866,6 +870,28 @@ mod tests {
         term.process_at(b"\x07", at(100));
         assert_eq!(rang.load(Ordering::Relaxed), 2, "a bell 100 ms on rings");
         assert_eq!(term.bell_total(), 2);
+
+        // A flood, well clear of the bells above: one BEL every 60 ms.
+        let flood = 10_000;
+        let mut rang_at = Vec::new();
+        for i in 0..21u64 {
+            let before = term.bell_total();
+            term.process_at(b"\x07", at(flood + i * 60));
+            if term.bell_total() > before {
+                rang_at.push(i * 60);
+            }
+        }
+        assert_eq!(
+            rang_at,
+            (0..=10u64).map(|k| k * 120).collect::<Vec<_>>(),
+            "a flood rings once each 100 ms, not once"
+        );
+        assert_eq!(
+            rang.load(Ordering::Relaxed),
+            2 + 11,
+            "the callback each time"
+        );
+        assert_eq!(term.bell_total(), 2 + 11);
     }
 
     /// OSC 7 queues the parsed cwd as an app-event and updates the terminal's

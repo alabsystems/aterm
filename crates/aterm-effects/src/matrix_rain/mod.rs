@@ -814,7 +814,7 @@ impl MatrixRain {
     }
 
     #[cfg(test)]
-    pub(crate) fn material_editing_for_test(&self) -> bool {
+    pub(crate) const fn material_editing_for_test(&self) -> bool {
         self.material_editing
     }
 
@@ -848,7 +848,7 @@ impl MatrixRain {
     /// useless wake redraws: false when disabled or under reduced motion.
     #[must_use]
     #[inline]
-    pub fn notes_can_wake(&self) -> bool {
+    pub const fn notes_can_wake(&self) -> bool {
         self.cfg.enabled
             && !self.reduced_motion
             && (!self.cfg.output_material || !self.material.is_empty())
@@ -1406,17 +1406,17 @@ impl MatrixRain {
     /// live. Both move only when a note reached the engine and a frame
     /// applied it.
     #[cfg(test)]
-    pub(crate) fn heard_for_test(&self) -> (RainSignal, bool) {
+    pub(crate) const fn heard_for_test(&self) -> (RainSignal, bool) {
         (self.semantic_phase, self.clock_ms < self.fail_until_ms)
     }
 
     #[cfg(test)]
-    pub(crate) fn literal_material_chars_for_test(&self) -> &[char] {
-        &self.material_chars
+    pub(crate) const fn literal_material_chars_for_test(&self) -> &[char] {
+        self.material_chars.as_slice()
     }
 
     #[cfg(test)]
-    pub(crate) fn config_for_test(&self) -> RainConfig {
+    pub(crate) const fn config_for_test(&self) -> RainConfig {
         self.cfg
     }
 
@@ -1712,13 +1712,13 @@ impl MatrixRain {
             .extend((0..u32::from(cols)).map(|c| col_params(&fp, c)));
     }
 
-    fn field_params(&self, rows: u16) -> FieldParams {
+    const fn field_params(&self, rows: u16) -> FieldParams {
         FieldParams {
             seed32: self.seed32,
-            rows: u32::from(rows),
+            rows: rows as u32,
             tick_ms: self.tick_ms,
-            speed: u32::from(self.cfg.speed),
-            trail: u32::from(self.cfg.trail),
+            speed: self.cfg.speed as u32,
+            trail: self.cfg.trail as u32,
             mq: self.mq,
             dq: self.dq,
             sq: self.sq,
@@ -2152,13 +2152,13 @@ impl MatrixRain {
     /// hoisted ahead of the per-cell trail math in [`Self::emit_column`]; the
     /// trail loop then asks only [`Self::cell_unmasked`].
     #[inline]
-    fn occ_bit(&self, row: u32, col: u16) -> bool {
-        let (r, c) = (row as usize, usize::from(col));
+    const fn occ_bit(&self, row: u32, col: u16) -> bool {
+        let (r, c) = (row as usize, col as usize);
         if r >= self.occ_rows || c >= self.occ_cols {
             return false;
         }
         let bit = r * self.occ_cols + c;
-        (self.occ[bit / 64] >> (bit % 64)) & 1 == 1
+        (self.occ.as_slice()[bit / 64] >> (bit % 64)) & 1 == 1
     }
 
     /// Tier-A + Tier-B mask: occupancy bit, cursor band, live selection.
@@ -2268,19 +2268,39 @@ impl MatrixRain {
 
 /// Defensive clamps (the gui resolver owns the real ones; the engine must be
 /// safe for any embedder input).
-fn clamp_config(mut cfg: RainConfig) -> RainConfig {
-    cfg.fps = cfg.fps.clamp(12, 60);
-    cfg.density = cfg.density.clamp(1, 12);
-    cfg.speed = cfg.speed.clamp(1, 10);
-    cfg.trail = cfg.trail.clamp(1, 10);
-    cfg.mutation_ms = cfg.mutation_ms.clamp(80, 2000);
-    cfg.idle_secs = cfg.idle_secs.clamp(2, 120);
-    cfg.alpha_override = cfg
-        .alpha_override
-        .map(|a| a.clamp(RAIN_ALPHA_FLOOR, RAIN_ALPHA_CAP));
-    cfg.head_alpha_override = cfg
-        .head_alpha_override
-        .map(|a| a.clamp(RAIN_ALPHA_FLOOR, RAIN_ALPHA_CAP));
+const fn clamp_config(mut cfg: RainConfig) -> RainConfig {
+    const fn clamp_u8(v: u8, lo: u8, hi: u8) -> u8 {
+        if v < lo {
+            lo
+        } else if v > hi {
+            hi
+        } else {
+            v
+        }
+    }
+    const fn clamp_u16(v: u16, lo: u16, hi: u16) -> u16 {
+        if v < lo {
+            lo
+        } else if v > hi {
+            hi
+        } else {
+            v
+        }
+    }
+    cfg.fps = clamp_u8(cfg.fps, 12, 60);
+    cfg.density = clamp_u8(cfg.density, 1, 12);
+    cfg.speed = clamp_u8(cfg.speed, 1, 10);
+    cfg.trail = clamp_u8(cfg.trail, 1, 10);
+    cfg.mutation_ms = clamp_u16(cfg.mutation_ms, 80, 2000);
+    cfg.idle_secs = clamp_u16(cfg.idle_secs, 2, 120);
+    cfg.alpha_override = match cfg.alpha_override {
+        Some(a) => Some(clamp_u8(a, RAIN_ALPHA_FLOOR, RAIN_ALPHA_CAP)),
+        None => None,
+    };
+    cfg.head_alpha_override = match cfg.head_alpha_override {
+        Some(a) => Some(clamp_u8(a, RAIN_ALPHA_FLOOR, RAIN_ALPHA_CAP)),
+        None => None,
+    };
     cfg
 }
 

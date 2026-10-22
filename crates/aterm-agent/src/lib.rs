@@ -567,28 +567,18 @@ aterm drive — the window harness's readers, run by hand.
 
 MENTAL MODEL
     Every Claude Code, agy, Muse Code and Gemini CLI session in an aterm window is
-    ALREADY supervised by the window's own host, by default (`status
-    supervisor=aterm-harness@<pid>`), under aterm.toml's [harness] table: `aterm help harness` lists its keys and what
-    it does — every box its answer, a question its `answer_text`, a turn that ended
-    its continuation, a wall its retry, its reset or a relaunch. These commands are
-    that host's own knowledge, run from a terminal: whether a shell line is a read
-    (classify), what a worker's screen says (phase), a choice typed into its
-    question dialog (answer), and how its run went (ledger); `tape` and `replay`
-    read and run again a harness tape a hosted loop recorded. A vendor `codex` is
-    shown (its own OSC 7501 report is `status program_state=`), not supervised;
-    codex-alab supervises itself and the window only watches it.
-    Driving a session goes through `aterm ctl` (`aterm ctl help`): a Claude Code
-    WORKER is started on a task with `aterm ctl @self spawn agent=claude -` (the
-    task on stdin), waited on with `aterm ctl await task @<sid>,… since=0` run as a
-    background command (a later wait names `@<sid>:<rev>`), and read with
-    `aterm ctl @<sid> result`; any session is read with `aterm ctl @<sid> text`,
-    typed to with `turn`, captured with `image`, and waited on with `await`
-    (`await agent idle,prompt,question,wall` for an agent).
-    One session's `aterm ctl @sid meta set questions ask|recommended|long-term|short-term`
-    decides that session's questions over the table: a priority word answers its
-    dialogs and the questions it asks in prose by that priority; `ask` hands each
-    of its DIALOGS to a person or a controller (`answer` below), and a dialog it
-    holds is answered within 2 s of `meta unset questions`.
+    supervised by default (`status supervisor=aterm-harness@<pid>`) under `[harness]`
+    in `aterm.toml` (`aterm help harness`). `aterm drive` exposes that host's readers
+    and tape tools from a terminal: `classify`, `phase`, `answer`, `ledger`, `tape`,
+    and `replay`. Vendor `codex` publishes `status program_state=` and is not read
+    here; `codex-alab` supervises itself.
+    Driving a session goes through `aterm ctl` (`aterm ctl help`): spawn a worker with
+    `aterm ctl @self spawn agent=claude -`, wait with `aterm ctl await task @<sid>,… since=0`,
+    and read its report with `aterm ctl @<sid> result`; or use `text`, `turn`, `image`,
+    and `await` (`await agent idle,prompt,question,wall`).
+    `aterm ctl @sid meta set questions ask|recommended|long-term|short-term` sets a
+    session's question policy (`ask` hands dialogs to a person or `aterm drive answer`;
+    `meta unset questions` resumes window answering within 2 s).
 
 USAGE
     aterm drive [--socket PATH] <command>
@@ -597,7 +587,8 @@ USAGE
               | answer @sid [--box TOKEN] <answer...>
               | ledger [@sid] [--journal FILE] [--since TIME] [--format text|md|html] [--out PATH]
                        [--source anchor|log]
-              | tape cat FILE [--text] [--salvage] | tape show FILE --decisions | tape stats FILE
+              | tape cat FILE [--text] [--salvage] | tape show FILE --decisions [--salvage]
+              | tape stats FILE [--salvage]
               | tape ls [@sid] | tape forget FILE|@sid...
               | replay FILE [--until door=N]
               | replay FILE --set k=v... | --policy FILE [--set k=v...] [--until door=N]
@@ -609,449 +600,141 @@ USAGE
 
 COMMANDS
     classify [--allow-python GLOB]... <cmd...>
-                       Is this shell line READ-ONLY, the way the supervisor judges
-                       it? Prints `read-only` (exit 0) or `not-read-only <reason>`
-                       (exit 1). The flags come first; from the command's first
-                       word on, every word is the command's (`classify git log
-                       --oneline` works unquoted; `--` also ends the flags). The
-                       line is read as the shell reads it first: a `#` comment
-                       ends at its newline, a here-document body is data (one
-                       under an unquoted terminator that runs `$(…)` refuses),
-                       and `$'…'` with an escape, a `${…}` holding a quote or a
-                       substitution, and an unterminated quote all refuse. Then
-                       quoted strings are dropped, and every segment's HEAD must
-                       be a known read-only program (a program word elsewhere is
-                       data: `grep -rn open src` reads); a program named by a
-                       path outside /bin and /usr/bin is unknown; a wrapper is
-                       seen through (`xargs touch`, `env FOO=1 ./x.sh` are touch
-                       and ./x.sh), a shell keyword is one only where a command
-                       begins (`X=1 if …`, `2>/dev/null for …` and `env if …`
-                       run a program by that name), a `&` ends a segment like
-                       `;`, git needs a read-only subcommand and form (`git
-                       branch NAME` creates). Anywhere on the line, these
-                       refuse: git
-                       push/reset/commit…, `git -c`, `git --output`,
-                       `--ext-diff`, `git grep -O` in any spelling (`-nO`,
-                       `--open`), `git <cmd> --help` (it runs the configured
-                       man viewer), a redirect to a file (`>&file`
-                       too), sed -i, python3 -c, sort -o and
-                       --compress-program, rg --pre, printf -v, less +cmd,
-                       date -s, uniq IN OUT, find -fprint, and an assignment
-                       to PATH (unless every entry is a system bin dir), HOME,
-                       GIT_*, LD_*/DYLD_*, a pager or an editor. `aterm ctl`
-                       reads only by verb AND form (`meta` and `task` read,
-                       `meta set` and `task mark` write; `await task`,
-                       `result` and `survey` read, `spawn` writes), and so does
-                       `aterm drive` (`ledger` reads unless `--out` writes a
-                       file; `answer` writes). python3 runs only a script on the
-                       --allow-python globs (none by default; no `..`). The
-                       programs handed to awk and sed are read from the raw
-                       words: `system(`, a redirect or a pipe in awk, a `w`/`e`
-                       command or `s///w` flag in sed, a `-f` program file, all
-                       refuse. A tie breaks toward not-read-only.
-    phase [@sid]       One read, one word: busy | prompt | limited | idle |
-                       question. The worker is read by its own program's
-                       grammar (`status program=`, else what its screen shows:
-                       Claude Code's, agy's or Muse Code's), as the
-                       window's loops read it. For a prompt the parsed box
-                       follows: `kind`, `command`, `description`, one `note
-                       <text>` per note row (a Bash box's warning rows, e.g.
-                       the critical-path
-                       `rm` warning), `classify` (a Bash box), one `option N …`
-                       per option, then what Esc does — `cancel esc` (it
-                       leaves the box), `exit esc` (it quits the program: a
-                       trust dialog's), no line where nothing says — and
-                       for a question `box <token>`, its token for `answer
-                       --box`. For
-                       busy, `reason <where>: <rule>` names the signal that
-                       fired. For limited, `message <text>` and `reset
-                       <text|->`. aterm reads no Codex screen (its Codex
-                       screen lane was retired on 2026-10-16): on a Codex
-                       every read is `idle` with no evidence and names no box
-                       (`status agent=unknown`; its own state is `status
-                       program_state=`), so phase and answer read nothing
-                       there. What follows describes Claude Code's grammar.
-                       A prompt wins over busy, busy over limited,
-                       limited over question — except a busy that is only a
-                       background monitor: a question, a limit notice or any
-                       other wall the turn ended on (an API error, a lost login,
-                       a full context; read idle) outranks it (a persistent
-                       monitor can outlive any budget).
-                       Busy is read from the LIVE ZONE around Claude Code's
-                       composer, which sits between two full-width rules. The
-                       STATUS ROW is, walking up from the top rule, the first row
-                       that starts in column 0 with a spinner glyph, found before
-                       any transcript row (the worker's `⏺` message or tool call,
-                       output under the `⎿` gutter); what sits between it and the
-                       rule never hides it (a tip, a todo list, a hint of any
-                       length, a rating survey, a banner, a queued message).
-                       It is busy when it is a spinner running into an ellipsis,
-                       `Waiting for N …` (a dynamic workflow, a background agent)
-                       or a done row still counting `N shell(s) still running`;
-                       so is a `Still working` hint under it, and the FOOTER
-                       under the bottom rule: `esc to interrupt`, `Still
-                       working`, `ctrl+b to run in background`, `· N shell(s) ·`,
-                       a workflow's `◯ … agents done` line. A monitor still
-                       running (`N monitor(s) still running` on the status row,
-                       `· N monitor(s) ·` in the footer) is the soft busy above.
-                       A status row above a transcript row is history, not a
-                       signal, and so is anything above Claude Code's launch
-                       card or another composer's rule: a dead process's frame
-                       left over a new one (`/exit`, then `claude` with no
-                       `clear`) is not read as live. With no composer rules on
-                       the screen every row is scanned. The footer does not always say `esc to interrupt`
-                       while a turn runs, so the status row is the first signal.
-                       Limited is the usage-limit wall: nothing busy (a monitor
-                       aside), no box, and the last thing said above the
-                       composer (the done row, hints, tips, the survey and
-                       banners under it skipped) is a block under the `⎿`
-                       gutter that OPENS with a limit notice — `You've reached
-                       your … limit`, `You've hit your … limit`, a few words and
-                       `limit reached`, or `API Error` with a rate or usage
-                       limit — or the footer carries one. Anything
-                       said after a notice makes it history: a later turn (a
-                       background command's end or a monitor event starts one
-                       too), the `/model` output. The worker's own words about
-                       limits, the rows your message wrapped onto and a tool's
-                       output it went on to discuss never count, and neither does
-                       text that says `Approaching` a limit. The worker sits at an
-                       idle composer, and what you send it fails until the limit
-                       resets or its model is switched.
-                       A last line `survey 0` follows when one of Claude Code's
-                       rating surveys is OPEN above the composer — `● How is
-                       Claude doing this session?` in column 0 (or the
-                       long-context, plugin or memory card's own question row)
-                       over `1: Bad … 0: Dismiss`, only blank rows, a
-                       right-aligned hint or a tip between it and the top rule
-                       (a copy quoted in the transcript is not open). `0` is
-                       the key that dismisses it: `aterm ctl @sid key
-                       'if=^●.How.is.Claude.doing' 0` — the guard matches only
-                       a row that starts with `●` (the line for another kind
-                       names THAT card's own question row), so a copy quoted in
-                       the transcript (indented, or under `⎿`) lets no `0`
-                       through to the composer (quoted: `^` is a glob in zsh
-                       with extended_glob). While it is open, a turn whose first
-                       character is 1, 2 or 3 is taken as a rating — the human's
-                       to give, never yours. Dismiss it first. The card is one
-                       parked block, so a busy worker still reads busy under
-                       it; the transcript-share question, the web-setup offer
-                       and the drafted-feedback card are read the same way and
-                       are never pressed. A card the loop would not press (a shape
-                       nobody has words for that lacks the vendor's `(optional)`
-                       mark, or a question row no guard can fence) prints
-                       `survey withheld (<why>)` instead: read it with `aterm ctl
-                       @sid text`; a `0` for it is a person's call.
-                       A last line `context <n>%` follows (after any `survey 0`)
-                       while Claude Code's context indicator is up: `<n>% until
-                       auto-compact` (or `Context left until auto-compact: <n>%`)
-                       under the status row (with none, under the last transcript
-                       row) and above the top rule, alone on its row, ending
-                       against the right edge where the rules end (in a narrow
-                       pane too). A copy quoted in the transcript or in a tool's
-                       output does not count unless it, too, ends at that edge.
-                       That much of the worker's context is left before Claude
-                       Code auto-compacts it, replacing its history with a summary
-                       in which the rules you gave it may not survive.
+                       Judge whether <cmd...> is read-only: prints `read-only` (exit 0)
+                       or `not-read-only <reason>` (exit 1). Flags precede the command
+                       (`--` also ends flags). Parses shell syntax first (comments,
+                       heredocs, quotes, expansions, segments) and requires every
+                       segment head (looking through `env`/`xargs` wrappers) to be a
+                       known read-only program in `/bin` or `/usr/bin` (or a matching
+                       `--allow-python GLOB` script without `..`). Refuses file
+                       redirects, mutating flags/subcommands (`git push/reset/commit`,
+                       `git -c/--output/--ext-diff`, `git grep -O`, `git <cmd> --help`,
+                       `sed -i`, `awk` `system(`/redirects/pipes, `sed` `w`/`e`/`-f`,
+                       `python3 -c`, `sort -o/--compress-program`, `rg --pre`,
+                       `printf -v`, `less +cmd`, `date -s`, `uniq IN OUT`,
+                       `find -fprint`), and unsafe env assignments (`PATH`, `HOME`,
+                       `GIT_*`, `LD_*/DYLD_*`, pager/editor). `aterm ctl` and
+                       `aterm drive` are judged by verb and form (`meta`/`task`/
+                       `await task`/`result`/`survey`/`ledger` without `--out` read;
+                       `meta set`/`task mark`/`spawn`/`answer` write).
+    phase [@sid] [--allow-python GLOB]...
+                       Read @sid once using its foreground program's reader (`status
+                       program=`, else screen detection) and print:
+                         busy | prompt | limited | idle | question
+                       Followed by details for that phase:
+                         prompt:   `kind`, `command`, `description`, `note <text>`,
+                                   `classify` (Bash), `option N …`, and `cancel esc`
+                                   or `exit esc`
+                         question: `box <token>` (for `answer --box`) and options
+                         busy:     `reason <where>: <rule>` (from the live zone/footer)
+                         limited:  `message <text>` and `reset <text|->`
+                       Appends `survey 0` when a dismissible feedback survey is open
+                       (`survey withheld (<why>)` when withheld) and `context <n>%`
+                       when the context indicator (`<n>% until auto-compact`) is shown.
+                       Codex tabs always read `idle`.
     answer @sid [--box TOKEN] <answer...>
-                       Type YOUR choice into the worker's question, read by its
-                       own program's grammar (`status program=`, else what its
-                       screen shows). Claude Code's question dialog — the
-                       screen on display, one tab at a time: an
-                       option's number or exact label; for a multi-select the
-                       options to check, `, `-joined (each whose check differs
-                       is toggled, then its button); `submit` on the review
-                       tab; `recommended` (what the window presses under the
-                       `recommended` priority; on a multi-select the whole tab:
-                       each recommended option checked, then its button);
-                       `human` (nothing typed). A free-text answer is refused:
-                       that row is a person's (so is a multi-select whose row
-                       holds text, before any key); so are `long-term` and
-                       `short-term` where no option is labelled so — the
-                       window's own policy words: the refusal names `aterm ctl
-                       @sid meta set questions <word>`, which has the window
-                       answer by it. The keys are the window's own —
-                       the focus moved a row a key, each move seen landing,
-                       then Enter guarded on the chosen row under the screen
-                       fence; never a digit, Esc or a key on the free-text,
-                       chat or cancel row. agy's question (read by its
-                       answers' roles): an answer's number or exact label,
-                       `recommended` (the window's own: its `(Recommended)`
-                       answer, else the first) or `human`; the key is the
-                       answer's digit, guarded on the question's title row
-                       under the screen fence (a host without the fence:
-                       NOT-SERVED, nothing typed) — never Enter or Esc, and
-                       never a `None of the above`, which asks for a person's
-                       own words. Muse
-                       Code's question (read by its answers' roles too) takes
-                       no digit: the focus is moved to the answer, each move
-                       guarded on the question's own row and seen landing,
-                       then Enter on the answer's row, every key under the
-                       screen fence and the person fence; never Esc, and never
-                       `None of the above`. --box TOKEN (`phase`'s `box`) refuses another
-                       question, nothing typed. Take a worker's questions
-                       with `aterm ctl @sid meta set questions ask` (its window
-                       then raises each instead of answering it). Prints one
-                       line: `ANSWERED @sid enters=<k> answer=<what> next=<the
-                       question now on display|review|none>` (exit 0; <k> the
-                       answering keys: the Enters, agy's one digit, Muse
-                       Code's one Enter), `LEFT`
-                       (a person keyed the session, or `human`; exit 0),
-                       `NO-BOX` (exit 1), `REFUSED <why>` (exit 2, nothing
-                       typed) or `NOT-SERVED <why> (enters=<k>)` (exit 3).
+                       Send a choice to @sid's open question dialog under its program's
+                       grammar (`status program=`, else screen detection) and fences:
+                         Claude Code: option number or exact label; `, `-joined options
+                           for multi-select; `submit` on the review tab; `recommended`;
+                           or `human` (no keys sent). Moves focus row by row and presses
+                           Enter fenced on the target row (never digits, Esc, free-text,
+                           chat, or cancel).
+                         agy: option number, exact label, `recommended`, or `human`;
+                           sends the option digit fenced on the title row.
+                         Muse Code: option number, exact label, `recommended`, or
+                           `human`; moves focus and presses Enter under screen/person
+                           fences.
+                       `None of the above`, free-text rows, and policy words
+                       (`long-term`, `short-term` when not option labels; use
+                       `aterm ctl @sid meta set questions <word>`) are refused.
+                       `--box TOKEN` requires `phase`'s current `box` token.
+                       Prints:
+                         `ANSWERED @sid enters=<k> answer=<what> next=<question|review|none>` (exit 0)
+                         `LEFT` (person typed, or `human`; exit 0)
+                         `NO-BOX` (exit 1)
+                         `REFUSED <why>` (exit 2, nothing typed)
+                         `NOT-SERVED <why> (enters=<k>)` (exit 3)
     ledger [@sid] [--journal FILE] [--since TIME] [--format text|md|html] [--out PATH]
            [--source anchor|log]
-                       How the loop RAN, replayed on one time axis: what you
-                       sent, what the watcher decided, how big the worker's
-                       replies were, and the fabric mail in between. It joins
-                       four sources, and names the ones it could not read:
-                         * the worker's turn ledger (`history`): every turn, its
-                           start, and how the `turn` verb settled (`settled in
-                           1.8s`, `timeout after 6.0s`);
-                         * the size of the reply each turn drew, in rows, from
-                           ONE `offscreen tail=20000 max=20000 screen=1` read,
-                           the archived rows joined with the screen's — the rows
-                           from the turn's `❯` row to the next turn's (a turn
-                           whose own row is nowhere, queued or lost to a
-                           restart, is named in the count that holds its reply);
-                         * a supervisor's journal, --journal FILE, when given
-                           (one JSON object per line; the window's own host keeps
-                           one per session, <aterm state>/drive/<sid>.journal.jsonl):
-                           every EVENT, APPROVED, DISMISSED, RECONNECT, TIMEOUT
-                           and EXIT line, with the wall-clock time it was written;
-                         * this session's fabric mail with that worker — the
-                           `inbox --peek --meta` rows from it (nothing is listed
-                           or handled) and the `post` rows of this session's
-                           `timeline` addressed to it.
-                       SUMMARY counts the turns, the worker's busy time, your
-                       response latency (median and max from each EVENT idle or
-                       question to the next turn's start), approvals,
-                       dismissals, context warnings and compactions,
-                       reconnects, and mail in and out. TIMELINE is one row
-                       per item in time order: time, lane (manager | worker |
-                       watcher | fabric), what, and the duration or latency.
-                       --format text (the default) aligns columns, md writes
-                       tables, html writes ONE
-                       self-contained page — inline style and script, nothing
-                       fetched — with the manager, watcher and worker swimlanes
-                       on a time axis and the fabric's mail on a fourth, turns
-                       as bars, the whole line on hover, and the same rows as a
-                       table under it. --out PATH writes it there, created
-                       0600, and prints the path instead — the window's LEDGER
-                       KEY (⇧⌘L on macOS, Ctrl+Shift+L elsewhere; `open_ledger`
-                       in `[keybindings]`) runs exactly `ledger @<focused sid>
-                       --format html --out <a 0600 file in the temp dir>` and
-                       opens the file in the browser. --since takes Unix
-                       milliseconds or a time word (`2026-09-14`,
-                       `2026-09-14T10:30`, with `Z` or `±HH:MM`; a bare date or
-                       time is local) and drops everything before it. With no
-                       @sid the worker is the one the journal's own lines name.
-                       `history`, the inbox and the timeline are stamped by the
-                       aterm process's own clock, not wall time; they are
-                       placed by the BIRTH TIME of that instance's control
-                       socket. Without that the times are marked `~` and no
-                       latency is claimed, and a turn an aterm self-update
-                       carried from an earlier process (`carried=1`) is on that
-                       process's clock and has no time at all. --source log
-                       reads no clock: each turn is placed by its own session
-                       log record (`log class=turn`, joined to `history` by
-                       `ledger=` alone, never by time; a turn whose open was
-                       evicted by its close, which restates `ledger=`) and each
-                       message by its `mail` mark (`@self log kinds=mail`,
-                       joined by `inbox=`); SOURCES counts what the log no
-                       longer holds. --source anchor, the default, is the
-                       birth-time path above. It only reads:
-                       exit 0 even when a source was missing.
-    tape cat FILE [--text] [--salvage] | tape show FILE --decisions | tape stats FILE
-                       Read a harness tape a hosted loop recorded (`tape ls`
-                       lists them), from the file alone: no aterm is asked
-                       anything. `cat`
-                       prints its items one line each, every value numbered
-                       by its place on the tape; --text prints the exact text
-                       form instead — one record per line, every body line
-                       by line, a final newline its last empty line — which
-                       reads back to the very same tape (a binary or a text
-                       tape reads with every verb). `show --decisions`
-                       answers \"why did it press 2?\" without a replay: per
-                       decision, the screen it judged (the rows of the very
-                       read it decided on), the rule and the outcome, the
-                       act that followed and its reply, and the line the
-                       loop journaled or printed. `stats` prints what the
-                       tape cost: its bytes, its items by kind and by door,
-                       its decisions, its span and kB per hour of it. A
-                       damaged tape is refused, naming the byte, unless
-                       --salvage keeps its whole frames before the damage:
-                       a frame changed, or, on a tape of frame format 2,
-                       whole frames repeated, moved, or dropped from inside
-                       it (a format-1 tape cannot tell). A tape that lost
-                       its last frames reads as a run that stopped there,
-                       with no end: line. A torn tail (a run that died
-                       mid-write) is read up to the tear and said on stderr.
-                       Exit 0, or 2 for a tape that cannot be read or a
-                       usage error.
+                       Replay @sid's run on one time axis by joining:
+                         * `history` (every `turn` and settlement time)
+                         * reply row counts from `offscreen tail=20000 max=20000 screen=1`
+                         * `--journal FILE` (`<aterm state>/drive/<sid>.journal.jsonl`:
+                           `EVENT`, `APPROVED`, `DISMISSED`, `RECONNECT`, `TIMEOUT`, `EXIT`)
+                         * fabric mail (`inbox --peek --meta` and `@self` `timeline` `post` rows)
+                       Prints `SUMMARY` and `TIMELINE` (`manager | worker | watcher | fabric`).
+                       `--format text|md|html` selects column text (default), Markdown tables,
+                       or a self-contained swimlane HTML page (`--out PATH` writes mode 0600
+                       and prints PATH; bound to `open_ledger`, ⇧⌘L / Ctrl+Shift+L).
+                       `--since TIME` filters by Unix ms or timestamp (`YYYY-MM-DD[THH:MM[:SS]][Z|±HH:MM]`).
+                       `--source anchor` (default) anchors process clocks via the control
+                       socket's birth time (`~` when unknown; `carried=1` turns omit time);
+                       `--source log` joins turns and mail via session log records
+                       (`log class=turn` `ledger=` and `log kinds=mail` `inbox=`).
+                       With no `@sid`, uses the single session named in `--journal`. Exit 0.
+    tape cat FILE [--text] [--salvage] | tape show FILE --decisions [--salvage]
+    tape stats FILE [--salvage]
+                       Read a recorded `.atape` (binary or `atape-text 1`) without
+                       contacting aterm. `cat` lists numbered items (`--text` emits
+                       round-trippable text form); `show --decisions` prints each
+                       decision's screen, rule, outcome, act, reply, and journal line;
+                       `stats` prints byte size, item/decision counts, span, and kB/h.
+                       Damaged tapes exit 2 unless `--salvage` keeps valid frames
+                       before the damage (torn tails are read up to the tear and noted
+                       on stderr).
     tape ls [@sid] | tape forget FILE|@sid...
-                       The window's own loops' tapes: a development build
-                       records each hosted run when ATERM_HARNESS_TAPE is set
-                       (the lab's instances set it; a shipped build never
-                       records one), to <state>/drive/tapes/<sid>/, each tape
-                       0600 in 0700 directories, the newest kept within
-                       256 MiB and 72 h (tapes/kept/ is yours and never
-                       swept, nor is a tape a running loop still writes).
-                       `ls` lists them newest first (one session's
-                       with @sid, the kept ones beside it): size, age, path.
-                       `forget` removes each FILE named and every tape of
-                       each @sid but its kept ones; anything named that is no
-                       tape in the store (a FILE, or an @sid with none)
-                       refuses the whole call. Only the store is read or
-                       changed.
+                       Manage hosted tapes in `<state>/drive/tapes/<sid>/` (recorded by
+                       dev builds when `ATERM_HARNESS_TAPE` is set, bounded to 256 MiB
+                       and 72 h; `tapes/kept/` and active tapes are preserved). `ls`
+                       lists tapes newest first (filtered to `@sid` plus `kept/` when
+                       given); `forget` deletes named FILEs or all unkept tapes for
+                       `@sid` (failing before any deletion if a target has no tape).
     replay FILE [--until door=N]
-                       Run the loop a harness tape recorded again, offline and
-                       exactly: rebuilt from the tape's own setup and policy
-                       (every file it named moved under a directory that does
-                       not exist), fed every value the recorded loop observed
-                       in its order, every request and line it makes checked
-                       against the recorded one where it occurs. Only the
-                       file is read: no socket, no session, no clock, no file
-                       the run named; a journal or ledger row is compared,
-                       never written. Prints REPRODUCED, ENDED (a tape with no
-                       end — a killed run, a tear, the cap — reproduced as far
-                       as it goes), REACHED (--until door=N: stopped after the
-                       value numbered N in `tape cat`), DIVERGED at #N with
-                       its door and class (decision: an act or a decision
-                       differs; output: a line, row or write differs; drift:
-                       anything else) and why, or PANICKED (the recorded panic
-                       reproduced, or the door it died in reached), then how
-                       many requests the replayed loop asked, how it ended,
-                       each act it
-                       made (`> key 1`: a key, send, post or signal; its reads
-                       are only counted) and each line it printed (`| …`).
-                       Strict: the build that recorded the tape replays it; on
-                       another build a divergence is behaviour changed since
-                       the recording's, and says both builds. A hosted tape
-                       replays a window host's every answer from the tape (no
-                       host is asked, its notifications compared). Exit 0 (reproduced, ended,
-                       reached), 1 (diverged), 4 (panicked), or 2 for a tape
-                       that cannot be replayed or a usage error.
+                       Deterministically replay FILE's loop offline against its
+                       recorded observations and compare every request and output.
+                       Prints `REPRODUCED`, `ENDED`, `REACHED` (`--until door=N`),
+                       `DIVERGED` at `#N` (`decision`, `output`, or `drift`), or
+                       `PANICKED`, plus request counts, acts (`> …`), and lines (`| …`).
+                       Exit 0 (reproduced/ended/reached), 1 (diverged), 4 (panicked),
+                       or 2 (unreplayable/usage error).
     replay FILE --set k=v... | --policy FILE [--set k=v...] [--until door=N]
-                       \"Would it have pressed the same key under another
-                       policy?\": a COUNTERFACTUAL — the recorded loop run
-                       again under a CANDIDATE policy, up to the first act it
-                       takes otherwise. `--policy FILE` reads a whole
-                       [harness] table (an aterm.toml) by the owner's reader
-                       in place of the recorded policy; each `--set k=v` (a
-                       [harness] key, `harness.` before it or not) sets one
-                       key over it; a key or a value the reader refuses — in
-                       a --set or anywhere in the file, a misplaced key too —
-                       is refused, never run as a default. ACTS MODE:
-                       only the ACTS are held to the tape — a key, send,
-                       post, badge, signal, restart or the window host's act
-                       must be the next one the recorded run took, byte for
-                       byte; a read is answered from its own stretch of the
-                       tape between two acts (skipping ahead within it, or
-                       the same answer again), a derived look from before
-                       the point, never from past an act not yet taken; a
-                       clock with no record there runs on the recorded
-                       stamps and the sleeps; outputs, decisions and the
-                       claim's renewals and release are not compared.
-                       Prints REPRODUCED (every act taken as recorded),
-                       DIVERGED at the first act taken otherwise — the
-                       recorded act and the candidate's (none where it ended
-                       without it, or went on to wait for the screen the
-                       recorded run waited for only after it), the
-                       decisions before each, the
-                       last screen the candidate read — STALE (the candidate
-                       asks a read the tape never answered there: what it
-                       would have seen is not on the tape; the recorded
-                       run's next act said), or ENDED (a tape with no end,
-                       every record on it taken), then how far it strayed
-                       and the BOUND: nothing past the first divergent act,
-                       no agent re-driven. Exit 0, 1 (diverged), 3 (stale),
-                       4 (panicked), or 2.
+                       Counterfactual replay in ACTS MODE under `--policy FILE`
+                       (`[harness]` TOML) and/or `--set k=v` overrides (unknown or
+                       invalid keys/values are refused). Compares only acts up to the
+                       first divergence. Prints `REPRODUCED` (0), `ENDED` (0),
+                       `DIVERGED` (1), `STALE` (3, candidate requested an unrecorded
+                       read), or `PANICKED` (4); exit 2 on usage/read error.
     replay FILE... --shadow [--set k=v...] [--policy FILE]
-                       Every decision on each tape decided again by THIS
-                       build under the candidate (the recorded policy with
-                       neither): an approval or a question on any build,
-                       from the facts its mark carries and the looks the
-                       tape holds before it; a turn end on the recording
-                       build only, beside a strict replay that rebuilds its
-                       fold (on another build each says why not). One row
-                       per decision, both sides, `needs:`, and TAINT on
-                       every row after the first that differs (the candidate
-                       would not have seen those screens). Exit 0 (every
-                       point decided again, and as recorded), 1 (one decided
-                       otherwise), 3 (none otherwise, but one not decided
-                       again: the tape cannot say there), or 2. Over several
-                       tapes each is said under its own heading — one that
-                       does not shadow with why — and the exit is 1 if any
-                       point is decided otherwise, else 2 if a tape did not
-                       shadow, else 3, else 0.
+                       Re-evaluate every recorded decision on each FILE under this
+                       build and the candidate policy (or recorded policy), marking
+                       missing inputs under `needs:` and rows after the first difference
+                       as `TAINT`. Exit 0 (all matched), 1 (diverged), 2 (unshadowable
+                       tape or usage error), or 3 (undecidable point).
     replay --check FILE|DIR... [--set k=v...] [--policy FILE]
-                       A CORPUS CHECK: every tape named, and every tape
-                       (*.atape, *.atape.txt) under each DIR at any depth,
-                       replayed in ACTS MODE as above under its own recorded
-                       policy (or the candidate's): does this build still
-                       take every act the recorded run took? One line per
-                       tape — REPRODUCED with the acts it took, or its whole
-                       report under it — then the count of each verdict.
-                       aterm's development checkout keeps a corpus of such
-                       tapes, recorded in its lab over a real agent and
-                       scrubbed of the recording machine's names, and its
-                       tests check every one. Exit 0 (every tape's
-                       acts taken), else 1 if one diverged, else 2 if one was
-                       not replayed (each still said), else 3 (stale), else 4
-                       (its recorded panic); 2 too for a check that finds no
-                       tape or a usage error.
+                       Corpus check: replay every named tape and `*.atape`/`*.atape.txt`
+                       under each DIR in acts mode, printing per-tape verdicts
+                       (`REPRODUCED`, `NOT REPLAYED`, etc.) and summary counts.
+                       Exit 0, 1 (diverged), 2 (not replayed / no tapes / usage error),
+                       3 (stale), or 4 (panicked).
     replay FILE --why --at seq=N|door=N|[YYYY-MM-DDT]HH:MM[:SS]|\"<journal line>\"
                        [--format text|md|html]
-                       \"Why did it press 2?\": one decision on the tape
-                       explained instead of the whole run replayed — the
-                       screen it judged, the box this build reads on it, the
-                       FACTS it was decided on and the record each came from
-                       (`ctl meta #12`, `probe.worker_proc #30`), the
-                       policy's RULE TRACE (every check consulted, the rule
-                       that decided), the act, its reply, the journal line
-                       and the ledger row. An approval or a question is
-                       decided again by THIS build's policy on the facts the
-                       decision's mark carries, the policy the tape's header
-                       carries and the looks the tape holds before it (never
-                       one from after), labelled with both builds and whether
-                       this build's policy decides the same; a fact or a look
-                       the tape lacks, or a policy value this build supplied
-                       where the header does not say the run's, is listed
-                       under `needs:`, never presented as the recorded
-                       world. A turn end is traced by a strict replay of the
-                       tape to the point, on the build that recorded it only
-                       (it decides on a fold over the whole run); on another
-                       build its note of the fold and reading is printed
-                       instead. --at names the point:
-                       `seq=N` (the decision on that screen), `door=N` (the
-                       decision in force at effect #N of `tape cat`),
-                       `[YYYY-MM-DDT]HH:MM[:SS]` (the last at or before that
-                       local time, each decision read by the offset its own
-                       instant had; with no day named, the one day of the
-                       run the time falls within — a time on more than one
-                       is refused, asking for the day), or a journal line's
-                       text (the decision it followed). `tape ls @sid` names
-                       a session's tapes. Only the file is read (and the
-                       local zone's offsets, for a local time), and no
-                       running loop ever keeps a trace. Exit 0, or 2 for a
-                       point with no decision, a tape that does not read, or
-                       a usage error.
+                       Explain one decision at `--at` (by screen `seq=N`, effect
+                       `door=N`, local timestamp, or journal line): the screen, parsed
+                       box, input facts with source records, rule trace, act, reply,
+                       journal line, ledger row, and `needs:` gaps. Exit 0, or 2 if no
+                       decision matches or FILE cannot be read.
     help               Show this text.
 
 OPTIONS
-    --socket PATH   The target aterm's control socket. Defaults to the
-                    instance hosting this terminal, else the newest local
-                    instance.
+    --socket PATH   Target aterm control socket (defaults to the hosting instance,
+                    else the newest local instance).
 
 EXAMPLES
-    # is this line a read? (exit 0/1; the reason names the rule)
     aterm drive classify 'git status --short && git pull | tail'
-    # what is the worker doing right now?
     aterm drive phase @s-1e918c46
-    # take its questions, then answer the one on display by its label:
     aterm ctl @s-1e918c46 meta set questions ask
     aterm drive answer @s-1e918c46 'Use the existing schema'
-    # how its run went, as one page in the browser:
     aterm drive ledger @s-1e918c46 --format html --out /tmp/ledger.html";
 
 #[cfg(test)]

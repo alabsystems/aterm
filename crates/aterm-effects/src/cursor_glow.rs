@@ -1069,14 +1069,18 @@ impl FrameFingerprint {
     const FORGE_FILL: u64 = 0x666f_7267_655f_6669;
 
     #[inline]
-    fn write(&mut self, word: u64) {
-        self.0 = Some(fnv_mix_u64(self.0.unwrap_or(FNV64_OFFSET), word));
+    const fn write(&mut self, word: u64) {
+        let prev = match self.0 {
+            Some(h) => h,
+            None => FNV64_OFFSET,
+        };
+        self.0 = Some(fnv_mix_u64(prev, word));
     }
 
     #[inline]
-    fn begin_stream(&mut self, tag: u64, len: usize) {
+    const fn begin_stream(&mut self, tag: u64, len: usize) {
         self.write(tag);
-        self.write(u64::try_from(len).unwrap_or(u64::MAX));
+        self.write(len as u64);
     }
 
     #[inline]
@@ -1089,7 +1093,10 @@ impl FrameFingerprint {
         // `fnv_mix_u64` chain over the same words in the same order. A ribbon
         // frame streams thousands of quads through here, so the loops are
         // counted: an unoptimized build calls an iterator's `next` out of line.
-        let mut hash = self.0.unwrap_or(FNV64_OFFSET);
+        let mut hash = match self.0 {
+            Some(h) => h,
+            None => FNV64_OFFSET,
+        };
         let mut qi = 0;
         while qi < quads.len() {
             let words = quads[qi].damage_words();
@@ -1105,75 +1112,103 @@ impl FrameFingerprint {
     }
 
     #[inline]
-    fn fire_patches(&mut self, patches: &[FirePatch]) {
+    const fn fire_patches(&mut self, patches: &[FirePatch]) {
         if patches.is_empty() {
             return;
         }
         self.begin_stream(Self::FIRE_PATCH, patches.len());
-        let mut hash = self.0.unwrap_or(FNV64_OFFSET);
-        for p in patches {
-            for word in p.damage_words() {
-                hash = fnv_mix_u64(hash, word);
+        let mut hash = match self.0 {
+            Some(h) => h,
+            None => FNV64_OFFSET,
+        };
+        let mut pi = 0;
+        while pi < patches.len() {
+            let words = patches[pi].damage_words();
+            let mut wi = 0;
+            while wi < words.len() {
+                hash = fnv_mix_u64(hash, words[wi]);
+                wi += 1;
             }
+            pi += 1;
         }
         self.0 = Some(hash);
     }
 
     #[inline]
-    fn chars(&mut self, chars: &[CharFg]) {
+    const fn chars(&mut self, chars: &[CharFg]) {
         if chars.is_empty() {
             return;
         }
         self.begin_stream(Self::CHAR_FG, chars.len());
-        let mut hash = self.0.unwrap_or(FNV64_OFFSET);
-        for c in chars {
+        let mut hash = match self.0 {
+            Some(h) => h,
+            None => FNV64_OFFSET,
+        };
+        let mut ci = 0;
+        while ci < chars.len() {
+            let c = &chars[ci];
             hash = fnv_mix_u64(
                 hash,
-                u64::from(c.row) | (u64::from(c.col) << 16) | (u64::from(c.fg) << 32),
+                (c.row as u64) | ((c.col as u64) << 16) | ((c.fg as u64) << 32),
             );
+            ci += 1;
         }
         self.0 = Some(hash);
     }
 
     #[inline]
-    fn fire_halos(&mut self, cells: &[FireHaloCell]) {
+    const fn fire_halos(&mut self, cells: &[FireHaloCell]) {
         if cells.is_empty() {
             return;
         }
         self.begin_stream(Self::FIRE_HALO, cells.len());
-        let mut hash = self.0.unwrap_or(FNV64_OFFSET);
-        for c in cells {
+        let mut hash = match self.0 {
+            Some(h) => h,
+            None => FNV64_OFFSET,
+        };
+        let mut ci = 0;
+        while ci < cells.len() {
+            let c = &cells[ci];
             hash = fnv_mix_u64(
                 hash,
-                u64::from(c.row) | (u64::from(c.col) << 16) | (u64::from(c.strength) << 32),
+                (c.row as u64) | ((c.col as u64) << 16) | ((c.strength as u64) << 32),
             );
+            ci += 1;
         }
         self.0 = Some(hash);
     }
 
     #[inline]
-    fn rain_halos(&mut self, halos: &[RainHalo]) {
+    const fn rain_halos(&mut self, halos: &[RainHalo]) {
         if halos.is_empty() {
             return;
         }
         self.begin_stream(Self::RAIN_HALO, halos.len());
-        let mut hash = self.0.unwrap_or(FNV64_OFFSET);
-        for h in halos {
-            for word in h.damage_words() {
-                hash = fnv_mix_u64(hash, word);
+        let mut hash = match self.0 {
+            Some(h) => h,
+            None => FNV64_OFFSET,
+        };
+        let mut hi = 0;
+        while hi < halos.len() {
+            let words = halos[hi].damage_words();
+            let mut wi = 0;
+            while wi < words.len() {
+                hash = fnv_mix_u64(hash, words[wi]);
+                wi += 1;
             }
+            hi += 1;
         }
         self.0 = Some(hash);
     }
 
     #[inline]
-    fn forge_fill(&mut self, fill: u32) {
+    const fn forge_fill(&mut self, fill: u32) {
         self.begin_stream(Self::FORGE_FILL, 1);
-        self.write(u64::from(fill));
+        self.write(fill as u64);
     }
 
     #[inline]
-    fn finish(self) -> u64 {
+    const fn finish(self) -> u64 {
         match self.0 {
             None => 0,
             Some(0) => 1,
@@ -1791,7 +1826,7 @@ impl CursorGlow {
     /// (a cursor hide inside a DEC-2026 synchronized update, Claude Code's
     /// per-keystroke redraw). Arms [`Self::blink_hint`]; never admits movement.
     #[inline]
-    pub fn note_repaint_blink(&mut self, now: Instant) {
+    pub const fn note_repaint_blink(&mut self, now: Instant) {
         self.unsettle();
         self.blink_hint = Some(now);
     }
@@ -1800,7 +1835,7 @@ impl CursorGlow {
     /// different terminal, and a blink carried from the old one must not
     /// classify a candidate (or, host-side, the probe) against the new one.
     #[inline]
-    pub fn clear_blink(&mut self) {
+    pub const fn clear_blink(&mut self) {
         self.blink_hint = None;
     }
 
@@ -1809,7 +1844,7 @@ impl CursorGlow {
     /// consults it; `false` (main screen, or a host that never calls this)
     /// leaves the classifier unchanged.
     #[inline]
-    pub fn note_context(&mut self, alt: bool) {
+    pub const fn note_context(&mut self, alt: bool) {
         self.ctx_alt = alt;
     }
 
@@ -1817,11 +1852,12 @@ impl CursorGlow {
     /// space handed to [`Self::tick`], for v2's band floor. Morphology only:
     /// [`Self::move_licensed`] remains the sole authority to mint light.
     #[inline]
-    pub fn note_pane_rows(&mut self, first_row: u16, rows: usize) {
-        let pane_rows = u16::try_from(rows)
-            .ok()
-            .filter(|rows| *rows > 0)
-            .map(|rows| (first_row, rows));
+    pub const fn note_pane_rows(&mut self, first_row: u16, rows: usize) {
+        let pane_rows = if rows > 0 && rows <= u16::MAX as usize {
+            Some((first_row, rows as u16))
+        } else {
+            None
+        };
         self.v2.set_pane_rows(pane_rows);
     }
 
@@ -1829,11 +1865,12 @@ impl CursorGlow {
     /// space handed to [`Self::tick`], for v2's band floor. Morphology only:
     /// [`Self::move_licensed`] remains the sole authority to mint light.
     #[inline]
-    pub fn note_pane_columns(&mut self, first_col: u16, cols: usize) {
-        self.pane_columns = u16::try_from(cols)
-            .ok()
-            .filter(|cols| *cols > 0)
-            .map(|cols| (first_col, cols));
+    pub const fn note_pane_columns(&mut self, first_col: u16, cols: usize) {
+        self.pane_columns = if cols > 0 && cols <= u16::MAX as usize {
+            Some((first_col, cols as u16))
+        } else {
+            None
+        };
         // …and v2 folds at the same edges (its ribbon wraps a typed fold
         // within the pane, never at the grid's margin).
         self.v2.set_pane(self.pane_columns);
@@ -1865,7 +1902,7 @@ impl CursorGlow {
     /// temperature it chases is above the threshold. Fire-gated: only Fire has
     /// a metal, though every style integrates `disp_t`.
     #[inline]
-    fn ember_live(&self) -> bool {
+    const fn ember_live(&self) -> bool {
         self.cursor_temp > Self::FORGE_MIN_TEMP
             || (matches!(self.last_style, Some(GlowStyle::Fire))
                 && self.disp_t > Self::FORGE_MIN_TEMP)
@@ -1885,12 +1922,12 @@ impl CursorGlow {
     /// than at the erase key ([`Self::bs_baseline`]), releasing the fallback's
     /// [`Self::POOF_FALLBACK_GRACE`] early. No baseline is no witness.
     #[inline]
-    fn poof_erase_witnessed(&self) -> bool {
+    const fn poof_erase_witnessed(&self) -> bool {
         match (self.bs_baseline, self.row_cur_meta) {
             (Some((brow, bfill)), Some(cur)) => {
                 // A ContentOnly probe (plain alt screen) is no erase witness:
                 // the shrink may be a region scroll (see [`ProbeTrust`]).
-                cur.trust == ProbeTrust::Full && cur.row == brow && cur.fill < bfill
+                matches!(cur.trust, ProbeTrust::Full) && cur.row == brow && cur.fill < bfill
             }
             _ => false,
         }
@@ -1899,7 +1936,7 @@ impl CursorGlow {
     /// Whether any moving light is alive (everything is_active tracks except
     /// the standing forge ember and a pending kill hint).
     #[inline]
-    fn has_live_motion(&self) -> bool {
+    const fn has_live_motion(&self) -> bool {
         self.needs_frame_cadence() || !self.vapor.is_empty()
     }
 
@@ -1909,7 +1946,7 @@ impl CursorGlow {
     /// kill-hint polling are excluded; a live style crossfade counts.
     #[inline]
     #[must_use]
-    pub fn needs_frame_cadence(&self) -> bool {
+    pub const fn needs_frame_cadence(&self) -> bool {
         // The classic wake's comet, crown and ring all move every frame. Each
         // engine is live only while it owns the frame: any other style resets
         // the classic one, and the classic branch settles this one.
@@ -1919,7 +1956,7 @@ impl CursorGlow {
     /// [`Self::needs_frame_cadence`] for this engine's own light, without the
     /// classic wake's.
     #[inline]
-    fn modern_needs_frame_cadence(&self) -> bool {
+    const fn modern_needs_frame_cadence(&self) -> bool {
         !self.sparks.is_empty()
             || !self.particles.is_empty()
             || !self.fire_meteors.is_empty()
@@ -2107,7 +2144,7 @@ impl CursorGlow {
     /// Un-latch [`Self::dark_settled`]: the caller is about to write state the
     /// `!cfg.enabled` teardown owns, so the next disabled tick wipes again.
     #[inline]
-    fn unsettle(&mut self) {
+    const fn unsettle(&mut self) {
         self.dark_settled = false;
     }
 
@@ -2127,7 +2164,7 @@ impl CursorGlow {
     /// nothing next tick, keeping the band for when the live viewport returns;
     /// `false` for other styles, whose caller resets instead.
     #[inline]
-    pub fn hide_v2(&mut self) -> bool {
+    pub const fn hide_v2(&mut self) -> bool {
         if !self.v2.engaged() {
             return false;
         }
@@ -2140,7 +2177,7 @@ impl CursorGlow {
     /// hide it has no tick for ([`Self::hide_v2`]; `TornBand::Keep`).
     #[inline]
     #[must_use]
-    pub fn v2_owns_frame(&self) -> bool {
+    pub const fn v2_owns_frame(&self) -> bool {
         self.v2.engaged()
     }
 
@@ -2158,19 +2195,17 @@ impl CursorGlow {
     /// reads.
     #[inline]
     #[must_use]
-    pub fn reads_neighbor_rows(&self) -> bool {
+    pub const fn reads_neighbor_rows(&self) -> bool {
         self.v2_owns_frame()
             || self.last_classic_mono
-            || self
-                .last_style
-                .is_some_and(|s| !matches!(s, GlowStyle::Classic))
+            || matches!(self.last_style, Some(s) if !matches!(s, GlowStyle::Classic))
     }
 
     /// Whether a one-frame hide is armed and not yet taken — the twins'
     /// witness that no non-ticking path left one standing.
     #[inline]
     #[must_use]
-    pub fn v2_hide_armed(&self) -> bool {
+    pub const fn v2_hide_armed(&self) -> bool {
         self.v2.hide_armed()
     }
 
@@ -3286,7 +3321,7 @@ impl CursorGlow {
 
     /// Deterministic xorshift float in [0,1).
     #[inline]
-    fn frand(&mut self) -> f32 {
+    const fn frand(&mut self) -> f32 {
         let mut x = self.rng;
         x ^= x << 13;
         x ^= x >> 17;

@@ -2030,7 +2030,7 @@ mod tests {
     /// session to a build older than the one that wrote its records: a download staged
     /// there and an installed bundle there mint no stage and back no activation, and the
     /// one same-image hop (the QA seam, a launch-record renewal) runs this very build.
-    /// Round eight of the update audit's U6 (a quiet restart's record read by a build
+    /// U6 (a quiet restart's record read by a build
     /// that predates `quiet`) and U13 (a successor that predates the timeline id carry)
     /// both need such a hop. NEGATIVE CONTROL: one build newer is a stage both ways.
     #[test]

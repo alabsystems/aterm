@@ -1,21 +1,21 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE REMAINING §4.1 MARKS (session log Phase 3B, plan §3.2): what the
+//! THE REMAINING §4.1 MARKS (plan §3.2): what the
 //! engine, the status classifier, the screen reader, the resize ledger and
 //! the launch card say, each one typed call into [`SessionLog`] from a
 //! timeline hold its site already takes (no payload is formatted to be parsed
 //! back, design:775). [`Observed`] holds what each last wrote, so a value
 //! written twice writes one mark, and crosses a seamless update as additive
-//! tokens on the carry's `state` host line (fingerprints only, ruling S5), so
+//! tokens on the carry's `state` host line (fingerprints only), so
 //! a successor does not restate them.
 //!
 //! What each writes (the node `-` is the session, `<run>` the run in front):
 //! - `mark - integration state=on|off|degraded`, when the shell
 //!   integration's posture moves;
 //! - `mark - notify n=<delta>`, at most once a sweep, the notifications the
-//!   program asked for since the last (counted with notifications off too,
-//!   ruling S19; never their text), the first read a baseline;
+//!   program asked for since the last (counted with notifications off too; never their text),
+//!   the first read a baseline;
 //! - `mark - bell n=<delta>`, at most once a second;
 //! - `mark <run> progress state=none|normal|error|indeterminate|paused
 //!   pct=<n>`, on a state change or each ten points;
@@ -45,7 +45,7 @@
 //!   hold_origin=` and its reason at the content tier;
 //! - `mark - meta field=<f> value=<v>` by its writer, from the one
 //!   `meta-change` writer (`SessionTimeline::record_meta_change`), one for
-//!   every row (phase 6, 6F-8, ruling U13) — for `attention`, whose text
+//!   every row — for `attention`, whose text
 //!   can hold a box's command or a question's words (the supervisor's
 //!   escalation), `fp=<16 hex>` in place of the value, the text beside it
 //!   at the content tier only (`attn_text=`: RAM, never journaled, carried
@@ -63,7 +63,7 @@
 //!   [ask=<permission|question|auth>] [coalesced=<n>] src=engine
 //!   conf=claim`, each move of what the program in front says about itself
 //!   (OSC 7501) that the status sweep's gate shows, in the hold that records
-//!   its `program-state` row (phase 6, 6F-4; rulings U17, U44): a per-run
+//!   its `program-state` row: a per-run
 //!   bucket of [`PROGRAM_BURST`], then one each [`PROGRAM_REFILL_MS`],
 //!   bounds a flapping program, and a move that finds it empty is
 //!   COALESCED, never dropped: it replaces the run's one pending state, and
@@ -79,7 +79,7 @@
 //!   fold never reads them and `brief` prints none;
 //! - `mark - shown [need=<w> sev=<stuck|decide>] [held=<w>] [coalesced=<n>]
 //!   by=aterm src=aterm conf=strong`, each move of what the person is shown
-//!   of the session's need (phase 6, 6F-9; rulings U26, U44): KEYED ON THE
+//!   of the session's need: KEYED ON THE
 //!   PRINTED TUPLE ([`ShownTuple`]: `status needs=`, its severity, and
 //!   `hold_by=`; each absent for none), never on the published verdict's
 //!   other facts (`waiting`, `recheck_unix`), from the one verdict writer
@@ -94,10 +94,10 @@
 //!   ring row: `mark - state state=<w>` each registry move
 //!   ([`SessionLog::observe_state`]; the close is the session's close
 //!   record); `mark - policy gen=<n>` on every session the harness policy
-//!   cell moves on (ruling U16); and from the fabric's hook `mark - advisory
+//!   cell moves on; and from the fabric's hook `mark - advisory
 //!   origin=<w> gen=<n>` (its reason at the content tier), `mark -
-//!   mail-fetch off=<n>` (ruling U15) and `mark - topic change=add|drop
-//!   fp=<16 hex>` (the name and `since=` at the content tier, ruling U11).
+//!   mail-fetch off=<n>` and `mark - topic change=add|drop
+//!   fp=<16 hex>` (the name and `since=` at the content tier).
 //!
 //! None of it is input, and none of it names a PTY path (slog-inert).
 
@@ -120,7 +120,7 @@ pub(crate) const PROGRAM_REFILL_MS: u64 = 1_000;
 /// A full bucket, in thousandths of a token.
 const PROGRAM_FULL_MILLI: u64 = PROGRAM_BURST * 1_000;
 
-/// A THROTTLED MARK CLASS'S BUCKET (6F-4, 6F-9; ruling U44): [`PROGRAM_BURST`]
+/// A THROTTLED MARK CLASS'S BUCKET: [`PROGRAM_BURST`]
 /// tokens, refilled one each [`PROGRAM_REFILL_MS`], held in thousandths as
 /// of `at` (monotonic ms). A program's run keeps one ([`ProgramMarks`]), and
 /// a session's shown marks one ([`ShownMarks`]); each coalesces what finds
@@ -188,7 +188,7 @@ impl ProgramWords {
     }
 }
 
-/// THE PROGRAM MARKS' BUCKET (6F-4; rulings U17, U44): the run in front's
+/// THE PROGRAM MARKS' BUCKET: the run in front's
 /// tokens, and the newest move not yet written. A move that finds no token
 /// replaces the pending one, counted; the pending state is written as soon
 /// as a token frees, so the newest is never lost.
@@ -202,8 +202,8 @@ pub(crate) struct ProgramMarks {
     pending: Option<(ProgramWords, u64)>,
 }
 
-/// WHAT THE PERSON IS SHOWN of a session's need (phase 6, 6F-9; ruling
-/// U26): the printed tuple, as its `shown` mark words it — the need's word
+/// WHAT THE PERSON IS SHOWN of a session's need:
+/// the printed tuple, as its `shown` mark words it — the need's word
 /// (`status needs=`), how it is shown (its severity) and whose hold stands
 /// (`hold_by=`), each `None` for none.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -252,7 +252,7 @@ impl ShownTuple {
     }
 }
 
-/// THE SHOWN MARKS' BUCKET (6F-9; rulings U26, U44): the tuple last taken
+/// THE SHOWN MARKS' BUCKET: the tuple last taken
 /// (written, or pending: the dedupe), the session's tokens, and the newest
 /// tuple not yet written with how many it replaced. A move that finds no
 /// token replaces the pending one, counted, and the pending tuple is
@@ -331,7 +331,7 @@ pub(crate) struct Observed {
     /// The progress state and its tenth.
     progress: Option<(&'static str, Option<u8>)>,
     /// The cwd and the informative title last said, as fingerprints
-    /// ([`name_fp`]; 0: cleared): the carry holds no text (ruling S5).
+    /// ([`name_fp`]; 0: cleared): the carry holds no text.
     cwd: Option<u64>,
     title: Option<u64>,
     /// Whether the effective attention owner was the supervisor's when a
@@ -355,8 +355,8 @@ const META_FIELDS_MAX: usize = crate::session_timeline::MetaField::ALL.len() + 1
 /// A meta field whose value is free text that can hold what must never
 /// leave RAM (a box's command, a question's words, the screen's last line:
 /// the supervisor's escalation): its mark says a fingerprint below the
-/// content tier, and the text only at it (`attn_text=`; phase 6, 6F-8,
-/// ruling U13: "never stored" became "never leaves RAM", the ring's own
+/// content tier, and the text only at it (`attn_text=`;
+/// "never stored" became "never leaves RAM", the ring's own
 /// exposure).
 const FINGERPRINTED_META: &[&str] = &["attention"];
 
@@ -900,8 +900,8 @@ impl SessionLog {
     /// is the mark with no `cwd=`, and the first read of a session with no
     /// directory is no news (as a title's is). Returns the directory the
     /// mark holds (empty: none) when it was written: the text the
-    /// timeline's `cwd-change` row prints, so the row is its record's
-    /// (phase 6, 6F-8, ruling U13), on the record's trigger too — a
+    /// timeline's `cwd-change` row prints, so the row is its record's,
+    /// on the record's trigger too — a
     /// successor that carried the fingerprint restates neither.
     pub(crate) fn observe_cwd(&mut self, cwd: Option<&str>, at: Stamp) -> Option<String> {
         let cwd = cwd.filter(|c| !c.is_empty());
@@ -931,8 +931,8 @@ impl SessionLog {
     /// aside ([`title_fp`]). The title is content tier: `log` prints it
     /// only at `tier=content`, and neither the journal nor the carry holds
     /// it. Returns the title the mark holds (empty: cleared) when it was
-    /// written: the `title-change` row's text, which since phase 6 (6F-8,
-    /// ruling U13) follows this mark, its cadence and its words.
+    /// written: the `title-change` row's text, which since phase 6
+    /// follows this mark, its cadence and its words.
     pub(crate) fn observe_title(&mut self, title: &str, at: Stamp) -> Option<String> {
         let fp = title_fp(title);
         if self.observed.title == Some(fp) {
@@ -1003,11 +1003,11 @@ impl SessionLog {
     /// with `moved=`; a hold's `origin= hold_origin=`). Ids, words and
     /// offsets — a body is never in a fact, so it is in no record; a topic's
     /// name and `since=` and a hold's or an advisory's reason are content
-    /// tier, RAM only (ruling U11).
+    /// tier, RAM only.
     pub(crate) fn observe_fabric(&mut self, fact: crate::fabric::FabricFact<'_>, at: Stamp) {
         use crate::fabric::FabricFact as F;
         // A person's key the timeline's hold kept from the log stands
-        // before the mail (ruling T2).
+        // before the mail.
         self.reconcile_person(at);
         // A word outside the key's list is `unknown`, and a key with no
         // `unknown` is left out: the fields already set stay.
@@ -1143,8 +1143,8 @@ impl SessionLog {
                 };
                 (Kind::Hold, by, f)
             }
-            // A topic is a fingerprint wherever its record leaves RAM
-            // (ruling U11): the name and its `since=` are content tier.
+            // A topic is a fingerprint wherever its record leaves RAM:
+            // the name and its `since=` are content tier.
             F::Topic { add, name, since } => {
                 let f = word(Fields::new(), Key::Change, if add { "add" } else { "drop" });
                 let f = with(
@@ -1181,7 +1181,7 @@ impl SessionLog {
             }
         };
         // A `mail dir=in` mark sets the fold's mail latch as it folds: the
-        // person's next input is marked (rulings T39, U19). A post's relay
+        // person's next input is marked. A post's relay
         // hops are the one field whose grammar's bound the record's others
         // can leave no room for (`via=` admits 560 bytes beside a 70-byte
         // `to=`, a 64-byte `idem=` and three numbers): the mark is cut there,
@@ -1235,11 +1235,11 @@ impl SessionLog {
     /// for a [`FINGERPRINTED_META`] field, the text beside it at the content
     /// tier, `attn_text=`, RAM only), from the one `meta-change` writer
     /// ([`crate::session_timeline::SessionTimeline::record_meta_change`]):
-    /// ONE MARK FOR EVERY ROW (phase 6, 6F-8, ruling U13), with every field
+    /// ONE MARK FOR EVERY ROW, with every field
     /// the row prints (the Autopilot pair's timer, `land_at=`), so the
     /// `meta-change` row is its record's. A value this log last said of the
     /// field (a carried log's: a successor restoring what it carried) is
-    /// no news (ruling S5): its mark says `carried=1`, as a carried
+    /// no news: its mark says `carried=1`, as a carried
     /// session's `state` and `hold` marks do. And the `escalated` need that
     /// write moves (addendum A16):
     /// `escalated` is whether the effective attention owner is now the
@@ -1305,7 +1305,7 @@ impl SessionLog {
         );
     }
 
-    /// A WORKER'S TASK MOVED (plan 5C-3; ruling T21): `mark - task rev=<n>
+    /// A WORKER'S TASK MOVED: `mark - task rev=<n>
     /// state=<working|done|exited|stalled> attention=<0|1> [why=<w>]
     /// [code=<exit>] src=aterm conf=exact`, the fact of the timeline's
     /// `task-change` row ([`crate::task_record::TaskRecord::event_payload`]),
@@ -1369,7 +1369,7 @@ impl SessionLog {
 
     /// `mark - act word=relaunch rule=<row>`: a relaunch or upgrade row of
     /// the window's harness host that moved the session
-    /// (`harness_host::log_act`, plan 5F-2, rulings T25 and T28) — `by=harness
+    /// (`harness_host::log_act`) — `by=harness
     /// src=aterm conf=strong`: aterm saw its own harness act. `rule=` is the
     /// row's name ([`aterm_agent::harness::acts::relaunch_act`]); the row's
     /// pid, conversation and versions stay in the row. The turn the pass
@@ -1382,7 +1382,7 @@ impl SessionLog {
     /// into the running agent, a stop or a wait), the failure the restart
     /// caused is lifted with `mark - seen by=harness` when it is the
     /// session's only one, an agent ran under its run, and the relaunched
-    /// run is open ([`SessionLog::harness_saw_failure`], Phase 6 step 6C-1).
+    /// run is open ([`SessionLog::harness_saw_failure`]).
     pub(crate) fn observe_relaunch_act(&mut self, rule: &str, started: bool, at: Stamp) {
         let Ok(f) = Fields::new()
             .word(Key::Word, aterm_agent::harness::acts::RELAUNCH_WORD)
@@ -1422,8 +1422,8 @@ impl SessionLog {
 
     /// `mark - policy gen=<n>`: the harness policy cell moved to generation
     /// `generation` (`App::announce_harness_policy`), the fact of the
-    /// `harness-policy gen=<n>` row it writes on every session, in its hold
-    /// (phase 6, 6F-5; ruling U16). The node log's `config key=` stays.
+    /// `harness-policy gen=<n>` row it writes on every session, in its hold.
+    /// The node log's `config key=` stays.
     pub(crate) fn observe_policy(&mut self, generation: u64, at: Stamp) {
         let f = with(
             Fields::new(),

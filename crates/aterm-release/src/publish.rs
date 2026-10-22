@@ -7607,7 +7607,7 @@ pub fn run_cut(repo: &Path, opts: &CutOptions) -> Result<()> {
         let _ = fs::remove_file(&journal_path);
     }
     // ---- the published commit (before the tier, the version and the claim) -
-    // THE CUT RELEASES WHAT `pub publish` PUBLISHED (owner ruling R2): the
+    // THE CUT RELEASES WHAT `pub publish` PUBLISHED: the
     // newest aterm row of the engine's ledger, whatever main's tip is, in the cut
     // tree — this checkout never moves. When this binary is not that commit's own
     // cutter, the cut is handed to the one built there.

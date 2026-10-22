@@ -128,31 +128,31 @@ impl Unit {
 /// degenerate sample and reads as blank).
 #[inline]
 #[must_use]
-pub fn unit_at(cols: &[char], col: u16) -> Unit {
-    let i = usize::from(col);
-    match cols.get(i) {
-        None => Unit::BLANK,
-        Some('\0') => {
-            let lead = i
-                .checked_sub(1)
-                .and_then(|j| cols.get(j))
-                .copied()
-                .unwrap_or(' ');
-            if lead == '\0' || lead == ' ' {
-                Unit::BLANK
-            } else {
-                Unit {
-                    ch: lead,
-                    wide: true,
-                    cont: true,
-                }
+pub const fn unit_at(cols: &[char], col: u16) -> Unit {
+    let i = col as usize;
+    if i >= cols.len() {
+        return Unit::BLANK;
+    }
+    let c = cols[i];
+    if c == '\0' {
+        let lead = if i > 0 { cols[i - 1] } else { ' ' };
+        if lead == '\0' || lead == ' ' {
+            Unit::BLANK
+        } else {
+            Unit {
+                ch: lead,
+                wide: true,
+                cont: true,
             }
         }
-        Some(&c) => Unit {
+    } else if c == ' ' {
+        Unit::BLANK
+    } else {
+        Unit {
             ch: c,
-            wide: cols.get(i + 1) == Some(&'\0'),
+            wide: i + 1 < cols.len() && cols[i + 1] == '\0',
             cont: false,
-        },
+        }
     }
 }
 
@@ -368,14 +368,17 @@ fn neighbours_of<'a>(rows: &[RowSample<'a>], row: u16) -> [Option<&'a [char]>; 4
 /// ([`Witness::translate_band`]) for a record carried from `old` to `new`: those
 /// whose neighbour moved with it (`old + dr` is now at `new + dr`).
 #[inline]
-fn band_keeps(old: u16, new: u16, top: u16, bottom: u16, delta: i16) -> u8 {
+const fn band_keeps(old: u16, new: u16, top: u16, bottom: u16, delta: i16) -> u8 {
     let mut keep = 0u8;
-    for (k, dr) in FOLLOW_DRS.into_iter().enumerate() {
+    let mut k = 0;
+    while k < FOLLOW_DRS.len() {
+        let dr = FOLLOW_DRS[k];
         if let (Some(was), Some(now)) = (old.checked_add_signed(dr), new.checked_add_signed(dr))
-            && band_row(was, top, bottom, delta) == Some(now)
+            && matches!(band_row(was, top, bottom, delta), Some(r) if r == now)
         {
             keep |= 1 << k;
         }
+        k += 1;
     }
     keep
 }
@@ -1417,14 +1420,14 @@ impl Witness {
     /// Records held.
     #[must_use]
     #[cfg(test)]
-    pub fn len(&self) -> usize {
+    pub const fn len(&self) -> usize {
         self.seen.len()
     }
 
     /// True with nothing witnessed.
     #[must_use]
     #[cfg(test)]
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.seen.is_empty()
     }
 
@@ -1466,7 +1469,7 @@ impl Witness {
     /// the caret shows on its line. Each follow pass says it again, `None`
     /// when nothing waits.
     #[inline]
-    pub(crate) fn await_caret(&mut self, run: Option<(u16, u32)>) {
+    pub(crate) const fn await_caret(&mut self, run: Option<(u16, u32)>) {
         self.awaiting = run;
     }
 

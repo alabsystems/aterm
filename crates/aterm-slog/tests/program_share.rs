@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE PROGRAM SHARE (phase 6, 6F-3; T6, ruling U17): a node's program marks
+//! THE PROGRAM SHARE: a node's program marks
 //! (OSC 7501's reports, `mark <run|-> program state=…`) hold at most
 //! [`program_share`] of the ring, 64 a run at a session's bound, taken oldest
 //! first, never the newest record, never a fenced one, never another node's

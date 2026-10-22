@@ -248,14 +248,14 @@ pub(crate) fn push_fx_ramp(
 
 /// Per-channel linear interpolation between two `0x00RRGGBB` colours, `t` 0..1.
 #[inline]
-pub(crate) fn lerp_rgb(a: u32, b: u32, t: f32) -> u32 {
+pub(crate) const fn lerp_rgb(a: u32, b: u32, t: f32) -> u32 {
     let t = t.clamp(0.0, 1.0);
-    let mix = |sh: u32| {
+    const fn mix(a: u32, b: u32, t: f32, sh: u32) -> u32 {
         let ca = ((a >> sh) & 0xff) as f32;
         let cb = ((b >> sh) & 0xff) as f32;
         ((ca + (cb - ca) * t) + 0.5) as u32
-    };
-    (mix(16) << 16) | (mix(8) << 8) | mix(0)
+    }
+    (mix(a, b, t, 16) << 16) | (mix(a, b, t, 8) << 8) | mix(a, b, t, 0)
 }
 
 /// Clamped per-channel RGB mix (`t` from a → b), rounded to nearest. Not
@@ -273,7 +273,7 @@ pub(crate) fn mix_rgb(a: u32, b: u32, t: f32) -> u32 {
 
 /// `a + (b - a) t`, `t` clamped to 0..1.
 #[inline]
-pub(crate) fn lerp(a: f32, b: f32, t: f32) -> f32 {
+pub(crate) const fn lerp(a: f32, b: f32, t: f32) -> f32 {
     a + (b - a) * t.clamp(0.0, 1.0)
 }
 
@@ -310,10 +310,9 @@ const WATER_STOPS: [(f32, u32); 5] = [
 // min-first pins NaN to 1.0 and the lerp lands exactly on the crest colour.
 #[allow(clippy::manual_clamp)]
 #[inline]
-fn ramp_5stop(stops: &[(f32, u32); 5], t: f32) -> u32 {
+const fn ramp_5stop(stops: &[(f32, u32); 5], t: f32) -> u32 {
     let t = t.min(1.0).max(0.0);
-    let idx =
-        usize::from(t > stops[1].0) + usize::from(t > stops[2].0) + usize::from(t > stops[3].0);
+    let idx = (t > stops[1].0) as usize + (t > stops[2].0) as usize + (t > stops[3].0) as usize;
     let (t0, c0) = stops[idx];
     let (t1, c1) = stops[idx + 1];
     // No `t1 > t0` divide guard: positions strictly ascend by table contract
@@ -323,13 +322,13 @@ fn ramp_5stop(stops: &[(f32, u32); 5], t: f32) -> u32 {
 
 /// The black-body-ish fire palette, `t` 0 (cool, deep red) → 1 (hot, white-yellow).
 #[inline]
-pub(crate) fn fire_ramp(t: f32) -> u32 {
+pub(crate) const fn fire_ramp(t: f32) -> u32 {
     ramp_5stop(&FIRE_STOPS, t)
 }
 
 /// The water palette, `t` 0 (deep navy) → 1 (pale foam crest).
 #[inline]
-pub(crate) fn water_ramp(t: f32) -> u32 {
+pub(crate) const fn water_ramp(t: f32) -> u32 {
     ramp_5stop(&WATER_STOPS, t)
 }
 
@@ -388,7 +387,7 @@ pub(crate) const STAR_OVER_CENTRE_LAYS: f32 = 3.0;
 /// The taper's coverage multiplier at `u` (the fraction of the way from the
 /// body's end to the point), shared by both rasterizers.
 #[inline]
-pub(crate) fn star_taper_cov(u: f32) -> f32 {
+pub(crate) const fn star_taper_cov(u: f32) -> f32 {
     1.0 - (1.0 - STAR_TIP_COV) * u.clamp(0.0, 1.0)
 }
 
@@ -447,7 +446,7 @@ const _: () = {
 
 /// A star's arm half-length in px: cell height × [`STAR_ARM`] × a named ratio.
 #[inline]
-pub(crate) fn star_arm(cell_h: f32, ratio: f32) -> f32 {
+pub(crate) const fn star_arm(cell_h: f32, ratio: f32) -> f32 {
     cell_h * STAR_ARM * ratio
 }
 
@@ -456,8 +455,9 @@ pub(crate) fn star_arm(cell_h: f32, ratio: f32) -> f32 {
 /// `2·arm·ratio`: rounding would turn the hero grain at a 40 px cell (7.84 px of arm) into a
 /// 2 px bar on a 3 px nucleus.
 #[inline]
-pub(crate) fn star_arm_px(arm: f32) -> i32 {
-    (arm as i32).max(1)
+pub(crate) const fn star_arm_px(arm: f32) -> i32 {
+    let px = arm as i32;
+    if px < 1 { 1 } else { px }
 }
 
 /// The stardust rule (owner, 2026-08-08): a population's body is round stardust
@@ -482,14 +482,14 @@ pub(crate) const STAR_ACCENT_DEN: u32 = 16;
 
 /// Deal a stored particle seed: `true` is the 4-point accent, `false` a round mote.
 #[inline]
-pub(crate) fn star_accent(seed: u32) -> bool {
+pub(crate) const fn star_accent(seed: u32) -> bool {
     seed.is_multiple_of(STAR_ACCENT_DEN)
 }
 
 /// Stardust mote radius, px: seeded so no two motes match, floored so the smallest is still a
 /// lit point.
 #[inline]
-pub(crate) fn dust_r(cell_h: f32, seed01: f32) -> f32 {
+pub(crate) const fn dust_r(cell_h: f32, seed01: f32) -> f32 {
     (cell_h * (0.07 + 0.05 * seed01)).max(1.3)
 }
 
@@ -557,7 +557,7 @@ pub(crate) fn twinkle_env(age_s: f32, phase: f32) -> f32 {
 /// glints: a fraction of the envelope's own range, so a depth retune cannot
 /// change the glint duty.
 #[inline]
-pub(crate) fn twinkle_peak(env: f32) -> bool {
+pub(crate) const fn twinkle_peak(env: f32) -> bool {
     env >= TWINKLE_FLOOR + TWINKLE_DEPTH * TWINKLE_GLINT_FRAC
 }
 

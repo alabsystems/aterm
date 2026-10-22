@@ -289,6 +289,89 @@ fn decode_html_amp(input: &str) -> String {
         .replace("&#61;", "=")
 }
 
+fn decode_base64_block(input: &str) -> Option<String> {
+    let sextet = |b: u8| -> Option<u8> {
+        match b {
+            b'A'..=b'Z' => Some(b - b'A'),
+            b'a'..=b'z' => Some(b - b'a' + 26),
+            b'0'..=b'9' => Some(b - b'0' + 52),
+            b'+' | b'-' => Some(62),
+            b'/' | b'_' => Some(63),
+            _ => None,
+        }
+    };
+    let mut out = Vec::new();
+    let mut group = [0u8; 4];
+    let mut len = 0usize;
+    for &b in input.as_bytes() {
+        if b.is_ascii_whitespace() {
+            continue;
+        }
+        if b == b'=' {
+            break;
+        }
+        let val = sextet(b)?;
+        group[len] = val;
+        len += 1;
+        if len == 4 {
+            out.push((group[0] << 2) | (group[1] >> 4));
+            out.push((group[1] << 4) | (group[2] >> 2));
+            out.push((group[2] << 6) | group[3]);
+            len = 0;
+        }
+    }
+    if len == 2 {
+        out.push((group[0] << 2) | (group[1] >> 4));
+    } else if len == 3 {
+        out.push((group[0] << 2) | (group[1] >> 4));
+        out.push((group[1] << 4) | (group[2] >> 2));
+    } else if len == 1 {
+        return None;
+    }
+    (!out.is_empty()).then(|| String::from_utf8_lossy(&out).into_owned())
+}
+
+fn decode_mime_base64_parts(raw_email: &str) -> String {
+    let mut decoded_parts = String::new();
+    let mut search = raw_email;
+    while let Some(pos) = search
+        .to_ascii_lowercase()
+        .find("content-transfer-encoding")
+    {
+        let from_hdr = &search[pos..];
+        let line_end = from_hdr.find('\n').unwrap_or(from_hdr.len());
+        let hdr_line = &from_hdr[..line_end];
+        let is_b64 = hdr_line
+            .split_once(':')
+            .is_some_and(|(_, v)| v.trim().to_ascii_lowercase().starts_with("base64"));
+        let after_line = &from_hdr[line_end..];
+        if is_b64
+            && let Some((_, body_start)) = from_hdr
+                .split_once("\r\n\r\n")
+                .or_else(|| from_hdr.split_once("\n\n"))
+        {
+            let mut body_end = body_start.len();
+            let mut offset = 0usize;
+            for line in body_start.split_inclusive('\n') {
+                if line.starts_with("--") {
+                    body_end = offset;
+                    break;
+                }
+                offset += line.len();
+            }
+            if let Some(decoded) = decode_base64_block(&body_start[..body_end]) {
+                decoded_parts.push('\n');
+                decoded_parts.push_str(&decoded);
+            }
+        }
+        if after_line.is_empty() {
+            break;
+        }
+        search = &after_line[1..];
+    }
+    decoded_parts
+}
+
 fn is_supported_auth_url(url: &str) -> bool {
     !url.chars().any(|c| c.is_whitespace() || c.is_control())
         && (url.starts_with("https://")
@@ -326,15 +409,38 @@ fn unfold_rfc5322_headers(head: &str) -> Vec<String> {
     unfolded
 }
 
+fn json_value_matches_email(val: &Value, target: &str) -> bool {
+    match val {
+        Value::String(s) => contains_matching_email(s, target),
+        Value::Array(items) => items
+            .iter()
+            .any(|item| json_value_matches_email(item, target)),
+        Value::Object(map) => ["email", "address"]
+            .into_iter()
+            .filter_map(|k| map.get(k))
+            .any(|v| json_value_matches_email(v, target)),
+        _ => false,
+    }
+}
+
 fn email_matches_target(raw_email: &str, target: &str) -> bool {
     let target_trimmed = target.trim();
     if target_trimmed.is_empty() {
         return true;
     }
-    if let Ok(doc) = aterm_json::from_str::<Value>(raw_email)
-        && let Some(to) = doc.get("to").and_then(Value::as_str)
-    {
-        return contains_matching_email(to, target_trimmed);
+    if let Ok(doc) = aterm_json::from_str::<Value>(raw_email) {
+        let mut saw_json_recipient = false;
+        for key in ["to", "recipients", "recipient", "delivered_to"] {
+            if let Some(val) = doc.get(key) {
+                saw_json_recipient = true;
+                if json_value_matches_email(val, target_trimmed) {
+                    return true;
+                }
+            }
+        }
+        if saw_json_recipient {
+            return false;
+        }
     }
     let head = raw_email
         .split_once("\r\n\r\n")
@@ -389,6 +495,7 @@ pub fn extract_magic_link_from_email(
     {
         return None;
     }
+    let mut extra_text = decode_mime_base64_parts(raw_email);
     if let Ok(doc) = aterm_json::from_str::<Value>(raw_email) {
         for key in ["magic_url", "verify_url", "login_url", "url"] {
             if let Some(u) = doc.get(key).and_then(Value::as_str)
@@ -398,8 +505,21 @@ pub fn extract_magic_link_from_email(
                 return Some(u.to_owned());
             }
         }
+        for key in ["body", "html", "text", "raw"] {
+            if let Some(s) = doc.get(key).and_then(Value::as_str) {
+                extra_text.push('\n');
+                extra_text.push_str(s);
+                extra_text.push_str(&decode_mime_base64_parts(s));
+            }
+        }
     }
-    let decoded = decode_html_amp(&decode_quoted_printable(raw_email));
+    let qp_decoded = decode_quoted_printable(raw_email);
+    let combined = if extra_text.is_empty() {
+        qp_decoded
+    } else {
+        format!("{qp_decoded}\n{extra_text}")
+    };
+    let decoded = decode_html_amp(&combined);
     let mut urls = Vec::new();
     for scheme in ["https://", "http://127.0.0.1:", "http://localhost:"] {
         let mut rest = decoded.as_str();
@@ -873,7 +993,7 @@ pub(super) fn poll_mailbox_for_magic_link(
     let mut tried = BTreeSet::new();
     loop {
         if let Ok(entries) = std::fs::read_dir(mailbox_dir) {
-            let mut candidates: Vec<(std::time::SystemTime, PathBuf)> = entries
+            let mut candidates: Vec<(std::time::SystemTime, u64, PathBuf)> = entries
                 .filter_map(Result::ok)
                 .filter_map(|e| {
                     let path = e.path();
@@ -883,20 +1003,23 @@ pub(super) fn poll_mailbox_for_magic_link(
                         return None;
                     }
                     let clicked_marker = mailbox_dir.join(format!("{name_str}.clicked"));
-                    if clicked_marker.exists() || tried.contains(&path) {
+                    if clicked_marker.exists() {
                         return None;
                     }
                     let meta = e.metadata().ok()?;
-                    if !meta.is_file() {
+                    if !meta.is_file() || meta.len() == 0 {
                         return None;
                     }
                     let mtime = meta.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH);
-                    Some((mtime, path))
+                    if tried.contains(&(path.clone(), meta.len(), mtime)) {
+                        return None;
+                    }
+                    Some((mtime, meta.len(), path))
                 })
                 .collect();
             candidates.sort_by_key(|a| std::cmp::Reverse(a.0));
-            for (_, path) in candidates {
-                tried.insert(path.clone());
+            for (mtime, len, path) in candidates {
+                tried.insert((path.clone(), len, mtime));
                 let mut raw = String::new();
                 let Ok(file) = std::fs::File::open(&path) else {
                     continue;
@@ -1016,10 +1139,29 @@ pub(super) fn authorize_using(
     Err("OAuth approval did not redirect to callback listener")
 }
 
+fn discover_mailbox_dir() -> Option<PathBuf> {
+    if let Some(mailbox) = std::env::var_os(MAILBOX_ENV).filter(|v| !v.is_empty()) {
+        return Some(PathBuf::from(mailbox));
+    }
+    if std::env::var_os(PROFILE_ENV).is_some_and(|v| !v.is_empty()) {
+        return None;
+    }
+    if let Some(arg0) = std::env::args_os().next()
+        && let Some(store_dir) = Path::new(&arg0).parent().and_then(Path::parent)
+    {
+        let store_mailbox = store_dir.join(DEFAULT_MAILBOX_DIR);
+        if store_mailbox.is_dir() {
+            return Some(store_mailbox);
+        }
+    }
+    None
+}
+
 /// `aterm-open-url <url>` (the argv0 alias, `crates/aterm`'s router): when
-/// [`MAILBOX_ENV`] names a mailbox directory, drives the automated OAuth +
-/// email magic-link authorization flow ([`authorize_with_mailbox`]); otherwise
-/// opens the URL in [`PROFILE_ENV`]'s Chrome profile ([`open_with`]).
+/// [`MAILBOX_ENV`] (or `<accounts store>/mailbox` with no [`PROFILE_ENV`]) names
+/// a mailbox directory, drives the automated OAuth + email magic-link
+/// authorization flow ([`authorize_with_mailbox`]); otherwise opens the URL in
+/// [`PROFILE_ENV`]'s Chrome profile ([`open_with`]).
 #[must_use]
 pub fn main_entry(args: Vec<OsString>) -> ExitCode {
     let args: Vec<String> = args
@@ -1027,15 +1169,10 @@ pub fn main_entry(args: Vec<OsString>) -> ExitCode {
         .map(|a| a.to_string_lossy().into_owned())
         .collect();
     if let [url] = args.as_slice()
-        && let Some(mailbox) = std::env::var_os(MAILBOX_ENV).filter(|v| !v.is_empty())
+        && let Some(mailbox) = discover_mailbox_dir()
     {
         let email = std::env::var(EMAIL_ENV).ok();
-        match authorize_with_mailbox(
-            url,
-            Path::new(&mailbox),
-            email.as_deref(),
-            AUTHORIZE_TIMEOUT,
-        ) {
+        match authorize_with_mailbox(url, &mailbox, email.as_deref(), AUTHORIZE_TIMEOUT) {
             Ok(()) => return ExitCode::from(0),
             Err(why) => {
                 eprintln!("{OPENER}: not authorized: {why}");

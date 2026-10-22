@@ -149,13 +149,15 @@ pub fn simhash_ctx_reference(
 
 /// Accumulate one voter's 64 bit votes at weight `w`.
 #[inline]
-fn cast_vote(votes: &mut [i32; 64], h: u64, w: i32) {
-    for (i, v) in votes.iter_mut().enumerate() {
+const fn cast_vote(votes: &mut [i32; 64], h: u64, w: i32) {
+    let mut i = 0;
+    while i < 64 {
         if (h >> i) & 1 == 1 {
-            *v += w;
+            votes[i] += w;
         } else {
-            *v -= w;
+            votes[i] -= w;
         }
+        i += 1;
     }
 }
 
@@ -278,16 +280,22 @@ pub struct VoterSet {
 /// fold of [`simhash_ctx_reference`], factored so the battery compares both
 /// kernels on identical inputs.
 #[cfg(test)]
-pub fn simhash_majority_reference(v: &VoterSet) -> u64 {
+pub const fn simhash_majority_reference(v: &VoterSet) -> u64 {
     let mut votes = [0i32; 64];
-    for (i, &w) in SIMHASH_SLOT_WEIGHTS.iter().enumerate() {
+    let mut i = 0;
+    while i < SIMHASH_SLOT_WEIGHTS.len() {
         if v.present & (1 << i) != 0 {
-            cast_vote(&mut votes, v.hash[i], w);
+            cast_vote(&mut votes, v.hash[i], SIMHASH_SLOT_WEIGHTS[i]);
         }
+        i += 1;
     }
     let mut fp = 0u64;
-    for (i, vv) in votes.iter().enumerate() {
-        fp |= u64::from(*vv >= 0) << i;
+    let mut i = 0;
+    while i < 64 {
+        if votes[i] >= 0 {
+            fp |= 1u64 << i;
+        }
+        i += 1;
     }
     fp
 }
@@ -295,34 +303,34 @@ pub fn simhash_majority_reference(v: &VoterSet) -> u64 {
 /// One lane-wise full adder: `(sum, carry)` — all ops bitwise, carry-free
 /// across lanes (the lift side condition).
 #[inline]
-fn csa(a: u64, b: u64, c: u64) -> (u64, u64) {
+const fn csa(a: u64, b: u64, c: u64) -> (u64, u64) {
     (a ^ b ^ c, (a & b) | (c & (a ^ b)))
 }
 
 /// Bit-sliced majority via the carry-save adder network. Equals
 /// `simhash_majority_reference` on every input (the certificate, and the battery below).
 #[inline]
-pub fn simhash_majority_bitsliced(v: &VoterSet) -> u64 {
+pub const fn simhash_majority_bitsliced(v: &VoterSet) -> u64 {
     // Masked lanes: an absent voter contributes no set bits (and, below, no
     // weight to W) — exactly the reference's "does not vote".
-    let h = |i: usize| {
+    const fn h(v: &VoterSet, i: usize) -> u64 {
         if v.present & (1 << i) != 0 {
             v.hash[i]
         } else {
             0
         }
-    };
+    }
 
     // Weight bit-planes ({4,3,2,1} binary-decomposed; slot order as in
     // SIMHASH_SLOT_WEIGHTS):
     //   plane 1 (weight bit 0): form(3), right d4(1), left d4(1)   — 3 inputs
     //   plane 2 (weight bit 1): form(3), right/left d2(2) d3(2)    — 5 inputs
     //   plane 4 (weight bit 2): right d1(4), left d1(4)            — 2 inputs
-    let (p1_s, p1_c) = csa(h(0), h(4), h(8));
-    let (p2_a, p2_ca) = csa(h(0), h(2), h(3));
-    let (p2_s, p2_cb) = csa(p2_a, h(6), h(7));
+    let (p1_s, p1_c) = csa(h(v, 0), h(v, 4), h(v, 8));
+    let (p2_a, p2_ca) = csa(h(v, 0), h(v, 2), h(v, 3));
+    let (p2_s, p2_cb) = csa(p2_a, h(v, 6), h(v, 7));
     let (p2_t1, p2_t2) = (p2_ca ^ p2_cb, p2_ca & p2_cb); // carries: 2·(ca+cb)
-    let (p4_s, p4_c) = (h(1) ^ h(5), h(1) & h(5));
+    let (p4_s, p4_c) = (h(v, 1) ^ h(v, 5), h(v, 1) & h(v, 5));
 
     // S = p1 + 2·p2 + 4·p4 as five bit-sliced digits (S ≤ 3 + 2·5 + 4·2 = 21):
     //   value 1: p1_s          value 2: p1_c, p2_s
@@ -336,17 +344,23 @@ pub fn simhash_majority_bitsliced(v: &VoterSet) -> u64 {
     // Signed majority as the unsigned threshold 2·S ≥ W ⇔ S ≥ ⌈W/2⌉ = T
     // (ties → 1 exactly like the reference: W even, S = W/2 passes).
     let mut w_total = 0i32;
-    for (i, &w) in SIMHASH_SLOT_WEIGHTS.iter().enumerate() {
+    let mut i = 0;
+    while i < SIMHASH_SLOT_WEIGHTS.len() {
         if v.present & (1 << i) != 0 {
-            w_total += w;
+            w_total += SIMHASH_SLOT_WEIGHTS[i];
         }
+        i += 1;
     }
     let t = (w_total + 1) >> 1; // 0..=11
     // Lane-wise "S ≥ T" comparator, LSB→MSB: ge = (s_k ∧ ¬t_k) ∨ (¬(s_k ⊕ t_k) ∧ ge).
     let mut ge = !0u64;
-    for (k, s_k) in [s0, s1, s2, s3, s4].into_iter().enumerate() {
+    let planes = [s0, s1, s2, s3, s4];
+    let mut k = 0;
+    while k < 5 {
+        let s_k = planes[k];
         let t_k = if (t >> k) & 1 == 1 { !0u64 } else { 0u64 };
         ge = (s_k & !t_k) | (!(s_k ^ t_k) & ge);
+        k += 1;
     }
     ge
 }
@@ -432,7 +446,7 @@ pub const fn field(gkey: u64, lo: u32, n: u32) -> u64 {
 
 /// Gray encode, the inverse of [`gray_decode`]: `g = b ^ (b >> 1)`.
 #[cfg(test)]
-pub fn gray_encode(b: u64) -> u64 {
+pub const fn gray_encode(b: u64) -> u64 {
     b ^ (b >> 1)
 }
 
@@ -534,8 +548,12 @@ pub const fn nova_radius(g: u64) -> f32 {
 /// included, reads the cat window (bits 26..33). Each 4-bit code maps to a hue
 /// rotation in `-18°..=+18°`.
 #[inline]
-pub fn ink_pair_nudges(class: Class, gkey: u64) -> (u8, u8) {
-    let lo = if class == Class::Profanity { 19 } else { 26 };
+pub const fn ink_pair_nudges(class: Class, gkey: u64) -> (u8, u8) {
+    let lo = if matches!(class, Class::Profanity) {
+        19
+    } else {
+        26
+    };
     (field(gkey, lo, 4) as u8, field(gkey, lo + 4, 4) as u8)
 }
 
@@ -608,7 +626,7 @@ pub enum Accessory {
 /// window and the `>> 12` nova window. `None` for any magic-build cat, so rate
 /// tests condition on `cat_magic == None` (marginal `(4033/4096)·rate`).
 #[cfg(test)]
-pub fn cat_accessory(magic: u64) -> Option<Accessory> {
+pub const fn cat_accessory(magic: u64) -> Option<Accessory> {
     if cat_magic(magic).is_some() {
         return None;
     }

@@ -25,7 +25,11 @@ pub const CENTRAL_DENY: &[&str] = &["docs", "publish", ".github"];
 /// A literal pathspec selects itself and every path under it; one holding `*`
 /// or `?` matches the whole path, `*` crossing `/` (git's default pathspec
 /// magic, measured: `!vendor/*/.github` excludes no file under a `.github`).
-/// `.` and `./` name the whole checkout; a root exclusion, including bare `!`, excludes it all.
+/// `.` (or `./.`, `././`) names the whole checkout, and excluding it excludes
+/// it all. The engine strips one leading `./` from a line and refuses one that
+/// leaves nothing (a bare `!`; git refuses the empty pathspec of a `./`); so
+/// does this. It also refuses a manifest that selects no file, which only the
+/// checkout can say: the `export-content` guard holds that.
 #[derive(Debug)]
 pub struct Selection {
     include: Vec<Spec>,
@@ -76,20 +80,26 @@ impl Spec {
     fn matches(&self, rel: &str) -> bool {
         match self {
             Self::Root => true,
-            Self::Literal(spec) => rel
-                .strip_prefix(spec.as_str())
-                .is_some_and(|rest| rest.is_empty() || rest.starts_with('/')),
+            Self::Literal(spec) => under(rel, spec),
             Self::Glob(re) => re.is_match(rel),
         }
     }
 }
 
+/// Whether `rel` is the literal path `spec` or under it.
+fn under(rel: &str, spec: &str) -> bool {
+    rel.strip_prefix(spec)
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
+}
+
 impl Selection {
     /// The manifest's lines (`#` to the end of a line is a comment). `Err` names
-    /// the 1-based line of a pathspec this reading cannot follow.
+    /// the 1-based line of a pathspec this reading cannot follow or the engine
+    /// refuses.
     ///
     /// # Errors
-    /// A line holding an absolute path, class, escape or git magic.
+    /// A line holding an absolute path, class, escape or git magic, or nothing
+    /// once its `./` is stripped.
     pub fn parse(manifest: &str) -> Result<Self, (usize, String)> {
         let mut include = Vec::new();
         let mut exclude: Vec<Spec> = CENTRAL_DENY
@@ -101,11 +111,27 @@ impl Selection {
             if line.is_empty() {
                 continue;
             }
-            let (list, text) = match line.strip_prefix('!') {
-                Some(body) => (&mut exclude, body.trim()),
-                None => (&mut include, line),
+            let (excluding, text) = match line.strip_prefix('!') {
+                Some(body) => (true, body.trim()),
+                None => (false, line),
             };
-            list.push(Spec::new(text).map_err(|why| (i + 1, why))?);
+            // the engine's reading: one `./` stripped, the rest handed to git
+            let spec = text.strip_prefix("./").unwrap_or(text);
+            if spec.is_empty() {
+                return Err((
+                    i + 1,
+                    format!(
+                        "{line:?} names nothing once the engine strips its `./`, so the engine \
+                         refuses it (a bare `!`, or an empty pathspec git refuses)"
+                    ),
+                ));
+            }
+            let spec = Spec::new(text).map_err(|why| (i + 1, why))?;
+            if excluding {
+                exclude.push(spec);
+            } else {
+                include.push(spec);
+            }
         }
         Ok(Self { include, exclude })
     }
@@ -253,7 +279,7 @@ mod tests {
         }
         assert!(Selection::everything().selects("tools/install.sh"));
         assert!(!Selection::everything().selects(".github/workflows/a.yml"));
-        for root in [".", "./", "././", "././."] {
+        for root in [".", "././", "././."] {
             let selected = Selection::parse(&format!("{root}\n!./crates/x/proofs/\n"))
                 .expect("root include with a directory exclusion");
             for (rel, want) in [
@@ -269,7 +295,7 @@ mod tests {
                 assert_eq!(selected.selects(rel), want, "{root}: {rel}");
             }
         }
-        for root in [".", "./", "././", "././.", ""] {
+        for root in [".", "././", "././."] {
             let excluded = Selection::parse(&format!("*\n!{root}\n")).expect("root exclusion");
             for rel in ["README.md", ".root", "crates/x/src/lib.rs"] {
                 assert!(!excluded.selects(rel), "{root}: {rel}");
@@ -283,5 +309,37 @@ mod tests {
                 .0,
             2
         );
+    }
+
+    /// A line the engine refuses is refused at that line, never read as the
+    /// whole checkout: one empty once its one `./` is stripped (a bare `!` the
+    /// engine refuses, an empty pathspec git refuses).
+    #[test]
+    fn a_line_the_engine_refuses_is_refused() {
+        for (manifest, line) in [
+            ("crates\n!\n", 2),
+            ("crates\n! \n", 2),
+            ("crates\n!./\n", 2),
+            ("crates\n! ./ # the root\n", 2),
+            ("./\n", 1),
+        ] {
+            assert_eq!(
+                Selection::parse(manifest).map(|_| ()).unwrap_err().0,
+                line,
+                "{manifest:?}"
+            );
+        }
+        // these parse, each line naming something once one `./` is stripped;
+        // whether one selects a file (the engine refuses one that selects none)
+        // is the checkout's to say, and the guard's to hold
+        for manifest in [
+            "crates\n!.\n",
+            "crates\n!././\n",
+            "././docs\n",
+            "docsx\n",
+            "",
+        ] {
+            assert!(Selection::parse(manifest).is_ok(), "{manifest:?}");
+        }
     }
 }

@@ -757,7 +757,7 @@ pub fn session_log_cursor_model() -> Model {
 /// closed the last turn (10 none yet, 11 a ctl exchange, 12 the transcript)
 /// and `cticks` how long its resting word had held.
 ///
-/// The transcript (phase 3B, rulings S2 and A6) adds two actions through
+/// The transcript adds two actions through
 /// `TurnTracker::transcript`: `TxClose`, the vendor turn's end closing the
 /// open turn when no screen step is open under it (`cw = 12`; a wall on
 /// the run stays), and `TxRefute`, the wall judge retracting the screen's
@@ -765,7 +765,7 @@ pub fn session_log_cursor_model() -> Model {
 /// word moves (every `See*`). `wg` is the GHOST of a wall's need taken by a
 /// transcript close.
 ///
-/// WHO DISMISSED A BOX (phase 5, ruling T1). `bk` is the input bound to the
+/// WHO DISMISSED A BOX. `bk` is the input bound to the
 /// open approval or question step (`step` 1 or 2): 0 none, 1 a control or
 /// harness input (who it came from and its `act=` decide `out=`, which the
 /// conformance binding reads off the real close), 2 a person's, 3 one
@@ -1243,12 +1243,12 @@ pub fn turn_tracker_model() -> Model {
 /// times seq `i` is shown, `vlost` the losses it says, `vs`/`vr`/`vt` whether
 /// the session, run and turn read open, `cs`/`cr`/`ct` the place of each
 /// one's synthetic close among the view's closes (0: none), which the reader
-/// derives at read time for a dead chain that did not hand the session on
-/// (ruling R1), and `ca` the `after=` of its `gap why=crash` (0: none). Any
+/// derives at read time for a dead chain that did not hand the session on,
+/// and `ca` the `after=` of its `gap why=crash` (0: none). Any
 /// change to the journal makes an earlier view stale (`rd = 0`, the view's
 /// variables cleared).
 ///
-/// Laws (ruling R12): `ViewAtMostOnce` (each `(sid, space, seq)` once in any
+/// Laws: `ViewAtMostOnce` (each `(sid, space, seq)` once in any
 /// reply), `DeadViewClosed` (every tree in a dead chain's view is closed,
 /// unless its last line for the session hands it on: a rolled-back update's
 /// is closed), `ChildClosesFirst` (closes innermost first: ORDER, not counts;
@@ -1459,7 +1459,7 @@ pub fn session_log_journal_model() -> Model {
     }
 }
 
-/// SESSION LOG MARK QUOTA (phase 3A, design §7.4; ruling R4): the claims a
+/// SESSION LOG MARK QUOTA (design §7.4): the claims a
 /// consumer writes back (`mark`, `src=mark`) hold at most a quarter of a
 /// ring's capacity, and the quota keeps that by taking only marks, the
 /// oldest first, never the record just appended and never one the readers'
@@ -1591,7 +1591,7 @@ pub fn session_log_mark_quota_model() -> Model {
     }
 }
 
-/// SESSION LOG PROGRAM SHARE (phase 6, 6F-3; T6, ruling U17): the program
+/// SESSION LOG PROGRAM SHARE: the program
 /// marks (OSC 7501's reports) hanging from one node hold at most its share of
 /// the ring, and the share keeps that by taking only that node's program
 /// marks, the oldest first, never the record just appended and never one the
@@ -1752,8 +1752,196 @@ pub fn session_log_program_share_model() -> Model {
     }
 }
 
-/// SESSION LOG CLAIMS (phase 3A, design §3.7 and §7.3; rulings R13 and the
-/// plan's correction 5, and the fixer's review): the claim half of the fold.
+/// SESSION LOG ROWS: the records a host's
+/// timeline prints as rows (`aterm_slog::Log::keep_rows`), numbered densely
+/// from a counter the host carries across an update, and the row floor: the
+/// newest rows, up to a quarter of the ring, which an eviction batch takes
+/// only once every other record it may take is taken.
+///
+/// Variables: `seq` the records this log accounts for and `lost` those it
+/// counts lost; live records: `u` the ones that are no row of this log (an
+/// unflagged record, or a carried one, which is never a row), `ro` the rows
+/// outside the floor and `rf` the rows within it (`Floor`, the quarter: 2
+/// here, a ring of 8 records); `nw` what the newest record is (0 none, 1
+/// another record, 2 a row), which no batch takes. The ids: `rid` the row
+/// counter's head (the last id issued, or the count carried in), `rfirst`
+/// the first id this log issues, `rapp` how many it issued, `rprev` the
+/// highest id an earlier process of this id space may have issued (a
+/// seamless update continues the space, its predecessor's ceiling the head
+/// plus the overlap's `Reserve`; a crash adoption at a new epoch starts its
+/// own); `ups` whether the update or adoption happened (one a walk:
+/// `MaxEp`, which keeps the box small); `under` whether a batch took a floor
+/// row while another record it may take was live (a ghost).
+///
+/// `AppendOther` and `AppendRow` append; a row takes the next id and joins
+/// the floor, whose oldest leaves it once it is full (a record that prints
+/// two rows, a session close, takes two ids: aterm-slog's
+/// `row_ids_are_dense_in_append_order_and_a_session_close_takes_two`, kept
+/// out of the box, which it would double). `EvictOther`,
+/// `EvictOutside` and `EvictFloor` are the level-aware batch (whose order
+/// among the rest is the ring model's): a floor row goes only once no other
+/// record but the newest is live. `HandoffCarried` is a carried update: the
+/// records cross as no rows, and the successor's ids continue past the
+/// count its host carried (`aterm_slog::Log::continue_rows`), its `mark -
+/// handoff` the first; `HandoffUncarried` starts a new log at its `gap
+/// why=handoff`, its ids continuing too; `Crash` is a crash adoption at a
+/// new epoch, its `gap why=crash` row id 1 (a row is named by its epoch and
+/// id, never by a start second).
+///
+/// Laws: `RowFloor`: no floor row goes while another record could;
+/// `DenseRowIds`: this log's ids are `rfirst ..= rid`, each issued once, in
+/// order, all above any earlier process's of its id space; `NoSilentLoss`:
+/// every record is live or counted lost.
+///
+/// `Buggy = 1` adds dead mutants, each at most once a walk (which keeps
+/// the mutated box within the interpreter's): a batch that takes a floor
+/// row while another record could go (`EvictRowUnderFloor`, `RowFloor`'s),
+/// a carried update whose successor's counter is not carried
+/// (`HandoffRowsRestart`) and a crash adoption whose ids start over in its
+/// predecessor's id space (`CrashKeepsEpoch`), both `DenseRowIds`', and a
+/// carried update that drops a record nobody counts (`CarryShedUncounted`,
+/// `NoSilentLoss`'s). Tier-1: aterm-slog's
+/// `slog_rows_conform_to_derived_model`.
+#[must_use]
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn session_log_rows_model() -> Model {
+    aterm_spec::ty_model! {
+        SessionLogRows {
+            const Buggy = 0;
+            const MaxSeq = 9;
+            const Floor = 2;
+            const Reserve = 1;
+            const MaxEp = 1;
+            const MaxId = 24;
+            var seq = 0;
+            var lost = 0;
+            var u = 0;
+            var ro = 0;
+            var rf = 0;
+            var nw = 0;
+            var rid = 0;
+            var rfirst = 1;
+            var rapp = 0;
+            var rprev = 0;
+            var ups = 0;
+            var under = 0;
+
+            action AppendOther when (MaxSeq > seq) {
+                u = u + 1;
+                seq = seq + 1;
+                nw = 1;
+            }
+            action AppendRow when (MaxSeq > seq) {
+                ro = if Floor > rf { ro } else { ro + 1 };
+                rf = if Floor > rf { rf + 1 } else { rf };
+                rid = rid + 1;
+                rapp = rapp + 1;
+                seq = seq + 1;
+                nw = 2;
+            }
+            action EvictOther when (u > (if nw == 1 { 1 } else { 0 })) {
+                u = u - 1;
+                lost = lost + 1;
+            }
+            action EvictOutside when (ro > 0) {
+                ro = ro - 1;
+                lost = lost + 1;
+            }
+            action EvictFloor when (rf > (if nw == 2 { 1 } else { 0 }) && ro == 0 && u <= (if nw == 1 { 1 } else { 0 })) {
+                rf = rf - 1;
+                lost = lost + 1;
+            }
+            action HandoffCarried when (MaxEp > ups && MaxSeq > seq) {
+                u = u + ro + rf;
+                ro = 0;
+                rf = 1;
+                rprev = rid + Reserve;
+                rfirst = rid + Reserve + 1;
+                rid = rid + Reserve + 1;
+                rapp = 1;
+                seq = seq + 1;
+                nw = 2;
+                ups = ups + 1;
+            }
+            action HandoffUncarried when (MaxEp > ups) {
+                seq = 1;
+                lost = 0;
+                u = 0;
+                ro = 0;
+                rf = 1;
+                rprev = rid + Reserve;
+                rfirst = rid + Reserve + 1;
+                rid = rid + Reserve + 1;
+                rapp = 1;
+                nw = 2;
+                ups = ups + 1;
+            }
+            action Crash when (MaxEp > ups) {
+                seq = 1;
+                lost = 0;
+                u = 0;
+                ro = 0;
+                rf = 1;
+                rprev = 0;
+                rfirst = 1;
+                rid = 1;
+                rapp = 1;
+                nw = 2;
+                ups = ups + 1;
+            }
+            action EvictRowUnderFloor when (Buggy == 1 && under == 0 && rf > (if nw == 2 { 1 } else { 0 }) && u > (if nw == 1 { 1 } else { 0 })) {
+                rf = rf - 1;
+                lost = lost + 1;
+                under = 1;
+            }
+            action HandoffRowsRestart when (Buggy == 1 && MaxEp > ups && MaxSeq > seq) {
+                u = u + ro + rf;
+                ro = 0;
+                rf = 1;
+                rprev = rid + Reserve;
+                rfirst = 1;
+                rid = 1;
+                rapp = 1;
+                seq = seq + 1;
+                nw = 2;
+                ups = ups + 1;
+            }
+            action CrashKeepsEpoch when (Buggy == 1 && MaxEp > ups) {
+                seq = 1;
+                lost = 0;
+                u = 0;
+                ro = 0;
+                rf = 1;
+                rprev = rid;
+                rfirst = 1;
+                rid = 1;
+                rapp = 1;
+                nw = 2;
+                ups = ups + 1;
+            }
+            action CarryShedUncounted when (Buggy == 1 && MaxEp > ups && MaxSeq > seq && u + ro + rf > 0) {
+                u = u + ro + rf - 1;
+                ro = 0;
+                rf = 1;
+                rprev = rid + Reserve;
+                rfirst = rid + Reserve + 1;
+                rid = rid + Reserve + 1;
+                rapp = 1;
+                seq = seq + 1;
+                nw = 2;
+                ups = ups + 1;
+            }
+
+            invariant RowFloor: under == 0;
+            invariant DenseRowIds: rid + 1 == rfirst + rapp && rfirst > rprev;
+            invariant NoSilentLoss: lost + u + ro + rf == seq;
+            bound StateBounded: seq <= MaxSeq && lost <= MaxSeq && u <= MaxSeq && ro <= MaxSeq && rf <= Floor && nw <= 2 && rid <= MaxId && rfirst <= MaxId && rapp <= MaxId && rprev <= MaxId && ups <= MaxEp && under <= 1;
+        }
+    }
+}
+
+/// SESSION LOG CLAIMS (design §3.7 and §7.3):
+/// the claim half of the fold.
 /// A claim is an attributed opinion: it never lifts an observed need, a need
 /// it raises ranks below every observed one and stays its raiser's, the label
 /// `brief` and the clause show is only ever a trusted author's and a proven
@@ -1948,7 +2136,7 @@ pub fn session_log_claims_model() -> Model {
     }
 }
 
-/// SESSION LOG FOLD (phase 3B, plan §4.2 as amended by A31 and ruling S13):
+/// SESSION LOG FOLD (plan §4.2):
 /// what `aterm_slog::Fold::apply` and the clause make of one agent run,
 /// its one turn, one need-bearing step of that turn (a wall the screen saw),
 /// one claimed need and one label, as records arrive and time passes.
@@ -1957,7 +2145,7 @@ pub fn session_log_claims_model() -> Model {
 /// the outcome the fold holds for the closed turn (0 while it is open, 1
 /// `done`, 2 `wall:*`, 3 `gone`) and `oc` the rank of the record that set it
 /// (`Conf::rank`: 3 strong, 4 exact); `gw`/`gc` the GHOST of the outcome
-/// rulings S9 and A5 give over every close and amend of the turn: the close's
+/// given over every close and amend of the turn: the close's
 /// own, unless an EXACT amend (the transcript, on a measured build) refines
 /// it, before the close or after; a strong amend never does; `nd`, `nw`,
 /// `ng` the session totals' `done`, `walled` and `other` buckets; `s` the
@@ -2158,8 +2346,8 @@ pub fn session_log_fold_model() -> Model {
     }
 }
 
-/// TRANSCRIPT JOIN (phase 3B, plan §4.3 as amended by rulings S1, S2, S4,
-/// S9 and S13): what `aterm_slog::TurnTracker::transcript` makes of one
+/// TRANSCRIPT JOIN (plan §4.3):
+/// what `aterm_slog::TurnTracker::transcript` makes of one
 /// agent run's vendor turns while the screen drives the same tracker.
 ///
 /// Variables: `wm` the join holds a watermark (bound to the file); `pt` the
@@ -2537,7 +2725,7 @@ pub fn transcript_join_model() -> Model {
     }
 }
 
-/// SESSION LOG MAIL LINK (phase 5, plan 5D-5; rulings T10, T11, T36, T39;
+/// SESSION LOG MAIL LINK (
 /// design §2.6, DESIGN:203-207): the heuristic mail → turn link
 /// `aterm_slog::Fold::apply` makes as a session's mail and turns arrive and
 /// time passes (`aterm_slog::mail_link_of`, `fold_mail.rs`).

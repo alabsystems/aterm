@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE INSTANCE'S NODE LOG, host side (session log 5J-2, ruling T27; design
+//! THE INSTANCE'S NODE LOG, host side (design
 //! §2.1 "node", §2.6 "Per instance", §6's instance row): one
 //! [`aterm_slog::NodeLog`] per process, what the instance itself did.
 //!
@@ -12,7 +12,7 @@
 //!   this launch ended once it has read the ledger ([`NodeLogHost::note_prev_end`]:
 //!   `amend n start prev_end=<word>`, a caught signal's number in `code=`). A
 //!   launch that never reads the ledger (plain headless, dev) keeps `-`; a lab
-//!   desk reads its private root's own (Phase 6 step 6C-4,
+//!   desk reads its private root's own (
 //!   `recovery_census::cold_census`).
 //! - **`link state=`.** Every stored transition of the fabric link, through
 //!   `aterm_gui_fabric::on_link_moved` (that crate has no aterm-slog
@@ -287,8 +287,8 @@ pub(crate) fn names_node_log(rest: &str) -> bool {
     rest.split_whitespace().any(|w| w == "n")
 }
 
-/// `log n [since=<seq> ep=<epoch>] [n=<count>] [kinds=<k>[,...]] [--json]`
-/// (session log 5J-3): `host`'s records as `log` prints a session's, under
+/// `log n [since=<seq> ep=<epoch>] [n=<count>] [kinds=<k>[,...]] [--json]`:
+/// `host`'s records as `log` prints a session's, under
 /// the same header. A node subtree, `lvl=` or `class=turn` names nothing
 /// here: a usage error.
 pub(crate) fn cmd_node_log(host: &NodeLogHost, rest: &str) -> String {

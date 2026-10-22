@@ -292,6 +292,32 @@ pub fn boot_with(
     configure: impl FnOnce(&Path, &mut Command),
     ready: impl Fn(&Instance) -> bool,
 ) -> Instance {
+    boot_under(prefix, None, configure, ready)
+}
+
+/// [`boot_with`], the instance launched by `/usr/bin/sandbox-exec` under the
+/// Seatbelt `profile` (SBPL), which it and everything it starts keep for good:
+/// a network witness, say, that kills a process at its first connection to
+/// anything but loopback. `sandbox-exec` execs the instance in place, so the
+/// child's pid is the instance's. macOS only.
+#[cfg(target_os = "macos")]
+#[track_caller]
+pub fn boot_jailed(
+    prefix: &str,
+    profile: &str,
+    configure: impl FnOnce(&Path, &mut Command),
+    ready: impl Fn(&Instance) -> bool,
+) -> Instance {
+    boot_under(prefix, Some(profile), configure, ready)
+}
+
+#[track_caller]
+fn boot_under(
+    prefix: &str,
+    jail: Option<&str>,
+    configure: impl FnOnce(&Path, &mut Command),
+    ready: impl Fn(&Instance) -> bool,
+) -> Instance {
     let tmp = scratch_root(prefix);
     let log = tmp.join("gui.log");
     let (out, err) = match std::fs::File::create(&log).and_then(|f| Ok((f.try_clone()?, f))) {
@@ -306,7 +332,14 @@ pub fn boot_with(
     // ([`aterm_spec::wait::first_exec`]); `--help` is answered above the mode
     // fork, before any setup.
     aterm_spec::wait::first_exec(&aterm, &["--help"]);
-    let mut cmd = Command::new(&aterm);
+    let mut cmd = match jail {
+        None => Command::new(&aterm),
+        Some(profile) => {
+            let mut cmd = Command::new("/usr/bin/sandbox-exec");
+            cmd.args(["-p", profile]).arg(&aterm);
+            cmd
+        }
+    };
     launch_isolation::apply(&mut cmd, &tmp);
     cmd.args(["--headless", launch_isolation::NO_REROUTE])
         .args(launch_isolation::control_sock(&tmp))

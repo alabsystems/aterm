@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE LAB DESK'S `prev_end=` (session log Phase 6, step 6C-4; ruling U9),
+//! THE LAB DESK'S `prev_end=`,
 //! across real aterm processes sharing one scratch world. A lab desk is a
 //! headless instance under the lab's desk seam (`ATERM_DEBUG_HEADLESS_RESTORE`
 //! under a private `ATERM_STATE_HOME`: `Desk::LabHeadless`): it arms its crash

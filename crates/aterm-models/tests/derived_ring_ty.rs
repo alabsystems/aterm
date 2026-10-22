@@ -564,9 +564,9 @@ fn derived_session_log_ring_proves_and_catches_each_law() {
 /// the only one some single `Buggy = 1` step breaks, every mutant is dead at
 /// the committed config and caught on its own, and the paths are reachable:
 /// a hole said by one cover; a slot pinned under the update's fence that no
-/// landing passes, landed by the successor only after it adopted the session
-/// (ruling Q1), its carried cursor moved past the pin; another writer's record
-/// at the pinned seq re-pinned, never landed (ruling Q3). Tier-1: aterm-link's
+/// landing passes, landed by the successor only after it adopted the session,
+/// its carried cursor moved past the pin; another writer's record
+/// at the pinned seq re-pinned, never landed. Tier-1: aterm-link's
 /// `log_mirror_conforms_to_derived_model`.
 #[test]
 fn derived_log_mirror_proves_and_catches_each_law() {
@@ -764,7 +764,7 @@ fn derived_session_log_cursor_proves_and_catches_each_law() {
     );
 }
 
-/// The journal reader's view (phase 2B, ruling R12): each of its five laws
+/// The journal reader's view: each of its five laws
 /// is the only one some single `Buggy = 1` step breaks, every mutant is dead
 /// at the committed config and caught on its own, and the paths: a line
 /// journaled twice reads once, a dead chain reads its crash closes innermost
@@ -847,7 +847,7 @@ fn derived_session_log_journal_proves_and_catches_each_law() {
     assert_eq!((r["vs"], r["cs"], r["ca"]), (0, 1, 1), "stood down: closed");
 }
 
-/// The mark quota (phase 3A, §7.4; ruling R4): each of its four laws is the
+/// The mark quota (§7.4): each of its four laws is the
 /// only one some single `Buggy = 1` step breaks, every mutant is dead at the
 /// committed config and caught on its own, and the paths: a third mark takes
 /// the first, a fence keeps its marks past the quota (only the newest beside
@@ -894,7 +894,7 @@ fn derived_session_log_mark_quota_proves_and_catches_each_law() {
     assert_eq!((s["um"], s["mq"], s["lost"]), (1, 1, 4), "a lowered share");
 }
 
-/// The program share (phase 6, 6F-3; T6, ruling U17): each of its four laws
+/// The program share: each of its four laws
 /// is the only one some single `Buggy = 1` step breaks, every mutant is dead
 /// at the committed config and caught on its own, and the paths: a third
 /// program mark of a node takes its first and nothing beside it, another
@@ -945,7 +945,84 @@ fn derived_session_log_program_share_proves_and_catches_each_law() {
     );
 }
 
-/// The claims (phase 3A, §3.7, §7.3; ruling R13 and the fixer's review):
+/// The rows: each of its three laws is the
+/// only one some single `Buggy = 1` step breaks, every mutant is dead at
+/// the committed config and caught on its own, and the paths: the floor's
+/// rows outlive every other record a batch may take, a third row moves the
+/// oldest out of the floor and that one goes first, each row takes the next
+/// id, a carried update's ids continue past the predecessor's ceiling,
+/// and a crash adoption's start at 1 in its own epoch. Tier-1: aterm-slog's
+/// `slog_rows_conform_to_derived_model`.
+#[test]
+fn derived_session_log_rows_proves_and_catches_each_law() {
+    let model = aterm_models_session::session_log_rows_model();
+    assert_proves_and_catches(&model);
+    assert_every_invariant_breaks_first(&model);
+    assert_committed_dead_actions(
+        &model,
+        &[
+            "EvictRowUnderFloor",
+            "HandoffRowsRestart",
+            "CrashKeepsEpoch",
+            "CarryShedUncounted",
+        ],
+    );
+    let fire = |s: &mut aterm_spec::interp::State, path: &[&str]| {
+        for action in path {
+            assert!(model.fire(action, s), "{action}: {s:?}");
+        }
+    };
+    let mut s = model.init_state();
+    fire(
+        &mut s,
+        &[
+            "AppendRow",
+            "AppendRow",
+            "AppendOther",
+            "AppendOther",
+            "AppendOther",
+        ],
+    );
+    assert_eq!((s["rf"], s["ro"], s["u"]), (2, 0, 3));
+    assert!(
+        !model.fire("EvictFloor", &mut s.clone()),
+        "a floor row waits while another record may go"
+    );
+    fire(&mut s, &["EvictOther", "EvictOther"]);
+    assert!(
+        model.fire("EvictFloor", &mut s.clone()),
+        "only the newest is left beside the floor: its rows may go"
+    );
+    fire(&mut s, &["AppendRow"]);
+    assert_eq!((s["rf"], s["ro"]), (2, 1), "the oldest row left the floor");
+    assert!(!model.fire("EvictFloor", &mut s.clone()));
+    fire(&mut s, &["EvictOutside", "AppendRow"]);
+    assert_eq!(
+        (s["rid"], s["rfirst"], s["rapp"]),
+        (4, 1, 4),
+        "each row takes the next id"
+    );
+    let mut crashed = s.clone();
+    fire(&mut s, &["HandoffCarried"]);
+    assert_eq!(
+        (s["rid"], s["rfirst"], s["rprev"], s["rf"], s["u"]),
+        (6, 6, 5, 1, 4),
+        "the successor's ids continue past the ceiling; the carried records are no rows"
+    );
+    fire(&mut crashed, &["Crash"]);
+    assert_eq!(
+        (
+            crashed["rid"],
+            crashed["rfirst"],
+            crashed["rprev"],
+            crashed["seq"]
+        ),
+        (1, 1, 0, 1),
+        "a crash adoption's ids start at 1 in its own epoch"
+    );
+}
+
+/// The claims (§3.7, §7.3):
 /// each of its seven laws is the only one some single `Buggy = 1` step
 /// breaks, every mutant is dead at the committed config and caught on its
 /// own, and the paths: a claim's clear leaves an observed need standing, a

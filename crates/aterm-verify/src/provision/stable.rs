@@ -1,17 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The stock exceptions a full `ship provision` acquires before it audits them (`--check`
-//! acquires nothing): rustup itself (no default toolchain, auto-install off), upstream
-//! stable with the `x86_64-apple-darwin` slice, the foreign cells' std and the clippy
-//! that lints them (for `verify cells`, run by hand; the audit does not ask for them),
-//! the wasm32 pin `publish/config.sh`'s wasm32 clause names, with its wasm32 target,
-//! rustup's `trust` link (atpkg's seam, the pass `aterm pkg repair` runs), and the
-//! wasm-bindgen CLI at the pin `verify wasm-glue`'s oracle row holds the goldens to
-//! (the audit does not ask for it either), installed through targo with `--locked` into
-//! the machine-wide tooling directory that row reads from every checkout
-//! (`aterm_verify::wasm_glue::tooling`), `--force`d over a copy there that does not
-//! answer the pin.
+//! `verify provision`'s rustup row: the stock exceptions (§6.1 rows 23 and 24), which
+//! `ship provision` acquired before this verb took them over: rustup itself (no default
+//! toolchain, auto-install off, laid by the pinned rustup-init the row hands [`run`]),
+//! upstream stable with the `x86_64-apple-darwin` slice, the foreign cells' std and the
+//! clippy that lints them (for `verify cells`, run by hand), and the wasm32 pin
+//! `publish/config.sh`'s wasm32 clause names, with its wasm32 target, in a tree that has
+//! `publish/` ([`wasm_pin_wanted`]). rustup's `trust` link stays `ship provision`'s
+//! (atpkg's seam, the pass `aterm pkg repair` runs), and the wasm-bindgen CLI is the
+//! `--record` row's.
 //!
 //! Stock stable builds only the x86_64 slice and lints the foreign cells, and the pin
 //! only type-checks the wasm32 clause, so each is installed by name with what its job
@@ -21,7 +19,18 @@
 
 use std::path::{Path, PathBuf};
 
-use aterm_verify::wasm_glue::{BINDGEN_INSTALL, bindgen_root, reports_pin};
+/// The std targets the `cells` check (`targo --unverified verify cells`, by hand)
+/// compiles the foreign cells for, on upstream stable (Trust has none of them). This row
+/// acquires them so the check can run here; no release needs them (`cells` is in no set),
+/// so `ship provision`'s audit does not ask for them.
+pub const FOREIGN_CELL_TARGETS: [&str; 4] = [
+    "x86_64-pc-windows-msvc",
+    "aarch64-pc-windows-msvc",
+    "aarch64-unknown-linux-gnu",
+    "wasm32-unknown-unknown",
+];
+
+pub use crate::rustup::{ClauseError, WasmClause, wasm_clause, wasm_pin, wasm_pin_wanted};
 
 /// The wasm32 target the pin carries.
 const WASM32: &str = "wasm32-unknown-unknown";
@@ -45,9 +54,6 @@ pub(crate) struct Seen {
     pub stable_components: Vec<String>,
     /// The std targets installed on the wasm32 pin.
     pub pin_targets: Vec<String>,
-    /// Whether the tooling directory's wasm-bindgen answers exactly
-    /// [`aterm_verify::wasm_glue::BINDGEN`].
-    pub bindgen: bool,
 }
 
 /// One acquisition.
@@ -65,12 +71,6 @@ pub(crate) enum Step {
     PinToolchain(String),
     /// `rustup target add --toolchain <pin> wasm32-unknown-unknown`.
     PinTarget(String),
-    /// rustup's `trust` entry, attached (or a stale one re-pointed) by atpkg's seam.
-    TrustSeam,
-    /// `targo --unverified install wasm-bindgen-cli --version <BINDGEN> --locked --force
-    /// --root <root>` ([`BINDGEN_INSTALL`]), the root under the tooling directory
-    /// ([`bindgen_root`]).
-    Bindgen(PathBuf),
 }
 
 /// Whether `listed` holds `name`, which rustup lists with a triple after it: a toolchain
@@ -81,14 +81,8 @@ fn has(listed: &[String], name: &str) -> bool {
         .any(|t| t == name || t.starts_with(&format!("{name}-")))
 }
 
-/// What a machine that holds `seen` lacks, in order, its wasm-bindgen installed under
-/// `tooling` — pure.
-pub(crate) fn plan(
-    seen: &Seen,
-    pin: Option<&str>,
-    stable_targets: &[&str],
-    tooling: Option<&Path>,
-) -> Vec<Step> {
+/// What a machine that holds `seen` lacks, in order — pure. Empty: the row is in place.
+pub(crate) fn plan(seen: &Seen, pin: Option<&str>, stable_targets: &[&str]) -> Vec<Step> {
     let mut steps = Vec::new();
     let fresh = seen.rustup.is_none();
     if fresh {
@@ -119,15 +113,10 @@ pub(crate) fn plan(
             steps.push(Step::PinTarget(pin.to_string()));
         }
     }
-    steps.push(Step::TrustSeam);
-    // Last: a build from source, and it needs nothing of rustup's.
-    if let Some(tooling) = tooling.filter(|_| !seen.bindgen) {
-        steps.push(Step::Bindgen(bindgen_root(tooling)));
-    }
     steps
 }
 
-/// The rustup command lines of `step` (none for the seam, which runs in-process).
+/// The rustup command lines of `step`.
 pub(crate) fn argv(step: &Step) -> Vec<Vec<String>> {
     let v = |a: &[&str]| a.iter().map(|s| (*s).to_string()).collect::<Vec<_>>();
     match step {
@@ -177,56 +166,32 @@ pub(crate) fn argv(step: &Step) -> Vec<Vec<String>> {
             WASM32,
         ])],
         Step::PinTarget(pin) => vec![v(&["rustup", "target", "add", "--toolchain", pin, WASM32])],
-        Step::TrustSeam => Vec::new(),
-        Step::Bindgen(root) => {
-            let mut a = v(&["targo", "--unverified"]);
-            a.extend(v(&BINDGEN_INSTALL));
-            a.extend(v(&["--root", &root.to_string_lossy()]));
-            vec![a]
-        }
     }
 }
 
-/// The host rustup-init is downloaded for.
-fn host_triple() -> Option<&'static str> {
-    match (std::env::consts::ARCH, std::env::consts::OS) {
-        ("aarch64", "macos") => Some("aarch64-apple-darwin"),
-        ("x86_64", "macos") => Some("x86_64-apple-darwin"),
-        ("x86_64", "linux") => Some("x86_64-unknown-linux-gnu"),
-        ("aarch64", "linux") => Some("aarch64-unknown-linux-gnu"),
-        _ => None,
-    }
-}
-
-/// The directories rustup and atpkg resolve, read from the environment once: rustup's
-/// own rules (`$CARGO_HOME`, else `~/.cargo`; `$RUSTUP_HOME`, else `~/.rustup`), which
-/// every child is handed explicitly so rustup-init installs where the next step looks,
-/// and the machine-wide tooling directory.
+/// The directories rustup resolves, read from the environment once: rustup's own rules
+/// (`$CARGO_HOME`, else `~/.cargo`; `$RUSTUP_HOME`, else `~/.rustup`), which every child
+/// is handed explicitly so rustup-init installs where the next step looks.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct Homes {
+pub struct Homes {
     /// `$HOME`.
     pub home: PathBuf,
     /// Where rustup-init puts `bin/rustup`.
     pub cargo_home: PathBuf,
     /// Where rustup keeps its toolchains.
     pub rustup_home: PathBuf,
-    /// `$XDG_CONFIG_HOME`, for the atpkg prefix the seam resolves.
-    pub xdg_config_home: Option<PathBuf>,
     /// `$PATH`, searched for an installed rustup before `<cargo_home>/bin`.
     pub path: Option<std::ffi::OsString>,
-    /// Homebrew's rustup keg, looked at last: this machine's
-    /// ([`atpkg::toolchain::rustup::HOMEBREW_RUSTUP`]), or `None` where the homes are a
-    /// test's and nothing of this machine's may answer.
+    /// Homebrew's rustup keg, looked at last, as a resolver fallback and never a remedy:
+    /// this machine's ([`aterm_toolchain::rustup::HOMEBREW_RUSTUP`]), or `None` where the
+    /// homes are a test's and nothing of this machine's may answer.
     pub homebrew_keg: Option<PathBuf>,
-    /// The machine-wide tooling directory the wasm-glue oracle reads
-    /// (`aterm_verify::wasm_glue::tooling`), where wasm-bindgen is installed; `None`
-    /// where none is named, and nothing is installed.
-    pub tooling: Option<PathBuf>,
 }
 
 impl Homes {
     /// This process's.
-    pub(crate) fn from_env(home: &Path) -> Self {
+    #[must_use]
+    pub fn from_env(home: &Path) -> Self {
         let set = |k: &str| {
             std::env::var_os(k)
                 .filter(|v| !v.is_empty())
@@ -235,32 +200,19 @@ impl Homes {
         Self {
             home: home.to_path_buf(),
             cargo_home: set("CARGO_HOME").unwrap_or_else(|| home.join(".cargo")),
-            rustup_home: atpkg::toolchain::rustup_home(
+            rustup_home: aterm_toolchain::rustup::rustup_home(
                 std::env::var_os("RUSTUP_HOME").as_deref(),
                 home,
             ),
-            xdg_config_home: set("XDG_CONFIG_HOME"),
             path: std::env::var_os("PATH"),
-            homebrew_keg: Some(PathBuf::from(atpkg::toolchain::rustup::HOMEBREW_RUSTUP)),
-            tooling: aterm_verify::wasm_glue::tooling(Some(home), set("XDG_CACHE_HOME").as_deref()),
+            homebrew_keg: Some(PathBuf::from(aterm_toolchain::rustup::HOMEBREW_RUSTUP)),
         }
-    }
-
-    /// The wasm-bindgen the tooling directory holds, installed or not.
-    fn bindgen(&self) -> Option<PathBuf> {
-        self.tooling
-            .as_deref()
-            .map(|t| bindgen_root(t).join("bin/wasm-bindgen"))
-    }
-
-    fn rustup_init(&self) -> PathBuf {
-        self.cargo_home.join("rustup-init")
     }
 
     /// The one rustup finder (`aterm_toolchain::rustup::find_rustup_among`) over these
     /// homes: PATH, then `<cargo_home>/bin`, `~/.cargo/bin` and the keg they name.
     fn find_rustup(&self) -> Option<PathBuf> {
-        atpkg::toolchain::rustup::find_rustup_among(
+        aterm_toolchain::rustup::find_rustup_among(
             self.path.as_deref(),
             Some(self.cargo_home.as_os_str()),
             Some(self.home.as_os_str()),
@@ -269,9 +221,8 @@ impl Homes {
     }
 }
 
-/// What runs rustup, and targo for the one install it makes: this machine ([`System`]),
-/// or a test's stateful stand-in.
-pub(crate) trait Rustup {
+/// What runs rustup: this machine ([`System`]), or a test's stateful stand-in.
+pub trait Rustup {
     /// `tool args…` with `RUSTUP_TOOLCHAIN` set to `toolchain` (else cleared) and the
     /// homes' `CARGO_HOME`/`RUSTUP_HOME`: its stdout, or why it failed.
     fn run(
@@ -281,16 +232,10 @@ pub(crate) trait Rustup {
         args: &[String],
         toolchain: Option<&str>,
     ) -> Result<String, String>;
-
-    /// This host's rustup-init, from rustup's own dist server, at `dest`.
-    fn fetch_init(&self, dest: &Path) -> Result<(), String>;
-
-    /// The targo that installs wasm-bindgen: the Trust toolchain's own.
-    fn targo(&self) -> Result<PathBuf, String>;
 }
 
 /// This machine.
-pub(crate) struct System;
+pub struct System;
 
 impl Rustup for System {
     fn run(
@@ -315,33 +260,6 @@ impl Rustup for System {
             Err(e) => Err(format!("could not run {}: {e}", tool.display())),
         }
     }
-
-    fn fetch_init(&self, dest: &Path) -> Result<(), String> {
-        let triple = host_triple().ok_or("no rustup-init for this host")?;
-        if let Some(dir) = dest.parent() {
-            std::fs::create_dir_all(dir).map_err(|e| format!("mkdir {}: {e}", dir.display()))?;
-        }
-        let url = format!("https://static.rust-lang.org/rustup/dist/{triple}/rustup-init");
-        let out = aterm_uds::spawnfd::command("curl")
-            .args(["--proto", "=https", "--tlsv1.2", "-sSf", "-o"])
-            .arg(dest)
-            .arg(&url)
-            .output()
-            .map_err(|e| format!("curl: {e}"))?;
-        if !out.status.success() {
-            return Err(format!(
-                "{url}: {}",
-                String::from_utf8_lossy(&out.stderr).trim()
-            ));
-        }
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(dest, std::fs::Permissions::from_mode(0o755))
-            .map_err(|e| format!("chmod {}: {e}", dest.display()))
-    }
-
-    fn targo(&self) -> Result<PathBuf, String> {
-        crate::gates::resolve_targo().map_err(|e| e.to_string())
-    }
 }
 
 /// The first word of each line: rustup's `toolchain list` and `target list --installed`
@@ -353,19 +271,11 @@ fn first_words(stdout: &str) -> Vec<String> {
         .collect()
 }
 
-/// What rustup and the tooling directory hold on this machine; an answer neither gives
-/// reads as nothing held.
+/// What rustup holds on this machine; an answer it does not give reads as nothing held.
+/// Each toolchain is asked about only once rustup lists it, so no read auto-installs one.
 fn observe(homes: &Homes, rustup: &dyn Rustup, pin: Option<&str>) -> Seen {
-    let bindgen = homes.bindgen().filter(|b| b.is_file()).is_some_and(|b| {
-        rustup
-            .run(homes, &b, &["--version".to_string()], None)
-            .is_ok_and(|out| reports_pin(&out))
-    });
     let Some(bin) = homes.find_rustup() else {
-        return Seen {
-            bindgen,
-            ..Seen::default()
-        };
+        return Seen::default();
     };
     let lines = |toolchain: Option<&str>, args: &[&str]| {
         let args: Vec<String> = args.iter().map(|a| (*a).to_string()).collect();
@@ -391,48 +301,71 @@ fn observe(homes: &Homes, rustup: &dyn Rustup, pin: Option<&str>) -> Seen {
         stable_targets,
         stable_components,
         pin_targets,
-        bindgen,
     }
 }
 
-/// Acquire what this machine lacks; each step is said, and a step that fails is said with
-/// why — the audit that follows names its remedy.
-pub(crate) fn run(repo: &Path, homes: &Homes, rustup: &dyn Rustup, report: &mut dyn FnMut(&str)) {
-    let pin = match std::fs::read_to_string(repo.join("publish/config.sh"))
-        .map_err(|e| e.to_string())
-        .and_then(|c| {
-            crate::release_steps::wasm_clause(&c).map_err(|r| format!("{} — {}", r.why, r.remedy))
-        }) {
-        Ok(clause) => Some(clause.pin),
-        Err(why) => {
-            report(&format!("the wasm32 pin is not acquired — {why}"));
-            None
-        }
-    };
-    let mut targets: Vec<&str> = super::FOREIGN_CELL_TARGETS.to_vec();
+/// What this row asks stable for on this host: the foreign cells' stds, and on macOS the
+/// shipped binary's x86_64 slice first.
+fn stable_targets() -> Vec<&'static str> {
+    let mut targets: Vec<&str> = FOREIGN_CELL_TARGETS.to_vec();
     if cfg!(target_os = "macos") {
         targets.insert(0, "x86_64-apple-darwin");
     }
+    targets
+}
+
+/// Whether no rustup is installed where the row looks for one: a run then needs the
+/// pinned rustup-init first.
+#[must_use]
+pub fn lacks_rustup(homes: &Homes) -> bool {
+    homes.find_rustup().is_none()
+}
+
+/// What this machine lacks of the row, read only: empty when it is in place. `pin` is
+/// the wasm32 pin ([`wasm_pin_wanted`]), `None` where the tree wants none.
+pub fn missing(homes: &Homes, rustup: &dyn Rustup, pin: Option<&str>) -> Vec<String> {
+    plan(&observe(homes, rustup, pin), pin, &stable_targets())
+        .iter()
+        .flat_map(argv)
+        .map(|a| a.join(" "))
+        .collect()
+}
+
+/// Acquire what this machine lacks; each step is said, and a step that fails is said with
+/// why. `init` is the rustup-init a machine with no rustup installs it with: fetched by the
+/// row at its pin and held to its sha256 before this runs it ([`super::provide`]), `None`
+/// where a rustup is installed. `Err` names every step that failed (or the unreadable
+/// pin); `Ok` holds what was acquired, empty when the row was in place.
+///
+/// # Errors
+/// As above: the row is not in place.
+pub fn run(
+    repo: &Path,
+    homes: &Homes,
+    rustup: &dyn Rustup,
+    init: Option<&Path>,
+    report: &mut dyn FnMut(&str),
+) -> Result<Vec<String>, String> {
+    let mut failed = Vec::new();
+    let pin = match wasm_pin_wanted(repo) {
+        Ok(pin) => pin,
+        Err(why) => {
+            failed.push(format!("the wasm32 pin is not acquired — {why}"));
+            None
+        }
+    };
     let seen = observe(homes, rustup, pin.as_deref());
-    for step in plan(&seen, pin.as_deref(), &targets, homes.tooling.as_deref()) {
-        if step == Step::TrustSeam {
-            seam(homes, report);
-            continue;
-        }
-        if step == Step::InstallRustup
-            && let Err(why) = rustup.fetch_init(&homes.rustup_init())
-        {
-            report(&format!("rustup was not installed — {why}"));
-            return;
-        }
+    let mut acquired = Vec::new();
+    'steps: for step in plan(&seen, pin.as_deref(), &stable_targets()) {
         for mut a in argv(&step) {
             let tool = match a.remove(0).as_str() {
-                "rustup-init" => homes.rustup_init(),
-                "targo" => match rustup.targo() {
-                    Ok(targo) => targo,
-                    Err(why) => {
-                        report(&format!("`targo {}` did not run — {why}", a.join(" ")));
-                        continue;
+                "rustup-init" => match init {
+                    Some(init) => init.to_path_buf(),
+                    None => {
+                        failed.push(
+                            "rustup was not installed — no pinned rustup-init was fetched".into(),
+                        );
+                        break 'steps;
                     }
                 },
                 // Found again per command: rustup-init has only just laid it.
@@ -444,8 +377,12 @@ pub(crate) fn run(repo: &Path, homes: &Homes, rustup: &dyn Rustup, report: &mut 
                 .file_name()
                 .map_or_else(String::new, |n| n.to_string_lossy().into());
             match rustup.run(homes, &tool, &a, None) {
-                Ok(_) => report(&format!("acquired: {name} {}", a.join(" "))),
-                Err(why) => report(&format!(
+                Ok(_) => {
+                    let line = format!("{name} {}", a.join(" "));
+                    report(&format!("acquired: {line}"));
+                    acquired.push(line);
+                }
+                Err(why) => failed.push(format!(
                     "`{} {}` failed: {why}",
                     tool.display(),
                     a.join(" ")
@@ -453,24 +390,15 @@ pub(crate) fn run(repo: &Path, homes: &Homes, rustup: &dyn Rustup, report: &mut 
             }
         }
     }
-}
-
-/// rustup's `trust` entry through atpkg's own seam pass (`aterm pkg repair`): a first
-/// attach where it is absent and trust is installed, a stale or dangling link re-pointed
-/// at atpkg's view, and anything it did not lay left alone with the one fix.
-fn seam(homes: &Homes, report: &mut dyn FnMut(&str)) {
-    let layout = atpkg::Layout {
-        prefix: atpkg::toolchain::atpkg_prefix(&homes.home, homes.xdg_config_home.as_deref()),
-    };
-    for event in atpkg::seam::repair(&layout, &homes.rustup_home) {
-        report(&format!("rustup trust: {event}"));
+    if failed.is_empty() {
+        Ok(acquired)
+    } else {
+        Err(failed.join("; "))
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use aterm_verify::wasm_glue::BINDGEN;
-
     use super::*;
 
     const TARGETS: &[&str] = &["x86_64-apple-darwin", "wasm32-unknown-unknown"];
@@ -489,7 +417,6 @@ mod tests {
                 "clippy-aarch64-apple-darwin",
             ]),
             pin_targets: names(&["aarch64-apple-darwin", WASM32]),
-            bindgen: true,
         }
     }
 
@@ -500,12 +427,11 @@ mod tests {
         s.stable_components = names(&["cargo-aarch64-apple-darwin"]);
         s.pin_targets = names(&["aarch64-apple-darwin"]);
         assert_eq!(
-            plan(&s, Some("1.97.1"), TARGETS, Some(Path::new("/t"))),
+            plan(&s, Some("1.97.1"), TARGETS),
             [
                 Step::StableTargets(names(&["x86_64-apple-darwin"])),
                 Step::StableClippy,
                 Step::PinTarget("1.97.1".into()),
-                Step::TrustSeam,
             ]
         );
         assert_eq!(
@@ -519,55 +445,26 @@ mod tests {
         let mut s = provisioned();
         s.toolchains = names(&["nightly-aarch64-apple-darwin"]);
         assert_eq!(
-            plan(&s, Some("1.97.1"), TARGETS, Some(Path::new("/t"))),
+            plan(&s, Some("1.97.1"), TARGETS),
             [
                 Step::StableToolchain,
                 Step::StableTargets(names(TARGETS)),
                 Step::PinToolchain("1.97.1".into()),
-                Step::TrustSeam,
             ]
         );
-        // No readable pin: nothing is guessed.
-        assert_eq!(plan(&provisioned(), None, TARGETS, None), [Step::TrustSeam]);
-    }
-
-    /// wasm-bindgen at the pin is installed, last, into the tooling directory's root
-    /// for it when the directory lacks it. NEGATIVE CONTROL: not when it holds it, and
-    /// nothing is guessed where no tooling directory is named.
-    #[test]
-    fn a_missing_bindgen_is_installed_at_the_pin_into_the_tooling_directory() {
-        let tooling = Path::new("/c/aterm/tooling");
-        let mut s = provisioned();
-        assert_eq!(plan(&s, None, TARGETS, Some(tooling)), [Step::TrustSeam]);
-        s.bindgen = false;
-        let root = tooling.join(format!("wasm-bindgen-{BINDGEN}"));
-        assert_eq!(
-            plan(&s, None, TARGETS, Some(tooling)),
-            [Step::TrustSeam, Step::Bindgen(root.clone())]
-        );
-        assert_eq!(plan(&s, None, TARGETS, None), [Step::TrustSeam]);
-        assert_eq!(
-            argv(&Step::Bindgen(root)).concat().join(" "),
-            format!(
-                "targo --unverified install wasm-bindgen-cli --version {BINDGEN} --locked \
-                 --force --root /c/aterm/tooling/wasm-bindgen-{BINDGEN}"
-            )
-        );
+        // No readable pin: nothing is guessed, and a provisioned machine lacks nothing.
+        assert_eq!(plan(&provisioned(), None, TARGETS), []);
     }
 }
 
 /// `run` and `observe` over a stateful rustup: what it holds changes as it is asked, and a
 /// call naming a toolchain it lacks auto-installs it until `set auto-install disable`, then
 /// fails as rustup 1.29 does, so "every toolchain by name" and "auto-install off before
-/// any install" are observed, not assumed. Its `targo install` keeps cargo's records of
-/// the root and refuses as cargo does, so a wasm-bindgen that is replaced is replaced as
-/// real cargo would.
+/// any install" are observed, not assumed.
 #[cfg(test)]
 mod stateful {
     use std::cell::RefCell;
     use std::collections::BTreeMap;
-
-    use aterm_verify::wasm_glue::BINDGEN;
 
     use super::*;
 
@@ -583,15 +480,10 @@ mod stateful {
         components: BTreeMap<String, Vec<String>>,
         calls: Vec<String>,
         auto_installed: Vec<String>,
-        /// The version the tooling directory's wasm-bindgen answers, if it answers.
-        bindgen: Option<String>,
-        /// The wasm-bindgen-cli version cargo's records of that root (`.crates2.json`) say it
-        /// installed there; `None` where cargo laid nothing.
-        bindgen_recorded: Option<String>,
     }
 
     #[derive(Default)]
-    struct FakeRustup(RefCell<State>);
+    pub(super) struct FakeRustup(RefCell<State>);
 
     impl FakeRustup {
         fn calls(&self) -> Vec<String> {
@@ -603,54 +495,6 @@ mod stateful {
                 .keys()
                 .find(|t| *t == name || t.starts_with(&format!("{name}-")))
                 .cloned()
-        }
-
-        /// `targo install wasm-bindgen-cli <flags>` as cargo runs it into `--root`: a
-        /// wasm-bindgen already there is replaced under `--force`, or where cargo's
-        /// records laid another version of the CLI; without it, one they do not know is
-        /// refused, and one they say is at this version is left as it is ("already
-        /// installed", exit 0), answering or not.
-        fn install_bindgen(s: &mut State, homes: &Homes, flags: &[&str]) -> Result<String, String> {
-            let (mut version, mut root, mut locked, mut force) = (None, None, false, false);
-            let mut it = flags.iter();
-            while let Some(f) = it.next() {
-                match *f {
-                    "--version" => version = it.next().copied(),
-                    "--root" => root = it.next().copied(),
-                    "--locked" => locked = true,
-                    "--force" => force = true,
-                    other => return Err(format!("unexpected install flag {other}")),
-                }
-            }
-            let (Some(version), Some(root), true) = (version, root, locked) else {
-                return Err(format!(
-                    "not a --locked install at a version into a root: {flags:?}"
-                ));
-            };
-            let bin = Path::new(root).join("bin/wasm-bindgen");
-            assert_eq!(
-                homes.bindgen().as_deref(),
-                Some(bin.as_path()),
-                "installed where the tooling directory is looked in"
-            );
-            if bin.exists() && !force {
-                match s.bindgen_recorded.as_deref() {
-                    None => {
-                        return Err(
-                            "error: binary `wasm-bindgen` already exists in destination\n\
-                                    Add --force to overwrite"
-                                .into(),
-                        );
-                    }
-                    Some(v) if v == version => return Ok(String::new()),
-                    Some(_) => {}
-                }
-            }
-            std::fs::create_dir_all(bin.parent().unwrap()).unwrap();
-            std::fs::write(&bin, "#!/bin/false\n").unwrap();
-            s.bindgen = Some(version.to_string());
-            s.bindgen_recorded = Some(version.to_string());
-            Ok(String::new())
         }
 
         /// `name`, installed, auto-installed, or refused.
@@ -685,20 +529,6 @@ mod stateful {
                 args.join(" ")
             ));
             let a: Vec<&str> = args.iter().map(String::as_str).collect();
-            match (name.as_deref(), a.as_slice()) {
-                (Some("wasm-bindgen"), ["--version"]) => {
-                    return s
-                        .bindgen
-                        .as_ref()
-                        .map(|v| format!("wasm-bindgen {v}\n"))
-                        .ok_or_else(|| "not installed".to_string());
-                }
-                (Some("targo"), ["--unverified", "install", "wasm-bindgen-cli", flags @ ..]) => {
-                    return Self::install_bindgen(&mut s, homes, flags);
-                }
-                (Some("targo"), other) => return Err(format!("unexpected targo call {other:?}")),
-                _ => {}
-            }
             if name.as_deref() == Some("rustup-init") {
                 assert!(
                     a.ends_with(&["--default-toolchain", "none"]),
@@ -777,16 +607,6 @@ mod stateful {
                 other => Err(format!("unexpected rustup call {other:?}")),
             }
         }
-
-        fn fetch_init(&self, dest: &Path) -> Result<(), String> {
-            self.0.borrow_mut().calls.push("fetch rustup-init".into());
-            assert!(dest.ends_with(".cargo/rustup-init"), "{}", dest.display());
-            Ok(())
-        }
-
-        fn targo(&self) -> Result<PathBuf, String> {
-            Ok(PathBuf::from("/stage2/bin/targo"))
-        }
     }
 
     fn repo() -> PathBuf {
@@ -794,19 +614,16 @@ mod stateful {
     }
 
     fn pin() -> String {
-        let config = std::fs::read_to_string(repo().join("publish/config.sh")).unwrap();
-        crate::release_steps::wasm_clause(&config).unwrap().pin
+        wasm_pin(&repo()).unwrap()
     }
 
-    fn homes(dir: &Path) -> Homes {
+    pub(super) fn homes(dir: &Path) -> Homes {
         Homes {
             home: dir.to_path_buf(),
             cargo_home: dir.join(".cargo"),
             rustup_home: dir.join(".rustup"),
-            xdg_config_home: None,
             path: None,
             homebrew_keg: None,
-            tooling: Some(dir.join("caches/aterm/tooling")),
         }
     }
 
@@ -822,11 +639,22 @@ mod stateful {
         let tmp = aterm_tempfile::tempdir().unwrap();
         let homes = homes(tmp.path());
         let rustup = FakeRustup::default();
-        run(&repo(), &homes, &rustup, &mut |_| {});
+        assert!(lacks_rustup(&homes));
+        // Without the installer the row fetches, nothing is run and the row fails.
+        let refused = run(&repo(), &homes, &rustup, None, &mut |_| {}).unwrap_err();
+        assert!(
+            refused.contains("no pinned rustup-init was fetched"),
+            "{refused}"
+        );
+        assert!(rustup.calls().is_empty(), "{:#?}", rustup.calls());
+        let init = tmp.path().join("scratch/download/rustup-init");
+        stub(&init);
+        let acquired = run(&repo(), &homes, &rustup, Some(&init), &mut |_| {}).unwrap();
+        assert!(!acquired.is_empty());
+        assert!(!lacks_rustup(&homes));
         let calls = rustup.calls();
-        assert_eq!(calls[0], "fetch rustup-init");
         assert_eq!(
-            calls[1],
+            calls[0],
             "rustup-init -y --no-modify-path --profile minimal --default-toolchain none"
         );
         assert!(
@@ -859,36 +687,12 @@ mod stateful {
         rustup
             .run(&homes, &bin, &add, None)
             .expect("the pin was installed by name");
-        // Last, the oracle's wasm-bindgen at its pin, through targo, `--locked`, into the
-        // tooling directory.
+        // A second pass acquires nothing: stable has the clippy `verify cells` lints with.
+        assert_eq!(missing(&homes, &rustup, Some(&pin)), Vec::<String>::new());
         assert_eq!(
-            calls.last(),
-            Some(&format!(
-                "targo --unverified install wasm-bindgen-cli --version {BINDGEN} --locked --force \
-                 --root {}",
-                bindgen_root(homes.tooling.as_deref().unwrap()).display()
-            ))
+            run(&repo(), &homes, &rustup, None, &mut |_| {}),
+            Ok(Vec::new())
         );
-        // A second pass acquires nothing: stable has the clippy `verify cells` lints with,
-        // and the tooling directory's wasm-bindgen answers the pin.
-        assert_eq!(
-            plan(
-                &observe(&homes, &rustup, Some(&pin)),
-                Some(&pin),
-                &stable_targets(),
-                homes.tooling.as_deref()
-            ),
-            [Step::TrustSeam]
-        );
-    }
-
-    /// What [`run`] asks stable for on this host.
-    fn stable_targets() -> Vec<&'static str> {
-        let mut targets: Vec<&str> = super::super::FOREIGN_CELL_TARGETS.to_vec();
-        if cfg!(target_os = "macos") {
-            targets.insert(0, "x86_64-apple-darwin");
-        }
-        targets
     }
 
     /// An executable that is not run: the fake answers for it.
@@ -899,25 +703,6 @@ mod stateful {
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
 
-    /// A machine rustup has nothing to add to: stable with every target [`run`] asks for
-    /// and clippy, the pin with wasm32, auto-install off.
-    fn provisioned(homes: &Homes, pin: &str) -> FakeRustup {
-        let rustup = FakeRustup::default();
-        {
-            let mut s = rustup.0.borrow_mut();
-            s.rustup = true;
-            s.auto_install_off = true;
-            let stable = format!("stable-{HOST}");
-            let targets = stable_targets().iter().map(|t| (*t).to_string()).collect();
-            s.toolchains.insert(stable.clone(), targets);
-            s.components.insert(stable, vec![CLIPPY.into()]);
-            s.toolchains
-                .insert(format!("{pin}-{HOST}"), vec![HOST.into(), WASM32.into()]);
-        }
-        stub(&homes.cargo_home.join("bin/rustup"));
-        rustup
-    }
-
     #[test]
     fn a_toolchain_missing_a_piece_gets_it_on_that_channel_alone() {
         let tmp = aterm_tempfile::tempdir().unwrap();
@@ -925,7 +710,7 @@ mod stateful {
         let rustup = FakeRustup::default();
         let pin = pin();
         {
-            let mut targets: Vec<String> = super::super::FOREIGN_CELL_TARGETS
+            let mut targets: Vec<String> = FOREIGN_CELL_TARGETS
                 .iter()
                 .map(|t| (*t).to_string())
                 .collect();
@@ -938,7 +723,15 @@ mod stateful {
                 .insert(format!("{pin}-{HOST}"), vec![HOST.into()]);
         }
         stub(&homes.cargo_home.join("bin/rustup"));
-        run(&repo(), &homes, &rustup, &mut |_| {});
+        assert_eq!(
+            missing(&homes, &rustup, Some(&pin)),
+            [
+                "rustup component add --toolchain stable clippy".to_string(),
+                format!("rustup target add --toolchain {pin} wasm32-unknown-unknown"),
+            ],
+            "the read-only probe names what a run adds"
+        );
+        run(&repo(), &homes, &rustup, None, &mut |_| {}).unwrap();
         let calls = rustup.calls();
         position(
             &calls,
@@ -953,69 +746,7 @@ mod stateful {
             "{calls:#?}"
         );
         assert!(rustup.0.borrow().auto_installed.is_empty());
-        assert_eq!(
-            plan(
-                &observe(&homes, &rustup, Some(&pin)),
-                Some(&pin),
-                &stable_targets(),
-                homes.tooling.as_deref()
-            ),
-            [Step::TrustSeam]
-        );
-    }
-
-    /// A tooling wasm-bindgen that does not answer the pin is replaced by the pin's,
-    /// whatever cargo's records of its root say: one they do not know (laid by hand), and
-    /// one they say is the pin's that no longer answers. NEGATIVE CONTROL: the same install
-    /// without `--force` leaves each as it was (cargo refuses the first and calls the
-    /// second installed), and the plan still asks for it.
-    #[test]
-    fn a_tooling_wasm_bindgen_off_the_pin_is_replaced_by_the_pins() {
-        let pin = pin();
-        // (what its `--version` answers, the version cargo's records say they laid)
-        for (answers, recorded) in [
-            (Some(format!("{BINDGEN}0")), None),
-            (None, Some(BINDGEN.to_string())),
-        ] {
-            let tmp = aterm_tempfile::tempdir().unwrap();
-            let homes = homes(tmp.path());
-            let rustup = provisioned(&homes, &pin);
-            stub(&homes.bindgen().unwrap());
-            {
-                let mut s = rustup.0.borrow_mut();
-                s.bindgen.clone_from(&answers);
-                s.bindgen_recorded.clone_from(&recorded);
-            }
-            let settled = || {
-                plan(
-                    &observe(&homes, &rustup, Some(&pin)),
-                    Some(&pin),
-                    &stable_targets(),
-                    homes.tooling.as_deref(),
-                )
-            };
-            let install = Step::Bindgen(bindgen_root(homes.tooling.as_deref().unwrap()));
-            assert_eq!(settled(), [Step::TrustSeam, install.clone()]);
-            let mut unforced = argv(&install).remove(0);
-            unforced.remove(0);
-            unforced.retain(|a| a != "--force");
-            let said = rustup.run(&homes, &rustup.targo().unwrap(), &unforced, None);
-            assert_eq!(said.is_err(), recorded.is_none(), "{said:?}");
-            assert_eq!(
-                rustup.0.borrow().bindgen,
-                answers,
-                "cargo left it as it was"
-            );
-            assert_eq!(settled(), [Step::TrustSeam, install.clone()]);
-            let mut said = Vec::new();
-            run(&repo(), &homes, &rustup, &mut |l| said.push(l.to_string()));
-            assert_eq!(
-                rustup.0.borrow().bindgen.as_deref(),
-                Some(BINDGEN),
-                "{said:#?}"
-            );
-            assert_eq!(settled(), [Step::TrustSeam]);
-        }
+        assert_eq!(missing(&homes, &rustup, Some(&pin)), Vec::<String>::new());
     }
 
     #[test]
@@ -1024,10 +755,7 @@ mod stateful {
         let on_path = tmp.path().join("bin");
         std::fs::create_dir_all(&on_path).unwrap();
         for bin in [on_path.join("rustup"), tmp.path().join(".cargo/bin/rustup")] {
-            std::fs::create_dir_all(bin.parent().unwrap()).unwrap();
-            std::fs::write(&bin, "#!/bin/false\n").unwrap();
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+            stub(&bin);
         }
         let mut h = homes(tmp.path());
         assert_eq!(h.find_rustup(), Some(tmp.path().join(".cargo/bin/rustup")));

@@ -122,8 +122,8 @@ pub(crate) struct NeedFacts {
     pub(crate) now_unix: i64,
     /// The worker's NEEDS YOU sets as its loop told the window's host, whole,
     /// each with the entry's text it was told with
-    /// ([`crate::session_timeline::SessionTimeline::harness_needs`], slice
-    /// 2c): copied under the timeline's leaf lock the facts already take
+    /// ([`crate::session_timeline::SessionTimeline::harness_needs`]):
+    /// copied under the timeline's leaf lock the facts already take
     /// (two reference counts). Read through [`Self::told_needs`], which
     /// reads a set only beside the entry it was told with.
     pub(crate) told: ToldNeeds,
@@ -141,7 +141,7 @@ impl NeedFacts {
     /// lost — a take-down whose `unset` never landed, a set whose `meta set`
     /// never did — is never read beside an entry it does not describe. Where
     /// it reads a set, [`attention_outcome`] says the need in it, whole
-    /// ([`HarnessAsk::told`], slice 2d); where it reads none, the entry's own
+    /// ([`HarnessAsk::told`]); where it reads none, the entry's own
     /// parse stands ([`HarnessAsk::of`]).
     #[must_use]
     pub(crate) fn told_needs(&self) -> Option<&[String]> {
@@ -155,8 +155,8 @@ impl NeedFacts {
 }
 
 /// THE WORKER'S NEEDS YOU AS THE WINDOW HOLDS THEM
-/// (`docs/DESIGN-harness-autopilot-2026-10-15.md` §12.2.3 items 3-4, §12.2.11;
-/// slice 2c): the set the loop told last, and beside it the OUTGOING set —
+/// (`docs/DESIGN-harness-autopilot-2026-10-15.md` §12.2.3 items 3-4, §12.2.11):
+/// the set the loop told last, and beside it the OUTGOING set —
 /// the one that described the needs entry standing as that tell arrived.
 /// Each tell comes just before its request (the entry's `meta set`, or its
 /// `unset`), so until that request lands the entry standing is still the
@@ -246,8 +246,8 @@ impl ToldNeeds {
 }
 
 /// THE WORKER'S NEEDS YOU, WHOLE, AS ITS LOOP TOLD THEM
-/// (`docs/DESIGN-harness-autopilot-2026-10-15.md` §12.2.3 items 3-4; slice
-/// 2c): the set the turn-end policy holds standing — each need the worker's
+/// (`docs/DESIGN-harness-autopilot-2026-10-15.md` §12.2.3 items 3-4):
+/// the set the turn-end policy holds standing — each need the worker's
 /// own line, sanitized and held to the policy's 160 characters, never cut to
 /// the entry's 64 cells — and the needs owner's entry text the loop was about
 /// to set for it ([`aterm_agent::supervise::IdleHost::needs_standing`]).
@@ -343,8 +343,8 @@ pub(crate) struct Need {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct HarnessAsk {
     /// The first need without the frame, folded to one line: whole as the
-    /// loop told it, within [`NEED_TOLD_MAX`] bytes ([`Self::told`], slice
-    /// 2d), else read from the entry, whose writer cut it at 64 cells, within
+    /// loop told it, within [`NEED_TOLD_MAX`] bytes ([`Self::told`]),
+    /// else read from the entry, whose writer cut it at 64 cells, within
     /// [`NEED_WHAT_MAX`] ([`Self::of`]).
     pub(crate) first: String,
     /// How many further needs stand (the told set's others, else the
@@ -372,7 +372,7 @@ impl HarnessAsk {
         }
     }
 
-    /// THE WHOLE SET, AS THE LOOP TOLD IT (§12.2.3 item 4, slice 2d): the
+    /// THE WHOLE SET, AS THE LOOP TOLD IT (§12.2.3 item 4): the
     /// first need and every further one, each whole up to the policy's 160
     /// characters, folded to one line within [`NEED_TOLD_MAX`] bytes (so no
     /// need the policy kept is cut here, in any script), under `program`,
@@ -636,7 +636,7 @@ pub(crate) const ROW_WHAT_MAX: usize = 72;
 /// menu row) may carry before it clips to its own room.
 pub(crate) const NEED_WHAT_MAX: usize = 240;
 /// Byte budget for each need a harness's loop told the window whole
-/// ([`HarnessAsk::told`], slice 2d): every need its policy keeps — at most
+/// ([`HarnessAsk::told`]): every need its policy keeps — at most
 /// `NEED_CHARS` (160) characters, each of up to four bytes — so a need in
 /// letters of three bytes is as whole as one in ASCII. A surface with less
 /// room clips to its own: the banner's body to [`NEED_WHAT_MAX`], a menu
@@ -975,7 +975,7 @@ fn attention_outcome(facts: &NeedFacts) -> (Option<Need>, Option<Waiting>, bool)
                 let text = entry.text.trim();
                 // A harness's own entry is read without aterm's frame
                 // (§12.2.3): in the words its loop told the window, whole,
-                // while they were told with this very entry (slice 2d),
+                // while they were told with this very entry,
                 // else the entry's own parse (2a). Its key stays the
                 // entry's hash, so the survey still finds the entry the
                 // published ask names.
@@ -1007,8 +1007,8 @@ fn attention_outcome(facts: &NeedFacts) -> (Option<Need>, Option<Waiting>, bool)
 
 /// THE NEEDS OWNER'S ASK IN THE WORKER'S WORDS: the set `told` beside this
 /// entry ([`NeedFacts::told_needs`], which reads a set only beside the
-/// entry text it was told with) under the program the entry names, whole
-/// (slice 2d); else, or where the entry names no program this build knows,
+/// entry text it was told with) under the program the entry names, whole;
+/// else, or where the entry names no program this build knows,
 /// the entry's own parse ([`need_words`], 2a); `None` where neither reads.
 fn harness_ask(text: &str, told: Option<&[String]>) -> Option<HarnessAsk> {
     let parsed = need_words(text);

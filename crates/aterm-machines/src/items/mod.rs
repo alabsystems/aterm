@@ -164,6 +164,14 @@ pub trait Item: Send + Sync {
     fn stood_aside(&self) -> Option<aterm_converge::StoodAside> {
         None
     }
+
+    /// Why this item stands aside before it acts ([`aterm_converge::Item::stands_aside`]):
+    /// the run lacks what its change needs (the vault a join reads does not answer). The
+    /// engine then neither journals nor applies it, and reports it `Blocked` with this
+    /// line. Asked in an apply, after a probe that planned a change. `None`, the default.
+    fn stands_aside(&self, _sys: &dyn System, _ctx: &Ctx) -> Option<aterm_converge::StoodAside> {
+        None
+    }
 }
 
 /// Every item `baseline` asks for, in run order: tools before what needs them (Command

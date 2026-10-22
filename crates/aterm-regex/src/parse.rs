@@ -188,7 +188,7 @@ impl ClassSet {
     /// Heap bytes this class costs, charged against the compile-time ceiling
     /// alongside the instruction that indexes it.
     #[inline]
-    pub(crate) fn byte_size(&self) -> usize {
+    pub(crate) const fn byte_size(&self) -> usize {
         size_of::<Self>()
             + self.ranges.len() * size_of::<(char, char)>()
             + self.perls.len() * size_of::<PerlClass>()
@@ -373,7 +373,7 @@ impl Parser<'_> {
     }
 
     #[inline]
-    fn depth(&self) -> usize {
+    const fn depth(&self) -> usize {
         self.stack.len()
     }
 

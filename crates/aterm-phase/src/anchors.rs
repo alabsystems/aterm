@@ -1901,13 +1901,13 @@ pub const TRANSCRIPT_KEYS: &[Anchor] = &[
 /// (`aterm-agent`'s `harness::codex_steps`) reads (ids `rollout.…`): the
 /// row and payload types it opens, ends, interrupts, calls and compacts by,
 /// the keys it names a thread, a turn, a call and a model by, the one wall
-/// word it reads, and the one call it classes by name. Ruling T9: ONLY literal strings a committed rollout shows, each
+/// word it reads, and the one call it classes by name. ONLY literal strings a committed rollout shows, each
 /// `since` the build it was read on — the lab's Codex 0.163.0 rollouts
 /// (session log 5G, 2026-10-19), reduced and committed as `aterm-agent`'s
 /// `harness/testdata/steps/codex-0.163.0.jsonl` and its `-subagent` leg
 /// (`every_rollout_key_is_in_its_committed_rollout`), never a guessed key.
 /// The codex-alab builds 0.164.0-dev.12521 and 12479 the lab measured
-/// (session log 6D-3a, `lab codex-alab-proof`, their legs committed as
+/// (`lab codex-alab-proof`, their legs committed as
 /// `codex-alab-<release>-<leg>.jsonl`, `rollout_reduction_stem`) spell
 /// every key of the steps their rollouts show as 0.163.0 did, and add one
 /// call name the fold classes: `exec_command`, a shell command; so does
@@ -2003,7 +2003,7 @@ pub fn newer_than(a: &str, b: &str) -> bool {
 /// a leg of it, `<stem>-<leg>.jsonl`): `codex-<build>`, and for an ALab
 /// build, whose version is a pre-release with its commit as build metadata
 /// (`X.Y.Z-dev.N+g<sha>`, the publication scheme a codex-alab package
-/// names), `codex-alab-<the version before its +>` (session log 6D-3a). The
+/// names), `codex-alab-<the version before its +>`. The
 /// one rule both the key table's test and the step fold's read it by.
 #[cfg(any(test, debug_assertions))]
 #[must_use]
@@ -2329,7 +2329,7 @@ mod tests {
         out
     }
 
-    /// RULING T9: every rollout key is a literal the committed rollout of
+    /// every rollout key is a literal the committed rollout of
     /// the build it names (`since`) shows, quoted — a JSON key or a closed
     /// word — never a guess; and the lookups read it like any anchor.
     /// NEGATIVE CONTROLS: the planted key is named missing, and a build with
@@ -2392,7 +2392,7 @@ mod tests {
         assert!(committed_rollouts("9.9.999").is_empty());
     }
 
-    /// The codex-alab build the lab measured (session log 6D-3a).
+    /// The codex-alab build the lab measured.
     const ALAB_BUILD: &str = "0.164.0-dev.12521+g3d3eb12d8";
 
     /// The forever-port codex-alab build the lab measured (B5c), whose

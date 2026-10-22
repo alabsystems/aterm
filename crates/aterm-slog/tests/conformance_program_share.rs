@@ -11,7 +11,7 @@
 //! a node) under a session and an open run, both opened before the walk (the
 //! model's records are the walk's): observations (a bell at the session),
 //! program marks at the run (the model's node `a`) and at the session (node
-//! `b`), the readers fenced and the fence lifted (ruling R4). After every
+//! `b`), the readers fenced and the fence lifted. After every
 //! step the live records are projected onto the model (others and each
 //! node's program marks, fenced or not, the newest's node, the log's own
 //! `lost`), and the step must be the model's: the action, then whatever the

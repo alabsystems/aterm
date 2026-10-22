@@ -2946,7 +2946,7 @@ impl PrivacyWarmup {
 /// Disk Access page with aterm's panel beside it, then the folder warm-up
 /// (owner ask 2026-10-16, `crate::consent_launch`); and, once per Mac, aterm's
 /// own debugger-access alert, after the Full Disk Access and Developer Tools
-/// pages and before the folders (owner ruling O29,
+/// pages and before the folders (
 /// `crate::debugger_access::admit_launch_ask`), whose yes alone starts macOS's
 /// administrator dialog. No key here answers a system dialog, flips a switch or
 /// widens aterm's access, and a key can only keep a launch question from coming
@@ -3000,7 +3000,7 @@ pub(crate) struct PrivacyConfig {
     /// probe reads the grant off on a grant-stable build where aterm never
     /// verified it, System Settings opens at that page with aterm's panel
     /// beside it, once per version. It also gates the debugger-access launch
-    /// ask (owner ruling O29, `AskDrop::NoticeOff`): off, aterm never raises
+    /// ask (`AskDrop::NoticeOff`): off, aterm never raises
     /// that alert by itself; no value raises it. Absent means on.
     pub(crate) notice: Option<bool>,
     /// Per-session responsible-process corroboration on reports. Absent means on.
@@ -3084,8 +3084,8 @@ impl Config {
 /// @<sid>` and `brief @<sid>` answer for a session from an earlier run or a
 /// crash (`crate::session_log_journal`). `journal = false` is the opt-out:
 /// aterm then creates no file or directory for it, starts no thread and
-/// deletes nothing. `clause` (default on: D6, ruled 2026-10-19; session log
-/// phase 3B) adds the log's clause to a tab's tooltip and context menu (`now:
+/// deletes nothing. `clause` (default on: D6, ruled 2026-10-19)
+/// adds the log's clause to a tab's tooltip and context menu (`now:
 /// running shell`, a shown label with its author), never to its label;
 /// `clause = false` is the opt-out, and then both are as they were before
 /// the clause, byte for byte.

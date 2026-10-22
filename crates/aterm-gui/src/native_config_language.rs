@@ -878,9 +878,9 @@ const MANUAL_SCHEMA: &[ManualSchemaEntry] = &[
         &["fabric", "presence", "meta", "minimal", "privacy"],
         true,
     ),
-    // `[fabric] log` (session log phase 4), which `aterm-link serve` reads
-    // (`aterm_link::fabric::log_from_config`): "auto" (the default, D4,
-    // session log Phase 6 step 6E-3: the bus mirror of the session logs once
+    // `[fabric] log`, which `aterm-link serve` reads
+    // (`aterm_link::fabric::log_from_config`): "auto" (the default:
+    // the bus mirror of the session logs once
     // the broker retains the node's `ev` faces), "off" (the opt-out) or
     // "turns" (over any broker, up to a total where it retains nothing).
     manual(
@@ -978,6 +978,18 @@ const MANUAL_SCHEMA: &[ManualSchemaEntry] = &[
         "Fleet nodes that may drive this Mac",
         ConfigSchemaKind::StringList,
         &["fleet", "drive", "step-in", "take over", "node"],
+        true,
+    ),
+    // `[fleet] accounts_source` (2026-10-22): where `aterm harness accounts
+    // sync` and a window's accounts upkeep read the fleet's accounts — a file,
+    // an http(s) URL or `rclone:<remote>:<path>`. The fleet accounts feature's
+    // one opt-in: absent, nothing is fetched and no sign-in is started
+    // (`aterm_agent::harness::accounts_sync::configured_source`).
+    manual(
+        "fleet.accounts_source",
+        "Where this machine's fleet accounts come from",
+        ConfigSchemaKind::Scalar(EditKind::Text),
+        &["fleet", "accounts", "sync", "source", "roster"],
         true,
     ),
     // The coding-agent primer's opt-out (default on), read by the spawn seam. Off the
@@ -1172,7 +1184,7 @@ const MANUAL_SCHEMA: &[ManualSchemaEntry] = &[
         &["session", "log", "journal", "crash", "history"],
         true,
     ),
-    // `[session_log] clause` (session log phase 3B; D6, ruled 2026-10-19:
+    // `[session_log] clause` (D6, ruled 2026-10-19:
     // on): the log's clause in a tab's tooltip and menu. On by default; read
     // live; a Settings row.
     manual(

@@ -57,11 +57,13 @@ use super::core::TapeValue;
 use super::frame::Hint;
 use crate::harness::accounts::Sample;
 use crate::harness::acts::{Act, LandHeld, TaskFace};
+use crate::harness::disk::Level;
 use crate::harness::repo_work::RepoWork;
 use crate::harness::upgrade::{LastTurn, StandingLimit};
 use crate::supervise::background::{BackgroundCall, BackgroundEvidence};
 use crate::supervise::fx::Fx;
 use crate::supervise::memory::{AgentMemory, Pressure};
+use crate::supervise::occupancy::{OccupancyReading, SlotsSeen};
 use crate::supervise::policy::exception::Exception;
 use crate::supervise::policy::login::LoginShared;
 use crate::supervise::policy::reset::{
@@ -259,6 +261,13 @@ pub(crate) trait HostReply: Sized {
     ///
     /// Bytes [`Self::put`] did not write.
     fn take(bytes: &[u8], origin: Instant) -> Result<Self, CodecError>;
+
+    /// The answer a replay gives at a door the recording build did not have
+    /// ([`TapeValue::absent`]); `None`: such a door diverges, as any door
+    /// the tape does not hold.
+    fn absent() -> Option<Self> {
+        None
+    }
 }
 
 /// Every value a round trip already tapes holds no `Instant`.
@@ -269,6 +278,10 @@ impl<T: TapeValue> HostReply for T {
 
     fn take(bytes: &[u8], _: Instant) -> Result<Self, CodecError> {
         T::from_tape(bytes)
+    }
+
+    fn absent() -> Option<Self> {
+        T::absent()
     }
 }
 
@@ -732,6 +745,97 @@ impl TapeValue for BackgroundEvidence {
                 },
             },
         })
+    }
+}
+
+/// `occupancy`'s answer as a tape holds it ([`OccupancyReading`]): numbers and
+/// closed words (the memory pressure's and the disk level's), never a path or
+/// a name.
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+struct OccupancyWire {
+    taken_ms: i64,
+    stale: bool,
+    avail_mib: Option<u64>,
+    pressure: Option<String>,
+    disk: Option<String>,
+    slots: Option<SlotsWire>,
+    slots_free_ms: Option<u64>,
+    room: Option<bool>,
+    held_slot_last_ms: Option<i64>,
+}
+
+/// [`SlotsSeen`] as a tape holds it.
+#[derive(Serialize, Deserialize)]
+struct SlotsWire {
+    usable: u16,
+    n: u16,
+}
+
+/// The disk watch's [`Level`] on a tape, by its own word.
+fn level_of(word: &str) -> Result<Level, CodecError> {
+    [
+        Level::Unknown,
+        Level::Ok,
+        Level::Low,
+        Level::Short,
+        Level::Emergency,
+    ]
+    .into_iter()
+    .find(|l| l.as_str() == word)
+    .ok_or(bad("a disk level this build does not know"))
+}
+
+/// A DOOR NEWER THAN THE TAPE: a recording build with no `host.occupancy`
+/// asked nothing there, and its loop judged no rule on the machine, so its
+/// replay answers the empty reading ([`TapeValue::absent`]) — where the
+/// tape's header says that build lacked the door, and only there.
+impl TapeValue for OccupancyReading {
+    fn to_tape(&self) -> Vec<u8> {
+        let OccupancyReading {
+            taken_ms,
+            stale,
+            avail_mib,
+            pressure,
+            disk,
+            slots,
+            slots_free_ms,
+            room,
+            held_slot_last_ms,
+        } = *self;
+        json(&OccupancyWire {
+            taken_ms,
+            stale,
+            avail_mib,
+            pressure: pressure.map(|p| pressure_word(p).to_string()),
+            disk: disk.map(|l| l.as_str().to_string()),
+            slots: slots.map(|SlotsSeen { usable, n }| SlotsWire { usable, n }),
+            slots_free_ms,
+            room,
+            held_slot_last_ms,
+        })
+    }
+
+    fn from_tape(bytes: &[u8]) -> Result<Self, CodecError> {
+        let w = of_json::<OccupancyWire>(bytes)?;
+        Ok(OccupancyReading {
+            taken_ms: w.taken_ms,
+            stale: w.stale,
+            avail_mib: w.avail_mib,
+            pressure: w.pressure.as_deref().map(pressure_of).transpose()?,
+            disk: w.disk.as_deref().map(level_of).transpose()?,
+            slots: w.slots.map(|s| SlotsSeen {
+                usable: s.usable,
+                n: s.n,
+            }),
+            slots_free_ms: w.slots_free_ms,
+            room: w.room,
+            held_slot_last_ms: w.held_slot_last_ms,
+        })
+    }
+
+    fn absent() -> Option<Self> {
+        Some(OccupancyReading::default())
     }
 }
 

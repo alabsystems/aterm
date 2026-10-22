@@ -166,21 +166,35 @@ impl InkLedger {
     /// cell the account does not hold (off every line, past the grid, or the
     /// caret's own).
     #[inline]
-    fn slot(&self, row: i32, col: i32) -> Option<usize> {
-        if self.caret == Some((row, col)) || col < 0 || col as usize >= self.stride {
+    const fn slot(&self, row: i32, col: i32) -> Option<usize> {
+        if matches!(self.caret, Some((cr, cc)) if cr == row && cc == col)
+            || col < 0
+            || col as usize >= self.stride
+        {
             return None;
         }
-        self.lines.iter().enumerate().find_map(|(i, line)| {
-            line.filter(|&(r, first, end)| r == row && (first..end).contains(&col))
-                .map(|_| (i * self.stride + col as usize) * Self::BANDS)
-        })
+        let mut i = 0;
+        while i < self.lines.len() {
+            if let Some((r, first, end)) = self.lines[i]
+                && r == row
+                && col >= first
+                && col < end
+            {
+                return Some((i * self.stride + col as usize) * Self::BANDS);
+            }
+            i += 1;
+        }
+        None
     }
 
     /// The text cell at `(row, col)`'s index into `under`, as
     /// [`Self::slot`] finds it.
     #[inline]
-    fn cell(&self, row: i32, col: i32) -> Option<usize> {
-        self.slot(row, col).map(|at| at / Self::BANDS)
+    const fn cell(&self, row: i32, col: i32) -> Option<usize> {
+        match self.slot(row, col) {
+            Some(at) => Some(at / Self::BANDS),
+            None => None,
+        }
     }
 
     /// Close the account: an idle ledger admits everything. Every tick does

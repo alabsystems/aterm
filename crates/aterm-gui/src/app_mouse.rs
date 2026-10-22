@@ -961,8 +961,10 @@ pub(crate) struct HoverMapping {
 /// Whatever a frame lays in frame cells for the pointer to find — the
 /// harness's glass (`crate::claude_lights`), the tab menu's card
 /// (`App::splice_tab_menu`), the Autopilot and fact menus' card
-/// (`crate::autopilot_menu`) — is stamped with this as it is laid, and
-/// answers the pointer only through [`App::laid_cell_at`]: a pointer event
+/// (`crate::autopilot_menu`), the find bar (`App::splice_find_bar`) — is
+/// stamped with this as it is laid, and answers the pointer only through
+/// [`App::laid_cell_at`] (the overlay scrollbars, hit in pixels, through
+/// [`App::laid_grid`]): a pointer event
 /// that comes between a re-grid (a window resize, a font zoom, a split, a
 /// strip or band that grew) and the next frame would otherwise be hit-tested
 /// against the last frame's targets at a geometry the window no longer has,
@@ -2134,7 +2136,9 @@ impl App {
     /// clamped to the grid. The insets are stripped first ([`pixel_to_term_cell`]): the
     /// `pad_top + head` band (y only), the `pad` border, then the chrome rows (strip,
     /// presence row, message band), so a click in the strip or border clamps to terminal
-    /// row 0; callers intercept strip clicks with [`Self::strip_col_at`] first.
+    /// row 0; callers intercept strip clicks with [`Self::strip_col_at`] first. The
+    /// pointer paths take the `_with` twin; this one is the tests'.
+    #[cfg(test)]
     pub(crate) fn pixel_to_cell(&self, wid: WindowId, x: f64, y: f64) -> (u16, u16) {
         // One geometry derivation, shared with the nested `window_to_frame`.
         self.pixel_to_cell_with(wid, self.pointer_geometry(wid), x, y)
@@ -2150,7 +2154,7 @@ impl App {
         }
     }
 
-    /// [`Self::pixel_to_cell`] against geometry the caller already derived.
+    /// `pixel_to_cell` against geometry the caller already derived.
     ///
     /// The cell is the GRID's: where the glass shows a row's cells somewhere
     /// else than the grid holds them — Claude's mode pill relabelled `YOLO
@@ -2287,7 +2291,7 @@ impl App {
 
     /// The window pixel at the centre of terminal cell `(row, col)`: the inverse of
     /// [`pixel_to_term_cell`] plus the frame origin [`Self::window_to_frame_with`] removes,
-    /// so [`Self::pixel_to_cell`] maps it back to the same cell. The centre, not the origin:
+    /// so [`Self::pixel_to_cell_with`] maps it back to the same cell. The centre, not the origin:
     /// the origin is one rounding from the neighbouring cell, and the half-cell puts the
     /// pointer on a definite `SelectionSide`. `None` before the first layout or for a cell
     /// outside the grid, so the caller replies `ERR` instead of moving the pointer elsewhere.
@@ -3072,7 +3076,7 @@ impl App {
 
     /// Window pixel `(x, y)` as a frame cell `(row, col)`: the coordinates the tab-strip
     /// splice (and so [`crate::tab_menu::MenuRect`]) works in, row 0 being the strip's first
-    /// row. Unclamped, like [`Self::find_bar_pixel_hit`]: `pixel_to_cell` snaps a pad point
+    /// row. Unclamped, like [`Self::find_bar_cell_at`]: `pixel_to_cell` snaps a pad point
     /// onto the nearest cell, so a press in the top border or past the right edge would hit
     /// a menu row it never touched. A point outside the grid interior is `None`, off the card.
     pub(crate) fn frame_cell_at(&self, wid: WindowId, x: f64, y: f64) -> Option<(usize, usize)> {
@@ -3103,8 +3107,9 @@ impl App {
     /// re-grid, until the next frame lays them again, the last frame's cells
     /// are not where the window now puts them, so the pointer is told nothing
     /// is there rather than what was: the harness's glass
-    /// (`App::glass_cell_at`), the tab menu's card ([`Self::tab_menu_probe`])
-    /// and the Autopilot and fact menus' card all ask here.
+    /// (`App::glass_cell_at`), the tab menu's card ([`Self::tab_menu_probe`]),
+    /// the Autopilot and fact menus' card and the find bar
+    /// ([`Self::find_bar_cell_at`]) all ask here.
     pub(crate) fn laid_cell_at(
         &self,
         wid: WindowId,
@@ -3112,10 +3117,16 @@ impl App {
         x: f64,
         y: f64,
     ) -> Option<(usize, usize)> {
+        self.laid_grid(wid, laid)?.cell_at(x, y)
+    }
+
+    /// [`Self::laid_cell_at`]'s test alone, for a target hit-tested in pixels
+    /// rather than cells: grid `laid` while window `wid` still has it, `None`
+    /// where nothing was laid or the window was re-gridded since. The overlay
+    /// scrollbars (`crate::pane_chrome`) ask here.
+    pub(crate) fn laid_grid(&self, wid: WindowId, laid: Option<GlassGrid>) -> Option<GlassGrid> {
         let laid = laid?;
-        (self.glass_grid(wid)? == laid)
-            .then(|| laid.cell_at(x, y))
-            .flatten()
+        (self.glass_grid(wid)? == laid).then_some(laid)
     }
 
     /// The open menu's recorded rect plus the frame cell under `(x, y)`, once the menu has
@@ -3365,7 +3376,7 @@ impl App {
 
     /// How much of window `wid` (of raw `size`) lies outside its terminal grid
     /// along each edge ([`crate::client_frame::FrameMargins`]): the grid's rect
-    /// exactly as [`Self::pixel_to_cell`] maps it (the frame origin, the pad, and
+    /// exactly as [`Self::pixel_to_cell_with`] maps it (the frame origin, the pad, and
     /// above the grid the top pad, the band and the chrome rows), so the resize
     /// handles never take a cell's pixel.
     #[allow(
@@ -3641,42 +3652,31 @@ impl App {
         crate::find_bar::well_click(query, hit.field_scroll, &field, geom, panel_x as f32)
     }
 
-    /// Pixel gate for [`Self::find_bar_click_at`]: `true` only when window pixel `(x, y)` is
-    /// inside the find bar's cell band, not merely on the row [`Self::pixel_to_cell`] clamps
-    /// it to (a click in the top `pad_top` border snaps to row 0, the bar's usual row; one in
-    /// the bottom `pad` to the last row). On the frame's y-axis the band starts at
-    /// `pad_top + head + frame_row * ch` and spans `rows * ch`, with
-    /// `frame_row = chrome_rows + hit.band.start` as `splice_find_bar` placed it; the x-check
-    /// admits the panel's own columns only (`hit.cols`: the grid, or a split's focused pane),
-    /// so clicks past the grid's right edge or on a sibling pane miss. No bar ⇒ `false`.
-    pub(crate) fn find_bar_pixel_hit(&self, wid: WindowId, x: f64, y: f64) -> bool {
-        let Some((band, cols)) = self
-            .windows
-            .get(&wid)
-            .and_then(|ws| ws.find_bar_hit.as_ref())
-            .map(|h| (h.band.clone(), h.cols.clone()))
-        else {
-            return false;
-        };
-        let (cw, ch) = self.win_cell_size(wid);
-        let (cw, ch) = (cw.max(1), ch.max(1));
-        let pad = self.win_pad(wid);
-        let pad_top = self.win_pad_top(wid);
-        // Unclamped frame coordinates: `window_to_frame` clamps at 0, which would land a
-        // click above the frame (the top pad over a top-anchored bar) in the row-0 band.
-        let (ox, oy) = self.frame_origin(wid);
-        let (fx, fy) = (x - ox as f64, y - oy as f64);
-        let frame_row = usize::from(self.chrome_rows(wid)) + band.start;
-        let top = (pad_top + self.win_head(wid) + frame_row * ch) as f64;
-        let bottom = top + (band.len() * ch) as f64;
-        if fy < top || fy >= bottom || fx < pad as f64 {
-            return false;
+    /// Pixel gate for [`Self::find_bar_click_at`]: the terminal cell `(row, col)` under
+    /// window pixel `(x, y)` where that pixel is inside the find bar's cell band, not merely
+    /// on the row [`Self::pixel_to_cell_with`] clamps it to (a click in the top `pad_top` border
+    /// snaps to row 0, the bar's usual row; one in the bottom `pad` to the last row). The band
+    /// is the rows `hit.band` of the terminal band, below the chrome rows, as
+    /// `splice_find_bar` placed it; the x-check admits the panel's own columns only
+    /// (`hit.cols`: the grid, or a split's focused pane), so clicks past the grid's right edge
+    /// or on a sibling pane miss. The cell is the one the panel was painted at, read only on
+    /// the grid the splice laid it on ([`Self::laid_cell_at`]): between a re-grid and the
+    /// frame that lays the bar again, the band answers nothing, so a press cannot land on a
+    /// control the zoomed or resized grid no longer puts under the pointer. No bar ⇒ `None`.
+    pub(crate) fn find_bar_cell_at(&self, wid: WindowId, x: f64, y: f64) -> Option<(u16, u16)> {
+        let hit = self.windows.get(&wid)?.find_bar_hit.as_ref()?;
+        let (frame_row, col) = self.laid_cell_at(wid, hit.laid, x, y)?;
+        let row = frame_row.checked_sub(usize::from(self.chrome_rows(wid)))?;
+        if !hit.band.contains(&row) || !hit.cols.contains(&col) {
+            return None;
         }
-        // Reject clicks past the right edge — `pixel_to_cell` would clamp their column
-        // onto the last grid cell, which can land on an indicator span — and, in a
-        // split, clicks on the sibling beside the panel's pane.
-        let gx = (fx as usize).saturating_sub(pad);
-        cols.contains(&(gx / cw))
+        Some((u16::try_from(row).ok()?, u16::try_from(col).ok()?))
+    }
+
+    /// Whether window pixel `(x, y)` is on the find bar ([`Self::find_bar_cell_at`]).
+    #[cfg(test)]
+    pub(crate) fn find_bar_pixel_hit(&self, wid: WindowId, x: f64, y: f64) -> bool {
+        self.find_bar_cell_at(wid, x, y).is_some()
     }
 
     /// Resolve the OS cursor for the pointer's current location. Called on every
@@ -6374,18 +6374,18 @@ impl App {
         }
         // A left press on the find bar's `Aa` / `.*` indicators flips match-case / regex (as
         // ⌥⌘C / ⌥⌘R do) and stops there; a no-op elsewhere or when not searching. The pixel
-        // gate ([`Self::find_bar_pixel_hit`]) rejects pad clicks the clamping `pixel_to_cell`
-        // would snap onto the bar row.
+        // gate ([`Self::find_bar_cell_at`]) rejects pad clicks the clamping `pixel_to_cell`
+        // would snap onto the bar row, and every press between a re-grid and the frame that
+        // lays the bar again; its cell is the one the bar was painted at.
         if pressed && button == WinitMouseButton::Left {
             let (px, py) = self
                 .windows
                 .get(&wid)
                 .map_or((0.0, 0.0), |ws| ws.last_cursor_px);
-            if self.find_bar_pixel_hit(wid, px, py) {
-                let (row, col) = self.pixel_to_cell(wid, px, py);
-                if self.find_bar_click_at(wid, row, col, Some(px)) {
-                    return;
-                }
+            if let Some((row, col)) = self.find_bar_cell_at(wid, px, py)
+                && self.find_bar_click_at(wid, row, col, Some(px))
+            {
+                return;
             }
         }
         // A left press on the pet's drawn body pets it and stops here ([`Self::pet_press_at`]).

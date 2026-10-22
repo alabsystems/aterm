@@ -65,7 +65,7 @@ impl SessionLog {
 
 use aterm_slog::{Actor, Conf, Fields, Key, Kind, Mark, Node, ShortId, Src, Stamp};
 
-/// What an acted control input's mark says (ruling T1): its `act=`, and
+/// What an acted control input's mark says: its `act=`, and
 /// `re=` the step it was admitted under when that step closed before its
 /// bytes were written.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -130,7 +130,7 @@ impl InputVerb {
     }
 }
 
-/// The authors whose control-input bursts are told apart (ruling R11): the
+/// The authors whose control-input bursts are told apart: the
 /// trusted actors (the harness, the bridge, `ctl`, the person) each have a
 /// burst clock of their own outside every table, so no flood of other
 /// authors suppresses their `mark - input`; sessions (edge sources) and the
@@ -155,7 +155,7 @@ const fn reserved_burst(by: &Actor) -> Option<usize> {
 /// THE CONSUMER HALF's state in a session's log (one `SessionLog` field):
 /// the mark limiter, the watchers' wake and the control-input bursts. Under
 /// 2 KiB a session, and under 4 KiB while the limiter's owed-only table is
-/// full (32 entries of 56 bytes on the heap, ruling U18); not counted by
+/// full (32 entries of 56 bytes on the heap); not counted by
 /// `Log::footprint`.
 #[derive(Debug)]
 pub(crate) struct Consumers {
@@ -285,7 +285,7 @@ impl SessionLog {
     /// it too (`Typed`), and the first input of a burst from `by` writes
     /// `mark - input verb=<v> [cause= cause_k=] by=<a> src=ctl conf=strong` on
     /// the session. The bytes are never recorded.
-    /// An input that carries `act=` (ruling T1, `acted`) is marked at
+    /// An input that carries `act=` (`acted`) is marked at
     /// every input, with its act and a late one's step, within its author's
     /// mark tokens ([`Self::ctl_input_mark`]).
     pub(crate) fn ctl_input(
@@ -306,7 +306,7 @@ impl SessionLog {
     }
 
     /// THE ACCEPTANCE of a control input admitted as `adm` (its bytes fully
-    /// written; ruling T1): a person's key the timeline's hold kept from the
+    /// written): a person's key the timeline's hold kept from the
     /// log first (T2), then the tracker binds the input from `by` with its
     /// `act=` to the approval or question step it was admitted under, or
     /// led to. What it came to (a late input's step, for its mark's `re=`).
@@ -326,7 +326,7 @@ impl SessionLog {
         }
     }
 
-    /// THE ADMISSION of a control input about to be written (ruling T1):
+    /// THE ADMISSION of a control input about to be written:
     /// what the agent's tracker holds now, read under the timeline lock the
     /// writer takes before a byte. `None` with no agent run.
     pub(crate) fn admit_input(&self, at: Stamp) -> Option<aterm_slog::Admission> {
@@ -336,7 +336,7 @@ impl SessionLog {
     /// The input mark alone, for an input the tracker was already told of (a
     /// `ctl turn`'s first byte, [`SessionLog::ctl_turn`]): written at the first
     /// input of a burst from `by`.
-    /// An acted input (ruling T1) is marked whatever the burst, `mark -
+    /// An acted input is marked whatever the burst, `mark -
     /// input verb=<v> act=<w> [re=<step>] [dropped=<n> [pool=shared]]
     /// by=<it>`, `re=` the
     /// step a late one was admitted under (it closed before the bytes were
@@ -345,7 +345,7 @@ impl SessionLog {
     /// one a second), and one its bucket is short of is counted, not marked,
     /// the author's next acted mark saying how many (`dropped=`): its own
     /// count, a trusted actor's, a named slot's holder's, or an overflowed
-    /// author's owed-only entry's (Phase 6 step 6C-6, ruling U18); past
+    /// author's owed-only entry's; past
     /// that table, the shared pool's, said as the pool's (`dropped=<n>
     /// pool=shared`) by an overflowed author with none of its own
     /// ([`aterm_slog::MarkLimiter::owed`]). So no author's acted keys push
@@ -392,7 +392,7 @@ impl SessionLog {
         let mut f = f;
         if dropped > 0 {
             let _ = f.set(Key::Dropped, aterm_slog::Val::U(dropped));
-            // The shared pool's count is said as the pool's (ruling U18).
+            // The shared pool's count is said as the pool's.
             if owed.is_shared() {
                 f = f.clone().word(Key::Pool, "shared").unwrap_or(f);
             }
@@ -460,7 +460,7 @@ impl CauseRef {
 /// The usage refusal of a malformed or repeated `cause=`.
 pub(crate) const CAUSE_USAGE: &str = "ERR usage: cause=@<off>|<seq> names the mail (@broker offset) or record (seq) acted on, once\n";
 
-/// THE CAUSE CHECK (phase 3A ruling R7): `cause=` names only what THIS
+/// THE CAUSE CHECK: `cause=` names only what THIS
 /// session holds — mail it was delivered or a post of its own landed at
 /// ([`crate::fabric::SessionFabric::holds_offset`]) or a `mail` record of its
 /// log names, or a record seq inside its log's current seq space outside
@@ -659,7 +659,7 @@ impl MarkReq {
                 }
                 "re" => req.re = Some(CauseRef::parse(v).ok_or_else(usage)?),
                 // A chosen name is never an actor word a connection's class
-                // names (ruling R1's class): `by=- as=harness` would read as
+                // names (class): `by=- as=harness` would read as
                 // the harness to whoever reads the log.
                 "as" if is_as_name(v) && aterm_slog::field::is_reserved_name(v) => {
                     return Err(format!("ERR mark: as={v} is a session log actor\n"));
@@ -767,7 +767,7 @@ impl SessionLog {
         Ok((seq, node, self.take_log_wake()))
     }
 
-    /// A SELF-SUPERVISED AGENT'S ACT (plan 5C-2; rulings T21, T24): what a
+    /// A SELF-SUPERVISED AGENT'S ACT: what a
     /// proven self-claim's holder told with `meta set harness_act <act>`, as
     /// the log's `mark <node> act word=<w> rule=<act> holder=<h>
     /// harness_act=<act> by=<a> src=mark conf=claim` — the word
@@ -866,7 +866,7 @@ pub(crate) fn cmd_mark(
     }
 }
 
-// `await log` (phase 3A, design §7.2; ruling R2): park on the session log
+// `await log` (design §7.2): park on the session log
 // until a need, an open, a close or a kind, never polling and never spinning.
 
 /// The `await log` usage line.
@@ -874,7 +874,7 @@ pub(crate) const AWAIT_LOG_USAGE: &str = "ERR usage: await log <wait>[,<wait>...
      [since=<seq> ep=<e>] [timeout=<ms>]; <wait> is need|open=<lvl>|close=<lvl>|kind=<k>, at \
      most 4, any one answers; <lvl> is session|run|turn|step\n";
 
-/// The most predicates one `await log` lists (session log 5F-1).
+/// The most predicates one `await log` lists.
 pub(crate) const LOG_WAITS_MAX: usize = 4;
 
 /// What `await log` waits for.
@@ -919,7 +919,7 @@ impl LogWait {
     }
 }
 
-/// What one `await log` waits for (session log 5F-1): one to
+/// What one `await log` waits for: one to
 /// [`LOG_WAITS_MAX`] distinct predicates, written `need,close=turn`; a record
 /// that satisfies ANY of them answers the wait, and the wait is one waiter
 /// however many it lists.
@@ -1039,7 +1039,7 @@ pub(crate) enum LogAwaitStep {
 impl SessionLog {
     /// Where an `await log` with no `since=` starts, and a latched answer:
     /// `need` LATCHES from the fold's open OBSERVED needs as a reader is shown
-    /// them (ruling R2: never by replaying the ring, which a gap or a carried
+    /// them (never by replaying the ring, which a gap or a carried
     /// update's hole would answer again and again; a claim's need is left out,
     /// as `status need=` leaves it, or a need nobody can lift would answer
     /// every wait), `OK seq=<raised> ep=<e> as_of=<head> latched=1 <record>`
@@ -1077,8 +1077,8 @@ impl SessionLog {
     /// <record>`, the gap the records before it crossed, counted exactly up to
     /// it), a gap with no match among what the read returned (`OK gap why=
     /// lost= resync_to=<next> ep=` — `resync_to` the read's own `next`, so a
-    /// wait re-armed there reads past the hole and never meets the same gap,
-    /// ruling R2), or the cursor to read on from.
+    /// wait re-armed there reads past the hole and never meets the same gap),
+    /// or the cursor to read on from.
     pub(crate) fn await_check(&self, what: LogWaits, cursor: aterm_slog::Cursor) -> LogAwaitStep {
         let log = &self.log;
         if log.reader_last_seq() == cursor.seq && log.ep() == cursor.ep {

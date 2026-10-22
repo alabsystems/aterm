@@ -1633,7 +1633,7 @@ impl<C: Ctl> Session<'_, C> {
     /// The last message on them is BOUNDED BY ITS CELLS as the screen's is
     /// ([`Self::message_bounded_by_cells`]): on the grid read here, a
     /// message above a tail's rows (whose read could not reach its caret
-    /// row: the review of 3a4586a01e, R1), and with the history above, a
+    /// row), and with the history above, a
     /// message whose caret row scrolled up out of the grid
     /// ([`Self::rows_bounded_by_cells`], T1) — else agy's person's later
     /// paragraphs read as its reply, and their `NEEDS YOU:` as its need.

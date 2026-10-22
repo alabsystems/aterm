@@ -1,30 +1,20 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The warm spare's logic, headless (`docs/DESIGN-warm-spare-2026-10-16.md`
-//! §13, tests U1–U14): the learned gate, adoption's gates, the booking and
-//! promotion checks, the factory fingerprint, the reader's swallowing post,
-//! taint, the cast's rebase, the spawner's adopt check and the backstop. Real
-//! shells and the real `aterm-spare` thread are the live suite's
-//! (`crates/aterm/tests/spare_live_headless.rs`); the shells' own holds are
-//! `aterm-shell-integration`'s `tests_spare.rs`.
+//! Headless unit tests for the warm spare shell.
 
 use super::*;
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 use crate::tab_spawn::SpawnAsk;
 use std::sync::Mutex as StdMutex;
 
-/// A unix second far from the epoch's edges.
 const T: u64 = 1_800_000_000;
 
 fn gate_file(dir: &aterm_tempfile::TempDir) -> PathBuf {
     dir.path().join("spare-gate-v1.tsv")
 }
 
-/// U1: three clean visible runs open a generation; an unclean one resets the
-/// streak and an inconclusive one leaves it; a deterministic failure lasts until
-/// the generation changes; a backoff failure holds an hour, then a day for a
-/// second within a day; `T_READY` follows the longest run; the file round-trips.
+/// Three clean runs open a generation; failures reset or back off; the gate file round-trips.
 #[test]
 fn the_gate_opens_on_three_clean_runs_and_backs_off_on_failure() {
     let dir = aterm_tempfile::tempdir().expect("tempdir");
@@ -61,7 +51,6 @@ fn the_gate_opens_on_three_clean_runs_and_backs_off_on_failure() {
         "another generation learns on its own"
     );
 
-    // A backoff failure: an hour; a second within a day: a day.
     book.fail_at(g, Verdict::Backoff("rc_timeout"), T);
     for _ in 0..3 {
         book.sample(g, Sample::Clean { rc_ms: 40 });
@@ -78,7 +67,6 @@ fn the_gate_opens_on_three_clean_runs_and_backs_off_on_failure() {
     );
     assert!(book.eligible_at(g, T + 4000 + 24 * 3600));
 
-    // Deterministic: never again for this generation.
     book.fail_at(other, Verdict::Deterministic("sched"), T);
     for _ in 0..5 {
         book.sample(other, Sample::Clean { rc_ms: 10 });
@@ -86,21 +74,18 @@ fn the_gate_opens_on_three_clean_runs_and_backs_off_on_failure() {
     assert!(!book.eligible_at(other, T + 365 * 24 * 3600));
     assert_eq!(book.report(other), "ineligible:sched");
 
-    // The file: what a later process reads back.
     let mut back = GateBook::at(Some(gate_file(&dir)));
     assert!(back.eligible_at(g, T + 4000 + 24 * 3600));
     assert!(!back.eligible_at(other, T + 365 * 24 * 3600));
     assert_eq!(back.t_ready(g), Duration::from_millis(1200));
 }
 
-/// [`parked_slot`] for the conformance bind.
+/// Build a parked stub [`Slot`] for conformance testing.
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 pub(super) fn parked_slot_for(app: &App, id: u64, cwd: Option<&str>) -> Slot {
     parked_slot(app, id, cwd)
 }
 
-/// A stub spare in window 0 of `app`, parked, in `cwd`, at the window's grid,
-/// spawned by the app's own factory now.
 fn parked_slot(app: &App, id: u64, cwd: Option<&str>) -> Slot {
     let wid = WindowId(0);
     let now = Instant::now();
@@ -122,7 +107,6 @@ fn parked_slot(app: &App, id: u64, cwd: Option<&str>) -> Slot {
     }
 }
 
-/// An app with one tab whose focused pane reported `cwd` (OSC 7).
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 fn app_in(cwd: &str) -> App {
     let mut app = App::headless_for_test();
@@ -133,8 +117,6 @@ fn app_in(cwd: &str) -> App {
     app
 }
 
-/// [`app_in`] whose factory's shells can wait as spares (an integrated zsh;
-/// the test App's own factory integrates nothing, and books none).
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 fn spare_app_in(cwd: &str) -> App {
     let mut app = app_in(cwd);
@@ -147,16 +129,12 @@ fn spare_app_in(cwd: &str) -> App {
     app
 }
 
-/// U2: each of adoption's gates names its own miss, and a spare that passes
-/// them all is taken out of the slot. Every refusal leaves the spare where it
-/// was (the cold path runs instead).
+/// Each adoption gate reports its miss reason and leaves the spare in place on refusal.
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 #[test]
 fn each_adoption_gate_names_its_miss_and_a_spare_that_passes_them_is_taken() {
     let wid = WindowId(0);
     let mut app = app_in("/tmp");
-    // A zsh's spare, whatever the host's own login shell is: it parks, and a
-    // parked one may be retargeted (`App::spare_retargets`).
     app.session_factory.shell_override = Some("/bin/zsh".to_owned());
     let grid = app.spawn_grid(wid);
     let plain = SpawnAsk::new(None);
@@ -166,17 +144,14 @@ fn each_adoption_gate_names_its_miss_and_a_spare_that_passes_them_is_taken() {
         app.try_adopt_spare(wid, Some(wid), grid, ask).map(|_| ())
     };
 
-    // G3: nothing to adopt, or one still booked.
     assert_eq!(try_with(&mut app, &plain, grid), Err("none"));
     app.spares.slot = Some(parked_slot(&app, id, Some("/tmp")));
     app.spares.slot.as_mut().unwrap().state = SlotState::Booked;
     assert_eq!(try_with(&mut app, &plain, grid), Err("booked"));
     app.spares.slot.as_mut().unwrap().state = SlotState::Parked;
-    // G1: the kill switch.
     app.config.spare_shell = Some("off".into());
     assert_eq!(try_with(&mut app, &plain, grid), Err("off"));
     app.config.spare_shell = None;
-    // G2: only a plain ask.
     for ask in [
         SpawnAsk {
             observe: Some(aterm_session::SessionId::generate()),
@@ -192,12 +167,9 @@ fn each_adoption_gate_names_its_miss_and_a_spare_that_passes_them_is_taken() {
     ] {
         assert_eq!(try_with(&mut app, &ask, grid), Err("ask"));
     }
-    // G4: another factory.
     app.spares.slot.as_mut().unwrap().fingerprint ^= 1;
     assert_eq!(try_with(&mut app, &plain, grid), Err("factory"));
     app.spares.slot.as_mut().unwrap().fingerprint ^= 1;
-    // G5: the folder, exactly, for a parked spare that may not `cd` at its
-    // release (a system zshenv ran before its hold).
     app.spares
         .shared
         .pre_hold
@@ -210,15 +182,12 @@ fn each_adoption_gate_names_its_miss_and_a_spare_that_passes_them_is_taken() {
     assert_eq!(try_with(&mut app, &plain, grid), Err("folder"));
     app.spares.slot.as_mut().unwrap().cwd = Some("/tmp".into());
     app.spares.shared.pre_hold.store(0, Ordering::Release);
-    // G7: age.
     app.spares.slot.as_mut().unwrap().since = Instant::now().checked_sub(PARKED_MAX_AGE).unwrap();
     assert_eq!(try_with(&mut app, &plain, grid), Err("age"));
     app.spares.slot.as_mut().unwrap().since = Instant::now();
-    // Taint: whatever the program asked of the host before anyone owned it.
     app.spares.slot.as_ref().unwrap().link.taint(taint::BELL);
     assert_eq!(try_with(&mut app, &plain, grid), Err("taint"));
     app.spares.slot = Some(parked_slot(&app, id, Some("/tmp")));
-    // G9: its shell exited.
     app.spares.slot.as_ref().unwrap().link.decide(Wake::Exit {
         session: id,
         window: wid,
@@ -226,7 +195,6 @@ fn each_adoption_gate_names_its_miss_and_a_spare_that_passes_them_is_taken() {
     assert_eq!(try_with(&mut app, &plain, grid), Err("process"));
     app.spares.slot = Some(parked_slot(&app, id, Some("/tmp")));
 
-    // WARM tiers: the colours, the grid, the generation and the gate too.
     app.spares.slot.as_mut().unwrap().state = SlotState::Ready;
     app.spares.shared.generation.store(7, Ordering::Release);
     app.spares.shared.eligible.store(true, Ordering::Release);
@@ -245,7 +213,6 @@ fn each_adoption_gate_names_its_miss_and_a_spare_that_passes_them_is_taken() {
     app.spares.shared.eligible.store(false, Ordering::Release);
     assert_eq!(try_with(&mut app, &plain, grid), Err("gate"));
     app.spares.shared.eligible.store(true, Ordering::Release);
-    // A warm spare ran its rc in its own folder: never another one.
     app.spares.slot.as_mut().unwrap().cwd = Some("/var".into());
     assert_eq!(try_with(&mut app, &plain, grid), Err("folder"));
     assert_eq!(
@@ -253,7 +220,6 @@ fn each_adoption_gate_names_its_miss_and_a_spare_that_passes_them_is_taken() {
         Err("folder")
     );
     app.spares.slot.as_mut().unwrap().cwd = Some("/tmp".into());
-    // G10: an update in flight.
     let (record, _transfer) = crate::app_update_handoff::dry_run_capture_tests::prelaunched(
         1,
         crate::native_updater_service::ApplyMode::Automatic,
@@ -264,30 +230,20 @@ fn each_adoption_gate_names_its_miss_and_a_spare_that_passes_them_is_taken() {
     app.update_handoff_prelaunch = None;
     assert!(app.spares.slot.is_some(), "every refusal leaves the spare");
 
-    // Every gate passes: taken.
     let (slot, session) = app
         .try_adopt_spare(wid, Some(wid), grid, &plain)
         .expect("adopted");
     assert_eq!((slot.id, session.id), (id, id));
     assert!(app.spares.slot.is_none());
-    // A parked spare lands at any grid (resized before its release).
     app.spares.slot = Some(parked_slot(&app, id + 1, Some("/tmp")));
     assert!(try_with(&mut app, &plain, other_grid).is_ok());
-    // A parked spare in another folder passes here, for the pane's folder or
-    // one named: the spawner retargets it or names the miss
-    // (`AdoptCheck::verdict`).
     app.spares.slot = Some(parked_slot(&app, id + 2, Some("/var")));
     assert!(try_with(&mut app, &plain, grid).is_ok());
     app.spares.slot = Some(parked_slot(&app, id + 3, Some("/var")));
     assert!(try_with(&mut app, &SpawnAsk::new(Some("/usr")), grid).is_ok());
 }
 
-/// A spare whose startup files have run and whose escape scan waits out its
-/// window (Verifying) is taken as a warming one is, through the warm tiers'
-/// gates; one still spawning is not. Its verdict, coming after, acts on no
-/// other spare. NEGATIVE CONTROL: with Verifying refused as `booked` again
-/// (before, a tab asked for in the grace after the mark went cold), the
-/// adoption fails.
+/// A `Verifying` spare is adoptable through the warm gates while a `Spawned` one is not.
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 #[test]
 fn a_spare_verifying_its_run_is_taken_as_a_warming_one_is() {
@@ -321,7 +277,6 @@ fn a_spare_verifying_its_run_is_taken_as_a_warming_one_is() {
         (slot.id, session.id, slot.state),
         (id, id, SlotState::Verifying)
     );
-    // The next spare verifies in its turn; the adopted one's verdict leaves it.
     app.spares.slot = Some(parked_slot(&app, id + 1, Some("/tmp")));
     app.spares.slot.as_mut().unwrap().state = SlotState::Verifying;
     app.on_spare_note(id, SpareNote::Verified(Verdict::Backoff("escaped")));
@@ -331,38 +286,30 @@ fn a_spare_verifying_its_run_is_taken_as_a_warming_one_is() {
     );
 }
 
-/// U3: a booking waits for a person, the boot grace, the settle after input,
-/// the replacement spacing, the hourly budget and a pressure episode; a
-/// session not at its prompt waits for its output (a held pane books in its
-/// folder: live L13). A promotion waits for idle input and a stable folder,
-/// and stops for the budget, a pass, the power state and the gate.
+/// Booking and promotion enforce person presence, grace periods, budgets, and pressure holds.
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 #[test]
 fn booking_and_promotion_wait_for_every_condition() {
     let mut app = spare_app_in("/tmp");
     let inputs = app.spare_gen_inputs();
     let now = Instant::now();
-    // A person is required by default.
     assert_eq!(
         app.spare_book_check(now, &inputs),
         BookCheck::No("no-person")
     );
     app.config.spare_shell_needs_person = Some(false);
-    // The boot grace.
     app.spares.boot_at = Some(now);
     assert_eq!(
         app.spare_book_check(now, &inputs),
         BookCheck::Wait(now + BOOT_GRACE)
     );
     let later = now + BOOT_GRACE;
-    // A person typed: the settle after it.
     app.spares.person.set(Some(later));
     assert_eq!(
         app.spare_book_check(later, &inputs),
         BookCheck::Wait(later + SETTLE)
     );
     let t = later + SETTLE;
-    // The focused session has not drawn its prompt: its output looks again.
     let focused = app.focused_session_id(WindowId(0));
     assert_eq!(
         app.spare_book_check(t, &inputs),
@@ -377,11 +324,6 @@ fn booking_and_promotion_wait_for_every_condition() {
             cwd: Some("/tmp".into())
         }
     );
-    // A system file zsh reads before its hold (Ubuntu's /etc/zsh/zshenv), or
-    // the files not read yet (the production mirror before the thread, which
-    // the first tick starts, has looked): parking waits for the gate, and
-    // books once it is eligible. NEGATIVE CONTROL: bash's file alone does not
-    // hold a zsh spare.
     for bits in [PRE_HOLD_ZSH, Shared::unread().pre_hold.into_inner()] {
         app.spares.shared.pre_hold.store(bits, Ordering::Release);
         assert_eq!(app.spare_book_check(t, &inputs), BookCheck::No("system-rc"));
@@ -401,14 +343,12 @@ fn booking_and_promotion_wait_for_every_condition() {
         BookCheck::Go { .. }
     ));
     app.spares.shared.pre_hold.store(0, Ordering::Release);
-    // The replacement spacing.
     app.spares.last_replace = Some(t);
     assert_eq!(
         app.spare_book_check(t, &inputs),
         BookCheck::Wait(t + REPLACE_MIN)
     );
     app.spares.last_replace = None;
-    // The hourly budget.
     for i in 0..PARKED_BUDGET {
         app.spares
             .parked_spawns
@@ -419,26 +359,22 @@ fn booking_and_promotion_wait_for_every_condition() {
         BookCheck::Wait(t - Duration::from_secs(60) + HOUR)
     );
     app.spares.parked_spawns.clear();
-    // A pressure episode.
     app.spares.pressure_at = Some(t);
     assert_eq!(
         app.spare_book_check(t, &inputs),
         BookCheck::Wait(t + PRESSURE_HOLD)
     );
     app.spares.pressure_at = None;
-    // A parked spare that ran past its hold: none until the script set or shell changes.
     app.spares.parked_failed = Some(parked_key(&inputs));
     assert_eq!(
         app.spare_book_check(t, &inputs),
         BookCheck::No("parked-failed")
     );
     app.spares.parked_failed = None;
-    // `-e`, and temporal recording: never.
     app.session_factory.temporal_recording = true;
     assert_eq!(app.spare_book_check(t, &inputs), BookCheck::No("factory"));
     app.session_factory.temporal_recording = false;
 
-    // Promotion.
     let id = app.next_session_id;
     app.spares.slot = Some(parked_slot(&app, id, Some("/tmp")));
     app.spares.slot.as_mut().unwrap().since = t;
@@ -454,10 +390,6 @@ fn booking_and_promotion_wait_for_every_condition() {
     );
     let u = t + PROMOTE_FOLDER_STABLE;
     assert!(matches!(app.spare_promote_check(u), BookCheck::Go { .. }));
-    // An eligible generation admits every shell with a spare hold — fish
-    // too, whose generation stamps the startup roots its own record names
-    // (R7) — and never one with none. Neither these program names nor this
-    // check executes a shell.
     let previous_shell = app.session_factory.shell_override.clone();
     for (program, admitted) in [
         ("/bin/zsh", true),
@@ -497,19 +429,11 @@ fn booking_and_promotion_wait_for_every_condition() {
     assert_eq!(app.spare_promote_check(u), BookCheck::No("mode"));
 }
 
-/// A parked spare's spawn looks for the system files again: one may have
-/// appeared since the thread looked (zsh installed and made the shell while
-/// aterm runs), which the booking, reading the mirror, could not know. A zsh
-/// spare is not forked while its global zshenv now runs before the hold with
-/// no eligible gate, and the mirror takes what was found, so the next booking
-/// waits for the gate. NEGATIVE CONTROLS: an eligible gate, a bash spare (its
-/// own file absent) and a fish one (no parked hold) are forked, and a file
-/// gone again clears the mirror.
+/// Parked spawn re-checks system rc files that run before the hold.
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 #[test]
 fn a_parked_spawn_looks_for_the_system_files_again() {
     use aterm_core::shell_integration::ShellType;
-    // The thread found none at its start.
     let shared = Shared::default();
     let zshenv_now = |f: &str| f == "/etc/zsh/zshenv";
     assert!(parked_spawn_runs_unseen(
@@ -542,12 +466,7 @@ fn a_parked_spawn_looks_for_the_system_files_again() {
     assert!(!shared.ran_before_hold(ShellType::Zsh));
 }
 
-/// A spare whose spawn found its folder would fall back forked nothing: its
-/// booking goes back to the hourly budget, and that folder books no spare
-/// again until the wanted folder moves, so a held pane's folder that is
-/// another machine's costs one check per move, never one per keystroke.
-/// NEGATIVE CONTROL: any other failed spawn keeps its booking and bars no
-/// folder.
+/// A spawn whose folder would fall back refunds its budget slot and bars that folder until it changes.
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 #[test]
 fn a_folder_a_spare_would_fall_back_from_books_none_until_it_moves() {
@@ -564,7 +483,6 @@ fn a_folder_a_spare_would_fall_back_from_books_none_until_it_moves() {
         window: WindowId(0),
         cwd: Some(cwd.into()),
     };
-    // Booked for /tmp, as `spare_book` books it, and its spawn refused.
     let booked = |app: &mut App, id: u64| {
         let mut slot = parked_slot(app, id, Some("/tmp"));
         slot.state = SlotState::Booked;
@@ -592,12 +510,10 @@ fn a_folder_a_spare_would_fall_back_from_books_none_until_it_moves() {
         BookCheck::No("folder"),
         "the same folder at the next tick"
     );
-    // The pane's folder moves: booked there.
     crate::term_lock(&app.pool.get(focused).unwrap().term)
         .process(b"\x1b]7;file://localhost/usr\x07");
     app.spare_follow(t);
     assert_eq!(app.spare_book_check(t, &inputs), go("/usr"));
-    // Another failure: counted against the budget, no folder barred.
     booked(&mut app, 61);
     app.on_spare_spawned(SpareSpawned {
         id: 61,
@@ -613,9 +529,7 @@ fn a_folder_a_spare_would_fall_back_from_books_none_until_it_moves() {
     assert_eq!(app.spare_book_check(t, &inputs), go("/usr"));
 }
 
-/// U3b: a person seen once is enough for a PARKED spare, through an absence
-/// longer than the person's window (the first Cmd-T back adopts it); WARM
-/// waits for a person now.
+/// A parked spare persists across user absence while promotion to warm requires recent presence.
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 #[test]
 fn a_parked_spare_waits_out_an_absence_and_only_warm_needs_a_person_now() {
@@ -627,7 +541,6 @@ fn a_parked_spare_waits_out_an_absence_and_only_warm_needs_a_person_now() {
     let s = app.pool.get(focused).unwrap();
     crate::term_lock(&s.term).process(b"\x1b]133;A\x07");
     app.spares.note_person(seen);
-    // Eleven minutes without a gesture.
     let back = seen + PERSON_WINDOW + Duration::from_secs(60);
     assert_eq!(
         app.spare_book_check(back, &inputs),
@@ -637,8 +550,6 @@ fn a_parked_spare_waits_out_an_absence_and_only_warm_needs_a_person_now() {
         },
         "a parked spare is booked after the absence"
     );
-    // The parked spare, its folder settled and the gate open: not promoted
-    // while nobody is here.
     let id = app.next_session_id;
     app.spares.slot = Some(parked_slot(&app, id, Some("/tmp")));
     app.spares.slot.as_mut().unwrap().since = seen;
@@ -647,7 +558,6 @@ fn a_parked_spare_waits_out_an_absence_and_only_warm_needs_a_person_now() {
     app.spares.shared.generation.store(9, Ordering::Release);
     app.spares.shared.eligible.store(true, Ordering::Release);
     assert_eq!(app.spare_promote_check(back), BookCheck::No("no-person"));
-    // The person is back: WARM once their input settles.
     app.spares.note_person(back);
     assert_eq!(
         app.spare_promote_check(back),
@@ -659,7 +569,7 @@ fn a_parked_spare_waits_out_an_absence_and_only_warm_needs_a_person_now() {
     ));
 }
 
-/// U3c: a window coming to the front is a person arriving, as a gesture is.
+/// Window focus counts as user presence.
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 #[test]
 fn a_window_coming_to_the_front_is_a_person() {
@@ -679,11 +589,7 @@ fn a_window_coming_to_the_front_is_a_person() {
     );
 }
 
-/// The FIFO sweep: a FIFO whose owner is gone (a reaped pid, or a pid now
-/// another process's) is removed with its link; a live owner's (this
-/// process's), one whose owner could not read its own birth (`0`) while that
-/// pid lives, a name that names no owner, and an owner-named entry that is no
-/// FIFO are left. The release of a shell blocked on it is live L12's.
+/// `sweep_dead_fifos` removes only FIFOs and symlinks belonging to dead owners.
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 #[test]
 fn the_fifo_sweep_removes_only_a_dead_owners_fifo_and_its_link() {
@@ -700,7 +606,6 @@ fn the_fifo_sweep_removes_only_a_dead_owners_fifo_and_its_link() {
         );
     };
     let link = |to: &str, sid: &str| std::os::unix::fs::symlink(to, at(sid)).expect("link");
-    // A process this test started and read, then killed and reaped.
     let mut gone = aterm_uds::spawnfd::command("/bin/sleep")
         .arg("600")
         .spawn()
@@ -723,7 +628,6 @@ fn the_fifo_sweep_removes_only_a_dead_owners_fifo_and_its_link() {
     mkfifo("s-0d");
     let not_fifo = format!("{gone_pid}-{gone_birth}-s-0e");
     std::fs::write(at(&not_fifo), b"").expect("file");
-    // A birth unread at the naming proves nothing while its pid lives.
     let unread = format!("{me}-0-s-0f");
     mkfifo(&unread);
     mkfifo(&format!("{gone_pid}-0-s-10"));
@@ -740,8 +644,7 @@ fn the_fifo_sweep_removes_only_a_dead_owners_fifo_and_its_link() {
     assert_eq!(left, kept);
 }
 
-/// U5: the factory fingerprint moves with every field that shapes a shell, and
-/// not with the colours.
+/// `spawn_fingerprint` changes with shell-shaping fields and ignores terminal colors.
 #[test]
 fn the_spawn_fingerprint_moves_with_what_shapes_a_shell_and_not_with_colours() {
     let app = App::headless_for_test();
@@ -786,7 +689,6 @@ fn the_spawn_fingerprint_moves_with_what_shapes_a_shell_and_not_with_colours() {
     assert_eq!(colours.spawn_fingerprint(), fp, "colours do not move it");
 }
 
-/// A link whose posts are captured.
 fn captured_link(id: u64) -> (Arc<SpareLink>, Arc<StdMutex<Vec<String>>>) {
     let seen = Arc::new(StdMutex::new(Vec::new()));
     let sink = Arc::clone(&seen);
@@ -818,10 +720,7 @@ fn a_start_seen(kind: StartKind) -> StartSeen {
     }
 }
 
-/// U6: before its adoption a spare's reader posts nothing the loop acts on —
-/// an output wake answers `false` (the latch clears) after noting a parked or a
-/// start mark once each, an exit becomes a note and never a `Wake::Exit` — and
-/// once live every wake goes on, stamped with its owner's window.
+/// `SpareLink` swallows wakes before adoption and forwards re-stamped wakes once live.
 #[test]
 fn a_spare_reader_is_swallowed_until_live_then_forwarded_to_its_window() {
     let (link, seen) = captured_link(5);
@@ -860,7 +759,6 @@ fn a_spare_reader_is_swallowed_until_live_then_forwarded_to_its_window() {
         "each note once, and no Exit reaches the loop"
     );
 
-    // Live in window 3: forwarded, re-stamped.
     let (link, seen) = captured_link(6);
     link.go_live(WindowId(3));
     assert!(link.decide(Wake::Output {
@@ -880,9 +778,7 @@ fn a_spare_reader_is_swallowed_until_live_then_forwarded_to_its_window() {
     );
 }
 
-/// U6's latch half: the documented headless path — a refused output post
-/// clears the session's latch, so the reader's next chunk posts again, and no
-/// repost is counted.
+/// A refused spare output post clears the output latch.
 #[test]
 fn a_refused_spare_output_post_clears_the_latch() {
     let (link, _) = captured_link(9);
@@ -901,9 +797,7 @@ fn a_refused_spare_output_post_clears_the_latch() {
     );
 }
 
-/// U8: before its adoption a spare's host effects reach nothing and taint it:
-/// the bell, a notification, an OSC 52 write; and an OSC 52 query is refused
-/// (revoked), so the pasteboard is never read.
+/// Pre-adoption host effects taint the spare without reaching the host.
 #[test]
 fn a_spare_host_effect_only_taints_it() {
     let term = Arc::new(std::sync::Mutex::new(crate::spawn::new_live_terminal(
@@ -937,9 +831,7 @@ fn a_spare_host_effect_only_taints_it() {
     assert!(seen.lock().unwrap().is_empty(), "nothing was delivered");
 }
 
-/// U9: an adopted spare's recording reads as a tab started at the adoption —
-/// what it recorded before moves to t = 0, later events are offset by its age,
-/// and order is kept.
+/// Adopting a spare rebases its recording timestamps to the adoption instant.
 #[test]
 fn an_adopted_spares_cast_starts_at_the_adoption() {
     let mut rec = crate::cast::CastRecorder::new(80, 24);
@@ -962,10 +854,7 @@ fn an_adopted_spares_cast_starts_at_the_adoption() {
     );
 }
 
-/// U11: the spawner hands a spare over only while its rc generation, its folder
-/// and its shell still hold; a parked one asked for in another folder is told
-/// to `cd` there at its release, to the folder's kernel path, when it may. A
-/// spawn naming no folder is judged in the factory's (`-d`), as it starts.
+/// `AdoptCheck` validates generation, folder, and live shell state before handoff.
 #[test]
 fn the_spawner_hands_a_spare_over_only_while_it_is_still_valid() {
     let home = aterm_tempfile::tempdir().expect("tempdir");
@@ -1001,14 +890,11 @@ fn the_spawner_hands_a_spare_over_only_while_it_is_still_valid() {
         check(Some("/tmp"), None).verdict(&session, Some("/tmp"), None),
         Ok(None)
     );
-    // The rc moved: stale.
     std::fs::write(home.path().join(".zshrc"), "PS1='$ '\nalias x=y\n").unwrap();
     assert_eq!(
         check(None, Some(generation)).verdict(&session, None, None),
         Err("stale")
     );
-    // Its folder would fall back now. Unix only: off unix no folder is judged
-    // before the spawn (`spawn_folder::start_fault`), the spawn inherits.
     #[cfg(unix)]
     {
         let gone = "/nonexistent/aterm-spare";
@@ -1016,8 +902,6 @@ fn the_spawner_hands_a_spare_over_only_while_it_is_still_valid() {
             check(Some(gone), None).verdict(&session, Some(gone), None),
             Err("folder")
         );
-        // Another folder: a spare that may not `cd` misses; a parked one may,
-        // never to a folder the cold spawn would fall back from.
         assert_eq!(
             check(Some("/tmp"), None).verdict(&session, Some("/usr"), None),
             Err("folder")
@@ -1027,8 +911,6 @@ fn the_spawner_hands_a_spare_over_only_while_it_is_still_valid() {
             Err("folder")
         );
     }
-    // The kernel's path: what a cold shell's `getcwd()` names there. macOS
-    // and Linux: elsewhere no spare parks, and nothing is retargeted.
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     {
         assert_eq!(
@@ -1041,9 +923,6 @@ fn the_spawner_hands_a_spare_over_only_while_it_is_still_valid() {
             Ok(Some("/private/tmp".to_owned())),
             "through the root's link"
         );
-        // A spawn that names no folder starts in the factory's (`-d`), the
-        // spare's own spawn too: a spare spawned there is in place, and a
-        // parked one elsewhere is told that folder, not the home folder.
         assert_eq!(
             check(None, None).verdict(&session, None, Some("/usr")),
             Ok(None)
@@ -1066,7 +945,6 @@ fn the_spawner_hands_a_spare_over_only_while_it_is_still_valid() {
             "a spare in the factory's folder, asked for another"
         );
     }
-    // Its shell is gone.
     link.decide(Wake::Exit {
         session: 3,
         window: WindowId(0),
@@ -1077,9 +955,7 @@ fn the_spawner_hands_a_spare_over_only_while_it_is_still_valid() {
     );
 }
 
-/// U14: the backstop swallows exactly the wakes about a spare nobody owns —
-/// the slot's, one in transit, a retired one's — and an output wake clears its
-/// latch; a request that names a session, and any other session's wake, pass.
+/// The event-loop backstop swallows wakes for unowned spares and passes all others.
 #[test]
 fn the_backstop_swallows_only_a_spares_own_wakes() {
     let mut app = App::headless_for_test();
@@ -1107,9 +983,7 @@ fn the_backstop_swallows_only_a_spares_own_wakes() {
         assert_eq!(wake.local_session(), Some(id), "{wake:?}");
         assert!(app.spares.swallows(id));
     }
-    // Another session's exit passes.
     assert!(!app.spares.swallows(id + 1));
-    // A request that names the spare's id is answered by its handler.
     let (tx, _rx) = std::sync::mpsc::channel();
     assert_eq!(
         Wake::CloseSession {
@@ -1120,7 +994,6 @@ fn the_backstop_swallows_only_a_spares_own_wakes() {
         .local_session(),
         None
     );
-    // The latch of a swallowed output wake is cleared.
     app.spares
         .slot
         .as_ref()
@@ -1146,23 +1019,16 @@ fn the_backstop_swallows_only_a_spares_own_wakes() {
             .load(Ordering::Relaxed),
         0
     );
-    // Retired: its late wakes are still swallowed.
     app.retire_spare("test", None);
     assert!(app.spares.slot.is_none());
     assert!(app.spares.swallows(id), "a tombstone");
 }
 
-/// The escape scan on an owned process tree: the fixture keeps the daemon
-/// parented until its exact pid, birth and parent chain are captured, then
-/// releases that parent and waits for launchd to adopt it. Cleanup never
-/// searches the host for a process name.
+/// macOS escape scan detects an orphaned daemon left behind in the run window.
 #[cfg(target_os = "macos")]
 #[test]
 fn the_escape_scan_catches_a_daemon_the_session_left_behind() {
     let dir = aterm_tempfile::tempdir().expect("tempdir");
-    // Stand-ins of our own, whose environment the scan can read, run in
-    // place: never copies in `dir`, which goes when the test ends, while
-    // macOS may still assess a first exec (`aterm_uds::deadline::stand_in`).
     let (shell, sleep) = (fixture_shell(), fixture_sleep());
     let mark = dir.path().join("daemon-pid");
     let release = dir.path().join("release-parent");
@@ -1189,15 +1055,11 @@ fn the_escape_scan_catches_a_daemon_the_session_left_behind() {
         .process_group(0)
         .spawn()
         .expect("spawn");
-    // Own the unreaped child's fresh group before any readiness wait or
-    // assertion. If capture fails, its still-parented descendants cannot escape.
     let mut owned = OwnedEscapeFixture {
         child: Some(child),
         daemon: None,
     };
     let shell_pid = owned.child.as_ref().unwrap().id() as i32;
-    // Read at its spawn, as `spawn_session` does: its `exec` once its
-    // child is gone takes a later version than the daemon's launcher has.
     let shell_version = bsdinfo_uniq(shell_pid).map(|info| info.p_idversion);
     let give_up = Instant::now() + aterm_spec::wait::MUST_HAPPEN;
     let daemon_pid = loop {
@@ -1217,7 +1079,6 @@ fn the_escape_scan_catches_a_daemon_the_session_left_behind() {
     let parent = bsdinfo_uniq(daemon.pbsd.pbi_ppid as i32).expect("its held parent");
     assert_eq!(parent.pbsd.pbi_ppid, shell_pid as u32, "our child's child");
     owned.daemon = Some((daemon_pid, daemon.p_uniqueid));
-    // Only a captured, still-parented daemon may be released to launchd.
     std::fs::write(&release, b"release\n").expect("release its parent");
     loop {
         let info = bsdinfo_uniq(daemon_pid).expect("the owned daemon is still live");
@@ -1241,10 +1102,6 @@ fn the_escape_scan_catches_a_daemon_the_session_left_behind() {
         born,
         born,
     );
-    // The window before this tree is judged over the fixture's own live
-    // processes: over the whole uid, any other process exiting while it is
-    // listed (another test's, under a full suite) reads as an incomplete
-    // scan, `Unknown`, not `Clean`.
     let window_before = escape_scan_among(
         shell_pid,
         "s-0123456789abcdef0123",
@@ -1253,7 +1110,6 @@ fn the_escape_scan_catches_a_daemon_the_session_left_behind() {
         |_| Some(vec![shell_pid, daemon_pid]),
         bsdinfo_uniq,
     );
-    // Negative control: the same fixture in the run's window is caught.
     let caught_among = escape_scan_among(
         shell_pid,
         "s-0123456789abcdef0123",
@@ -1282,11 +1138,7 @@ fn the_escape_scan_catches_a_daemon_the_session_left_behind() {
     );
 }
 
-/// A positive zombie state establishes completed exit for this scan; the
-/// flag that merely begins exit, a failed query, a partial record and an
-/// empty answer (a reaped pid — settled by a later listing, not this read)
-/// remain uncertain. These are bytes the real process-table reader passes
-/// to its decoder.
+/// `proc_pidinfo` decoder treats only a full zombie record as a completed exit.
 #[cfg(target_os = "macos")]
 #[test]
 fn a_zombie_establishes_a_completed_exit_and_an_empty_answer_does_not() {
@@ -1327,11 +1179,7 @@ fn a_zombie_establishes_a_completed_exit_and_an_empty_answer_does_not() {
     );
 }
 
-/// An incomplete scan is taken again, up to [`SCAN_ATTEMPTS`] listings: the
-/// first verdict that is not `Unknown` stands, an escape included, and no
-/// scan follows it. NEGATIVE CONTROL: one attempt reports the same
-/// incomplete scan as `Unknown`, and a host that never completes one stays
-/// `Unknown` after every attempt.
+/// Incomplete escape scans retry up to `SCAN_ATTEMPTS` before returning `Unknown`.
 #[cfg(target_os = "macos")]
 #[test]
 fn an_incomplete_escape_scan_is_taken_again() {
@@ -1365,11 +1213,7 @@ fn an_incomplete_escape_scan_is_taken_again() {
     );
 }
 
-/// A pid the scan cannot read that the process table says was born before the
-/// shell is none of the run's, so the first listing settles it: a host with a
-/// process wedged mid-exit otherwise left every scan `Unknown`. NEGATIVE
-/// CONTROL: `a_pid_reaped_mid_scan_is_settled_by_a_later_listing`'s reaped pid
-/// has no record, and stays unsettled.
+/// An unreadable process born before the shell is ignored on the first listing.
 #[cfg(target_os = "macos")]
 #[test]
 fn an_unreadable_process_older_than_the_shell_is_none_of_the_runs() {
@@ -1411,13 +1255,7 @@ fn an_unreadable_process_older_than_the_shell_is_none_of_the_runs() {
     );
 }
 
-/// A pid the first listing named that reads as nothing by the time it is read
-/// (a busy host's process reaped mid-scan) is settled by a later listing that
-/// no longer names it: a scan of a live shell stays clean, and the reaped pid
-/// takes one later listing, not a whole new scan with the host's fresh churn.
-/// NEGATIVE CONTROL: a later listing that still names the unreadable pid leaves
-/// the scan incomplete (`Unknown`) after every settling listing, and a scan
-/// whose later listing fails is `Unknown`.
+/// A pid reaped mid-scan is settled by a follow-up listing.
 #[cfg(target_os = "macos")]
 #[test]
 fn a_pid_reaped_mid_scan_is_settled_by_a_later_listing() {
@@ -1501,25 +1339,13 @@ fn a_pid_reaped_mid_scan_is_settled_by_a_later_listing() {
     drop(shell);
 }
 
-/// A daemon read while its launcher was still exiting names that launcher as
-/// its parent, though XNU hands an exiting process's children to launchd
-/// before it is a zombie. The scan reads every record that names a parent it
-/// dropped again, so the escape stands: a launcher that is a zombie at its
-/// read, and one reaped since the listing that a later listing settles. The
-/// processes are real; only the race (the launcher in `P_WEXIT` between the
-/// daemon's read and its own) is not left to the kernel's timing: the scan's
-/// first read of the daemon is the daemon's real record from before its
-/// launcher was killed. NEGATIVE CONTROL: without the second read both scans
-/// are `Clean`; a stale daemon that cannot be read again, yet is still listed
-/// (a later listing says so), leaves the scan `Unknown`, never `Clean`; the
-/// same tree read live is `Escaped`.
+/// A daemon read while its launcher was exiting is re-read so the orphan is caught.
 #[cfg(target_os = "macos")]
 #[test]
 fn a_daemon_read_before_its_launcher_exited_is_read_again() {
     let sid = FIXTURE_SID;
     let dir = aterm_tempfile::tempdir().expect("tempdir");
     let null = aterm_uds::spawnfd::Stdio::null;
-    // The shell stand-in is born first: an adopted daemon is younger than it.
     let shell = aterm_uds::spawnfd::command("/bin/sleep")
         .arg("600")
         .stdin(null())
@@ -1545,7 +1371,6 @@ fn a_daemon_read_before_its_launcher_exited_is_read_again() {
         .spawn()
         .expect("spawn the launcher");
     let launcher_pid = launcher.id() as i32;
-    // Own the launcher's fresh group (its daemon is in it) before any wait.
     let mut owned = OwnedEscapeFixture {
         child: Some(launcher),
         daemon: None,
@@ -1594,8 +1419,6 @@ fn a_daemon_read_before_its_launcher_exited_is_read_again() {
     let born = std::time::UNIX_EPOCH
         + Duration::from_secs(stale.pbsd.pbi_start_tvsec)
         + Duration::from_micros(stale.pbsd.pbi_start_tvusec);
-    // The launcher's pid reads only as the launcher (once reaped, a stranger
-    // may be given it).
     let live =
         |p: i32| bsdinfo_uniq(p).filter(|i| p != launcher_pid || i.p_uniqueid == launcher_birth);
     let not_again = |p: i32| if p == daemon_pid { None } else { live(p) };
@@ -1661,34 +1484,20 @@ fn a_daemon_read_before_its_launcher_exited_is_read_again() {
     assert_eq!(read_live, Scan::Escaped, "the same tree read live");
 }
 
-/// The session every escape fixture's processes name in their environment
-/// (`ATERM_PARENT_SESSION_ID`), and the one the scans here judge.
 #[cfg(target_os = "macos")]
 const FIXTURE_SID: &str = "s-0123456789abcdef0123";
 
-/// The escape fixtures' shell and `sleep`: ad hoc signed stand-ins of
-/// `/bin/bash` and `/bin/sleep` ([`aterm_uds::deadline::stand_in`]), run in
-/// place, whose environment another process can read. Darwin 27 withholds a
-/// platform binary's, and a scan counts an orphan whose environment it cannot
-/// read, so a fixture of plain `/bin/sh` and `/bin/sleep` left orphans that
-/// any other run's scan on the host counted as that run's escape: the live
-/// spare suite (`spare_live_headless`) beside two loops of `spare::` read
-/// COULD NOT RUN in 14 of 160 module runs (load 131-220), each on such a
-/// `sleep` (9) or the `bash` forked for one (5). Each process a fixture makes
-/// names [`FIXTURE_SID`] instead, which these scans count and no other run's
-/// does: 0 of 160 beside 865 runs of `spare::` (load 112-243).
+/// Ad-hoc signed shell and sleep stand-ins whose environment macOS allows reading.
 #[cfg(target_os = "macos")]
 fn fixture_shell() -> PathBuf {
     aterm_uds::deadline::stand_in(std::path::Path::new("/bin/bash"))
 }
 
-/// See [`fixture_shell`].
 #[cfg(target_os = "macos")]
 fn fixture_sleep() -> PathBuf {
     aterm_uds::deadline::stand_in(std::path::Path::new("/bin/sleep"))
 }
 
-/// A fixture's process: `program` naming [`FIXTURE_SID`], its stdio null.
 #[cfg(target_os = "macos")]
 fn fixture_command(program: &std::path::Path) -> aterm_uds::spawnfd::Command {
     let mut command = aterm_uds::spawnfd::command(program);
@@ -1700,7 +1509,6 @@ fn fixture_command(program: &std::path::Path) -> aterm_uds::spawnfd::Command {
     command
 }
 
-/// Hang-detector waits shared by the escape fixtures below.
 #[cfg(target_os = "macos")]
 struct FixtureWaits {
     give_up: Instant,
@@ -1714,7 +1522,6 @@ impl FixtureWaits {
         }
     }
 
-    /// The pid a fixture script wrote to `mark`.
     fn pid_in(&self, mark: &std::path::Path) -> i32 {
         loop {
             if let Ok(line) = std::fs::read_to_string(mark)
@@ -1732,15 +1539,6 @@ impl FixtureWaits {
         }
     }
 
-    /// Until `pid` is reaped: readable as another birth (its pid handed out
-    /// again), or unreadable, no zombie, and named by no whole listing of our
-    /// uid. A process still exiting (`P_WEXIT`, after its SIGKILL on a loaded
-    /// host) reads as nothing and is no zombie yet, but every listing names it
-    /// until its exit is done, and a scan then rightly reads it unsettled
-    /// (`Unknown`): waiting on the read alone let the escape fixtures scan
-    /// such a process (measured 10 of 667 runs of `spare::` beside the live
-    /// spare suite; none of 1449 once this waits, which outwaited such an
-    /// exit 46 times).
     fn gone(&self, pid: i32, birth: u64) {
         // SAFETY: `getuid` is a side-effect-free getter.
         let uid = unsafe { libc::getuid() };
@@ -1755,16 +1553,14 @@ impl FixtureWaits {
     }
 }
 
-/// SIGKILL `pid` if it is still the process born as `birth`.
 #[cfg(target_os = "macos")]
 fn kill_birth(pid: i32, birth: u64) {
     if bsdinfo_uniq(pid).is_some_and(|i| i.p_uniqueid == birth) {
-        // SAFETY: the captured birth, live a moment ago.
+        // SAFETY: `pid` matches the captured birth.
         unsafe { libc::kill(pid, libc::SIGKILL) };
     }
 }
 
-/// When the process `info` records started.
 #[cfg(target_os = "macos")]
 fn born_at(info: &BsdInfoWithUniqId) -> std::time::SystemTime {
     std::time::UNIX_EPOCH
@@ -1772,9 +1568,6 @@ fn born_at(info: &BsdInfoWithUniqId) -> std::time::SystemTime {
         + Duration::from_micros(info.pbsd.pbi_start_tvusec)
 }
 
-/// An owned shell stand-in that leads its own session, as a tab's shell does,
-/// and one child of its own in that session: the custody, the shell's pid, and
-/// the child's pid and record.
 #[cfg(target_os = "macos")]
 fn session_shell(
     dir: &std::path::Path,
@@ -1804,10 +1597,6 @@ fn session_shell(
     (owned, shell_pid, child_pid, child)
 }
 
-/// An owned orphan launchd adopted, its launcher killed and reaped: the
-/// custody, its pid, and its record once adopted. Its launcher made a session
-/// of its own, younger than any shell stand-in made before it, as a daemon that
-/// left the run's session does.
 #[cfg(target_os = "macos")]
 fn adopted_orphan(
     dir: &std::path::Path,
@@ -1830,7 +1619,6 @@ fn adopted_orphan(
     let pid = waits.pid_in(&mark);
     let birth = bsdinfo_uniq(pid).expect("the orphan-to-be").p_uniqueid;
     owned.daemon = Some((pid, birth));
-    // Reaped here: once its orphan is gone too, its group is a zombie's alone.
     let mut launcher = owned.child.take().expect("the owned launcher");
     launcher.kill().expect("kill the launcher");
     launcher.wait().expect("reap the launcher");
@@ -1850,15 +1638,11 @@ fn adopted_orphan(
     (owned, pid, adopted)
 }
 
-/// [`escape_scan_among`] of `shell_pid` and `target` in `target`'s birth
-/// window; `target`'s first read is `record`, every other read the kernel's.
 #[cfg(target_os = "macos")]
 fn scan_with_first_read(shell_pid: i32, target: i32, record: BsdInfoWithUniqId) -> Scan {
     scan_with_first_read_since(shell_pid, None, target, record)
 }
 
-/// [`scan_with_first_read`] for a shell whose pid version at its spawn was
-/// `shell_version`.
 #[cfg(target_os = "macos")]
 fn scan_with_first_read_since(
     shell_pid: i32,
@@ -1895,14 +1679,7 @@ fn scan_with_first_read_since(
     )
 }
 
-/// A process the scan read in its window but that is gone by the time its
-/// session and environment are read (a busy host's, or the shell's own
-/// short-lived child) holds nothing and is no escape: a child of the shell
-/// whose session can no longer be read did not leave it, and an orphan whose
-/// environment can no longer be read is not the run's. The processes are real;
-/// the scan's first read of each is its real record from while it lived.
-/// NEGATIVE CONTROL: the same orphan alive is `Escaped`; with the presence
-/// check mutated out both gone processes read `Escaped`.
+/// Processes that exit before their session or environment is read do not count as escapes.
 #[cfg(target_os = "macos")]
 #[test]
 fn a_process_gone_since_its_read_is_no_escape() {
@@ -1929,11 +1706,6 @@ fn a_process_gone_since_its_read_is_no_escape() {
     );
 }
 
-/// [`escape_scan_with_owner`] of `shell_pid` over the first listing `listed`,
-/// in the window of `window`'s birth. A pid's first reads are its records in
-/// `first`, in order (`None`: unreadable), every later one the kernel's; a
-/// later listing is the kernel's, of `later` alone; `owner` answers the
-/// environment check (`None`: the production read).
 #[cfg(target_os = "macos")]
 fn scan_reads(
     shell_pid: i32,
@@ -1970,7 +1742,6 @@ fn scan_reads(
     )
 }
 
-/// A pid of ours, reaped: it reads as nothing and is in no later listing.
 #[cfg(target_os = "macos")]
 fn reaped_pid() -> i32 {
     let mut child = aterm_uds::spawnfd::command("/usr/bin/true")
@@ -1983,7 +1754,6 @@ fn reaped_pid() -> i32 {
     child.id() as i32
 }
 
-/// `info` as read with `pid`, parent `ppid` and unique id `uniqueid`.
 #[cfg(target_os = "macos")]
 fn record_as(info: &BsdInfoWithUniqId, pid: i32, ppid: i32, uniqueid: u64) -> BsdInfoWithUniqId {
     BsdInfoWithUniqId {
@@ -1997,25 +1767,7 @@ fn record_as(info: &BsdInfoWithUniqId, pid: i32, ppid: i32, uniqueid: u64) -> Bs
     }
 }
 
-/// A double fork caught mid-exit: its middle process (adopted, in the window)
-/// read alive, then exited before its session was read, and its daemon was read
-/// still naming it. That daemon is launchd's now, so the scan is incomplete,
-/// and the rescan reads it as the escape it is (before: neither was judged an
-/// escape, and the scan read `Clean`). The same with the middle's pid already
-/// another process's at its confirm read. But a middle process whose recorded
-/// children are gone too (a pipeline it waited for) orphaned nothing: `Clean`.
-/// A daemon read as nothing at that check, yet listed and no zombie, may live:
-/// `Unknown`. So may one below a gone child of the middle process (a triple
-/// fork whose two middles exited): `Unknown`. A live child in a session older
-/// than the shell is no process of the run (this test's own process, read as
-/// the middle's child): `Clean`. The daemon is real (adopted); the middle
-/// process is a real pid of ours, reaped (or, replaced, a live process of
-/// another birth), its first read the record it had alive. NEGATIVE CONTROL:
-/// with the stale-parent clause mutated out of either branch, its straddled
-/// scan reads `Clean`; counting a gone child, the pipeline's reads `Unknown`;
-/// with the unreadable-yet-listed arm mutated out the unread daemon's reads
-/// `Clean`, as the triple fork's does with the walk below a gone child; with
-/// older sessions counted, the stranger's reads `Unknown`.
+/// Double-fork daemons whose middle process exits mid-scan are re-read and caught.
 #[cfg(target_os = "macos")]
 #[test]
 fn a_daemon_read_under_a_parent_gone_since_its_read_is_read_again() {
@@ -2037,7 +1789,6 @@ fn a_daemon_read_under_a_parent_gone_since_its_read_is_read_again() {
         attempts += 1;
         scan(if attempts == 1 { &straddle } else { &[] })
     });
-    // The middle's pid read again as another process (the shell's child).
     let replaced_middle = record_as(&adopted, child_pid, 1, adopted.p_uniqueid - 1);
     let replaced = scan_reads(
         shell_pid,
@@ -2058,7 +1809,6 @@ fn a_daemon_read_under_a_parent_gone_since_its_read_is_read_again() {
         ],
         None,
     );
-    // The middle's only recorded child was reaped before it exited.
     let piped_pid = reaped_pid();
     let piped = record_as(&adopted, piped_pid, middle_pid, adopted.p_uniqueid + 1);
     let pipeline = scan_reads(
@@ -2069,13 +1819,11 @@ fn a_daemon_read_under_a_parent_gone_since_its_read_is_read_again() {
         &[(middle_pid, Some(middle)), (piped_pid, Some(piped))],
         None,
     );
-    // The daemon, read under the middle, unreadable when read again.
     let unread = scan(&[
         (daemon_pid, Some(stale)),
         (middle_pid, Some(middle)),
         (daemon_pid, None),
     ]);
-    // A triple fork: the middle's child exited too, the daemon read under it.
     let second_pid = reaped_pid();
     let second = record_as(&adopted, second_pid, middle_pid, adopted.p_uniqueid - 1);
     let first = record_as(&adopted, middle_pid, 1, adopted.p_uniqueid - 2);
@@ -2099,8 +1847,6 @@ fn a_daemon_read_under_a_parent_gone_since_its_read_is_read_again() {
         ],
         None,
     );
-    // The middle's live child is this process, in a session older than the
-    // shell's (its own, listed with it).
     let here = std::process::id() as i32;
     let me = bsdinfo_uniq(here).expect("this process's record");
     let stranger = scan_reads(
@@ -2134,17 +1880,7 @@ fn a_daemon_read_under_a_parent_gone_since_its_read_is_read_again() {
     );
 }
 
-/// A record naming a parent gone since the listing that is gone itself when
-/// read again (a parent and its last child exiting together, a busy host's
-/// churn) orphaned nothing when nothing recorded below it lives: the scan is
-/// whole. Measured: 240 runs of the live spare module beside three more loops
-/// of it (load 130-246) failed 15 of 3600 tests on an `Inconclusive` visible
-/// run (the gate left learning) or a verification's `scan-unknown`, and each
-/// of their scans read `Unknown` on such stale records alone; with this rule,
-/// 720 more runs failed none that way. One with a live process recorded
-/// below it still leaves the scan `Unknown`. The parent and the child
-/// are real pids of ours, reaped; the live process below is a real orphan.
-/// NEGATIVE CONTROL: on the code before, the lone child's scan read `Unknown`.
+/// A child that exits together with its gone parent and leaves no live descendants is clean.
 #[cfg(target_os = "macos")]
 #[test]
 fn a_child_gone_with_its_gone_parent_is_no_stale_record() {
@@ -2194,12 +1930,7 @@ fn a_child_gone_with_its_gone_parent_is_no_stale_record() {
     );
 }
 
-/// The same straddle where the middle process left the shell's session and
-/// passed its confirm read, but its environment could not be read and it was
-/// gone at the read after: its daemon, read naming it, is launchd's. The
-/// middle is a live process of ours (another adopted orphan) read as nothing at
-/// its third read and in no later listing. NEGATIVE CONTROL: with the
-/// stale-parent clause mutated out of that branch, the scan reads `Clean`.
+/// A daemon whose parent disappears before its environment read triggers a rescan.
 #[cfg(target_os = "macos")]
 #[test]
 fn a_daemon_under_a_parent_gone_at_its_environment_read_is_read_again() {
@@ -2249,15 +1980,7 @@ fn a_daemon_under_a_parent_gone_at_its_environment_read_is_read_again() {
     assert_eq!(verdict, Scan::Unknown, "the daemon read stale");
 }
 
-/// The shell's child, in its session, read under a parent that has exited by
-/// its confirm read (one the startup files left running before the run's
-/// window, `( daemon & )`): the same process under another parent now is
-/// launchd's, adopted in the shell's session, and the scan is incomplete. And
-/// the straddle with the middle the shell's own: its child read naming it, in
-/// the shell's session, is launchd's too. The child is real; each parent is a
-/// reaped pid read as it lived. NEGATIVE CONTROL: with the changed-parent
-/// clause mutated out, the first reads `Clean`. (The second needs either
-/// clause: with the stale-parent one mutated out it still reads `Unknown`.)
+/// A shell child whose parent exits before confirmation is treated as an incomplete scan.
 #[cfg(target_os = "macos")]
 #[test]
 fn a_child_of_the_shell_under_a_parent_gone_since_its_read_is_read_again() {
@@ -2295,24 +2018,7 @@ fn a_child_of_the_shell_under_a_parent_gone_since_its_read_is_read_again() {
     assert_eq!(read_whole, Scan::Clean, "the control: the child as it is");
 }
 
-/// A daemon whose line to the shell runs through a live process of another
-/// user (a set-user-id program still running, as `sudo` is: not in this uid's
-/// listing) is still the shell's, and out of its session it escaped. Below one
-/// launchd adopted that is the run's (`sudo -b`) it is an orphan of the run
-/// too. Below one launchd itself started (a daemon of root's, at boot), or one
-/// born before the shell (an orphan of ours made before it), it is no orphan
-/// of the run: the hop is judged by the clause a direct orphan is, whose
-/// launcher half `a_process_launchd_started_is_no_orphan` pins. Below one that
-/// cannot be read (gone) the line ends, as before.
-/// The daemon is real (its own session); its first read names as parent the
-/// shell's own child or another adopted orphan of ours, each left out of the
-/// listing as another user's would be, a real daemon of root's, or a reaped
-/// pid, and so does its confirm read (a daemon under a live parent keeps it).
-/// NEGATIVE CONTROL: with the walk through other users' processes mutated
-/// out, the first reads `Clean`; with the adopted-hop clause mutated out, the
-/// second does; with that clause dropped from the hop (counted whatever its
-/// birth or launcher), the third reads `Escaped`; with its birth half mutated
-/// out, the fourth does.
+/// The escape scan traces ancestry through processes owned by other users.
 #[cfg(target_os = "macos")]
 #[test]
 fn a_daemon_below_another_users_process_is_still_the_shells() {
@@ -2326,7 +2032,6 @@ fn a_daemon_below_another_users_process_is_still_the_shells() {
     let hop_dir = dir.path().join("hop");
     std::fs::create_dir(&hop_dir).expect("the hop's folder");
     let (mut owned_hop, hop_pid, _) = adopted_orphan(&hop_dir, &waits);
-    // Read as below `parent` at its first read and at its confirm read.
     let below = |parent: i32| {
         let record = Some(record_as(&adopted, daemon_pid, parent, adopted.p_uniqueid));
         let ours = [shell_pid, daemon_pid];
@@ -2372,12 +2077,7 @@ fn a_daemon_below_another_users_process_is_still_the_shells() {
     assert_eq!(unread, Scan::Clean, "below a parent gone: the line ends");
 }
 
-/// A scan lists only once the window it judges has ended (the mark plus the
-/// grace), as a sample is due, so a verification at its hold waits; and a
-/// sample's runs at most once per [`SCAN_EVERY`]. NEGATIVE CONTROL: without the
-/// wait (before, a verification listed as soon as the rate limit let it), the
-/// first scan lists at the mark, before a daemon the startup files fork in the
-/// grace.
+/// Escape scans wait until the grace window ends and rate-limit sample scans.
 #[test]
 fn a_scan_lists_after_its_window() {
     let mark = Instant::now();
@@ -2398,15 +2098,7 @@ fn a_scan_lists_after_its_window() {
     assert_eq!((second, again), (Scan::RateLimited, false), "rate-limited");
 }
 
-/// A verification's scan is not spaced from the scan before it (a sample's,
-/// or the last spare's): its spare, and the thread that forks the next one,
-/// wait on it. Its job reaches the scan (the
-/// generation it was booked for, a clean posture), the last scan a moment ago
-/// (a stamp ahead of now is inside any spacing); pid 42 is a boot-time
-/// process, none of ours on a host whose tests run as a person, but whatever
-/// the scan reads of it, the verdict is the scan's. NEGATIVE CONTROLS: with the verification waiting
-/// out the spacing again, its verdict never comes (the hang detector); with its
-/// scan spaced, it is rate-limited and the earlier scan stays the last.
+/// Warm verification scans are not rate-limited by prior scans.
 #[test]
 fn a_verification_is_not_spaced_from_the_scan_before_it() {
     let dir = aterm_tempfile::tempdir().expect("tempdir");
@@ -2459,14 +2151,7 @@ fn a_verification_is_not_spaced_from_the_scan_before_it() {
     );
 }
 
-/// A process launchd itself started in the run's window (a Spotlight worker
-/// indexing a busy host's files: measured, 16 `mdworker_shared` in a minute
-/// here, and the escape most runs under load were failed on) was never the
-/// run's orphan, while an orphan launchd adopted still names its own
-/// launcher as its original parent. The orphan is real; the scan's first read
-/// of it is its record with launchd as its original parent. NEGATIVE CONTROL:
-/// its real record reads `Escaped`; with the original-parent check mutated out
-/// so does the launchd-started one.
+/// Processes started directly by `launchd` are not counted as run orphans.
 #[cfg(target_os = "macos")]
 #[test]
 fn a_process_launchd_started_is_no_orphan() {
@@ -2499,15 +2184,7 @@ fn a_process_launchd_started_is_no_orphan() {
     );
 }
 
-/// An orphan whose launcher took its pid version before the shell did is none
-/// of the run's: another terminal's tab, left to launchd as that terminal quit
-/// while this run's startup files ran (one such orphan every 50 ms failed live
-/// L4 five times in five: every boot run read `Unclean`). One the shell or a later
-/// process launched is still an escape, and so is any orphan when the shell's
-/// version at its spawn is unknown. The orphan is real (its launcher younger
-/// than the shell); the older launcher is its record with an older original
-/// parent. NEGATIVE CONTROL: without the launcher-version clause the older
-/// launcher's orphan reads `Escaped`.
+/// Orphans whose launcher predates the shell pid version are not counted as escapes.
 #[cfg(target_os = "macos")]
 #[test]
 fn an_orphan_whose_launcher_predates_the_shell_is_no_escape() {
@@ -2555,10 +2232,6 @@ fn an_orphan_whose_launcher_predates_the_shell_is_no_escape() {
     assert!(!launched_before(i32::MIN, i32::MAX));
 }
 
-/// An owned session of its own, as a busy host's shell leads one: its leader
-/// waits for `go`, then leaves one background job's process to launchd and
-/// lives on (in the same process group, so its custody's group kill reaches
-/// the orphan too).
 #[cfg(target_os = "macos")]
 struct ForeignSession {
     owned: OwnedEscapeFixture,
@@ -2598,8 +2271,6 @@ impl ForeignSession {
         }
     }
 
-    /// Release the leader's background job: the orphan's pid and its record
-    /// once launchd adopted it.
     fn orphan(&mut self, waits: &FixtureWaits) -> (i32, BsdInfoWithUniqId) {
         std::fs::write(&self.go, b"go\n").expect("release the leader");
         let pid = waits.pid_in(&self.mark);
@@ -2621,23 +2292,7 @@ impl ForeignSession {
     }
 }
 
-/// An orphan launchd adopted in the run's window from a session with a live
-/// member born before the shell (a busy host's background job: measured, one
-/// such orphan every 50 ms failed every gate test's boot run, 3 of 3 runs) is
-/// not the run's. The run's processes are in the shell's session or one the
-/// run made, and a session is entered only by birth from a member, so no
-/// process older than the shell is in either. Nor is an orphan of a session
-/// made after the shell whose leader lives under a process born before it
-/// (another tab's: measured, a parallel instance's `( { sleep 8; } & )` failed
-/// an_unclean_rc_never_opens_the_gate's boot run 2 of 180 times under load):
-/// the run's own `setsid` leader is under the shell, or launchd's once its
-/// parent is gone. The processes are real.
-/// NEGATIVE CONTROL: the older session's orphan read with its older member left
-/// out of the scan's records is `Escaped`; the younger session's orphan is
-/// `Escaped` with its leader's parent unread, with its leader read as adopted by
-/// launchd (the run's daemon whose launcher exited), and with that parent read
-/// as born after the leader (a reused pid). With either rule mutated out, its
-/// clean case is `Escaped` too.
+/// Orphans from sessions or leaders predating the shell are not counted as escapes.
 #[cfg(target_os = "macos")]
 #[test]
 fn an_orphan_of_a_session_older_than_the_shell_is_no_escape() {
@@ -2687,7 +2342,6 @@ fn an_orphan_of_a_session_older_than_the_shell_is_no_escape() {
             })
         },
     );
-    // This process's own parent is listed, so only the birth order ends the walk.
     // SAFETY: `getppid` reads this process's parent.
     let my_parent = unsafe { libc::getppid() };
     let parent_reused = scan_reading(
@@ -2757,42 +2411,26 @@ fn an_orphan_of_a_session_older_than_the_shell_is_no_escape() {
     );
 }
 
-/// `<sys/proc_info.h>`: `pbi_flags` says the process has exec'd (`P_EXEC`).
 #[cfg(target_os = "macos")]
 const PROC_FLAG_EXEC: u32 = 0x4000;
 
-/// When a [`TerminalSession`]'s orphan execs its `sleep`.
 #[cfg(target_os = "macos")]
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum OrphanExec {
-    /// At once, while the terminal still has its leader: it keeps
-    /// `P_CONTROLT`.
     WhileLed,
-    /// Only once [`TerminalSession::exec_now`] says so, after
-    /// [`TerminalSession::end_leader`]: as the `$(...)` child of a tab's zsh
-    /// whose tab closed before its exec. It loses `P_CONTROLT`.
     AfterLeader,
 }
 
-/// Another terminal's session, owned: its leader leads a fresh PTY, as a
-/// tab's shell does, and leaves one background process to launchd at once (a
-/// double fork), which ignores the hangup and so lives on through its leader's
-/// exit. The leader is this process's child, killed and reaped by
-/// [`Self::end_leader`] or at drop; the orphan is retired by its birth. Its
-/// programs are the fixtures' stand-ins, naming [`FIXTURE_SID`].
 #[cfg(target_os = "macos")]
 struct TerminalSession {
     leader: Option<i32>,
     master: i32,
     orphan: OwnedEscapeFixture,
-    /// The FIFO an [`OrphanExec::AfterLeader`] orphan reads its go from.
     go: std::path::PathBuf,
 }
 
 #[cfg(target_os = "macos")]
 impl TerminalSession {
-    /// The session, and its orphan's pid and record once launchd adopted it
-    /// (and, [`OrphanExec::WhileLed`], once it exec'd).
     fn new(
         dir: &std::path::Path,
         waits: &FixtureWaits,
@@ -2822,7 +2460,7 @@ impl TerminalSession {
             mark.clone().into_os_string(),
             go.clone().into_os_string(),
         ];
-        // SAFETY: a test process; the trusted-launcher contract trivially holds.
+        // SAFETY: test process; the trusted-launcher contract holds.
         let authority = unsafe { aterm_cap::Authority::root_authority() };
         let spawn_cap = authority.grant::<aterm_cap::effects::Spawn>(aterm_cap::Tier::Trusted);
         let sandbox_cap = authority.grant::<aterm_sandbox::Sandbox>(aterm_cap::Tier::Trusted);
@@ -2857,11 +2495,6 @@ impl TerminalSession {
         let pid = waits.pid_in(&mark);
         let birth = bsdinfo_uniq(pid).expect("the orphan-to-be").p_uniqueid;
         session.orphan.daemon = Some((pid, birth));
-        // Adopted, and (`WhileLed`) its `sleep` exec'd while the terminal
-        // still has its leader: an exec after the leader's exit drops
-        // `P_CONTROLT` (measured on Darwin 27: 0 of 30 such orphans kept it,
-        // 30 of 30 that exec'd before), and the forked shell can be adopted
-        // before it execs.
         let adopted = session.orphan_once(waits, |info| {
             info.pbsd.pbi_ppid == 1
                 && (exec == OrphanExec::AfterLeader || info.pbsd.pbi_flags & PROC_FLAG_EXEC != 0)
@@ -2869,7 +2502,6 @@ impl TerminalSession {
         (session, pid, adopted)
     }
 
-    /// The orphan's record once `holds` of it, under the hang detector.
     fn orphan_once(
         &self,
         waits: &FixtureWaits,
@@ -2891,15 +2523,9 @@ impl TerminalSession {
         }
     }
 
-    /// An [`OrphanExec::AfterLeader`] orphan's go: it execs its `sleep` now.
-    /// Its record once it has.
     fn exec_now(&self, waits: &FixtureWaits) -> BsdInfoWithUniqId {
         use std::io::Write as _;
         use std::os::unix::fs::OpenOptionsExt as _;
-        // The orphan waits in its open of the read end from its birth, and a
-        // reader waiting there counts: a non-blocking open for writing then
-        // succeeds, where it fails `ENXIO` with no reader. A blocking open
-        // would wait for ever on an orphan that died; this is a hang detector.
         let mut go = loop {
             match std::fs::OpenOptions::new()
                 .write(true)
@@ -2921,13 +2547,12 @@ impl TerminalSession {
         self.orphan_once(waits, |info| info.pbsd.pbi_flags & PROC_FLAG_EXEC != 0)
     }
 
-    /// Kill and reap the leader: its session outlives it in its orphan.
     fn end_leader(&mut self) {
         if let Some(leader) = self.leader.take() {
-            // SAFETY: this process's own unreaped child, so the pid is still it.
+            // SAFETY: this process's own unreaped child.
             unsafe { libc::kill(leader, libc::SIGKILL) };
             let mut status = 0;
-            // SAFETY: reaps exactly that child.
+            // SAFETY: reaps `leader`.
             let reaped = unsafe { libc::waitpid(leader, &mut status, 0) };
             assert_eq!(reaped, leader, "reap the terminal's leader");
         }
@@ -2942,25 +2567,7 @@ impl Drop for TerminalSession {
     }
 }
 
-/// An orphan born on another terminal, outside the shell's session, whose
-/// leader is not shown to be the run's, is none of the run's: as the child an
-/// interactive zsh forks for a startup file's `$(...)` (`/etc/zshrc`'s
-/// `locale LC_CTYPE`) is when that zsh's tab closes mid-startup and launchd
-/// holds the child for its last moment. Measured: the live gate tests read a
-/// visible run `Unclean` under load with no unclean-run line; with the escape
-/// named in the log, 240 runs of the live spare module beside three more
-/// loops of it (load 60-150) read one, in L3: a `zsh` with the terminal flag
-/// (`0x1400090`), adopted in the session of a leader gone and unlisted. The
-/// run's own processes leave its session only by `setsid`, which drops the
-/// terminal for good. The processes are real; the orphan ignores the hangup,
-/// so it holds still in the state the scan read that `zsh` in, and the
-/// environment's answer is Darwin 27's for a platform binary (withheld, so
-/// counted against the run).
-/// NEGATIVE CONTROL: the same orphan read without its terminal flag and with
-/// its stdio live (the run's `setsid` daemon whose launcher exited, on the
-/// shell's terminal) is `Escaped`, and so is the orphan
-/// while its live leader is read as under the shell (a terminal the run
-/// opened). On the code before, the gone leader's orphan read `Escaped`.
+/// Orphans retaining a controlling terminal from a foreign session are not counted as escapes.
 #[cfg(target_os = "macos")]
 #[test]
 fn an_orphan_born_on_another_terminal_is_no_escape() {
@@ -3003,8 +2610,6 @@ fn an_orphan_born_on_another_terminal_is_no_escape() {
     // SAFETY: `getsid` reads the process table.
     let sessions = unsafe { (libc::getsid(orphan), libc::getsid(leader)) };
     let leader_gone = scan(&[shell_pid, orphan], &bsdinfo_uniq);
-    // The run's `setsid` daemon holds the shell's terminal, live while the
-    // shell lives.
     let born_on_none = scan_with(
         &[shell_pid, orphan],
         &|p| {
@@ -3053,13 +2658,7 @@ fn an_orphan_born_on_another_terminal_is_no_escape() {
     );
 }
 
-/// A dead standard vnode does not prove an orphan's terminal origin. The
-/// real orphan here exec'd after its terminal's leader left and lost
-/// `P_CONTROLT`; its stdio answers dead. But a run-owned orphan with stdio on
-/// a force-unmounted ordinary file has the same observation. Without the
-/// terminal flag or a proven outside leader line, dead/live/unread stdio
-/// cannot overrule the ownership answer. The scan remains conservative.
-/// This fixture observes a revoked PTY, not an actual force-unmount.
+/// Dead stdio without a controlling terminal or foreign leader does not clear an orphan.
 #[cfg(target_os = "macos")]
 #[test]
 fn a_dead_stdio_orphan_is_not_cleared_without_terminal_origin() {
@@ -3133,10 +2732,7 @@ fn a_dead_stdio_orphan_is_not_cleared_without_terminal_origin() {
     assert_eq!(unread, Scan::Escaped, "the same orphan, its stdio unread");
 }
 
-/// A late missing identity is not proof that a listed process disappeared.
-/// The BSD records and ownership answers are modeled observations; only the
-/// candidate pid is this test's own process, so the scan's session/table reads
-/// never require a stand-in child, and no signal or cleanup authority is used.
+/// A missing process identity during late confirmation keeps the scan `Unknown`.
 #[cfg(target_os = "macos")]
 #[test]
 fn a_late_unreadable_escape_identity_keeps_the_scan_unknown() {
@@ -3193,8 +2789,6 @@ fn a_late_unreadable_escape_identity_keeps_the_scan_unknown() {
             stdio_dead,
         )
     };
-    // Ordinary ownership, foreign environment, known replacement and a
-    // complete later absence are controls before either uncertainty witness.
     assert_eq!(scan(0, false, Some(true), Some(true)), Scan::Escaped);
     assert_eq!(scan(0, false, Some(false), Some(true)), Scan::Clean);
     assert_eq!(scan(0, false, None, Some(true)), Scan::Escaped);
@@ -3214,8 +2808,6 @@ fn a_late_unreadable_escape_identity_keeps_the_scan_unknown() {
     );
 }
 
-/// The original unreaped Child owns this process group until its wait. The
-/// orphan's separate custody names one captured birth, never a host-wide name.
 #[cfg(target_os = "macos")]
 struct OwnedEscapeFixture {
     child: Option<aterm_uds::spawnfd::Child>,
@@ -3229,7 +2821,7 @@ impl OwnedEscapeFixture {
         if let Some((pid, birth)) = self.daemon
             && bsdinfo_uniq(pid).is_some_and(|info| info.p_uniqueid == birth)
         {
-            // SAFETY: exactly the fixture's captured process birth.
+            // SAFETY: `pid` matches the fixture's captured process birth.
             if unsafe { libc::kill(pid, libc::SIGKILL) } != 0 {
                 let error = std::io::Error::last_os_error();
                 if error.raw_os_error() != Some(libc::ESRCH) {
@@ -3238,8 +2830,7 @@ impl OwnedEscapeFixture {
             }
         }
         if let Some(child) = self.child.as_mut() {
-            // SAFETY: this unreaped Child still owns its freshly created group;
-            // no other Child/try_wait can reap it or let its group id be reused.
+            // SAFETY: `child` is unreaped and still owns its process group.
             if unsafe { libc::killpg(child.id() as i32, libc::SIGKILL) } != 0 {
                 let error = std::io::Error::last_os_error();
                 if error.raw_os_error() != Some(libc::ESRCH) {
@@ -3255,8 +2846,6 @@ impl OwnedEscapeFixture {
             loop {
                 match child.try_wait() {
                     Ok(Some(_)) => {
-                        // The exact Child reached EOF and is reaped. Only now
-                        // release its custody; a failed wait leaves it in self.
                         self.child.take();
                         break;
                     }
@@ -3291,11 +2880,7 @@ impl Drop for OwnedEscapeFixture {
     }
 }
 
-/// U13: an update's apply retires the spare first (it is in no manifest), and
-/// a spare's own life — its spawn landing, its parked note — never counts as
-/// activity that would hold an update off. Negative control: the slot is
-/// still there before the apply.
-// A PARKED hold is a zsh/bash wrapper's, on macOS and Linux (`has_parked_hold`).
+/// Applying an update retires the spare, and spare lifecycle events do not count as user activity.
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 #[test]
 fn an_update_retires_the_spare_and_a_spare_is_never_activity() {
@@ -3303,7 +2888,6 @@ fn an_update_retires_the_spare_and_a_spare_is_never_activity() {
     let id = 50;
     let mut slot = parked_slot(&app, id, None);
     slot.state = SlotState::Booked;
-    // A parked shell's spare, whatever the host's own login shell is.
     slot.inputs.shell = aterm_core::shell_integration::ShellType::Zsh;
     let link = Arc::clone(&slot.link);
     slot.session = None;
@@ -3334,11 +2918,7 @@ fn an_update_retires_the_spare_and_a_spare_is_never_activity() {
     assert!(app.spares.swallows(id), "and its late wakes swallowed");
 }
 
-/// A promotion writes `run` only on a stamp of the rc generation taken after
-/// it asked (`Job::Freshen`, answered on the `aterm-spare` thread): a mirror
-/// that still says eligible for a generation an edit has since moved never
-/// runs the edited startup files unseen. Negative control: without the
-/// freshen, the first look writes `run` on the stale mirror.
+/// Promotion to warm requires a fresh `Job::Freshen` stamp of the rc generation.
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 #[test]
 fn a_promotion_runs_only_on_a_fresh_stamp_of_the_gate() {
@@ -3360,7 +2940,6 @@ fn a_promotion_runs_only_on_a_fresh_stamp_of_the_gate() {
     let shared = Arc::clone(&app.spares.shared);
     shared.generation.store(7, Ordering::Release);
     shared.eligible.store(true, Ordering::Release);
-    // What the shell at its hold would read, without blocking.
     let mut shell_end = std::fs::OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NONBLOCK)
@@ -3384,24 +2963,19 @@ fn a_promotion_runs_only_on_a_fresh_stamp_of_the_gate() {
     let state = |app: &App| app.spares.slot.as_ref().map(|s| s.state);
     let at = Instant::now() + Duration::from_secs(3_600);
 
-    // The first look asks for a stamp and writes nothing.
     app.spare_promote(at);
     let n = asked(&app).expect("a freshen asked");
     assert_eq!(state(&app), Some(SlotState::Parked));
     assert_eq!(read(), "", "no `run` before a fresh stamp");
-    // Asked and unanswered: the next look asks nothing more, writes nothing.
     app.spare_promote(at);
     assert_eq!(asked(&app), Some(n));
     assert_eq!(read(), "");
-    // The stamp finds a startup file edited: a new generation, its gate shut.
     shared.generation.store(8, Ordering::Release);
     shared.eligible.store(false, Ordering::Release);
     shared.fresh.store(n, Ordering::Release);
     app.spare_promote(at);
     assert_eq!(state(&app), Some(SlotState::Parked));
     assert_eq!(read(), "", "the edited generation never runs unseen");
-    // Its gate opens later: the old answer is stale, a new one is asked, and
-    // only its answer runs the spare, for the new generation.
     shared.eligible.store(true, Ordering::Release);
     let later = at + FRESH_FOR;
     app.spare_promote(later);
@@ -3415,11 +2989,7 @@ fn a_promotion_runs_only_on_a_fresh_stamp_of_the_gate() {
     assert_eq!(read(), "run\n");
 }
 
-/// A spawned spare that has not said it is parked [`PARKED_DEADLINE`] after
-/// its spawn landed ran past the wrapper's hold, its rc possibly running
-/// unasked: it is retired `no_park` and spares stay off for its script set
-/// and shell. Negative control: one a millisecond younger is kept, its tick
-/// armed for the deadline. On the injected clock, so no load moves either age.
+/// A spawned spare that misses `PARKED_DEADLINE` is retired and disables parked spares for that shell.
 #[test]
 fn a_spawned_spare_unparked_at_its_deadline_is_retired_and_a_younger_one_kept() {
     let mut app = App::headless_for_test();
@@ -3452,12 +3022,7 @@ fn a_spawned_spare_unparked_at_its_deadline_is_retired_and_a_younger_one_kept() 
     assert_eq!(app.spares.discards, vec![("no_park", 1)]);
 }
 
-/// A start record the reader saw before the spawn's completion landed (its
-/// note found the slot still Booked): the shell ran past its parked hold, so
-/// the spare goes and spares stay off for this script set and shell, exactly
-/// as for a record seen once it is Parked. Negative control: the note alone,
-/// while Booked, changes nothing.
-// A PARKED hold is a zsh/bash wrapper's, on macOS and Linux (`has_parked_hold`).
+/// A start record arriving while `Booked` retires a parked-capable spare.
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 #[test]
 fn a_start_record_before_the_spawn_lands_retires_the_spare() {
@@ -3466,7 +3031,6 @@ fn a_start_record_before_the_spawn_lands_retires_the_spare() {
     let mut slot = parked_slot(&app, id, None);
     slot.state = SlotState::Booked;
     slot.session = None;
-    // A parked shell's spare, whatever the host's own login shell is.
     slot.inputs.shell = aterm_core::shell_integration::ShellType::Zsh;
     let link = Arc::clone(&slot.link);
     let key = parked_key(&slot.inputs);
@@ -3489,14 +3053,7 @@ fn a_start_record_before_the_spawn_lands_retires_the_spare() {
     assert!(app.spares.swallows(id));
 }
 
-/// A fish spare (no PARKED hold) lands Warming, its startup files running from
-/// the spawn: its start record, even one seen before the spawn's completion
-/// landed, is judged as on arrival — a `spare` record sends it to Verifying,
-/// and nothing is held against the script set — and the escape scan it asks
-/// for covers the run from the booking, ahead of the fork, never from the
-/// completion (a window opened there missed what the startup files forked
-/// before the main loop read it). The same record from a parked shell is the
-/// negative control: it ran past its hold, and spares go off.
+/// A fish spare lands in `Warming` and verifies from its booking timestamp.
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 #[test]
 fn a_fish_spare_lands_warming_and_judges_an_early_start_record() {
@@ -3510,7 +3067,6 @@ fn a_fish_spare_lands_warming_and_judges_an_early_start_record() {
         slot.state = SlotState::Booked;
         slot.session = None;
         slot.inputs.shell = shell;
-        // Booked (and so forked) a while before its completion lands.
         let booked = Instant::now() - Duration::from_millis(250);
         slot.booked = booked;
         slot.since = booked;
@@ -3547,20 +3103,12 @@ fn a_fish_spare_lands_warming_and_judges_an_early_start_record() {
     }
 }
 
-/// A write that lands in a spare's input queue before its adoption (an rc's
-/// query, answered by its reader) fires the input watch into the swallowing
-/// post; the watch fires once per episode until its probe re-arms it, so the
-/// adoption re-arms it (and wakes it for the byte still unread), and the
-/// adopted tab's next write wakes the loop as a cold tab's does. Negative
-/// control: without the adoption, the next write wakes nothing. macOS only:
-/// the input watch is armed only where its probe reads a tty's queue
-/// (`input_stall::watch_input`).
+/// Adopting a spare re-arms the PTY input watch.
 #[cfg(target_os = "macos")]
 #[test]
 fn an_adopted_spares_input_watch_is_armed_again() {
     let wid = WindowId(0);
     let mut app = App::headless_for_test();
-    // The id the stub tab below is installed under.
     let id = app.next_session_id;
     let (master, slave) = crate::input_stall::tests::raw_pty_pair();
     let sink = Arc::new(aterm_session::sink::SinkWriter::new(master));
@@ -3576,12 +3124,10 @@ fn an_adopted_spares_input_watch_is_armed_again() {
             .filter(|w| w.starts_with("InputWatch"))
             .count()
     };
-    // Nobody's yet: the query reply fires the watch, and the post swallows it.
     sink.write_frame_nonparking(b"\x1b[?1;2c").expect("reply");
     assert_eq!(watches(), 0, "swallowed while it is nobody's");
     sink.write_frame_nonparking(b"x").expect("a second write");
     assert_eq!(watches(), 0, "fired once: the watch waits for a re-arm");
-    // Adopted: the session lands and goes live.
     let mut session = crate::stub_session_with_sink(id, Arc::clone(&sink));
     Arc::get_mut(&mut session.ctx).expect("one ctx").witness = Arc::clone(&link.witness);
     app.push_stub_tab(wid, session);
@@ -3603,17 +3149,13 @@ fn an_adopted_spares_input_watch_is_armed_again() {
         1,
         "re-armed and woken for the bytes still unread"
     );
-    // SAFETY: both ends are this test's, opened by `raw_pty_pair`.
+    // SAFETY: both fds belong to this test's `raw_pty_pair`.
     unsafe {
         libc::close(slave);
     }
 }
 
-/// The rc generation (design §7.1) moves with what a shell's start reads — a
-/// startup file, a `shell.d` hook edited in place (its folder's mtime does
-/// not move) or added, the rc folder a `.zshenv` points `ZDOTDIR` at — and
-/// not with the history file, which the release re-reads instead. Negative
-/// control: an untouched tree stamps the same twice.
+/// `rc_generation` changes with startup files and hooks, and ignores history files.
 #[test]
 fn the_rc_generation_moves_with_startup_files_and_hooks_not_history() {
     let home = aterm_tempfile::tempdir().expect("tempdir");
@@ -3636,14 +3178,12 @@ fn the_rc_generation_moves_with_startup_files_and_hooks_not_history() {
         g0,
         "an untouched tree"
     );
-    // The history file is not a startup file.
     std::fs::write(h.join(".zsh_history"), ": 1:0;ls\n").unwrap();
     assert_eq!(
         rc_generation(&inputs, &Reported::default()),
         g0,
         "history moves nothing"
     );
-    // A hook edited in place: a longer line, its folder's mtime unmoved.
     let dir_mtime = std::fs::metadata(&hooks).unwrap().modified().unwrap();
     std::fs::write(hooks.join("path.zsh"), "export PATH=/a:/b:$PATH\n").unwrap();
     assert_eq!(
@@ -3653,11 +3193,9 @@ fn the_rc_generation_moves_with_startup_files_and_hooks_not_history() {
     );
     let g1 = rc_generation(&inputs, &Reported::default());
     assert_ne!(g1, g0, "a hook edited in place moves it");
-    // A hook added.
     std::fs::write(hooks.join("more.zsh"), "alias l=ls\n").unwrap();
     let g2 = rc_generation(&inputs, &Reported::default());
     assert_ne!(g2, g1, "a hook added moves it");
-    // A `.zshenv` that points ZDOTDIR elsewhere: that folder's files count.
     let z = h.join("zdot");
     std::fs::create_dir_all(&z).unwrap();
     std::fs::write(z.join(".zshrc"), "PS1='% '\n").unwrap();
@@ -3675,14 +3213,7 @@ fn the_rc_generation_moves_with_startup_files_and_hooks_not_history() {
     );
 }
 
-/// A fish generation (R7) stamps the folders its start record names: the
-/// user's (`$__fish_config_dir`), the sysconf one and every vendor conf.d one,
-/// an inherited `$XDG_DATA_DIRS` entry's included. A file added to a vendor
-/// conf.d or the sysconf conf.d, a sysconf `config.fish` written, an entry
-/// edited in place: each moves it, so a spare warmed before is stale. Controls:
-/// an untouched tree stamps the same twice, a folder no record named (the
-/// binary prefix's vendor conf.d, the old guess) moves nothing, and a
-/// generation with no roots named is not the one with them.
+/// Fish `rc_generation` stamps the startup roots reported by the start mark.
 #[test]
 fn a_fish_generation_stamps_the_startup_roots_its_record_names() {
     let root = aterm_tempfile::tempdir().expect("tempdir");
@@ -3764,11 +3295,7 @@ fn a_fish_generation_stamps_the_startup_roots_its_record_names() {
     moved("a default.theme added to the user's themes folder");
 }
 
-/// A fish run teaches its generation only when its start record named the
-/// startup roots the generation stamps (R7): with none, what a spare would
-/// run unseen is unknown, and the run is unclean before any process scan.
-/// Controls: the same fish record naming its roots, and a zsh record (which
-/// names none), both go on as far as the injected scan limit.
+/// A fish visible run without reported startup roots is marked unclean.
 #[test]
 fn a_fish_run_whose_record_names_no_roots_teaches_nothing_clean() {
     use aterm_core::shell_integration::ShellType;
@@ -3803,7 +3330,6 @@ fn a_fish_run_whose_record_names_no_roots_teaches_nothing_clean() {
         seen.input = Some(input);
         seen.fg_pgrp = 42;
         seen.image = Some(PathBuf::from("/owned/shell"));
-        // The future stamp withholds the scan (as above): no latency assertion.
         judge(&obs, &seen, &mut Some(now + Duration::from_secs(3600)))
     };
     assert_eq!(judged(ShellType::Fish, None), Sample::Unclean);
@@ -3814,10 +3340,7 @@ fn a_fish_run_whose_record_names_no_roots_teaches_nothing_clean() {
     assert_eq!(judged(ShellType::Zsh, None), Sample::Inconclusive);
 }
 
-/// A fish spare ran the startup files of the roots its own record names; its
-/// generation holds only if it was stamped over those: a record naming other
-/// roots, or none, backs off as `roots`. Control: the same roots go on to the
-/// generation guard (`stale` here, its booked generation being 0).
+/// Warm fish verification rejects start marks whose roots differ from the stamped generation.
 #[test]
 fn a_fish_spare_holds_only_for_the_roots_its_generation_stamped() {
     use aterm_core::shell_integration::ShellType;
@@ -3872,7 +3395,7 @@ fn a_fish_spare_holds_only_for_the_roots_its_generation_stamped() {
     assert_eq!(verdict(ShellType::Zsh, None), Verdict::Backoff("stale"));
 }
 
-/// Corrupt disk state cannot partially authorize running startup files unseen.
+/// Malformed gate snapshots are rejected.
 #[test]
 fn a_malformed_gate_snapshot_cannot_keep_an_eligible_record() {
     let dir = aterm_tempfile::tempdir().expect("tempdir");
@@ -3899,7 +3422,7 @@ fn a_malformed_gate_snapshot_cannot_keep_an_eligible_record() {
     }
 }
 
-/// A valid prefix in an oversized file is not a valid persisted gate snapshot.
+/// Oversized gate snapshots are rejected.
 #[test]
 fn an_oversized_gate_snapshot_cannot_authorize_warm_startup() {
     let dir = aterm_tempfile::tempdir().expect("tempdir");
@@ -3919,7 +3442,7 @@ fn an_oversized_gate_snapshot_cannot_authorize_warm_startup() {
     assert!(!allowed, "oversized disk state authorized warm startup");
 }
 
-/// A stale staging entry is private data, not permission to truncate or remove it.
+/// Gate persistence refuses to overwrite an existing staging file.
 #[test]
 fn persisting_a_gate_never_overwrites_an_existing_staging_entry() {
     let dir = aterm_tempfile::tempdir().expect("tempdir");
@@ -3946,7 +3469,7 @@ fn persisting_a_gate_never_overwrites_an_existing_staging_entry() {
     );
 }
 
-/// A kernel read that cannot identify the shell proves no clean process scan.
+/// An unreadable shell process record makes the escape scan `Unknown`.
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 #[test]
 fn an_unreadable_shell_is_not_a_clean_escape_scan() {
@@ -3963,10 +3486,6 @@ fn an_unreadable_shell_is_not_a_clean_escape_scan() {
     );
 }
 
-// ─── The Linux escape scan (R6) ───
-
-/// A `/proc` table a test writes: each pid's record as a function of how many
-/// settling pauses have passed, each pid's environment verdict, the listing.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 struct FixtureProcs {
     listing: Vec<i32>,
@@ -4002,8 +3521,6 @@ impl ProcTable for FixtureProcs {
     }
 }
 
-/// A live process of uid 501 with parent `ppid`, in session `session`, born
-/// at tick `start`.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn proc_at(ppid: i32, session: i32, start: u64) -> ProcRecord {
     ProcRecord {
@@ -4017,9 +3534,6 @@ fn proc_at(ppid: i32, session: i32, start: u64) -> ProcRecord {
     }
 }
 
-/// The fixture's shell: pid 10, leading its own session, born at tick 100;
-/// the run's window is ticks 100-200, and pid 5 (aterm's parent, say a
-/// `systemd --user`) is the one reaper besides init.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn scan_fixture(others: Vec<(i32, ProcRecord)>, owners: &[(i32, Option<bool>)]) -> (Scan, usize) {
     let mut table = FixtureProcs {
@@ -4049,9 +3563,6 @@ fn scan_fixture(others: Vec<(i32, ProcRecord)>, owners: &[(i32, Option<bool>)]) 
     (verdict, table.pauses)
 }
 
-/// A `/proc` table whose records change read by read: each pid's reads in
-/// order (the last repeats; an empty list or none is gone), and each pid's
-/// environment verdict. The shell is pid 10 as in [`scan_fixture`].
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 struct ReadsProcs {
     listing: Vec<i32>,
@@ -4080,8 +3591,6 @@ impl ProcTable for ReadsProcs {
     fn pause(&mut self, _pause: Duration) {}
 }
 
-/// [`linux_escape_scan`] of shell 10 (window ticks 100-200, reapers 1 and 5)
-/// over `procs`, each pid's reads in order, listed in that order.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn scan_linux_reads(
     procs: Vec<(i32, Vec<Option<ProcRecord>>)>,
@@ -4106,27 +3615,7 @@ fn scan_linux_reads(
     )
 }
 
-/// The Linux scan's parents read again (2026-10-19 review): `/proc` is read in
-/// pid order, so a parent read alive can begin to exit before its child's
-/// read, which still names it (`( daemon & )`: the subshell 20 exits at once,
-/// its daemon 30 stays in the shell's session). Every record in the window has
-/// its parent read once more, and one now gone is settled: the daemon is
-/// init's, in the shell's session, the run's. And a candidate whose
-/// environment cannot be read, gone at its re-read, leaves a live child read
-/// naming it stale: the scan is incomplete. Only a live one: a child it reaped
-/// before it exited (a pipeline) orphaned nothing; one below a child gone too
-/// (a triple fork) counts. The parent's pid read again as another birth is
-/// gone too, and so is a middle the settle found reaped (a double fork). A
-/// parent the listing never named (another user's under `hidepid=2`) is not
-/// read again: the line ends there, as before. NEGATIVE
-/// CONTROLS: the same subshell alive, or reading as nothing in any case but
-/// the live child, is `Clean`; with the parents' second read mutated out the
-/// first case reads `Clean`, with the gone candidate's children unread the
-/// third does, and counting a gone child the fourth reads `Unknown`; without
-/// the walk below a gone child the triple fork reads `Clean`, without the
-/// birth check the new birth does, with the reaped middle only removed the
-/// double fork does, and reading the unnamed parent again leaves the last
-/// `Unknown`.
+/// Linux escape scan re-reads parent records to catch daemons whose parent exited mid-scan.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn the_linux_scan_reads_each_parent_again() {
@@ -4147,8 +3636,6 @@ fn the_linux_scan_reads_each_parent_again() {
         Scan::Clean,
         "the control: the subshell alive, the daemon still under the shell"
     );
-    // 20, adopted in the window and in its own session, cannot have its
-    // environment read and is gone at the read after; 30, its child.
     let orphan = proc_at(1, 20, 150);
     let child = proc_at(20, 20, 151);
     let orphan_reads = || vec![Some(orphan), Some(orphan), None];
@@ -4168,7 +3655,6 @@ fn the_linux_scan_reads_each_parent_again() {
         Scan::Clean,
         "a child the candidate reaped before it exited"
     );
-    // 30 read alive at the parents' read, gone after; 40 below it lives.
     assert_eq!(
         scan_linux_reads(
             vec![
@@ -4181,15 +3667,12 @@ fn the_linux_scan_reads_each_parent_again() {
         Scan::Unknown,
         "a live process below a gone child of the candidate"
     );
-    // The subshell's pid read again is a new child of the shell's.
     let reborn = vec![Some(subshell), Some(proc_at(10, 10, 160))];
     assert_eq!(
         scan_linux_reads(vec![(20, reborn), (30, adopted.clone())], &[]),
         Scan::Escaped,
         "the daemon of a subshell whose pid is another's now"
     );
-    // A double fork: 20 exiting, its child 25 (its own session) reaped at the
-    // settle, the daemon 30 read under 25, then under init.
     assert_eq!(
         scan_linux_reads(
             vec![
@@ -4214,7 +3697,6 @@ fn the_linux_scan_reads_each_parent_again() {
         Scan::Escaped,
         "the daemon of a double fork whose middle the settle found reaped"
     );
-    // 20 is in no listing and reads as nothing.
     assert_eq!(
         scan_linux_reads(
             vec![(30, vec![Some(proc_at(20, 30, 150))])],
@@ -4225,25 +3707,7 @@ fn the_linux_scan_reads_each_parent_again() {
     );
 }
 
-/// The Linux scan's line to the shell runs through another user's process
-/// (2026-10-19 review): a daemon below a live `sudo` under the shell, out of
-/// its session, escaped; below one the run left to a reaper (`sudo -b`) it is
-/// an orphan of the run. Before, other users' records were read and dropped,
-/// the walk stopped at them, and both read `Clean`. Out of the shell's session
-/// only an environment naming the session says: this uid's login below a
-/// `sshd -i` systemd started in the window, its environment withheld, is no
-/// escape, while a process below a set-user-id daemon of the run (`screen
-/// -dm`) whose environment names the session is. A record of such a process
-/// naming a parent exiting is settled as
-/// one of ours is (the first `sudo -b` caught exiting), and so is one of ours
-/// naming it exiting. NEGATIVE CONTROLS: the same set-user-id process born
-/// before the window, under init, is no orphan of the run (`Clean`); with the
-/// walk through other users' records mutated out the first reads `Clean`, and
-/// with the reaper clause the second; with a withheld environment counted
-/// below one out of the session the `sshd` login reads `Escaped`, and with
-/// such a hop no orphan at all the `screen` daemon reads `Clean`; settling only records of ours, the caught `sudo -b`
-/// reads `Clean`, and so does the daemon below an exiting `sudo` when a parent
-/// of another user's is never leaving.
+/// Linux escape scan traces ancestry across other users' processes.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn the_linux_scan_walks_through_another_users_process() {
@@ -4273,7 +3737,6 @@ fn the_linux_scan_walks_through_another_users_process() {
         Scan::Clean,
         "below a sudo older than the run"
     );
-    // `sshd -i` (20, its own session) and the login's process of this uid.
     let own_session = || {
         vec![
             (20, vec![Some(root(1, 20, 140))]),
@@ -4290,8 +3753,6 @@ fn the_linux_scan_walks_through_another_users_process() {
         Scan::Escaped,
         "below a set-user-id daemon of the run in its own session"
     );
-    // The first `sudo -b` (20) exiting; its child (25) read under it until it
-    // is gone, then under init; the daemon (30) below that child.
     let exiting = |r: ProcRecord| ProcRecord { exiting: true, ..r };
     let first_sudo = || {
         vec![
@@ -4319,8 +3780,6 @@ fn the_linux_scan_walks_through_another_users_process() {
         Scan::Escaped,
         "below a sudo -b caught as its launcher exits"
     );
-    // A `sudo` under the shell (20) exiting; the daemon read under it, then
-    // under init.
     assert_eq!(
         scan_linux_reads(
             vec![
@@ -4337,11 +3796,7 @@ fn the_linux_scan_walks_through_another_users_process() {
     );
 }
 
-/// Following a gone candidate's stale children has a bound, and one too deep
-/// to follow is no answer, never a `Clean` (2026-10-19 review): 300 gone
-/// processes, each the child of the one before, the last with a live child.
-/// NEGATIVE CONTROL: with the bound skipping instead (before), each reads
-/// "nothing lives below".
+/// Exceeding the stale-child walk depth bound returns `Unknown` rather than `Clean`.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn too_many_gone_below_a_candidate_to_follow_is_no_answer() {
@@ -4362,7 +3817,6 @@ fn too_many_gone_below_a_candidate_to_follow_is_no_answer() {
     assert_eq!(procs.orphans_live(&mut table, 999), Ok(true), "Linux");
     #[cfg(target_os = "macos")]
     {
-        // Pids above macOS's 99999: none is ever a process.
         let here = std::process::id() as i32;
         let me = bsdinfo_uniq(here).expect("this process's record");
         let infos: Vec<_> = (0..=300)
@@ -4381,22 +3835,11 @@ fn too_many_gone_below_a_candidate_to_follow_is_no_answer() {
     }
 }
 
-/// The Linux scan's verdict on each kind of process in the run's window.
-/// An orphan handed to a reaper (init, or a subreaper among aterm's
-/// ancestors) is the run's when it is still in the shell's session, or when
-/// its environment names the session or cannot be read while the same birth
-/// lives; a process still under the shell counts only once it left the
-/// session. NEGATIVE CONTROLS, each beside its positive: the same orphan
-/// outside the window, naming another session, gone at its re-read, a zombie,
-/// of another uid, in a session a live leader older than the shell holds, or
-/// parented by a live process that is no reaper; the same child still in the
-/// shell's session.
+/// Linux escape scan classifies orphans, session children, zombies, and foreign processes.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn the_linux_escape_scan_judges_each_kind_of_process_in_the_window() {
     use std::io::{Error, ErrorKind};
-    // The actual proc adapters preserve read/list uncertainty before the
-    // verdict logic sees it; none of these controls reads the host's /proc.
     let line = "20 (helper) S 1 20 20 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 150 1000 5 0";
     assert_eq!(
         read_proc_record(20, || Ok(line.into()), || Ok(501)).unwrap(),
@@ -4475,8 +3918,6 @@ fn the_linux_escape_scan_judges_each_kind_of_process_in_the_window() {
         )
     };
     assert_eq!(judge(&mut fixture()), Scan::Clean);
-    // Initial candidate read, shell read and final shell read are all
-    // required. An inaccessible or malformed record proves no disappearance.
     for (pid, read) in [(20, 1), (10, 1), (10, 3)] {
         for kind in [ErrorKind::PermissionDenied, ErrorKind::InvalidData] {
             let mut table = fixture();
@@ -4490,8 +3931,6 @@ fn the_linux_escape_scan_judges_each_kind_of_process_in_the_window() {
     let mut unread_list = fixture();
     unread_list.list_error = true;
     assert_eq!(judge(&mut unread_list), Scan::Unknown);
-    // An unreadable environment needs a successful same-birth re-read;
-    // failure there cannot masquerade as a process that has exited.
     let mut owner = fixture();
     owner.owners.clear();
     owner
@@ -4508,8 +3947,6 @@ fn the_linux_escape_scan_judges_each_kind_of_process_in_the_window() {
         .read_errors
         .insert((30, 1), ErrorKind::PermissionDenied);
     assert_eq!(judge(&mut older_session), Scan::Unknown);
-    // Both reads in a settling pass preserve errors rather than deleting
-    // the parent or child as though a missing entry had confirmed its exit.
     for pid in [20, 21] {
         let mut settling = fixture();
         settling.listing.push(21);
@@ -4545,12 +3982,10 @@ fn the_linux_escape_scan_judges_each_kind_of_process_in_the_window() {
         "incomplete capped ancestry"
     );
     let named = Some(true);
-    // An orphan still in the shell's session: the run's, whatever it holds.
     assert_eq!(
         scan_fixture(vec![(20, proc_at(1, 10, 150))], &[(20, Some(false))]).0,
         Scan::Escaped
     );
-    // An orphan that left it (`setsid`), handed to init or to aterm's parent.
     assert_eq!(
         scan_fixture(vec![(20, proc_at(1, 20, 150))], &[(20, named)]).0,
         Scan::Escaped
@@ -4563,12 +3998,10 @@ fn the_linux_escape_scan_judges_each_kind_of_process_in_the_window() {
         scan_fixture(vec![(20, proc_at(5, 20, 150))], &[(20, Some(false))]).0,
         Scan::Clean
     );
-    // Unreadable (`ssh-agent` makes itself non-dumpable): the run's while it lives.
     assert_eq!(
         scan_fixture(vec![(20, proc_at(1, 20, 150))], &[(20, None)]).0,
         Scan::Escaped
     );
-    // Outside the window, either side.
     assert_eq!(
         scan_fixture(vec![(20, proc_at(1, 20, 99))], &[(20, named)]).0,
         Scan::Clean
@@ -4577,15 +4010,11 @@ fn the_linux_escape_scan_judges_each_kind_of_process_in_the_window() {
         scan_fixture(vec![(20, proc_at(1, 20, 201))], &[(20, named)]).0,
         Scan::Clean
     );
-    // A zombie holds nothing; another uid's is not judged.
     let zombie = ProcRecord {
         ended: true,
         ..proc_at(1, 10, 150)
     };
     assert_eq!(scan_fixture(vec![(20, zombie)], &[]).0, Scan::Clean);
-    // A daemon whose `main` returned through `pthread_exit` while its other
-    // threads run: its leader reads as a zombie, or mid-exit, and the process
-    // lives on (unreadable now: the leader's memory is gone).
     for (ended, exiting) in [(true, true), (false, true)] {
         let leader_gone = ProcRecord {
             ended,
@@ -4598,7 +4027,6 @@ fn the_linux_escape_scan_judges_each_kind_of_process_in_the_window() {
             Scan::Escaped,
             "ended={ended} exiting={exiting}"
         );
-        // NEGATIVE CONTROL: the group's last thread exiting holds nothing.
         let last = ProcRecord {
             threads: 1,
             ..leader_gone
@@ -4610,8 +4038,6 @@ fn the_linux_escape_scan_judges_each_kind_of_process_in_the_window() {
         ..proc_at(1, 10, 150)
     };
     assert_eq!(scan_fixture(vec![(20, theirs)], &[]).0, Scan::Clean);
-    // Still under the shell: a job of the run in its session, or a daemon
-    // that left it.
     assert_eq!(
         scan_fixture(
             vec![(20, proc_at(10, 10, 150)), (21, proc_at(20, 10, 160))],
@@ -4628,8 +4054,6 @@ fn the_linux_escape_scan_judges_each_kind_of_process_in_the_window() {
         .0,
         Scan::Escaped
     );
-    // A stranger's child: its live parent (30, born before the shell) is no
-    // reaper, and it never was under the shell.
     assert_eq!(
         scan_fixture(
             vec![(30, proc_at(1, 30, 50)), (31, proc_at(30, 31, 150))],
@@ -4638,9 +4062,6 @@ fn the_linux_escape_scan_judges_each_kind_of_process_in_the_window() {
         .0,
         Scan::Clean
     );
-    // An orphan in a session whose live leader is older than the shell is
-    // another terminal's background job, even unreadable; one whose leader
-    // came after the shell is not settled by that.
     assert_eq!(
         scan_fixture(
             vec![(40, proc_at(1, 40, 50)), (41, proc_at(1, 40, 150))],
@@ -4659,14 +4080,7 @@ fn the_linux_escape_scan_judges_each_kind_of_process_in_the_window() {
     );
 }
 
-/// A record read while its parent was exiting still names that parent (the
-/// kernel hands the children on only as the exit ends), so a daemon whose
-/// launcher was exiting at the read looks still under the shell, in its
-/// session: a job, not an escape. It is read again, with its parent, until it
-/// names a live one; then it reads as the orphan it is. NEGATIVE CONTROL: a
-/// parent that never finishes exiting leaves the scan `Unknown` (never
-/// `Clean`) after every settling listing; a pid listed and reaped before its
-/// read holds nothing and settles at once.
+/// Linux escape scan settles records whose parent is mid-exit (`PF_EXITING`).
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn a_daemon_read_while_its_launcher_exits_is_read_again() {
@@ -4679,13 +4093,11 @@ fn a_daemon_read_while_its_launcher_exits_is_read_again() {
             listing: vec![10, 20, 21],
             records: Box::new(move |pid, pauses| match pid {
                 10 => Some(shell),
-                // The launcher: exiting until a pause has passed, then a zombie.
                 20 => Some(ProcRecord {
                     exiting: true,
                     ended: finishes && pauses > 0,
                     ..proc_at(10, 10, 150)
                 }),
-                // The daemon: handed to init once its launcher's exit ended.
                 21 => Some(proc_at(
                     if finishes && pauses > 0 { 1 } else { 20 },
                     10,
@@ -4716,7 +4128,6 @@ fn a_daemon_read_while_its_launcher_exits_is_read_again() {
         (Scan::Unknown, SCAN_SETTLE_LISTINGS - 1),
         "a launcher still exiting leaves no verdict"
     );
-    // A listed pid reaped before its read: nothing to settle.
     let mut reaped = FixtureProcs {
         read_errors: std::collections::HashMap::new(),
         reads: std::collections::HashMap::new(),
@@ -4735,7 +4146,6 @@ fn a_daemon_read_while_its_launcher_exits_is_read_again() {
         501,
     );
     assert_eq!((verdict, reaped.pauses), (Scan::Clean, 0));
-    // The shell gone, or another process under its pid by the end: no verdict.
     for end in [None, Some(proc_at(9, 10, 300))] {
         let reads = std::cell::Cell::new(0);
         let mut gone = FixtureProcs {
@@ -4765,10 +4175,7 @@ fn a_daemon_read_while_its_launcher_exits_is_read_again() {
     }
 }
 
-/// `/proc/<pid>/stat`'s fields, counted from the command name's last `)`
-/// (a name may hold spaces and parentheses), with `PF_EXITING` read from the
-/// flags, the group's thread count, and the zombie and dead states as ended. NEGATIVE CONTROL: a line
-/// naming another pid, or cut short, is no record.
+/// `parse_proc_stat` parses `/proc/<pid>/stat` fields after the last `)`.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn a_proc_stat_line_reads_as_its_record() {
@@ -4813,7 +4220,7 @@ fn a_proc_stat_line_reads_as_its_record() {
     );
 }
 
-/// Linux: this process's own `/proc/self/stat` reads as the kernel says of it.
+/// `/proc/self/stat` matches the kernel process ids.
 #[cfg(target_os = "linux")]
 #[test]
 fn this_processs_own_proc_record_names_its_parent_session_and_start() {
@@ -4835,8 +4242,6 @@ fn this_processs_own_proc_record_names_its_parent_session_and_start() {
     assert!(!rec.ended && !rec.exiting);
 }
 
-/// A [`ProcTable`] over the host's `/proc` that lists only a fixture's own
-/// processes, so a verdict about its tree is never another test's churn.
 #[cfg(target_os = "linux")]
 struct AmongProcs(Vec<i32>);
 
@@ -4859,13 +4264,7 @@ impl ProcTable for AmongProcs {
     }
 }
 
-/// Linux: the escape scan on an owned process tree, the macOS fixture's twin.
-/// The fixture keeps its daemon parented until its exact pid and start are
-/// captured, then releases that parent, and the kernel hands the daemon to
-/// its reaper (init, or a child subreaper among this process's ancestors).
-/// Its environment names the session, so the whole host's scan over the
-/// run's window catches it. NEGATIVE CONTROL: the same tree in a window
-/// before it is clean. Cleanup signals only the captured births.
+/// Linux escape scan detects a real orphaned daemon in the run window.
 #[cfg(target_os = "linux")]
 #[test]
 fn the_linux_escape_scan_catches_a_daemon_the_session_left_behind() {
@@ -4908,8 +4307,7 @@ fn the_linux_escape_scan_catches_a_daemon_the_session_left_behind() {
                     .read(pid)
                     .is_ok_and(|r| r.is_some_and(|r| r.start == start && !r.ended))
             {
-                // SAFETY: a signal to the daemon this fixture made, its birth
-                // checked just above.
+                // SAFETY: `pid` matches the fixture daemon's verified birth.
                 let _ = unsafe { libc::kill(pid, libc::SIGKILL) };
             }
             let _ = self.child.kill();
@@ -4968,7 +4366,7 @@ fn the_linux_escape_scan_catches_a_daemon_the_session_left_behind() {
     }
     let after = std::time::SystemTime::now();
     let caught = escape_scan(shell_pid, None, SID, before, after);
-    // SAFETY: a side-effect-free getter.
+    // SAFETY: side-effect-free getter.
     let uid = unsafe { libc::geteuid() };
     let window = super::boot_tick_window(before, after).expect("the boot clock");
     let among = |window| {
@@ -4993,8 +4391,7 @@ fn the_linux_escape_scan_catches_a_daemon_the_session_left_behind() {
     );
 }
 
-/// Actual visible-run judgment: a matching image passes as far as an injected
-/// rate limit; missing or unequal images must stop before any process scan.
+/// Visible-run judgment requires matching initial and current shell executable paths.
 #[test]
 fn a_visible_run_needs_two_observed_matching_shell_images() {
     let session = crate::stub_session(91);
@@ -5024,8 +4421,6 @@ fn a_visible_run_needs_two_observed_matching_shell_images() {
         seen.input = Some(input);
         seen.fg_pgrp = 42;
         seen.image = current.map(PathBuf::from);
-        // The future stamp deterministically withholds the scan within this
-        // test's minute detector; it is not a latency assertion or a sleep.
         judge(&obs, &seen, &mut Some(now + Duration::from_secs(3600)))
     };
     assert_eq!(
@@ -5045,8 +4440,6 @@ fn a_visible_run_needs_two_observed_matching_shell_images() {
     );
 }
 
-/// A private run stopped at the generation guard, so these posture tests use
-/// real verify decisions without reading the host's process table.
 fn verify_posture_only(
     home: &Path,
     flags: Option<aterm_core::terminal::StartFlags>,

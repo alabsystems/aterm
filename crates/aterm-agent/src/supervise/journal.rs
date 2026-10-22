@@ -38,7 +38,9 @@
 //! `WAITING`, `HOLD` (where the loop typed nothing though the agent stood still, and why: a
 //! `point` decided nothing, a `background` break no host step was offered at; its door is
 //! its phase), `OCCUPANCY` (what the occupancy measures of the agent's wait, once a change:
-//! `hold open|declared|closed`, its phase the measure, `hold`; `supervise::occupancy`),
+//! `hold open|declared|closed`, its phase the measure, `hold`; and what a built-in rule would
+//! do at a break, `rule=<id> rev=builtin episode=<hex> door=break
+//! would|held:<guard>|paced next_s=<n>|spent`, its phase the rule; `supervise::occupancy`),
 //! `UNVERIFIED`, most `SKIPPED`, `UNPROVEN` (after a full-power `APPROVED`: why no
 //! safe rule proved the box), `DIALOG` (a question decision's rows joined by ` ⏎ `),
 //! `DECLINED`, `PROBED … /usage no sample (<word>)`, and every `RESET` but `used (<n> left)`.
@@ -314,8 +316,9 @@ impl JournalRecord {
                     rec.seq = Some(seq);
                     tail = after;
                 }
+                // A rule's line names its rule; the hold's, its measure.
                 let (measure, after) = split_word(tail);
-                rec.phase = measure.to_string();
+                rec.phase = measure.strip_prefix("rule=").unwrap_or(measure).to_string();
                 tail = after;
             }
             "PROBE" => {
@@ -753,6 +756,13 @@ mod tests {
                 "hold",
                 Some(14),
                 "closed why=foreign held_s=7260",
+            ),
+            (
+                "OCCUPANCY seq=15 rule=wait-nudge@v1 rev=builtin episode=00ff door=break would",
+                "occupancy",
+                "wait-nudge@v1",
+                Some(15),
+                "rev=builtin episode=00ff door=break would",
             ),
             (
                 "PROBE deferred seq=102 text is typed",

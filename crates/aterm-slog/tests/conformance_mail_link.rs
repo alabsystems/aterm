@@ -2,8 +2,8 @@
 // Copyright 2026 Andrew Yates
 
 //! Tier-1 conformance: the heuristic mail → turn link
-//! ([`aterm_slog::Fold::mail_link`], `fold_mail.rs`; session log phase 5,
-//! plan 5D-5, rulings T10, T11, T36, T39) against the derived
+//! ([`aterm_slog::Fold::mail_link`], `fold_mail.rs`)
+//! against the derived
 //! `SessionLogMailLink` model
 //! (`aterm_models_session::session_log_mail_link_model`, checked at Tier-0
 //! in `aterm-models/tests/derived_ring_ty.rs`).
@@ -31,8 +31,8 @@
 //!
 //! THE CARRY (T10a): a turn's link crosses a seamless update on its own
 //! `fold` line; a carry without the `ml` tokens (3B-shaped) reads with no
-//! link, the same state otherwise, and the same brief, byte for byte. Since
-//! Phase 6 step 6C-5 (ruling U19) the waiting task mails and the mail latch
+//! link, the same state otherwise, and the same brief, byte for byte. The
+//! waiting task mails and the mail latch
 //! cross too, on the totals line (`mlw=`, `mlh=`): a task mail delivered
 //! before the update links the successor's next turn.
 
@@ -409,7 +409,7 @@ fn mail_link_conforms_to_derived_model() {
             if let Some(action) = w.step(&m, &mut rng) {
                 let next = w.project();
                 admitted(&m, action, &prev, &next);
-                // Waiting mail implies the latch (Phase 6 step 6C-5): the
+                // Waiting mail implies the latch: the
                 // carry's reader refuses the one without the other, so no
                 // fold may hold it. NEGATIVE CONTROL (by scratch revert): a
                 // fold whose task mail sets no latch fails here.
@@ -418,7 +418,7 @@ fn mail_link_conforms_to_derived_model() {
                     "seed {seed} after `{action}`: mail waits without the latch"
                 );
                 // The brief prints the link the fold holds, with its `~`,
-                // and no other (Phase 6 step 6C-3, ruling U5).
+                // and no other.
                 briefed += brief_mail_links_hold(&w.log, w.now())
                     .unwrap_or_else(|e| panic!("seed {seed} after `{action}`: {e}"));
                 ran.insert(action);
@@ -904,8 +904,8 @@ fn ctl_turn_link(log: &mut Log, run: Node, ms: u64) -> Option<MailLink> {
     log.fold().mail_link(turn)
 }
 
-/// THE MAIL LATCH AND THE WAITING MAILS CROSS AN UPDATE (Phase 6 step
-/// 6C-5, rulings U19, T10a): a `kind=task` mail delivered before a seamless
+/// THE MAIL LATCH AND THE WAITING MAILS CROSS AN UPDATE (T10a):
+/// a `kind=task` mail delivered before a seamless
 /// update rides the carry's totals line as `mlw=<off>:<t>`, with the latch
 /// as `mlh=1`; the successor holds both, and its next ctl turn (inside the
 /// window) links the mail, heuristically. The latch is the fold's own: a

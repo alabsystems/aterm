@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE FACTS SEAM'S STATE (`docs/DESIGN-system-awareness-2026-10-16.md` §14.4; the occupancy
-//! design's slice 1a, `docs/DESIGN-harness-occupancy-2026-10-20.md` §8): which episodes of a
+//! THE FACTS SEAM'S STATE (`docs/DESIGN-system-awareness-2026-10-16.md` §14.4;
+//! `docs/DESIGN-harness-occupancy-2026-10-20.md` §8): which episodes of a
 //! measured condition a session has been told, kept apart from the measuring and the typing.
 //! Pure and clockless: every instant is the caller's milliseconds.
 //!
@@ -12,7 +12,7 @@
 //! within [`SEED_HOLD_MS`] counts as told until its condition has been seen clear once
 //! ([`FactsState::observe_closed`]), so a restart never tells it twice.
 //!
-//! Slice 1a has one kind, [`FactKind::Hold`], whose rows the hold clock writes
+//! Currently holds one kind, [`FactKind::Hold`], whose rows the hold clock writes
 //! (`occupancy::hold`); nothing is typed for it yet, and nothing in the loop reads this state.
 //!
 //! [`FactKind`] shares its name with `crate::harness::footer::FactKind` (the footer's fact
@@ -21,8 +21,7 @@
 use std::collections::BTreeMap;
 
 /// What a fact is about, in priority order: where two open episodes are untold, the first kind
-/// rides. Slice 1a has the hold alone; `Stuck`, `Memory`, `Disk`, `Throttle`, `NoProgress`,
-/// `Wake`, `Step`, `Claim` and `Rule` join with their slices.
+/// rides. Currently holds [`FactKind::Hold`] alone.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum FactKind {
     /// The session's wait on its own background work: how long it has held, and whether the

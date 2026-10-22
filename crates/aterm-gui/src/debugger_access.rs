@@ -15,7 +15,7 @@
 //! asks for an administrator in its own dialog, which aterm never sees or answers;
 //! then aterm re-probes and reports only what it reads.
 //!
-//! THE LAUNCH ASK (owner ruling O29, 2026-10-19): once per Mac, aterm raises the same
+//! THE LAUNCH ASK: once per Mac, aterm raises the same
 //! alert by itself — after the first-launch Full Disk Access and Developer Tools pages,
 //! at a quiet moment, and only to turn debugger access on where it reads off and was
 //! never seen on or turned off here ([`admit_launch_ask`]). The Mac is written into
@@ -2022,7 +2022,7 @@ impl DebuggerChangeLane {
     }
 }
 
-// The launch ask (owner ruling O29, 2026-10-19)
+// The launch ask
 
 /// The record beside `aterm.toml` of the Macs on which aterm has asked, by itself,
 /// whether to allow debugger access: one `<host-uuid> <secs>` line per Mac
@@ -2353,7 +2353,7 @@ pub(crate) enum HostAsked {
     NotAsked,
 }
 
-/// What the launch ask is judged on (design §3.4 step 0, owner ruling O29). Pure
+/// What the launch ask is judged on (design §3.4 step 0). Pure
 /// data, gathered by the App at its look.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct LaunchAskFacts {
@@ -2581,7 +2581,7 @@ impl AskSettle {
     }
 }
 
-/// THE LAUNCH ASK'S ADMISSION (owner ruling O29). Pure, and the order is the
+/// THE LAUNCH ASK'S ADMISSION. Pure, and the order is the
 /// contract: the instance's gates; this Mac in the record; the reads it waits
 /// on; whether the question is answered here already; whether turning debugger
 /// access on can help this account from this aterm; then the moment — behind
@@ -2694,7 +2694,7 @@ impl OfferEnd {
 }
 
 impl DebuggerChangeLane {
-    /// THE LAUNCH ASK'S ALERT AND ANSWER (owner ruling O29): raise aterm's alert
+    /// THE LAUNCH ASK'S ALERT AND ANSWER: raise aterm's alert
     /// through `confirm` for a Mac its disk half has just written into
     /// [`ASKED_RECORD`] (`prepared`, from [`OfferDisk::prepare`]), and take the
     /// answer exactly as a press of *Allow debugger access…* ([`Self::begin`]: a
@@ -2807,7 +2807,7 @@ impl DebuggerChangeLane {
             })
     }
 
-    /// THE LAUNCH ASK SETTLED (owner ruling O29): write this Mac into
+    /// THE LAUNCH ASK SETTLED: write this Mac into
     /// [`ASKED_RECORD`] and nothing else. The question is answered here — a
     /// change is under way, the owner answered the alert in this process,
     /// debugger access is on, or it was on or turned off before — so no later
@@ -4689,7 +4689,7 @@ mod tests {
         );
     }
 
-    // The launch ask (owner ruling O29)
+    // The launch ask
 
     /// Facts under which the launch ask asks: every gate open, this Mac not in
     /// the record, the records and the probe read (off, an admin), a hardened
@@ -7204,7 +7204,7 @@ pub(crate) mod conformance {
         launch_ask_scenarios(fault);
     }
 
-    /// The launch ask (owner ruling O29), On only: refused before the probe; a
+    /// The launch ask, On only: refused before the probe; a
     /// yes that runs the change as a press's would, after which the record
     /// refuses every later ask; a No, or no alert, that the record carries into
     /// the next launch while the button stays the owner's; refused under a

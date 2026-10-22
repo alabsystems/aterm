@@ -872,6 +872,15 @@ pub struct Header {
     pub opts: SuperviseOpts,
     /// The run had a host behind [`SuperviseOpts::idle_host`].
     pub idle_host: bool,
+    /// THE HOST'S DOORS THE RECORDING BUILD HAD (`[opts] host_doors`, every
+    /// method of its `IdleHost`): a replay answers a door outside them that
+    /// has an answer for it (`TapeValue::absent`, the occupancy reading) as
+    /// that build's loop, which never asked there, would have been answered,
+    /// without taking a record, and diverges at a door inside them that the
+    /// tape does not hold — a newer build's tape that never asked never
+    /// replays a default silently (the occupancy red-team's F8). `None`: a
+    /// tape from before headers named them, which named none.
+    pub host_doors: Option<Vec<String>>,
     /// The policy's rebuild gave back the very policy the run had
     /// ([module docs](self)).
     pub policy_exact: bool,
@@ -931,6 +940,12 @@ impl Header {
             setup,
             opts,
             idle_host,
+            host_doors: Some(
+                crate::supervise::run::host_door::HOST_DOORS
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect(),
+            ),
             policy_exact,
             supplied: Vec::new(),
         }
@@ -948,6 +963,7 @@ impl Header {
             setup,
             opts,
             idle_host,
+            host_doors,
             policy_exact,
             // What a decode found missing: this build writes every key.
             supplied: _,
@@ -986,6 +1002,10 @@ impl Header {
         w.opt_path("tasks", tasks.as_deref(), roots);
         w.shown("yield_when_held", yield_when_held);
         w.shown("idle_host", idle_host);
+        // One space between each; none named (a tape from before) writes none.
+        if let Some(doors) = host_doors {
+            w.text("host_doors", &doors.join(" "));
+        }
         w.section("policy");
         let PolicyTexts {
             keys,
@@ -1093,6 +1113,15 @@ impl Header {
         let tasks = r.or_shipped("tasks", None, |r, key| r.opt_path(key, &roots))?;
         let yield_when_held = r.parsed("yield_when_held")?;
         let idle_host = r.parsed("idle_host")?;
+        // Arrived after the format did: a tape from before named no doors.
+        let host_doors = r.or_shipped("host_doors", None, |r, key| {
+            Ok(Some(
+                r.text(key)?
+                    .split_whitespace()
+                    .map(str::to_string)
+                    .collect(),
+            ))
+        })?;
         r.section("policy");
         // The verdict first: always written (`exact` last of all, what a torn
         // header lacks); an older build's `session_questions` beside it, a
@@ -1186,6 +1215,7 @@ impl Header {
                 tasks,
             },
             idle_host,
+            host_doors,
             policy_exact,
             supplied,
         })

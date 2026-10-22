@@ -80,12 +80,12 @@ use super::Rng;
 /// rolled-back batch refusing commits too), 1..=4000 at 400 steps and
 /// 1..=400 at 1500 broke none (134,105 and 56,819 acks held, 5,926 and 2,078
 /// reads that went on without one, 626 and 80 records read before their
-/// ack). With the device tearing (finding F1, decided) to nothing or
+/// ack). With the device tearing (decided) to nothing or
 /// part-way, a sweep that sets aside every file not provably whole,
 /// and a torn mirror pin left to stop the mirror, 1..=4000 at 400 steps and
 /// 1..=400 at 1500 broke none (10,153 and 3,686 power cuts, 6,964 and 3,063
 /// torn files set aside). With every whole in-flight entry of an earlier boot
-/// retired after an unclean stop (finding F2, decided), 1..=8064 at 400 steps
+/// retired after an unclean stop (decided), 1..=8064 at 400 steps
 /// and 1..=400 at 1500 broke none (20,387 and 3,670 power cuts, 18,518 and
 /// 4,011 entries retired); and the world that loses power both ways
 /// ([`both_ways`]), 1..=4000 at 400 and 1..=400 at 1500, broke none either
@@ -93,7 +93,7 @@ use super::Rng;
 /// and 8,034 entries retired) — where the old republish broke the order at
 /// 67 of 1..=2000, and nothing else. With every session row carrying its state
 /// dir's mark and a later bridge of the dir retiring its predecessors' ghosts
-/// by it (finding F4, decided), 1..=2000 at 400 steps and 1..=400 at 1500
+/// by it (decided), 1..=2000 at 400 steps and 1..=400 at 1500
 /// broke none and left no ghost row (5,111 and 3,671 power cuts, 11,814 and
 /// 9,003 ghost rows retired), nor did the world that loses power both ways,
 /// 1..=2000 at 400 (10,095 power cuts, 21,412 ghost rows retired), nor the
@@ -246,7 +246,7 @@ fn every_seed_holds_every_law() {
         ("sessions that left", total.exits),
         ("session-log records", total.log_records),
         ("`ms` the mirror put on the bus", total.mirrored),
-        // FINDING F1's LAW: a power cut tore state files, and a bridge set
+        // a power cut tore state files, and a bridge set
         // them aside and attached ([`a_torn_state_file_after_a_power_cut_is_set_aside_and_the_attach_goes_on`]).
         ("torn state files set aside", total.set_aside),
         ("torn state files told to aterm", total.set_aside_told),
@@ -255,7 +255,7 @@ fn every_seed_holds_every_law() {
         // ([`a_torn_mirror_pin_after_a_power_cut_is_set_aside_and_the_mirror_resumes`]).
         ("power cuts that tore the mirror's pin", total.pins_torn),
         ("torn mirror pins set aside", total.pins_set_aside),
-        // FINDING F2'S LAW: a power cut found in-flight entries, and the first
+        // a power cut found in-flight entries, and the first
         // bridge of the next boot retired them unpublished
         // ([`a_post_the_log_lost_stays_lost_after_a_later_power_cut`]).
         (
@@ -652,10 +652,10 @@ fn each_rule_switched_off_is_caught() {
                 // own fence (`max(local, bus) + 1`) holds wherever a record of
                 // the incarnation survived: only a world whose log also loses
                 // power alone shows the lease alone standing between a reused
-                // incarnation and the bus ([`both_ways`], finding F2's world,
+                // incarnation and the bus ([`both_ways`],
                 // which with every rule on breaks no law).
                 // Seed 149 until the next boot's first bridge retired the
-                // entries a cut left (finding F2), which moved every schedule
+                // entries a cut left, which moved every schedule
                 // after a power cut; 546 until the mirror's durable copies,
                 // whose directory flushes pin `inc-lease` (`RARE_SEEDS`);
                 // 4023 until sim item S6, 8483 since. Sim item S7's floor,
@@ -722,7 +722,7 @@ fn each_rule_switched_off_is_caught() {
             "presence:",
             3,
         ),
-        // FINDING F4'S LAW: a later bridge of a state dir retires the ghosts
+        // a later bridge of a state dir retires the ghosts
         // its earlier bridges left, by the dir's mark on their rows — the rule
         // the committed worlds' ghosts are all retired by, which unread leaves
         // the ones whose writer's successors all died inside the five minutes.
@@ -888,7 +888,7 @@ fn each_rule_switched_off_is_caught() {
     // row still standing: seed 28 of the first 64 until aterm-0's review fixes
     // moved every schedule (a refused commit retried, an idle loop waiting for
     // its posts' answers), seed 66 until a later bridge of a state dir
-    // retired its predecessors' ghosts (finding F4), seed 194 since. The
+    // retired its predecessors' ghosts, seed 194 since. The
     // self-lane window's needs a move after an `acked` write failed and the
     // replay of the entry it kept: seed 28 of the first 64 on sim item S7's
     // own base, 92 since main's per-open run admission (one more durable
@@ -1242,7 +1242,7 @@ fn a_failing_seed_replays_exactly() {
     );
 }
 
-/// **FINDING F1, DECIDED: A TORN STATE FILE AFTER A POWER CUT IS SET ASIDE, AND
+/// **A TORN STATE FILE AFTER A POWER CUT IS SET ASIDE, AND
 /// THE ATTACH GOES ON** ([`super::device`]'s module doc). The committed device
 /// is POSIX's worst case — a power cut may TEAR any file it did not find
 /// flushed, to nothing or part-way ([`Opts::seed`]) — and the committed worlds'
@@ -1318,8 +1318,8 @@ fn a_torn_state_file_after_a_power_cut_is_set_aside_and_the_attach_goes_on() {
     );
 }
 
-/// **A TORN MIRROR PIN AFTER A POWER CUT IS SET ASIDE, AND THE MIRROR RESUMES**
-/// (rulings Q6 and Q13 across a power cut). The pin (`logpin`) holds the
+/// **A TORN MIRROR PIN AFTER A POWER CUT IS SET ASIDE, AND THE MIRROR RESUMES.**
+/// The pin (`logpin`) holds the
 /// node's alias key and its lifetime total, which no reboot ends, so a torn
 /// one used to be kept and stop the mirror for good. Each now has a durable
 /// copy on the media before each atomic batch pin or send — the key in
@@ -1437,7 +1437,7 @@ fn a_torn_mirror_pin_after_a_power_cut_is_set_aside_and_the_mirror_resumes() {
     }
 }
 
-/// **FINDING F4, DECIDED: A GHOST ROW IS RETIRED BY A LATER BRIDGE OF ITS STATE
+/// **A GHOST ROW IS RETIRED BY A LATER BRIDGE OF ITS STATE
 /// DIR** ([`super::world`]'s presence oracle). A session that left with nobody
 /// to say so — its tab closed while no bridge ran, its instance gone in a power
 /// cut, or its `exited` row taken by a lossy cut — keeps a `state=live` row.
@@ -1497,7 +1497,7 @@ fn a_ghost_row_is_retired_by_a_later_bridge_of_its_state_dir() {
 }
 
 /// **A SIBLING'S ROW IS RETIRED ONLY BY THE ATTACH THAT WITNESSED ITS WILL**
-/// (finding F4's other half, [`Opts::with_a_sibling`]). A copy of the state
+/// ([`Opts::with_a_sibling`]). A copy of the state
 /// dir runs a bridge under the same node id: another state dir, so another
 /// mark on its rows. It attaches outranking this node's bridges, carries a
 /// session, and mostly dies; its will fires unless this node outranked it
@@ -1541,7 +1541,7 @@ fn a_siblings_row_is_retired_only_by_the_attach_that_witnessed_its_will() {
 }
 
 /// **A SIBLING THAT TAKES ONE OF THIS DIR'S INCARNATIONS IS STILL ANOTHER
-/// DIR'S** (finding F4's review, [`Opts::with_a_racing_sibling`]). An attach
+/// DIR'S** ([`Opts::with_a_racing_sibling`]). An attach
 /// here takes an incarnation and the broker refuses its will, so nothing of
 /// it reaches the bus; a copy of the state dir, under the same node id, then
 /// reads the node face before the next attach here has presented anything,
@@ -2008,8 +2008,7 @@ fn an_ordered_write_reaches_the_media_before_every_later_one() {
 /// every one of those files holds exactly what the run left: none torn, none
 /// rolled back to an older version or to nothing, and the cleared entry not
 /// back — so damage after a clean stop stays a bug's, refused where it is
-/// read and never a power cut's, and a clean stop keeps every unlink (what
-/// finding F2's republish after one rests on). The law is exercised: clean
+/// read and never a power cut's, and a clean stop keeps every unlink. The law is exercised: clean
 /// records and open ones are both drawn, and an open one over files the cut
 /// changed (the next boot's sweep is that one's). NEGATIVE CONTROLS
 /// ([`crate::state::StopRules`]): the record written first, the directories
@@ -2570,7 +2569,7 @@ fn torn_kinds_as_they_stand(root: &std::path::Path) -> std::collections::BTreeMa
     out
 }
 
-/// THE WORLD THAT LOSES POWER BOTH WAYS — finding F2's: the committed world of
+/// THE WORLD THAT LOSES POWER BOTH WAYS: the committed world of
 /// `seed`, whose broker's log may lose power ALONE ([`Opts::bus_losses`], a log
 /// on another volume than the state dir, a lossy flush) and whose whole
 /// machine may lose power too ([`Opts::power_cuts`]), whichever device layout
@@ -2691,7 +2690,7 @@ fn every_seed_with_write_errors_holds_every_law() {
 }
 
 /// **THE WORLD THAT LOSES POWER BOTH WAYS BREAKS NO LAW** ([`both_ways`]),
-/// over [`SEEDS`] seeds — finding F2's world, held as the committed one is
+/// over [`SEEDS`] seeds — held as the committed one is
 /// ([`every_seed_holds_every_law`]): the log loses power on its own, moving
 /// its generation under a running bridge, and the machine loses power too,
 /// rolling the state dir back and ending aterm's sessions — and the seeds
@@ -2732,7 +2731,7 @@ fn every_seed_of_the_world_that_loses_power_both_ways_holds_every_law() {
     }
 }
 
-/// **FINDING F2, DECIDED: A POST THE LOG LOST STAYS LOST AFTER A LATER POWER
+/// **A POST THE LOG LOST STAYS LOST AFTER A LATER POWER
 /// CUT** — never published again out of its sender's order.
 ///
 /// In the world that loses power both ways ([`both_ways`]) the log loses, on
@@ -2755,8 +2754,8 @@ fn every_seed_of_the_world_that_loses_power_both_ways_holds_every_law() {
 /// on a replay; the same seed with the entries retired breaks no law and
 /// retired some. Seed 8 was the first (67 of 1..=2000 broke the order that
 /// way; the test before the decision named 122, the witness it checked first)
-/// until a later bridge of a state dir retired its predecessors' ghosts
-/// (finding F4), which moved every schedule: 36 since.
+/// until a later bridge of a state dir retired its predecessors' ghosts,
+/// which moved every schedule: 36 since.
 #[test]
 fn a_post_the_log_lost_stays_lost_after_a_later_power_cut() {
     let republishing = |s: u64| both_ways(s).with(Mutant::RepublishInFlightOfAnEarlierBoot);

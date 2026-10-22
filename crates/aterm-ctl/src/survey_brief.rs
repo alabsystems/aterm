@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `aterm ctl survey --brief [--budget <chars>]`: THE LOCAL BRIEF (session
-//! log plan 5F-6, rulings P9 and T27; DESIGN:607-609). The survey client's
+//! `aterm ctl survey --brief [--budget <chars>]`: THE LOCAL BRIEF (DESIGN:607-609).
+//! The survey client's
 //! walk asks every live instance on this machine for its own node log (`log
 //! n`: what the instance itself did — its `start prev_end=`, each fabric
 //! `link state=`, each `config key=`) and its sessions' briefs (`brief all`),

@@ -1,14 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The one port between this crate and the operating system.
-//!
-//! Every tool an item runs, every file it reads or writes, and the converge journal its
-//! changes are recorded in go through [`System`]. The live arm ([`Live`]) runs absolute
-//! programs built by `aterm_uds::spawnfd::command`, each bounded by a deadline, with a fixed
-//! environment. The test arm (`Fake`, test builds only) answers from a script and records
-//! the argv, so no test touches the real `defaults`, `pmset`, `scutil` or `launchctl` of
-//! the machine running it, nor its account's journal.
+//! Operating-system port ([`System`]), with [`Live`] and test (`Fake`) implementations.
 
 use std::ffi::OsString;
 use std::io;
@@ -34,8 +27,7 @@ pub use secret::{SECRET_MAX, Secret, no_core_dumps};
 pub use staged_child::{START_BYTE, START_LIMIT, StagedChild};
 pub use stops::name as stop_name;
 
-/// The default bound on one tool run. Generous: a hung tool is what it catches, not a
-/// slow one.
+/// Default deadline for a single tool run.
 pub const DEFAULT_BUDGET: Duration = Duration::from_secs(60);
 
 /// What [`Live`] spawns for one run: the program, its arguments and its environment.
@@ -69,30 +61,20 @@ pub struct Cmd {
     pub program: PathBuf,
     /// Arguments after the program.
     pub args: Vec<OsString>,
-    /// Run as this account (design §3.5): from root, `sudo -n -u <u> -H -- /usr/bin/env -i
-    /// HOME=… USER=… LOGNAME=… SHELL=… PATH=… <program> …`.
+    /// Run as this account via `sudo -n -u <u> -H -- /usr/bin/env -i ...`.
     pub user: Option<User>,
-    /// Run inside that user's login session (`launchctl asuser <uid>`), for tools that
-    /// talk to the user's GUI session (`open`, `killall Dock`). The caller checks that the
-    /// session exists (`launchctl print gui/<uid>`).
+    /// Run inside the user's login session (`launchctl asuser <uid>`).
     pub session: bool,
     /// A file to read standard input from; standard input is closed otherwise.
     pub stdin: Option<PathBuf>,
     /// The deadline, counted from the start of the run.
     pub budget: Duration,
-    /// Variables added to the fixed environment, in order (`HOMEBREW_NO_ANALYTICS=1`, or
-    /// `SSH_AUTH_SOCK` for the signing agent). A run with `user` passes them through `env -i`,
-    /// where they are visible in that process's argv, so a secret belongs only on a run
-    /// without `user`, and a credential never in a variable: it goes on standard input
-    /// ([`System::run_complete_stdout_input`]).
+    /// Variables added to the fixed environment, in order.
     pub env: Vec<(String, String)>,
-    /// The names in `env` whose values [`Cmd::display`] masks ([`Cmd::secret_env`]).
-    /// `Debug` masks every value.
+    /// Variable names in `env` whose values [`Cmd::display`] masks.
     pub masked: Vec<String>,
-    /// The deadline ends the run rather than failing it: for a tool that never exits on its
-    /// own (`dns-sd -B` browses until it is killed). At the deadline the child's process
-    /// group is killed (`SIGKILL`) and the run answers `Ok` with `status: None` and what it
-    /// printed by then; a run that ends sooner answers as any other.
+    /// Kill the process group at the deadline and return `Ok` with `status: None` and captured
+    /// output instead of [`RunFailed::TimedOut`].
     pub keep_on_timeout: bool,
 }
 
@@ -202,9 +184,7 @@ impl Cmd {
         self
     }
 
-    /// The command as one shell-quoted line: the form revert lines and logs print, and the
-    /// key the test arm's script is matched on (`<user>$ ` prefixed when `user` is set,
-    /// each [`Cmd::env`] variable as a `NAME=value` word before the program).
+    /// The command formatted as a single shell-quoted line.
     #[must_use]
     pub fn display(&self) -> String {
         let mut out = String::new();
@@ -230,8 +210,7 @@ impl Cmd {
     }
 }
 
-/// `word` quoted for a POSIX shell: bare when it is made only of characters no shell
-/// treats specially, else in single quotes with each `'` written `'\''`.
+/// Quote `word` for a POSIX shell.
 #[must_use]
 pub fn shell_word(word: &str) -> String {
     let plain = !word.is_empty()
@@ -358,23 +337,14 @@ pub trait Relaying {
     /// The port it listens on, on `127.0.0.1`.
     fn port(&self) -> u16;
 
-    /// Stop listening, then end (`SIGKILL`) and reap every run still carrying a connection.
-    /// A second close does nothing.
-    ///
-    /// # Errors
-    /// One line when the relay failed on its own before the close: it stopped accepting, or
-    /// a connection's run did not start.
+    /// Stop listening, then `SIGKILL` and reap every active connection run.
     fn close(&mut self) -> Result<(), String>;
 }
 
 /// The operating system, as items see it.
 pub trait System: Sync {
-    /// Read one GitHub API endpoint through agh as the already-admitted development
-    /// credential. No credential is written to process environment, files or logs.
-    /// The live arm runs only as `user`; unsupported and test backends never network.
-    ///
-    /// # Errors
-    /// Unsupported backend, user mismatch, invalid credential, or incomplete/failed read.
+    /// Read one GitHub API endpoint through `agh` as `user` using the admitted development
+    /// credential.
     fn github_api(
         &self,
         _user: &User,
@@ -384,14 +354,8 @@ pub trait System: Sync {
         Err("GitHub reads are not implemented by this backend".into())
     }
 
-    /// One GitHub REST request as this process's own account (the machines controller):
-    /// `method endpoint` to the API origin over aterm-http, `token` in an `Authorization`
-    /// header built in memory, `body` as JSON. A redirect is refused, never followed. The
-    /// live arm networks; the test arm answers from a script.
-    ///
-    /// # Errors
-    /// Unsupported backend, an endpoint that is not one path, a failed or cut-short request,
-    /// an answer over its bound, or a redirect. No error carries the token.
+    /// Send one GitHub REST request as the controller account with `token` in `Authorization`
+    /// and optional JSON `body`, refusing redirects.
     fn github_rest(
         &self,
         _token: &Secret,
@@ -402,29 +366,17 @@ pub trait System: Sync {
         Err("GitHub REST requests are not implemented by this backend".into())
     }
 
-    /// Natural scrolling through the same native getter used by System Settings.
-    /// Apple's getter synchronizes and reads preferences; it does not independently
-    /// query WindowServer's active input state. No preference write or UI prompt.
-    ///
-    /// # Errors
-    /// The native framework or getter is unavailable, or returned an unknown value.
+    /// Read the active session's natural scrolling preference via the native getter.
     fn natural_scrolling(&self) -> Result<bool, String> {
         Err("native scroll direction is not implemented by this backend".into())
     }
 
-    /// Apply Natural scrolling in this process's current macOS login session with
-    /// the native System Settings setter, including its normal change notification.
-    /// The caller also verifies the persistent global preference.
-    ///
-    /// # Errors
-    /// The native setter is unavailable or the native preference read-back does not match.
+    /// Set natural scrolling in the current macOS login session via the native setter.
     fn set_natural_scrolling(&self, _natural: bool) -> Result<(), String> {
         Err("native scroll direction is not implemented by this backend".into())
     }
 
-    /// Allocate an exclusive owned directory. `None` selects the backend's temporary
-    /// parent; `Some` keeps staging on the caller's filesystem. Prefer [`Scratch`]'s
-    /// constructors; an implementation that cannot prove exclusive creation refuses.
+    /// Allocate an exclusively owned temporary directory under `_parent` (or default temp dir).
     fn scratch_dir(&self, _parent: Option<&Path>, _label: &str) -> io::Result<Scratch<'_>> {
         Err(io::Error::new(
             io::ErrorKind::Unsupported,
@@ -433,89 +385,47 @@ pub trait System: Sync {
     }
 
     /// Run `cmd` to completion or its deadline.
-    ///
-    /// # Errors
-    /// [`RunFailed`] when nothing ran to completion.
     fn run(&self, cmd: &Cmd) -> Result<Ran, RunFailed>;
 
-    /// Capture stdout as a complete bounded record. Success proves EOF, no read error
-    /// and no discarded stdout bytes; stderr remains a diagnostic tail. This is not the
-    /// diagnostic [`Self::run`] lane and cannot return a kept timed-out partial result.
-    ///
-    /// # Errors
-    /// Unsupported backend, timeout, failed capture or stdout beyond the capture bound.
+    /// Run `_cmd` and capture complete bounded stdout (failing on truncation or timeout).
     fn run_complete_stdout(&self, _cmd: &Cmd) -> Result<Ran, RunFailed> {
         Err(RunFailed::Refused(
             "complete stdout is not implemented by this backend".into(),
         ))
     }
 
-    /// Send exactly `input` through a private stdin pipe while capturing complete,
-    /// bounded stdout. Input is never a file, argument, environment variable or log
-    /// record. The concurrent writer shares the child's deadline and is joined before
-    /// return, including when spawn or capture fails. `cmd.stdin` must be absent.
-    ///
-    /// # Errors
-    /// Unsupported backend, incomplete input, timeout or unproven stdout capture.
+    /// Feed `_input` via a private stdin pipe and capture complete bounded stdout.
     fn run_complete_stdout_input(&self, _cmd: &Cmd, _input: &[u8]) -> Result<Ran, RunFailed> {
         Err(RunFailed::Refused(
             "complete stdout with piped input is not implemented by this backend".into(),
         ))
     }
 
-    /// Run `cmd` on this process's own terminal (standard input, output and error
-    /// inherited, no deadline): for the two prompts a person answers at enrollment,
-    /// OpenSSH's password and Apple's sudo. Returns the exit status.
-    ///
-    /// # Errors
-    /// [`RunFailed`] when the program could not be started.
+    /// Run `cmd` with inherited stdio and no deadline on the controlling terminal.
     fn run_tty(&self, cmd: &Cmd) -> Result<Option<i32>, RunFailed>;
 
-    /// Whether this process has a controlling terminal a person can answer a prompt on
-    /// ([`Self::run_tty`]'s `sudo`): `/dev/tty` opens for reading and writing. `false` for
-    /// a backend with none.
+    /// Whether `/dev/tty` can be opened for reading and writing.
     fn has_tty(&self) -> bool {
         false
     }
 
-    /// Run `cmd` to completion or its deadline, as [`System::run`] does, with `input` and a
-    /// newline on its standard input: a pipe written and closed before the child starts,
-    /// never a file, an argument or a variable (`enroll` feeds the admin's password to `ssh`
-    /// and `sudo` so). `cmd.stdin` is not used.
-    ///
-    /// # Errors
-    /// [`RunFailed`] when nothing ran to completion.
+    /// Run `cmd` with `input` and a trailing newline written to a private stdin pipe.
     fn run_fed(&self, cmd: &Cmd, input: &Secret) -> Result<Ran, RunFailed> {
         let _ = (cmd, input);
         Err(RunFailed::Refused("run_fed: not supported".into()))
     }
 
-    /// Ask the person at this process's controlling terminal (`/dev/tty`, never standard
-    /// input): write `prompt`, read one line, with the terminal's echo off when `secret`.
-    /// `None` when they typed nothing (an empty line, or the end of input).
-    ///
-    /// # Errors
-    /// No terminal, or the read failed; [`io::ErrorKind::Interrupted`] when they stopped
-    /// the prompt (Ctrl-C).
+    /// Prompt on `/dev/tty` and read one line, disabling echo when `secret` is true.
     fn ask(&self, prompt: &str, secret: bool) -> io::Result<Option<Secret>> {
         let _ = (prompt, secret);
         Err(io::Error::from(io::ErrorKind::Unsupported))
     }
 
-    /// The bytes of `path`.
-    ///
-    /// # Errors
-    /// The underlying I/O error.
+    /// Read the bytes of `path`.
     fn read_file(&self, path: &Path) -> io::Result<Vec<u8>>;
 
-    /// Read one bounded regular file through the descriptor whose metadata was
-    /// admitted. The final path must not be a link; ownership must match `uid`,
-    /// set-id/group/other write bits are refused, and `private` also refuses every
-    /// group/other permission. File contents never belong in admission errors.
-    ///
-    /// # Errors
-    /// Unavailable safe reads, unsafe metadata, an I/O failure, or more than `max`
-    /// bytes. A backend without this operation refuses rather than using read_file.
+    /// Read a bounded regular file at `_path` (at most `_max` bytes) after verifying it is not a
+    /// symlink, is owned by `_uid`, and has safe mode bits.
     fn read_owned_file(
         &self,
         path: &Path,
@@ -527,102 +437,51 @@ pub trait System: Sync {
         Err(io::ErrorKind::Unsupported.into())
     }
 
-    /// Write `bytes` to `path` atomically (a sibling temporary, then a rename), with
-    /// `mode`, as this process's own user. Never follows a link at `path`.
-    ///
-    /// # Errors
-    /// The underlying I/O error.
+    /// Write `bytes` to `path` atomically with `mode`, without following symlinks.
     fn write_file(&self, path: &Path, bytes: &[u8], mode: u32) -> io::Result<()>;
 
-    /// Write `bytes` to `path` as `user` (the agent re-runs itself as that user, so a link
-    /// the user planted can never redirect a root write). `path` must be inside the user's
-    /// home.
-    ///
-    /// # Errors
-    /// The underlying I/O error, or a refusal as [`io::ErrorKind::PermissionDenied`].
+    /// Write `bytes` to `path` (inside `user`'s home) as `user` with `mode`.
     fn write_user_file(&self, user: &User, path: &Path, bytes: &[u8], mode: u32) -> io::Result<()>;
 
-    /// Make directory-entry changes in `path` durable before later writes.
-    ///
-    /// # Errors
-    /// The directory cannot be opened or flushed. An unsupported backend refuses.
+    /// Flush directory-entry changes in `path` to durable storage.
     fn durable_dir(&self, path: &Path) -> io::Result<()> {
         let _ = path;
         Err(io::ErrorKind::Unsupported.into())
     }
 
-    /// Remove `path` (a file or an empty directory); absent is success.
-    ///
-    /// # Errors
-    /// The underlying I/O error.
+    /// Remove a file or empty directory at `path` (succeeding if already absent).
     fn remove(&self, path: &Path) -> io::Result<()>;
 
-    /// Create `path` and any missing parents with `mode`.
-    ///
-    /// # Errors
-    /// The underlying I/O error.
+    /// Create `path` and any missing parent directories with `mode`.
     fn create_dir_all(&self, path: &Path, mode: u32) -> io::Result<()>;
 
-    /// `chown(path, uid, gid)`, never following a link.
-    ///
-    /// # Errors
-    /// The underlying I/O error.
+    /// Change owner and group of `path` without following symlinks.
     fn chown(&self, path: &Path, uid: u32, gid: u32) -> io::Result<()>;
 
-    /// Give the regular file at `path` the owner `uid:gid` and the permission bits `mode`,
-    /// through one descriptor opened without following a link. Anything but a regular file
-    /// with exactly one link is refused: in a directory others may write (stock macOS's
-    /// `/Library/Application Support/CrashReporter` is `root:admin 0775`), a name swapped
-    /// for a link between a check and a path-based `chown` would hand that owner and mode
-    /// to another file.
-    ///
-    /// # Errors
-    /// The underlying I/O error, or [`io::ErrorKind::InvalidInput`] for a refused file.
+    /// Set owner `uid:gid` and permission bits `mode` on the single-linked regular file at `path`
+    /// via an open descriptor (`O_NOFOLLOW`).
     fn set_owner_and_mode(&self, path: &Path, uid: u32, gid: u32, mode: u32) -> io::Result<()> {
         let _ = (path, uid, gid, mode);
         Err(io::Error::from(io::ErrorKind::Unsupported))
     }
 
-    /// `lstat(path)`.
-    ///
-    /// # Errors
-    /// The underlying I/O error.
+    /// Return `lstat(path)` metadata without following symlinks.
     fn stat(&self, path: &Path) -> io::Result<Stat>;
 
-    /// The names in directory `path`.
-    ///
-    /// # Errors
-    /// The underlying I/O error.
+    /// List entry names in directory `path`.
     fn list_dir(&self, path: &Path) -> io::Result<Vec<String>>;
 
-    /// The SHA-256 of the file at `path`, lowercase hex, read in a stream (artifacts run to
-    /// hundreds of megabytes). Never follows a link at `path`.
-    ///
-    /// # Errors
-    /// The underlying I/O error.
+    /// Compute the lowercase hex SHA-256 of the file at `path` without following symlinks.
     fn sha256(&self, path: &Path) -> io::Result<String>;
 
-    /// Copy the file `from` to `to` (through a sibling temporary and a rename) with `mode`.
-    /// Never follows a link at either end.
-    ///
-    /// # Errors
-    /// The underlying I/O error.
+    /// Atomically copy `from` to `to` with `mode` without following symlinks at either end.
     fn copy_file(&self, from: &Path, to: &Path, mode: u32) -> io::Result<()>;
 
-    /// `rename(from, to)`.
-    ///
-    /// # Errors
-    /// The underlying I/O error.
+    /// Rename `from` to `to`.
     fn rename(&self, from: &Path, to: &Path) -> io::Result<()>;
 
-    /// Atomically rename `from` to an absent `to`. Any existing destination,
-    /// including an empty directory or a dangling link, is preserved.
-    /// Backends must provide an exclusive OS primitive, never a prior existence
-    /// check followed by an ordinary rename.
-    ///
-    /// # Errors
-    /// The underlying I/O error, [`io::ErrorKind::AlreadyExists`] on collision,
-    /// or [`io::ErrorKind::Unsupported`] when atomic exclusion is unavailable.
+    /// Atomically rename `from` to an absent `to`, failing with [`io::ErrorKind::AlreadyExists`]
+    /// on collision.
     fn rename_noreplace(&self, from: &Path, to: &Path) -> io::Result<()> {
         let _ = (from, to);
         Err(io::ErrorKind::Unsupported.into())
@@ -634,12 +493,7 @@ pub trait System: Sync {
     /// Unix seconds now.
     fn now(&self) -> u64;
 
-    /// Create `path` holding `bytes` with `mode`, failing with
-    /// [`io::ErrorKind::AlreadyExists`] when anything (a link included) is there: the
-    /// exclusive create a lock file needs.
-    ///
-    /// # Errors
-    /// The underlying I/O error.
+    /// Exclusively create `path` with `bytes` and `mode`, failing if anything already exists.
     fn create_new(&self, path: &Path, bytes: &[u8], mode: u32) -> io::Result<()> {
         let _ = (path, bytes, mode);
         Err(io::Error::from(io::ErrorKind::Unsupported))
@@ -651,11 +505,7 @@ pub trait System: Sync {
         false
     }
 
-    /// Retain a child and offer a stdin start gate. The executable must cooperatively
-    /// await that gate before effects; this does not suspend arbitrary child code.
-    ///
-    /// # Errors
-    /// Unsupported backend, invalid request or spawn failure. No child is returned by PID alone.
+    /// Spawn a detached child gated on a one-byte stdin start token.
     fn stage_detached(
         &self,
         _cmd: &Cmd,
@@ -666,61 +516,37 @@ pub trait System: Sync {
         ))
     }
 
-    /// Await the parent's one-byte start gate before admitting a run-job's actions.
-    /// This is lifecycle gating, not a replacement for envelope/holder authority.
-    ///
-    /// # Errors
-    /// Missing/invalid commit, timeout, I/O failure or unsupported backend.
+    /// Wait up to `_limit` for the parent's one-byte start token on stdin.
     fn await_start(&self, _limit: Duration) -> Result<(), RunFailed> {
         Err(RunFailed::Refused(
             "start gate is not implemented by this backend".into(),
         ))
     }
 
-    /// Start `cmd` detached from this process: a session of its own (`setsid`), standard
-    /// input closed, standard output and error appended to `log`, no deadline. Returns
-    /// its pid. The agent's run job (design §4.4) outlives the SSH session this way.
-    ///
-    /// # Errors
-    /// [`RunFailed`] when it could not be started.
+    /// Start `cmd` detached in its own session (`setsid`) with output appended to `log`.
     fn spawn_detached(&self, cmd: &Cmd, log: &Path) -> Result<u32, RunFailed> {
         let _ = (cmd, log);
         Err(RunFailed::Refused("spawn_detached: not supported".into()))
     }
 
-    /// Make `link` a symbolic link to `target`.
-    ///
-    /// # Errors
-    /// The underlying I/O error.
+    /// Create a symbolic link at `link` pointing to `target`.
     fn symlink(&self, target: &Path, link: &Path) -> io::Result<()> {
         let _ = (target, link);
         Err(io::Error::from(io::ErrorKind::Unsupported))
     }
 
-    /// The target of the symbolic link at `path`.
-    ///
-    /// # Errors
-    /// The underlying I/O error.
+    /// Read the target of the symbolic link at `path`.
     fn read_link(&self, path: &Path) -> io::Result<PathBuf> {
         let _ = path;
         Err(io::Error::from(io::ErrorKind::Unsupported))
     }
 
-    /// Resolve a local filesystem target, including app-bundle aliases. Test
-    /// backends may leave this unsupported and compare their injected paths.
-    ///
-    /// # Errors
-    /// The path cannot be resolved or this backend cannot inspect the filesystem.
+    /// Resolve `_path` to its canonical local filesystem path.
     fn canonicalize(&self, _path: &Path) -> io::Result<PathBuf> {
         Err(io::ErrorKind::Unsupported.into())
     }
 
-    /// Write everything `from` yields to `path` atomically with `mode`, like
-    /// [`System::write_file`], without holding it all in memory (an artifact runs to
-    /// hundreds of megabytes). Returns the byte count.
-    ///
-    /// # Errors
-    /// The underlying I/O error.
+    /// Stream `from` into `path` atomically with `mode`, returning the number of bytes written.
     fn write_stream(&self, path: &Path, from: &mut dyn io::Read, mode: u32) -> io::Result<u64> {
         let mut bytes = Vec::new();
         from.read_to_end(&mut bytes)?;
@@ -728,64 +554,34 @@ pub trait System: Sync {
         Ok(bytes.len() as u64)
     }
 
-    /// Hold an exclusive advisory lock (`flock`) on `path` (created 0600 when missing, never
-    /// through a link) until the returned guard drops, waiting at most `limit` for another
-    /// holder: the critical section in which the agent's run lock is taken, handed and
-    /// released, so two of them never interleave. The default holds nothing (a test arm
-    /// runs one thread).
-    ///
-    /// # Errors
-    /// The underlying I/O error, or [`io::ErrorKind::TimedOut`] past `limit`.
+    /// Acquire an exclusive `flock` on `path` within `limit`, held until the returned guard drops.
     fn exclusive(&self, path: &Path, limit: Duration) -> io::Result<Box<dyn std::any::Any>> {
         let _ = (path, limit);
         Ok(Box::new(()))
     }
 
-    /// `screen`'s local end (design §6): listen on a free port on `127.0.0.1` and run `cmd`
-    /// once for each connection made to it, with that connection as the run's standard input
-    /// and output and standard error discarded. A run lasts as long as its connection (no
-    /// deadline: `cmd`'s budget is not used), and the handle's close or drop ends them all.
-    ///
-    /// # Errors
-    /// [`RunFailed::Refused`] for a `cmd` a connection cannot carry (a relative program, a
-    /// run as another user or in a session, an input file, a run kept to its deadline);
-    /// [`RunFailed::Spawn`] when the listener could not be made.
+    /// Listen on a loopback port and spawn `cmd` per connection with stdio bound to the socket.
     fn relay(&self, cmd: &Cmd) -> Result<Box<dyn Relaying + '_>, RunFailed> {
         let _ = cmd;
         Err(RunFailed::Refused("relay: not supported".into()))
     }
 
-    /// Lock the screen of the login session this process runs in, as the Apple menu's Lock
-    /// Screen does, whatever the screen-lock setting (design §6): [`Live`] asks loginwindow
-    /// through login.framework (`port/screen_lock.rs`). Only a process inside that session
-    /// (`launchctl asuser`) reaches its loginwindow. The default locks nothing; the test arm
-    /// records the call.
-    ///
-    /// # Errors
-    /// One line when loginwindow did not take the lock.
+    /// Lock the current login session's screen via `login.framework`.
     fn lock_screen(&self) -> Result<(), String> {
         Err("lock_screen: not supported".into())
     }
 
-    /// Until the handle drops, note SIGINT, SIGTERM and SIGHUP ([`System::stopped`]) instead
-    /// of ending this process, so `screen` can close its relay and lock the session before it
-    /// exits (design §6); the drop puts back the dispositions it replaced. [`Live`] sets them
-    /// for the whole process (`port/stops.rs`), so one flow holds them at a time. The default
-    /// catches nothing; the test arm records the catch and its end.
+    /// Catch `SIGINT`, `SIGTERM`, and `SIGHUP` until the returned handle drops.
     fn catch_stops(&self) -> Box<dyn std::any::Any> {
         Box::new(())
     }
 
-    /// The first signal [`System::catch_stops`] noted while its handle lives. The default:
-    /// none.
+    /// Return the first signal caught since [`System::catch_stops`] was armed.
     fn stopped(&self) -> Option<i32> {
         None
     }
 
-    /// Ignore SIGHUP and SIGPIPE from here on, for the whole process: the host's screen
-    /// watcher (`crate::agent::watch`) outlives the run that started it, and neither a hang-up
-    /// nor a log it cannot write may end it before it locks. [`Live`] sets both to `SIG_IGN`
-    /// (`port/stops.rs`); the default ignores nothing; the test arm records the call.
+    /// Ignore `SIGHUP` and `SIGPIPE` for the process.
     fn ignore_hangups(&self) {}
 
     /// This Mac's own `IOPlatformUUID` on the live system; `None` in tests.
@@ -793,15 +589,7 @@ pub trait System: Sync {
         None
     }
 
-    /// The converge journal of the account this system acts as, which records each change
-    /// before it is made (docs/DESIGN-init-system-2026-10-20.md §3.3): an item's journal
-    /// goes where its account is, so it comes from the same port the items act through.
-    /// [`Live`] keeps it under the account's state root; the test arm keeps it in its own
-    /// files, so a run over it can never write the journal of the account running the
-    /// test. The default keeps none, and every change is refused on it.
-    ///
-    /// # Errors
-    /// No journal can be kept (the account has no state root; this system keeps none).
+    /// Open the converge journal for the account this system acts as.
     fn journal(&self) -> Result<Box<dyn aterm_converge::Journal + '_>, String> {
         Err("this system keeps no converge journal".into())
     }
@@ -825,26 +613,19 @@ impl Live {
         }
     }
 
-    /// The argv `cmd` really runs: wrapped in `sudo -u … env -i …` and `launchctl asuser`
-    /// as asked (design §3.5).
+    /// Build the real program and argv for `cmd`, wrapping with `sudo` and `launchctl` as needed.
     fn argv(&self, cmd: &Cmd) -> Result<(PathBuf, Vec<OsString>), RunFailed> {
         Self::argv_from(self.euid(), cmd)
     }
 
-    /// What this port spawns for `cmd`: the program, its arguments and its whole
-    /// environment, for a test's spawn record.
-    ///
-    /// # Errors
-    /// As [`Live::argv`].
+    /// Return the program, arguments, and environment [`Live`] would spawn for `cmd`.
     #[cfg(test)]
     pub(crate) fn spawned(&self, cmd: &Cmd) -> Result<Spawned, RunFailed> {
         let (program, args) = self.argv(cmd)?;
         Ok((program, args, self.child_env(cmd)))
     }
 
-    /// [`Live::argv`] for a process whose effective uid is `euid`: a function of the
-    /// two alone, so both the root wrapping and the refusal without root are checked
-    /// on whatever account runs the tests.
+    /// Build the program and argv for `cmd` assuming effective uid `euid`.
     fn argv_from(euid: u32, cmd: &Cmd) -> Result<(PathBuf, Vec<OsString>), RunFailed> {
         let Some(user) = &cmd.user else {
             return Ok((cmd.program.clone(), cmd.args.clone()));
@@ -892,16 +673,7 @@ impl Live {
         Ok((program, args))
     }
 
-    /// The whole environment a child of `cmd` starts with (it is cleared first), then
-    /// [`Cmd::env`].
-    ///
-    /// A root process never passes on the HOME it was given (design §3.4): Apple's sudoers
-    /// keeps the caller's (`env_keep += "HOME MAIL"`), so under a password sudo root would
-    /// hand the admin's home to every tool. Root's children get root's own. A run as
-    /// another account from root carries [`account_env`] in the `env -i` list
-    /// [`Live::argv`] builds (sudo's env_reset drops what is set here). A run as this
-    /// process's own account, which `argv` leaves unwrapped, gets that same list here, so
-    /// it sees what it would see wrapped (`git config --global` needs HOME).
+    /// Build the complete child environment for `cmd` (account defaults plus [`Cmd::env`]).
     fn child_env(&self, cmd: &Cmd) -> Vec<(String, String)> {
         let mut env: Vec<(String, String)> = match &cmd.user {
             Some(user) if self.euid() != 0 => account_env(user).to_vec(),
@@ -926,12 +698,7 @@ impl Live {
         env
     }
 
-    /// [`System::run`] for a [`Cmd::keep_on_timeout`] run. Standard output and error go to
-    /// private files rather than pipes, so what the tool printed outlives the kill at the
-    /// deadline (`aterm_uds::deadline` answers a timed-out run with nothing). The child leads
-    /// its own process group, as there, and at the deadline the whole group is killed: run as
-    /// an account from root, the child is `sudo` (or `launchctl asuser`) and the tool its
-    /// descendant, which killing the child alone would leave running.
+    /// Run a [`Cmd::keep_on_timeout`] command with output redirected to temporary files.
     fn run_until_deadline(&self, cmd: &Cmd) -> Result<Ran, RunFailed> {
         use std::os::unix::fs::OpenOptionsExt as _;
         let failed = |e: io::Error| RunFailed::Spawn(e.to_string());
@@ -986,9 +753,7 @@ impl Live {
     }
 }
 
-/// The environment a run as `user` starts with, wrapped or not: the account's variables,
-/// then the fixed `PATH` and locale. Its login shell is `/bin/zsh` (macOS's default) when
-/// none was read.
+/// Base environment variables (`HOME`, `USER`, `LOGNAME`, `SHELL`, `PATH`, `LC_ALL`) for `user`.
 fn account_env(user: &User) -> [(String, String); 6] {
     let shell = if user.shell.is_empty() {
         "/bin/zsh"
@@ -1006,20 +771,17 @@ fn account_env(user: &User) -> [(String, String); 6] {
     .map(|(k, v)| (k.to_owned(), v.to_owned()))
 }
 
-/// `SIGKILL` the process group `child` leads (it was spawned with `process_group(0)`) and
-/// the child itself, then reap it: what `aterm_uds::deadline` does at a deadline.
+/// `SIGKILL` `child` and its process group, then reap `child`.
 fn end_group(child: &mut aterm_uds::spawnfd::Child) {
     if let Ok(pid) = libc::pid_t::try_from(child.id()) {
-        // SAFETY: a plain syscall. The child is not yet reaped, so its pid, and with it the
-        // group id it leads, cannot have been reused.
+        // SAFETY: `child` is not yet reaped, so its pid and process group id remain valid.
         unsafe { libc::kill(-pid, libc::SIGKILL) };
     }
     let _ = child.kill();
     let _ = child.wait();
 }
 
-/// The last [`aterm_uds::deadline::OUTPUT_KEEP`] bytes of the file at `path`, as a piped run
-/// keeps them; only those are read, whatever the tool wrote before them.
+/// Read at most the last [`aterm_uds::deadline::OUTPUT_KEEP`] bytes of `path`.
 fn kept_tail(path: &Path) -> io::Result<Vec<u8>> {
     use std::io::{Read as _, Seek as _};
     use std::os::unix::fs::OpenOptionsExt as _;
@@ -1035,9 +797,7 @@ fn kept_tail(path: &Path) -> io::Result<Vec<u8>> {
     Ok(bytes)
 }
 
-/// `program` with `args` in a cleared environment holding only `env` ([`Live::child_env`]),
-/// with `/` as the working directory. [`Live::run`] and [`System::relay`]'s connections
-/// share it.
+/// Build a command for `program` and `args` in `/` with only `env` set.
 fn fixed_command(
     program: &Path,
     args: &[OsString],
@@ -1150,8 +910,6 @@ impl System for Live {
         }
         let (program, args) = self.argv(cmd)?;
         let mut child = fixed_command(&program, &args, &self.child_env(cmd));
-        // Existing stdin admission policy is unchanged: opening a caller-supplied
-        // pathname precedes the child deadline. Complete capture is not an I/O deadline.
         let stdin = match &cmd.stdin {
             Some(path) => aterm_uds::spawnfd::Stdio::from(
                 std::fs::File::open(path)
@@ -1220,9 +978,6 @@ impl System for Live {
         }
         let (program, args) = self.argv(cmd)?;
         let mut child = fixed_command(&program, &args, &self.child_env(cmd));
-        // Written whole before the child starts, so no thread is needed: a pipe holds 16 KiB
-        // at least and a secret is at most SECRET_MAX. The writer's close is the child's end
-        // of input.
         let (reader, mut writer) = io::pipe().map_err(|e| RunFailed::Spawn(e.to_string()))?;
         writer
             .write_all(input.bytes())
@@ -1335,8 +1090,6 @@ impl System for Live {
 
     fn set_owner_and_mode(&self, path: &Path, uid: u32, gid: u32, mode: u32) -> io::Result<()> {
         use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _};
-        // O_NONBLOCK: a FIFO swapped in opens at once, and is refused below, instead of
-        // waiting for a writer.
         let file = std::fs::OpenOptions::new()
             .read(true)
             .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
@@ -1456,8 +1209,6 @@ impl System for Live {
             .open(path)?;
         f.write_all(bytes)?;
         f.set_permissions(std::fs::Permissions::from_mode(mode))?;
-        // Ordered: the run lock is taken over once its holder is dead, which no reboot
-        // leaves alive; a staging file is consumed at once; a placeholder is empty.
         aterm_durable::ordered(&f)
     }
 
@@ -1508,8 +1259,6 @@ impl System for Live {
             child.env(key, value);
         }
         let started = child.spawn().map_err(|e| RunFailed::Spawn(e.to_string()))?;
-        // The handle is dropped unreaped on purpose: the job outlives this process, and
-        // aterm-uds's reaper collects it should it end first.
         Ok(started.id())
     }
 
@@ -1594,10 +1343,7 @@ impl System for Live {
         crate::agent::platform::ioreg_value(&ran.out(), "IOPlatformUUID")
     }
 
-    /// `<state_dir>/converge/journal.ndjson` under [`aterm_types::dirs::account_state_dir`]:
-    /// the state root the process's items act on (a private state root as it is, else
-    /// `$HOME`'s), and for root its own account record's home, since `sudo aterm machines
-    /// here apply` may keep the invoking person's `$HOME`.
+    /// Open `<state_dir>/converge/journal.ndjson` under the target account's state directory.
     fn journal(&self) -> Result<Box<dyn aterm_converge::Journal + '_>, String> {
         aterm_types::dirs::account_state_dir()
             .map(|root| {
@@ -1608,14 +1354,11 @@ impl System for Live {
     }
 }
 
-/// [`Live::exclusive`]'s guard: released by `LOCK_UN` when dropped, before the close
-/// (clippy.toml: the flock release rule).
+/// Exclusive `flock` guard that unlocks before closing on drop.
 struct Exclusive(std::fs::File);
 
 impl Exclusive {
-    /// Take `file`'s exclusive lock, re-trying every 20 ms for up to `limit`.
     fn within(file: std::fs::File, limit: Duration, what: &Path) -> io::Result<Self> {
-        // The lock-order census's File evidence (as atpkg's `lock::Flock`).
         let file: std::fs::File = file;
         let deadline = std::time::Instant::now() + limit;
         loop {
@@ -1665,10 +1408,7 @@ impl Staged<'_> {
     }
 }
 
-/// Write `bytes` to a fresh 0600 file in an exclusively owned temporary directory.
-///
-/// # Errors
-/// The underlying I/O error. Only this call's allocation is cleaned on failure.
+/// Write `bytes` to a fresh `0600` file inside an exclusively owned temporary directory.
 pub fn staging_file<'s>(sys: &'s dyn System, bytes: &[u8]) -> io::Result<Staged<'s>> {
     let scratch = Scratch::new(sys, "stdin")?;
     let path = scratch.path().join("payload");
@@ -1679,14 +1419,7 @@ pub fn staging_file<'s>(sys: &'s dyn System, bytes: &[u8]) -> io::Result<Staged<
     })
 }
 
-/// Write `bytes` to `path` through a sibling temporary and a rename, with `mode`. A link
-/// at `path` is replaced, never followed; a link at the temporary's name fails the open.
-/// Flush the payload before rename and the destination directory after it. Callers
-/// that create ancestors must also publish those directory entries before relying on
-/// the new name surviving a power interruption. A flush error can leave `path` replaced.
-///
-/// # Errors
-/// The underlying I/O error.
+/// Atomically write `bytes` to `path` with `mode` via a sibling temporary file and durable rename.
 pub fn write_atomic(path: &Path, bytes: &[u8], mode: u32) -> io::Result<()> {
     use std::io::Write as _;
     use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
@@ -1733,11 +1466,7 @@ mod fake {
     /// A tool a test models from its own state ([`Fake::simulate`]).
     type Model = Arc<dyn Fn(&Fake, &Cmd) -> Option<Ran> + Send + Sync>;
 
-    /// The scripted operating system tests run items against.
-    ///
-    /// A reply is keyed by [`Cmd::display`] (`<user>$ ` prefixed for `as_user`). Replies
-    /// for one key are consumed in order and the last one repeats. A run with no scripted
-    /// reply fails as [`RunFailed::Spawn`], so a test notices a command it did not expect.
+    /// Scripted [`System`] implementation for unit tests.
     #[derive(Default)]
     pub struct Fake {
         /// The tools a test models instead of scripting ([`Fake::simulate`]).
@@ -1770,11 +1499,9 @@ mod fake {
         pub next_pid: u32,
         /// The port [`System::relay`] answers; 0 fails it.
         pub relay_port: u16,
-        /// What [`System::lock_screen`] answers: `None` takes the lock, `Some(why)` refuses
-        /// it. Either way the call is recorded as `lock-screen`, and nothing is locked.
+        /// Simulated [`System::lock_screen`] error (`None` succeeds).
         pub lock_refused: Option<String>,
-        /// How many [`System::stopped`] readings answer none before every later one answers
-        /// SIGINT, as if the person pressed Ctrl-C there; `None`: never.
+        /// Number of `None` readings from [`System::stopped`] before returning `SIGINT`.
         pub stop_after: Option<usize>,
         /// The [`System::stopped`] readings so far.
         stop_readings: Mutex<usize>,
@@ -1792,7 +1519,6 @@ mod fake {
         Stat(PathBuf, Stat),
     }
 
-    /// [`Fake`]'s converge journal: each line appended to [`Fake::JOURNAL`] in its files.
     struct Journaled<'a>(&'a Fake);
 
     impl aterm_converge::Journal for Journaled<'_> {
@@ -1974,8 +1700,7 @@ mod fake {
             self
         }
 
-        /// The fake account's converge journal ([`System::journal`]), a file of the fake's
-        /// own: each change's line is appended there, read back with [`Fake::written`].
+        /// Path of the fake converge journal in [`Fake`]'s virtual filesystem.
         pub const JOURNAL: &'static str =
             "/var/root/Library/Application Support/aterm/converge/journal.ndjson";
 
@@ -1988,8 +1713,7 @@ mod fake {
             }
         }
 
-        /// The deterministic candidate used only by this in-memory backend. Fixtures
-        /// script external-tool output after allocation, never pre-adopt a real path.
+        /// Return the next deterministic scratch path without allocating it.
         #[must_use]
         pub fn scratch_path(parent: Option<&Path>, label: &str, sequence: u64) -> PathBuf {
             parent.unwrap_or_else(|| Path::new("/tmp")).join(format!(
@@ -1998,8 +1722,7 @@ mod fake {
             ))
         }
 
-        /// Have the scripted command create its output when it runs, after the caller
-        /// has allocated its scratch. No host filesystem or command is involved.
+        /// Script a file write side effect when `key` runs.
         pub fn on_write(&self, key: &str, path: &Path, bytes: &[u8]) -> &Self {
             self.outputs
                 .lock()
@@ -2053,16 +1776,13 @@ mod fake {
             self
         }
 
-        /// Queue an explicit child-side gate observation. No answer means refusal,
-        /// never a real stdin read or a grant inferred from a fake spawned PID.
+        /// Queue the result returned by [`System::await_start`].
         pub fn start_answer(&self, answer: Result<(), RunFailed>) -> &Self {
             self.start_answers.lock().unwrap().push_back(answer);
             self
         }
 
-        /// Queue what the next [`System::ask`] answers: `Some(line)` as typed, `None` for
-        /// nothing typed. An ask with nothing queued fails, so a test notices a prompt it
-        /// did not expect.
+        /// Queue the next reply for [`System::ask`].
         pub fn answer(&self, line: Option<&str>) -> &Self {
             self.answers
                 .lock()
@@ -2071,19 +1791,13 @@ mod fake {
             self
         }
 
-        /// Every [`System::run_fed`] run so far: its key (`fed <display>`, the key its reply
-        /// is scripted under) and what it was fed. Only here does a fed secret show: the
-        /// run's display, which [`Fake::calls`] records, never holds it.
+        /// Recorded `(key, input)` pairs from [`System::run_fed`].
         #[must_use]
         pub fn fed(&self) -> Vec<(String, Vec<u8>)> {
             self.fed.lock().unwrap().clone()
         }
 
-        /// Answer every command `model` answers (`Some`) from the test's own state, before
-        /// any scripted reply: a desktop whose `defaults`, `pgrep`, `killall` and `sleep` act
-        /// on one another. It is handed this fake, so it can start and end processes
-        /// ([`Fake::alive`], [`Fake::exited`]). Each run is still recorded in
-        /// [`Fake::calls`]; one it leaves (`None`) gets its scripted reply.
+        /// Install a dynamic command handler consulted before scripted replies.
         pub fn simulate(
             &self,
             model: impl Fn(&Self, &Cmd) -> Option<Ran> + Send + Sync + 'static,
@@ -2125,9 +1839,7 @@ mod fake {
             self
         }
 
-        /// Script a controller REST request (`github <METHOD> <endpoint>`), without
-        /// retaining its credential or opening a socket. [`Fake::calls`] records it with its
-        /// JSON body, when it has one, after the endpoint.
+        /// Script a [`System::github_rest`] response.
         pub fn on_github_rest(
             &self,
             method: super::RestMethod,
@@ -2178,8 +1890,6 @@ mod fake {
             self
         }
 
-        /// What the commands scripted under `key` leave behind ([`Fake::on_write`],
-        /// [`Fake::on_stat`]), once one of them ran.
         fn produce(&self, key: &str) {
             let outputs = self
                 .outputs
@@ -2317,8 +2027,6 @@ mod fake {
                 *sequence = sequence
                     .checked_add(1)
                     .ok_or_else(|| io::Error::other("fake scratch sequence exhausted"))?;
-                // A subtree is occupancy too: Fake fixtures must not seed unowned
-                // contents and then pretend their absent directory was just allocated.
                 let files = self.files.lock().unwrap();
                 let mut stats = self.stats.lock().unwrap();
                 let links = self.links.lock().unwrap();
@@ -2391,8 +2099,6 @@ mod fake {
             if let Some(why) = self.strict_refusals.lock().unwrap().get(&cmd.display()) {
                 return Err(RunFailed::Refused(why.clone()));
             }
-            // A scripted Fake vector models the entire stream, not a captured tail.
-            // Only Live's strict helper establishes real pipe EOF/no loss.
             if reply.stdout.len() > aterm_uds::deadline::OUTPUT_KEEP {
                 return Err(RunFailed::Refused(format!(
                     "complete stdout exceeds {} bytes",
@@ -2404,8 +2110,6 @@ mod fake {
 
         fn run_complete_stdout_input(&self, cmd: &Cmd, _input: &[u8]) -> Result<Ran, RunFailed> {
             super::complete_input::admit(cmd)?;
-            // No input copy is retained, even by the injected backend. The ordinary
-            // command key scripts the complete reply; calls records only that key.
             self.run_complete_stdout(cmd)
         }
 
@@ -2705,7 +2409,6 @@ mod fake {
             if let Some(v) = files.remove(from) {
                 files.insert(to.to_path_buf(), v);
             }
-            // A directory's rename carries the files below it.
             let below: Vec<PathBuf> = files
                 .keys()
                 .filter(|p| p.starts_with(from) && *p != from)
@@ -2731,8 +2434,6 @@ mod fake {
             {
                 return Err(io::ErrorKind::InvalidInput.into());
             }
-            // Hold all modeled filesystem maps across both admission and movement.
-            // A competing exclusive publisher cannot observe a check/move gap.
             let mut files = self.files.lock().unwrap();
             let mut stats = self.stats.lock().unwrap();
             let mut links = self.links.lock().unwrap();
@@ -2905,7 +2606,6 @@ mod fake {
         }
     }
 
-    /// [`Fake::catch_stops`]'s handle: catches nothing, records its end as `stops restored`.
     struct Caught(Arc<Mutex<Vec<String>>>);
 
     impl Drop for Caught {
@@ -2914,7 +2614,6 @@ mod fake {
         }
     }
 
-    /// [`Fake::relay`]'s handle: listens on nothing, records its close as `relay closed`.
     struct Relayed<'a> {
         calls: &'a Mutex<Vec<String>>,
         port: u16,
@@ -3089,7 +2788,6 @@ mod tests {
 
     #[test]
     fn from_root_a_user_run_scrubs_the_environment_and_a_session_run_goes_through_launchctl() {
-        // Only the argv shape is checked here, for a root euid on any account; nothing runs.
         let (program, args) = Live::argv_from(
             0,
             &Cmd::new("/usr/bin/open")
@@ -3135,7 +2833,6 @@ mod tests {
         other.uid = euid + 1;
         let err = Live::argv_from(euid, &Cmd::new("/usr/bin/true").as_user(&other)).unwrap_err();
         assert!(matches!(err, RunFailed::Refused(_)), "{err:?}");
-        // Its own account it runs unwrapped.
         let (program, args) = Live::argv_from(
             euid,
             &Cmd::new("/usr/bin/true").as_user(&User {
@@ -3152,15 +2849,10 @@ mod tests {
     fn a_run_as_this_processs_own_account_gets_that_accounts_home_and_names() {
         let live = Live::new();
         if live.euid() == 0 {
-            // From root the run is wrapped in sudo to an account that does not exist; the
-            // argv tests above check that wrapping on any account.
             aterm_uds::host::could_not_run(
                 "as root a run as this account is wrapped; the unwrapped run needs a non-root uid",
             );
         }
-        // Our own uid under a name and home of the test's making: what the child sees must
-        // come from the account, not from this process's environment, and be the list a
-        // run wrapped from root carries (the argv test above).
         let me = User {
             name: "lab-person".into(),
             uid: live.euid(),
@@ -3206,8 +2898,6 @@ mod tests {
         assert!(!format!("{cmd:?}").contains("agent-secret"), "{cmd:?}");
     }
 
-    /// A new run lock, staging file or placeholder is only ordered (aterm-durable's
-    /// counting seam); a copied artifact stays durable.
     #[test]
     fn a_new_file_is_ordered_and_a_copy_durable() {
         use aterm_durable::{Flush, seam::Recording};
@@ -3267,8 +2957,6 @@ mod tests {
 
     #[test]
     fn a_run_kept_to_its_deadline_ends_what_its_child_started_too() {
-        // Run as an account from root, the child is `sudo` (or `launchctl asuser`) and the
-        // tool is its descendant: the deadline must end the tool, not orphan it.
         let live = Live::new();
         let ran = live
             .run(
@@ -3303,7 +2991,6 @@ mod tests {
         std::fs::write(&file, b"x").unwrap();
         std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
         let meta = std::fs::metadata(&file).unwrap();
-        // Our own uid and gid: the one owner a process that is not root may give.
         live.set_owner_and_mode(&file, meta.uid(), meta.gid(), 0o644)
             .unwrap();
         assert_eq!(std::fs::metadata(&file).unwrap().mode() & 0o7777, 0o644);

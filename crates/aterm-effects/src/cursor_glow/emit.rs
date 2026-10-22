@@ -2579,7 +2579,7 @@ impl CursorGlow {
     /// The first sample of the run of adjacent samples that ends just
     /// before `end` in `samples`.
     #[inline]
-    fn water_run_start(samples: &[WaterSample], end: usize) -> usize {
+    const fn water_run_start(samples: &[WaterSample], end: usize) -> usize {
         let mut start = end - 1;
         while start > 0 {
             let (a, b) = (&samples[start - 1], &samples[start]);
@@ -4165,7 +4165,7 @@ impl CursorGlow {
     /// lifted for the theme's text) only when a test asks: the negative
     /// control of the light-body legibility tests.
     #[inline]
-    pub(super) fn light_ground(&self, cfg: &GlowConfig) -> LightGround {
+    pub(super) const fn light_ground(&self, cfg: &GlowConfig) -> LightGround {
         let ground = LightGround::of(cfg);
         #[cfg(test)]
         let ground = LightGround {
@@ -4178,12 +4178,12 @@ impl CursorGlow {
     /// Whether a test asked for the light bodies' inks and ceilings unsolved
     /// ([`Self::light_ground`]); never in a build.
     #[cfg(test)]
-    pub(super) fn light_body_unsolved(&self) -> bool {
+    pub(super) const fn light_body_unsolved(&self) -> bool {
         self.light_body_unsolved
     }
     #[cfg(not(test))]
     #[inline(always)]
-    pub(super) fn light_body_unsolved(&self) -> bool {
+    pub(super) const fn light_body_unsolved(&self) -> bool {
         false
     }
 
@@ -4191,12 +4191,12 @@ impl CursorGlow {
     /// solved to the bar: never in a build, and only when a test asks (the
     /// bed's bar test's negative control).
     #[cfg(test)]
-    pub(super) fn bed_unsolved(&self) -> bool {
+    pub(super) const fn bed_unsolved(&self) -> bool {
         self.bed_unsolved
     }
     #[cfg(not(test))]
     #[inline(always)]
-    pub(super) fn bed_unsolved(&self) -> bool {
+    pub(super) const fn bed_unsolved(&self) -> bool {
         false
     }
 
@@ -4204,12 +4204,12 @@ impl CursorGlow {
     /// in a build, and only when a test asks (the account's negative
     /// control).
     #[cfg(test)]
-    pub(super) fn over_ink_idle(&self) -> bool {
+    pub(super) const fn over_ink_idle(&self) -> bool {
         self.over_ink_idle
     }
     #[cfg(not(test))]
     #[inline(always)]
-    pub(super) fn over_ink_idle(&self) -> bool {
+    pub(super) const fn over_ink_idle(&self) -> bool {
         false
     }
 
@@ -4217,12 +4217,12 @@ impl CursorGlow {
     /// over-ink ledger and its steam's stacking budget): never in a build,
     /// and only when a test asks (the contrast tests' negative control).
     #[cfg(test)]
-    pub(super) fn streak_unbudgeted(&self) -> bool {
+    pub(super) const fn streak_unbudgeted(&self) -> bool {
         self.streak_unbudgeted
     }
     #[cfg(not(test))]
     #[inline(always)]
-    pub(super) fn streak_unbudgeted(&self) -> bool {
+    pub(super) const fn streak_unbudgeted(&self) -> bool {
         false
     }
 
@@ -4298,7 +4298,7 @@ impl CursorGlow {
     /// gold by default) at a warm gold's chroma, so the comet reads gold, not
     /// cream.
     #[inline]
-    pub(super) fn sparkle_gold(cfg: &GlowConfig) -> u32 {
+    pub(super) const fn sparkle_gold(cfg: &GlowConfig) -> u32 {
         crate::spectrum::spectrum_with_min_saturation(cfg.color & 0x00FF_FFFF, 0.72)
     }
 
@@ -4318,8 +4318,8 @@ impl CursorGlow {
     /// fresh mark is all but opaque (it is never laid over the text, so it
     /// needs no may-touch-text ceiling), and a fading one thins with it.
     #[inline]
-    pub(super) fn paper_gold_alpha(cov: u8) -> u8 {
-        (f32::from(cov) * 1.25).min(240.0) as u8
+    pub(super) const fn paper_gold_alpha(cov: u8) -> u8 {
+        (cov as f32 * 1.25).min(240.0) as u8
     }
 }
 
@@ -4430,7 +4430,7 @@ fn fire_band_lifts(
 /// The bloom-layer stack `style` draws its streak with (and charges its
 /// over-ink budget against): each beam style's own, the comet's for the rest.
 #[inline]
-fn streak_layers(style: GlowStyle) -> &'static [(f32, f32, u32, f32, f32, usize)] {
+const fn streak_layers(style: GlowStyle) -> &'static [(f32, f32, u32, f32, f32, usize)] {
     match style {
         GlowStyle::Phaser => &PHASER_LAYERS,
         GlowStyle::Beam => &BEAM_LAYERS,

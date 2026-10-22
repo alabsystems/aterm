@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE OVERVIEW'S "ON THE FABRIC" GROUP (session log Phase 6 step 6E-7,
-//! ruling U42): what the fabric's log says the sessions on this aterm's
+//! THE OVERVIEW'S "ON THE FABRIC" GROUP:
+//! what the fabric's log says the sessions on this aterm's
 //! fabric's OTHER machines need of the person — a UX decision made from the
 //! stream alone, readable with `controls overview`.
 //!

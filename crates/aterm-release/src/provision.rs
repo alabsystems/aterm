@@ -15,10 +15,15 @@
 //! stable `x86_64-apple-darwin` slice of the universal binary, Apple's packaging tools,
 //! the Developer ID identity, a
 //! LIVE-tested notarytool credential, the credentials profile, `gh` auth and the
-//! channel token. On a machine with none of that, the front door is `aterm pkg install
-//! trust`, then this verb: a full run first ACQUIRES the stock exceptions it audits
-//! ([`acquire`]: rustup, the stable slices, the wasm32 pin, rustup's `trust` link, the
-//! wasm-glue oracle's wasm-bindgen).
+//! channel token. A release host is a develop machine plus the release layer
+//! (docs/DESIGN-init-system-2026-10-20.md §4.6), so it also audits the base layer (the
+//! installed aterm's `aterm init --check --only base`), the develop layer (every row a
+//! bare `targo --unverified verify provision` provides) and the release items
+//! ([`layer`]: macOS's LibreSSL, the publication engine, the site checkout, node and
+//! firebase-tools). On a machine with none of that, the front door is `aterm pkg
+//! install trust`, then this verb: a full run first ACQUIRES what it can: `verify
+//! provision`'s default rows (rustup, the stable slices, the wasm32 pin, fish, pwsh,
+//! binaryen, the browsers) in process, and rustup's `trust` link ([`seam`]).
 //!
 //! The order is the safety argument:
 //!
@@ -59,8 +64,8 @@ use crate::{channel, gates, machines, publish, sign};
 // By path: `tests/it` compiles this file by `#[path]`, where a bare `mod` would resolve
 // beside it.
 #[cfg(unix)]
-#[path = "provision/acquire.rs"]
-mod acquire;
+#[path = "provision/layer.rs"]
+mod layer;
 
 /// POSIX-only, exactly like the engine it drives: `atpkg-keys` compiles empty on
 /// Windows (`#![cfg(unix)]`), because the master phrase is read from `/dev/tty`.
@@ -272,12 +277,25 @@ pub fn run_provision(
         "build stack",
         "the toolchain and SDK a cut compiles with",
     );
-    // What the audit below would only report missing, a full run acquires first.
+    // What the audit below would only report missing, a full run acquires first: the
+    // rows a bare `verify provision` provides (the develop layer the audit reads back),
+    // then rustup's `trust` link.
     if !check_only {
-        let homes = acquire::Homes::from_env(Path::new(&home));
-        acquire::run(repo, &homes, &acquire::System, &mut |line| {
-            step("acquire", line);
-        });
+        match aterm_verify::provision::this_machine(repo) {
+            Some(machine) => {
+                aterm_verify::provision::run(
+                    &aterm_verify::provision::Options::default(),
+                    &machine,
+                    &aterm_verify::provision::System::new(repo),
+                    &mut |line| step("provision", line),
+                );
+            }
+            None => step(
+                "provision",
+                "COULD NOT RUN — no $HOME names this user's cache",
+            ),
+        }
+        seam(Path::new(&home), &mut |line| step("acquire", line));
     }
     // These two run only behind a proven stage2: without one they have nothing to look at,
     // and a stage2 that cannot compile the native lane needs replacing anyway.
@@ -292,6 +310,12 @@ pub fn run_provision(
     record("rust shims", rust_shim_check(&home), &mut checks);
     record("x86 slice", x86_slice_check(), &mut checks);
     record("apple sdk", apple_clt_check(), &mut checks);
+    // The layers a release host stands on, and the release layer's own tools (§4.6).
+    let host: std::sync::Arc<dyn layer::ReleaseHost> =
+        std::sync::Arc::new(layer::System::new(repo, Path::new(&home)));
+    for (label, check) in layer::audit(&host) {
+        record(label, check, &mut checks);
+    }
 
     phase(
         3,
@@ -423,15 +447,7 @@ pub fn run_provision(
         check_only,
         report: report.as_ref(),
         profile: checks.iter().find(|(l, _)| *l == "profile").map(|(_, c)| c),
-        open: checks
-            .iter()
-            .filter_map(|(l, c)| match c {
-                Check::Fail { .. } | Check::Owner { .. } => Some(format!("{l} (gap)")),
-                Check::Todo { .. } => Some(format!("{l} (waiting)")),
-                Check::CouldNotRun(_) => Some(format!("{l} (could not run)")),
-                _ => None,
-            })
-            .collect(),
+        open: open_labels(&checks),
         authority,
         roster_kept,
         key_exists: key_path.exists(),
@@ -439,6 +455,39 @@ pub fn run_provision(
         waiting,
         host_cannot_cut,
     })
+}
+
+/// The label of every open item, with the word it is counted under: what the closing
+/// verdict names.
+#[cfg(unix)]
+fn open_labels(checks: &[(&'static str, Check)]) -> Vec<String> {
+    checks
+        .iter()
+        .filter_map(|(l, c)| match c {
+            Check::Fail { .. } | Check::Owner { .. } => Some(format!("{l} (gap)")),
+            Check::Todo { .. } => Some(format!("{l} (waiting)")),
+            Check::CouldNotRun(_) => Some(format!("{l} (could not run)")),
+            _ => None,
+        })
+        .collect()
+}
+
+/// rustup's `trust` entry through atpkg's own seam pass (`aterm pkg repair`): a first
+/// attach where it is absent and trust is installed, a stale or dangling link re-pointed
+/// at atpkg's view, and anything it did not lay left alone with the one fix.
+#[cfg(unix)]
+fn seam(home: &Path, report: &mut dyn FnMut(&str)) {
+    let xdg = std::env::var_os("XDG_CONFIG_HOME")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from);
+    let layout = atpkg::Layout {
+        prefix: atpkg::toolchain::atpkg_prefix(home, xdg.as_deref()),
+    };
+    let rustup_home =
+        atpkg::toolchain::rustup_home(std::env::var_os("RUSTUP_HOME").as_deref(), home);
+    for event in atpkg::seam::repair(&layout, &rustup_home) {
+        report(&format!("rustup trust: {event}"));
+    }
 }
 
 /// Everything the closing structure needs, gathered so the results print together, not
@@ -642,15 +691,19 @@ fn close(c: Closing<'_>) -> Result<()> {
     if !c.key_exists {
         if c.check_only {
             let open = gaps(c.fails, c.waiting);
-            println!(
-                "CHECK ONLY — unminted; {}",
-                if open.is_empty() {
-                    format!("a real `{SHIP} provision --id {}` would mint", c.id)
-                } else {
-                    format!("{open} before a real run mints")
-                }
-            );
-            return Ok(());
+            if open.is_empty() {
+                println!(
+                    "CHECK ONLY — unminted; a real `{SHIP} provision --id {}` would mint",
+                    c.id
+                );
+                return Ok(());
+            }
+            // Before the mint as after it, an audit with something open exits non-zero
+            // naming each open item, so a caller can gate on it.
+            return Err(Error::new(format!(
+                "CHECK ONLY — unminted; nothing was written. {open} before a real run mints: {}.",
+                c.open.join(", ")
+            )));
         }
         // Mint deferred: there is no identity to bind, and the machine is not provisioned
         // — say so through the exit code too.
@@ -1539,18 +1592,6 @@ fn x86_slice_check() -> Check {
         },
     }
 }
-
-/// The std targets the `cells` check (`targo --unverified verify cells`, by hand)
-/// compiles the foreign cells for, on upstream stable (Trust has none of them). A full
-/// run acquires them ([`acquire`]) so the check can run here; no release needs them
-/// (`cells` is in no set), so the audit does not ask for them.
-#[cfg(unix)]
-const FOREIGN_CELL_TARGETS: [&str; 4] = [
-    "x86_64-pc-windows-msvc",
-    "aarch64-pc-windows-msvc",
-    "aarch64-unknown-linux-gnu",
-    "wasm32-unknown-unknown",
-];
 
 /// Apple's bundle/sign/package command-line tools — the cut shells all of them.
 #[cfg(unix)]

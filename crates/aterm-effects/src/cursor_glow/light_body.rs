@@ -66,7 +66,7 @@ const fn toward_white(rgb: u32, w: f32) -> u32 {
 /// The composite of `ink` at opacity `a` over `bg`, through the renderer's
 /// own source-over arithmetic.
 #[inline]
-fn over_at(bg: u32, ink: u32, a: u8) -> u32 {
+const fn over_at(bg: u32, ink: u32, a: u8) -> u32 {
     aterm_render::over_premul(bg & 0x00FF_FFFF, premul_rgb(ink, a), a) & 0x00FF_FFFF
 }
 

@@ -113,8 +113,10 @@ fn leak(path: &Path) -> &'static str {
     Box::leak(path.to_string_lossy().into_owned().into_boxed_str())
 }
 
-/// §10 S2: a stand-in at `fish-<pinned>/bin/fish` in a scratch tooling dir is found ahead
-/// of the usual install paths, and `$ATERM_TEST_FISH` still comes first.
+/// §10 S2: a stand-in at `fish-<pinned>/bin/fish` in a scratch tooling dir, stamped as
+/// `verify provision` stamps what it places, is found ahead of the usual install paths,
+/// and `$ATERM_TEST_FISH` still comes first. NEGATIVE CONTROL: the same copy without its
+/// stamp (laid by hand) is passed over for the usual path.
 #[test]
 fn the_pinned_copy_in_the_tooling_cache_comes_before_the_usual_paths() {
     let scratch = aterm_tempfile::tempdir().expect("scratch");
@@ -130,6 +132,18 @@ fn the_pinned_copy_in_the_tooling_cache_comes_before_the_usual_paths() {
         tooling: Some(tooling.clone()),
         path: None,
     };
+    assert_eq!(
+        row.find_in(&lookup),
+        Some(fixed.clone()),
+        "an unstamped copy at the pin is not the pin"
+    );
+    let stamp = tooling
+        .join(format!("fish-{}", pin.version))
+        .join(PIN_STAMP);
+    std::fs::create_dir(&stamp).expect("a folder named like the stamp");
+    assert_eq!(row.find_in(&lookup), Some(fixed), "a stamp is a file");
+    std::fs::remove_dir(&stamp).expect("rmdir");
+    stand_in(&stamp);
     assert_eq!(row.find_in(&lookup), Some(pinned.clone()), "the pin first");
 
     let named = scratch.path().join("named/fish");
@@ -163,6 +177,7 @@ fn a_copy_at_another_version_is_not_the_pin() {
     let row = fish_like(leak(&fixed));
     let tooling = scratch.path().join("tooling.noindex");
     stand_in(&tooling.join("fish-0.0.1/bin/fish"));
+    stand_in(&tooling.join("fish-0.0.1").join(PIN_STAMP));
     let lookup = Lookup {
         named: None,
         tooling: Some(tooling.clone()),
@@ -198,30 +213,34 @@ fn a_copy_at_another_version_is_not_the_pin() {
 }
 
 /// The refusal names the provider's one command, never a hand install, and never a command
-/// that does not exist: the pinned fish and pwsh have no provisioning verb until S7 (#89), so
-/// their refusals lead with the variable that finds a copy and say where the official build
-/// comes from.
+/// that does not exist (#89): a pinned tool's is the `verify provision` run that provides
+/// it, with the variable that names another copy after it.
 #[test]
 fn the_refusal_names_its_provider() {
-    let fish = tool("fish").refusal();
-    assert!(
-        fish.starts_with("no fish here: ATERM_TEST_FISH=<path> names one; ")
-            && fish.contains("github.com/fish-shell/fish-shell/releases"),
-        "{fish}"
+    let mac = "macos-aarch64";
+    let fish = tool("fish").refusal_on(mac);
+    assert_eq!(
+        fish,
+        "no fish here: `targo --unverified verify provision` builds the pinned 4.9.3 into this \
+         user's cache (or ATERM_TEST_FISH=<path> names one)"
     );
-    let pwsh = tool("pwsh").refusal();
-    assert!(
-        pwsh.starts_with("no pwsh here: ATERM_TEST_PWSH=<path> names one; ")
-            && pwsh.contains("github.com/PowerShell/PowerShell/releases"),
-        "{pwsh}"
+    let pwsh = tool("pwsh").refusal_on(mac);
+    assert_eq!(
+        pwsh,
+        "no pwsh here: `targo --unverified verify provision` fetches the pinned 7.6.7 into this \
+         user's cache (or ATERM_TEST_PWSH=<path> names one)"
     );
-    for refusal in [&fish, &pwsh] {
-        assert!(
-            !refusal.contains("verify provision") && !refusal.contains("init --develop"),
-            "no command that does not exist yet: {refusal}"
-        );
-    }
-    let bindgen = tool("wasm-bindgen").refusal();
+    let lima = tool("limactl").refusal_on("macos-x86_64");
+    assert!(
+        lima.starts_with("no limactl here: `targo --unverified verify provision --linux` fetches"),
+        "{lima}"
+    );
+    let bindgen = tool("wasm-bindgen").refusal_on("linux-x86_64");
+    assert!(
+        bindgen
+            .contains("`targo --unverified verify provision --record` builds the pinned 0.2.108"),
+        "{bindgen}"
+    );
     let vim = tool("vim").refusal();
     assert!(
         vim.contains("operating system, and no command adds it"),
@@ -250,9 +269,91 @@ fn the_refusal_names_its_provider() {
         gpu,
         "this host lacks a GPU wgpu can open, and no command adds it"
     );
-    for refusal in [fish, pwsh, bindgen, vim, ty, python, zstd, cc, gpu] {
+    for refusal in [fish, pwsh, lima, bindgen, vim, ty, python, zstd, cc, gpu] {
         assert!(!refusal.contains("brew"), "no remedy says brew: {refusal}");
     }
+}
+
+/// Every pinned row's remedy, on a host it is pinned for, is the `verify provision` run its
+/// `when` names, with that run's flag and no other, and no row names `aterm init
+/// --develop` before S8 lands it. NEGATIVE CONTROL: a `--linux` row's words without the
+/// flag would send a person to a run that skips it.
+#[test]
+fn every_workspace_row_names_the_run_that_provides_it() {
+    let mut seen = 0;
+    for row in TOOLS {
+        let Provider::Workspace { when } = row.provider else {
+            continue;
+        };
+        seen += 1;
+        let refusal = row.refusal_on("macos-aarch64");
+        assert!(
+            refusal.contains(&format!("`{}`", when.command())),
+            "{refusal}"
+        );
+        for (flag, wanted) in [("--linux", When::Linux), ("--record", When::Record)] {
+            assert_eq!(refusal.contains(flag), when == wanted, "{refusal}");
+        }
+        assert!(
+            !refusal.contains("init --develop") && !refusal.contains("brew"),
+            "{refusal}"
+        );
+        assert_eq!(row.provided_by(), when.verb());
+    }
+    assert!(seen >= 8, "the pinned rows: {seen}");
+    assert_eq!(When::Linux.verb(), "verify provision --linux");
+    assert_eq!(
+        When::Always.command(),
+        "targo --unverified verify provision"
+    );
+}
+
+/// On a host the tree pins nothing for, a pinned row's refusal says aterm provides none
+/// there and which hosts the run covers, rather than naming a run that would answer
+/// "nothing is pinned". NEGATIVE CONTROL: the same rows on a Mac name their run, and a row
+/// built wherever targo runs (wasm-bindgen) names it on Linux too.
+#[test]
+fn a_host_the_tree_pins_nothing_for_is_told_so() {
+    for name in ["fish", "pwsh", "wasm-opt", "limactl"] {
+        let row = tool(name);
+        let linux = row.refusal_on("linux-x86_64");
+        assert!(
+            linux.contains("aterm provides none for linux-x86_64:")
+                && linux.contains("pins it for macos-aarch64 and macos-x86_64 only")
+                && !linux.contains(" fetches the pinned")
+                && !linux.contains(" builds the pinned"),
+            "{linux}"
+        );
+        for mac in MACOS_HOSTS {
+            let words = row.refusal_on(mac);
+            assert!(words.contains("the pinned"), "{mac}: {words}");
+        }
+    }
+    let bindgen = tool("wasm-bindgen").refusal_on("linux-aarch64");
+    assert!(bindgen.contains("builds the pinned 0.2.108"), "{bindgen}");
+}
+
+/// A pin's directory is its package's, so a program a package carries under another name
+/// resolves where `verify provision` lays the package.
+#[test]
+fn a_pin_lives_under_its_package() {
+    let t = Path::new("/t");
+    assert_eq!(
+        tool("wasm-opt").pinned_in(t),
+        Some(PathBuf::from("/t/binaryen-133/bin/wasm-opt"))
+    );
+    assert_eq!(
+        tool("limactl").pinned_in(t),
+        Some(PathBuf::from("/t/lima-2.2.1/bin/limactl"))
+    );
+    assert_eq!(
+        tool("wasm-bindgen").pinned_root(t),
+        Some(PathBuf::from(format!(
+            "/t/wasm-bindgen-{}",
+            pinned_version("wasm-bindgen")
+        )))
+    );
+    assert_eq!(tool("rustup").pinned_in(t), None);
 }
 
 /// §8.3's third step before its fourth: a row's usual install path is found ahead of
@@ -334,12 +435,15 @@ fn a_missing_tool_ends_could_not_run_naming_its_provider() {
 fn a_tools_variable_is_its_upper_snake_name() {
     assert_eq!(tool("fish").var(), "ATERM_TEST_FISH");
     assert_eq!(tool("wasm-opt").var(), "ATERM_TEST_WASM_OPT");
-    assert_eq!(tool("fish").needs_label(), "fish (upstream)");
-    assert_eq!(tool("limactl").needs_label(), "limactl (upstream)");
-    // A pinned tool a command of this tree already fetches names that command.
+    assert_eq!(tool("fish").needs_label(), "fish (verify provision)");
     assert_eq!(
-        tool("firefox").needs_label(),
-        "firefox (verify fetch-browser)"
+        tool("limactl").needs_label(),
+        "limactl (verify provision --linux)"
+    );
+    assert_eq!(tool("firefox").needs_label(), "firefox (verify provision)");
+    assert_eq!(
+        tool("wasm-bindgen").needs_label(),
+        "wasm-bindgen (verify provision --record)"
     );
     assert_eq!(tool("zsh").needs_label(), "zsh (OS)");
 }

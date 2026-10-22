@@ -3292,7 +3292,7 @@ fn login_row(line: &str) -> Option<(LoginRow, Option<u64>)> {
 /// [`transcript_login_wall`] and [`login_lifted_at`] read of the rows folded
 /// in so far, each row's say ([`LoginRow`]) in order. A reader that reads a
 /// transcript row by row reads the login through it (`aterm-lab reduce`'s
-/// readings, session log ruling U7: the closed words a reduction keeps).
+/// readings, the closed words a reduction keeps).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct LoginScan {
     /// The last row that said something of the login.
@@ -3923,7 +3923,7 @@ fn standing_limit_of(v: &Value) -> Option<StandingLimit> {
 /// [`transcript_limit_reset`], [`transcript_limit_spend`],
 /// [`transcript_standing_wall`] and [`transcript_standing_limit`] each read.
 /// A reader that reads a transcript row by row reads the limit through it
-/// (`aterm-lab reduce`'s readings, session log ruling U7: the closed words a
+/// (`aterm-lab reduce`'s readings, the closed words a
 /// reduction keeps).
 ///
 /// CLAUDE CODE'S OWN CONTINUATION after that row ([`vendor_continues`]: at

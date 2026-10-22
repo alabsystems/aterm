@@ -7,7 +7,9 @@
 //!
 //! The row's cell keeps its character (the text grid, a screen reader, copy and the
 //! `messages` verb read it); only its glyph's pixels are drawn here, and only on a band
-//! row that asks ([`aterm_core::render::ChromeRaster::icons`]).
+//! row that asks ([`aterm_core::render::ChromeRaster::icons`]). The harness switch's three
+//! marks (`● ○ ◐`, `BandIcon::switch_mark`) are drawn here too, on the composer's top line,
+//! so its states read as one set whatever face holds which of them.
 //!
 //! # Geometry
 //!
@@ -412,6 +414,16 @@ impl Shape {
                 let hw = (r * 0.6).max(t);
                 disc.max(-rect(px, py, self.cx - hw, y0, self.cx + hw, y0 + bh))
             }
+            BandIcon::Disc => self.mark_disc(px, py),
+            BandIcon::Ring => self.mark_ring(px, py),
+            BandIcon::HalfDisc => {
+                // `◐`: the ring, its left half filled to a pixel boundary at the
+                // centre (the centre's own column filled where the centre is a
+                // pixel's middle), so the three marks share one outline.
+                let split = (self.cx + 0.5).floor();
+                self.mark_ring(px, py)
+                    .min(self.mark_disc(px, py).max(px - split))
+            }
             BandIcon::More => {
                 let r = (t * 0.6).max(0.8);
                 let y = self.bot.round() - r;
@@ -426,6 +438,29 @@ impl Shape {
                     .fold(f32::INFINITY, f32::min)
             }
         }
+    }
+
+    /// The harness switch's marks' radius and centre row: a disc as tall as
+    /// the capitals on their centre line, as a face's `●` sits among words
+    /// (no badge's overshoot), its sides and its top on pixel boundaries.
+    fn mark_frame(&self) -> (f32, f32) {
+        let frac = self.cx.fract();
+        let r = ((self.half - frac).round() + frac).min(self.room).max(1.0);
+        let top = (self.cy - r).round();
+        (r, top + r)
+    }
+
+    /// `●`: the switch's disc ([`Self::mark_frame`]).
+    fn mark_disc(&self, px: f32, py: f32) -> f32 {
+        let (r, cyr) = self.mark_frame();
+        (px - self.cx).hypot(py - cyr) - r
+    }
+
+    /// `○`: the switch's disc as a ring one stroke wide, its outer edge the
+    /// disc's.
+    fn mark_ring(&self, px: f32, py: f32) -> f32 {
+        let (r, cyr) = self.mark_frame();
+        ((px - self.cx).hypot(py - cyr) - (r - self.t * 0.5)).abs() - self.t * 0.5
     }
 
     /// A disc of radius `r` pixels on the centre line, `v` half heights
@@ -744,8 +779,8 @@ mod tests {
                 let regular = band_icon_coverage(icon, 16, 32, regular_m, spill);
                 let heavy = band_icon_coverage(icon, 16, 32, bold, spill);
                 match icon {
-                    // A filled star has no stroke: the same shape.
-                    BandIcon::Sparkle => {
+                    // A filled star or disc has no stroke: the same shape.
+                    BandIcon::Sparkle | BandIcon::Disc => {
                         let (a, b) = (f64::from(ink(&heavy)), f64::from(ink(&regular)));
                         assert!((a - b).abs() <= 0.1 * b, "{icon:?}: {a} vs {b}");
                     }
@@ -811,6 +846,46 @@ mod tests {
                 };
                 let (stem, dot) = (stem.1 - stem.0, dot.1 - dot.0);
                 assert!(stem >= 5 && stem > dot, "{at}: stem {stem} rows, dot {dot}");
+            }
+        }
+    }
+
+    /// THE HARNESS SWITCH'S MARKS ARE ONE SET: `●`, `○` and `◐` share one ink box on every
+    /// face, spilled or in a cell of their own; `○` is hollow at its centre and `●` is not;
+    /// `◐` is `●` left of its centre and `○` right of it.
+    #[test]
+    fn the_switch_marks_share_one_outline() {
+        for (cw, ch, m) in FACES.into_iter().chain([(12, 24, M)]) {
+            for spill in [false, true] {
+                let w = band_icon_width(cw, spill);
+                let draw = |icon| band_icon_coverage(icon, cw, ch, m, spill);
+                let (disc, ring, half) = (
+                    draw(BandIcon::Disc),
+                    draw(BandIcon::Ring),
+                    draw(BandIcon::HalfDisc),
+                );
+                let at = format!("{cw}x{ch} stem {} spill {spill}", m.stem);
+                let outline = ink_box(&disc, w);
+                assert_eq!(ink_box(&ring, w), outline, "{at}: ○ is ●'s size");
+                assert_eq!(ink_box(&half, w), outline, "{at}: ◐ is ●'s size");
+                let (x0, x1, y0, y1) = outline;
+                let (cx, cy) = ((x0 + x1) / 2, (y0 + y1) / 2);
+                assert_eq!(disc[cy * w + cx], 255, "{at}: ● is filled");
+                assert_eq!(ring[cy * w + cx], 0, "{at}: ○ is hollow");
+                for y in y0..y1 {
+                    for x in x0..x1 {
+                        // Two columns either side of the centre are the split's.
+                        let (left, right) = (x + 2 < cx, x > cx + 2);
+                        let want = if left {
+                            disc[y * w + x]
+                        } else if right {
+                            ring[y * w + x]
+                        } else {
+                            continue;
+                        };
+                        assert_eq!(half[y * w + x], want, "{at}: ◐ at ({x}, {y})");
+                    }
+                }
             }
         }
     }

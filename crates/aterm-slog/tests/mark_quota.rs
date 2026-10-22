@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The mark quota and the mark limiter (design §7.4, phase 3A; rulings R4,
-//! R11): claims hold at most a quarter of a ring, taken oldest first and
+//! The mark quota and the mark limiter (design §7.4, phase 3A):
+//! claims hold at most a quarter of a ring, taken oldest first and
 //! never an observation or a fenced record; one author marks at most its
 //! burst plus one a second, and the trusted authors' buckets are their own.
-//! What an author was short of is its own to say (rulings T1, U18), past
+//! What an author was short of is its own to say, past
 //! the owed-only table the shared pool's, said as the pool's.
 
 use aterm_slog::{
@@ -199,8 +199,8 @@ fn a_flood_of_minted_edges_never_delays_a_trusted_author() {
     }
 }
 
-/// THE SHORT COUNT IS ITS OWN AUTHOR'S (phase 5, ruling T1; Phase 6 step
-/// 6C-6, ruling U18): session A was short of 79 marks and session B of
+/// THE SHORT COUNT IS ITS OWN AUTHOR'S:
+/// session A was short of 79 marks and session B of
 /// none; B's next mark owes nothing, A's owes the 79, and A saying them
 /// leaves the rest alone. The overflow's authors (an unattributed author,
 /// `aterm`, a vendor) each keep their own count, as a trusted actor does;
@@ -359,7 +359,7 @@ fn a_short_count_rides_only_its_own_bucket() {
     assert_eq!(lim.owed(&a, later), Owed::Own(0), "said once");
 }
 
-/// PAST THE OWED-ONLY TABLE, THE POOL (Phase 6 step 6C-6, ruling U18):
+/// PAST THE OWED-ONLY TABLE, THE POOL:
 /// every named slot in debt and the overflow's tokens spent, each of
 /// [`MARK_OWED_AUTHORS`] + 1 sessions past the slots is short of a count of
 /// its own (the k-th of k + 1). The first, noted least recently, spills its
@@ -433,8 +433,8 @@ fn an_overflowed_authors_count_is_its_own_and_past_the_table_the_pools() {
     assert!(lim.peek(&minted(4000), MARK_REFILL_MS).is_ok());
 }
 
-/// A SESSION TAKING A SLOT FROM A FULL TABLE BRINGS ITS OWN COUNT (Phase 6
-/// step 6C-6, ruling U18): every named slot owes 1 and the owed-only table
+/// A SESSION TAKING A SLOT FROM A FULL TABLE BRINGS ITS OWN COUNT:
+/// every named slot owes 1 and the owed-only table
 /// is full, each of its [`MARK_OWED_AUTHORS`] authors owing 1, the first
 /// noted least recently. When the slots fall idle and that first author
 /// takes one, its own entry leaves the table before the displaced holder's

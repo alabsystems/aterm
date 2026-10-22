@@ -13,8 +13,9 @@ description = "aterm's system-awareness model: what the machine, aterm and each 
 # through aterm-sysprobe and hands this crate plain numbers.
 
 [dev-dependencies]
-# The stuck verdict's Tier-1 conformance (tests/conformance_stuck_verdict.rs)
-# replays the engine against its model.
+# The Tier-1 conformance of the stuck verdict
+# (tests/conformance_stuck_verdict.rs) and the scope balance
+# (tests/conformance_scope_balance.rs) replays each against its model.
 aterm-models-misc.workspace = true
 aterm-spec.workspace = true
 

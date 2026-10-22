@@ -2,8 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! export-content: a text file the export publishes carries nothing its content
-//! guard forbids.
+//! export-content: a file the export publishes carries nothing its content guard
+//! forbids.
 //!
 //! The publication engine's content guard greps the export against the rows of
 //! `publish/forbidden-extra.txt` and of its own `baseline/forbidden-content.txt`,
@@ -14,20 +14,25 @@
 //! rows first, over the same text:
 //! * the files the export selects ([`crate::export::Selection`]: the manifest's
 //!   pathspecs beside the central denies; every file outside them when the
-//!   checkout has no manifest, as a public snapshot has none);
+//!   checkout has no manifest, as a public snapshot has none), a manifest that
+//!   selects none being one the engine refuses (line 0);
 //! * each read as the transforms leave it ([`crate::export::rewrite`]) and split
 //!   into lines as grep splits it, its path judged too (the engine's filename
-//!   pass);
-//! * one tag the engine honours: a line carrying `gitleaks:allow` (a test's fake
-//!   token) is exempt from the baseline's credential section ([`credentials`]),
-//!   and from nothing else.
+//!   pass); a file holding a NUL the transforms leave as it is, and a match in
+//!   its bytes is the engine's binary hit, at no line (line 0);
+//! * one tag the engine honours: a text line carrying `gitleaks:allow` (a test's
+//!   fake token) is exempt from the baseline's credential section
+//!   ([`credentials`]), and from nothing else.
 //!
 //! A finding names the file, the line and the row, never the text. What it does
-//! not read: a binary file (one holding a NUL, which the rewrite leaves alone
-//! too; the engine greps it as bytes), and the astream crates the transforms
-//! write from the submodule (astream's own checks hold its source). The fix is
-//! the SOURCE: replace the text with neutral text, or spell a needle a test needs
-//! in halves (`concat!("aya", "tes")`), as `crate::export` does.
+//! not read: the astream crates the transforms write from the submodule
+//! (astream's own checks hold its source), and what the engine decodes before it
+//! greps (a gzip or zstd file's plaintext, a UTF-16/32 file behind its byte-order
+//! mark), whose raw bytes alone it holds; on 2026-10-22 the export carried no
+//! gzip or BOM'd file, and its zstd test vectors' plaintext matched no row. The
+//! fix is the SOURCE: replace the text with neutral text, or spell a needle a
+//! test needs in halves (`concat!("aya", "tes")`), as `crate::export` does; for
+//! a generated fixture, its generator.
 //!
 //! The export is some 200 MB of text, which a regex pass per row would take
 //! seconds of every core to read. Each row instead names the literals every
@@ -137,7 +142,8 @@ fn class_end(chars: &[char], open: usize) -> Option<usize> {
 /// The literals every match of `pattern` holds: per top-level alternative, its
 /// longest run of two or more characters a match holds side by side (`[Xx]` a
 /// letter of either case, which folds the whole run). `None` when an alternative
-/// has none, or the pattern sets a flag, so the row is read whole.
+/// has none, or the pattern sets a flag or spells a code point in hex, so the row
+/// is read whole.
 fn anchors(pattern: &str) -> Option<Vec<(String, bool)>> {
     let chars: Vec<char> = pattern.chars().collect();
     let mut branches: Vec<Vec<Piece>> = vec![Vec::new()];
@@ -149,11 +155,14 @@ fn anchors(pattern: &str) -> Option<Vec<(String, bool)>> {
                 i += 1;
                 continue;
             }
+            // the escapes as aterm-regex reads them
             '\\' => {
                 let e = *chars.get(i + 1)?;
                 i += 1;
                 match e {
-                    'b' | 'B' | 'A' | 'z' => Piece::Assert,
+                    'b' | 'B' | 'A' | 'z' | '<' | '>' => Piece::Assert,
+                    // a code point spelled by the hex digits after it
+                    'x' | 'u' | 'U' => return None,
                     e if e.is_ascii_punctuation() => Piece::Char(e, false),
                     _ => Piece::Other,
                 }
@@ -397,6 +406,23 @@ fn held_to(tree: &Tree<'_>, baseline: Result<(String, String), String>, out: &mu
             return;
         }
     };
+    let files: Vec<&str> = tree
+        .corpus
+        .paths
+        .iter()
+        .map(String::as_str)
+        .filter(|rel| selection.selects(rel))
+        .collect();
+    if manifest.is_some() && files.is_empty() {
+        // the engine's "no tracked files matched", which covers its empty and
+        // no-allowlist refusals too: only the checkout says what a manifest selects
+        out.push(finding(
+            MANIFEST,
+            0,
+            "it selects no file of the checkout, so the engine refuses the export".into(),
+        ));
+        return;
+    }
     let extras = file_rows(&extra, EXTRA, EXTRA, EXPORT_CONTENT.id, out);
     let (base, exempt) = match &baseline {
         Ok((path, text)) => (
@@ -415,13 +441,6 @@ fn held_to(tree: &Tree<'_>, baseline: Result<(String, String), String>, out: &mu
         .chain(base.iter().map(|row| exempt.contains(row.line.as_str())))
         .collect();
     let held = Held::new(rows, credential);
-    let files: Vec<&str> = tree
-        .corpus
-        .paths
-        .iter()
-        .map(String::as_str)
-        .filter(|rel| selection.selects(rel))
-        .collect();
     let next = AtomicUsize::new(0);
     let workers = std::thread::available_parallelism().map_or(4, |n| n.get().min(16));
     let found: Vec<Vec<Finding>> = std::thread::scope(|s| {
@@ -445,7 +464,9 @@ fn held_to(tree: &Tree<'_>, baseline: Result<(String, String), String>, out: &mu
 }
 
 /// One exported file: its path, then each line of its rewritten text, held to
-/// the rows.
+/// the rows. A file holding a NUL the transforms leave as it is, and the
+/// engine's grep reads its bytes (`-a`): a match there is a binary hit, at no
+/// line and cleared by no tag, so it is one finding per row at line 0.
 fn judge(tree: &Tree<'_>, rel: &str, held: &Held<'_>, out: &mut Vec<Finding>) {
     for (k, _) in held.candidates(rel.as_bytes()) {
         if held.rows[k].line.is_match(rel) {
@@ -463,35 +484,43 @@ fn judge(tree: &Tree<'_>, rel: &str, held: &Held<'_>, out: &mut Vec<Finding>) {
             return;
         }
     };
-    if bytes.contains(&0) {
-        return;
-    }
-    let text = rewrite(&bytes);
-    let lines: Vec<&[u8]> = text.split(|&b| b == b'\n').collect();
+    let binary = bytes.contains(&0);
+    let text = if binary { bytes } else { rewrite(&bytes) };
+    // read once: the lossy text keeps every `\n` byte, so its lines are the bytes'
+    let lossy = String::from_utf8_lossy(&text);
+    let lines: Vec<&str> = lossy.split('\n').collect();
+    let mut reported = BTreeSet::new();
     for (k, i) in held.candidates(&text) {
-        let line = String::from_utf8_lossy(lines[i]);
-        let row = held.rows[k];
-        match row.line.try_is_match(&line) {
-            Ok(false) => {}
-            Ok(true) if held.credential[k] && line.contains(ALLOW_TAG) => {}
-            Ok(true) => out.push(finding(
-                rel,
-                i + 1,
-                format!(
-                    "as exported, this line matches {}; replace the text, or spell what a \
-                     test needs in halves",
-                    row.source
-                ),
-            )),
-            Err(_) => out.push(finding(
-                rel,
-                i + 1,
-                format!(
-                    "this line exhausted the search for {}, so it is not judged",
-                    row.source
-                ),
-            )),
+        if binary && reported.contains(&k) {
+            continue;
         }
+        let line = lines[i];
+        let row = held.rows[k];
+        let detail = match row.line.try_is_match(line) {
+            Ok(false) => continue,
+            Ok(true) if !binary && held.credential[k] && line.contains(ALLOW_TAG) => continue,
+            Ok(true) if binary => format!(
+                "its bytes match {} (a binary file, which the transforms leave as it is and no \
+                 tag clears); make it without that text",
+                row.source
+            ),
+            Ok(true) => format!(
+                "as exported, this line matches {}; replace the text, or spell what a test \
+                 needs in halves",
+                row.source
+            ),
+            Err(_) => format!(
+                "{} exhausted the search for {}, so it is not judged",
+                if binary {
+                    "a line of its bytes"
+                } else {
+                    "this line"
+                },
+                row.source
+            ),
+        };
+        reported.insert(k);
+        out.push(finding(rel, if binary { 0 } else { i + 1 }, detail));
     }
 }
 

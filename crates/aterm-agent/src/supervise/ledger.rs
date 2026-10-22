@@ -24,15 +24,15 @@
 //! time here. A source that cannot be read is named in SOURCES and the rest is
 //! printed.
 //!
-//! `--source log` ([`LedgerSource::Log`], session log plan 5F-4, beside the
-//! anchor path, which stays the default until P6 is ruled, T35) reads no
+//! `--source log` ([`LedgerSource::Log`], beside the
+//! anchor path, which stays the default until P6 is ruled) reads no
 //! anchor: each turn's time is its own session log record's wall `t=`,
 //! joined to `history` by `ledger=` alone (`@<worker> log class=turn`: the
 //! turn's open, or its close less `dur_ms` once the open was evicted — the
 //! close restates `ledger=`, 5F-4a), and each message's is its `mail` mark's
 //! (`@self log kinds=mail`, joined to the inbox rows by `inbox=`; the inbox
-//! read stays, for `len=` and `trust=`). Nothing is ever joined by time
-//! (ruling T12): a turn whose `ledger=` is gone stays unplaced, and SOURCES
+//! read stays, for `len=` and `trust=`). Nothing is ever joined by time:
+//! a turn whose `ledger=` is gone stays unplaced, and SOURCES
 //! counts it. A turn's time there is when the worker's screen saw it begin,
 //! after the press, so its row reads `turn <id> began`, where the anchor
 //! path's `turn <id> sent` is the exchange's start: the two agree to the
@@ -350,8 +350,8 @@ fn log_record(line: &str) -> Option<(&str, &str, &str, Option<i64>)> {
     Some((op, node, kind, t))
 }
 
-/// What the worker's `log class=turn` says of its turns (plan 5F-4, ruling
-/// T12), by `ledger=` alone, never by time.
+/// What the worker's `log class=turn` says of its turns,
+/// by `ledger=` alone, never by time.
 #[derive(Debug, Default, PartialEq, Eq)]
 struct LogTurns {
     /// Each `ledger=` id's turn start, wall ms: the turn's open record's

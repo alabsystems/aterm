@@ -10,7 +10,7 @@
 //! holds it: an append of a mark and a change of the budget or of the
 //! readers' fence call it. It takes only marks, the oldest first, never an
 //! observation, never the record just appended, and never a record the
-//! readers' fence holds (ruling R4: what a reader is shown during an
+//! readers' fence holds (what a reader is shown during an
 //! update's overlap is what the carry holds, as [`Log::fence_reads`] keeps
 //! it for the eviction batch). While a journal writer follows the log it
 //! takes the marks the writer has already taken first. Each mark it takes is
@@ -18,7 +18,7 @@
 //! no counter of its own: one pass over the ring, so it holds whichever way
 //! the ring was built (a carry, a closed copy, a journal read).
 //!
-//! THE PROGRAM SHARE (phase 6, 6F-3; T6, ruling U17): the program marks
+//! THE PROGRAM SHARE: the program marks
 //! (`mark <node> program`, OSC 7501's reports) hanging from one node hold at
 //! most [`program_share`] of the ring: 64 per run at a session's bound, or
 //! per session while no run is open. [`Log::enforce_program_share`] keeps it

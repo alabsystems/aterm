@@ -20,6 +20,9 @@
 //!   session is current only while it is newer than the newest run or turn
 //!   that closed beneath that node: a verdict mark from three turns ago is
 //!   history, not the present.
+//!   While the host keeps timeline rows ([`Log::keep_rows`], `log_rows`),
+//!   the newest of them, up to a quarter of the ring ([`row_floor`]), go
+//!   only after every other record the batch may take.
 //! - **Losses** are counted where they happened: into the log's `lost`, and
 //!   into the rollup of the record's nearest open node (a closed node's
 //!   rollup is already written).
@@ -88,6 +91,9 @@ pub use mirror::{
 #[path = "log_quota.rs"]
 mod quota;
 pub use quota::{PROGRAM_SHARE_MAX, mark_quota, program_share};
+#[path = "log_rows.rs"]
+mod rows;
+pub use rows::{ROW_SPAN_MAX, Row, RowRule, row_floor};
 pub use summary::CLOSED_SUMMARY_BYTES;
 
 /// A session ring's record bound (§5.1).
@@ -424,7 +430,7 @@ impl Close {
 
 /// Whether the log writes `key` itself on a record of `op`: `orphan=` on an
 /// open; the outcome, duration and rollup on a close; and `op_by=` (a turn
-/// close's restated opener, Phase 6 step 6C-2) on none but the log's own
+/// close's restated opener) on none but the log's own
 /// close, so no caller writes it on any record. A caller's fields carrying
 /// one are refused, so a close always says what the log decided.
 #[must_use]
@@ -813,7 +819,7 @@ struct Entry {
     /// mirror turned on later finds every record numbered; its only cost
     /// with the mirror off is these 8 bytes a record ([`ENTRY_BYTES`]).
     ms: u64,
-    /// THE RECORD'S PROCESS-CLOCK READING (Phase 6 step 6F-1, ruling U1):
+    /// THE RECORD'S PROCESS-CLOCK READING:
     /// the `mono_ms` of the [`Stamp`] its append was given, so a view that
     /// orders or ages records on this process's monotonic clock (the
     /// timeline's `t_ms`) reads it off the record, never off the wall `t=`.
@@ -824,6 +830,10 @@ struct Entry {
     /// one read back from a journal or a closed summary reads 0. Another 8
     /// bytes a record ([`ENTRY_BYTES`]), which [`Log::footprint`] counts.
     mono: u64,
+    /// THE ROWS IT STANDS FOR: its dense
+    /// row ids, when the host's rule flagged it as it was appended
+    /// (`log_rows`). RAM only, as `mono` is: another 8 bytes a record.
+    row: rows::RowTag,
 }
 
 /// One node of the log's index: a node that is open, or whose subtree holds
@@ -843,7 +853,7 @@ struct NodeInfo {
     open_bytes: usize,
 }
 
-/// THE JOURNAL'S WAKE (design §5.3; phase 2B, ruling R6): a host's dirty
+/// THE JOURNAL'S WAKE (design §5.3): a host's dirty
 /// notifier, rung by every append and every eviction of a log it is installed
 /// in ([`Log::set_notify`]), so no producer path can write a record the host's
 /// journal writer is not woken for. The host's function sets its own flag and
@@ -937,15 +947,18 @@ pub struct Log {
     /// newest bus-class record appended, evicted or not.
     ms_head: u64,
     /// [`Self::ms_head`] when the readers were fenced ([`Log::fence_reads`]):
-    /// what a take under the fence and its tail gap stop at (ruling Q2).
+    /// what a take under the fence and its tail gap stop at.
     fence_ms: u64,
     /// THE MIRROR (phase 4, `mirror.rs`): where this log's bus-class records
     /// stand on the bus. `None` until the first take, which a bridge makes
     /// only while its mirror runs (`[fabric] log = "turns"`, or the default
-    /// `"auto"` over a broker that retains it, Phase 6 step 6E-3): with the
+    /// `"auto"` over a broker that retains it): with the
     /// mirror off nothing is ever held here, and the carry writes no byte of
     /// it.
     mirror: Option<Box<mirror::Mirror>>,
+    /// THE TIMELINE'S ROWS (`log_rows`): the host's row
+    /// rule, the dense row counter and where this log's own records begin.
+    rows: rows::Rows,
 }
 
 /// One live record's estimated heap: its ring entry, the shared record's own
@@ -1039,6 +1052,7 @@ impl Log {
             ms_head: 0,
             fence_ms: 0,
             mirror: None,
+            rows: rows::Rows::NEW,
         }
     }
 
@@ -1067,7 +1081,7 @@ impl Log {
     }
 
     /// [`Log::after_handoff`], the gap naming the predecessor's build
-    /// (`gap why=handoff epoch=<ep> build=<n>`, Phase 6 step 6F-7) when the
+    /// (`gap why=handoff epoch=<ep> build=<n>`) when the
     /// update said it.
     #[must_use]
     pub fn after_handoff_built(
@@ -1885,7 +1899,7 @@ impl Log {
     }
 
     /// [`Log::gap`], naming the build of the process the loss came across
-    /// from (`build=<n>`, Phase 6 step 6F-7: a handoff's or a crash
+    /// from (`build=<n>`, a handoff's or a crash
     /// adoption's predecessor) when `build` says it.
     pub fn gap_built(&mut self, why: GapWhy, lost: u64, build: Option<u64>, at: Stamp) -> u64 {
         let mut f = Fields::new();
@@ -2179,7 +2193,7 @@ impl Log {
         self.push(rec, at.mono_ms)
     }
 
-    /// A TURN'S CLOSE RESTATES ITS `ledger=` (plan 5F-4a, ruling T12): the
+    /// A TURN'S CLOSE RESTATES ITS `ledger=`: the
     /// `ledger=` of turn `node`'s open record, which the ring still holds
     /// (an open node's open is pinned, and its close is not appended yet),
     /// unless the close's own fields `f` already name one. A reader holding
@@ -2198,7 +2212,7 @@ impl Log {
             .and_then(|e| e.rec.f.get_u(Key::Ledger))
     }
 
-    /// A TURN'S CLOSE RESTATES WHO OPENED IT (Phase 6 step 6C-2, ruling U6):
+    /// A TURN'S CLOSE RESTATES WHO OPENED IT:
     /// the `by=` of turn `node`'s open record, which the ring still holds (as
     /// [`Self::restated_ledger`] reads it), as the id `op_by=` takes, so a
     /// `brief` holding the close alone still names the turn's author. Only
@@ -2244,11 +2258,13 @@ impl Log {
         self.fold.apply(&rec);
         self.index_push(&rec, bytes);
         self.heap = self.heap.saturating_add(entry_heap(&rec));
+        let row = self.tag_own(&rec);
         self.ring.push_back(Entry {
             rec: Arc::new(rec),
             bytes,
             ms,
             mono,
+            row,
         });
         self.bytes = self.bytes.saturating_add(bytes);
         // A claim's append keeps the marks within their quarter of the ring
@@ -2465,7 +2481,10 @@ impl Log {
     /// holds only its open path (no victim to take) is at most the open path
     /// plus one record long. While a journal writer follows the log
     /// ([`Log::note_journaled`]), the policy runs over the records it has
-    /// taken before the ones it has not.
+    /// taken before the ones it has not. THE ROW FLOOR:
+    /// while the host keeps rows ([`Log::keep_rows`]), the
+    /// newest of them, up to [`row_floor`], run the policy last, once every
+    /// other record it may take is taken.
     fn evict_batch(&mut self) {
         let n = self.ring.len();
         if n <= 1 {
@@ -2507,8 +2526,26 @@ impl Log {
             Some(j) => &[Some(j), None],
             None => &[None],
         };
-        'policy: for tier in tiers {
-            let open = |i: usize, victim: &[bool]| !victim[i] && tier.is_none_or(|j| seqs[i] <= j);
+        // THE ROW FLOOR (`log_rows`): the newest rows, a
+        // quarter of the ring at most, run the policy only once everything
+        // else it may take is taken, every unflagged closed detail first.
+        // WITHIN EACH JOURNAL TIER: the floor yields to the writer (2B), so a
+        // floor row it holds goes before a record it has not reached, and a
+        // burst between two of its passes still loses nothing it could
+        // write; the view tells such a row's id as a hole.
+        let floor = self.row_floor_members();
+        let floors: &[bool] = if floor.contains(&true) {
+            &[false, true]
+        } else {
+            &[false]
+        };
+        let passes = tiers
+            .iter()
+            .flat_map(|&tier| floors.iter().map(move |&in_floor| (in_floor, tier)));
+        'policy: for (in_floor, tier) in passes {
+            let open = |i: usize, victim: &[bool]| {
+                !victim[i] && floor[i] == in_floor && tier.is_none_or(|j| seqs[i] <= j)
+            };
             // Closed detail, then the opens of closed structure.
             for slot in [0, 1] {
                 for &i in &buckets[slot] {

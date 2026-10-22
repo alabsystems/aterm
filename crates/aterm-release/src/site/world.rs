@@ -117,6 +117,13 @@ fn keep_rust_homes(cmd: &mut Command) {
     }
 }
 
+/// The wasm-opt the site's engine build runs: the resolver's (`ATERM_TEST_WASM_OPT`, the
+/// pinned binaryen `verify provision` places, then PATH), else the bare name, whose
+/// failure to start names it.
+fn wasm_opt_program() -> PathBuf {
+    aterm_uds::host::find_tool("wasm-opt").unwrap_or_else(|| "wasm-opt".into())
+}
+
 /// The site's `deploy.sh`, run in `site`, with `unset` removed.
 #[must_use]
 pub fn deploy_command(site: &Path, unset: &[String]) -> Command {
@@ -329,7 +336,7 @@ impl World for Real {
         };
         // wasm-opt is asked first: the build takes minutes, and its module never ships
         // without the pass
-        let mut probe = plain(Path::new("wasm-opt"));
+        let mut probe = plain(&wasm_opt_program());
         probe.arg("--version");
         if !output(launch, &mut probe).is_ok_and(|o| o.status.success()) {
             return Err(format!(
@@ -383,7 +390,7 @@ impl World for Real {
     }
 
     fn optimise(&mut self, wasm: &Path, out: &mut dyn Write) -> Result<(), String> {
-        let mut opt = command("wasm-opt");
+        let mut opt = command(wasm_opt_program());
         opt.args(WASM_OPT_FLAGS).arg("-o").arg(wasm).arg(wasm);
         for name in &self.unset {
             opt.env_remove(name);

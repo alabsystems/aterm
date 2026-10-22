@@ -3831,8 +3831,8 @@ fn a_sonnet_bucket_under_the_generic_banner_relaunches_on_the_fallback() {
     );
 }
 
-/// A BUCKET'S WORDS IN A TOOL'S OUTPUT RUN NO FALLBACK (F2 of the merge
-/// review of fix/harness-integrate2, 2026-10-16). The measured 2.1.300
+/// A BUCKET'S WORDS IN A TOOL'S OUTPUT RUN NO FALLBACK.
+/// The measured 2.1.300
 /// screen with the turn's `❯` row turned into a call — `⏺ Bash(cat
 /// limits.log)` over the bucket's notice as its output, the same reset —
 /// leaves the generic footer naming no limit of the turn's: the five-hour
@@ -4306,7 +4306,7 @@ fn a_buckets_notice_nothing_dates_is_read_by_the_fallbacks_latch_alone() {
 }
 
 /// A BUCKET THE FALLBACK'S RELAUNCH LEFT HOLDS NO POINT FOR AN UNREAD
-/// CONVERSATION ([`TurnEndState::relaunched_off`]; the review of ddf58eaf8b).
+/// CONVERSATION ([`TurnEndState::relaunched_off`]).
 /// A host that cannot read the session's transcript leaves a remembered
 /// limit's conversation unread, and the limit is looked at again with
 /// nothing decided on its account. The lab's Sonnet bucket, relaunched on
@@ -7201,8 +7201,8 @@ fn record_of(prompt: &str, age: Duration, ended: Option<Duration>) -> RecordTurn
 /// its record's row older than the act; the act's own words over the turn it
 /// was typed at (only the record tells them apart); a wall drawn; a person's
 /// Esc; a check a UserPromptSubmit hook stopped, its own row over Claude
-/// Code's `⏺ Operation stopped by hook: <stopReason>` (the review of
-/// a00553122d: read as the worker's idle report) — each stands untaken to
+/// Code's `⏺ Operation stopped by hook: <stopReason>` (read as the worker's idle report)
+/// — each stands untaken to
 /// its window, as before. Nor is the check taken so across Off or after a
 /// wall answered the check.
 #[test]
@@ -17775,7 +17775,7 @@ fn a_superseded_logins_held_follow_is_waited_for_and_asks_nothing() {
 }
 
 /// A WALL SPLITS A JOB IN A NEW LOOP TOO (F3 of the merge review of
-/// fix/harness-integrate2, 2026-10-16; also its MAIN-SURVIVE-1 and XR-2).
+/// fix/harness-integrate2; also its MAIN-SURVIVE-1 and XR-2).
 /// Main's 7fffc8156 sums a person's turn across a wall: their job's work
 /// before a 529 and its retry's answer after it, in all past
 /// [`EXCHANGE_WORK`], is a job, continued. Ours' RR4-TE-2 carries the
@@ -18434,7 +18434,7 @@ mod face {
 }
 
 /// Why Land still holds (`turn_end_hold_tests.rs`; the Autopilot design's
-/// §12.3, slice 3a).
+/// §12.3).
 mod hold {
     use super::*;
     include!("turn_end_hold_tests.rs");

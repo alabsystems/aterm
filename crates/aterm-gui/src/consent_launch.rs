@@ -24,7 +24,7 @@
 //!    and never walked again: macOS keeps each answer for a grant-stable build.
 //!
 //! The order on a new Mac is the Full Disk Access page, the Developer Tools page, aterm's
-//! once-per-Mac debugger-access question (`debugger_access`, owner ruling O29), then the
+//! once-per-Mac debugger-access question (`debugger_access`), then the
 //! folders: the warm-up waits while that question is still to come and while a
 //! debugger-access change is under way, so no folder dialog stacks on macOS's
 //! administrator dialog (one left unanswered holds the folders for that process).

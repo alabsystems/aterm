@@ -154,8 +154,8 @@ fn vocab_mirrors_the_screen_reader() {
     );
 }
 
-/// The mail and inbox words hold every word the fabric speaks (phase 3B,
-/// ruling S20): each kind `deliver` accepts is a `mail kind=` word, each
+/// The mail and inbox words hold every word the fabric speaks:
+/// each kind `deliver` accepts is a `mail kind=` word, each
 /// receipt verdict a `word=` word, and each story verb `aterm ctl story`
 /// tells a `word=` word, so a mark of any of them never reads `unknown`.
 #[test]

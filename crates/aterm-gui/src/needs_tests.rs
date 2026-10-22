@@ -905,7 +905,7 @@ impl Gen {
             hold: self.pick(&[None, None, Some(HoldWord::Local), Some(HoldWord::Bridge)]),
             reset_unix: self.pick(&[None, Some(NOW - 60), Some(NOW + 60)]),
             now_unix: NOW,
-            // No set told: the verdict reads the entry (slice 2c stores the
+            // No set told: the verdict reads the entry (Stores the
             // words; nothing reads them into a verdict before 2d).
             told: crate::needs::ToldNeeds::default(),
         }
@@ -1295,7 +1295,7 @@ fn needs_of(app: &crate::App, id: u64) -> Option<String> {
         .map(str::to_string)
 }
 
-/// A TAB CLOSED IN AN OUTAGE LEAVES IT (scenario 6; review of 742e292c3): no
+/// A TAB CLOSED IN AN OUTAGE LEAVES IT (scenario 6): no
 /// publication runs for a closed tab again, so its close is what takes it out
 /// of the one `ApiOutage` entry's count and drops its need's recheck — the
 /// entry counts the tab left, and goes once the last tab in the outage
@@ -1346,8 +1346,8 @@ fn a_tab_closed_in_an_outage_leaves_its_count() {
     assert_eq!(outage_entries(&app), 0, "the outage is over here");
 }
 
-/// AN OUTAGE ENTRY AN EARLIER PROCESS LEFT OPEN ENDS (scenario 6; review of
-/// 742e292c3): the family is told only as tabs enter and leave the wait, so
+/// AN OUTAGE ENTRY AN EARLIER PROCESS LEFT OPEN ENDS (scenario 6):
+/// the family is told only as tabs enter and leave the wait, so
 /// this process states its whole answer at its first look whether or not a
 /// tab moved, and the entry goes through the digest's clock when no tab here
 /// waits on the API. NEGATIVE CONTROL: a tab that does wait keeps it,
@@ -1379,8 +1379,8 @@ fn an_outage_entry_an_earlier_process_left_ends_when_no_tab_waits() {
     assert_eq!(outage_entries(&app), 1, "a tab here still waits");
 }
 
-/// A RESET SLEPT THROUGH IS DUE AT THE FIRST TURN AFTER THE WAKE (§2.2;
-/// review of 742e292c3): an unsupervised limit's recheck is kept on the wall
+/// A RESET SLEPT THROUGH IS DUE AT THE FIRST TURN AFTER THE WAKE (§2.2):
+/// an unsupervised limit's recheck is kept on the wall
 /// clock, which a Mac's sleep advances and `Instant` does not, so a wall
 /// clock past the reset with the presence clock not moved at all finds the
 /// recheck due now, and the tick publishes the `wall` need. NEGATIVE
@@ -1426,7 +1426,7 @@ fn a_reset_slept_through_is_due_at_the_first_turn_after_the_wake() {
     assert!(app.need_rechecks.is_empty());
 }
 
-/// AN ENTRY CLEARED UNDER A NEWER ONE MOVES THE NEED (review of 742e292c3):
+/// AN ENTRY CLEARED UNDER A NEWER ONE MOVES THE NEED:
 /// the classifier reads every attention entry, so clearing an older ask under
 /// a newer wait — the bare one, or a keyed one — answers a change (what the
 /// wire's `meta` arm posts `Wake::MetaChanged` on), and the need it
@@ -1801,7 +1801,7 @@ fn a_harness_ask_keeps_its_line_within_its_bytes() {
 const NEED_B: &str = "the release credential (~/.aterm/release-credentials.toml) to sign 0.48.0";
 
 /// The facts of a lone needs owner's entry `entry`, with `needs` told to
-/// the window with `told_with` (slice 2c's store: the set told last).
+/// the window with `told_with` (the set told last).
 fn told_with(entry: &str, needs: &[&str], told_with: &str) -> NeedFacts {
     let set: Vec<String> = needs.iter().map(|need| (*need).to_string()).collect();
     let mut told = ToldNeeds::default();
@@ -1826,7 +1826,7 @@ fn entry_of(text: &str) -> AttentionFact {
 }
 
 /// A HARNESS'S NEED READS IN ITS OWN WORDS (Autopilot v5 §12.2.3 item 4,
-/// §12.2.6; slice 2d): where the loop told the window the whole set with
+/// §12.2.6): where the loop told the window the whole set with
 /// the very entry that stands, the verdict's `harness.first` is need (a)
 /// whole — longer than the 64 cells the entry carries — with `more = 1`
 /// and need (b) among its `others`; `what` stays within [`ROW_WHAT_MAX`]
@@ -1887,7 +1887,7 @@ fn a_harness_need_reads_in_its_own_words() {
 }
 
 /// THE PROGRAM IS THE ENTRY'S, AND A NEED THAT FOLDS TO NOTHING IS NO
-/// NEED (slice 2d): the told set is said under the program the entry names
+/// NEED: the told set is said under the program the entry names
 /// (`agy needs you:` reads as agy), even where a cap cut the entry past its
 /// count, so its parse reads nothing; a told need that folds to nothing is
 /// passed over, and a set of none such falls back to the parse. An entry

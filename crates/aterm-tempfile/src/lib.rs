@@ -414,7 +414,7 @@ impl Builder {
     /// A native `match` rather than `as_deref().unwrap_or(".tmp")`, whose std
     /// bodies the verifier's lowered bundle lacks.
     #[inline]
-    fn prefix_str(&self) -> &str {
+    const fn prefix_str(&self) -> &str {
         match &self.prefix {
             Some(p) => p.as_str(),
             None => ".tmp",

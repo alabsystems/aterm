@@ -17,7 +17,7 @@
 //! the next.
 //!
 //! In order, the lane takes `ATERM_FIREFOX` (any Firefox executable), then
-//! the pinned build in this machine's cache (`verify fetch-browser` puts it
+//! the pinned build in this machine's cache (`verify provision` puts it
 //! there). Neither is a COULD NOT RUN naming the fetch.
 
 use std::ffi::{OsStr, OsString};
@@ -66,10 +66,10 @@ pub(crate) const PINNED: [Pinned; 2] = [
 pub(crate) const FIREFOX_ENV: &str = "ATERM_FIREFOX";
 
 /// The fix a run without a Firefox names, where `pinned` (this host has a
-/// pin `verify fetch-browser` can fetch).
+/// pin `verify provision` can fetch).
 pub(crate) fn fix_for(pinned: bool) -> &'static str {
     if pinned {
-        "targo --unverified verify fetch-browser, or set ATERM_FIREFOX to a Firefox executable"
+        "targo --unverified verify provision, or set ATERM_FIREFOX to a Firefox executable"
     } else {
         "set ATERM_FIREFOX to a Firefox executable; none is pinned for this host"
     }
@@ -385,8 +385,8 @@ mod tests {
     /// Only a host with a pin is told to fetch one.
     #[test]
     fn the_fix_names_the_fetch_only_where_a_pin_exists() {
-        assert!(fix_for(true).contains("verify fetch-browser"));
-        assert!(!fix_for(false).contains("fetch-browser"));
+        assert!(fix_for(true).contains("verify provision"));
+        assert!(!fix_for(false).contains("provision"));
         assert!(fix_for(false).contains(FIREFOX_ENV));
     }
 

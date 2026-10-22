@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-use aterm_models_misc::{stuck_verdict_liveness, stuck_verdict_model};
+use aterm_models_misc::{scope_balance_model, stuck_verdict_liveness, stuck_verdict_model};
 use aterm_spec::{interp, verify};
 
 /// THE STUCK VERDICT (`docs/DESIGN-system-awareness-2026-10-16.md` §17): it holds with no mutant
@@ -80,4 +80,43 @@ fn the_stuck_verdict_holds_and_each_law_has_its_own_mutant() {
     // Named at φ ≥ 8: stuck at once.
     assert!(model.fire("Relabel", &mut s));
     assert_eq!((s["cls"], s["v"]), (2, 2));
+}
+
+/// THE SCOPE BALANCE (`docs/DESIGN-system-awareness-2026-10-16.md` §7.7, §17): it holds with no
+/// mutant on, each `Buggy` value breaks exactly the laws its row names, and a delegated member
+/// read ahead of its launcher's counter moves no more than the launcher's own figure, the excess
+/// shown as a negative residual. Tier-1 against the real split is `aterm-vitals`'
+/// `conformance_scope_balance`.
+#[test]
+fn the_scope_balance_holds_and_each_law_has_its_own_mutant() {
+    let model = scope_balance_model();
+    assert_eq!(
+        verify::sweep_faults(std::slice::from_ref(&model)),
+        Vec::<String>::new()
+    );
+    verify::prove_and_catch_scalar(&model, "scope balance");
+
+    for (dial, laws) in [
+        (1, &["PartsSumToWhole", "ResidualIsShown"][..]),
+        (2, &["DelegatedCountedOnce", "PartsSumToWhole"]),
+        (3, &["PartsNeverNegative"]),
+        (4, &["ResidualIsShown"]),
+        (5, &["MatchedWindowsOnly"]),
+    ] {
+        let broken = interp::violated_invariants(&interp::with_buggy(&model, dial));
+        assert_eq!(broken.into_iter().collect::<Vec<_>>(), laws, "Buggy {dial}");
+    }
+
+    // A delegated member read one unit ahead of its launcher's counter: the
+    // launcher gives up its one unit, the tab shows both, and the residual
+    // shows the unit no coalition counted.
+    let mut s = model.init_state();
+    for action in ["DelegatedWork", "DelegatedAhead", "Move", "Close"] {
+        assert!(model.fire(action, &mut s), "{action}");
+    }
+    assert_eq!((s["g"], s["l"], s["d"]), (1, 1, 2));
+    assert_eq!(
+        (s["moved"], s["others"], s["tab"], s["rest"], s["residual"]),
+        (1, 0, 2, 0, -1)
+    );
 }

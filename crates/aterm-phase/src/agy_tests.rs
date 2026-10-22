@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! One test per measured agy screen (agy 1.4.0), each with its negative
-//! control.
+//! Screen-reader tests for `agy` 1.4.0 captures and negative controls.
 
 use super::fixtures::*;
 use super::*;
@@ -33,17 +32,12 @@ fn edited(rows: &[String], head: &str, with: &str) -> Vec<String> {
     out
 }
 
-/// The screens agy LEFT — its last frame, its resume line and the shell
-/// under them — signed in and in the lab (one ended by SIGTERM with its
-/// background work running, the panel's rows in its last frame): nothing on
-/// them is agy's to read.
+/// Screens after `agy` exited (leaving its last frame, resume line, and shell prompt).
 fn left(text: &str) -> bool {
     [EXITED, lab::EXIT, lab::BG_EXITED].contains(&text)
 }
 
-/// The screens no layout names agy on: the ones agy [`left`], and a frame one PTY
-/// read split mid-redraw ([`lab::SPLIT_HALF`]), its erase-below having taken the
-/// composer: a prefix of a screen, none agy drew whole.
+/// Screens that no layout identifies as `agy` (exited screens and split mid-redraw frames).
 fn unnamed(text: &str) -> bool {
     left(text) || text == lab::SPLIT_HALF
 }
@@ -56,14 +50,8 @@ fn captures() -> Vec<(String, String)> {
         .collect()
 }
 
-/// A fresh session at its composer — after the notices were dismissed, at
-/// 100 columns, and right after the trust box with the shell's echo of agy's
-/// terminal queries on the row under the launch line and a dismissable
-/// card over the composer — is idle as evidence: no message yet, the footer
-/// `? for shortcuts`. The composer is the caret and NOTHING (no
-/// placeholder), on the row the cursor parks on, at column 2 (measured).
-/// NEGATIVE CONTROL: the busy screen's composer is the same empty caret row,
-/// and the phase is busy.
+/// Fresh idle composer screens (after dismissing notices, at 100 cols, or after trust) read as
+/// authoritative idle.
 #[test]
 fn a_fresh_session_is_idle_at_its_composer() {
     for text in [IDLE, IDLE_100X30, IDLE_FRESH_NOTICE] {
@@ -92,11 +80,8 @@ fn a_fresh_session_is_idle_at_its_composer() {
     assert!(!busy.fresh, "a message was sent");
 }
 
-/// THE SPINNER ROW OVER THE OPEN COMPOSER IS BUSY, the tip under it or not;
-/// the turn has no last words yet. `esc to cancel` alone is NOT a turn
-/// running (a menu and a box draw it too): with the spinner row gone it is
-/// busy without evidence. NEGATIVE CONTROL: the spinner gone and the footer
-/// back to `? for shortcuts` is the turn's end, as evidence.
+/// A spinner row above the open composer is authoritative busy; `esc to cancel` alone is
+/// non-authoritative.
 #[test]
 fn the_spinner_row_is_busy_and_esc_to_cancel_alone_is_not() {
     for text in [BUSY, BUSY_TIP] {
@@ -119,8 +104,6 @@ fn the_spinner_row_is_busy_and_esc_to_cancel_alone_is_not() {
     let ended = edited(&gone, "esc to cancel", "? for shortcuts");
     assert_eq!(phase(&ended), (Phase::Idle, true), "the control");
 
-    // Under the tip: with no spinner row in the turn, the tip is no turn
-    // running.
     let tip = screen(BUSY_TIP);
     let at = tip.iter().position(|r| is_spinner_row(r)).expect("spinner");
     let mut said = tip.clone();
@@ -128,11 +111,7 @@ fn the_spinner_row_is_busy_and_esc_to_cancel_alone_is_not() {
     assert_eq!(phase(&said), (Phase::Busy, false));
 }
 
-/// A turn ends on its reply, with no row marking the end: the spinner gone
-/// and `? for shortcuts` back. Its last words are the reply's paragraphs,
-/// the indent stripped. NEGATIVE CONTROLS: a reply whose last words ask is a
-/// question; the same rows with the spinner over the composer are a turn
-/// still running, with no last words.
+/// An ended turn returns to `? for shortcuts` and extracts the reply paragraphs as `said_tail`.
 #[test]
 fn a_turn_ends_on_its_reply() {
     let r = agy(END_OF_TURN);
@@ -165,13 +144,7 @@ fn a_turn_ends_on_its_reply() {
     assert_eq!(said_tail(&running), None);
 }
 
-/// Esc in a turn, and each box refused (`No, cancel`, `No, deny creation`,
-/// `No, reject this change`), end the turn on agy's `⎿  Interrupted · What
-/// should Antigravity CLI do instead?` — idle as evidence, and the PERSON's:
-/// the next message is theirs. The vendor's question is no last words.
-/// NEGATIVE CONTROLS: a turn that ended by itself is not interrupted; nor is
-/// one whose interrupt a newer message answered, nor a reply that says the
-/// words.
+/// Esc in a turn or refusing an approval box ends the turn on `Interrupted` as a user interrupt.
 #[test]
 fn an_interrupted_turn_is_the_persons() {
     for text in [INTERRUPTED, CANCELLED, DECLINED, REJECTED] {
@@ -221,12 +194,8 @@ fn an_interrupted_turn_is_the_persons() {
     assert!(!interrupted(&quoted), "the words in a reply");
 }
 
-/// A turn that failed ends on `⚠ <message>` and `Error ID: <id>`, agy's
-/// own rows: idle as evidence, NO wall (no kind fits it: the one measured
-/// came of a dead proxy and names none), no last words of the agent, no
-/// interrupt. The footer names no model while the model list is unknown, and
-/// still reads. NEGATIVE CONTROL: a reply under the error is the turn's last
-/// words.
+/// A turn ending on `⚠ <message>` and `Error ID:` with no known wall kind is authoritative idle
+/// with no wall.
 #[test]
 fn a_failed_turn_is_an_ended_turn_with_no_wall() {
     let r = agy(ERROR_TURN);
@@ -247,10 +216,7 @@ fn a_failed_turn_is_an_ended_turn_with_no_wall() {
     assert_eq!(said_tail(&replied).as_deref(), Some("Retrying now."));
 }
 
-/// A typed draft is the composer's text, the cursor after it (measured), and
-/// the footer's left side BLANK while it is held: idle as evidence, and the
-/// session still fresh. NEGATIVE CONTROL: the same blank footer with the
-/// composer empty says nothing.
+/// A held draft in the composer with a blank left footer is authoritative idle.
 #[test]
 fn an_unsent_draft_is_the_composers() {
     let r = agy(DRAFT);
@@ -263,14 +229,8 @@ fn an_unsent_draft_is_the_composers() {
     assert_eq!(phase(&cleared), (Phase::Idle, false));
 }
 
-/// The shell-command box, at 120 and 100 columns: a Bash prompt for the
-/// command under `Requesting permission for:`, its four options by their
-/// roles — the one-shot run, the conversation's grant, the grant persisted
-/// to settings.json, the refusal — the first focused, chosen by digit. Its
-/// Esc is the turn's `esc to cancel`: it stops the turn and refuses nothing.
-/// The box replaces the composer, and no wall is read under it. NEGATIVE
-/// CONTROLS: a second cursor, or a gap in the numbering, and no option
-/// carries a role.
+/// Shell-command approval box at 120 and 100 columns maps to a `Bash` prompt with four option
+/// roles.
 #[test]
 fn the_exec_box_is_a_bash_prompt_with_its_roles() {
     for (text, command) in [(BOX_EXEC, "touch x.txt"), (BOX_EXEC_100X30, "ls -la")] {
@@ -319,11 +279,7 @@ fn the_exec_box_is_a_bash_prompt_with_its_roles() {
     );
 }
 
-/// A box whose title scrolled off the rows read is named by nothing (an
-/// Other prompt, its head off the screen), and its options take the approval
-/// boxes' roles where one of their one-shot allows is among them — `Yes, run
-/// command` here. NEGATIVE CONTROL: with no one-shot allow among them, no
-/// option carries a role.
+/// An approval box whose title scrolled off-screen reads as `Other` while preserving option roles.
 #[test]
 fn a_box_whose_title_scrolled_off_is_named_by_its_one_shot_allow() {
     let rows = screen(BOX_EXEC);
@@ -348,10 +304,7 @@ fn a_box_whose_title_scrolled_off_is_named_by_its_one_shot_allow() {
     );
 }
 
-/// A tool row's own output, drawn right under its `●` row, is no words of
-/// the agent: a turn that ends on it has no last words. NEGATIVE CONTROL:
-/// the same rows with a blank row between the tool row and them are the
-/// agent's reply.
+/// Tool output directly under a `●` row is not read as agent reply text.
 #[test]
 fn a_tool_rows_output_is_no_last_words() {
     let rows = screen(END_OF_TURN);
@@ -369,11 +322,7 @@ fn a_tool_rows_output_is_no_last_words() {
     assert!(said.starts_with("Ocean tides—the rhythmic"), "{said}");
 }
 
-/// A long option WRAPS with its tail at column 0 of the next row (measured):
-/// the tail is the option above's, so `(Persist to settings.json)` closes
-/// option 3's label, and option 4 is still `No, cancel`. NEGATIVE CONTROL:
-/// with the tail row gone, option 3's label stops at `(Persist to` — the
-/// join is what restores it.
+/// Wrapped option labels at column 0 join onto the preceding numbered option.
 #[test]
 fn a_wrapped_options_tail_belongs_to_the_option_above() {
     let p = agy(BOX_EXEC_WRAPPED).prompt.expect("the box");
@@ -401,13 +350,7 @@ fn a_wrapped_options_tail_belongs_to_the_option_above() {
     assert!(labels(&p)[2].ends_with("(Persist to"), "{}", labels(&p)[2]);
 }
 
-/// The file boxes: `Create file` is a Write prompt for its path, with
-/// `Reason: outside workspace` as its description and the persisting grant
-/// `Yes, and always allow non-workspace access` beside the one-shot and the
-/// refusal; inside the workspace it offers the two alone. `Pending edit` is
-/// an Edit prompt for its path, and its `shift+tab to auto-approve file
-/// edits` hint is no option. NEGATIVE CONTROL: Claude Code's reader sees no
-/// box on any of them.
+/// `Create file` and `Pending edit` boxes read as `Write` and `Edit` prompts.
 #[test]
 fn the_file_boxes_are_write_and_edit_prompts() {
     let path = "/private/tmp/at.XXXXXX/work/x.txt";
@@ -441,13 +384,7 @@ fn the_file_boxes_are_write_and_edit_prompts() {
     assert_eq!(p.options.len(), 2);
 }
 
-/// agy's ask-the-user tool: a Question prompt, its question the text after
-/// `Question 1/1:`, the model's answers [`Role::Answer`] and `Write-in...`
-/// (the person's own words) [`Role::Other`], none recommended, chosen by
-/// digit; its key row's `esc Skip` leaves it unanswered. NEGATIVE CONTROLS:
-/// Claude Code's reader sees no box on it, and once answered the `? …` and
-/// `> Blue` rows it leaves are transcript — no box, and the reply under them
-/// is the turn's last words.
+/// `ask_question` boxes read as `Question` prompts with `Answer` and `Other` (`Write-in...`) roles.
 #[test]
 fn the_question_tool_is_a_question_with_answers() {
     let r = agy(QUESTION);
@@ -480,12 +417,7 @@ fn the_question_tool_is_a_question_with_answers() {
     );
 }
 
-/// The trust box agy draws in a new folder: a Trust prompt for its folder,
-/// its two options UNNUMBERED — `Yes, I trust this folder` the trust, `No,
-/// exit` the exit — the first focused, chosen by the cursor and Enter (no
-/// digit names them); no Esc offered. NEGATIVE CONTROLS: both rows focused
-/// and no option carries a role; Claude Code's reader, whose own trust
-/// dialog says the same words in another frame, sees no box on it.
+/// Unnumbered folder-trust box reads as a `Trust` prompt selected by cursor and Enter.
 #[test]
 fn the_trust_box_is_a_trust_prompt_chosen_by_enter() {
     let r = agy(BOX_TRUST);
@@ -510,13 +442,7 @@ fn the_trust_box_is_a_trust_prompt_chosen_by_enter() {
     assert_eq!(ClaudeReader.prompt(&screen(BOX_TRUST)), None, "the control");
 }
 
-/// `/` opens the command menu UNDER the composer, and the footer reads `esc
-/// to cancel` with no turn running: the composer is still the composer, its
-/// draft the `/` (the cursor after it, measured) — the menu scrolled, an `↑
-/// N more` over its rows, too — and no box is up, but nothing is evidence,
-/// the menu taking the footer's place. NEGATIVE CONTROLS: a row of no shape
-/// the menu draws under the composer leaves no composer read; the menu
-/// closed and `? for shortcuts` back is idle as evidence.
+/// The `/` command menu under the composer keeps the draft but makes idle non-authoritative.
 #[test]
 fn the_command_menu_is_no_box_and_no_evidence() {
     let r = agy(SLASH_MENU);
@@ -546,17 +472,8 @@ fn the_command_menu_is_no_box_and_no_evidence() {
     assert_eq!(phase(&closed), (Phase::Idle, true));
 }
 
-/// AN EXIT PENDING IS IDLE BUT NEVER EVIDENCE: one ctrl+c (signed in) or one
-/// ctrl+d (the lab) at the empty composer turns the footer's left side into
-/// `press <key> again to exit`, that key again ends agy, and the hint does
-/// not time out (each stood 45 s, measured): agy is still at its composer —
-/// empty, the cursor on its caret row, its last words read, its layout
-/// naming it — but idle NOT as evidence, so nothing is typed into an agy
-/// about to exit. The footer is read by the binary's template (`press %s
-/// again to exit`): any one key word, the model's name after a gap.
-/// NEGATIVE CONTROLS: the same screens with the footer back to `? for
-/// shortcuts` are idle as evidence; `press` with no key, another verb, the
-/// words run on, and the vendor's other capitalisation are no exit pending.
+/// `press <key> again to exit` in the footer is non-authoritative idle so nothing is typed into an
+/// exiting session.
 #[test]
 fn an_exit_pending_is_idle_but_never_evidence() {
     for (text, hint, said) in [
@@ -610,12 +527,8 @@ fn an_exit_pending_is_idle_but_never_evidence() {
     }
 }
 
-/// ONE CTRL+C OVER A HELD DRAFT ARMS THE EXIT TOO (the lab, agy 1.4.0): the
-/// draft stays in the composer and the footer's left side becomes `press
-/// ctrl+c again to exit` — idle NOT as evidence, the draft read as the
-/// composer's, agy's layout still naming it. NEGATIVE CONTROL: the same
-/// screen with the footer's left side gone (the right side alone, as while a
-/// draft is held) is a held draft, idle as evidence.
+/// `press ctrl+c again to exit` while holding a draft keeps the draft and is non-authoritative
+/// idle.
 #[test]
 fn one_ctrl_c_over_a_draft_arms_the_exit_and_keeps_the_draft() {
     let text = lab::CTRL_C_DRAFT;
@@ -646,11 +559,7 @@ fn one_ctrl_c_over_a_draft_arms_the_exit_and_keeps_the_draft() {
     assert_eq!(h.composer, Some((caret, vec!["x".to_string()])));
 }
 
-/// After the second ctrl+c agy has left: its last frame stays above its
-/// resume line and the shell's prompt, and nothing on that screen is agy's
-/// to read — no composer, no evidence, and the screen names no program.
-/// NEGATIVE CONTROL: the frame it left, with its footer back and the shell's
-/// rows gone, is a composer again.
+/// After the second `ctrl+c`, the exited screen is not identified as `agy` and reads no composer.
 #[test]
 fn an_exited_agy_is_read_as_nothing() {
     let gone = agy(EXITED);
@@ -667,11 +576,7 @@ fn an_exited_agy_is_read_as_nothing() {
     assert_eq!(phase(&left), (Phase::Idle, true), "the control");
 }
 
-/// SIGNED OUT, agy draws its login-method menu instead of a composer: a
-/// WALL (the login is gone), never a box — no prompt is read, so no option
-/// of it (`Google OAuth` opens a browser on the person's desktop) is ever
-/// pressed — idle as evidence on its wall. NEGATIVE CONTROLS: the menu with
-/// its `Select login method:` row gone is no wall, and still no box.
+/// Signed-out login-method menu reads as a `Login` wall rather than an interactive prompt box.
 #[test]
 fn the_sign_in_wall_is_a_wall_and_never_a_box() {
     let rows = screen(SIGNED_OUT);
@@ -699,8 +604,7 @@ fn the_sign_in_wall_is_a_wall_and_never_a_box() {
     assert_eq!(prompt(&unnamed), None);
 }
 
-/// Claude Code's and Codex's readers on agy's screens: never a box, never a
-/// question — agy's `>` boxes and composer are no frame of theirs.
+/// Claude Code and Codex readers do not match `agy` boxes or composers.
 #[test]
 fn claudes_and_codexs_readers_see_no_box_and_no_question_on_agy_screens() {
     for (name, text) in captures() {
@@ -717,13 +621,7 @@ fn claudes_and_codexs_readers_see_no_box_and_no_question_on_agy_screens() {
     }
 }
 
-/// A shell, a pager or a viewer showing agy's screen is not agy: the
-/// program's NAME wins. With no name, or a runtime's, EVERY screen agy draws
-/// names it — its composer idle, busy and at a turn's end, each box, its
-/// trust box, its first run's onboarding, its survey and its sign-in wall —
-/// but the screen agy left and a frame caught half drawn ([`unnamed`]). A screen with
-/// agy's words and no frame names nothing. NEGATIVE CONTROL: the same box
-/// under `agy`.
+/// Program name takes precedence over screen sniffing; unnamed live `agy` screens sniff as `Agy`.
 #[test]
 fn a_shell_quoting_agy_is_not_agy() {
     let r = screen(BOX_EXEC);
@@ -759,10 +657,7 @@ fn a_shell_quoting_agy_is_not_agy() {
     assert_eq!(identify(None, &quoted).program(), Program::Generic);
 }
 
-/// agy is named `agy`, by its path and arguments too, and its busy row is
-/// the spinner row: one on each busy screen. NEGATIVE CONTROLS: the
-/// footer's `esc to cancel`, a reply's row, the blank braille cell and a
-/// frame with one blank after it are no spinner row.
+/// `is_agy_command` matches `agy` paths/args and `is_agy_busy_row` matches the braille spinner row.
 #[test]
 fn agy_is_named_and_busy_on_its_spinner_row() {
     assert_eq!(crate::reader::program_of("agy"), Some(Program::Agy));
@@ -784,10 +679,8 @@ fn agy_is_named_and_busy_on_its_spinner_row() {
     }
 }
 
-/// THE SNIFF CLAIMS NO OTHER PROGRAM'S SCREEN: over every capture of Claude
-/// Code, Muse Code and Gemini CLI under `src/fixtures/`, agy's layout test says
-/// no, the screen is never identified as agy's, and agy's reader reads no
-/// box on it. The control: it says yes on agy's own (but the ones [`unnamed`]).
+/// `agy` layout sniffing and prompt reading reject all Claude Code, Muse Code, and Gemini CLI
+/// fixtures.
 #[test]
 fn the_agy_sniff_claims_no_other_programs_screen() {
     let mut swept = 0;
@@ -806,14 +699,8 @@ fn the_agy_sniff_claims_no_other_programs_screen() {
     assert!(swept > 150, "only {swept} other captures");
 }
 
-/// A SHELL BOX WHOSE OPTIONS QUOTE A MULTI-LINE COMMAND (measured on the
-/// person's own agy, signed in, a real task): options 2 and 3 carry the
-/// command's prefix over rows of their own at column 0, a blank row among
-/// them. The box is read whole — its four options from the `1.` row down,
-/// each tail joined to its label (no blank in it), the one-shot allow, the
-/// conversation grant, the kept grant, the cancel — as evidence. NEGATIVE
-/// CONTROL: with no `1.` row above the blank the options cannot be placed,
-/// and no role is read.
+/// Multi-line shell commands inside option labels (including blank lines) join into the four
+/// options.
 #[test]
 fn a_box_whose_options_quote_a_multi_line_command_is_read_whole() {
     let r = agy(BOX_EXEC_MULTILINE);
@@ -841,13 +728,8 @@ fn a_box_whose_options_quote_a_multi_line_command_is_read_whole() {
     );
 }
 
-/// AN ANSWER AGY SAVES IS KEPT, WHATEVER ITS WORDS: `… (Persist to
-/// settings.json)` is a kept grant (or refusal) and `… in this
-/// conversation` a session one — never the one-shot allow, and the press
-/// gate refuses a saved one by its suffix too ([`crate::prompt::settles_later`]),
-/// for a label that does not say `always allow` (agy's binary's `Yes, grant
-/// permission for <target> (Persist to settings.json)`). NEGATIVE CONTROL:
-/// the measured box keeps its roles.
+/// Options suffixed with `(Persist to settings.json)` or `in this conversation` map to
+/// saved/session roles.
 #[test]
 fn agys_saved_and_conversation_answers_are_never_one_shot() {
     let rows = screen(BOX_EXEC);
@@ -873,12 +755,8 @@ fn top_rule(rows: &[String]) -> usize {
     composer(rows).expect("the composer") - 1
 }
 
-/// AGY MARKS THE ANSWER IT RECOMMENDS AS A PREFIX (UNMEASURED: its
-/// ask-the-user tool tells the model to open the option with
-/// `(Recommended)`, by its binary; built by editing the measured question):
-/// `  2. (Recommended) Green` is still an answer, and the one recommended.
-/// NEGATIVE CONTROLS: the measured question marks none; the mark inside a
-/// label marks nothing.
+/// `(Recommended)` prefix on a question option marks `recommended: true` while keeping
+/// `Role::Answer`.
 #[test]
 fn agys_recommended_answer_opens_its_label() {
     let rows = screen(QUESTION);
@@ -901,12 +779,8 @@ fn agys_recommended_answer_opens_its_label() {
     assert_eq!(prompt(&inside).expect("the question").recommended(), None);
 }
 
-/// A QUESTION NO DIGIT ANSWERS CARRIES NO ROLES, so it escalates
-/// (UNMEASURED: agy's binary's marks on the measured question): a
-/// multi-select's checkboxes (`> 1. [ ] Red`, `> 1. [x] Red` — a digit only
-/// toggles one), the person's own answer kept on a row (`  2. ✓ Green`), or
-/// options that do not end on `Write-in...`. NEGATIVE CONTROL: the measured
-/// question keeps its Answer roles.
+/// Multi-select questions or questions without `Write-in...` assign no option roles so policy
+/// escalates.
 #[test]
 fn a_question_no_digit_answers_carries_no_roles() {
     let rows = screen(QUESTION);
@@ -932,16 +806,8 @@ fn a_question_no_digit_answers_carries_no_roles() {
     );
 }
 
-/// A TURN THAT FAILED ON ONE OF AGY'S WALLS (UNMEASURED: its binary's words
-/// in the measured failure's rows, `⚠ <message>` over `Error ID:`): `Our
-/// servers are experiencing high traffic …` is an Overloaded wall on the
-/// turn's idle end; `You have exhausted your quota on this model.` a usage
-/// wall and `Your AI credits balance is too low to continue.` a spend wall,
-/// each LIMITED as evidence, no reset named — a banner, under no call.
-/// NEGATIVE CONTROLS: the measured failure is no wall
-/// (`a_failed_turn_is_an_ended_turn_with_no_wall`); the words with no `Error
-/// ID:` under them, or not in column 0, are none; a spinner over them is a
-/// turn running on, with no wall.
+/// `⚠ <message>` over `Error ID:` maps high traffic to `Overloaded`, quota exhausted to `Usage`,
+/// and low credits to `Spend`.
 #[test]
 fn agys_turn_walls_are_read_by_their_words() {
     let rows = screen(ERROR_TURN);
@@ -997,13 +863,7 @@ fn agys_turn_walls_are_read_by_their_words() {
     assert!(!WallKind::Overloaded.reads_limited());
 }
 
-/// A PERMISSION MODE'S HINT IS NO DRAFT (UNMEASURED: agy's binary's four
-/// hints on the measured idle composer): the caret row showing one — whole,
-/// or cut with `...` at a narrow pane's edge — is the EMPTY composer, idle as
-/// evidence, and the reader takes no text of it for a placeholder to type
-/// over. NEGATIVE CONTROLS: a typed draft is the draft; a cut that lost its
-/// ` mode: `, a hint with words typed after it, and a hint over a second
-/// line are drafts.
+/// Permission-mode hints on the caret row read as an empty composer rather than a user draft.
 #[test]
 fn a_permission_modes_hint_is_an_empty_composer() {
     let rows = screen(IDLE);
@@ -1048,13 +908,8 @@ fn a_permission_modes_hint_is_an_empty_composer() {
     );
 }
 
-/// A NARROW PANE WRAPS A BOX'S KEY ROW onto column-2 rows of its own
-/// (UNMEASURED: the measured boxes' key rows split in two): the box is still
-/// read — the edit box an Edit with its accept and its refusal, its key row
-/// read whole, its span to the row it wrapped onto — and the question's
-/// `esc Skip`, wrapped onto the second row, is still its Esc. NEGATIVE
-/// CONTROL: a column-2 run that does not open `↑/↓ Navigate` is no key row,
-/// and no box is read.
+/// Narrow panes that wrap a box's key hint row onto column-2 continuation rows still parse the box
+/// and `esc Skip`.
 #[test]
 fn a_wrapped_key_row_is_read_whole() {
     let rows = screen(BOX_EDIT);
@@ -1108,14 +963,8 @@ fn a_wrapped_key_row_is_read_whole() {
     assert_eq!(phase(&headless), (Phase::Idle, false));
 }
 
-/// THE PENDING EDIT'S ESC DOES NOTHING in agy 1.4.0 (its binary): the Edit
-/// box offers no Esc, though its footer reads `esc to cancel`; and after one
-/// agy draws `Esc disabled during file edits — press 1 to accept or 2 to
-/// reject.` under the key row (UNMEASURED: built on the measured box, at
-/// column 0 and at the key row's column 2), where the box is still read
-/// whole, its key row its own. NEGATIVE CONTROLS: the shell box's Esc is
-/// still the turn's interrupt; a row of other words in that place leaves no
-/// box read.
+/// `Pending edit` boxes report `esc: None` even when `Esc disabled during file edits` is drawn
+/// below the key row.
 #[test]
 fn the_pending_edits_esc_is_disabled() {
     let rows = screen(BOX_EDIT);
@@ -1159,13 +1008,8 @@ fn the_pending_edits_esc_is_disabled() {
     assert_eq!(prompt(&other), None, "the control");
 }
 
-/// THE FOOTER'S RIGHT SIDE ALONE IS A BLANK LEFT SIDE, whatever it names
-/// (UNMEASURED: a model with no effort badge, `Gemini 2.5 Flash`, and
-/// `(initializing...)` under the measured draft): the draft held is idle as
-/// evidence. The sniff stays strict: such a footer does not name the screen
-/// agy's, as the measured `<model> · <effort>` does. NEGATIVE CONTROLS: the
-/// empty composer over it says nothing; words at column 0 this grammar has
-/// not measured say nothing.
+/// A right-aligned model/status footer with a blank left side is authoritative idle when a draft is
+/// held.
 #[test]
 fn a_footer_naming_the_model_alone_is_blank() {
     let rows = screen(DRAFT);
@@ -1187,12 +1031,7 @@ fn a_footer_naming_the_model_alone_is_blank() {
     assert_eq!(phase(&other), (Phase::Idle, false), "the control");
 }
 
-/// A DRAFT WITH A BLANK LINE IN IT (UNMEASURED: the measured draft with a
-/// second paragraph, its rows indented under the caret's text): the composer
-/// holds all of it, the blank line an empty line, idle as evidence. NEGATIVE
-/// CONTROL: a row under the caret at column 0 that is no rule ends no frame —
-/// and the menu's, the boxes' and the exited screen's controls hold as
-/// before.
+/// Multi-paragraph drafts containing blank lines are read in full by `composer`.
 #[test]
 fn a_blank_line_in_a_draft_is_a_line_of_it() {
     let rows = screen(DRAFT);
@@ -1220,14 +1059,8 @@ fn a_blank_line_in_a_draft_is_a_line_of_it() {
     assert_eq!(phase(&broken), (Phase::Idle, false));
 }
 
-/// A TURN RUNS WHILE ITS SPINNER ROW IS ANYWHERE IN THE TURN (UNMEASURED: a
-/// row drawn between the spinner and the composer, a queued message's, say):
-/// busy as evidence, with no last words. The footer's `Press ↑ to edit queued
-/// messages` is a running turn's own hint: with no spinner in sight it is
-/// busy NOT authoritatively, as `esc to cancel` is, and names the screen
-/// agy's. NEGATIVE CONTROLS: the turn's end stays idle; a spinner row above
-/// the last message is an earlier turn's, and no turn running; a footer of
-/// other words says nothing.
+/// A spinner row anywhere in the active turn is authoritative busy; `Press ↑ to edit queued
+/// messages` alone is non-authoritative busy.
 #[test]
 fn a_spinner_anywhere_in_the_turn_is_busy() {
     let rows = screen(BUSY);
@@ -1261,12 +1094,7 @@ fn a_spinner_anywhere_in_the_turn_is_busy() {
     assert_eq!(phase(&earlier), (Phase::Idle, true), "an earlier turn's");
 }
 
-/// THE NOTICE CARD OVER THE COMPOSER IS NO WORDS OF THE AGENT: the measured
-/// card's rows (` ┃ Meet Gemini 4 Argon` … ` ┃ esc to dismiss`, its bar in
-/// column 1; [`IDLE_FRESH_NOTICE`]) over the composer under a turn's reply
-/// leave the reply its last words, idle as evidence. NEGATIVE CONTROL: the
-/// same rows with the bar in column 0, no card agy draws, leave the turn no
-/// last words.
+/// Notice cards (`┃ ...`) above the composer are excluded from `said_tail`.
 #[test]
 fn the_notice_card_is_no_last_words() {
     let card: Vec<String> = screen(IDLE_FRESH_NOTICE)
@@ -1290,14 +1118,8 @@ fn the_notice_card_is_no_last_words() {
     assert_eq!(said_tail(&flush), None, "the control");
 }
 
-/// A SUBAGENT'S ALERT IS A PROMPT NOTHING HERE ANSWERS (UNMEASURED: its
-/// binary's words, `<agent> needs approval for <tool>` and `<agent> has a
-/// question`, as a row of the turn over the measured composer): a prompt as
-/// evidence — while the turn's spinner runs too — read as an Other box titled
-/// by the alert, with NO option and its head on the screen, so a policy
-/// escalates it; no wall is read under it. NEGATIVE CONTROLS: the measured
-/// turn's end has no alert; an alert above the last message is an earlier
-/// turn's.
+/// Subagent approval/question alerts in the turn read as optionless `Other` prompts so policy
+/// escalates.
 #[test]
 fn a_subagents_alert_is_a_prompt_with_no_option() {
     let rows = screen(END_OF_TURN);
@@ -1333,7 +1155,6 @@ fn a_subagents_alert_is_a_prompt_with_no_option() {
         assert_eq!(phase(&earlier), (Phase::Idle, true), "{alert}");
         assert_eq!(prompt(&earlier), None, "{alert}");
     }
-    // A reply's row (two columns in) that names an alert's words is no alert.
     let mut said = rows.clone();
     said.insert(
         top,
@@ -1343,8 +1164,6 @@ fn a_subagents_alert_is_a_prompt_with_no_option() {
     let r = agy(END_OF_TURN);
     assert_eq!((r.phase, r.prompt), (Phase::Idle, None), "the control");
 }
-
-// ---- the lab's captures: agy 1.4.0 under the Gemini API provider -------
 
 /// What one lab capture must read as, by agy's reader under its own name.
 struct Lab {
@@ -1448,8 +1267,6 @@ fn lab_readings() -> Vec<Lab> {
             sniffed: Program::Generic,
             ..lab(lab::BG_EXITED, "idle", false)
         },
-        // A frame split by a PTY read: no composer, no spinner row, no layout; its whole
-        // successor busy (`docs/measured/half-drawn-frame-2026-10-22.md`).
         Lab {
             sniffed: Program::Generic,
             ..lab(lab::SPLIT_HALF, "idle", false)
@@ -1458,30 +1275,8 @@ fn lab_readings() -> Vec<Lab> {
     ]
 }
 
-/// THE BACKGROUND-WORK PANEL IS NO PART OF THE COMPOSER, AND ITS WORK IS THE
-/// AGENT'S OWN (agy 1.4.0, measured in the lab on 2026-10-17): under the
-/// composer's bottom rule agy draws one row an item — a command task or a
-/// timer `  ● [hh:mm:ss] <what> running`, a subagent `  ● Agent(<kind>:
-/// <name>)  Working · Ns` — then a second rule, then the footer counting
-/// them. The composer reads over it as without it: the empty caret on the
-/// row the cursor parks on, a held draft the draft, the spinner of a turn
-/// sent meanwhile busy as evidence and no background work (the turn is the
-/// agent's live one), the reply the last words. An ended turn over it is
-/// the agent's own background work, named, and busy as evidence — as Claude
-/// Code's reader reads a shell, a workflow or a background agent it left
-/// running, over a question it ended on too (the hard rule) — so no
-/// continuation is typed into a session agy wakes itself. Each of the
-/// panel's rows says so alone (its footer's count stripped), and so does
-/// the count alone (agy's setting that hides the panel, `hideActiveItems`:
-/// measured, [`lab::BG_PANEL_OFF_TASK`] and its siblings). Before,
-/// every one of these read as no composer: idle NOT as evidence, the draft
-/// unseen, the running turn idle. NEGATIVE CONTROLS: the panel gone and the
-/// count gone (as the work's end leaves the screen: the question then a
-/// question), the panel with no running row and no count, a task's row
-/// stamped with no clock, a count of `0`, a panel no rule closes or one
-/// closed by a rule of another width, and the screen agy left with the
-/// panel's rows in its last frame read no background work. Claude Code's
-/// reader reads none of it.
+/// Background-work panel rows (`● [hh:mm:ss] ... running` or `● Agent(...) Working`) and footer
+/// counts mark an ended turn as busy on background work while leaving composer parsing intact.
 #[test]
 fn the_background_panel_is_no_part_of_the_composer_and_its_work_is_the_agents() {
     let uncounted = |rows: &[String]| -> Vec<String> {
@@ -1513,12 +1308,10 @@ fn the_background_panel_is_no_part_of_the_composer_and_its_work_is_the_agents() 
         assert_eq!(r.said_tail.as_deref(), Some("Tool call done."), "{name}");
         assert_eq!(background_wait(&rows), Some(what), "{name}");
         assert_eq!(ClaudeReader.background_wait(&rows), None, "{name}");
-        // The panel's rows with no count under them.
         let counted_not = uncounted(&rows);
         assert_ne!(counted_not, rows, "{name}: the count stripped");
         assert_eq!(phase(&counted_not), (Phase::Busy, true), "{name}");
         assert_eq!(background_wait(&counted_not), Some(what), "{name}");
-        // The footer's count with no panel over it.
         let panel: Vec<usize> = (0..rows.len())
             .filter(|&i| is_panel_row(&rows[i]))
             .collect();
@@ -1531,12 +1324,10 @@ fn the_background_panel_is_no_part_of_the_composer_and_its_work_is_the_agents() 
             .collect();
         assert_eq!(phase(&bare), (Phase::Busy, true), "{name}");
         assert_eq!(background_wait(&bare), Some(what), "{name}");
-        // THE CONTROLS. No panel and no count: the turn's end as without it.
         let plain = uncounted(&bare);
         assert_eq!(phase(&plain), (Phase::Idle, true), "{name}");
         assert_eq!(background_wait(&plain), None, "{name}");
         assert_eq!(said_tail(&plain), r.said_tail, "{name}");
-        // The panel's rows saying nothing runs, and no count.
         let mut idle = uncounted(&rows);
         for &i in &panel {
             idle[i] = idle[i]
@@ -1546,7 +1337,6 @@ fn the_background_panel_is_no_part_of_the_composer_and_its_work_is_the_agents() 
         assert_eq!(phase(&idle), (Phase::Idle, true), "{name}");
         assert_eq!(background_wait(&idle), None, "{name}");
         assert!(composer(&idle).is_some(), "{name}");
-        // A count of none is no work.
         let none: Vec<String> = bare
             .iter()
             .map(|r| {
@@ -1557,8 +1347,6 @@ fn the_background_panel_is_no_part_of_the_composer_and_its_work_is_the_agents() 
         assert_ne!(none, bare, "{name}: the count zeroed");
         assert_eq!(phase(&none), (Phase::Idle, true), "{name}");
         assert_eq!(background_wait(&none), None, "{name}");
-        // A panel no rule closes is no frame of agy's, nor one closed by a
-        // rule of another width (the transcript's separators are 60).
         let mut open = rows.clone();
         open.remove(close);
         let mut narrow = rows.clone();
@@ -1569,7 +1357,6 @@ fn the_background_panel_is_no_part_of_the_composer_and_its_work_is_the_agents() 
             assert_eq!(background_wait(shape), None, "{name}");
         }
     }
-    // A task's row is stamped with the clock: `[hh:mm:ss]`, nothing else.
     let rows = uncounted(&screen(lab::BG_TASK));
     for stamp in ["[17:50]", "[17-50-42]", "[1750:42]", "[ab:cd:ef]"] {
         let unclocked: Vec<String> = rows
@@ -1580,8 +1367,6 @@ fn the_background_panel_is_no_part_of_the_composer_and_its_work_is_the_agents() 
         assert_eq!(phase(&unclocked), (Phase::Idle, true), "{stamp}");
         assert_eq!(background_wait(&unclocked), None, "{stamp}");
     }
-    // A question the turn ended on: the work holds it, as a shell left
-    // running holds Claude Code's (the hard rule); the work gone, it asks.
     let rows = screen(lab::BG_TASK);
     let asks = edited(
         &rows,
@@ -1604,7 +1389,6 @@ fn the_background_panel_is_no_part_of_the_composer_and_its_work_is_the_agents() 
         .collect();
     assert_eq!(phase(&asked), (Phase::Question, true), "the control");
     assert_eq!(background_wait(&asked), None, "the control");
-    // A draft held over the panel is the draft, the cursor after it.
     let r = agy(lab::BG_DRAFT);
     let (row, col) = cursor(lab::BG_DRAFT).expect("measured");
     assert_eq!(
@@ -1613,7 +1397,6 @@ fn the_background_panel_is_no_part_of_the_composer_and_its_work_is_the_agents() 
     );
     assert_eq!(col, 2 + "busy while a task runs".len());
     assert_eq!((r.phase, r.phase_authoritative), (Phase::Busy, true));
-    // A turn sent meanwhile: its spinner, the agent's live turn.
     let busy = screen(lab::BG_BUSY);
     let r = agy(lab::BG_BUSY);
     assert_eq!((r.phase, r.phase_authoritative), (Phase::Busy, true));
@@ -1621,7 +1404,6 @@ fn the_background_panel_is_no_part_of_the_composer_and_its_work_is_the_agents() 
     assert_eq!(busy.iter().filter(|r| is_spinner_row(r)).count(), 1);
     let (row, _) = cursor(lab::BG_BUSY).expect("measured");
     assert_eq!(r.composer, Some((row, vec![String::new()])));
-    // The work over, and agy gone with its work running.
     let r = agy(lab::BG_TASK_ENDED);
     assert_eq!((r.phase, r.phase_authoritative), (Phase::Idle, true));
     assert_eq!(background_wait(&screen(lab::BG_TASK_ENDED)), None);
@@ -1636,17 +1418,8 @@ fn the_background_panel_is_no_part_of_the_composer_and_its_work_is_the_agents() 
     assert_eq!(background_wait(&gone), None);
 }
 
-/// WHAT THE SCREEN SHOWS OF THE AGENT'S OWN BACKGROUND WORK, WHATEVER ITS
-/// TURN DOES ([`background_shown`], the live upgrade's quiet restart's screen
-/// witness): every panel row of the lab's captures — a task, a timer, a
-/// subagent, a daemon task, both at once, under a draft, and under a turn
-/// running (whose reading is busy with no background work named) — and the
-/// footer's count alone where the panel is turned off (`hideActiveItems`,
-/// measured), and a subagent's row in a state the reader names no work for
-/// (`Processing...`, measured for a moment as it starts) with the count
-/// stripped. NEGATIVE CONTROLS: the work over (no panel, no count), an idle
-/// and a fresh screen, a box, the screen agy left with the panel's rows in
-/// its last frame, and a count of `0` show none.
+/// `background_shown` reports whether the screen displays active background work in the panel or
+/// footer.
 #[test]
 fn every_panel_row_and_every_count_shows_background_work() {
     for (text, what) in [
@@ -1697,16 +1470,8 @@ fn every_panel_row_and_every_count_shows_background_work() {
     }
 }
 
-/// A LIMIT OR A WALL THE TURN ENDED ON STANDS OVER THE AGENT'S OWN
-/// BACKGROUND WORK (agy 1.4.0's lab screens): the panel and its running task
-/// spliced under the composer of a turn that ended on the stub's 500, on
-/// the key's 401 and on a per-day 429 read as those walls still — idle on
-/// the error and on the key (so the retry ladder and the login's escalation
-/// run), limited until the reset — while [`background_wait`] names the
-/// work, as Claude Code's reader reads the wall a turn ended on behind a
-/// shell it left running (`phase::background_wall`). Read busy, the ladder
-/// and the escalation would never run. NEGATIVE CONTROL: the same splice
-/// under a turn that ended on no wall reads busy.
+/// API error, login, and quota walls take precedence over background work while `background_wait`
+/// still reports the task.
 #[test]
 fn a_wall_the_turn_ended_on_stands_over_the_background_work() {
     let splice = |text: &str| -> Vec<String> {
@@ -1742,15 +1507,8 @@ fn a_wall_the_turn_ended_on_stands_over_the_background_work() {
     assert_eq!(background_wait(&ended), Some(TASK_RUNNING), "the control");
 }
 
-/// ONLY AN ENDED TURN THE READER VOUCHES FOR IS HELD BY THE WORK, AND THE
-/// PANEL'S ROWS SIT TWO COLUMNS IN (the review of the hard rule's guards).
-/// An exit pending (`press ctrl+c again to exit`) over a running task is
-/// `idle` NOT as evidence still, no background work named: agy is one key
-/// from gone, and read busy its exit would be waited through. A `● ` row one
-/// column in or four under the bottom rule is no panel row of agy's (one
-/// item, `● ` two columns in, measured), so the screen has no frame and no
-/// work is named. NEGATIVE CONTROL: the measured screen, its task's row two
-/// columns in under `? for shortcuts`, is busy on its task.
+/// Background work holds only an authoritative ended turn and requires panel items indented by two
+/// columns.
 #[test]
 fn an_exit_pending_over_work_is_no_evidence_and_a_panel_row_sits_two_columns_in() {
     let rows = screen(lab::BG_TASK);
@@ -1780,11 +1538,8 @@ fn an_exit_pending_over_work_is_no_evidence_and_a_panel_row_sits_two_columns_in(
     }
 }
 
-/// EVERY LAB CAPTURE READS AS IT MUST — its phase and whether that is
-/// evidence, its box's kind, its wall's, its survey, the program its layout
-/// names and the background work it shows — and the table covers every `agy-1.4.0-lab-*` file, so a
-/// capture added later is never left unread. NEGATIVE CONTROL: the generic
-/// reader, handed the same screens, reads none of it.
+/// Every `agy-1.4.0-lab-*` fixture matches its expected `Lab` reading and is rejected by
+/// `GenericReader`.
 #[test]
 fn every_lab_capture_reads_as_it_must() {
     let table = lab_readings();
@@ -1823,17 +1578,8 @@ fn every_lab_capture_reads_as_it_must() {
     }
 }
 
-/// AGY'S SURVEY IS A RATING CARD — never its composer, never a box: drawn in
-/// the composer's place, its question and `[1] Good  [2] Fine  [3] Bad  [0]
-/// Skip` at column 1 over the footer, it is read as a session survey whose
-/// `0` may be pressed, guarded on its options row as the screen shows it
-/// (its question's ASCII `'` could not be quoted), with no composer, no box,
-/// no last words and an idle that is NO evidence, so nothing is typed into
-/// it (a digit typed for a turn would rate). The turn under it ended on a
-/// 401, which is read once the survey has gone and the composer is back.
-/// NEGATIVE CONTROLS: the card's rows quoted two columns in (a reply), its
-/// question row gone, its options without `[0] Skip`, and a composer drawn
-/// under it are no survey.
+/// Session rating survey cards read as `survey: true` and non-authoritative idle with no composer
+/// or prompt box.
 #[test]
 fn the_survey_is_a_rating_card_never_the_composer_or_a_box() {
     let rows = screen(lab::SURVEY);
@@ -1885,7 +1631,6 @@ fn the_survey_is_a_rating_card_never_the_composer_or_a_box() {
     ]);
     assert_eq!(survey(&composed), None, "a composer under it");
 
-    // The survey gone with `0`: the composer back over the turn's 401.
     let at = rows
         .iter()
         .position(|r| r.starts_with(anchor_text("agy.error.id")))
@@ -1903,17 +1648,8 @@ fn the_survey_is_a_rating_card_never_the_composer_or_a_box() {
     assert_eq!(gone.wall.map(|w| w.kind), Some(WallKind::Auth));
 }
 
-/// A TURN THE GEMINI API FAILED IS A WALL, by the status agy printed: 401
-/// and a 400 whose reason is `API_KEY_INVALID` the login, a 429 that says
-/// the quota is exceeded a spend wall (limited, as evidence), a 503 that
-/// says overloaded an overload, a 500 an API error that agy did not retry.
-/// The wall is the `⚠` row's, a banner whose reset is a 429's RetryInfo
-/// delay as a span (none on the others), its message the block's rows
-/// joined. NEGATIVE CONTROLS: the signed-in failure with no
-/// status is no wall; the same blocks with the words that name their kind
-/// changed are API errors by their status; a reply under the block, or a
-/// newer message, ends the turn elsewhere; the retry under the spinner is
-/// busy, with no wall.
+/// Gemini API error blocks map 401/`API_KEY_INVALID` to `Login`, 429 quota to `Spend`, 503 to
+/// `Overloaded`, and 500 to `ApiError`.
 #[test]
 fn a_failed_turn_is_a_wall_by_the_status_the_api_answered() {
     for (text, kind, reset) in [
@@ -2024,14 +1760,8 @@ fn a_failed_turn_is_a_wall_by_the_status_the_api_answered() {
     assert_eq!((busy.phase, busy.wall), (Phase::Busy, None));
 }
 
-/// THE FIRST RUN'S ONBOARDING SCREENS ARE BOXES NO POLICY PRESSES: the colour
-/// scheme and the terms are prompts of NO KIND whose every option (the
-/// schemes, the consent's ticked box, the buttons) carries no role, chosen
-/// by the cursor and Enter, with no Esc, no wall and no composer — the
-/// person's taste and the person's consent. The trust box after them reads
-/// as the signed-in one does. NEGATIVE CONTROLS: with its heading gone a
-/// screen is no box, and nothing is evidence; the signed-in trust box is the
-/// same prompt the lab's is, roles and all.
+/// First-run colour-scheme and terms onboarding screens read as option-role-free prompts so policy
+/// never presses them.
 #[test]
 fn the_first_run_screens_are_boxes_of_no_kind() {
     let scheme = agy(lab::FIRST_RUN_SCHEME).prompt.expect("the picker");
@@ -2097,13 +1827,7 @@ fn the_first_run_screens_are_boxes_of_no_kind() {
     assert_eq!(lab_trust.path.as_deref(), Some("/private/tmp/at.tPt6/proj"));
 }
 
-/// UNDER AN API KEY THE SCREENS ARE THE SIGNED-IN ONES (module header): each
-/// box reads with the same kind, labels, roles, select and Esc as its
-/// signed-in capture, the fresh composer is idle and fresh as evidence, and
-/// an Esc is the person's interrupt — the logo's account row, the model's
-/// name and the spinner's word aside. NEGATIVE CONTROL: where they differ,
-/// the reader says so — signed out, agy draws a sign-in WALL; with the
-/// provider seeded, its first run draws boxes and no wall.
+/// API-key lab captures of boxes, fresh composer, and interrupts match the signed-in readings.
 #[test]
 fn the_lab_screens_read_as_the_signed_in_ones() {
     for (signed_in, keyed) in [
@@ -2147,17 +1871,8 @@ fn the_lab_screens_read_as_the_signed_in_ones() {
     }
 }
 
-/// WHAT ESC DOES ON A BOX THAT NAMES NONE ([`esc`]), as measured in the lab
-/// on 1.4.0 (2026-10-16): on the trust box it QUITS agy (back at the shell
-/// within two seconds of the Esc; the box left alone stood) — `Exit`; on the
-/// terms screen it goes back to the colour scheme, as its `[Previous]`
-/// button does — `Back`. A box that names its Esc says so itself: the
-/// command box's footer `esc to cancel` stops the turn (`Interrupt`), the
-/// question's key row `esc Skip` leaves it (`Back`). NEGATIVE CONTROLS: the
-/// colour-scheme screen, whose Esc changed nothing, says nothing; the terms
-/// screen with its `[Previous]` gone says nothing either, so the button is
-/// what the reading rests on; and the reader's own hook answers as [`esc`]
-/// does ([`ScreenReader::esc`]), where the default reads only a named Esc.
+/// `esc` maps trust to `Exit`, terms (`[Previous]`) and question (`esc Skip`) to `Back`, and
+/// command boxes to `Interrupt`.
 #[test]
 fn esc_on_a_box_that_names_none_is_what_agy_was_measured_to_do() {
     use crate::reader::AgyReader;
@@ -2200,21 +1915,8 @@ fn esc_on_a_box_that_names_none_is_what_agy_was_measured_to_do() {
     assert_eq!(CodexReader.esc(&p), None, "the default: only a named Esc");
 }
 
-/// THE STATUSES MEASURED IN THE LAB AFTER THE FIRST FIVE map by what agy
-/// does with them (its retries, counted in the stub's log) and what time
-/// does: a 403 `PERMISSION_DENIED` (with and without its `SERVICE_DISABLED`
-/// reason), a 404 `NOT_FOUND` model and a 400 `FAILED_PRECONDITION` are API
-/// errors agy did not retry; a 504 one it retried eight times, as it does a
-/// bare 429 (no RetryInfo), which limits; a per-minute 429 (its RetryInfo
-/// 47 s, more than agy waits) is a rate, an API error 429 that limits, and a
-/// per-day one of 41397 s a spend wall — each 429 with a RetryInfo carries
-/// its delay as the reset, rounded up to whole seconds. NEGATIVE CONTROLS:
-/// the per-day quota's id renamed per-minute is the rate, and the per-minute
-/// one renamed per-day the spend wall; the per-minute quota with a per-day
-/// (or daily) one beside it, before or after it, is the spend wall, and with
-/// a second per-minute one beside it still the rate; with its RetryInfo's
-/// word changed no reset is read; a delay wrapped mid-number still reads
-/// whole, and a delay in another unit, or none, reads nothing.
+/// Additional lab HTTP statuses (403, 404, 400, 504, and 429 per-minute vs per-day `RetryInfo`)
+/// map to their expected walls and resets.
 #[test]
 fn the_measured_statuses_map_by_what_agy_and_time_do_with_them() {
     let api = |code: u16, retryable: bool| WallKind::ApiError {
@@ -2266,9 +1968,6 @@ fn the_measured_statuses_map_by_what_agy_and_time_do_with_them() {
     assert_eq!(wall(&minute).map(|w| w.kind), Some(api(429, true)));
     let day = swap(lab::ERROR_429_PER_MINUTE, "PerMinutePer", "PerDayPer");
     assert_eq!(wall(&day).map(|w| w.kind), Some(WallKind::Spend));
-    // A per-day violation beside the per-minute one is the day's (Google's
-    // own client: a `PerDay` or `Daily` quota id is terminal before anything
-    // else is read), whichever of the two the SDK prints first.
     for second in [
         "GenerateRequestsPerDayPerProjectPerModel-FreeTier",
         "GenerateContentDailyRequestsPerProject",
@@ -2324,17 +2023,8 @@ fn the_measured_statuses_map_by_what_agy_and_time_do_with_them() {
     }
 }
 
-/// AGY'S `not signed in` SPLASH — the words its 1.4.0 binary holds for a
-/// screen that says so with no login menu under it (`Welcome back! You are
-/// currently not signed in.`, `No authentication methods available.. You are
-/// currently not signed in.`; a first run was seen to flash one before its
-/// colour picker, and the lab could not draw it again on 1.4.0 in six
-/// launches under its seeds: a first run, an untrusted one, a plain start, a
-/// dead proxy and a cold copy of the binary, every byte of each recorded) —
-/// is no box, no wall and no evidence: idle NOT authoritatively, with no
-/// composer, survey or last words, and not named agy's by its layout.
-/// NEGATIVE CONTROL: the sign-in wall, whose login menu stands under the
-/// same words, is the login wall.
+/// The `not signed in` splash without a login menu reads as non-authoritative idle with no wall,
+/// box, or layout match.
 #[test]
 fn the_not_signed_in_splash_is_no_box_and_no_evidence() {
     for words in [
@@ -2360,18 +2050,8 @@ fn the_not_signed_in_splash_is_no_box_and_no_evidence() {
     assert_eq!(signed_out.wall.map(|w| w.kind), Some(WallKind::Auth));
 }
 
-/// A REPLY TALLER THAN THE SCREEN IS NO WHOLE REPLY ([`said_whole`]): its
-/// rows reach the top of the rows read, its last words are the rows in
-/// sight, and the need its first row said is not in them — so a reader of a
-/// landing knows to read the rest (the recheck of d88a7bf289 found only
-/// Claude Code's cut read, and a tall report here land on its last rows).
-/// Nor is one under a CARET ROW ON THE TOP ROW: the rule above it that makes
-/// it a person's message is not on the rows, and the rows the message
-/// wrapped onto read as the reply's — the land instruction's `NEEDS YOU:`
-/// hint among them. The read of the history above stops at that rule, never
-/// the caret row ([`said_history_stop`]). NEGATIVE CONTROLS: the rule on the
-/// rows, or the reply's first row under agy's own row, is whole, the
-/// person's words out of the reply's.
+/// `said_whole` is false when a reply reaches the top of the screen or starts under an un-ruled
+/// top caret row.
 #[test]
 fn a_reply_whose_top_is_off_the_rows_is_no_whole_reply() {
     let rows = screen(END_OF_TURN);
@@ -2400,37 +2080,24 @@ fn a_reply_whose_top_is_off_the_rows_is_no_whole_reply() {
     let reply = |rows: &[String]| said_tail(rows).expect("a reply");
     assert!(said_whole(&drawn) && AgyReader.said_whole(&drawn));
     assert!(reply(&drawn).starts_with("Merged the parser"));
-    // The reply's top off the rows.
     let cut = drawn[drawn.len() - rows.len()..].to_vec();
     assert!(!said_whole(&cut) && !AgyReader.said_whole(&cut));
     assert!(reply(&cut).ends_with("Nothing left: all of it is merged."));
-    // The caret row on the top row: its rule above it not.
     let caret = drawn[user..].to_vec();
     assert!(!said_whole(&caret) && !AgyReader.said_whole(&caret));
     assert!(reply(&caret).starts_with("NEEDS YOU: and carry on."));
     assert!(!said_history_stop(&drawn[user]) && !AgyReader.said_history_stop(&drawn[user]));
     assert!(said_history_stop(&drawn[user - 1]) && AgyReader.said_history_stop(&drawn[user - 1]));
     assert!(!said_history_stop("  - merged item 3"));
-    // NEGATIVE CONTROL: the rule on the rows.
     let ruled = drawn[user - 1..].to_vec();
     assert!(said_whole(&ruled) && reply(&ruled).starts_with("Merged the parser"));
-    // NEGATIVE CONTROL: agy's own row on the top row.
     let mut own = cut.clone();
     own[0] = "● Ran git push".to_string();
     own[1] = String::new();
     assert!(said_whole(&own));
 }
 
-/// A NEED SAID BEFORE A TOOL CALL IS THE TURN'S ([`turn_said_before`]): the
-/// reply above a tool's `●` row, under the person's message, is read with
-/// the turn its last reply ends — a `NEEDS YOU:` there stands however the
-/// last reply says nothing is left (the recheck of ea564676a3 found the
-/// turn's earlier words read on Claude Code alone). The turn is whole with
-/// its message under its rule on the rows ([`turn_whole`]); with them above
-/// the rows it is not, and the history read above stops at the rule
-/// ([`turn_history_stop`]). Rows drawn right under a `●` row are its output,
-/// no words of the agent. NEGATIVE CONTROL: the same turn with no reply
-/// before the call holds no other words.
+/// `turn_said_before` extracts agent reply text above a tool call (`●`) within the current turn.
 #[test]
 fn a_need_said_before_a_tool_call_is_read_with_the_turn() {
     let rows = screen(END_OF_TURN);
@@ -2471,34 +2138,24 @@ fn a_need_said_before_a_tool_call_is_read_with_the_turn() {
         Some("Nothing left: all of it is merged.")
     );
     assert!(turn_whole(&drawn) && AgyReader.turn_whole(&drawn));
-    // The message above the rows: the turn is cut, and the read above stops
-    // at its rule.
     let cut = drawn[user + 1..].to_vec();
     assert!(said_whole(&cut) && !turn_whole(&cut) && !AgyReader.turn_whole(&cut));
     assert!(turn_history_stop(&drawn[user - 1]) && AgyReader.turn_history_stop(&drawn[user - 1]));
     for row in &drawn[user..user + 4] {
         assert!(!turn_history_stop(row), "{row}");
     }
-    // A tool row's output is no words of the agent.
     let output = turn(&[
         "● Ran cat NOTES.md (ctrl+o to expand)",
         "  NEEDS YOU: the signing credential, to sign the release.",
         "",
     ]);
     assert_eq!(turn_said_before(&output), None);
-    // NEGATIVE CONTROL: no reply before the call.
     let plain = turn(&[]);
     assert_eq!(turn_said_before(&plain), None);
     assert!(turn_whole(&plain) && said_tail(&plain).is_some());
 }
 
-/// THE MESSAGE THAT OPENED THE TURN IS READ UNDER ITS RULE
-/// ([`turn_opened_by`]): the caret row's text past its `>`, and the rows it
-/// wrapped onto up to the blank row under it, joined — what tells a
-/// successor whether its land act opened the turn whose defense stands (the
-/// review of b8/residuals found a defense said under a person's earlier
-/// message landed on agy, nothing reading the message). NEGATIVE CONTROLS:
-/// the message above the rows, and Claude Code's reader, read none.
+/// `turn_opened_by` extracts the user message under the turn's opening rule.
 #[test]
 fn the_message_that_opened_the_turn_is_read_under_its_rule() {
     let rows = screen(END_OF_TURN);
@@ -2516,18 +2173,13 @@ fn the_message_that_opened_the_turn_is_read_under_its_rule() {
         turn_opened_by(&wrapped).as_deref(),
         Some(format!("{said} Keep it short.").as_str())
     );
-    // NEGATIVE CONTROLS.
     let cut = rows[user + 1..].to_vec();
     assert!(said_tail(&cut).is_some());
     assert_eq!(turn_opened_by(&cut), None);
     assert_eq!(ClaudeReader.turn_opened_by(&rows), None);
 }
 
-/// The grid rows of the long-reply screen's last message whose column-0
-/// cells agy drew in its caret row's style (`5c5cff` bold), its blank row
-/// among them: MEASURED with the capture (`aterm-agent`'s
-/// `supervise/fixtures/agy-1.4.0-lab-person-paragraphs-long-reply.cells`).
-/// Every other row under the message, blank ones too, is plain.
+/// Styled message row indices (`5c5cff` bold at col 0) for `PERSON_PARAGRAPHS_LONG_REPLY`.
 const LONG_REPLY_MESSAGE_ROWS: [usize; 3] = [30, 31, 32];
 
 /// The same for the first screen's person's message: rows 8 to 11.
@@ -2543,20 +2195,10 @@ fn inner_of(blanks: &[usize], styled: &[usize]) -> Vec<usize> {
         .collect()
 }
 
-/// A PERSON'S PARAGRAPHS ARE BOUNDED BY THE MESSAGE'S CELLS (module
-/// header's A MESSAGE'S BLANK LINE): on the measured screens of a person's
-/// message whose blank line agy drew as a blank row, the text names the
-/// blank rows to read under the message ([`message_blanks`]), the measured
-/// cells say which are the message's own, and with those taken out
-/// ([`fold_message`]) the reply is agy's alone — no `NEEDS YOU:` of the
-/// person's in it — the turn opened by every paragraph of the message, the
-/// composer, the footer and the reply's rows where they were. NEGATIVE
-/// CONTROLS: read as drawn, the person's later paragraph is agy's reply and
-/// its `NEEDS YOU:` with it; no fold where the cells keep no blank row, or
-/// the caret row is no message's; and no rows to read while a turn runs.
+/// `message_blanks` and `fold_message` use cell styling to keep multi-paragraph user messages out
+/// of `said_tail`.
 #[test]
 fn a_persons_paragraphs_are_bounded_by_the_messages_cells() {
-    // The long reply: the person's two paragraphs, the stub's three.
     let rows = screen(lab::PERSON_PARAGRAPHS_LONG_REPLY);
     assert!(
         provenance(lab::PERSON_PARAGRAPHS_LONG_REPLY)
@@ -2593,15 +2235,12 @@ fn a_persons_paragraphs_are_bounded_by_the_messages_cells() {
         AgyReader.message_blanks(&rows),
         Some((caret, blanks.clone()))
     );
-    // NEGATIVE CONTROL: read as drawn, the person's paragraph is the reply.
     let misread = said_tail(&rows).expect("words");
     assert!(
         misread.starts_with("NEEDS YOU: the person's own words"),
         "{misread}"
     );
 
-    // The first screen, cut to the person's turn: three paragraphs, a line
-    // break then a blank line, the stub's one-line reply.
     let first = screen(lab::PERSON_PARAGRAPHS);
     let act = first
         .iter()
@@ -2619,18 +2258,13 @@ fn a_persons_paragraphs_are_bounded_by_the_messages_cells() {
         said_tail(&folded).as_deref(),
         Some("Hi! I am the local lab stub, not a model. (reply 1)")
     );
-    // NEGATIVE CONTROL: as drawn, the third paragraph is agy's need.
     assert!(said_tail(&turn).is_some_and(|t| t.starts_with("NEEDS YOU: a paragraph after")));
 
-    // NEGATIVE CONTROLS: nothing kept, or no message's caret, folds nothing.
     assert_eq!(fold_message(&rows, caret_of(&rows), &[]), rows);
     assert_eq!(fold_message(&rows, 31, &[33]), rows);
-    // The rows of the full first screen: its last message is the act's,
-    // whose blank row under it is the plain one (not kept by the cells).
     let (act_caret, act_blanks) = message_blanks(&first).expect("rows to read");
     assert_eq!(act_caret, act);
     assert!(inner_of(&act_blanks, &[16, 17, 18]).is_empty());
-    // No rows while a turn runs, nor on a fresh screen.
     assert_eq!(message_blanks(&screen(lab::BUSY_STREAMING)), None);
     assert_eq!(message_blanks(&screen(lab::IDLE)), None);
     assert_eq!(ClaudeReader.message_blanks(&rows), None);

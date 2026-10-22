@@ -2,7 +2,7 @@
 // Copyright 2026 Andrew Yates
 
 //! Hand-written verdict sequences through the real tracker (design §2.4,
-//! §10 slice 1). Every sequence goes through `conformance_turn::drive`, so
+//! §10). Every sequence goes through `conformance_turn::drive`, so
 //! each step is also checked against the derived `TurnTracker` model; the
 //! assertions here are about the tree the log ends up holding. Every host
 //! call is a checked [`Step`], so each test's path is its `.seq` twin's

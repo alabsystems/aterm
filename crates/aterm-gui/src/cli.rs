@@ -110,13 +110,10 @@ macro_rules! shell_flag_help {
         concat!(
             "        --shell <name|path>        Interactive shell to spawn. Discovery-resolved:\n",
             "                                   \"bash\" finds Git Bash even off PATH; \"pwsh\",\n",
-            "                                   \"cmd\", \"wsl\", \"nu\", or an absolute path also work.\n",
-            "                                   Shell integration (prompt marks, jump-to-prompt,\n",
-            "                                   command blocks, cwd) is injected for zsh/bash/fish/\n",
-            "                                   pwsh and \"wsl\" (bash login shell). \"cmd\" is partial:\n",
-            "                                   prompt marks, jump-to-prompt and cwd work, but blocks\n",
-            "                                   carry no command text or exit code. \"nu\" gets none.\n",
-            "                                       [config: shell]\n",
+            "                                   \"cmd\", \"wsl\", \"nu\", or a path also work. Shell\n",
+            "                                   integration is injected for zsh/bash/fish/pwsh and\n",
+            "                                   \"wsl\" (bash login); \"cmd\" is partial (no command\n",
+            "                                   text or exit code); \"nu\" gets none. [config: shell]\n",
         )
     };
 }
@@ -124,19 +121,17 @@ macro_rules! shell_flag_help {
 macro_rules! shell_flag_help {
     () => {
         concat!(
-            "        --shell <name|path>        Interactive shell to spawn: a program name on\n",
-            "                                   PATH (\"bash\", \"zsh\", \"fish\") or a path. Unset:\n",
-            "                                   $SHELL, else your login shell. Shell integration\n",
-            "                                   (prompt marks, jump-to-prompt, command blocks,\n",
-            "                                   cwd) is injected for zsh, bash, fish and pwsh.\n",
-            "                                       [config: shell]\n",
+            "        --shell <name|path>        Interactive shell to spawn: a name on PATH (\"bash\",\n",
+            "                                   \"zsh\", \"fish\") or a path (default: $SHELL, else\n",
+            "                                   login shell). Shell integration is injected for\n",
+            "                                   zsh, bash, fish and pwsh. [config: shell]\n",
         )
     };
 }
 
 /// The `--help` text: every user-facing flag with its argument, a one-line description and its
-/// `[config: key]` where it has one. There is no ENVIRONMENT section: no variable changes what a
-/// shipped aterm does, so precedence is flag > config > default.
+/// `[config: key]` where it has one. No environment variable changes what a shipped aterm does,
+/// so precedence is flag > config > default.
 const HELP_TITLE: &str = "aterm-gui — a fast, hardened terminal\n";
 const HELP_HEAD: &str = concat!(
     "\n",
@@ -144,75 +139,54 @@ const HELP_HEAD: &str = concat!(
     "    aterm-gui [OPTIONS]\n",
     "    aterm-gui [-d <dir>] -e <command> [args...]\n\n",
     "OPTIONS:\n",
-    "    -e, --command <cmd> [args...]  Run <cmd> in the terminal instead of $SHELL;\n",
-    "                                   the window closes when it exits. Consumes the\n",
-    "                                   rest of the command line.\n",
-    "    -d, --working-directory <dir>  Start the shell/command in <dir>.\n",
-    "        --hold                     Keep the window open after the -e command\n",
-    "                                   exits (close it manually).\n",
-    "        --font-px <px>             Font size in px at 1x, points on macOS\n",
-    "                                   (6..=200), for this launch. [config: font_px]\n",
-    "        --font <name|path>         Primary font FAMILY (e.g. \"JetBrains Mono\") or\n",
-    "                                   font file for this launch. [config: font_family]\n",
+    "    -e, --command <cmd> [args...]  Run <cmd> instead of $SHELL; window closes on exit.\n",
+    "                                   Consumes the rest of the command line.\n",
+    "    -d, --working-directory <dir>  Start the shell or command in <dir>.\n",
+    "        --hold                     Keep the window open after the -e command exits.\n",
+    "        --font-px <px>             Font size in px at 1x, points on macOS (6..=200),\n",
+    "                                   for this launch. [config: font_px]\n",
+    "        --font <name|path>         Primary font family or font file for this launch.\n",
+    "                                   [config: font_family]\n",
     shell_flag_help!(),
-    "        --scale <f>                Force the render scale factor (font + padding).\n",
-    "                                   In a window this overrides the display scale;\n",
-    "                                   headless it makes the `image` capture render at\n",
-    "                                   that DPI (e.g. --scale 2 ≈ a 2× Retina window).\n",
-    "        --gpu                      Force GPU rendering — the DEFAULT (Metal on macOS,\n",
-    "                                   wgpu elsewhere; auto CPU fallback). [config: gpu]\n",
-    "        --cpu                      Force the CPU renderer (overrides config; the\n",
-    "                                   last of --cpu/--gpu wins).\n",
+    "        --scale <f>                Force render scale factor (font + padding); headless,\n",
+    "                                   sets `image` capture DPI (e.g. 2 = 2x Retina).\n",
+    "        --gpu                      Force GPU rendering — the DEFAULT (Metal/GL/DX12;\n",
+    "                                   auto CPU fallback). [config: gpu]\n",
+    "        --cpu                      Force CPU renderer (last of --cpu/--gpu wins).\n",
     "        --containment <mode>       Containment mode: user|safety|containment\n",
-    "                                   (an invalid value fails closed to containment).\n",
+    "                                   (invalid values fail closed to containment).\n",
     "        --sandbox                  Shorthand for --containment containment.\n",
     "        --no-sandbox               Shorthand for --containment user.\n",
-    "        --control-sock <path>      Bind the control socket at <path> (or 0/off to\n",
-    "                                   disable); clients reach it with --sock <path>.\n",
+    "        --control-sock <path>      Bind control socket at <path> (or 0/off to disable);\n",
+    "                                   clients connect with --sock <path>.\n",
     "        --no-control-sock          Disable the control socket.\n",
-    "        --headless                 No window; engine + control socket only. The\n",
-    "                                   launch announces the mode on stderr. Once it\n",
-    "                                   is up, SIGTERM, SIGINT or SIGHUP quits it as\n",
-    "                                   Quit does (a second one ends it at once; one\n",
-    "                                   it was started ignoring, as by nohup, stays\n",
-    "                                   ignored).\n",
-    "        --lifeline-fd <n>          With --headless: shut down when descriptor <n>\n",
-    "                                   (a pipe's read end) reads end-of-file — the\n",
-    "                                   launcher that holds its write end is gone. For\n",
-    "                                   harnesses: a killed test run takes its instance\n",
-    "                                   with it.\n",
-    "        --ready-fd <n>             With --headless: once the control socket listens,\n",
-    "                                   write one byte to descriptor <n> (a pipe's write\n",
-    "                                   end, 3 or above) and close it; closed with nothing\n",
-    "                                   written, the instance has no socket. For harnesses:\n",
-    "                                   wait on it instead of polling the socket.\n",
+    "        --headless                 No window; engine + control socket only. Announces\n",
+    "                                   mode on stderr; SIGTERM/SIGINT/SIGHUP quits cleanly\n",
+    "                                   (a second exits immediately; ignored signals stay ignored).\n",
+    "        --lifeline-fd <n>          With --headless: shut down when descriptor <n> (pipe\n",
+    "                                   read end) reaches EOF because its launcher exited.\n",
+    "        --ready-fd <n>             With --headless: write one byte to descriptor <n> (3+)\n",
+    "                                   and close it once the control socket listens (closed\n",
+    "                                   empty if the socket is disabled).\n",
     "        --columns <n>              Initial width in columns (20..=500).\n",
     "        --lines <n>                Initial height in rows (5..=300).\n",
-    "        --shell-integration        OSC 133/633 command marks (blocks/cwd/title) — ON by\n",
-    "                                       default; this flag is a no-op.\n",
-    "        --no-shell-integration     Disable shell-integration marks (default is on).\n",
+    "        --shell-integration        OSC 133/633 command marks (default on; no-op).\n",
+    "        --no-shell-integration     Disable shell-integration marks.\n",
     "        --verbose                  Verbose diagnostics on stderr.\n",
-    "        --diagnose                 Print a diagnostics report (version, build,\n",
-    "                                   renderer, capabilities, config, env) and exit.\n",
-    "        --list-actions             List the bindable [keybindings] action names\n",
-    "                                   and exit.\n",
-    "        --validate-config          Check aterm.toml: unknown keys (by line),\n",
-    "                                   unaccepted values (by key) and parse errors;\n",
-    "                                   exits 1 only when the file does not load.\n",
-    "        --list-fonts               List the font search dirs and discoverable\n",
-    "                                   font families, then exit.\n",
-    "        --show-config              Print what a launch resolves (font, size,\n",
-    "                                   renderer, shell, theme, colours) and whether\n",
-    "                                   aterm.toml loaded, then exit.\n",
-    "        --write-config             Write a documented starter aterm.toml if absent\n",
-    "                                   (every line commented out, so it changes\n",
-    "                                   nothing), then exit.\n",
-    "        --list-keybinds            List built-in + configured [keybindings] and\n",
-    "                                   [key_sequences], plus bindable actions, then exit.\n",
-    "        --show-face [family]       Print the resolved font face (path + metrics)\n",
-    "                                   for [family] (or the configured font) and exit.\n",
-    "        --list-themes              List the built-in and custom colour themes\n",
-    "                                   and exit.\n",
+    "        --diagnose                 Print diagnostics (version, build, renderer,\n",
+    "                                   capabilities, config, env) and exit.\n",
+    "        --list-actions             List bindable [keybindings] action names and exit.\n",
+    "        --validate-config          Check aterm.toml (unknown keys, unaccepted values,\n",
+    "                                   parse errors); exits 1 only if the file fails to load.\n",
+    "        --list-fonts               List font search dirs and discoverable families, then exit.\n",
+    "        --show-config              Print effective launch config (font, size, renderer,\n",
+    "                                   shell, theme, colours) and config load state, then exit.\n",
+    "        --write-config             Write a commented starter aterm.toml if absent, then exit.\n",
+    "        --list-keybinds            List built-in + configured [keybindings], [key_sequences],\n",
+    "                                   and bindable actions, then exit.\n",
+    "        --show-face [family]       Print resolved font face (path + metrics) for [family]\n",
+    "                                   (or the configured font) and exit.\n",
+    "        --list-themes              List built-in and custom colour themes and exit.\n",
     "    -h, --help                     Print this help and exit.\n",
     "    -V, --version                  Print the version and exit.\n\n",
 );
@@ -224,22 +198,19 @@ const HELP_HEAD: &str = concat!(
 const KEYS_HELP: &str = concat!(
     "KEYS (in the window):\n",
     "    Cmd-C / Cmd-V     Copy selection / paste (control-stripped, bracketed).\n",
-    "    Cmd-= / Cmd--     Zoom the font in / out.   Cmd-0  Reset zoom.\n",
-    "    Cmd-click         Open a hyperlink / detected URL (http/https/mailto);\n",
+    "    Cmd-= / Cmd--     Zoom font in / out.   Cmd-0  Reset zoom.\n",
+    "    Cmd-click         Open hyperlink, URL (http/https/mailto) or file:line citation;\n",
     "                      Cmd-Option-click where the program tracks the mouse.\n",
     "    Cmd-F             Find (screen + scrollback): type, Enter/Shift-Enter, Esc.\n",
     "    Cmd-S / Cmd-R     Emacs search forward / backward; repeat to navigate + wrap.\n",
-    "    Cmd-,             Open the native Settings tab; Manual edits aterm.toml.\n",
-    "    Cmd-N             Open a new window (same process, same sessions).\n",
-    "    Cmd-T             Open a new tab (new shell, same window).\n",
-    "    Cmd-W             Close the focused pane; the last pane closes the tab,\n",
-    "                      and the last tab its window; the last window quits aterm.\n",
-    "    Cmd-Shift-T       Reopen the most recently closed tab.\n",
+    "    Cmd-,             Open Settings tab; Manual edits aterm.toml.\n",
+    "    Cmd-N / Cmd-T     New window (same process) / new tab (same window).\n",
+    "    Cmd-W             Close focused pane -> tab -> window; last window quits aterm.\n",
+    "    Cmd-Shift-T       Reopen most recently closed tab.\n",
     "    Cmd-Shift-] / [   Next / previous tab (wraps).   Cmd-1..9  Nth tab.\n",
     "    Cmd-Shift-P       Command Palette (every action, searchable).\n",
-    "    Cmd-Opt-Arrow     Move focus to the pane in that direction (no menu item).\n",
-    "    This is the common set; the menu bar lists them ALL (splits, move-tab, and\n",
-    "    more) with their live chords.\n\n",
+    "    Cmd-Opt-Arrow     Focus pane in that direction (no menu item).\n",
+    "    The menu bar lists every action (splits, move-tab, and more) with its live chord.\n\n",
 );
 
 /// The non-macOS KEYS section, generated from
@@ -272,7 +243,7 @@ fn keys_help() -> String {
         s.push_str(&format!("    {chords:<width$}  {action}\n"));
     }
     // Not a chord, so not in the table: the pointer half of the keymap.
-    s.push_str("    ctrl+click  Open a hyperlink / detected URL (http/https/mailto);\n");
+    s.push_str("    ctrl+click  Open hyperlink, URL (http/https/mailto) or file:line citation;\n");
     s.push_str("                ctrl+alt+click where the program tracks the mouse.\n");
     s.push_str(
         "    shift+drag  Select text where the program tracks the mouse (alt+drag too).\n\n",
@@ -288,54 +259,42 @@ fn keys_help() -> String {
 
 const HELP_TAIL: &str = concat!(
     "CHILD-SHELL ENV HYGIENE:\n",
-    "    The spawned shell has every AI-agent context variable STRIPPED before exec —\n",
-    "    CLAUDE*, ANTHROPIC_*, COPILOT_*, CODEX_*, ANTIGRAVITY_*, GEMINI_*, CURSOR_*, AI_*,\n",
-    "    and _DEVTOOL_* — so they never leak into your session. An inner agent whose\n",
-    "    context vars went missing was sanitized here by design (aterm_types::env_sanitize),\n",
-    "    not lost.\n\n",
+    "    Spawned shells strip AI-agent context variables before exec (CLAUDE*,\n",
+    "    ANTHROPIC_*, COPILOT_*, CODEX_*, ANTIGRAVITY_*, GEMINI_*, CURSOR_*, AI_*,\n",
+    "    _DEVTOOL_*) via aterm_types::env_sanitize so outer agent state never leaks in.\n\n",
     "CONFIG:  <aterm.toml>  (live settings reload; launch/session settings disclose their timing; precedence flag > config > default)\n",
     "  Appearance  font_px, font_family, theme (name, or dark:<name>,light:<name>),\n",
     "              foreground, background, cursor_color, selection_color,\n",
-    "              selection_foreground,\n",
-    "              palette [array of #RRGGBB], window_theme, tab_strip_rows.\n",
+    "              selection_foreground, palette [array of #RRGGBB], window_theme,\n",
+    "              tab_strip_rows.\n",
     "  Window/Tabs tab_status, tab_status_quiet_after_ms, tab_status_dwell_ms,\n",
     "              tab_status_badge, tab_connection_badge, spare_shell,\n",
     "              spare_shell_needs_person.\n",
-    "  Cursor      serious_mode (mute all sound/decorative effects), motion,\n",
-    "              cursor_style, cursor_blink, cursor_momentum_glow (typing-speed glow),\n",
-    "              cursor_trail_style (default rainbow kitty pet; off on Windows),\n",
-    "              cursor_trail_color/_accent/_intensity/_radius,\n",
-    "              cursor_trail_ms/_length/_ring, cursor_trail_bloom (+_strength/_radius).\n",
-    "  Sound       trail_sounds (master), trail_sound_volume (scales every synth\n",
-    "              voice), trail_sound_style (the typing sound: auto | music box |\n",
-    "              warm pluck | glitter | ice chime | droplet | pew | zap | tick |\n",
-    "              crackle | mechanical | typewriter | marimba | felt), tone_melody,\n",
-    "              trail_sound_bed (the ambient texture; default on),\n",
-    "              trail_sound_riff (the sing-along song — the loudest voice),\n",
-    "              bell_sound (the audible BEL beep; macOS/Windows/X11),\n",
-    "              sparkle_words.profanity.bonk[_detonation] (the curse bonk).\n",
-    "  Text        ligatures, font_features, bidi, ambiguous_width,\n",
-    "              text_blending (linear-corrected | linear), font_thicken (macOS),\n",
-    "              stem_gamma,\n",
-    "              font_hinting (Linux/Windows: full | light | off),\n",
-    "              font_subpixel (Linux CPU renderer: off | rgb | bgr),\n",
-    "              font_variation [\"wght=450\", ...], font_weight,\n",
-    "              font_weight_dark_nudge (variable fonts, e.g. SF Mono),\n",
-    "              font_family_bold/_italic/_bold_italic, font_synthetic_style,\n",
-    "              fallback_fonts [ordered], symbol_font, emoji_font,\n",
-    "              line_height, font_size_scale (config > theme > built-in;\n",
-    "              a blank font name means aterm's own choice).\n",
+    "  Cursor      serious_mode (mute sound/decorative effects), motion, cursor_style,\n",
+    "              cursor_blink, cursor_momentum_glow, cursor_trail_style (default\n",
+    "              rainbow kitty pet; off on Windows), cursor_trail_color/_accent/\n",
+    "              _intensity/_radius/_ms/_length/_ring, cursor_trail_bloom\n",
+    "              (+_strength/_radius).\n",
+    "  Sound       trail_sounds (master), trail_sound_volume, trail_sound_style\n",
+    "              (auto | music box | warm pluck | glitter | ice chime | droplet |\n",
+    "              pew | zap | tick | crackle | mechanical | typewriter | marimba |\n",
+    "              felt), tone_melody, trail_sound_bed, trail_sound_riff, bell_sound,\n",
+    "              sparkle_words.profanity.bonk[_detonation].\n",
+    "  Text        ligatures, font_features, bidi, ambiguous_width, text_blending\n",
+    "              (linear-corrected | linear), font_thicken (macOS), stem_gamma,\n",
+    "              font_hinting (Linux/Windows: full | light | off), font_subpixel\n",
+    "              (Linux CPU: off | rgb | bgr), font_variation [\"wght=450\", ...],\n",
+    "              font_weight, font_weight_dark_nudge, font_family_bold/_italic/\n",
+    "              _bold_italic, font_synthetic_style, fallback_fonts [ordered],\n",
+    "              symbol_font, emoji_font, line_height, font_size_scale.\n",
     "  Behaviour   gpu, scrollback_lines, columns, lines, copy_on_select,\n",
-    "              option_as_meta, search_history_lines, focus_boost (Windows:\n",
-    "              shell priority follows window focus; default on),\n",
-    "              conpty (Windows: the console host new tabs run in —\n",
-    "              bundled, the default | inbox | auto | a path to\n",
-    "              OpenConsole.exe),\n",
-    "              desktop_alerts (aterm's own alerts also as system\n",
-    "              notifications, needs only; default off).\n",
-    "  Security    allow_window_ops, allow_notifications, allow_palette_reconfigure,\n",
-    "              allow_kitty_file_transfer, allow_osc52_query,\n",
-    "              secure_keyboard_entry (macOS)  (all opt-in, default off).\n",
+    "              option_as_meta, search_history_lines, focus_boost (Windows;\n",
+    "              default on), conpty (Windows: bundled | inbox | auto | path),\n",
+    "              desktop_alerts (aterm's own needs-you alerts as system\n",
+    "              notifications; default off).\n",
+    "  Security    allow_window_ops, allow_notifications, allow_kitty_file_transfer,\n",
+    "              allow_osc52_query, secure_keyboard_entry (macOS) (default off);\n",
+    "              allow_palette_reconfigure (default on).\n",
     "  Keys        [keybindings] \"chord\"=\"action\"; [key_sequences] \"chord\"=raw bytes.\n",
 );
 
@@ -389,23 +348,14 @@ const WINDOWS_HELP_TAIL: &str = concat!(
 macro_rules! starter_shell_block {
     () => {
         "\
-# shell = \"bash\"        # interactive shell. Discovery-resolved: \"bash\" finds Git
-#                       # Bash even if it is not on PATH; \"pwsh\", \"cmd\", \"wsl\",
-#                       # \"nu\", or an absolute path also work. Unset = platform
-#                       # default (Windows: pwsh > powershell > %COMSPEC% > cmd;
-#                       # `aterm doctor` names the one this machine gets). Override
-#                       # at launch with --shell. Applies to new sessions.
-#                       # Shell integration (prompt marks, jump-to-prompt, command
-#                       # blocks, cwd tracking) is injected automatically for zsh,
-#                       # bash, fish, pwsh/powershell and \"wsl\" (whose distro must
-#                       # use bash as its login shell). \"cmd\" is PARTIAL: prompt
-#                       # marks, jump-to-prompt and cwd tracking all work, but cmd
-#                       # has no hook for when a command starts or finishes, so
-#                       # `blocks` shows prompt-delimited regions with no command
-#                       # text and no exit code, and `wait` never fires. \"nu\" gets
-#                       # none.
-# shell_args = [\"-l\", \"-i\"]  # extra argv after the shell (e.g. a login bash);
-#                       # for \"wsl\" these are wsl.exe options, e.g. [\"-d\", \"Debian\"]
+# shell = \"bash\"        # interactive shell: \"bash\" (finds Git Bash even off PATH),
+#                       # \"pwsh\", \"cmd\", \"wsl\", \"nu\", or a path. Unset = platform
+#                       # default (pwsh > powershell > %COMSPEC% > cmd; `aterm doctor`
+#                       # names it). Override with --shell; applies to new sessions.
+#                       # Shell integration is injected for zsh/bash/fish/pwsh and
+#                       # \"wsl\" (bash login); \"cmd\" is partial (no command text or
+#                       # exit code); \"nu\" gets none.
+# shell_args = [\"-l\", \"-i\"]  # extra argv after the shell (for \"wsl\", wsl.exe options)
 
 "
     };
@@ -414,16 +364,12 @@ macro_rules! starter_shell_block {
 macro_rules! starter_shell_block {
     () => {
         "\
-# shell = \"bash\"        # interactive shell: a program name on PATH (\"bash\",
-#                       # \"zsh\", \"fish\") or a path. Unset = $SHELL, else your
-#                       # login shell (`aterm doctor` names the one this machine
-#                       # gets). Override at launch with --shell. Applies to new
-#                       # sessions. Shell integration (prompt marks, jump-to-
-#                       # prompt, command blocks, cwd tracking) is injected
-#                       # automatically for zsh, bash, fish and pwsh.
-# shell_args = [\"-l\", \"-i\"]  # extra argv after the shell, e.g. a login shell:
-#                       # macOS starts one already; elsewhere aterm starts an
-#                       # interactive non-login shell, as other terminals there do
+# shell = \"bash\"        # interactive shell: a name on PATH (\"bash\", \"zsh\", \"fish\")
+#                       # or a path. Unset = $SHELL, else login shell (`aterm doctor`
+#                       # names it). Override with --shell; applies to new sessions.
+#                       # Shell integration is injected for zsh, bash, fish and pwsh.
+# shell_args = [\"-l\", \"-i\"]  # extra argv after the shell (macOS starts a login shell
+#                       # already; elsewhere aterm starts an interactive non-login shell)
 
 "
     };
@@ -458,41 +404,46 @@ const STARTER_CONFIG: &str = concat!(
 # background = \"#1A1B26\"
 # cursor_style = \"block\"          # block | bar
 # cursor_blink = true
-# cursor_momentum_glow = true     # the cursor glows with how fast you type and cools when you stop, on every style; warm = no blink (default ON, except on Windows)
+# cursor_momentum_glow = true     # typing-speed cursor glow; warm = no blink (default ON, except on Windows)
 # selection_color = \"#33415E\"
 # selection_foreground = \"#FFFFFF\" # selected-text ink; unset = auto contrast floor
-# selection_inactive = false       # dim the selection band while the window is unfocused
-# split_focus_mark = true          # in a split, ink the divider edge of the pane taking keystrokes
-# scrollbar = true                 # overlay scrollbar in each pane's right gutter (default: Windows on, else off: the brief scroll pill)
+# selection_inactive = false       # dim selection band while window is unfocused
+# split_focus_mark = true          # in a split, ink the divider edge of the focused pane
+# scrollbar = true                 # overlay scrollbar in right gutter (default: Windows on, else off)
 # window_colorspace = \"srgb\"       # macOS GPU CAMetalLayer tag: srgb (colour-managed) | display-p3 (legacy stretched)
-# minimum_contrast = 1             # per-cell WCAG contrast floor, 1 (off) ..= 21; unset on Windows: theme colours held to 4.5:1
-# background_opacity = 1           # macOS GPU window glass, 0 (transparent) ..= 1 (solid); other renderers stay solid; <1 auto-floors contrast to 4.5:1
+# minimum_contrast = 1             # per-cell WCAG contrast floor, 1 (off) ..= 21; unset on Windows holds theme colours to 4.5:1
+# background_opacity = 1           # macOS GPU window glass, 0 (transparent) ..= 1 (solid); <1 auto-floors contrast to 4.5:1
 # background_material = \"none\"     # macOS vibrancy behind glass: none | hud | sidebar | under-window
 # window_padding = 12              # interior padding, logical px per edge (0..=64; hot-applies)
-# window_padding_top = 2           # tighter TOP-edge override (0..=window_padding; the titlebar band supplies the rest)
+# window_padding_top = 2           # top-edge override (0..=window_padding; titlebar band supplies the rest)
 # bold_is_bright = true            # SGR bold promotes ANSI 0-7 to bright 8-15
-# faint_opacity = 0.5              # SGR dim: fg fraction kept, blended toward the bg
+# faint_opacity = 0.5              # SGR dim: fg fraction kept, blended toward bg
 # scrollback_lines = 100000        # total history across ring + tiered store (default 100k, 0 = unlimited)
 # tab_strip_rows = 1               # in-grid tab bar rows (default 1; 0 on macOS, whose toolbar carries tabs)
 
 # --- tab subject & status -------------------------------------------------------
-# Entirely local classification of what each session is DOING (running / quiet /
-# idle / exited), from shell integration, the foreground-job boolean, and screen
-# movement. No model, no network. tab_status = false stops the classifier itself.
-# tab_status = true                # classify session status (default ON)
-# tab_status_quiet_after_ms = 5000 # a silent foreground job becomes \"quiet\" after this, clamped to 500..=120000
-# tab_status_dwell_ms = 750        # hysteresis before a phase is published, clamped to 0..=10000
-# tab_status_badge = true          # project status onto the tab's busy/attention marks
+# Local session phase classification (running / quiet / idle / exited) from shell
+# integration, foreground job state, and screen movement. No model, no network.
+# tab_status = true                # classify session status (default ON; false stops the classifier)
+# tab_status_quiet_after_ms = 5000 # silent foreground job becomes \"quiet\" after this (500..=120000)
+# tab_status_dwell_ms = 750        # hysteresis before publishing a phase (0..=10000)
+# tab_status_badge = true          # project status onto tab busy/attention marks
 # tab_connection_badge = true      # mark tabs holding/receiving a session connection (▲ out / ▽ in / hourglass both)
-# spare_shell = \"auto\"           # a shell spawned ahead that a plain new tab adopts: auto | parked | off
-# spare_shell_needs_person = true  # a spare exists only after a person's gesture in the last 10 min
+# spare_shell = \"auto\"           # pre-spawned shell adopted by a new tab: auto | parked | off
+# spare_shell_needs_person = true  # keep a spare only after a person's gesture in the last 10 min
 
 # --- motion / cursor aurora -----------------------------------------------------
-# serious_mode = false            # mute sounds + hide decorative effects; underlying effect settings return when switched off
-# motion = \"auto\"                 # auto (live Reduce Motion on macOS; sampled at Windows window attach; no OS query elsewhere) | full | reduced
-# load_adaptive_motion = true      # drop decorative effects under sustained render overload (smooth scrolling is never shed); false = never shed (motion=\"full\" also forces effects on)
-# cursor_trail_style = \"rainbow kitty pet\"  # the cursor motion trail + light crown; off draws none. rainbow kitty pet (DEFAULT, except on Windows where off is: uncomment this line for the whole show; the tall full-height rainbow body — letters inside the light — with the walking cat; \"rainbow kitty\"/\"kitty\"/\"rainbow kitty tall\" name the same resident) | rainbow kitty underline (the explicit highlighter-plus-under-baseline alternate) | rainbow dog pet | rainbow kitty flying (same tall ribbon under the earned flying head; aliases \"flying kitty\"/\"kitty flying\" and historical \"nyan rainbow\"/\"nyan\"/\"rainbow\") | rainbow kitty flat (the A/B control: the flat body of 2026-09-13, before the comet body and its vivid rail; aliases \"rainbow flat\"/\"flat rainbow\"/\"nyan flat\") | phaser | fire | water | laser (Lightning: lightning on jumps and a bolt caret; also \"lightning\") | comet | sparkle | lumen | beam | classic (the v0.28 trail restored: thin comet, soft square bloom, and the jump comet the modern gates no longer draw, in shifting colors, or in ONE hue with cursor_trail_color set; cursor_trail_color = \"cursor\", which the old \"classic mono\" says, is the one hue in the cursor colour) | off
-# cursor_trail_color = \"#50FA7B\"      # base colour (default: laser/beam/comet/sparkle their own hue — beam/comet/sparkle wear a configured cursor_color or a program's OSC 12 — every other style the cursor colour; \"cursor\" chooses the live cursor colour for every style)
+# serious_mode = false            # mute sounds + hide decorative effects; underlying settings return when off
+# motion = \"auto\"                 # auto (Reduce Motion on macOS/Windows) | full | reduced
+# load_adaptive_motion = true      # shed decorative effects under sustained render overload (smooth scroll stays on)
+# cursor_trail_style = \"rainbow kitty pet\"  # cursor motion trail + light crown (DEFAULT; off on Windows):
+#                                  #   rainbow kitty pet (aliases: \"rainbow kitty\", \"kitty\", \"rainbow kitty tall\")
+#                                  #   | rainbow kitty underline | rainbow dog pet
+#                                  #   | rainbow kitty flying (aliases: \"flying kitty\", \"kitty flying\", \"nyan rainbow\", \"nyan\", \"rainbow\")
+#                                  #   | rainbow kitty flat (aliases: \"rainbow flat\", \"flat rainbow\", \"nyan flat\")
+#                                  #   | phaser | fire | water | laser (alias: \"lightning\") | comet | sparkle | lumen | beam
+#                                  #   | classic (v0.28 comet + jump trail; \"cursor\" colour = classic mono) | off
+# cursor_trail_color = \"#50FA7B\"      # base colour (\"cursor\" uses live cursor colour; unset = style default or cursor colour)
 # cursor_trail_accent = \"#7AA2F7\"     # comet-tail / ring colour (default: brightened base)
 # cursor_trail_ms = 260                # fade duration in ms (30..=2000)
 # cursor_trail_length = 24             # max comet length in cells (1..=512)
@@ -500,223 +451,166 @@ const STARTER_CONFIG: &str = concat!(
 # cursor_trail_radius = 0.6            # bloom-crown radius in cells (0..=2)
 # cursor_trail_ring = true             # expanding landing \"ping\" ring on a jump (default ON)
 # --- sound (Settings > Sound) -------------------------------------------------
-# trail_sounds = true              # Music effects: every synth sound on or off together (typing notes, song, ambient bed, chimes, bonk); macOS-only (parsed but inert elsewhere). Typing notes are silent while the cursor trail is off; the other sounds still play (default ON)
-# trail_sound_volume = 0.4         # 0..=1 trail sound level (default 0.4 ~= -22 dBFS peaks, far under the bell); does NOT scale bell_sound
-# trail_sound_style = \"auto\"     # typing sound: auto = follow the trail style; or an instrument for every keystroke whatever the trail looks like:
-#                                  #   music box | warm pluck | glitter | ice chime | droplet | pew | zap | tick | crackle  (the nine palettes, by sound)
-#                                  #   mechanical (keyboard click + thock) | typewriter (clack + platen, bell + carriage on Enter) | marimba | felt (muted piano)
-#                                  #   aliases: the trail-style names (water, comet, rainbow kitty, ...), bell, raindrop, mech, thock, piano, clack
-# tone_melody = true               # the melody leans with the typed line's inferred mood (on-device, typed input only); default ON and deliberately subtle
-# trail_sound_bed = true           # the continuous ambient BED texture behind the notes (default ON; false silences the bed)
-# trail_sound_riff = true          # the held-key SING-ALONG song (the loudest voice); false quiets just the song and keeps its visuals (default ON)
-# bell_sound = true                # the audible BEL beep (macOS NSBeep / Windows MessageBeep / the X11 bell); false keeps the visual flash and window attention (default ON)
+# trail_sounds = true              # master synth switch (typing notes, song, bed, chimes, bonk; macOS-only, default ON)
+# trail_sound_volume = 0.4         # 0..=1 synth level (default 0.4 ~= -22 dBFS; does not scale bell_sound)
+# trail_sound_style = \"auto\"     # typing sound: auto (follow trail style) | music box | warm pluck | glitter |
+#                                  #   ice chime | droplet | pew | zap | tick | crackle | mechanical | typewriter |
+#                                  #   marimba | felt (aliases: trail names, bell, raindrop, mech, thock, piano, clack)
+# tone_melody = true               # subtle on-device mood inflection from typed input (default ON)
+# trail_sound_bed = true           # continuous ambient bed texture behind notes (default ON)
+# trail_sound_riff = true          # held-key sing-along song (default ON; false quiets song, keeps visuals)
+# bell_sound = true                # audible BEL beep (macOS NSBeep / Windows MessageBeep / X11 bell; default ON)
 # cursor_trail_bloom = true            # GPU-only soft halo around the comet (default ON)
 # cursor_trail_bloom_strength = 0.85   # 0..=3 (halo intensity)
-# cursor_trail_bloom_radius = 2.2      # 0.5..=8 half-res blur texels; default 2.2, 1.8 for rainbow kitty; set to override
+# cursor_trail_bloom_radius = 2.2      # 0.5..=8 half-res blur texels (default 2.2; 1.8 for rainbow kitty)
 # cursor_fire_shimmer = true           # GPU-only heat-haze refraction above burning cells (default ON)
-# hdr_glow = true                      # EDR cursor glow above SDR white (GPU + HDR panel, macOS EDR or Windows scRGB; provably inert on SDR; default ON)
-# cursor_glow_sdr_boost = 0.25         # GPU-only SDR crown strength 0..=1 (dark themes only — light themes self-degrade; 0 = off)
-# temporal_recording = false       # record a per-session replay spine (query via `aterm-ctl temporal [tick]`); default off, costs memory; applies to new sessions
+# hdr_glow = true                      # EDR cursor glow above SDR white (GPU + HDR panel, macOS EDR / Windows scRGB; default ON)
+# cursor_glow_sdr_boost = 0.25         # GPU-only SDR crown strength 0..=1 (dark themes only; 0 = off)
+# temporal_recording = false       # per-session replay spine (`aterm-ctl temporal [tick]`); default off, applies to new sessions
 
 # --- text shaping -------------------------------------------------------------
 # ligatures = true                 # programming ligatures (=>, !=, >=, ===, ...)
-# cursor_break_ligatures = true    # break the cursor cell out of ligatures (default false leaves ligatures intact)
-# line_height = 1                  # cell-box multiplier 0.8..=2 (leading splits half above/below; default 1.1 on Windows, 1 elsewhere)
-# font_size_scale = 1              # multiplies font_px or the auto size, 0.8..=1.25 (a theme may set it; this wins)
-# adjust_baseline = 0              # px baseline escape hatch (±32) for off-metric faces
-# adjust_underline_position = 0    # px underline shift (±32, + = down) over the font's post table
-# adjust_underline_thickness = 0   # px underline thickness delta (±32) over the font's post table
-# underline_skip_descenders = true # gap the underline around descender ink (browser-style)
+# cursor_break_ligatures = true    # break the cursor cell out of ligatures (default false)
+# line_height = 1                  # cell-box multiplier 0.8..=2 (default 1.1 on Windows, 1 elsewhere)
+# font_size_scale = 1              # multiplies font_px or auto size, 0.8..=1.25 (wins over theme)
+# adjust_baseline = 0              # px baseline shift (±32) for off-metric faces
+# adjust_underline_position = 0    # px underline shift (±32, + = down)
+# adjust_underline_thickness = 0   # px underline thickness delta (±32)
+# underline_skip_descenders = true # gap underline around descender ink
 # font_features = [\"zero\", \"ss01\"] # OpenType features to force on
 # bidi = \"implicit\"               # RTL reordering: implicit | disabled | explicit
 # ambiguous_width = \"narrow\"       # East-Asian ambiguous width: narrow | wide
 # text_blending = \"linear-corrected\" # AA weight: linear-corrected (native feel) | linear
 # font_thicken = false             # macOS: CoreText font smoothing (heavier glyphs)
 # stem_gamma = 1                   # aesthetic stem weight (<1 thicker, >1 thinner)
-# font_hinting = \"full\"           # Linux/Windows grid fitting: full (crispest, default) | light
-#                                  # (hintslight look) | off
-# font_subpixel = \"off\"           # Linux subpixel-RGB text (CPU renderer only, stage 1):
-#                                  # off (default) | rgb | bgr; opaque frames only
-# font_variation = [\"wght=450\"]    # variable-font axes (clamped to fvar; default = Regular / wght=400)
+# font_hinting = \"full\"           # Linux/Windows grid fitting: full (default) | light | off
+# font_subpixel = \"off\"           # Linux CPU subpixel-RGB text: off (default) | rgb | bgr (opaque frames only)
+# font_variation = [\"wght=450\"]    # variable-font axes (clamped to fvar; default wght=400)
 # font_weight = 450                # wght shorthand; wins over a font_variation wght entry
-# font_weight_dark_nudge = 0       # extra wght on DARK themes (applied only when grid-safe)
+# font_weight_dark_nudge = 0       # extra wght on dark themes (applied only when grid-safe)
 
 # --- behaviour ----------------------------------------------------------------
-# gpu = false                      # GPU rendering is ON by default (auto CPU fallback); false or --cpu forces CPU; applies next launch
-# copy_on_select = true            # auto-copy mouse selection to CLIPBOARD (DEFAULT on; OFF on Linux, where a
-                                   # selection owns PRIMARY and the CLIPBOARD stays for explicit copies; true opts into both)
-# show_build_badge = false         # OPTIONAL floating top-right v<version>·<build> pill — DEFAULT off
-                                   # (the version lives in the menu bar: the v<version> menu opens About)
-# confirm_multiline_paste = true   # confirm an unbracketed paste holding a line break (macOS sheet / Windows dialog / Linux in-window banner)
-# focus_boost = true               # Windows: boost the visible shells' priority while aterm is focused (DEFAULT on; no-op elsewhere)
-# conpty = \"bundled\"               # Windows: the console host new tabs run in. DEFAULT \"bundled\" (the OpenConsole.exe
-                                   # shipped beside aterm, else the Windows console host); \"inbox\" keeps the Windows console
-                                   # host; \"auto\" also tries a copy of Windows Terminal's; or give the path of an
-                                   # OpenConsole.exe. `aterm doctor` names the host a new tab gets
-# desktop_alerts = false           # aterm's OWN alerts (an agent that needs you, a macOS permission, and the one
-                                   # update-health cause only you can end) also as system notifications (macOS,
-                                   # run from the app: aterm's own once macOS allows it, which Notify Me asks when
-                                   # turned on and the first notice asks while on, none until then or once it says
-                                   # no, none from one in your Desktop, Documents or Downloads folder until it moves
-                                   # to Applications, and none from one started through a link to it, such as
-                                   # ~/.local/bin/aterm, until aterm.app itself is opened; not run from the app,
-                                   # terminal-notifier, found on PATH or in Homebrew, else osascript, whose banner is
-                                   # \"Script Editor\"'s). Needs only. DEFAULT off: they stay in the band, the menu
-                                   # bar and messages.log; the menu bar's Notify Me When I'm Needed turns them on. Programs' OSC 9/99/777 notifications are allow_notifications' below
+# gpu = false                      # GPU rendering is ON by default (auto CPU fallback); false or --cpu forces CPU next launch
+# copy_on_select = true            # auto-copy mouse selection to CLIPBOARD (default on; off on Linux, where selection owns PRIMARY)
+# show_build_badge = false         # floating top-right v<version>·<build> pill (default off; menu bar shows v<version>)
+# confirm_multiline_paste = true   # confirm unbracketed multiline paste (sheet / dialog / banner)
+# focus_boost = true               # Windows: boost visible shells' priority while focused (default on)
+# conpty = \"bundled\"               # Windows console host for new tabs: \"bundled\" (default) | \"inbox\" | \"auto\" | path to OpenConsole.exe
+# desktop_alerts = false           # also post aterm's own needs-you alerts as system notifications (default off;
+#                                  #   macOS: UNUserNotificationCenter from Applications/aterm.app once authorized,
+#                                  #   else terminal-notifier or osascript when run outside an app bundle).
+#                                  #   Program OSC 9/99/777 notifications are gated by allow_notifications below
 
 # --- program permissions (default OFF unless noted) --------------------------
-# allow_window_ops = false         # XTWINOPS title, text-grid-size, text-area-pixels and cell-size reports (window/screen
-#                                  # position and screen size stay unanswered); Linux also applies window
-#                                  # manipulations (move stays denied)
-# allow_notifications = false      # OSC 9/99/777 desktop notifications; macOS, run from the app, delivers as aterm
-#                                  # itself once macOS allows it (see desktop_alerts; while that is off they ask
-#                                  # nothing), none until then or once it says no, and none from one in your
-#                                  # Desktop, Documents or Downloads folder or one started through a link to it;
-#                                  # not run from the app, through terminal-notifier if installed, else osascript —
-#                                  # a subprocess under aterm's identity; Windows shows a notification-area
-#                                  # balloon/toast from aterm itself (Shell_NotifyIcon, no subprocess); Linux has no delivery yet — the request is dropped
-# allow_palette_reconfigure = true   # programs may set the 256 indexed colours (OSC 4/21: base16-shell, pywal,
-#                                  # theme.sh) for the session; false refuses
-# allow_kitty_file_transfer = false # let Kitty file/temp-file/shm media read host files; applies to new sessions
-# allow_osc52_query = false        # programs may READ the clipboard (OSC 52); answered only when on. On macOS 26 that
-#                                  # read is what raises the system's \"aterm would like to paste from …\" alert
-# secure_keyboard_entry = false    # macOS: block other processes from observing keystrokes (held while aterm is frontmost)
+# allow_window_ops = false         # XTWINOPS title/grid/pixel/cell-size reports (position/screen size stay unanswered);
+#                                  #   Linux also applies window ops except move
+# allow_notifications = false      # OSC 9/99/777 desktop notifications (default off; macOS: UNUserNotificationCenter
+#                                  #   from Applications/aterm.app once authorized, else terminal-notifier/osascript;
+#                                  #   Windows: Shell_NotifyIcon balloon/toast; Linux: D-Bus org.freedesktop.Notifications)
+# allow_palette_reconfigure = true   # allow OSC 4/21 256-colour palette changes for the session (default ON)
+# allow_kitty_file_transfer = false # allow Kitty file/temp-file/shm media to read host files (new sessions)
+# allow_osc52_query = false        # allow programs to READ the clipboard via OSC 52 (triggers macOS paste alert)
+# secure_keyboard_entry = false    # macOS: block other processes from observing keystrokes while frontmost
 
 # --- sparkle words (purely visual; NEVER affects copied text, logs, or recordings)
-# Decorate matched words: a randomized SPARKLE over profanity (the \"fuck\" family in
-# every major language) and a steady CAT-PAW over cat/kitty words. Both live toys are
-# ON by default. Use the independent Sparkle words and Keyword kitties
-# switches in Settings, or set a live category's `enabled = false` here, to
-# silence either product. The retained master `enabled = false` silences both.
+# Decorates matched words: sparkle over profanity and cat-paw over cat/kitty words
+# (both ON by default; master or per-category `enabled = false` silences them).
 # [sparkle_words]
 # enabled = true                   # master switch (default ON; false → byte-identical render)
 # languages = [\"en\"]               # un-gate ambiguous homographs (fr \"chat\", de \"Kater\"); [\"all\"] = every language
 # reduced_motion = false           # force the static, non-twinkling path
 # suppress_in_alt_screen = false   # true → full-screen TUIs (vim/less/htop/claude) never decorated
-# lexicon = \"~/.config/aterm/extra-lexicon.toml\"   # extra [[entry]] blocks merged over the builtin
+# lexicon = \"~/.config/aterm/extra-lexicon.toml\"   # extra [[entry]] blocks merged over builtin
 # toy_packs = [\"~/.config/aterm/toys/tiny-triumphs/pack.toml\"]  # strict community packs (max 8; later wins)
 # deny = [\"scat\"]                  # never decorate these words, any category
 # [sparkle_words.profanity]
-# enabled = true                   # ON by default; set false to silence just the expletive sparkle
-# style = \"rainbow\"                # \"rainbow\" (default) = the v3 animated rainbow ink; 10% of
-#                                  #   episodes escalate to the FUCK SUPER NOVA (supernova_chance)
-#                                  #   | \"nova\" = the v2 classic nova (one flash per appearance,
-#                                  #   WCAG-limited to <= 2 ignitions/s window-wide) | \"sparkle\" = v1
+# enabled = true                   # ON by default; false silences just profanity sparkle
+# style = \"rainbow\"                # \"rainbow\" (default; supernova_chance escalates to supernova) | \"nova\" (<=2/s) | \"sparkle\"
 # supernova_chance = 10            # rainbow-only escalation chance, percent (0..=100; 0 disables)
 # magic = true                     # Quasar (1/512) / Singularity (1/1024) rare nova variants
-# palette = [\"#ffd447\", \"#ff7ce5\", \"#7cf0ff\"]   # sparkle tints; empty → lively hue rotation
+# palette = [\"#ffd447\", \"#ff7ce5\", \"#7cf0ff\"]   # sparkle tints; empty → hue rotation
 # density = 3                      # sparks per word per frame (1..=12)
-# anim_ms = 2500                   # how long a word sparkles after appearing (350..=10000)
+# anim_ms = 2500                   # sparkle duration in ms (350..=10000)
 # jitter = 2                       # sub-cell sparkle jitter in px (0..=6)
 # intensity = 0.85                 # opacity 0..=1
-# bonk = true                      # the curse BONK sound effect on a TYPED curse (default ON; scaled by trail_sound_volume; Settings > Sound shows it)
-# bonk_detonation = false          # also bonk when an on-screen curse's supernova ignites (default OFF; typed provenance only unless opted in)
+# bonk = true                      # curse BONK sound on a typed curse (default ON; scaled by trail_sound_volume)
+# bonk_detonation = false          # also bonk when an on-screen curse's supernova ignites (default OFF)
 # extra_words = [\"frak\"]           # extra words to treat as profanity
 # ignore_words = [\"fluff\"]         # never decorate these as profanity
 # [sparkle_words.feline]
-# enabled = true                   # the friendly default (takes effect only when master on)
-# style = \"cat\"                    # \"cat\" is the only graphic mode; legacy \"paw\" is
-#                                  #   ink-only and renders no paw graphic (Manual-only)
+# enabled = true                   # default ON (requires master enabled)
+# style = \"cat\"                    # \"cat\" (graphic) | \"paw\" (legacy ink-only)
 # magic = true                     # Fortune (1/512) / Nebula (1/1024) rare cats
-# allow_bare_cat = true            # DEFAULT on: decorate the literal 3-letter \"cat\" (also the shell command)
-# cjk_single_char = false          # decorate a lone 猫 anywhere (high false-positive rate)
-# log = true                       # record sightings into the Kitty Log collection book
-#                                  #   (machine-owned kitty-log.toml beside aterm.toml)
+# allow_bare_cat = true            # default ON: decorate literal 3-letter \"cat\"
+# cjk_single_char = false          # decorate lone 猫 anywhere
+# log = true                       # record sightings into kitty-log.toml beside aterm.toml
 # extra_words = [\"mittens\"]        # extra words to treat as feline
 # ignore_words = [\"cats\"]          # never decorate these as feline
-# [[sparkle_words.custom]]         # v3 custom word effects: data, not code (repeatable block)
-# words = [\"ultrathink\"]           # surfaces (2-char+ ok — explicit config is consent; CJK ok)
+# [[sparkle_words.custom]]         # custom word effects (repeatable block)
+# words = [\"ultrathink\"]           # matched surfaces (2+ chars; CJK ok)
 # ink = { colorway = \"rainbow\" }   # or \"twotone:#RRGGBB,#RRGGBB\"; omit for no ink
 # burst = { kind = \"starburst\", chance = 10 }   # sparkle|nova|supernova|starburst|glow
-# graphic = { collection = \"cats\" }             # the peeking cat on your own word
+# graphic = { collection = \"cats\" }             # peeking cat on your word
 # [sparkle_words.ink]              # animated glyph-ink shimmer
-# enabled = true                   # takes effect only when sparkle_words.enabled is on
-# strength = 0.75                  # ink tint vs original fg; clamp 0..=1
-# sweep_ms = 2200                  # one specular sweep window; clamp 350..=6000
-# loop = false                     # true: re-sweep while visible (keeps focused wakes live;
-#                                  #   raises the sweep_ms floor to 600 — flash margin)
-# [sparkle_words.emphasis]         # hype words — ink-only class (4th lexicon class)
-# enabled = true                   # no builtin words — populate via extra_words
+# enabled = true                   # requires sparkle_words.enabled
+# strength = 0.75                  # ink tint vs original fg (0..=1)
+# sweep_ms = 2200                  # one specular sweep window (350..=6000)
+# loop = false                     # true: re-sweep while visible (floors sweep_ms to 600)
+# [sparkle_words.emphasis]         # hype words — ink-only class
+# enabled = true                   # no builtin words; populate via extra_words
 # extra_words = [\"megathink\"]      # extra words to treat as emphasis
 # ignore_words = [\"turbo\"]         # never decorate these as emphasis
 
-# --- matrix rain (PHOSPHOR; purely visual — rain falls UNDER the text, in EMPTY cells
-# only; copy/selection/search/recordings read exact bytes). OFF BY DEFAULT — the rain
-# follows what the session is doing: agent output pours, typing drizzles, idle drains
-# to still glass. `enabled` is the default for every session; View > Matrix Rain, the
-# command palette, `aterm-ctl rain`, or a bound \"toggle_matrix_rain\" chord override
-# it PER SESSION (either direction — a session can rain over a disabled config), and
-# toggling the session you're looking at is still the instant panic-off. Session
-# overrides are runtime-only: they die with the session and win over this key until
-# then. ------------------------------------------------------------------------
+# --- matrix rain (PHOSPHOR; purely visual — falls under text in empty cells only;
+# copy/selection/search/recordings read exact bytes). OFF by default; per-session
+# toggles (View > Matrix Rain, palette, `aterm-ctl rain`, `toggle_matrix_rain`)
+# override `enabled` either way for that session's lifetime. -------------------
 # [matrix_rain]
-# enabled = false                  # default for every session (OFF; true → it rains);
-#                                  #   per-session toggles override it either way
+# enabled = false                  # default for every session (OFF; per-session toggles override)
 # fps = 30                         # WORKING tick rate (12..=60; CALM always runs 12 Hz)
 # density = 6                      # column density (1..=12)
 # speed = 5                        # fall speed (1..=10; 5 = neutral)
 # trail = 5                        # trail length (1..=10; 5 = neutral)
-# alpha = 96                       # body coverage (16..=135); omit → derived from the theme
-#                                  #   under the below-dim-text luminance bound
+# alpha = 96                       # body coverage (16..=135); omit → derived from theme
 # head_alpha = 135                 # bright-head coverage (alpha..=135); omit → derived
 # hue = \"matrix\"                   # \"matrix\" | \"theme\" | \"#RRGGBB\" (bad hex → matrix green)
 # mutation_ms = 133                # glyph mutation window in ms (80..=2000)
-# idle_secs = 8                    # idle seconds until the mandatory drain (2..=120;
-#                                  #   there is no \"keep\" — nothing animates forever)
+# idle_secs = 8                    # idle seconds until mandatory drain (2..=120)
 # suppress_in_alt_screen = false   # true → fullscreen TUIs (vim/less/htop/claude) never rain
-# output_material = true           # supported literal codepoints from REAL output; current composer band protected
-# turn_wave = true                 # synchronized head sweep when the agent's turn completes
+# output_material = true           # sample codepoints from real output (composer band protected)
+# turn_wave = true                 # synchronized head sweep when agent turn completes
 # bell_alert = true                # visual bell → 2 s constant-luminance amber hue ramp
 # seed = 0                         # 0 = stable per-window field; nonzero = reproducible
 
-# --- bundled ALab toolchain manager (atpkg): the SAME table the co-located `atpkg`
-# reads, so there is exactly ONE config surface — and no environment alternative
-# to any of it. Inert in builds without a pinned root key — Settings ▸ Packages
-# shows the live posture. --
+# --- bundled ALab toolchain manager (atpkg): shared with `atpkg` (Settings ▸ Packages;
+# inert in builds without a pinned root key). ----------------------------------
 # [packages]
-# enabled = true                   # Keep ALab tools up to date — THE switch (Settings ▸ Packages):
-#                                  #   a published index within minutes, a full signed
-#                                  #   check every 6 hours; read LIVE — an edit stands
-#                                  #   the loop down or resumes it within seconds (what
-#                                  #   every lane did is in packages.log, beside aterm.log)
-# auto_install = true              # install the ALab toolset nobody named: the first-run
-#                                  #   fill and new members of the signed set (batteries
-#                                  #   included; may download GBs; `uninstall`, `exclude`
-#                                  #   and `enabled = false` always win)
-# exclude = []                     # per-program opt-out from the SIGNED default set
-# [packages.links]                 # a maintainer's local checkout, per program:
-# ay = \"~/src/ay\"                  #   path → managed dev-link (registry skipped)
+# enabled = true                   # keep ALab tools up to date (live reload; logs to packages.log)
+# auto_install = true              # install default signed toolset (`uninstall`/`exclude`/`enabled=false` win)
+# exclude = []                     # per-program opt-out from the signed default set
+# [packages.links]                 # local dev-link overrides per program (skips registry):
+# ay = \"~/src/ay\"
 # [reroute]
-# announce = true                  # a rerouted cargo/rustc/tlc says so before it runs
-#                                  #   upstream (false silences the line, never the run)
+# announce = true                  # announce cargo/rustc/tlc reroute before running upstream
 
-# --- this Mac: host settings, applied once a day at the first window or
-# terminal session, and by the next package pass after an edit here (while
-# [packages] enabled is on). `aterm pkg machine apply` applies now; `aterm pkg
-# machine` reads them. Settings ▸ Security shows the measured state and offers
-# Apply Now when there is something to apply. macOS only.
+# --- host settings (macOS only; applied daily and on package pass; `aterm pkg machine`)
 # [machine]
-# universal_control = \"off\"        # \"off\" (default: disable it for this host) | \"leave\"
-# rosetta = true                   # Apple silicon: install Rosetta 2 when missing, as you (no password) | false
+# universal_control = \"off\"        # \"off\" (default: disable for this host) | \"leave\"
+# rosetta = true                   # Apple silicon: install Rosetta 2 when missing (no password) | false
 
-# --- system awareness: the stats bars (Global, aterm, Tab): every core as a
-# tile, the GPU, memory and swap, the disk the tab is in. Read live; ⌘I opens
-# the close-up.
+# --- system awareness: live Global / aterm / Tab stats bars (⌘I opens close-up)
 # [sys]
-# stats_bars = \"deck\"              # \"deck\" (default: under the titlebar) | \"sill\" (bottom padding, no row) | \"off\"
-# stats_deck_size = \"auto\"         # \"auto\" (default: Full on a tall window, Folded on a short one) | \"full\" | \"folded\"
-# disk_roots = []                  # folders in ~/Library or protected ones the disk walker may size (macOS may ask once for a protected one)
+# stats_bars = \"deck\"              # \"deck\" (default: under titlebar) | \"sill\" (bottom padding) | \"off\"
+# stats_deck_size = \"auto\"         # \"auto\" (default: Full on tall window, Folded on short) | \"full\" | \"folded\"
+# disk_roots = []                  # ~/Library or protected folders the disk walker may size
 
-# --- input policy: map a chord to RAW BYTES sent to the program, overriding the
-# default key encoding + non-menu hardcoded chords (NOT macOS menu keys like Cmd-C,
-# which the menu claims first). Put a value with \\e / \\xNN
-# in a TOML literal '...' string; a basic \"...\" string only understands \\n \\r \\t. -
+# --- input policy: map a chord to raw bytes sent to the program (macOS menu chords
+# like Cmd-C are claimed by the menu first; use single-quoted '...' for \\e / \\xNN)
 # [key_sequences]
 # \"shift+enter\" = \"\\n\"        # send a literal newline (LF)
-# 'f5' = '\\e[15~'              # ESC[15~  (literal '...' string so \\e is ESC)
+# 'f5' = '\\e[15~'              # ESC[15~
 #
-# --- keybindings (MUST be the LAST section: a TOML table runs to end-of-file, so
-# any bare top-level key placed below it would parse as a keybinding entry) -------
+# --- keybindings (MUST be the LAST section: a TOML table runs to EOF) ---------
 # [keybindings]
 # \"ctrl+shift+t\" = \"new_tab\"
 ",

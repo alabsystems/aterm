@@ -1134,7 +1134,7 @@ fn no_step_while_parked(host: &HostHandle, looks: usize, stepped: &dyn Fn() -> u
     );
 }
 
-/// ROUND FOUR, PLAN ITEM 7 (a): THE AUTOMATIC UPDATE'S HOLD on a restored
+/// THE AUTOMATIC UPDATE'S HOLD on a restored
 /// queue lasts while an agent is queued and never past
 /// [`RESTORED_HOLD`] from the FIRST relaunch this process queued — a later
 /// queue does not extend it, so it cannot pin a build (the ladder's law). A
@@ -1942,7 +1942,7 @@ fn the_disk_watch_looks_once_per_tick_over_the_supervised_sessions() {
     assert_eq!(beats(), 3, "a beat at every look, handed a session or not");
 }
 
-/// THE DISK WATCH HANDS OVER NO OFF SESSION (the review of 345c41647):
+/// THE DISK WATCH HANDS OVER NO OFF SESSION:
 /// Autopilot Off is the harness's hands off, and a look below the floor
 /// reclaims build caches in the working directories it is handed, so an Off
 /// session's is never handed — by its own word, or by the table's default
@@ -2370,8 +2370,8 @@ fn the_disk_watch_says_each_end_once_a_change() {
     assert!(said.owed(&HostNote::DiskFullOver, late));
 }
 
-/// THE WATCH THAT SHIPS SENDS THROUGH THAT FILTER (the review of
-/// ba16cabbe5: the filter's own test held with `live_disk` unwired): the
+/// THE WATCH THAT SHIPS SENDS THROUGH THAT FILTER (the filter's own test held with `live_disk` unwired):
+/// the
 /// look [`live_disk`] hands the host, two looks a minute apart that each
 /// find both ends so, tells the window each end ONCE; a note no end, every
 /// time. The first look PANICS after it told the window, and the second
@@ -2653,8 +2653,8 @@ fn a_spelling_the_file_system_stalls_on_costs_one_deadline_then_nothing() {
     );
 }
 
-/// THE DISK WATCH'S THREADS HOLD THE SYSTEM'S ERROR BOXES OFF (wave 3's
-/// soundness review, its first finding): the look canonicalizes every tab's
+/// THE DISK WATCH'S THREADS HOLD THE SYSTEM'S ERROR BOXES OFF (its first finding):
+/// the look canonicalizes every tab's
 /// and agent's directory and the first reading the home folder's, and on
 /// Windows a query of an empty card reader or optical drive otherwise puts
 /// "There is no disk in the drive" on the owner's desktop and parks the
@@ -5184,7 +5184,7 @@ fn claiming_body(world: &Arc<World>, claimed: &Arc<Mutex<Vec<String>>>) -> Arc<B
 /// instance renews into the new one first, and this host then parks
 /// behind it as it would have in the old one. The menu bar, meanwhile,
 /// does not count them as the host's (`held_off`). Their worker WATCHES
-/// through the grace (round eight, #501): it is listed from the resume,
+/// through the grace (#501): it is listed from the resume,
 /// and the claim is its own loop's, run once — the same worker, never a
 /// second one — once the grace is over.
 ///
@@ -5757,7 +5757,7 @@ fn a_self_claimed_relaunch_owed_at_a_commit_carries_its_validated_line() {
     // copy standing and a Commit after it, the copy's relaunch is what the
     // model reaches, and the lane's `Read` is not enabled — the copy's
     // decision rode the Commit. `lost` is READ off the snapshot the real
-    // host relaunched (the review of 2026-10-16, finding 5: it was a
+    // host relaunched (the review of 2026-10-16, it was a
     // constant, and the invariant bound no code). NEGATIVE CONTROL: the
     // `Buggy` drop of the copy at that Commit (the code before this change)
     // breaks `TheCopysDecisionRidesTheCommit` and leaves the end to `Read`;
@@ -5975,7 +5975,7 @@ fn a_self_claimed_snapshot_publishes_the_line_its_copy_validated() {
     publish_snapshot_for_test(sid, None);
 }
 /// A HANDED AGENT'S EXIT IS DECIDED WITH NO VALIDATED LINE IN THE SUCCESSOR
-/// (the review of 2026-10-16, finding 1; [`HostHandle::watch_handed`]): the
+/// (the review of 2026-10-16; [`HostHandle::watch_handed`]): the
 /// handoff layout's `supervised` leaf is the outgoing instance's published
 /// snapshot, which names the line ITS copy validated while the agent ran.
 /// The successor has no copy until the agent re-proves its claim, so the
@@ -6986,8 +6986,8 @@ struct Acting {
     /// live read that fails does, the process itself alive and its end the kernel's.
     unreadable: AtomicBool,
     /// THE PROCESS HOLDING EACH TAB'S FOREGROUND while the roster names
-    /// an agent there, and its program (round two of the joint audit of
-    /// 2026-10-01): a new one at every launch — an agent arriving in a
+    /// an agent there, and its program:
+    /// a new one at every launch — an agent arriving in a
     /// tab at its shell ([`Self::set`]) or another job put in front of it
     /// ([`Self::another_job`]) — the first [`snap`]'s. The seams read the
     /// tab through it AS THE LIVE ONES DO, never more leniently: a
@@ -7912,6 +7912,7 @@ impl Acting {
                 disk_board: Acts::inert().disk_board,
                 jobs_board: Acts::inert().jobs_board,
                 program_check: Acts::inert().program_check,
+                occupancy: Acts::inert().occupancy,
                 resume: Arc::new(move |_, _, carry: CarryPoint| {
                     a9.landing.lock().unwrap().push(carry.land);
                     a9.onlys.lock().unwrap().push(carry.only);
@@ -8277,6 +8278,7 @@ impl Acting {
                 }),
                 standing_limit: Arc::new(|_, _| None),
                 account_wall: Arc::new(|_, _, _| ("inert", None)),
+                accounts_upkeep: Arc::new(|| {}),
                 account_usage: Arc::new(|_, _, _, _, _| "inert"),
                 account_gone: Arc::new(move |sid| {
                     a17.accounts_gone.lock().unwrap().push(sid.to_string());
@@ -16942,6 +16944,15 @@ fn the_hosts_own_look_is_made_at_its_start_and_after_every_wake() {
     host.shutdown_and_join();
 }
 
+/// Channel senders declared after this guard close the injected waits before shutdown.
+struct ActivationShutdown(HostHandle);
+
+impl Drop for ActivationShutdown {
+    fn drop(&mut self) {
+        self.0.shutdown_and_join();
+    }
+}
+
 /// THE ACTIVATION WAKE IS ARMED ON ITS OWN THREAD
 /// ([`spawn_activation_wake_with`]): finding the markers (atpkg's config
 /// parsed per agent, the notice folder made, each path resolved) is no work
@@ -16954,6 +16965,7 @@ fn the_activation_wake_is_armed_off_the_callers_thread() {
     let a = Accts::new();
     let (hooks, _notes) = noting(a.hooks());
     let host = HostHandle::start(at_wall_only(), false, true, hooks);
+    let _shutdown = ActivationShutdown(host.clone());
     let caller = std::thread::current().id();
     let (tx, rx) = std::sync::mpsc::channel();
     let looped = host.clone();
@@ -16990,20 +17002,71 @@ fn the_wakes_arming_has_every_session_attached_before_it_looked_at_again() {
     a.open.lock().unwrap().insert("s-arm".to_string());
     a.set(&[("s-arm", Program::Claude)]);
     let host = HostHandle::start(on(), false, false, a.hooks());
+    // Declared before the channel senders: unwind closes both parked waits before shutdown.
+    let _shutdown = ActivationShutdown(host.clone());
     a.attached(&host, "s-arm");
     let (arming_tx, arming) = std::sync::mpsc::channel::<()>();
     let (go, gone) = std::sync::mpsc::channel::<()>();
     let (stop, stopped) = std::sync::mpsc::channel::<()>();
-    spawn_activation_wake_with(host.clone(), move |_| {
-        let _ = arming_tx.send(());
-        let _ = gone.recv();
-        let wait: Box<dyn FnMut() -> bool + Send> = Box::new(move || {
-            // Parked until the test ends it, after the host's shutdown.
-            let _ = stopped.recv();
-            false
-        });
-        (None, wait)
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let starts = Arc::clone(&attempts);
+    spawn_activation_wake_on(
+        host.clone(),
+        move |_| {
+            let _ = arming_tx.send(());
+            let _ = gone.recv();
+            let wait: Box<dyn FnMut() -> bool + Send> = Box::new(move || {
+                // Parked until the test ends it, after the host's shutdown.
+                let _ = stopped.recv();
+                false
+            });
+            (None, wait)
+        },
+        Arc::new(move |task| {
+            if starts.fetch_add(1, Ordering::SeqCst) == 0 {
+                return Err(std::io::Error::other(
+                    "the first activation spawn is refused",
+                ));
+            }
+            std::thread::Builder::new().spawn(task).map(|_| ())
+        }),
+    );
+    // The host loop may own the first attempt while the registering caller returns.
+    until("the first refusal restores its pending start", || {
+        host.shared.lock().activation.next().is_some() && attempts.load(Ordering::SeqCst) == 1
     });
+    let due = host
+        .shared
+        .lock()
+        .activation
+        .next()
+        .expect("a retry is owned");
+    assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    assert!(matches!(
+        arming.try_recv(),
+        Err(std::sync::mpsc::TryRecvError::Empty)
+    ));
+    // Drive the real timer funnel with one sampled deadline; no scheduling margin or sleep.
+    assert_eq!(
+        try_activation_start(&host.shared, &host.hooks, due - Duration::from_nanos(1)),
+        Some(due)
+    );
+    assert_eq!(
+        attempts.load(Ordering::SeqCst),
+        1,
+        "not before its deadline"
+    );
+    assert_eq!(try_activation_start(&host.shared, &host.hooks, due), None);
+    assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        try_activation_start(&host.shared, &host.hooks, due + WAKE_FALLBACK),
+        None
+    );
+    assert_eq!(
+        attempts.load(Ordering::SeqCst),
+        2,
+        "one successful start only"
+    );
     arming
         .recv_timeout(aterm_spec::wait::MUST_HAPPEN)
         .expect("the arming begins");
@@ -17028,6 +17091,46 @@ fn the_wakes_arming_has_every_session_attached_before_it_looked_at_again() {
     );
     host.shutdown_and_join();
     drop(stop);
+
+    // A cancelled pending arm is dropped outside State's lock, and never retried.
+    struct ArmDropped(Arc<Shared>, Arc<AtomicUsize>);
+    impl Drop for ArmDropped {
+        fn drop(&mut self) {
+            assert!(self.0.lock().shutting_down, "drop may re-enter the host");
+            self.1.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+    let cancelled = HostHandle::start(on(), false, true, a.hooks());
+    let _shutdown_cancelled = ActivationShutdown(cancelled.clone());
+    let dropped = Arc::new(AtomicUsize::new(0));
+    let held = ArmDropped(Arc::clone(&cancelled.shared), Arc::clone(&dropped));
+    let refused = Arc::new(AtomicUsize::new(0));
+    let refused_starts = Arc::clone(&refused);
+    spawn_activation_wake_on(
+        cancelled.clone(),
+        move |_| {
+            let _held = held;
+            panic!("shutdown must discard the unrun arm");
+        },
+        Arc::new(move |_| {
+            refused_starts.fetch_add(1, Ordering::SeqCst);
+            Err(std::io::Error::other("the activation spawn is refused"))
+        }),
+    );
+    let due = cancelled
+        .shared
+        .lock()
+        .activation
+        .next()
+        .expect("retry queued");
+    assert_eq!(dropped.load(Ordering::SeqCst), 0);
+    cancelled.shutdown_and_join();
+    assert_eq!(dropped.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        try_activation_start(&cancelled.shared, &cancelled.hooks, due),
+        None
+    );
+    assert_eq!(refused.load(Ordering::SeqCst), 1, "no start past shutdown");
 }
 
 /// THE ACCOUNTS' UPKEEP HOLDS NO WAKE ([`upkept`], [`Upkeep`]): it ran on the activation
@@ -17139,6 +17242,73 @@ fn a_held_accounts_upkeep_holds_no_wake() {
     host.shutdown_and_join();
     drop(wakes);
     drop(free);
+}
+
+/// THE WAKE MAKES THE HOST'S OWN INJECTED UPKEEP ([`host_upkept`],
+/// [`Acts::accounts_upkeep`]): the arming and each wake run the upkeep the
+/// host was built with, so a host built on [`Acts::inert`] — every test host
+/// — makes the inert one, and no test host reaches the live upkeep's fetch or
+/// sign-in (FAILS with the wake building the live upkeep itself, as it did:
+/// the host's own is never made). NEGATIVE CONTROL: the same host, its wake
+/// built over another upkeep (that shape), hands the arming and a wake on and
+/// makes none of the host's.
+#[test]
+fn the_wake_makes_the_hosts_own_injected_upkeep() {
+    let a = Accts::new();
+    // Each host counts on its own channel: the first host's wake thread may
+    // still make one upkeep as it winds down, and that is no upkeep of the
+    // second host's.
+    let counting = || {
+        let (made_tx, made) = std::sync::mpsc::channel::<()>();
+        let made_tx = Mutex::new(made_tx);
+        let upkeep: UpkeepFn = Arc::new(move || {
+            let _ = made_tx.lock().unwrap().send(());
+        });
+        (upkeep, made)
+    };
+    let start = |upkeep: &UpkeepFn| {
+        let mut hooks = a.hooks();
+        hooks.acts.accounts_upkeep = Arc::clone(upkeep);
+        HostHandle::start(at_wall_only(), false, true, hooks)
+    };
+    let (upkeep, made) = counting();
+    let host = start(&upkeep);
+    let (wakes, waits) = std::sync::mpsc::channel::<bool>();
+    spawn_activation_wake_with(host.clone(), move |host| {
+        (
+            None,
+            host_upkept(host, move || waits.recv().unwrap_or(false)),
+        )
+    });
+    made.recv_timeout(aterm_spec::wait::MUST_HAPPEN)
+        .expect("the arming makes the host's injected upkeep");
+    wakes.send(true).unwrap();
+    made.recv_timeout(aterm_spec::wait::MUST_HAPPEN)
+        .expect("a wake makes the host's injected upkeep again");
+    host.shutdown_and_join();
+    drop(wakes);
+
+    // NEGATIVE CONTROL: the wake over an upkeep that is not the host's.
+    let (upkeep, made) = counting();
+    let host = start(&upkeep);
+    let (wakes, waits) = std::sync::mpsc::channel::<bool>();
+    spawn_activation_wake_with(host.clone(), move |host| {
+        (
+            None,
+            upkept(host, move || waits.recv().unwrap_or(false), Arc::new(|| {})),
+        )
+    });
+    until("the arming handed on", || {
+        host.shared.activations.any() == 1
+    });
+    wakes.send(true).unwrap();
+    until("the wake handed on", || host.shared.activations.any() == 2);
+    host.shutdown_and_join();
+    drop(wakes);
+    assert!(
+        made.try_recv().is_err(),
+        "none of the host's upkeep was made"
+    );
 }
 
 /// THE WINDOW IS TOLD AGAIN WHERE IT MAY HOLD NOTHING, AND AT ONCE WHERE
@@ -17984,6 +18154,73 @@ fn a_worker_measures_its_agents_memory_at_most_once_per_cadence() {
     assert_eq!(*asked.lock().unwrap(), [4242, 4343, 4343]);
 }
 
+/// THE WORKER READS THE OCCUPANCY BOARD FOR ITS OWN SESSION
+/// ([`IdleHost::occupancy`] through [`Acts::occupancy`], a test's own): the
+/// board is asked by the worker's session id and answers that session's
+/// reading (its tab held a build slot). NEGATIVE CONTROL: another tab's
+/// worker over the same board asks by its own id and reads no slot held.
+#[test]
+fn a_workers_occupancy_reading_is_asked_for_its_own_session() {
+    use aterm_agent::supervise::occupancy::OccupancyReading;
+    let asked: Arc<Mutex<Vec<String>>> = Arc::default();
+    let worker = |sid: &str| {
+        let mut hooks = hooks(
+            &Arc::new(World::default()),
+            Arc::new(|_: &WorkerJob| BodyEnd::Stopped),
+        );
+        let seen = Arc::clone(&asked);
+        hooks.acts = Acts {
+            occupancy: Arc::new(move |sid| {
+                seen.lock().unwrap().push(sid.to_string());
+                OccupancyReading {
+                    held_slot_last_ms: (sid == "s-held").then_some(42),
+                    ..OccupancyReading::default()
+                }
+            }),
+            ..Acts::inert()
+        };
+        idle_host(sid, Program::Claude, switched(&on()), hooks)
+    };
+    assert_eq!(worker("s-held").occupancy().held_slot_last_ms, Some(42));
+    assert_eq!(worker("s-other").occupancy().held_slot_last_ms, None);
+    assert_eq!(*asked.lock().unwrap(), ["s-held", "s-other"]);
+}
+
+/// THE OCCUPANCY BOARD KEYS EACH SUPERVISED SESSION BY ITS TAB
+/// ([`board_sessions`]): each live session's process-local id, the key its
+/// tab carries in the vitals readings (`TabRoot::key`, the slot holders'
+/// tabs), beside its session id, so the board holds the session whose tab
+/// held a slot. NEGATIVE CONTROLS: a session id no live tab has is left out,
+/// and the other session's tab held none.
+#[test]
+fn the_occupancy_board_keys_each_session_by_its_tabs_id() {
+    use crate::occupancy_host::{Judged, board_of};
+    let store = crate::session_store::new_store();
+    let mut sids = Vec::new();
+    for n in [3, 8] {
+        let handle = crate::session_store::test_handle(n);
+        sids.push(handle.sid.as_str().to_string());
+        store.write().unwrap().register(handle);
+    }
+    let mut asked = sids.clone();
+    asked.push("s-gone".to_string());
+    let sessions = board_sessions(&store, &asked);
+    assert_eq!(sessions, [(3, sids[0].clone()), (8, sids[1].clone())]);
+    let now_ms = 1_792_656_000_000;
+    let snap = aterm_vitals::model::Snapshot {
+        slot_tabs: Some(vec![8]),
+        ..aterm_vitals::model::Snapshot::default()
+    };
+    let mut j = Judged::default();
+    j.step(
+        board_of(&snap, Some(now_ms), None, now_ms),
+        Some(&snap),
+        &sessions,
+    );
+    assert_eq!(j.reading(&sids[1], now_ms).held_slot_last_ms, Some(now_ms));
+    assert_eq!(j.reading(&sids[0], now_ms).held_slot_last_ms, None);
+}
+
 /// THE WORKER'S CANARY READS ITS OWN SESSION'S CALLS FROM THE JOBS BOARD
 /// ([`IdleHost::background_jobs`], the hung-call design's R1): the view
 /// posted to the board ([`Acts::jobs_board`], a test's own) maps each row's
@@ -18438,7 +18675,7 @@ fn unread_looks_climb_their_own_short_ladder_and_spend_none_of_the_steps_waits()
 }
 
 /// THE QUIET UPGRADE'S WAIT ON THE AGENT'S OWN WORK OWNS NO TURN END
-/// (round eight, #25): under the default flow (`upgrade_ask = false`) a
+/// (#25): under the default flow (`upgrade_ask = false`) a
 /// pending round with a shell under its agent waits `background` at every
 /// idle point — no READY was asked for, and the restart cannot come before
 /// the work ends — and that word owned the session's turn ends for
@@ -23151,7 +23388,7 @@ fn a_relaunch_behind_another_actor_waits_and_says_nothing() {
 }
 
 /// A RELAUNCH ON EXIT DUE AT A SEAMLESS UPDATE IS CARRIED, OR TAKEN UP
-/// AGAIN (round six, F13). A crashed agent's relaunch keeps waiting on
+/// AGAIN. A crashed agent's relaunch keeps waiting on
 /// its back-off; a park comes: no relaunch is typed while it holds, and
 /// the handoff layout names the agent the tab is owed
 /// ([`HostHandle::pending_restored_for`]) for the successor to relaunch.
@@ -23275,14 +23512,14 @@ fn counted_pauses(sid: &str) -> (Arc<AtomicUsize>, Arc<PauseFn>) {
     (paused, pause)
 }
 
-/// A RELAUNCH OWED ONLY AFTER THE PARK IS CARRIED TOO (round six F13,
+/// A RELAUNCH OWED ONLY AFTER THE PARK IS CARRIED TOO (
 /// review two): the agent exits once the park has frozen the restored
 /// queue — the worker reads the exit after its detection and settle — and
 /// the handoff layout still names the tab ([`HostHandle::pending_restored_for`],
 /// `Kept::owed`), for the successor or the rollback to relaunch, while
 /// nothing is typed; resumed, it is tried. A `crash` is owed so, and so is
-/// an `asked` exit (ruling 4 of 2026-10-08; the review of 3eaa8f83c found it
-/// unpinned): the explicit restart's stamp names the agent, which ends
+/// an `asked` exit:
+/// the explicit restart's stamp names the agent, which ends
 /// GRACEFULLY (its record removed).
 ///
 /// FAILS WITHOUT THE FIX: a frozen queue answered from its snapshot alone,
@@ -23290,7 +23527,7 @@ fn counted_pauses(sid: &str) -> (Arc<AtomicUsize>, Arc<PauseFn>) {
 ///
 /// "Nothing typed" is counted in the worker's looks, never waited out: a
 /// sleep passed before a loaded worker had looked once, and checked
-/// nothing (round ten). NEGATIVE CONTROL (`own`): the same graceful exit
+/// nothing. NEGATIVE CONTROL (`own`): the same graceful exit
 /// with no stamp is the agent's own — once the park ends it is left, owed
 /// nothing.
 #[test]
@@ -23544,7 +23781,7 @@ fn held_after_a_crash() -> HeldAfterACrash {
 }
 
 /// A RELAUNCH OWED AT A FAILED COMMIT IS DECIDED WHENEVER ITS WORKER DECIDES
-/// (rounds eleven and twelve; the review of 173b163e2). A crashed agent's
+/// (rounds eleven and twelve). A crashed agent's
 /// relaunch waits on its back-off, a park comes, and the worker is held in
 /// its pause seam ([`held_after_a_crash`]) until the Commit's stop, the
 /// Commit's failure and its whole rollback are over. It decides then, from
@@ -23556,7 +23793,7 @@ fn held_after_a_crash() -> HeldAfterACrash {
 ///   lifted — a stop for good, the relaunch settled, and nothing ever came
 ///   back for a tab at its shell (the F13 loss, on a loaded machine).
 /// * `back` — its agent back while the Commit held the host: nothing is
-///   queued. Without round ten's look at the tab ([`Hooks::still_wanted`])
+///   queued. without the look at the tab ([`Hooks::still_wanted`])
 ///   the take-up relaunched the conversation over the agent in its tab.
 /// * `closed before` — its tab closed during the park: nothing. Guarded
 ///   twice, each enough alone ([`HostHandle::suspend`] leaves a worker
@@ -24530,14 +24767,14 @@ fn a_crash_after_a_hand_over_conforms_to_the_commit_owed_model() {
 /// third the Commit took the cleared flag for a worker stopped already,
 /// marked nothing, and the rollback had nothing to take up; in the fourth
 /// the landing marked nothing either, and the agent's end in the hold was
-/// read by nobody once the Commit failed. AND UNTIL ROUND TWO the second
+/// read by nobody once the Commit failed. previously the second
 /// and fourth ended on the landing, leaving the exit to a worker the host
 /// handed it: the second's found no snapshot (`nothing-recorded`, the
 /// session forgotten) and the fourth's read the record swept by the
 /// line's agent's start, a graceful exit — one try each, green only
 /// while the fixture answered a follow of another process `Agent`, read
-/// a snapshot at a bare shell and relaunched on any exit record. AND
-/// UNTIL ROUND THREE the fifth's hand-over stopped a worker handed its
+/// a snapshot at a bare shell and relaunched on any exit record. previously
+/// the fifth's hand-over stopped a worker handed its
 /// exit, which then read the agent gone again as a stop for good — the
 /// session forgotten as `nothing-recorded` — and the sixth's worker left
 /// the landing to a roster that would never name it: nothing relaunched,
@@ -24951,7 +25188,7 @@ fn a_restart_asked_before_a_commit_reaches_the_agents_next_worker() {
 
 /// AN AGENT READ BACK KEEPS THE HOST'S MARK THROUGH A COMMIT'S STOP (round
 /// fifteen's guard in [`stopped`], ported onto the joint audit's
-/// [`Worker::back`]; the review of b7b6ec4f2): a Claude Code's exit is
+/// [`Worker::back`]): a Claude Code's exit is
 /// handed to its worker — the roster could not name it, and a hold that
 /// cannot be read keeps nothing — and the worker is held before it reads
 /// it. A Codex is then named in the tab, in a group of its own: the host
@@ -25314,8 +25551,8 @@ fn a_worker_started_as_its_sessions_off_lifts_is_told_so() {
     host.shutdown_and_join();
 }
 
-/// THE MASTER SWITCH OFF AND ON AGAIN IS EVERY SESSION'S OFF LIFTING (the
-/// review of 85d489954, finding 4): `[harness] enabled = false` stops every
+/// THE MASTER SWITCH OFF AND ON AGAIN IS EVERY SESSION'S OFF LIFTING:
+/// `[harness] enabled = false` stops every
 /// worker and the person drives every session, as under each one's own Off;
 /// switched on again, every worker the host starts is told it starts as its
 /// session's Off lifted ([`IdleHost::lifted_off`]), so the acts its ledger
@@ -25496,7 +25733,7 @@ fn an_agents_own_switch_off_and_on_again_starts_its_workers_as_off_lifted() {
     host.shutdown_and_join();
 
     // An instance LAUNCHED with the agent's switch off (the review of the
-    // bd90b5167 merge, finding 2): no worker of it ever ran, so no reap
+    // bd90b5167 merge): no worker of it ever ran, so no reap
     // marks its session — the pass's own mark (`switched_off`) does, and
     // the worker the switch-on starts there is its Off lifting too. FAILS
     // WITHOUT that mark: `[(s-a, false), (s-b, false)]`.
@@ -25531,8 +25768,8 @@ fn an_agents_own_switch_off_and_on_again_starts_its_workers_as_off_lifted() {
 }
 
 /// AN OFF SESSION'S WORKER IS STOPPED WHEN ANOTHER PROGRAM TAKES ITS TAB,
-/// mid-step or not, as under Cruise (the review of the bd90b5167 merge,
-/// finding 1): Off waits out an upgrade step in flight ([`visit_workers`]),
+/// mid-step or not, as under Cruise (the review of the bd90b5167 merge):
+/// Off waits out an upgrade step in flight ([`visit_workers`]),
 /// but once the roster names another program in the tab the step's agent is
 /// gone, and its worker is stopped at once — never handed over, and handed
 /// no exit (`OffLetsNothingGo`). FAILS WITHOUT THE FIX: the new-program loop
@@ -25641,7 +25878,7 @@ fn a_crash_of_an_off_session_is_not_relaunched() {
     host.shutdown_and_join();
 }
 
-/// AN AGENT THAT ENDED UNDER OFF IS FORGOTTEN (the review of a295792e4): Off
+/// AN AGENT THAT ENDED UNDER OFF IS FORGOTTEN: Off
 /// stops the worker without handing it the exit, so no worker's exit path
 /// forgets what was read of the agent. Once the roster names no agent in the
 /// Off tab (a person's `/exit`, its shell back), the host forgets the kept
@@ -25711,8 +25948,8 @@ fn an_agent_that_ended_under_off_is_forgotten_before_off_is_lifted() {
     host.shutdown_and_join();
 }
 
-/// A PASS PUBLISHES ITS OFF READING BEFORE IT STARTS A WORKER (the review
-/// of 345c41647): at every start ([`start_workers`], its claim epoch read
+/// A PASS PUBLISHES ITS OFF READING BEFORE IT STARTS A WORKER:
+/// at every start ([`start_workers`], its claim epoch read
 /// first), the Off sessions the host publishes ([`State::off`]) are the ones
 /// that very pass read — through the turn Off, when its stop comes first,
 /// and the turn back on, when its start comes after. Published after the
@@ -25772,7 +26009,7 @@ fn a_pass_publishes_its_off_reading_before_it_starts_a_worker() {
 }
 
 /// AN OFF SESSION'S EXIT LEFT TO THE HOST IS FORGOTTEN BY THE READ THAT
-/// WOULD HAND IT (the review of 345c41647): the exit no worker was handed
+/// WOULD HAND IT: the exit no worker was handed
 /// ([`Kept::unwatched`]) and an exit watch that hands itself, read
 /// ([`ExitWatched::hands`] — armed at a landing on another thread, its exit
 /// read on the watch's) are cleared in the very lock hold that reads them
@@ -25877,8 +26114,8 @@ fn an_off_sessions_exit_left_to_the_host_is_forgotten_by_the_read_that_would_han
     host.shutdown_and_join();
 }
 
-/// AN OFF SESSION'S RESTORED RELAUNCH IS DROPPED AND ITS TAB'S WORD CLEARED
-/// (the review of 345c41647): an attempt the restored queue drops because
+/// AN OFF SESSION'S RESTORED RELAUNCH IS DROPPED AND ITS TAB'S WORD CLEARED:
+/// an attempt the restored queue drops because
 /// its session is Off clears the word a relaunch raised on the tab ("still
 /// trying", a predecessor's carried here) — no worker of the Off session's
 /// own ever will — whether it went Off during a step (s-a, stepped once),
@@ -26386,7 +26623,7 @@ fn the_real_host_conforms_to_the_worker_lifecycle_model() {
             // Read once, before, it was a pass behind a worker that pass
             // started (`OffStopsTheWorker` broken by a stale `off: 1` beside
             // the worker the turn back to Cruise started: 5 runs in 3000
-            // parallel runs, the review of 345c41647) — and the test's word
+            // parallel runs) — and the test's word
             // alone, read before the host has acted on it, is no state the
             // host was in either.
             let off = host.off_sessions().contains("s-t1");
@@ -26723,8 +26960,8 @@ fn the_real_host_conforms_to_the_worker_lifecycle_model() {
     assert!(buggy.fire("Start", &mut admitted));
     assert!(!model.check_invariant("NoWorkerForAVendorCodex", &admitted));
 }
-/// THE PROJECTION CATCHES A REAL LET-GO OF AN OFF SESSION (the review of
-/// 345c41647): the conformance's let-go control fires the buggy `TurnOff`
+/// THE PROJECTION CATCHES A REAL LET-GO OF AN OFF SESSION:
+/// the conformance's let-go control fires the buggy `TurnOff`
 /// on model state alone — `letgo` a ghost only `Buggy` sets — which shows the
 /// model tells that host apart, not that the projection would see one. Here
 /// a pass of the REAL host is held where it reads the session's word, Off,
@@ -28639,7 +28876,7 @@ fn resumed_and_relaunched(mut job: ShellJob, a: &Acting, host: &HostHandle) {
     host.shutdown_and_join();
 }
 
-/// AN EXIT WHOSE PROGRAM STILL RUNS IS NOBODY'S YET (review of 1a733ed60,
+/// AN EXIT WHOSE PROGRAM STILL RUNS IS NOBODY'S YET (
 /// rulings 13 and 15). The deaf stand-in, a job of a real job-control `zsh`,
 /// stamped by the real verb, is stopped from elsewhere inside its grace; a
 /// FLEET HOLD lands, and the roster drops the agent as production's does
@@ -28849,7 +29086,7 @@ fn a_stopped_programs_end_under_another_supervisors_claim_is_that_supervisors() 
     host.shutdown_and_join();
 }
 
-/// THE HOLDER RULE AT THE READ (ruling 20 of 2026-10-14; §4's paragraph of
+/// THE HOLDER RULE AT THE READ (§4's paragraph of
 /// that name), and the Tier-1 of `HarnessRestartStamp`'s `Read` under a hand
 /// that lands after the act's program ended — and of its `ReadByClaim` after
 /// a `ClaimOn` beside that hand (`claim`; the review of ruling 20). The real
@@ -29596,7 +29833,7 @@ fn a_program_stopped_across_a_commit_is_ended_once_its_successor_read_it() {
     successor.shutdown_and_join();
 }
 
-/// THE ACT'S KILL WAITS OUT ANOTHER HAND (review of 1a733ed60, ruling 11),
+/// THE ACT'S KILL WAITS OUT ANOTHER HAND (ruling 11),
 /// and the Tier-1 of `HarnessRestartStamp`'s `HandOn`/`HandOff` guard on
 /// `Escalate`.
 ///
@@ -29857,7 +30094,7 @@ fn the_restart_acts_kill_waits_out_another_hand() {
     }
 }
 
-/// A STAMP THAT NO LONGER STANDS IS NO ACT'S TO FINISH (review of 1a733ed60,
+/// A STAMP THAT NO LONGER STANDS IS NO ACT'S TO FINISH (
 /// ruling 12): a stale stamp left on disk — one the act's watch let go
 /// (ruling 8: stopped past its life; ruling 11: a hand outlasted it) — whose
 /// program a person resumed and leads its tab again. A seamless update's
@@ -32007,7 +32244,7 @@ fn tap_on() -> SupervisorConfig {
     c
 }
 
-/// THE USAGE TAP'S SESSION LOG MARK (session log phase 3B, plan §3.2;
+/// THE USAGE TAP'S SESSION LOG MARK (plan §3.2;
 /// addendum A13): a reading the worker takes is handed to the window's log
 /// hook once, its two windows' percents, while `[harness] usage_tap` is on;
 /// an idle repeat (no reading taken) hands nothing, and with the switch off
@@ -32066,8 +32303,8 @@ fn a_taken_usage_reading_is_one_session_log_mark_while_the_tap_is_on() {
     assert_eq!(marks().len(), 1, "a tab gone");
 }
 
-/// THE HOSTED LANES SAY THEY RELAUNCHED (session log plan 5F-2, rulings T25
-/// and T28): the live acts' one row writer ([`live_row`]) marks each
+/// THE HOSTED LANES SAY THEY RELAUNCHED:
+/// the live acts' one row writer ([`live_row`]) marks each
 /// relaunch or upgrade row that moved the session ([`log_act`]) as `mark -
 /// act word=relaunch rule=<row> by=harness src=aterm conf=strong` on the
 /// tab's log — one mark per such row — waking its watchers (a one-minute
@@ -32267,8 +32504,8 @@ fn relaunch_act_line(rule: &str) -> String {
 
 const HARNESS_SEEN: &str = "mark - seen by=harness src=aterm conf=strong";
 
-/// A HOSTED RELAUNCH LIFTS THE FAILURE IT CAUSED (Phase 6 step 6C-1, ruling
-/// U3), through the live acts' one row writer: the old `claude` command, an
+/// A HOSTED RELAUNCH LIFTS THE FAILURE IT CAUSED,
+/// through the live acts' one row writer: the old `claude` command, an
 /// agent in front of it, ended 143 (`need=failure`), the relaunched one is
 /// open, and a row whose step brought the new agent up writes the act and
 /// then `mark - seen by=harness src=aterm conf=strong`, so neither the fold
@@ -35936,9 +36173,9 @@ fn a_restored_step_that_panicked_with_its_record_in_flight_is_a_landing() {
 /// tell: the line's own Claude coming up, or a person's started after the
 /// line's had ended as it started. Decided at the panic, the first was said
 /// as a relaunch that could not be started there, its remedy `claude
-/// --resume` typed into the Claude running in the tab (round eight), and
-/// then the second was taken for the landing, the miss never said (round
-/// nine). Stepped again on its back-off, the conversation's record decides:
+/// --resume` typed into the Claude running in the tab, and
+/// then the second was taken for the landing, the miss never said.
+/// Stepped again on its back-off, the conversation's record decides:
 /// landed (`adopted`: no row, its word cleared once), or the line's agent
 /// did not pick its conversation up (`failed:no-resume`: said). CONTROLS:
 /// the same steps with no panic say the same.
@@ -38120,7 +38357,7 @@ fn a_pass_whose_removals_went_unrecorded_is_not_spent() {
 /// EVERY INTENT OF THE NO-SESSION SWEEP HAS ITS OUTCOME ON RECORD: a stage an
 /// earlier pass left half-removed is sized and its `removing` row written
 /// before it goes, then its `removed` row, its bytes counted in what the
-/// pass freed (the review of d5ba0dc843: the intent stood alone, and the
+/// pass freed (the intent stood alone, and the
 /// bytes went uncounted) and, once, in today's freed tally on the board
 /// (Stats Deck v2 §7.3). NEGATIVE CONTROL: a ledger that cannot be written
 /// keeps the stage whole, writes nothing, counts nothing, and says the pass
@@ -38203,7 +38440,7 @@ fn the_sweep_journals_a_finished_stage_and_counts_it() {
 /// 3A), so what it types and marks reads `by=harness`; and when a listener
 /// refuses it (`ERR auth`: an update's successor rebound the socket and
 /// never knew it), the transport presents the token beside the socket and the
-/// request lands there (ruling R10), never a lost write.
+/// request lands there, never a lost write.
 #[cfg(unix)]
 #[test]
 fn the_hosted_loop_presents_the_in_memory_token_and_falls_back_beside() {
@@ -38405,8 +38642,8 @@ fn a_vendor_codex_is_shown_and_admitted_to_no_worker() {
     }
 }
 
-/// A GROUP'S IMAGE IS READ AGAIN WHEN ITS LEADER EXECS (the review of
-/// cc06144f2a, ruling lens #4): atpkg's `agents/codex` twin is a shell script
+/// A GROUP'S IMAGE IS READ AGAIN WHEN ITS LEADER EXECS (ruling lens #4):
+/// atpkg's `agents/codex` twin is a shell script
 /// that execs the store's binary under the same pid, so a roster pass that
 /// read the group while the shell led it cached "not ALab" for good, and the
 /// codex-alab that took its place counted as a vendor `codex` until it

@@ -278,7 +278,7 @@ pub(crate) struct TerminalLeafRestore {
     /// relaunches the agent, as before); an older producer never writes it.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub holds: Vec<String>,
-    /// THE SESSION THIS LEAF'S SHELL WAS (session log phase 2A; additive,
+    /// THE SESSION THIS LEAF'S SHELL WAS (additive,
     /// absent tolerated, written by every capture): its sid, so the shell a
     /// restore starts for the leaf opens `open - restore prev=<sid>`, and a
     /// reader can go from the new session to the one it stands in for (whose
@@ -293,8 +293,8 @@ pub(crate) struct TerminalLeafRestore {
     /// is. On a seamless update's layout it goes to the shell the leaf names.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lineage: Option<String>,
-    /// THE EPOCH ITS SHELL'S LOG WAS AT (session log phase 6, 6A-2, ruling
-    /// U1; additive, absent tolerated, written by every capture): a later
+    /// THE EPOCH ITS SHELL'S LOG WAS AT (additive, absent tolerated, written by every capture):
+    /// a later
     /// process notes it before any session starts
     /// (`session_log::Epochs::note_leaves`), so the epoch it gives a log of
     /// the same sid (an adoption told nothing of its predecessor's, a crash
@@ -3473,8 +3473,8 @@ pub(crate) fn write_quit_to(
 /// [`write_quit_to`] for the cold update lane, which runs on the GUI main
 /// thread: the restore lock is waited for at most `budget`, and a holder past
 /// it (another aterm reading or writing its windows, or stopped while it does)
-/// is a PASSING refusal, never a wait with no end (round eight of the update
-/// audit, U49). Every refusal says whether it passes ([`RestoreFault`]).
+/// is a PASSING refusal, never a wait with no end.
+/// Every refusal says whether it passes ([`RestoreFault`]).
 #[cfg(unix)]
 pub(crate) fn write_quit_to_within(
     path: &Path,
@@ -3525,7 +3525,7 @@ pub(crate) fn unwrite_quit_to(path: &Path, run: Option<&str>) -> Result<(), Stri
 
 /// [`unwrite_quit_to`] for the cold update lane on the GUI main thread: the
 /// restore lock is waited for at most `budget`, as its write waits
-/// ([`write_quit_to_within`]; round eight of the update audit, U49).
+/// ([`write_quit_to_within`]).
 #[cfg(unix)]
 pub(crate) fn unwrite_quit_to_within(
     path: &Path,
@@ -3973,8 +3973,7 @@ enum LockWait {
     /// Until the holder lets go: a launch's take, a person's quit, a worker.
     Unbounded,
     /// At most this long, then a passing refusal ([`RestoreFault::busy`]): the
-    /// GUI main thread's, which may not wait with no end (round eight of the
-    /// update audit, U49).
+    /// GUI main thread's, which may not wait with no end.
     #[cfg(unix)]
     Within(std::time::Duration),
 }
@@ -5334,7 +5333,7 @@ mod tests {
         assert!(takes_in(dir.path()).is_empty());
     }
 
-    /// ROUND EIGHT, U48: A LAYOUT WRITE SAYS WHETHER ITS CAUSE PASSES. A full
+    /// A LAYOUT WRITE SAYS WHETHER ITS CAUSE PASSES. A full
     /// disk, a quota, an I/O error or a busy lock is a moment the cold lane
     /// retries; a data folder this user cannot write, a read-only volume or a
     /// volume without the locks or syncs the write needs answers the same on
@@ -6818,8 +6817,8 @@ metadata = "opaque=copy-me"
         );
     }
 
-    /// A LEAF NAMES THE EPOCH ITS SHELL'S LOG WAS AT (session log phase 6,
-    /// 6A-2, ruling U1), AND THE LAYOUT SAYS THE LARGEST: `log_ep` round
+    /// A LEAF NAMES THE EPOCH ITS SHELL'S LOG WAS AT,
+    /// AND THE LAYOUT SAYS THE LARGEST: `log_ep` round
     /// trips through the capture's wire and the parse; a leaf without it is
     /// written as an older writer wrote it (no key) and an older writer's
     /// layout reads as none; `max_log_ep` is the largest over every

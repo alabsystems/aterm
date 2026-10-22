@@ -86,8 +86,7 @@ pub(crate) fn scripted(plant: bool) -> SessionHandle {
         g.register(h.clone()); // spawned
         g.set_title(5, title(plant));
     }
-    // title-change: the drift flush's writer, the title mark's row (phase 6,
-    // 6F-8, ruling U13).
+    // title-change: the drift flush's writer, the title mark's row.
     assert!(
         ctx.timeline
             .lock()

@@ -1,17 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Session, kernel, fd-lifecycle, recording and routing models, re-exported from
-//! this crate's root. Each constructor is `trust::skip`: it is model data, and the model it
-//! returns is what `ty` checks.
+//! Session, kernel, fd-lifecycle, recording, and routing models.
 
 use aterm_spec::derive::*;
 
-/// One fresh read in the momentum wait: accept a satisfied floor, time out an unmet reading
-/// past the backstop, otherwise arm one crossing. A latched timer is only a reason to re-read,
-/// never permission to ignore the backstop. `Buggy=1` re-parks an expired reading. Tier-1
-/// drives `control_session::momentum_read_outcome`; separate wait regressions bind the timer to
-/// the real snapping momentum metric.
+/// Momentum wait model: accept a satisfied floor, time out an unmet reading past the backstop,
+/// or arm one crossing (`Buggy = 1` re-parks an expired reading).
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn momentum_wait_read_model() -> Model {
@@ -21,7 +16,7 @@ pub fn momentum_wait_read_model() -> Model {
             var read = 0;
             var met = 0;
             var expired = 0;
-            var decision = 0; // 1=below, 2=deadline, 3=park
+            var decision = 0;
 
             action ReadLive when (read == 0) {
                 read = 1; met = 0; expired = 0;
@@ -50,16 +45,8 @@ pub fn momentum_wait_read_model() -> Model {
     }
 }
 
-/// Spawn-time locale: the child aterm launches runs under a UTF-8 `LC_CTYPE` whatever locale
-/// aterm inherited. Under a non-UTF-8 `LC_CTYPE`, locale-aware programs (emacs, vim, python)
-/// re-encode multibyte output to ASCII and print `?` per character. The real decision is
-/// `aterm_pty::resolve_spawn_locale` (POSIX precedence `LC_ALL > LC_CTYPE > LANG`, empty ==
-/// unset); Tier-1 is aterm-pty's `spawn_locale_conformance_*` test.
-///
-/// `present`: any locale var is set non-empty; `eff_utf8`: the effective inherited encoding is
-/// already UTF-8; `ctype`: the child's resulting `LC_CTYPE` (1 = UTF-8) once `resolved`. The
-/// `Observe*` actions spread the input shape and `Resolve` runs once. `Buggy = 1` forces UTF-8
-/// only when nothing is set, so a present non-UTF-8 locale breaks `ChildHasUtf8Ctype`.
+/// Spawn-time locale model: `resolve_spawn_locale` ensures the child runs under a UTF-8
+/// `LC_CTYPE` regardless of inherited locale (`Buggy = 1` fixes only when all vars are unset).
 #[cfg_attr(trust_verify, trust::skip)]
 #[aterm_spec::model]
 pub fn spawn_locale_model() -> Model {
@@ -87,7 +74,7 @@ pub fn spawn_locale_model() -> Model {
         fn_vars: vec![],
         actions: vec![
             Action {
-                name: "ObserveNonUtf8", // a non-UTF-8 locale is present (e.g. LANG=C)
+                name: "ObserveNonUtf8",
                 guard: Some(and_(
                     eq(var("resolved"), int(0)),
                     eq(var("present"), int(0)),
@@ -95,10 +82,10 @@ pub fn spawn_locale_model() -> Model {
                 updates: vec![Update {
                     var: "present",
                     expr: int(1),
-                }], // eff_utf8 stays 0
+                }],
             },
             Action {
-                name: "ObserveUtf8", // a UTF-8 locale is present
+                name: "ObserveUtf8",
                 guard: Some(and_(
                     eq(var("resolved"), int(0)),
                     eq(var("present"), int(0)),
@@ -115,15 +102,13 @@ pub fn spawn_locale_model() -> Model {
                 ],
             },
             Action {
-                name: "Resolve", // run resolve_spawn_locale once; sets the child's LC_CTYPE
+                name: "Resolve",
                 guard: Some(eq(var("resolved"), int(0))),
                 updates: vec![
                     Update {
                         var: "resolved",
                         expr: int(1),
                     },
-                    // Buggy=1: IF present=0 THEN 1 ELSE eff_utf8 (an all-unset guard leaves a
-                    // present non-UTF-8 locale unfixed). Buggy=0: always 1.
                     Update {
                         var: "ctype",
                         expr: if_(
@@ -138,33 +123,13 @@ pub fn spawn_locale_model() -> Model {
         invariants: vec![Invariant {
             name: "ChildHasUtf8Ctype",
             kind: InvariantKind::Claim,
-            // resolved => ctype = 1
             expr: or_(eq(var("resolved"), int(0)), eq(var("ctype"), int(1))),
         }],
     }
 }
 
-/// Proof-carrying DSU, the quiescence-safety obligation (Rung 0 of
-/// `docs/RFC-proof-carrying-dsu.md`). A computation begun under the old version's memory layout
-/// tears if resumed under the new one, so a running process may take an update only at a
-/// quiescence point, with no request in flight.
-///
-/// * `Begin` — a request starts (`inflight := 1`), bounded by `served <= MaxReq - 1`.
-/// * `Finish` — it completes (`inflight := 0`, `served += 1`).
-/// * `ApplyQuiescent` — apply at quiescence (`applied = 0 /\ inflight = 0`): the transformer
-///   runs on settled state.
-/// * `BuggyApplyInflight` — (`Buggy = 1`) apply mid-flight: a tear (`torn := 1`).
-///
-/// `NoTear` (`torn = 0`) holds at `Buggy = 0` and fails at `Buggy = 1`: the mid-flight apply is
-/// forbidden; request completion is not claimed.
-///
-/// Tier-1: in the overlap handoff a request is a slice of PTY output the reader drained from
-/// the kernel and has not yet folded into the engine, and the apply is the handoff proceeding
-/// past `park_all_readers`, which it does only when every `spawn::park_reader` returns `true`.
-/// aterm-gui's `spawn::dsu_quiescence_conformance` attaches the real reader (gather + parse) to
-/// a real pseudo-terminal, holds the engine busy on the terminal lock so a drained slice stays
-/// in flight, and checks every step (the reader stopping, `park_reader` acking) against this
-/// model; an ack with a drained slice unapplied is the step it rejects.
+/// Dynamic software update quiescence model: an update applies only when no request is in flight
+/// (`Buggy = 1` applies mid-flight and sets `torn`).
 #[cfg_attr(trust_verify, trust::skip)]
 #[aterm_spec::model]
 pub fn dsu_quiescence_model() -> Model {
@@ -173,26 +138,26 @@ pub fn dsu_quiescence_model() -> Model {
         consts: vec![("MaxReq", 3), ("Buggy", 0)],
         vars: vec![
             StateVar {
-                name: "inflight", // a request is mid-processing under the current version
+                name: "inflight",
                 init: 0,
             },
             StateVar {
-                name: "applied", // the dynamic update has been applied
+                name: "applied",
                 init: 0,
             },
             StateVar {
-                name: "torn", // SAFETY violation: an in-flight computation survived an apply
+                name: "torn",
                 init: 0,
             },
             StateVar {
-                name: "served", // completed request cycles (bounds the state space)
+                name: "served",
                 init: 0,
             },
         ],
         fn_vars: vec![],
         actions: vec![
             Action {
-                name: "Begin", // start a request under the current version
+                name: "Begin",
                 guard: Some(and_(
                     eq(var("inflight"), int(0)),
                     le(var("served"), sub(cst("MaxReq"), int(1))),
@@ -203,7 +168,7 @@ pub fn dsu_quiescence_model() -> Model {
                 }],
             },
             Action {
-                name: "Finish", // the request completes cleanly
+                name: "Finish",
                 guard: Some(eq(var("inflight"), int(1))),
                 updates: vec![
                     Update {
@@ -217,7 +182,7 @@ pub fn dsu_quiescence_model() -> Model {
                 ],
             },
             Action {
-                name: "ApplyQuiescent", // apply only at quiescence (no request in flight)
+                name: "ApplyQuiescent",
                 guard: Some(and_(
                     eq(var("applied"), int(0)),
                     eq(var("inflight"), int(0)),
@@ -228,7 +193,7 @@ pub fn dsu_quiescence_model() -> Model {
                 }],
             },
             Action {
-                name: "BuggyApplyInflight", // apply mid-flight -> tears the in-flight request
+                name: "BuggyApplyInflight",
                 guard: Some(and_(
                     and_(eq(var("applied"), int(0)), eq(var("inflight"), int(1))),
                     eq(cst("Buggy"), int(1)),
@@ -248,30 +213,13 @@ pub fn dsu_quiescence_model() -> Model {
         invariants: vec![Invariant {
             name: "NoTear",
             kind: InvariantKind::Claim,
-            expr: eq(var("torn"), int(0)), // torn = 0
+            expr: eq(var("torn"), int(0)),
         }],
     }
 }
 
-/// Proof-carrying DSU, the fd-handoff no-leak obligation (Rung 1b of
-/// `docs/RFC-proof-carrying-dsu.md`). Seamless re-exec clears `FD_CLOEXEC` on each live PTY
-/// master so it survives the exec (the kernel's `execve` rule, which the seamless handoff tests
-/// exercise end to end); a cleared master then neither re-adopted nor closed is a live, ungated
-/// PTY channel dangling across the exec. The incoming side's accounting: `adopted + closed <=
-/// prepared` always, and only `BuggyDrop` (adopt fails, the fd dropped unclosed) sets `leaked`.
-/// `NoLeak` forbids the leaking transition; eventual accounting (`adopted + closed ==
-/// prepared`) is liveness and not claimed — a prepared master not yet adopted or closed is a
-/// legal in-flight state.
-///
-/// Tier-1: two aterm-gui tests classify every handed master by a pooled session owning it
-/// (`Adopt`) or its witness reading EOF (`CloseFallback`), never `BuggyDrop`:
-/// `app_restore::tests::handed_off_masters_are_adopted_or_closed_never_leaked` hands socketpair
-/// "masters" through the real orphan net (`App::adopt_orphan_shells_as_tabs`) with and without a
-/// window to adopt into, adopting through `spawn::HandedMaster::into_sink`; and
-/// `seamless::tests::a_refused_handoff_closes_every_master_it_was_handed` has the real
-/// `take_incoming` refuse a staged two-PTY handoff after claiming one master.
-/// `spawn::HandedMaster` owns an un-adopted master and closes it on drop, which also covers a
-/// spawn that fails after taking the handle (not driven: it needs a live event loop).
+/// Seamless re-exec fd-handoff model: every prepared PTY master is either re-adopted or closed
+/// (`Buggy = 1` drops a failed adoption unclosed and sets `leaked`).
 #[cfg_attr(trust_verify, trust::skip)]
 #[aterm_spec::model]
 pub fn fd_handoff_no_leak_model() -> Model {
@@ -280,26 +228,26 @@ pub fn fd_handoff_no_leak_model() -> Model {
         consts: vec![("N", 3), ("Buggy", 0)],
         vars: vec![
             StateVar {
-                name: "prepared", // masters with CLOEXEC cleared, handed across the exec
+                name: "prepared",
                 init: 0,
             },
             StateVar {
-                name: "adopted", // re-adopted by the new process (reader thread + owner)
+                name: "adopted",
                 init: 0,
             },
             StateVar {
-                name: "closed", // deliberately closed (fell back to a fresh shell)
+                name: "closed",
                 init: 0,
             },
             StateVar {
-                name: "leaked", // SAFETY violation: a cleared master neither adopted nor closed
+                name: "leaked",
                 init: 0,
             },
         ],
         fn_vars: vec![],
         actions: vec![
             Action {
-                name: "Prepare", // clear CLOEXEC on one more master (outgoing side)
+                name: "Prepare",
                 guard: Some(le(var("prepared"), sub(cst("N"), int(1)))),
                 updates: vec![Update {
                     var: "prepared",
@@ -307,7 +255,7 @@ pub fn fd_handoff_no_leak_model() -> Model {
                 }],
             },
             Action {
-                name: "Adopt", // the new process re-adopts a prepared master (valid fd)
+                name: "Adopt",
                 guard: Some(gt(var("prepared"), add(var("adopted"), var("closed")))),
                 updates: vec![Update {
                     var: "adopted",
@@ -315,7 +263,7 @@ pub fn fd_handoff_no_leak_model() -> Model {
                 }],
             },
             Action {
-                name: "CloseFallback", // a dead/invalid fd: close it + cold-restart the tab
+                name: "CloseFallback",
                 guard: Some(gt(var("prepared"), add(var("adopted"), var("closed")))),
                 updates: vec![Update {
                     var: "closed",
@@ -323,7 +271,7 @@ pub fn fd_handoff_no_leak_model() -> Model {
                 }],
             },
             Action {
-                name: "BuggyDrop", // adopt fails and the fd is dropped unclosed -> leak
+                name: "BuggyDrop",
                 guard: Some(and_(
                     eq(cst("Buggy"), int(1)),
                     gt(var("prepared"), add(var("adopted"), var("closed"))),
@@ -337,7 +285,6 @@ pub fn fd_handoff_no_leak_model() -> Model {
         invariants: vec![Invariant {
             name: "NoLeak",
             kind: InvariantKind::Claim,
-            // leaked = 0 /\ adopted + closed <= prepared (never leak; never over-account)
             expr: and_(
                 eq(var("leaked"), int(0)),
                 le(add(var("adopted"), var("closed")), var("prepared")),
@@ -346,30 +293,9 @@ pub fn fd_handoff_no_leak_model() -> Model {
     }
 }
 
-/// The read-image snapshot-seq protocol. The engine's render snapshot
-/// (`Terminal::cell_frame_into`, outside this crate) is stamped with the monotone
-/// `damage_epoch` as its `snapshot_seq`:
-///
-/// * `Damage` advances the live `epoch` (net-new grid damage bumps `damage_epoch`).
-/// * `ReadImage` captures `snap_seq := epoch` atomically under the one lock and activates the
-///   snapshot (`snapped := 1`).
-/// * `Write` advances `epoch` after the snapshot; under `Buggy == 1 && snapped == 1` the write
-///   leaks into the active snapshot (`torn := 1`).
-///
-/// Two invariants:
-/// 1. `NoTornRead: torn = 0` — a write after the capture never mutates the emitted snapshot
-///    ([`snapshot_model`]'s isolation applied to the seq stamp).
-/// 2. `SeqIsStaleOrCurrent: snap_seq <= epoch` — the captured seq never exceeds the live epoch,
-///    so staleness is always detectable (`epoch > snap_seq`). `snap_seq` is the engine's stamp
-///    (`engine_fill_seq`), which only lags a write. The scratch's `snapshot_seq` can run ahead
-///    (every host mutator bumps it: prediction ghosts, the IME preedit, the find bar, the Claude
-///    footer); `Buggy = 1` stamps the capture one ahead, that host-bumped value read as the
-///    engine's, so one engine advance lands the epoch on it and a stale frame passes as current
-///    — the collision `effect_only_snapshot_reusable`'s `engine_fill_seq == snapshot_seq` clause
-///    refuses.
-///
-/// Tier-1: `aterm-core/tests/conformance_read_image_seq.rs` binds the real
-/// `Terminal::cell_frame` and `damage_epoch`/`take_damage` path, with a negative control per law.
+/// Render snapshot sequence model: `ReadImage` captures `snap_seq := epoch` atomically so post-read
+/// writes do not tear the snapshot and `snap_seq <= epoch` (`Buggy = 1` stamps one ahead and leaks
+/// subsequent writes).
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn read_image_seq_model() -> Model {
@@ -377,61 +303,33 @@ pub fn read_image_seq_model() -> Model {
         ReadImageSeq {
             const MaxSeq = 4;
             const Buggy = 0;
-            // The live damage epoch (monotone). The snapshot-active latch. The
-            // seq captured by the last ReadImage. The torn-read leak flag.
             var epoch = 0;
             var snapped = 0;
             var snap_seq = 0;
             var torn = 0;
 
-            // More grid damage bumps the engine's damage_epoch.
             action Damage when (epoch <= MaxSeq - 1) {
                 epoch = epoch + 1;
             }
 
-            // read_image: capture snap_seq = damage_epoch atomically, activate.
-            // Buggy: the stamp is a host-bumped seq, one ahead of the engine's.
             action ReadImage when (snapped == 0) {
                 snap_seq = if Buggy == 1 { epoch + 1 } else { epoch };
                 snapped = 1;
             }
 
-            // A write after the snapshot advances the epoch; in the buggy case it
-            // leaks into the active snapshot (a torn read).
             action Write when (epoch <= MaxSeq - 1) {
                 epoch = epoch + 1;
                 torn = if Buggy == 1 && snapped == 1 { 1 } else { torn };
             }
 
-            // No torn read / snapshot internal-consistency (the catch at Buggy=1).
             invariant NoTornRead: torn == 0;
-            // Monotone + staleness-detectable: the captured seq never exceeds the
-            // live epoch, so epoch > snap_seq is an observable "snapshot is stale".
             invariant SeqIsStaleOrCurrent: snap_seq <= epoch;
         }
     }
 }
 
-/// The session PTY-master fd lifecycle: the code-bound model of the `SinkWriter` ownership state
-/// machine in `aterm-session/src/sink.rs`. `SinkWriter` owns the master as `Option<OwnedFd>`;
-/// the fd closes exactly when the last `Arc<SinkWriter>` clone drops, never out of band, and
-/// raw-fd use goes through `master()` and `write_frame`.
-///
-/// * `Clone` — `Arc::clone` adds a holder while one exists and `MaxClones` is not reached; bound
-///   by a `spec_unmodeled` waiver on `new_owned` (`Arc::clone` has no aterm method to anchor).
-/// * `UseFd` — a holder uses the raw fd (`master()` / `write_frame`), latching `usedAfterClose`
-///   if it is already closed; bound by `#[refines]` on `write_frame`/`master`.
-/// * `DropClone` — drop one clone; the fd closes (via `OwnedFd::drop`) exactly on the last drop
-///   (`fdOpen' = (clones - 1 > 0)`). `Buggy = 1` closes on every drop, out of band while
-///   siblings still hold and use the raw fd. Bound by a `spec_unmodeled` waiver.
-///
-/// The defect rides the always-live `DropClone` rather than a Buggy-only action, so no action
-/// is dead at `Buggy = 0` (`--strict-vacuity`). At `Buggy = 1` a drop closes the fd while clones
-/// remain and a later `UseFd` latches the use-after-close.
-///
-/// 1. `NoUseAfterClose: ~usedAfterClose` — no holder uses the raw fd after it closed.
-/// 2. `ClosedImpliesNoClones: (~fdOpen) => (clones = 0)` — the fd closes only with no live
-///    holder, written `fdOpen \/ clones = 0` (the DSL has no `=>`/`~`).
+/// `SinkWriter` PTY master fd lifecycle model: the fd closes only when the last `Arc<SinkWriter>`
+/// clone drops, preventing use-after-close (`Buggy = 1` closes on every drop).
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 #[aterm_spec::model]
@@ -440,17 +338,14 @@ pub fn fd_lifecycle_model() -> Model {
         name: "FdLifecycle",
         consts: vec![("MaxClones", 3), ("Buggy", 0)],
         vars: vec![
-            // Live Arc<SinkWriter> clone count (the original owner starts holding it).
             StateVar {
                 name: "clones",
                 init: 1,
             },
-            // Is the PTY master fd still open? (1 = open, 0 = closed.)
             StateVar {
                 name: "fdOpen",
                 init: 1,
             },
-            // Latched: did a holder use the raw fd after it was closed? (the race.)
             StateVar {
                 name: "usedAfterClose",
                 init: 0,
@@ -459,8 +354,7 @@ pub fn fd_lifecycle_model() -> Model {
         fn_vars: vec![],
         actions: vec![
             Action {
-                name: "Clone", // Arc::clone: another party takes a holder.
-                // clones > 0 /\ clones < MaxClones
+                name: "Clone",
                 guard: Some(and_(
                     gt(var("clones"), int(0)),
                     le(var("clones"), sub(cst("MaxClones"), int(1))),
@@ -471,27 +365,21 @@ pub fn fd_lifecycle_model() -> Model {
                 }],
             },
             Action {
-                name: "UseFd", // a holder uses the RAW master fd (master()/write_frame).
+                name: "UseFd",
                 guard: Some(gt(var("clones"), int(0))),
-                // usedAfterClose' = IF fdOpen = 0 THEN 1 ELSE usedAfterClose
-                // (latches the use-after-close; fdOpen, clones UNCHANGED).
                 updates: vec![Update {
                     var: "usedAfterClose",
                     expr: if_(eq(var("fdOpen"), int(0)), int(1), var("usedAfterClose")),
                 }],
             },
             Action {
-                name: "DropClone", // drop one clone; the fd closes only on the last drop.
+                name: "DropClone",
                 guard: Some(gt(var("clones"), int(0))),
                 updates: vec![
                     Update {
                         var: "clones",
                         expr: sub(var("clones"), int(1)),
                     },
-                    // fdOpen' = IF Buggy = 1 THEN 0 (close on every drop)
-                    //           ELSE IF clones - 1 > 0 THEN 1 ELSE 0 (close iff last holder).
-                    // The defect rides this always-live action, so --strict-vacuity holds at
-                    // Buggy=0.
                     Update {
                         var: "fdOpen",
                         expr: if_(
@@ -504,13 +392,11 @@ pub fn fd_lifecycle_model() -> Model {
             },
         ],
         invariants: vec![
-            // No party ever uses the raw master fd after it has been closed.
             Invariant {
                 name: "NoUseAfterClose",
                 kind: InvariantKind::Claim,
                 expr: eq(var("usedAfterClose"), int(0)),
             },
-            // The fd is closed only when no live holder remains (fdOpen \/ clones = 0).
             Invariant {
                 name: "ClosedImpliesNoClones",
                 kind: InvariantKind::Claim,
@@ -520,27 +406,12 @@ pub fn fd_lifecycle_model() -> Model {
     }
 }
 
-/// Tier residency, spill-not-forget (HIERARCHICAL_SESSIONS.md Addendum B, B.8.2). Not an
-/// extension of [`evict_full_model`], which proves an evicted seq is not live: here an evicted
-/// seq stays recoverable, through `resident_warm`/`resident_cold` layered on the same eviction
-/// spine. `Push` evicts the oldest seq `lo` and spills it to warm in the same step (the
-/// recorder's spill hook fires synchronously on the `pop_front` path, so the evicted event is
-/// never neither live nor resident). `Demote` moves the whole warm tier to cold (the DSL cannot
-/// pick one index).
-///
-/// `NoSilentLoss`: every recorded seq up to the head is live or resident,
-/// `\A n \in 1..MaxSeq : (n =< seq) => (live[n] \/ resident_warm[n] \/ resident_cold[n])`,
-/// written `(n > seq) \/ R`. `Buggy = 1` drops on evict without spilling. Function-valued, so
-/// Tier-0 `ty` only. Keyframe recoverability is out of scope (it needs an existential the DSL
-/// lacks): re-keyframing keeps the latest instant reachable, and a needed base that aged out
-/// answers `ERR temporal unreachable` rather than a wrong screen (aterm-gui `temporal.rs`'s
-/// `rekeyframing_keeps_the_latest_reachable_past_the_budget`,
-/// `replay_degrades_to_none_when_needed_blobs_were_evicted`).
+/// Tier residency model: `Push` spills an evicted event to the warm tier atomically and `Demote`
+/// moves warm to cold, so every recorded seq up to `seq` remains live or resident (`Buggy = 1`
+/// drops on eviction without spilling).
 #[cfg_attr(trust_verify, trust::skip)]
 #[aterm_spec::model]
 pub fn tier_residency_model() -> Model {
-    // (seq + 1) - lo + 1 > Cap : the eviction condition over the pre-state seq
-    // (identical to `evict_full_model`'s spine).
     let evicting = || {
         gt(
             add(sub(add(var("seq"), int(1)), var("lo")), int(1)),
@@ -589,9 +460,6 @@ pub fn tier_residency_model() -> Model {
                     },
                     Update {
                         var: "live",
-                        // Same live-set discipline as evict_full: evicting rebuilds
-                        // (old minus the evicted `lo`) plus the new event; otherwise
-                        // just mark `seq+1`.
                         expr: if_(
                             evicting(),
                             comprehension(
@@ -609,22 +477,16 @@ pub fn tier_residency_model() -> Model {
                     },
                     Update {
                         var: "resident_warm",
-                        // Spill-not-forget: on eviction the evicted `lo` lands in warm
-                        // atomically. Buggy=1 drops it, so it is in no tier and NoSilentLoss
-                        // fails. A non-evicting Push leaves warm untouched.
                         expr: if_(
                             and_(evicting(), eq(cst("Buggy"), int(0))),
                             except("resident_warm", var("lo"), bool_lit(true)),
                             var("resident_warm"),
                         ),
                     },
-                    // resident_cold UNCHANGED in Push (rendered automatically).
                 ],
             },
             Action {
                 name: "Demote",
-                // warm -> cold for the whole tier; both are resident, so residency is
-                // preserved. Always enabled (a no-op self-loop when warm is empty).
                 guard: None,
                 updates: vec![
                     Update {
@@ -643,15 +505,12 @@ pub fn tier_residency_model() -> Model {
                         var: "resident_warm",
                         expr: comprehension("n", int(1), cst("MaxSeq"), bool_lit(false)),
                     },
-                    // seq, lo, live UNCHANGED.
                 ],
             },
         ],
         invariants: vec![Invariant {
             name: "NoSilentLoss",
             kind: InvariantKind::Claim,
-            // \A n \in 1..MaxSeq : (n =< seq) => (live[n] \/ warm[n] \/ cold[n])
-            // implication encoded as (n > seq) \/ R (DSL has no => / ~).
             expr: forall(
                 "n",
                 int(1),
@@ -671,55 +530,39 @@ pub fn tier_residency_model() -> Model {
     }
 }
 
-/// Hydration faithfulness (HIERARCHICAL_SESSIONS.md Addendum B, B.8.3): hydrating a recording
-/// at an instant and folding events forward from a keyframe reproduces the live engine state,
-/// `P(replay@t) = P(live@t)`. The invariant compares two parallel folds, not a counter copied
-/// to a counter, so a dropped or omitted event makes them diverge.
-///
-/// `ty` function-vars are boolean (`to_tla` seeds them all-FALSE), so `P` is a one-bit checksum
-/// and the fold a running XOR over the recorded events (`a # b`); parity is history-dependent,
-/// so dropping any event flips the tail. A TLA+ comprehension `[n |-> f(replay[n-1], ...)]`
-/// reads the old `replay` and is not a left fold, so `Hydrate` seeds `replay` from the keyframe
-/// (`replay[n] = live[n]` for `n =< KF`) and `ReplayStep` folds one index per step via the
-/// cursor `rt`.
-///
-/// `ReplayFaithful`: `\A n : (n =< rt) => (replay[n] = live[n])`, encoded
-/// `(n > rt) \/ (replay[n] <=> live[n])`. At `Buggy = 1`, `ReplayStep` at `rt+1 == DROPAT` skips
-/// the payload (parity stalls) and `replay[DROPAT..]` diverges.
+/// Recording hydration faithfulness model: seeding `replay` from keyframe `KF` and folding forward
+/// step-by-step via XOR parity reproduces `live` (`Buggy = 1` drops the payload at `DROPAT`).
 #[cfg_attr(trust_verify, trust::skip)]
 #[aterm_spec::model]
 pub fn recording_model() -> Model {
     Model {
         name: "Recording",
-        // KF = keyframe seq (fixed); DROPAT = the replay index the bug drops.
         consts: vec![("MaxSeq", 4), ("KF", 2), ("DROPAT", 3), ("Buggy", 0)],
         vars: vec![
             StateVar {
                 name: "seq",
                 init: 0,
-            }, // live head
+            },
             StateVar {
                 name: "rt",
                 init: 0,
-            }, // replay cursor (how far replay has folded)
+            },
         ],
         fn_vars: vec![
             FnVar {
                 name: "payload",
                 range: "MaxSeq",
-            }, // recorded events (TRUE once recorded)
+            },
             FnVar {
                 name: "live",
                 range: "MaxSeq",
-            }, // live parity fold
+            },
             FnVar {
                 name: "replay",
                 range: "MaxSeq",
-            }, // replay parity fold (from keyframe)
+            },
         ],
         actions: vec![
-            // Record one event: payload[seq+1]=TRUE; live[seq+1] = live[seq] XOR TRUE
-            // (base: live[1] = TRUE since live[0] does not exist).
             Action {
                 name: "Record",
                 guard: Some(le(var("seq"), sub(cst("MaxSeq"), int(1)))),
@@ -744,11 +587,8 @@ pub fn recording_model() -> Model {
                             ),
                         ),
                     },
-                    // replay UNCHANGED
                 ],
             },
-            // Hydrate: seed replay from the keyframe — replay[n] = live[n] for n =< KF,
-            // FALSE above; set the replay cursor to KF. Guarded so KF is recorded.
             Action {
                 name: "Hydrate",
                 guard: Some(le(cst("KF"), var("seq"))),
@@ -765,21 +605,15 @@ pub fn recording_model() -> Model {
                             cst("MaxSeq"),
                             if_(
                                 le(var("n"), cst("KF")),
-                                fn_access("live", var("n")), // keyframe seed
+                                fn_access("live", var("n")),
                                 bool_lit(false),
                             ),
                         ),
                     },
-                    // seq, payload, live UNCHANGED
                 ],
             },
-            // ReplayStep: fold replay forward one index using the prior replay[rt].
-            // replay[rt+1] = replay[rt] XOR payload[rt+1], EXCEPT the DROP bug skips it.
             Action {
                 name: "ReplayStep",
-                // KF =< rt: only after Hydrate seeded the cursor (rt is 0 before, and folding
-                // then would read replay[0], outside 1..MaxSeq). rt+1 =< seq: within recorded
-                // events.
                 guard: Some(and_(
                     le(cst("KF"), var("rt")),
                     le(add(var("rt"), int(1)), var("seq")),
@@ -799,7 +633,7 @@ pub fn recording_model() -> Model {
                                     eq(cst("Buggy"), int(1)),
                                     eq(add(var("rt"), int(1)), cst("DROPAT")),
                                 ),
-                                fn_access("replay", var("rt")), // drop: parity stalls
+                                fn_access("replay", var("rt")),
                                 neq(
                                     fn_access("replay", var("rt")),
                                     fn_access("payload", add(var("rt"), int(1))),
@@ -807,15 +641,12 @@ pub fn recording_model() -> Model {
                             ),
                         ),
                     },
-                    // seq, payload, live UNCHANGED
                 ],
             },
         ],
         invariants: vec![Invariant {
             name: "ReplayFaithful",
             kind: InvariantKind::Claim,
-            // \A n in 1..MaxSeq : (n =< rt) => (replay[n] = live[n])
-            // encoded (n > rt) \/ (replay[n] <=> live[n]); booleans use Iff.
             expr: forall(
                 "n",
                 int(1),
@@ -829,30 +660,17 @@ pub fn recording_model() -> Model {
     }
 }
 
-/// Coalescing: the streaming write fold is a pure function of the byte log however it is split
-/// across `process_at` calls, so the bulk lane (a coalesced run through the batched writers) and
-/// the single-char lane (one byte per call, every glyph through the per-glyph writer) agree on
-/// every cell after every element. This 2-safety property (a relation between two runs over
-/// one input) is lifted by self-composition to the 1-safety `LanesAgree`; the model keeps only
-/// the composition's verdict — `seq`, the elements folded, and `diverged`, whether the screens
-/// differ — and the two lanes are the Tier-1 bind's. `Buggy` makes the bulk lane drop at
-/// `SKIPAT` a per-element fixup the single lane applies (the wrap-tail blank, the ZWJ
-/// continuation).
-///
-/// Tier-1: `aterm-core/tests/replay_corpus_probe.rs` drives the shipping `process_at` down both
-/// lanes over every adversarial corpus, projects `diverged` from the lanes' real `checkpoint()`s
-/// after every parser-ground prefix (a record ending mid-escape or mid-UTF-8 extends the element
-/// into the next, since a checkpoint is defined only at ground), and checks each element as
-/// this model's `Emit`, so a divergence at any grounded prefix is a rejected step.
+/// Streaming write coalescing model: bulk and single-byte `process_at` lanes agree after every
+/// element (`Buggy = 1` drops a per-element fixup at `SKIPAT`).
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn coalesce_model() -> Model {
     aterm_spec::ty_model! {
         Coalesce {
             const MaxSeq = 4;
-            const SKIPAT = 2;   // the element at which the buggy bulk lane drops the fixup
+            const SKIPAT = 2;
             const Buggy = 0;
-            var seq = 0;        // elements folded down both lanes
-            var diverged = 0;   // the two lanes' screens differ
+            var seq = 0;
+            var diverged = 0;
             action Emit when (seq <= MaxSeq - 1) {
                 seq = seq + 1;
                 diverged = if Buggy == 1 && seq + 1 == SKIPAT { 1 } else { diverged };
@@ -862,44 +680,14 @@ pub fn coalesce_model() -> Model {
     }
 }
 
-/// In-process multi-window routing: `App` holds `BTreeMap<WindowId, WindowState>` with a
-/// `frontmost_window`; Cmd-N creates a window and closing the last one exits the app. Over
-/// `<<win_count, frontmost, next_id, exited>>`: live windows, the frontmost id (`0` = none), a
-/// monotonic never-reused id source, and whether the app exited. `MaxWin` bounds concurrent
-/// windows and `MaxId` total creations.
-///
-/// `Buggy = 1` has one slip per law in the real `App` seams (Tier-1: `aterm-gui`'s
-/// `window_routing_conformance`):
-/// * the last close does not exit (`ExitIffEmpty`);
-/// * `close_window_logical` skips its frontmost re-point, so the last close leaves
-///   `frontmost_window` naming the dropped window (`FrontmostLive`). Only the last close is
-///   caught, where the real app exits anyway (`CloseOutcome::Exit`), so this pins bookkeeping;
-///   the harmful form (the front window closes beside a survivor and keeps the dead id) passes
-///   this projection, and the real `structural_invariant_violation` oracle, debug-asserted by
-///   `close_window_logical`, refuses it;
-/// * `insert_logical_window` bumps `next_window_id` before reading it, so the new frontmost
-///   carries the id the next create mints again (`FrontmostAllocated`).
-///
-/// `ConnectedCreateWindow` (the `spawn connected= place=window` mint) is CreateWindow with the
-/// hosted-origin precondition (`win_count > 0`); `RaiseSession` (`raise <sid>` / map Enter)
-/// re-points `frontmost` over the allocated ids. Both add transitions, never state.
-///
-/// * `ExitIffEmpty` — `exited = 1 <=> win_count = 0`.
-/// * `FrontmostLive` — `frontmost = 0 <=> win_count = 0`.
-/// * `FrontmostAllocated` — `frontmost = 0 \/ frontmost < next_id`: never a future or reused
-///   id, so a stale `Wake` for a closed window cannot address a live one.
-///
-/// The projection tracks the frontmost's null-ness and allocation, not which ids are live
-/// (that is the Tier-1 bind's).
+/// Multi-window routing model: tracks `win_count`, `frontmost`, monotonic `next_id`, and `exited`
+/// across window creation, close, and session raise (`Buggy = 1` skips exit on last close, skips
+/// frontmost re-point, and reads `next_id` after bumping).
 #[cfg_attr(trust_verify, trust::skip)]
 #[aterm_spec::model]
 pub fn window_routing_model() -> Model {
-    // The value `frontmost` takes when the last window closes: none (0), or — the
-    // skipped re-point — the id of the window just closed.
     let emptied = || eq(sub(var("win_count"), int(1)), int(0));
     let last_close_frontmost = || if_(eq(cst("Buggy"), int(1)), var("frontmost"), int(0));
-    // The id a create mints for the new frontmost window: `next_id`, or — read
-    // after the bump — the one the next create will mint.
     let minted = || add(var("next_id"), cst("Buggy"));
     Model {
         name: "WindowRouting",
@@ -924,8 +712,6 @@ pub fn window_routing_model() -> Model {
         ],
         fn_vars: vec![],
         actions: vec![
-            // Cmd-N / Wake::CreateWindow: a new window takes the next monotonic id
-            // and becomes frontmost. Bounded by MaxWin (concurrent) + MaxId (total).
             Action {
                 name: "CreateWindow",
                 guard: Some(and_(
@@ -950,8 +736,6 @@ pub fn window_routing_model() -> Model {
                     },
                 ],
             },
-            // CloseRequested / Cmd-W last tab: closing the last window exits the app (unless
-            // Buggy) and clears frontmost to 0; a survivor keeps an allocated frontmost id.
             Action {
                 name: "CloseWindow",
                 guard: Some(and_(
@@ -963,7 +747,6 @@ pub fn window_routing_model() -> Model {
                         var: "win_count",
                         expr: sub(var("win_count"), int(1)),
                     },
-                    // exited' = IF this was the last window THEN (Buggy ? 0 : 1) ELSE exited
                     Update {
                         var: "exited",
                         expr: if_(
@@ -972,19 +755,6 @@ pub fn window_routing_model() -> Model {
                             var("exited"),
                         ),
                     },
-                    // frontmost' \in (IF empty THEN {0} ELSE the surviving allocated ids).
-                    //
-                    // Which survivor a frontmost close re-points to is not a function of the
-                    // projection (it does not track which ids are live; the real app picks the
-                    // lowest live `WindowId`), so `frontmost'` may be any allocated id
-                    // `1..(next_id - 1)`, non-empty while a survivor remains (`next_id >= 3`)
-                    // and collapsing to `{0}` on the last close. Every admissible re-point
-                    // preserves FrontmostLive and FrontmostAllocated, and the real choice is
-                    // one of them.
-                    //
-                    // The in_range must be the top-level RHS (the renderer emits
-                    // `frontmost' \in lo..hi` only there), so Buggy's skipped re-point is
-                    // folded into the bounds of the emptied case.
                     Update {
                         var: "frontmost",
                         expr: in_range(
@@ -998,10 +768,6 @@ pub fn window_routing_model() -> Model {
                     },
                 ],
             },
-            // `spawn connected= place=window`: CreateWindow with a live, hosted origin session
-            // (`of=<origin>`), which the projection states as `win_count > 0` (headless
-            // `place=window` is refused before any create). ExitIffEmpty already implies it;
-            // stating it keeps the precondition in the spec. Same bounds and updates.
             Action {
                 name: "ConnectedCreateWindow",
                 guard: Some(and_(
@@ -1029,12 +795,6 @@ pub fn window_routing_model() -> Model {
                     },
                 ],
             },
-            // `raise <sid>` / map Enter / menu Show: focus routing re-points `frontmost` to the
-            // window hosting the raised session; nothing is created or destroyed. Which window
-            // hosts it is not in the projection, so this is CloseWindow's nondeterministic
-            // re-point over the allocated ids `1..(next_id - 1)`, of which the real choice (and
-            // the headless stutter) is one value. A live window implies `next_id >= 2`, so the
-            // range is non-empty. Only `frontmost` moves: the act adds edges, never states.
             Action {
                 name: "RaiseSession",
                 guard: Some(and_(
@@ -1051,7 +811,6 @@ pub fn window_routing_model() -> Model {
             Invariant {
                 name: "ExitIffEmpty",
                 kind: InvariantKind::Claim,
-                // (exited=1 /\ win_count=0) \/ (exited=0 /\ win_count>0)
                 expr: or_(
                     and_(eq(var("exited"), int(1)), eq(var("win_count"), int(0))),
                     and_(eq(var("exited"), int(0)), gt(var("win_count"), int(0))),
@@ -1060,7 +819,6 @@ pub fn window_routing_model() -> Model {
             Invariant {
                 name: "FrontmostLive",
                 kind: InvariantKind::Claim,
-                // (frontmost=0 /\ win_count=0) \/ (frontmost>0 /\ win_count>0)
                 expr: or_(
                     and_(eq(var("frontmost"), int(0)), eq(var("win_count"), int(0))),
                     and_(gt(var("frontmost"), int(0)), gt(var("win_count"), int(0))),
@@ -1069,7 +827,6 @@ pub fn window_routing_model() -> Model {
             Invariant {
                 name: "FrontmostAllocated",
                 kind: InvariantKind::Claim,
-                // frontmost = 0 \/ frontmost < next_id (never a future/reused id)
                 expr: or_(
                     eq(var("frontmost"), int(0)),
                     gt(var("next_id"), var("frontmost")),
@@ -1079,21 +836,11 @@ pub fn window_routing_model() -> Model {
     }
 }
 
-// Introspection / recursive-stacking models (the aterm-gui control plane and cross-process
-// proxy). See docs/TRUST-introspection-audit-detection.md.
-
-/// Dispatch completeness: the control router routes every forwardable verb class aimed at a
-/// remote child to the cross-process forward, never to the local path (where it answers
-/// `ERR no such session`). `vc` enumerates the classes `0..MaxVc`; `decided` is the verdict (`0`
-/// undecided, `2` forward, `3` deny/local-miss). Forwardable is `vc =< 3`
-/// (read/write/subscribe/feed-bin); `vc = 4` is a non-forwardable instance verb. `Buggy = 1` drops
-/// the subscribe class (`vc = 2`), as a selector-first planner misses the verb-first
-/// `subscribe` grammar. `ForwardableRemoteAlwaysForwarded`: once decided, a forwardable class
-/// is forwarded.
+/// Control router dispatch completeness model: every forwardable verb class (`vc <= 3`) aimed at a
+/// remote child is forwarded rather than denied locally (`Buggy = 1` drops `vc = 2`).
 #[cfg_attr(trust_verify, trust::skip)]
 #[aterm_spec::model]
 pub fn dispatch_complete_model() -> Model {
-    // forward=2, deny/local-miss=3; Buggy drops the subscribe class (vc=2).
     props::gated_completeness(props::Gated {
         name: "DispatchComplete",
         item: "vc",
@@ -1110,25 +857,11 @@ pub fn dispatch_complete_model() -> Model {
     })
 }
 
-/// Relay teardown: when the cross-process relay tears down, both read halves of both sockets
-/// are shut, so a pump parked on a clone of a local socket gets EOF and its worker joins (no
-/// thread/fd leak). `child_read_open`/`client_read_open` are the two read halves a pump blocks
-/// on; `Teardown` hangs up each socket (`aterm_uds::hangup::hang_up`: its write half, then its
-/// read half), closing them. `Buggy = 1` shuts only `Write`, leaving the read halves open. The
-/// worker also polls before each read and stops on a flag set before every hang-up of the
-/// child, so a lost wake costs one poll, not a parked thread. `ReadersUnblockAfterTeardown`:
-/// after teardown both read halves are closed.
-///
-/// Tier-1: aterm-gui's `proxy::tests::relay_teardown_conforms_to_readers_unblock_after_teardown`
-/// tears the real `relay_bidirectional` down on an injected send fault while both peers stay
-/// open, observes each read half on a clone of the relay's local socket, and checks the result
-/// as this model's `Teardown`; a `shutdown(Write)`-only teardown leaves both halves open, the
-/// step only `Buggy = 1` admits.
+/// Cross-process relay teardown model: `Teardown` closes both read halves so blocked reader pumps
+/// observe EOF and join (`Buggy = 1` shuts only `Write`, leaving read halves open).
 #[cfg_attr(trust_verify, trust::skip)]
 #[aterm_spec::model]
 pub fn relay_teardown_model() -> Model {
-    // A hang-up closes both read halves; Buggy's shutdown(Write) leaves them open. The flags
-    // init open (1); Teardown gates on `done`.
     props::teardown_clears(props::Teardown {
         name: "RelayTeardown",
         flags: vec!["child_read_open", "client_read_open"],
@@ -1138,20 +871,8 @@ pub fn relay_teardown_model() -> Model {
     })
 }
 
-/// Proxy registry lifecycle: what a parent retains for a spawned child (its 0600 edge-token
-/// file, owned by the `proxy::ChildProxy` the session keeps) is retired on session close, so it
-/// never outnumbers the live sessions. `live` counts live sessions, `registered` retained files,
-/// bounded by `MaxN`; `Spawn` registers and adds a session, `Close` removes one and its file.
-/// `Buggy = 1` is a `Drop` that forgets to retire it, once, from a set not yet leaked (keeping
-/// the space finite). `NoRegistryLeak`: `registered =< live`.
-///
-/// Tier-1: aterm-gui's `session_pool_tests::session_close_conforms_to_proxy_registry_no_leak`
-/// drives the real provisioning (`spawn::provision_child_proxy`, whose `proxy::ChildProxy` the
-/// session keeps) and the real session drop through a spawn/close script that fills `MaxN` and
-/// drains it, projecting the pool and the children's edge-token files onto `live`/`registered`
-/// at every step. Storing the `ChildProxy` is `spawn_session`'s, which needs a live event loop;
-/// the test stores it the same way, and the undriven half is structural: an unstored
-/// `ChildProxy` drops, removing the file.
+/// Child proxy registry lifecycle model: retained edge-token files are retired on session close so
+/// `registered <= live` (`Buggy = 1` drops a session without retiring its file).
 #[cfg_attr(trust_verify, trust::skip)]
 #[aterm_spec::model]
 pub fn proxy_registry_model() -> Model {
@@ -1167,23 +888,9 @@ pub fn proxy_registry_model() -> Model {
     })
 }
 
-/// Forward-handshake liveness (the `drain_buffered` bug; `control::try_proxy_forward`:
-/// `control_lanes::LaneReader::take_buffered`, then proxy.rs `relay_hop`): a blocking I/O
-/// deadlock no bad-state invariant can see. The cross-process forward is request → relay →
-/// reply: the reply bytes are already buffered past the request line, and the client is parked
-/// awaiting them. At `Buggy = 0` the server relays the buffered bytes (`reader.buffer()`) and
-/// the client is always served, ending in the `Done` self-loop. `Buggy = 1` reads more
-/// (`fill_buf()`) before the first relay, but the client sends nothing while it waits, so every
-/// action is disabled outside `Done`: a deadlock.
-///
-/// Checked with `CHECK_DEADLOCK TRUE` ([`Model::to_cfg_deadlock_with`]); the `Done` self-loop is
-/// required, or the clean `client_waiting = 0` terminal itself reads as a deadlock.
-///
-/// Tier-1: aterm-gui's `control::tests::try_proxy_forward_conforms_to_forward_handshake` sends
-/// one request line through the real `try_proxy_forward` to a stand-in child socket and checks
-/// the observed `Relay` (the child receives the handshake) and `ClientRecv` (the client is
-/// answered) against this model; a forward that demands a fresh client read first is reported
-/// parked in the state only `Buggy = 1` wedges in.
+/// Cross-process forward handshake liveness model: the server drains already-buffered bytes before
+/// reading more so the waiting client is always served (`Buggy = 1` demands a fresh read first and
+/// deadlocks).
 #[cfg_attr(trust_verify, trust::skip)]
 #[aterm_spec::model]
 pub fn forward_handshake_model() -> Model {
@@ -1200,17 +907,9 @@ pub fn forward_handshake_model() -> Model {
     })
 }
 
-/// TLS relay startup liveness. A peer's first application record can be decrypted by the TLS
-/// handshake driver before `tls::relay_answers` begins (the fleet listener's relay into its
-/// control server, aterm-net). The local service is waiting for that request, while the peer
-/// is waiting for its reply. Correct (`Buggy = 0`): `DrainBuffered` forwards the
-/// already-buffered request without requiring another network read. `Buggy = 1` demands a
-/// fresh record first, leaving both parties parked in the initial state.
-///
-/// Deliberately separate from [`forward_handshake_model`]: the abstract wedge is the same, but
-/// each is Tier-1-bound to its own relay — this one to the genuine TLS relay by aterm-net's
-/// `tls::tests::relay_round_trips_guarded_artifact_ack_before_request_half_close`, that one to
-/// the control socket's cross-process forward.
+/// TLS relay startup liveness model: `DrainBuffered` forwards application bytes decrypted during
+/// the TLS handshake without waiting for another network read (`Buggy = 1` deadlocks waiting for a
+/// fresh record).
 #[cfg_attr(trust_verify, trust::skip)]
 #[aterm_spec::model]
 pub fn tls_buffered_relay_model() -> Model {
@@ -1227,19 +926,8 @@ pub fn tls_buffered_relay_model() -> Model {
     })
 }
 
-/// Authorization soundness: the trust core's central predicate (`decide_edge` /
-/// `EdgeTable::authorize`) permits a presented token only when all four conjuncts hold — the
-/// token is in the table, its `dst` equals the resolved target, its `op` the verb's required op,
-/// and its nonce the target's current launch nonce. `Buggy` drops the `dst` conjunct (the
-/// confused deputy: a token for one session authorizing another); dropping `op`, `nonce` or
-/// `token` would model op-confusion, replay or forgery. `PermitImpliesAllGuards`: a permit
-/// implies every guard held.
-///
-/// Tier-1: aterm-session's `tests/conformance_authorize.rs` drives the real `decide_edge` over
-/// all sixteen guard combinations and `EdgeTable::authorize` over the eight with `op` held (it
-/// takes no op, and its callers compare the one it returns to nothing), validates each real
-/// `Present`/`Authorize` step against this model, and replays them against `Buggy = 1`, which
-/// must reject the shipping gate's denial of the wrong-destination presentation.
+/// Edge authorization soundness model: a presented token is permitted only when table membership,
+/// destination, operation, and launch nonce all match (`Buggy = 1` omits the destination check).
 #[cfg_attr(trust_verify, trust::skip)]
 #[aterm_spec::model]
 pub fn authorize_soundness_model() -> Model {
@@ -1254,29 +942,8 @@ pub fn authorize_soundness_model() -> Model {
     })
 }
 
-/// No transitive authority: forwarding requires owner-class scope (`relay_candidate` answers
-/// `None` unless `scope.is_owner_class()`: the instance token, or the fabric bridge connection,
-/// which is Owner plus the two bridge verbs), so a connection that holds only an edge (a
-/// parent's edge onto a child, a granted one) cannot initiate a forward. A connection
-/// authenticates at a socket with a token and resolves to `Owner` or `Edge` there, never
-/// `Bridge`: that scope exists only on an fd the instance handed its own child, never a relayed
-/// one. Authority does not compose through edges: an edge onto a parent cannot be borrowed to
-/// reach the parent's child; that needs a direct edge to the grandchild (a delegation/grant).
-/// An Owner reaches any instance with that instance's own token, a credential any same-uid
-/// client reads directly, so a forward grants it nothing.
-///
-/// A single-guard instance of [`props::conjunctive_authz`]: a forward is permitted only when the
-/// connection is Owner-scoped; `Buggy` waives the guard. `ForwardImpliesOwner`: a permitted
-/// forward implies the connection was Owner.
-///
-/// Tier-1: aterm-gui's `control::tests::proxy_forward_plan_conforms_to_no_transitive_authority`
-/// drives the real `proxy_forward_plan` across read, write, signal, owner and subscribe lines
-/// aimed at a session another instance hosts, for an Owner connection, a bridge one, and one
-/// that arrived with an edge (whose scope is what a child's connect-time auth,
-/// `control::first_line_scope`, makes of `TOKEN <parent edge> <line>` against the edges
-/// `spawn::install_parent_edges` put in its table), stating `owner` from each scope rather than
-/// from `is_owner_class`, and replays the steps against `Buggy = 1`, which must part from the
-/// real router on every edge line.
+/// Cross-process forwarding authority model: forwarding is permitted only for owner-class scope,
+/// preventing transitive authority across session edges (`Buggy = 1` waives the owner guard).
 #[cfg_attr(trust_verify, trust::skip)]
 #[aterm_spec::model]
 pub fn no_transitive_authority_model() -> Model {
@@ -1291,65 +958,27 @@ pub fn no_transitive_authority_model() -> Model {
     })
 }
 
-/// One live holder per session id: two holders mean `@<sid>` can deliver a keystroke into a
-/// human's window.
-///
-/// A pane's shell exports `ATERM_SESSION_ID`, the identity the outer aterm preminted for the
-/// inner aterm that pane may launch. The export deliberately outlives the launch it was minted
-/// for — a child aterm that exits must relaunch in the same shell under its original identity,
-/// or every edge the outer minted for it dies with the first launch — so a launch must tell a
-/// relaunch (the previous holder gone: a transfer) from a second simultaneous launch (the
-/// previous holder live: a duplicate). Otherwise two instances answer to one id, `@<sid>`
-/// resolves through one discovery entry, and a driver reading a sid from a listing can land a
-/// keystroke in the other instance's window.
-///
-/// * `Instances` — launches from one shell. `Launch` is admitted only below it, so
-///   `Instances = 1` collapses this onto the single-launch case where nothing can go wrong.
-/// * `Local` — what a launch consults. `Local = 0` is the shipping rule: the kernel arbitrates,
-///   via a `flock` held for the process's life and a live foreign `graph/<sid>` entry.
-///   `Local = 1` decides from the launch's own premint alone, blind to other holders: each
-///   launch is individually "correct" and the id is held N times, breaking the invariant at
-///   every corner.
-/// * `Buggy` — consult the claim lock but not the live entry. That is invisible until a
-///   seamless update, whose successor keeps its ids and cannot inherit the predecessor's lock,
-///   so the lock goes free while the successor's own entry says the id is held. It needs
-///   `Handoff = 1` to bite, which is why the entry gate exists beside the lock.
-/// * `Unmarked` — the handoff window. On a fixed-path socket the predecessor exits (its lock
-///   dies) before the successor binds and publishes its entry, and between the two neither gate
-///   answers. (A per-process socket's successor publishes before the Commit instead, where the
-///   question is who answers: [`handoff_address_owner_model`].) The predecessor names its
-///   successor at Commit (`claims/<sid>.successor`, a third gate a launch consults), and the
-///   successor retires the marker once its entry is published. `Unmarked = 1` exits with no
-///   marker, and a launch in the window duplicates.
-///
-/// The lock dying with its holder is what lets a relaunch adopt, and why the claim file is never
-/// unlinked (unlinking a claim a peer holds open lets two processes both hold one). `Exit`
-/// models that release, so a "fix" that never adopts would not reproduce the relaunch trace.
-///
-/// Tier-1: aterm-gui's
-/// `identity_claim::session_id_claim_conformance_real_adoption_projects_onto_model` and
-/// `identity_claim::the_handoff_window_is_held_by_the_successor_marker` drive the real
-/// `claim_for_adoption` through every arm, the window included.
+/// Session id claim exclusivity model: at most one live instance holds `@<sid>` across normal
+/// launches, exits, and seamless handoffs via the claim lock, live graph entry, and successor
+/// marker.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn session_id_claim_model() -> Model {
     aterm_spec::ty_model! {
         SessionIdClaim {
-            const Buggy = 0;      // 1 = consult the claim lock but not the live entry
-            const Local = 0;      // 1 = each launch adopts on its own premint read alone
-            const Instances = 2;  // launches from one shell (the export outlives the launch)
-            const Handoff = 0;    // 1 = a seamless-update successor takes the id over
-            const Unmarked = 0;   // 1 = the predecessor exits without naming its successor
-            // Seamless updates hand ids over in the real code.
+            const Buggy = 0;
+            const Local = 0;
+            const Instances = 2;
+            const Handoff = 0;
+            const Unmarked = 0;
             scenario Handoff = 1;
-            var holders = 0;      // live instances answering to the id
-            var lock = 0;         // the claim flock is held by a live process
-            var entry = 0;        // a live process has published graph/<sid>
-            var window = 0;       // predecessor gone, successor not yet published
-            var marker = 0;       // claims/<sid>.successor names the live successor
-            var steps = 0;        // run bound
+            var holders = 0;
+            var lock = 0;
+            var entry = 0;
+            var window = 0;
+            var marker = 0;
+            var steps = 0;
 
-            // A launch reads the surviving premint and tries to adopt it.
             action Launch when (steps <= 5 && Instances > holders) {
                 steps = steps + 1;
                 holders = if Local == 1 { holders + 1 }
@@ -1360,9 +989,6 @@ pub fn session_id_claim_model() -> Model {
                               { 1 } else { lock } };
             }
 
-            // The holder exits and the lock dies with it — what lets a relaunch adopt, and why
-            // nothing is ever unlinked. A successor dying in the window takes its marker's
-            // authority with it (a marker naming a dead pid reads as no marker).
             action Exit when (steps <= 5 && holders > 0) {
                 steps = steps + 1;
                 holders = holders - 1;
@@ -1372,9 +998,6 @@ pub fn session_id_claim_model() -> Model {
                 marker = if holders > 1 { marker } else { 0 };
             }
 
-            // A seamless-update successor takes the id over: a transfer, not a second holder.
-            // The predecessor names it at Commit and exits; its lock dies with it, and nothing
-            // of the successor's is published yet.
             action PredecessorExits
                 when (steps <= 5 && Handoff == 1 && holders == 1 && entry == 0 && window == 0)
             {
@@ -1384,9 +1007,6 @@ pub fn session_id_claim_model() -> Model {
                 marker = if Unmarked == 1 { 0 } else { 1 };
             }
 
-            // The successor binds and publishes its own entry, which now holds the id, and
-            // retires the marker. It re-attempts the claim too, but the model takes the worst
-            // case (it may not get it), so the entry gate stays load-bearing.
             action SuccessorPublishes when (steps <= 5 && window == 1 && holders > 0) {
                 steps = steps + 1;
                 entry = 1;
@@ -1394,96 +1014,44 @@ pub fn session_id_claim_model() -> Model {
                 marker = 0;
             }
 
-            // An address that resolves at all resolves to exactly one place.
             invariant AtMostOneHolder: holders <= 1;
         }
     }
 }
 
-/// Who answers an adopted `@<sid>` while a seamless update decides (aterm-gui
-/// `control::publish_when_committed`, and `control::ambiguous_sid_refusal` over
-/// `identity_claim::live_holder`).
-///
-/// `graph/<sid>` is the address every `@<sid>` client resolves. The dispatch refuses an id this
-/// process hosts when that entry names another live process: two holders of one address, so a
-/// keystroke could land in a stranger's window. A successor on a per-process socket that
-/// published its carried ids at boot, before the predecessor's Commit, would make the entry
-/// refuse the predecessor's own supervisor (`ERR ambiguous session id … also served by pid
-/// <successor>`) while the predecessor still owns the sessions. Two layers close it:
-///
-/// * The order: a successor publishes the carried entries only once the Commit has released
-///   its gate, so while this process owns a session its address names no process it could be
-///   handed to — `CandidateNamedOnlyAfterCommit`.
-/// * The exemption: should an entry name this process's own candidate early anyway, it is the
-///   transfer being decided, not a second holder — the one pid this process's handoff lane
-///   registered, for as long as the attempt decides — `RefusesExactlyAStranger`.
-///
-/// `cand`: this process's candidate, 0 none yet, 1 alive, 2 proven dead (a rejection reaps
-/// before the lane lets go of it); `registered`: the lane's registration names it (`Launch`
-/// creates and registers it before any descriptor reaches it; `Reject` reaps, then drops the
-/// registration); `entry`: whom `graph/<sid>` names, 0 this process, 1 the candidate, 2 a live
-/// stranger (an unrelated instance holding the same id); `pred`: this process still owns the
-/// session (0 after the Commit's `_exit`); `asked`: the last request answered, 0 none, else 1 +
-/// the entry it met; `refused`: whether it was refused.
-///
-/// * `Buggy = 1` — publish at boot and refuse any live foreign entry, the candidate's included:
-///   `Launch` → `SuccessorPublishes` names the candidate while this process owns the session,
-///   and a `Request` there refuses its own session.
-/// * `Early = 1` — publish at boot with the exemption in place. `CandidateNamedOnlyAfterCommit`
-///   is caught; the exemption alone still keeps `RefusesExactlyAStranger`, checked with the
-///   order's invariant set aside, so the second layer is proved on its own.
-/// * `Blanket = 1` — an exemption keyed on "an attempt is deciding" rather than on which pid: a
-///   stranger publishing the same id during an update is served (`StrangerPublishes` →
-///   `Request`).
-///
-/// A request after a `Reject` meets a dead candidate's entry (only under `Early`), which no
-/// rule refuses (a dead pid is no holder); one after the Commit never reaches this process. In
-/// the fork lane the registration follows `spawn` by microseconds; the model takes the launched
-/// lane's order, where the registration comes at the dial, before the grant gives the successor
-/// any id to publish.
-///
-/// Tier-1: aterm-gui's
-/// `control::publish_when_committed_conformance::a_candidates_entries_name_it_only_after_the_commit`
-/// drives the real gated publication (`SuccessorPublishes` at the Commit, never before);
-/// `control::tests::an_id_handed_to_this_processs_update_candidate_is_served_here_until_commit`
-/// the real `ambiguous_sid_refusal` and `resolve` through every entry and registration
-/// state; and `identity_claim::tests::a_handoff_candidate_registration_is_exactly_its_own` the
-/// registration's life.
+/// Handoff address ownership model: a seamless-update candidate publishes carried session entries
+/// only after commit, and the predecessor exempts its own registered candidate while refusing live
+/// strangers.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn handoff_address_owner_model() -> Model {
     aterm_spec::ty_model! {
         HandoffAddressOwner {
-            const Buggy = 0;      // 1 = publish at boot and refuse every live foreign entry
-            const Early = 0;      // 1 = the successor publishes at boot (the exemption kept)
-            const Blanket = 0;    // 1 = exempt every entry while an attempt decides
-            var cand = 0;         // 0 none, 1 alive, 2 proven dead
-            var registered = 0;   // the lane's registration names the candidate
-            var entry = 0;        // graph/<sid> names: 0 us, 1 the candidate, 2 a stranger
-            var pred = 1;         // this process still owns the session
-            var asked = 0;        // the last request: 0 none, else 1 + the entry it met
-            var refused = 0;      // and whether it was refused
-            var steps = 0;        // run bound
+            const Buggy = 0;
+            const Early = 0;
+            const Blanket = 0;
+            var cand = 0;
+            var registered = 0;
+            var entry = 0;
+            var pred = 1;
+            var asked = 0;
+            var refused = 0;
+            var steps = 0;
 
-            // The lane makes its candidate and registers it, before the grant.
             action Launch when (pred == 1 && cand == 0) {
                 cand = 1;
                 registered = 1;
             }
 
-            // The candidate publishes the carried ids' entries once the Commit has
-            // released its gate (`Early`/`Buggy`: as soon as it has booted).
             action SuccessorPublishes when (cand == 1 && entry == 0
                                             && (pred == 0 || Early == 1 || Buggy == 1)) {
                 entry = 1;
             }
 
-            // An unrelated live instance publishes the same id.
             action StrangerPublishes when (entry <= 1) {
                 entry = 2;
             }
 
-            // This process's own supervisor asks for its session.
             action Request when (pred == 1 && steps <= 3) {
                 steps = steps + 1;
                 asked = entry + 1;
@@ -1494,23 +1062,17 @@ pub fn handoff_address_owner_model() -> Model {
                 };
             }
 
-            // The Commit: this process `_exit`s, its registration with it.
             action Commit when (pred == 1 && cand == 1) {
                 pred = 0;
             }
 
-            // A rejection: the candidate is reaped, then the lane lets go.
             action Reject when (pred == 1 && cand == 1) {
                 cand = 2;
                 registered = 0;
             }
 
-            // The order: while this process owns the session, its address names no candidate
-            // of this process's — one server per address at every instant.
             invariant CandidateNamedOnlyAfterCommit: pred == 0 || entry == 0 || entry == 2;
 
-            // The exemption: refuse exactly the entries a stranger holds — never the transfer
-            // this process is deciding, always a real duplicate.
             invariant RefusesExactlyAStranger: if asked == 3 { refused == 1 } else { refused == 0 };
         }
     }

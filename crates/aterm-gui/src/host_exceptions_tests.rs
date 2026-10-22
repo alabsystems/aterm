@@ -3228,7 +3228,7 @@ fn a_stall_at_ninety_minutes_is_a_record_once_and_no_line() {
 }
 
 /// A STALL ON THE AGENT'S OWN BACKGROUND WORK SPEAKS OF THAT AGENT AND ITS
-/// WORK (the review of 6b820169e8: agy's and Muse Code's ladder told the
+/// WORK (agy's and Muse Code's ladder told the
 /// window "Claude has stalled" over "Claude's own title has said idle … over
 /// a screen this build does not recognise", where no title was read, the
 /// screen was read, and the agent was not Claude). The 90-minute record of

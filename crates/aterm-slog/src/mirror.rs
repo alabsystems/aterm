@@ -10,33 +10,33 @@
 //!
 //! - **`ms`** numbers the bus-class records of one seq space densely from 1,
 //!   at append ([`Log::ms_head`]), whether or not anything mirrors. A take
-//!   derives every loss from `ms` alone (ruling Q15): the next live bus-class
+//!   derives every loss from `ms` alone: the next live bus-class
 //!   record's `ms` past the cursor's next is a hole, said by ONE cover body
 //!   per hole with its exact count (`op=gap why=evicted n=<k>`); the ring's
 //!   own gap records are records like any other. A loss of local-class
 //!   records only is no loss to the bus, which never held them.
-//! - **The cursor** ([`BusCursor`], one name for it, ruling Q15) is `(space,
+//! - **The cursor** ([`BusCursor`], one name for it) is `(space,
 //!   seq, ms)`: the seq space (the log's [`Log::base_ep`], which a carried
 //!   update continues), the seq and the `ms` the bus holds everything up to.
 //!   It moves only by [`Log::land`], which refuses while the readers are
-//!   fenced (ruling Q12): an update's export drew the cursor the successor
+//!   fenced: an update's export drew the cursor the successor
 //!   continues, so no landing may pass it until the update commits or stands
-//!   down. Under a fence a take stops at the fence's seq and its `ms` head
-//!   (ruling Q2), so a tail cover never covers an `ms` the successor will
+//!   down. Under a fence a take stops at the fence's seq and its `ms` head,
+//!   so a tail cover never covers an `ms` the successor will
 //!   number again.
 //! - **Off is nothing.** A log no bridge ever took from holds no mirror
 //!   state ([`Log::mirror_landed`] is `None`): its carry, its ring and every
-//!   reply are what they were before phase 4 (ruling Q5). The cost is heap
+//!   reply are what they were before phase 4. The cost is heap
 //!   alone: the 8-byte `ms` a record ([`ENTRY_BYTES`]) and 24 bytes a log
 //!   (the `ms` head, the head at the fence and the mirror's empty box,
 //!   [`LOG_MIRROR_BYTES`]). [`Log::footprint`] counts both, so an instance
 //!   AT its session-log memory cap gives each log a byte budget smaller by
 //!   them and evicts that much sooner than a build without phase 4; below
 //!   the cap nothing differs.
-//! - **Snapshots** are synthesized by a take, never stored (ruling Q5): at
+//! - **Snapshots** are synthesized by a take, never stored: at
 //!   a space's first take and each [`SNAP_EVERY`] bus-class records, a take
 //!   that reaches the head adds one `op=snap` body holding the open path and
-//!   the open needs, of the bus class only (ruling S17), the mail counts,
+//!   the open needs, of the bus class only, the mail counts,
 //!   and `upto=`, the `ms` head it folds. `n=` is the original bus-needs
 //!   count: a seeded reader can detect words omitted at the field cap.
 //!   It counts as given only once a
@@ -49,7 +49,7 @@
 //!   `upto=` (`aterm_slog::bus::BusSpace::fold_seeded`).
 //! - **Identity on the bus** is `(node, sid, ep, seq)` for a record. Covers
 //!   are coverage, unioned by a reader, and snaps seeds; neither is deduped
-//!   by identity (ruling Q0: the reader's view is the law, so a body the bus
+//!   by identity (the reader's view is the law, so a body the bus
 //!   holds twice is shown once).
 
 use super::{Entry, Log, entry_heap};
@@ -58,8 +58,7 @@ use crate::line::{encode_bus, encode_mirror};
 use crate::rec::{Rec, Stamp};
 use crate::vocab::{Actor, Conf, Kind, Node, Op, ShortId, Src};
 
-/// The most slots one take answers (`log-take n=` is capped at it, ruling
-/// Q10; the bridge asks half of its pipeline window).
+/// The most slots one take answers (`log-take n=` is capped at it; the bridge asks half of its pipeline window).
 pub const TAKE_MAX: usize = 64;
 
 /// A snapshot every this many bus-class records (§5.5): a reader joining at
@@ -117,7 +116,7 @@ impl BusCursor {
     }
 }
 
-/// A seq space an update that carried no log ended (ruling Q7): where the
+/// A seq space an update that carried no log ended: where the
 /// bus held it and its `ms` head, which the successor's first take says the
 /// rest of as one `gap why=reset n=<k>` in that space.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
@@ -455,7 +454,7 @@ impl Log {
     }
 
     /// Where the bus holds this log up to, once a take engaged the mirror;
-    /// `None` for a log nothing ever mirrored (ruling Q5: off is nothing).
+    /// `None` for a log nothing ever mirrored (off is nothing).
     #[must_use]
     pub fn mirror_landed(&self) -> Option<BusCursor> {
         self.mirror.as_ref().map(|m| m.landed)
@@ -476,7 +475,7 @@ impl Log {
     }
 
     /// The `ms` of every live bus-class record, oldest first: what a model's
-    /// projection reads of the ring (ruling Q2).
+    /// projection reads of the ring.
     pub fn live_ms(&self) -> impl Iterator<Item = u64> + '_ {
         self.ring.iter().map(|e| e.ms).filter(|ms| *ms > 0)
     }
@@ -493,7 +492,7 @@ impl Log {
     /// Whether the bus holds this log whole: engaged, no old space owed, and
     /// the cursor at the LIVE `ms` head — under a fence too, past which a
     /// closing session's records are still owed once the update stands down
-    /// (ruling Q4: what a closed session's tail is kept for).
+    /// (what a closed session's tail is kept for).
     #[must_use]
     pub fn mirror_complete(&self) -> bool {
         self.mirror.as_ref().is_some_and(|m| {
@@ -521,8 +520,8 @@ impl Log {
         self.engage();
     }
 
-    /// An update that carried no log ended the space `prior` names (ruling
-    /// Q7, the host's `LogAdopt`): the successor's first take says its tail.
+    /// An update that carried no log ended the space `prior` names (the host's `LogAdopt`):
+    /// the successor's first take says its tail.
     /// Nothing is owed when the bus held all of it.
     pub fn note_prior_space(&mut self, prior: Prior) {
         if prior.ms_head > prior.landed.ms {
@@ -537,8 +536,8 @@ impl Log {
     /// record whose `ms` is past the next one owed (the hole between,
     /// exact), and, once the take reaches the reader's head, one tail cover
     /// for the `ms` up to the reader's `ms` head no live record holds; then a
-    /// snapshot when one is due. While fenced, nothing past the fence (ruling
-    /// Q2). Engages the mirror: from now on the log carries its cursor.
+    /// snapshot when one is due. While fenced, nothing past the fence.
+    /// Engages the mirror: from now on the log carries its cursor.
     pub fn bus_copy(&mut self, room: usize, at: Stamp) -> BusCopy {
         let room = room.min(TAKE_MAX);
         let space = self.base_ep;
@@ -675,8 +674,8 @@ impl Log {
 
     /// THE LANDING: the bridge says every slot up to `at` is on the bus.
     /// Monotone (a cursor at or below the landed one, or of another space,
-    /// moves nothing); refused while the readers are fenced (ruling Q12:
-    /// the export drew the cursor the successor continues) and for a cursor
+    /// moves nothing); refused while the readers are fenced (the export drew the cursor the successor continues)
+    /// and for a cursor
     /// past anything this log numbered. A cursor of the old space an
     /// uncarried update ended moves that space's owed tail.
     ///
@@ -718,7 +717,7 @@ impl Log {
         Ok(Landed::Moved)
     }
 
-    /// A CLOSED SESSION'S BUS TAIL (ruling Q4): a copy holding only the
+    /// A CLOSED SESSION'S BUS TAIL: a copy holding only the
     /// bus-class records past the landed cursor, with the cursor, the
     /// accounting a take reads and the fold its snapshot reads. Only a take
     /// and a landing are meant of it. ALWAYS ENGAGED: a log no take ever

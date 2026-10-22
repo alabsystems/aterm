@@ -783,7 +783,7 @@ impl CursorGlow {
     /// stop). `0` for every style but rainbow kitty.
     #[inline]
     #[must_use]
-    pub fn ribbon_drawn(&self) -> usize {
+    pub const fn ribbon_drawn(&self) -> usize {
         if self.v2.engaged() {
             return self.v2.ribbon_drawn();
         }
@@ -819,7 +819,7 @@ impl CursorGlow {
     /// settles this one before it draws.
     #[inline]
     #[must_use]
-    pub fn live_sparks(&self) -> usize {
+    pub const fn live_sparks(&self) -> usize {
         self.sparks.len() + self.classic.live_sparks()
     }
 
@@ -829,7 +829,7 @@ impl CursorGlow {
     /// unless v2 owns the frame.
     #[inline]
     #[must_use]
-    pub fn momentum_display(&self) -> f32 {
+    pub const fn momentum_display(&self) -> f32 {
         if self.v2.engaged() {
             return self.v2.momentum_display();
         }
@@ -874,15 +874,15 @@ impl CursorGlow {
     /// This frame's radial light (see `halo_out`), for the host to splice
     /// into `RenderInput.glow_halo` right beside the `GlowQuad` scratch.
     #[inline]
-    pub fn halos(&self) -> &[RainHalo] {
-        &self.halo_out
+    pub const fn halos(&self) -> &[RainHalo] {
+        self.halo_out.as_slice()
     }
 
     /// This frame's under-ink flame body (see `under_out`), for
     /// `RenderInput.glow_under`.
     #[inline]
-    pub fn under_quads(&self) -> &[GlowQuad] {
-        &self.under_out
+    pub const fn under_quads(&self) -> &[GlowQuad] {
+        self.under_out.as_slice()
     }
 
     /// The under-ink stream the caret's bodies draw their light-ground ink
@@ -891,22 +891,22 @@ impl CursorGlow {
     /// with no host change. Each body bounds its own few quads; their
     /// fingerprints move the frame's.
     #[inline]
-    pub(crate) fn under_sink(&mut self) -> &mut Vec<GlowQuad> {
+    pub(crate) const fn under_sink(&mut self) -> &mut Vec<GlowQuad> {
         &mut self.under_out
     }
 
     /// This frame's per-pixel fire (see `patch_out`), for
     /// `RenderInput.fire_patch`.
     #[inline]
-    pub fn patches(&self) -> &[FirePatch] {
-        &self.patch_out
+    pub const fn patches(&self) -> &[FirePatch] {
+        self.patch_out.as_slice()
     }
 
     /// This frame's charred-ink overrides (see `char_out`), for
     /// `RenderInput.char_fg`.
     #[inline]
-    pub fn charred(&self) -> &[CharFg] {
-        &self.char_out
+    pub const fn charred(&self) -> &[CharFg] {
+        self.char_out.as_slice()
     }
 
     /// The rolling spectrum hue in turns `0..1`, the hue the next beam segment
@@ -927,7 +927,7 @@ impl CursorGlow {
     /// [`GlowStyle::RainbowKitty`].
     #[inline]
     #[must_use]
-    pub fn rainbow_phase(&self) -> f32 {
+    pub const fn rainbow_phase(&self) -> f32 {
         // While v2 owns the frame the shared phase ring is v2's spine clock; at
         // rest the ring is at its origin.
         if self.v2.engaged() {
@@ -997,8 +997,8 @@ impl CursorGlow {
     /// This frame's fire contrast-halo strengths (see `fire_halo_out`), for
     /// `RenderInput.fire_halo`.
     #[inline]
-    pub fn halo_cells(&self) -> &[FireHaloCell] {
-        &self.fire_halo_out
+    pub const fn halo_cells(&self) -> &[FireHaloCell] {
+        self.fire_halo_out.as_slice()
     }
 
     // ---- O(1) stream handoff -------------------------------------------
@@ -1016,35 +1016,35 @@ impl CursorGlow {
     /// `dst`'s previous contents come back in exchange and are cleared by the
     /// next [`Self::tick`]; never read them off the engine.
     #[inline]
-    pub fn swap_halos(&mut self, dst: &mut Vec<RainHalo>) {
+    pub const fn swap_halos(&mut self, dst: &mut Vec<RainHalo>) {
         std::mem::swap(dst, &mut self.halo_out);
     }
 
     /// Move this frame's under-ink flame body into `dst` (see
     /// [`Self::under_quads`]). Same previous-frame caveat as [`Self::swap_halos`].
     #[inline]
-    pub fn swap_under_quads(&mut self, dst: &mut Vec<GlowQuad>) {
+    pub const fn swap_under_quads(&mut self, dst: &mut Vec<GlowQuad>) {
         std::mem::swap(dst, &mut self.under_out);
     }
 
     /// Move this frame's per-pixel fire into `dst` (see [`Self::patches`]).
     /// Same previous-frame caveat as [`Self::swap_halos`].
     #[inline]
-    pub fn swap_patches(&mut self, dst: &mut Vec<FirePatch>) {
+    pub const fn swap_patches(&mut self, dst: &mut Vec<FirePatch>) {
         std::mem::swap(dst, &mut self.patch_out);
     }
 
     /// Move this frame's charred-ink overrides into `dst` (see
     /// [`Self::charred`]). Same previous-frame caveat as [`Self::swap_halos`].
     #[inline]
-    pub fn swap_charred(&mut self, dst: &mut Vec<CharFg>) {
+    pub const fn swap_charred(&mut self, dst: &mut Vec<CharFg>) {
         std::mem::swap(dst, &mut self.char_out);
     }
 
     /// Move this frame's fire contrast-halo strengths into `dst` (see
     /// [`Self::halo_cells`]). Same previous-frame caveat as [`Self::swap_halos`].
     #[inline]
-    pub fn swap_halo_cells(&mut self, dst: &mut Vec<FireHaloCell>) {
+    pub const fn swap_halo_cells(&mut self, dst: &mut Vec<FireHaloCell>) {
         std::mem::swap(dst, &mut self.fire_halo_out);
     }
 }
@@ -1064,11 +1064,19 @@ impl TextSpans {
     /// between words reads as punctuation, a hyphen or a middle dot, as
     /// surely as one over a letter reads as noise).
     #[inline]
-    pub(super) fn covers_cell(&self, row: i32, col: i32) -> bool {
-        self.rows
-            .iter()
-            .flatten()
-            .any(|&(r, first, end)| r == row && (first..end).contains(&col))
+    pub(super) const fn covers_cell(&self, row: i32, col: i32) -> bool {
+        let mut i = 0;
+        while i < self.rows.len() {
+            if let Some((r, first, end)) = self.rows[i]
+                && r == row
+                && col >= first
+                && col < end
+            {
+                return true;
+            }
+            i += 1;
+        }
+        false
     }
 
     /// Each probed line of text as `(row, first, end)`: the column span from
@@ -1081,8 +1089,10 @@ impl TextSpans {
     /// Whether the probe read grid row `row` this frame, so a cell of it off
     /// every line ([`Self::covers_cell`]) is known blank rather than unknown.
     #[inline]
-    pub(super) fn reads_row(&self, row: i32) -> bool {
-        self.read.contains(&Some(row))
+    pub(super) const fn reads_row(&self, row: i32) -> bool {
+        matches!(self.read[0], Some(r) if r == row)
+            || matches!(self.read[1], Some(r) if r == row)
+            || matches!(self.read[2], Some(r) if r == row)
     }
 }
 
@@ -1106,15 +1116,14 @@ impl FrameText {
     /// The ink (`None` for a blank cell) and ground of cell `(row, col)` in
     /// the frame's own cells, or `None` for a cell the frame did not read.
     #[inline]
-    pub(crate) fn pair(&self, row: i32, col: i32) -> Option<(Option<u32>, u32)> {
+    pub(crate) const fn pair(&self, row: i32, col: i32) -> Option<(Option<u32>, u32)> {
         let i = row - self.lo;
         if i < 0 || i as usize >= self.rows.len() || col < 0 || col as usize >= self.cols {
             return None;
         }
-        self.pairs
-            .get(i as usize * self.cols + col as usize)
-            .copied()
-            .flatten()
+        let idx = i as usize * self.cols + col as usize;
+        let pairs = self.pairs.as_slice();
+        if idx < pairs.len() { pairs[idx] } else { None }
     }
 }
 
@@ -1132,11 +1141,11 @@ impl<'a> TextView<'a> {
     /// The probe's lines and the frame's rows `frame` (`None` for a frame
     /// that handed none).
     #[inline]
-    pub(crate) fn new(spans: TextSpans, frame: Option<&'a FrameText>) -> Self {
+    pub(crate) const fn new(spans: TextSpans, frame: Option<&'a FrameText>) -> Self {
         match frame {
             Some(f) => Self {
                 spans,
-                frame: &f.rows,
+                frame: f.rows.as_slice(),
                 lo: f.lo,
             },
             None => Self {
@@ -1150,16 +1159,18 @@ impl<'a> TextView<'a> {
     /// The frame's own read of `row`: `Some(span)` for a row it read
     /// (`span` `None` when blank), `None` for a row it did not.
     #[inline]
-    fn frame_row(&self, row: i32) -> Option<Option<(i32, i32)>> {
+    const fn frame_row(&self, row: i32) -> Option<Option<(i32, i32)>> {
         let i = row - self.lo;
-        (i >= 0)
-            .then(|| self.frame.get(i as usize).copied())
-            .flatten()
+        if i >= 0 && (i as usize) < self.frame.len() {
+            Some(self.frame[i as usize])
+        } else {
+            None
+        }
     }
 
     /// Whether the frame says what row `row` holds (the probe or the cells).
     #[inline]
-    pub(crate) fn knows_row(&self, row: i32) -> bool {
+    pub(crate) const fn knows_row(&self, row: i32) -> bool {
         self.spans.reads_row(row) || self.frame_row(row).is_some()
     }
 
@@ -1167,7 +1178,7 @@ impl<'a> TextView<'a> {
     /// did: `Some(Some((first, end)))` for a row with glyphs, `Some(None)`
     /// for a blank one, `None` where neither read it.
     #[inline]
-    pub(crate) fn frame_line(&self, row: i32) -> Option<Option<(i32, i32)>> {
+    pub(crate) const fn frame_line(&self, row: i32) -> Option<Option<(i32, i32)>> {
         if self.spans.reads_row(row) {
             return None;
         }
@@ -1177,24 +1188,34 @@ impl<'a> TextView<'a> {
     /// Whether grid cell `(row, col)` lies on a line of text the frame
     /// shows (a glyph, or a blank between two of a line's glyphs).
     #[inline]
-    pub(crate) fn covers_cell(&self, row: i32, col: i32) -> bool {
+    pub(crate) const fn covers_cell(&self, row: i32, col: i32) -> bool {
         if self.spans.reads_row(row) {
             return self.spans.covers_cell(row, col);
         }
-        self.frame_row(row)
-            .flatten()
-            .is_some_and(|(first, end)| (first..end).contains(&col))
+        match self.frame_row(row) {
+            Some(Some((first, end))) => col >= first && col < end,
+            _ => false,
+        }
     }
 
     /// Whether the frame shows grid row `row` blank: read (by the probe or
     /// the frame's own cells) and holding no glyph. A row nobody read is
     /// not known blank.
     #[inline]
-    pub(crate) fn row_is_blank(&self, row: i32) -> bool {
+    pub(crate) const fn row_is_blank(&self, row: i32) -> bool {
         if self.spans.reads_row(row) {
-            !self.spans.lines().any(|line| line.0 == row)
+            let mut i = 0;
+            while i < self.spans.rows.len() {
+                if let Some((r, _, _)) = self.spans.rows[i]
+                    && r == row
+                {
+                    return false;
+                }
+                i += 1;
+            }
+            true
         } else {
-            self.frame_row(row) == Some(None)
+            matches!(self.frame_row(row), Some(None))
         }
     }
 
@@ -1202,7 +1223,7 @@ impl<'a> TextView<'a> {
     /// a line of text, or one on a row nobody read (so the full beam lands
     /// only where the frame showed air).
     #[inline]
-    pub(crate) fn over_text(&self, row: i32, col: i32) -> bool {
+    pub(crate) const fn over_text(&self, row: i32, col: i32) -> bool {
         !self.knows_row(row) || self.covers_cell(row, col)
     }
 }

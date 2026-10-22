@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE OCCUPANCY FACTS BOARD (`docs/DESIGN-harness-occupancy-2026-10-20.md`,
-//! slice 0: observe, type nothing): where the machine's occupancy stands —
+//! THE OCCUPANCY FACTS BOARD (`docs/DESIGN-harness-occupancy-2026-10-20.md`,):
+//! where the machine's occupancy stands —
 //! its cores and load, the memory it can hand out, its memory pressure, the
 //! home volume's level and the build slots — taken at each look of the
 //! harness's disk watch (once a [`crate::harness_host::DISK_TICK`]).
@@ -19,20 +19,43 @@
 //! then lands for the next look; a board whose snapshot is older than
 //! [`STALE_AFTER`] says so.
 //!
-//! Slice 0 stores the board and logs each change of its slots and disk word.
-//! It decides nothing and types nothing; slice 1 maps it to the decider's
-//! reading.
+//! Stores the board and logs each change of its slots and disk word.
+//! Judges at each look what needs `await sys`'s grammar or more than
+//! one look ([`Judged`]; the red-team's F15): the supervisor loop is not
+//! called while its agent's turn runs, so it cannot bridge looks it never
+//! saw. So the board holds `hold-room`'s slot term (`slots>=1 for=20m`,
+//! latched over its own looks by their snapshots' stamps), its machine
+//! terms, and, per supervised session, the last look at which a build slot's
+//! holder lay in that session's tab ([`slot_tabs`]). Each loop's host reads
+//! it as one [`OccupancyReading`] ([`reading_for`], `IdleHost::occupancy`).
+//! Nothing here decides or types anything.
 
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, PoisonError};
 use std::time::Duration;
 
 use aterm_agent::harness::disk::Level;
+use aterm_agent::supervise::memory::Pressure as MemoryPressure;
+use aterm_agent::supervise::occupancy::rules::{HOLD_ROOM_MACHINE, HOLD_ROOM_SLOTS};
+use aterm_agent::supervise::occupancy::{OccupancyReading, SlotsSeen};
 use aterm_sysprobe::slots::{SlotsRead, Unread};
-use aterm_vitals::model::{Pressure, SlotsUnread, SlotsView, Snapshot};
+use aterm_uds::process::ProcessStart;
+use aterm_vitals::model::{Pressure, ProcSample, SlotsUnread, SlotsView, Snapshot, TabRoot};
+use aterm_vitals::sys::predicate::{AwaitSys, Latch, Parsed, evaluate};
 
 /// A board whose snapshot is older than this (two disk looks) is stale.
 pub(crate) const STALE_AFTER: Duration = crate::harness_host::DISK_TICK.saturating_mul(2);
+
+/// How long the board remembers that a session's tab held a build slot: past
+/// any hold `hold-room` still asks about (four asks two hours apart, from two
+/// hours in), with room to spare.
+pub(crate) const HELD_KEEP: Duration = Duration::from_secs(48 * 3600);
+
+/// `d` in whole milliseconds, saturating.
+fn whole_ms(d: Duration) -> i64 {
+    i64::try_from(d.as_millis()).unwrap_or(i64::MAX)
+}
 
 /// The occupancy facts at one look.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -114,6 +137,185 @@ pub(crate) fn slots_view(r: &SlotsRead) -> SlotsView {
     }
 }
 
+/// THE TABS THAT HOLD A BUILD SLOT (their keys, each once, in order): each
+/// holder the slot reader proved in `read` found by its pid in the sweep
+/// `procs`, attributed to a tab of `tabs` under `self_pid`
+/// ([`aterm_vitals::model::attribute`]: the nearest tab shell on its parent
+/// chain), with its identity joined by `current_start` (asked after the
+/// sweep, of a holder in a tab alone): its boot-clock start must match the
+/// sweep, and its wall-clock birth must match the slot reader's holder.
+/// [`aterm_uds::process::read_process_start`] reads both for one process.
+/// Either reading may precede the other, so neither a reused pid nor an
+/// unknown identity can attribute a holder through an old parent chain.
+/// `None` where the reader read no holders or there is no sweep (a hidden
+/// deck's reading). Pure but for `current_start`.
+pub(crate) fn slot_tabs(
+    read: &SlotsRead,
+    procs: Option<&[ProcSample]>,
+    self_pid: u32,
+    tabs: &[TabRoot],
+    current_start: &mut dyn FnMut(u32) -> Option<ProcessStart>,
+) -> Option<Vec<u64>> {
+    let SlotsRead::Read { holders, .. } = read else {
+        return None;
+    };
+    let procs = procs?;
+    if holders.is_empty() {
+        return Some(Vec::new());
+    }
+    let members = aterm_vitals::model::attribute(procs, self_pid, tabs);
+    let mut keys: Vec<u64> = holders
+        .iter()
+        .filter_map(|h| {
+            let at = procs.iter().position(|p| p.pid == h.pid)?;
+            let tab = members.get(at)?.tab?;
+            let key = tabs.get(tab)?.key;
+            let swept_start = procs.get(at)?.start?;
+            let current = current_start(h.pid)?;
+            let wall = current.wall?;
+            let birth_us = wall
+                .seconds
+                .checked_mul(1_000_000)?
+                .checked_add(wall.microseconds)?;
+            (current.boot.0 == swept_start && birth_us == h.birth_us).then_some(key)
+        })
+        .collect();
+    keys.sort_unstable();
+    keys.dedup();
+    Some(keys)
+}
+
+/// One of `hold-room`'s waits (`text`, its leading `sys` included, as
+/// `await sys` hands the grammar its words), parsed: a machine wait, never a
+/// volume's.
+fn machine_wait(text: &str) -> Option<AwaitSys> {
+    match AwaitSys::parse(text) {
+        Ok(Parsed::Machine(wait)) => Some(wait),
+        _ => None,
+    }
+}
+
+/// The facts of `snap` `hold-room` judges, at THE BOARD'S CADENCE: the slot
+/// reader reads once a look at rest, so a slots reading no older than
+/// [`STALE_AFTER`] speaks for the look (`await sys`'s
+/// [`aterm_vitals::sys::predicate::SLOTS_FRESH_MS`] is a parked wait's, which
+/// arms the reader to seconds); an older one keeps its age and reads as
+/// warming.
+fn judged_snapshot(snap: &Snapshot) -> Snapshot {
+    let stale_ms = u64::try_from(STALE_AFTER.as_millis()).unwrap_or(u64::MAX);
+    Snapshot {
+        at_ns: snap.at_ns,
+        avail: snap.avail,
+        mem: snap.mem.clone(),
+        slots: snap.slots,
+        slots_age_ms: snap.slots_age_ms.filter(|age| *age > stale_ms),
+        ..Snapshot::default()
+    }
+}
+
+/// THE BOARD AND WHAT IT JUDGED ACROSS ITS LOOKS ([module docs](self)).
+#[derive(Debug, Default)]
+pub(crate) struct Judged {
+    /// The board as last taken.
+    board: Option<FactsBoard>,
+    /// `hold-room`'s slot term over the looks.
+    latch: Latch,
+    /// How long that term has held, ms, once it spans its `for=`.
+    slots_free_ms: Option<u64>,
+    /// Whether `hold-room`'s machine terms held at the last look; `None`
+    /// where they could not be judged.
+    room: Option<bool>,
+    /// Each supervised session's last look at which a build slot's holder
+    /// lay in its tab (the snapshot's unix ms), kept [`HELD_KEEP`].
+    held: BTreeMap<String, i64>,
+}
+
+impl Judged {
+    /// THE LOOK that took `board` from `snap` (`None`: no snapshot held),
+    /// with the supervised `sessions` (each its tab's key and its session
+    /// id). A stale board judges nothing, and its slot term starts over.
+    pub(crate) fn step(
+        &mut self,
+        board: FactsBoard,
+        snap: Option<&Snapshot>,
+        sessions: &[(u64, String)],
+    ) {
+        match snap.filter(|_| !board.stale) {
+            None => {
+                self.latch = Latch::default();
+                self.slots_free_ms = None;
+                self.room = None;
+            }
+            Some(snap) => {
+                let judged = judged_snapshot(snap);
+                self.slots_free_ms = machine_wait(HOLD_ROOM_SLOTS).and_then(|wait| {
+                    let o = evaluate(&wait, &judged, &[]);
+                    let holds = o.holds && o.refused.is_none();
+                    self.latch.step(holds, snap.at_ns, wait.for_ms)
+                });
+                self.room = machine_wait(HOLD_ROOM_MACHINE).and_then(|wait| {
+                    let o = evaluate(&wait, &judged, &[]);
+                    o.refused.is_none().then_some(o.holds)
+                });
+                if let Some(tabs) = &snap.slot_tabs {
+                    for (key, sid) in sessions {
+                        if tabs.contains(key) {
+                            self.held.insert(sid.clone(), board.as_of_unix_ms);
+                        }
+                    }
+                }
+            }
+        }
+        let taken = board.taken_unix_ms;
+        self.held
+            .retain(|_, at| taken.saturating_sub(*at) <= whole_ms(HELD_KEEP));
+        self.board = Some(board);
+    }
+
+    /// The board as session `sid`'s host reads it at `now_unix_ms`: the empty
+    /// reading before the first look, and a stale one where the board itself
+    /// is older than [`STALE_AFTER`] (its looks stopped, so what it judged
+    /// then no longer speaks for now).
+    pub(crate) fn reading(&self, sid: &str, now_unix_ms: i64) -> OccupancyReading {
+        let Some(b) = &self.board else {
+            return OccupancyReading::default();
+        };
+        let aged = now_unix_ms.saturating_sub(b.taken_unix_ms) > whole_ms(STALE_AFTER);
+        OccupancyReading {
+            taken_ms: b.taken_unix_ms,
+            stale: b.stale || aged,
+            avail_mib: b.avail_mib,
+            pressure: b.pressure.and_then(memory_pressure),
+            disk: b.disk,
+            slots: match b.slots {
+                Some(SlotsView::Read {
+                    n,
+                    free,
+                    discounted,
+                    ..
+                }) => Some(SlotsSeen {
+                    usable: free.saturating_sub(discounted),
+                    n,
+                }),
+                _ => None,
+            },
+            slots_free_ms: self.slots_free_ms,
+            room: self.room,
+            held_slot_last_ms: self.held.get(sid).copied(),
+        }
+    }
+}
+
+/// The kernel's memory pressure as the supervisor names it; `None` unread.
+fn memory_pressure(p: Pressure) -> Option<MemoryPressure> {
+    match p {
+        Pressure::Normal => Some(MemoryPressure::Normal),
+        Pressure::Warn => Some(MemoryPressure::Warn),
+        Pressure::Critical => Some(MemoryPressure::Critical),
+        Pressure::Unknown => None,
+    }
+}
+
 /// The words a change of the board is logged with: its slots and its disk
 /// level, which are what the log follows.
 fn change_words(b: &FactsBoard) -> String {
@@ -184,8 +386,9 @@ impl Drop for Armed<'_> {
 /// `aterm_sysprobe::slots::IDLE_PERIOD`, which the board's look needs.
 pub(crate) static SLOTS_ARMED: Arming = Arming::new();
 
-/// The board as last taken ([`look`]); `None` before the first look.
-static BOARD: Mutex<Option<FactsBoard>> = Mutex::new(None);
+/// The board and what it judged, as last taken ([`look`]); `None` before
+/// the first look.
+static BOARD: Mutex<Option<Judged>> = Mutex::new(None);
 
 /// The home volume's level on the disk board, where the watch judged it.
 fn home_level() -> Option<Level> {
@@ -195,9 +398,11 @@ fn home_level() -> Option<Level> {
 }
 
 /// TAKE THE BOARD at `now_unix_ms` (the disk look's): the newest whole
-/// snapshot as held, never pulled, and the home volume's level; stored, and
-/// logged when its slots or its disk word moved. Takes each lock alone.
-pub(crate) fn look(now_unix_ms: i64) {
+/// snapshot as held, never pulled, and the home volume's level; judged for
+/// the supervised `sessions` (each its tab's key and its session id,
+/// [`Judged::step`]), stored, and logged when its slots or its disk word
+/// moved. Takes each lock alone.
+pub(crate) fn look(now_unix_ms: i64, sessions: &[(u64, String)]) {
     let held = crate::sys_host::SYS.held_now();
     let disk = home_level();
     let board = match held.as_ref() {
@@ -212,8 +417,9 @@ pub(crate) fn look(now_unix_ms: i64) {
     let words = change_words(&board);
     let moved = {
         let mut kept = BOARD.lock().unwrap_or_else(PoisonError::into_inner);
-        let moved = kept.as_ref().map(change_words).as_deref() != Some(words.as_str());
-        *kept = Some(board);
+        let judged = kept.get_or_insert_with(Judged::default);
+        let moved = judged.board.as_ref().map(change_words).as_deref() != Some(words.as_str());
+        judged.step(board, held.as_ref().map(|h| &*h.snap), sessions);
         moved
     };
     if moved {
@@ -221,14 +427,18 @@ pub(crate) fn look(now_unix_ms: i64) {
     }
 }
 
-/// The board as last taken; `None` before the first look. Slice 1's decider
-/// reads it; slice 0 only its tests.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "slice 1's decider reads the board")
-)]
-pub(crate) fn board() -> Option<FactsBoard> {
-    BOARD.lock().unwrap_or_else(PoisonError::into_inner).clone()
+/// THE BOARD AS SESSION `sid`'S HOST READS IT NOW (`IdleHost::occupancy`,
+/// [`Judged::reading`]): the empty reading before the first look; a wall
+/// clock that cannot be read reads the board as stale.
+pub(crate) fn reading_for(sid: &str) -> OccupancyReading {
+    let now_unix_ms = aterm_time::unix_millis()
+        .and_then(|ms| i64::try_from(ms).ok())
+        .unwrap_or(i64::MAX);
+    BOARD
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .as_ref()
+        .map_or_else(OccupancyReading::default, |j| j.reading(sid, now_unix_ms))
 }
 
 #[cfg(test)]

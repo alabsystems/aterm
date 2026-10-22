@@ -135,7 +135,7 @@
 //!   through the same path as a control write (`send`, `key`), which stamps no
 //!   `human_ms`, answered alike: the point is codex-alab's to go on with
 //!   (`continue@v1` at once, its journal's `act continue@v1`, `task=open`).
-//! * the rollout tap (session log 5G-3): once `first`, `continue`,
+//! * the rollout tap: once `first`, `continue`,
 //!   `approval` and `question` are done, each tab's `log kinds=turn`, read
 //!   past the tap's fence (two more asks answered, `status rollout_asks=`:
 //!   every write the tap would make about what the rollout held is in the
@@ -460,8 +460,8 @@ fn needs_raised(meta: &str) -> bool {
 }
 
 /// Whether a `log kinds=act` reply holds the act mark a self-claim's `act`
-/// writes for `holder` (session log phase 6, 6F-7): `<seq> mark <node> act
-/// word=<w> rule=<act, @ .> holder=<holder> harness_act=<act>`, the word
+/// writes for `holder`: `<seq> mark <node> act
+/// word=<w> rule=<act, @.> holder=<holder> harness_act=<act>`, the word
 /// map's ([`aterm_agent::harness::acts::self_claim_act`]; `word=unknown`
 /// and no `rule=` for an act it has no word for), its holder the proven
 /// claim's, which the server read, and the act whole (host tier: the
@@ -1682,8 +1682,8 @@ impl Proof {
             .map(str::to_string)
     }
 
-    /// THE ROLLOUT TAP, LIVE (session log 5G-3; plan A1's 6D-3b; ruling
-    /// T15): each done leg's tab logs turns from its codex-alab's own
+    /// THE ROLLOUT TAP, LIVE:
+    /// each done leg's tab logs turns from its codex-alab's own
     /// rollout when the build that rollout names is one the session log
     /// measured, and none when not. Each tab's log is read only past the
     /// tap's fence ([`past_the_fence`]: two more asks answered, each counted

@@ -1712,14 +1712,14 @@ impl Meteors {
     /// before the frame's events, so a landing minted this frame sees the floor as
     /// it stands now. `None` bounds nothing.
     #[inline]
-    pub fn set_hand_floor(&mut self, floor: Option<(u16, u16)>) {
+    pub const fn set_hand_floor(&mut self, floor: Option<(u16, u16)>) {
         self.hand_floor = floor;
     }
 
     /// The floor this pool holds, as last set by [`Meteors::set_hand_floor`].
     #[must_use]
     #[cfg(test)]
-    pub fn hand_floor_cell(&self) -> Option<(u16, u16)> {
+    pub const fn hand_floor_cell(&self) -> Option<(u16, u16)> {
         self.hand_floor
     }
 
@@ -1885,14 +1885,23 @@ impl Meteors {
     /// [`FLIGHT_MAX_LIVE`] by §6.9's cap; landed trains and chained stubs count.
     #[inline]
     #[must_use]
-    pub fn live(&self) -> usize {
-        self.live.iter().filter(|m| m.retired_at.is_none()).count()
+    pub const fn live(&self) -> usize {
+        let mut count = 0;
+        let slice = self.live.as_slice();
+        let mut i = 0;
+        while i < slice.len() {
+            if slice[i].retired_at.is_none() {
+                count += 1;
+            }
+            i += 1;
+        }
+        count
     }
 
     /// True when nothing is in the air and no landing is finishing.
     #[must_use]
     #[cfg(test)]
-    pub fn at_rest(&self) -> bool {
+    pub const fn at_rest(&self) -> bool {
         self.live.is_empty() && self.landings.is_empty()
     }
 
@@ -2979,7 +2988,7 @@ fn draw_flash(l: &Landing, ctx: &Ctx<'_>, frame: &mut Frame<'_>) {
 /// the tuned cells; at a tiny cell it shortens only near-vertical spikes.
 #[inline]
 #[must_use]
-fn burst_rise_limit(dy: f32, rise_px: f32, half_thick_px: f32) -> f32 {
+const fn burst_rise_limit(dy: f32, rise_px: f32, half_thick_px: f32) -> f32 {
     let room = rise_px - half_thick_px;
     if room <= 0.0 {
         return 0.0;
@@ -3291,9 +3300,9 @@ fn mint_spark(seed: u32, k: usize, ch: f32) -> Spark {
 /// under the chroma cull.
 #[inline]
 #[must_use]
-fn spark_at(spark: Spark, age_ms: f32, ch: f32) -> Option<((f32, f32), f32)> {
+const fn spark_at(spark: Spark, age_ms: f32, ch: f32) -> Option<((f32, f32), f32)> {
     let u = age_ms / spark.life.max(1.0);
-    if !(0.0..1.0).contains(&u) {
+    if !(u >= 0.0 && u < 1.0) {
         return None;
     }
     let alpha = if u <= SPARK_HOLD_U {
@@ -3553,7 +3562,7 @@ fn ms_since(a: Instant, b: Instant) -> f32 {
 /// at a pixel a scroll may have moved is dropped outside it, never clamped (seam
 /// point 12).
 #[inline]
-fn on_glass(geom: Geom, x: f32, y: f32) -> bool {
+const fn on_glass(geom: Geom, x: f32, y: f32) -> bool {
     super::stardust::on_glass((x.round() as i32, y.round() as i32), geom)
 }
 
@@ -3627,7 +3636,7 @@ fn seed_of(row: u16, col: u16, ord: u32) -> u32 {
 /// A seeded value in `[0, 1)`: the one place in this file a hash becomes a
 /// number, so no draw rolls its own bias.
 #[inline]
-fn unit01(seed: u32, salt: u32) -> f32 {
+const fn unit01(seed: u32, salt: u32) -> f32 {
     hash01(mix32(seed ^ salt))
 }
 

@@ -182,7 +182,7 @@ fn exit_actors_and_reasons_map_onto_the_logs_words() {
         "s-0123456789abcdef0123"
     );
     // A source `grant` took as given is a session only when it reads as a
-    // minted sid (phase 3A ruling R1): never a trusted actor's word.
+    // minted sid: never a trusted actor's word.
     for chosen in ["s-1", "harness", "human", "ctl", "bridge"] {
         assert_eq!(
             exit_actor(&ExitActor::Sid(chosen.into())).word(),
@@ -587,7 +587,7 @@ fn a_seq_count_past_any_log_never_stands_the_commit_down() {
 /// THE SEQ CONTINUES ACROSS AN UPDATE: the manifest draws the count while the
 /// producer goes on writing to its Commit; the successor's first record is
 /// above every seq the producer wrote, and an older manifest's successor (no
-/// `log_seq`) starts at 1 as slice 1 did.
+/// `log_seq`) starts at 1 as before.
 #[test]
 fn the_successors_first_seq_is_above_every_predecessor_seq() {
     let producer = test_handle(1);
@@ -946,7 +946,7 @@ fn block_read_reports_every_block_past_the_cursor() {
 }
 
 /// A FINISHED BLOCK IS LOGGED BY ITS PROGRAM ALONE, the privacy rule the
-/// journal's on-by-default rests on (D3, Phase 6 step 6B-1): a sweep that
+/// journal's on-by-default rests on: a sweep that
 /// first sees a command already finished (the usual case for `echo` or
 /// `export KEY=…`) reduces its line, the scraped row or the shell's own
 /// OSC 633;E line, as the running command's is reduced. So `detail=echo`, and
@@ -5754,7 +5754,7 @@ fn a_reader_during_the_overlap_sees_only_what_was_carried() {
 
 /// A crash recovery's log, as `spawn::mark_handoff_gap` adopts a shell the
 /// PTY keeper held, at wall `ms`, its keeper tag naming `tag_ep`: each in a
-/// process of its own (the test constructor's allocator, ruling U46).
+/// process of its own (the test constructor's allocator).
 fn recovered(ms: u64, tag_ep: Option<u32>) -> SessionLog {
     let mut log = SessionLog::for_test();
     let at = Stamp::new(WALL0 + ms, 5);
@@ -5775,7 +5775,7 @@ fn recovered(ms: u64, tag_ep: Option<u32>) -> SessionLog {
 /// window registers its own log's epoch with the keeper
 /// (`keeper_link::registration_tag`), and the next recovery takes one above
 /// it. NEGATIVE CONTROL: told no epoch (an older window's tag), two
-/// recoveries in the same second take the same one, slice 1's limit.
+/// recoveries in the same second take the same one.
 #[test]
 fn two_crash_adoptions_in_one_second_take_growing_epochs() {
     let first = recovered(100, None);
@@ -6681,7 +6681,7 @@ fn a_turn_a_delivery_route_refuses_keeps_attribution_without_an_input_mark() {
     );
 }
 
-/// THE HOST LINES AT THEIR WORST (ruling S5; addendum A1, A2): the `state`
+/// THE HOST LINES AT THEIR WORST (addendum A1, A2): the `state`
 /// line with every `Observed` token at its longest (`u64::MAX` walls, the
 /// widest pgid, the longest word of each table, both fingerprints,
 /// `obs_esc`, a `meta_fp` of every meta field), and every line present
@@ -6857,7 +6857,7 @@ fn the_always_present_host_lines_fit_the_carry_at_their_worst() {
     );
 }
 
-// ---- the epoch allocator (phase 6, 6A-2, ruling U1) -------------------------
+// ---- the epoch allocator -------------------------
 
 /// A process of its own: an allocator that has issued nothing, having noted
 /// the epoch its restore layout's leaves recorded (`leaf_ep`), as a launch
@@ -7045,8 +7045,8 @@ fn an_adoption_after_a_chain_ahead_of_the_clock_repeats_no_epoch() {
     );
 }
 
-/// THE TEST CONSTRUCTOR READS `ep=1` AND THE PROCESS ALLOCATOR NEVER DOES
-/// (ruling U46): a unit test's log is at the floor; a log an allocator
+/// THE TEST CONSTRUCTOR READS `ep=1` AND THE PROCESS ALLOCATOR NEVER DOES:
+/// a unit test's log is at the floor; a log an allocator
 /// starts at a hand-set instant is at or above that instant's seconds and
 /// above the floor; and two logs the process starts (what every production
 /// session takes, a debug build's and the dev seams' included) are above

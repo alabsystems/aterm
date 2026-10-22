@@ -44,12 +44,12 @@
 //! seeds, aterm's own layout): the two lose power together, in a power cut
 //! of the whole machine ([`Opts::power_cuts`]) — the broker's lossy restart,
 //! the state dir's image (which may tear a file the cut did not find flushed,
-//! [`Opts::torn_device`]: the bridge sets it aside, finding F1), aterm gone
+//! [`Opts::torn_device`]: the bridge sets it aside), aterm gone
 //! with its sessions (the relaunch mints new sids) and a new boot. TWO
 //! DEVICES (even seeds): the log loses power ALONE
 //! ([`Opts::bus_losses`]) while aterm, the bridge and the state dir live on —
 //! a log on another volume, a Lossy flush failure: the move the endpoint's
-//! lane 3 exists for. Both at once is finding F2's world — a landed post
+//! lane 3 exists for. Both at once is a landed post
 //! the log lost on its own, its in-flight entry brought back by a later cut —
 //! decided (the next boot's first bridge retires an earlier boot's entries
 //! unpublished) and held as a committed sweep of its own (`super::tests`'
@@ -81,7 +81,7 @@
 //!   `live`; no row of a session that left still does when its writer is this
 //!   incarnation, its exact witnessed predecessor, or an earlier bridge of
 //!   this state dir in this kernel boot, proved by its mark
-//!   (finding F4, decided: [`World::presence_gaps`]). A SIBLING's row
+//!   (decided: [`World::presence_gaps`]). A SIBLING's row
 //!   ([`Opts::sibling`], [`Opts::race`]) carries a copy's mark, and is retired
 //!   only by an attach that witnessed its will, and by the running one once it
 //!   did. A post to a session that left before it was routed may be retired
@@ -98,14 +98,14 @@
 //!   boot's first bridge sets the torn pin aside, and the mirror resumes, so a
 //!   bridge that ever stops for its pin is a violation
 //!   ([`World::mirror_stopped_for_its_pin`]).
-//! * THE MIRROR'S KEY AND TOTAL, at every step and across every boot
-//!   (rulings Q6, Q13): the node's takes name one alias key over its life,
+//! * THE MIRROR'S KEY AND TOTAL, at every step and across every boot:
+//!   the node's takes name one alias key over its life,
 //!   and an engaged mirror never counts fewer bytes than a pin of the node
 //!   was written with ([`World::mirror_key_and_total`]).
 //! * THE BROKER'S LAW: every restart is held to astream's P2-P7
 //!   ([`bus::law_check`]; P1 holds by construction, P8 is not modelled).
 //! * LIVENESS: the settle phase ends, the bridge never panics — after a power
-//!   cut that tore a state file too (finding F1: the bridge sets it aside;
+//!   cut that tore a state file too (the bridge sets it aside;
 //!   [`Mutant::RefuseTornAfterPowerCut`], the old refusal, wedges), and after
 //!   any write error (sim item S7): the settle phase's disk is clean, so a
 //!   bridge a full disk held up is no violation and one a clean disk does not
@@ -118,7 +118,7 @@
 //!   aterm (`link set-aside`) of no more torn files than the state dir's
 //!   quarantine holds — counting none of the whole in-flight entries an
 //!   earlier boot left, which the next boot's first bridge retired there
-//!   (`retired.`, finding F2) and tells nobody of. And the newest bridge told
+//!   (`retired.`) and tells nobody of. And the newest bridge told
 //!   aterm the count it holds (`link quarantine torn=<k>`, sim item S6: what
 //!   ends aterm's entry once the owner empties it).
 
@@ -184,7 +184,7 @@ pub(crate) enum Mutant {
     IgnoreWitnessedWill,
     /// A will's incarnation is trusted without matching its writer's mark.
     WitnessByIncarnationAlone,
-    /// The sweep reads no row's state-dir mark, as before finding F4's
+    /// The sweep reads no row's state-dir mark, before the fix
     /// decision (`crate::state::StateDir::mark`): only its own incarnation and
     /// the will it witnessed are its to retire, and a ghost whose writer's
     /// successors all died inside the five minutes stands.
@@ -211,17 +211,16 @@ pub(crate) enum Mutant {
     /// parks with a sender's `outbox sent` left to the idle backstop's grace.
     IdlePostLeftToBackstop,
     /// A file a power cut tore is refused where it is read, at every attach of
-    /// every later boot, as before finding F1's fix
+    /// every later boot, before the fix
     /// (`crate::state::StateDir::set_aside_torn` never runs).
     RefuseTornAfterPowerCut,
-    /// The sweep judges a file whole when its reader takes it, as finding F1's
-    /// first fix did (`crate::state::StateDir::set_aside_torn_by_the_reader_alone`):
+    /// The sweep judges a file whole when its reader takes it, as did (`crate::state::StateDir::set_aside_torn_by_the_reader_alone`):
     /// an in-flight entry cut before its witness, or inside its body at an even
     /// length, still reads — and a reply's is then refused at every attach.
     SweepByTheReaderAlone,
     /// The first bridge of a boot after an unclean stop leaves every whole
     /// in-flight entry where it is, and the attach publishes each again at its
-    /// sequence, as before finding F2's decision
+    /// sequence, before the fix decision
     /// (`crate::state::StateDir::retire_in_flight_of_an_earlier_boot` never
     /// runs): an entry a power cut brought back after its record landed, and
     /// the log on its own then lost, lands behind its sender's later posts.
@@ -324,8 +323,7 @@ pub(crate) struct Opts {
     /// The state dir's device keeps every write (a control).
     pub(crate) lossless_device: bool,
     /// The state dir's device may tear an unflushed file (POSIX's worst
-    /// case, [`Device::tears`]): on in every committed world (finding F1's
-    /// law), off only for a control that needs every image whole.
+    /// case, [`Device::tears`]): on in every committed world (), off only for a control that needs every image whole.
     pub(crate) torn_device: bool,
     /// THE BUS MIRROR: `[fabric] log = "turns"`, the sessions' logs mirrored
     /// onto their `ev` faces.
@@ -393,14 +391,14 @@ impl Opts {
             // state dir share a device (aterm's layout: they lose power
             // together, in a power cut of the whole machine), an even seed's
             // log is on a device of its own (it loses power alone). Both at
-            // once is finding F2's world, a committed sweep of its own
+            // once is a committed sweep of its own
             // ([`super::tests`]' `both_ways`).
             power_cuts: seed % 2 == 1,
             bus_losses: seed.is_multiple_of(2),
             cut_weight: 1,
             lossless_device: false,
             // POSIX'S WORST CASE, EVERYWHERE: a power cut may tear any file it
-            // did not find flushed (finding F1, [`Device::tears`]), and the
+            // did not find flushed ([`Device::tears`]), and the
             // bridge sets what it tore aside rather than wedge on it.
             torn_device: true,
             // THE MIRROR ON OR OFF, alternating by pairs of seeds, so each
@@ -550,8 +548,7 @@ pub(crate) struct Stats {
     pub(crate) pins_set_aside: u64,
     /// Whole in-flight entries the first bridge of a boot retired into the
     /// quarantine after an unclean stop, never published again
-    /// (`crate::state::StateDir::retire_in_flight_of_an_earlier_boot`, finding
-    /// F2), counted once settled.
+    /// (`crate::state::StateDir::retire_in_flight_of_an_earlier_boot`), counted once settled.
     pub(crate) retired: u64,
     /// HELD ACKS ([`Opts::hold_acks`], [`bus::Broker::held_counts`]): answers
     /// the broker held, reads that must not wait which found one not yet
@@ -1696,7 +1693,7 @@ impl World {
     /// Every row of THIS state dir in THIS BOOT at or below `me` is the running bridge's to
     /// retire: each carries the dir's mark (`crate::state::StateDir::mark`),
     /// read off the directory, so whichever earlier bridge of the dir wrote it,
-    /// in this boot, it is the dir's (finding F4). A sibling's, under a
+    /// in this boot, it is the dir's. A sibling's, under a
     /// copy's mark ([`Opts::sibling`], [`Opts::race`]), only when its
     /// incarnation AND writer mark are `witnessed`. The dir's live node rows
     /// are told from the sibling's by their writer mark, including aliases
@@ -1905,7 +1902,7 @@ impl World {
         (n > 0).then(|| format!("mirror: stopped for its pin {n} times"))
     }
 
-    /// RULINGS Q6 AND Q13 ACROSS EVERY BOOT, at every step: the node's takes
+    /// Across every boot, at every step: the node's takes
     /// named ONE alias key over its whole life, so an edge has one alias on
     /// the bus; and an engaged mirror's total is never below the highest
     /// total any pin of the node was written with ([`Device::pin_total`]) —

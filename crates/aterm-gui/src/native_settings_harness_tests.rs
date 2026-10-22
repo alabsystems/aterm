@@ -2053,8 +2053,8 @@ fn todays_lines_give_way_hero_then_plain_then_the_second_line() {
     });
 }
 
-/// A NOTE IS NEVER DRAWN IN HERO TYPE, AND KEEPS THE COUNTS' ROOM (the
-/// post-check of wave 1, owner-eye-7, and its review): Hero type is for a
+/// A NOTE IS NEVER DRAWN IN HERO TYPE, AND KEEPS THE COUNTS' ROOM (owner-eye-7):
+/// Hero type is for a
 /// line of counts; `nothing yet today` and `reading…` say no count, and are
 /// drawn in the page's plain type — in the Hero line's slot wherever Hero
 /// would hold them, so the counts that replace them (the first reading, the
@@ -2329,8 +2329,8 @@ fn a_rows_day_its_show_and_its_landing() {
     );
 }
 
-/// THE LANDED ROW'S CARD HOLDS ITS WHOLE BLOCK, CLEAR OF ITS WORDS (the
-/// post-check of wave 1, owner-eye-3): the accent card is drawn around the
+/// THE LANDED ROW'S CARD HOLDS ITS WHOLE BLOCK, CLEAR OF ITS WORDS (owner-eye-3):
+/// the accent card is drawn around the
 /// row's whole block — its title and detail, its buttons, its state line,
 /// its day and its open timer's buttons — inset so its outline touches no
 /// glyph and no button: 8 px beside them, half the gap between rows over and
@@ -2471,7 +2471,7 @@ fn a_landed_rows_card_holds_its_whole_block_clear_of_its_words() {
 }
 
 /// THE LANDING DRAWS ALL OF THE BLOCK IT SELECTS (the review of
-/// v3/polish-page's fixes, finding 2): the Autopilot menu's `Harness settings…`
+/// v3/polish-page's fixes): the Autopilot menu's `Harness settings…`
 /// lands Settings ▸ Harness on a SESSIONS row and draws its whole block —
 /// the row, its state, its day, its open timer — on the accent, so the page
 /// scrolls until all of that block
@@ -3035,7 +3035,7 @@ fn two_rows_that_share_a_title_have_buttons_that_read_apart() {
 }
 
 /// A ROW'S WORDS KEEP ITS PLACE WHOLE, AND ITS BUTTONS THEIR FACES (§10.3.4,
-/// "A narrow page"; the review of v3/stats-fold, finding 4): two `✳ Claude
+/// "A narrow page"; the review of v3/stats-fold): two `✳ Claude
 /// Code` rows of one tab — in the first window, and in a second — on the
 /// narrowest Medium page (760), on Medium pages where a fifth fixed button
 /// squeezed the words (780, 820), and on Compact pages (320, 340, 584), at
@@ -4050,11 +4050,11 @@ fn a_background_landing_moves_no_switch() {
     });
 }
 
-/// [`fixture`] with landings (design §12.4, slice 4c): three sessions under
+/// [`fixture`] with landings (design §12.4): three sessions under
 /// Land — one landing, one landed, one through a person's own exchange —
 /// and a reading whose day and week landed, typed land prompts, checked done
 /// claims and pressed boxes no safe rule proved. The landing one is held
-/// (slice 3c, `hold_tests::held_session`): every leg, each count and
+/// (`hold_tests::held_session`): every leg, each count and
 /// nudges, so its state line is as tall as a hold makes it.
 pub(super) fn fixture_landings() -> HarnessState {
     use aterm_agent::harness::acts::TaskFace;
@@ -4116,10 +4116,10 @@ pub(super) fn fixture_landings() -> HarnessState {
     state
 }
 
-/// THE PAGE COUNTS LANDINGS, AS DRAWN (design §12.4.1, slice 4c): read back
+/// THE PAGE COUNTS LANDINGS, AS DRAWN (design §12.4.1): read back
 /// from the compiled page, the Every row says `1 landing, 1 landed, 1
 /// quiet`, and so does its Cruise button; WHAT THE HARNESS DID draws
-/// `Landed` over `Land prompts` and, under Kept going, `of them  a done
+/// `Landed` over `Land prompts` and, under Kept going, `of them a done
 /// claim checked`, keyed apart from the `of those` row under Approved
 /// (each fact is keyed by its label, and a compile refuses two of one
 /// key); STATUS's today line and the landed session's day line lead with
@@ -4169,7 +4169,7 @@ fn the_page_draws_its_landings_and_the_done_claims_checked() {
     }
 }
 
-/// EVERY MODE'S SENTENCE COMES FROM ONE TABLE (§12.4.1, §12.4.6; slice 4d):
+/// EVERY MODE'S SENTENCE COMES FROM ONE TABLE (§12.4.1, §12.4.6):
 /// for each mode, the Autopilot chip's title (`autopilot: <mode> — <chip>`),
 /// the `Autopilot set to <mode>` record's line, the SESSIONS row's button's
 /// description as a screen reader reads it off this page, the note under

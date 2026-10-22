@@ -1176,7 +1176,7 @@ fn admit_recovered_journaled(
     let tag = Tag::decode(tag).ok_or("carries a tag this build does not read")?;
     let sid = tag.sid.clone().ok_or("carries no session id")?;
     // THE SESSION'S FABRIC, as its last META said it (the fabric audit's
-    // fourth round, findings 2-5; `fabric::KeeperCarry`): the sid and its
+    // fourth round; `fabric::KeeperCarry`): the sid and its
     // agent survive the crash, so its hold stands again, its broadcast
     // opt-ins resume from the bridge's cursors, its ids count on above the
     // dead window's, and the posts it was told are queued are retired dead
@@ -2334,7 +2334,7 @@ mod tests {
         drop(adopted);
 
         // THE SESSION'S FABRIC rides the META (the fabric audit's fourth
-        // round, findings 2-5): the recovered session's hold, opt-ins, id
+        // round): the recovered session's hold, opt-ins, id
         // lease, queued posts and owed receipts are the dead window's.
         let fabric = crate::fabric::KeeperCarry {
             hold: Some("fleet human%20stop".to_string()),
@@ -2393,7 +2393,7 @@ mod tests {
         );
 
         // NEGATIVE CONTROL: an older window's tag, without the key, names
-        // no epoch (the recovery takes the wall clock's seconds, slice 1's).
+        // no epoch (the recovery takes the wall clock's seconds).
         let older = Tag {
             slog_ep: None,
             ..Tag::decode(&tag()).expect("the tag reads")
@@ -3108,8 +3108,8 @@ mod tests {
     /// A META not sent (not built, no link, a full queue) is retried on the next pass: the
     /// pump records only the fingerprints it sent.
     ///
-    /// AND THE FABRIC MOVES IT TOO (the fabric audit's fourth round, findings
-    /// 2-5): a hold set or lifted, or a topic added, with the modes standing
+    /// AND THE FABRIC MOVES IT TOO (the fabric audit's fourth round):
+    /// a hold set or lifted, or a topic added, with the modes standing
     /// still sends the session's META again, its fabric as it stands now.
     /// NEGATIVE CONTROL: with neither moved, nothing is built.
     #[cfg(unix)]

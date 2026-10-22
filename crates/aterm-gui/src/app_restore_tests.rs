@@ -5178,7 +5178,7 @@ fn assert_tooltips_name_their_shells(app: &App, shape: &str) {
     }
 }
 
-/// ROUND SIX, FINDING 10: A SESSION OPEN IN TWO WINDOWS KEEPS THE WHOLE
+/// A SESSION OPEN IN TWO WINDOWS KEEPS THE WHOLE
 /// LAYOUT, AND BOTH VIEWS. `Open Session in New Window` (Cmd-Shift-O)
 /// shows one pooled session in a second window, and the handoff capture
 /// stamps its id on both leaves. The successor refused the repeat as a
@@ -6068,7 +6068,7 @@ fn timed_session(app: &App, land_at: i64) -> Option<u64> {
 ///   own path): stored and indexed at its instant; and where its time
 ///   passed while the tab was closed — aterm running all along — due at
 ///   once, and the record says the TAB was closed, never aterm (review of
-///   slice B, finding 2: it said aterm).
+///   slice B, it said aterm).
 /// * THE LIVE GRAFT of a seamless update onto the adopted shell: stored and
 ///   indexed; and where a driver wrote the word on the new process first
 ///   (`meta set autopilot off`), that write wins for BOTH halves — no timer,
@@ -6272,7 +6272,7 @@ fn a_timed_cruise_rides_the_cold_restore_the_reopen_and_the_graft() {
 /// reopened and the live graft each store it beside the word with no
 /// revision step — so `meta` reads the old process's writer and its time,
 /// and the new process's first wake records nothing for a write it did not
-/// see. A leaf from before slice 7 (no field) reads `restored`. A driver's
+/// see. A leaf from an older format (no field) reads `restored`. A driver's
 /// write on the new process wins for the word and its setter. NEGATIVE
 /// CONTROL: the carried setter stored over a driver's write fails the last
 /// assertion.
@@ -6362,7 +6362,7 @@ fn the_setter_rides_the_cold_restore_the_reopen_and_the_graft() {
     );
     host.shutdown_and_join();
 
-    // A CLOSED TAB REOPENED, and a leaf from before slice 7.
+    // A CLOSED TAB REOPENED, and a leaf from an older format.
     for (leaf_by, want, word) in [
         (Some(carried.as_str()), Some(carried.as_str()), "ctl"),
         (None, None, "restored"),
@@ -6416,8 +6416,8 @@ fn the_setter_rides_the_cold_restore_the_reopen_and_the_graft() {
     crate::autopilot_timers::set_fake_clocks(None);
 }
 
-/// A SETTER GOES ONLY WITH A WORD STORED (§11.7.3, item 5; the review of
-/// slice 7): a leaf whose word this build cannot read (`fly`) carries a
+/// A SETTER GOES ONLY WITH A WORD STORED (§11.7.3, item 5):
+/// a leaf whose word this build cannot read (`fly`) carries a
 /// setter that parses, and neither the cold restore's seed nor the live
 /// graft stores it — the word is dropped, so `meta` reads `-` and `-`, never
 /// a setter beside no word. A readable word beside it is stored with it.
@@ -6475,8 +6475,8 @@ fn a_setter_beside_a_word_this_build_cannot_read_is_not_stored() {
     }
 }
 
-/// A HAND-EDITED SETTER COSTS THE SETTER, NEVER THE WINDOW (§11.7.3, item 5;
-/// the review of slice 7): a manifest whose leaf's `autopilot_by` was edited
+/// A HAND-EDITED SETTER COSTS THE SETTER, NEVER THE WINDOW (§11.7.3, item 5):
+/// a manifest whose leaf's `autopilot_by` was edited
 /// by hand still reopens its window. The leaf's setter is written back in
 /// its one form (`ctl 0005` → `ctl 5`), dropped where it names no writer
 /// this build knows (`human:pad 1`), and dropped beside no word.
@@ -6528,7 +6528,7 @@ fn a_hand_edited_setter_costs_the_setter_never_the_window() {
 }
 
 /// A TIMED CRUISE ACROSS A SEAMLESS UPDATE, END TO END (design §9.6.2,
-/// acceptance 2; review of slice B, finding 5): the parent arms its session
+/// acceptance 2; review of slice B): the parent arms its session
 /// four minutes out; its handoff capture carries the pair, across the wire,
 /// to a successor that grafts it onto the adopted shell and indexes it. A
 /// driver arms the session two minutes out on the successor before its
@@ -6637,7 +6637,7 @@ fn a_timed_cruise_crosses_the_handoff_and_lands_once_after_the_commit() {
     crate::autopilot_timers::set_fake_clocks(None);
 }
 
-// ---- restore lineage (session log phase 2A) ----------------------------------
+// ---- restore lineage ----------------------------------
 
 /// The record lines of pool session `session`'s log, oldest first.
 fn slog_lines(app: &App, session: u64) -> Vec<String> {

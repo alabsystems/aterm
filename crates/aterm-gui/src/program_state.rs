@@ -7,8 +7,8 @@
 //! row on the session's timeline per move the gate shows
 //! (`SessionTimeline::note_program_state`: `timeline` is then the program's
 //! turn ledger) and, in the same hold, one `program` mark in the session log
-//! (`mark <run|-> program state= [ask=] [coalesced=] src=engine conf=claim`,
-//! phase 6 step 6F-4), and as the edge an `fx celebrate on=done` arm waits
+//! (`mark <run|-> program state= [ask=] [coalesced=] src=engine conf=claim`),
+//! and as the edge an `fx celebrate on=done` arm waits
 //! for (`App::note_program_done`), and NOTHING ELSE.
 //!
 //! The engine keeps each session's last report with a sequence
@@ -29,7 +29,7 @@
 //! `phase_authoritative` nor the zone hash an act reads: no decision of
 //! aterm's reads it (the timeline row and the celebration are display), and
 //! the verdict those carry stays the screen reader's. It is NO LONGER DISPLAY
-//! ONLY (6F-4, ruling U17, T24's reversal): its log mark is a fact a consumer
+//! ONLY (T24's reversal): its log mark is a fact a consumer
 //! may wait on (`await log kind=program`, `subscribe … log`), written through
 //! a per-run bucket that coalesces a flap to its latest state and never drops
 //! the newest; the log's fold never reads it, `brief` prints none, and it

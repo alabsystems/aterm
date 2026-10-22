@@ -70,7 +70,7 @@ pub const TIER_NOVA_END: u64 = 950;
 /// Decode the tier from the high half of the birth draw (base windows).
 #[must_use]
 #[cfg(test)]
-pub fn tier_of(draw: u64) -> SuperTier {
+pub const fn tier_of(draw: u64) -> SuperTier {
     tier_for(draw, 1)
 }
 
@@ -130,8 +130,15 @@ const _: () = {
 /// `level <= 1` uses the base windows.
 #[inline]
 #[must_use]
-pub fn tier_for(draw: u64, level: u32) -> SuperTier {
-    let row = level.clamp(1, COMBO_EXTREME_LEVEL) as usize - 1;
+pub const fn tier_for(draw: u64, level: u32) -> SuperTier {
+    let clamped = if level < 1 {
+        1
+    } else if level > COMBO_EXTREME_LEVEL {
+        COMBO_EXTREME_LEVEL
+    } else {
+        level
+    };
+    let row = clamped as usize - 1;
     let (flash_end, nova_end) = COMBO_TIER_WINDOWS[row];
     match (draw >> 32) % 1000 {
         d if d < flash_end => SuperTier::Flash,
@@ -144,12 +151,15 @@ pub fn tier_for(draw: u64, level: u32) -> SuperTier {
 /// `min(100, cfg + COMBO_CHANCE_STEP·(level − 1))`. `cfg == 0` stays 0.
 #[inline]
 #[must_use]
-pub fn combo_chance(cfg: u8, level: u32) -> u8 {
+pub const fn combo_chance(cfg: u8, level: u32) -> u8 {
     if cfg == 0 {
         return 0;
     }
-    let boost = COMBO_CHANCE_STEP.saturating_mul(level.saturating_sub(1).min(4) as u8);
-    cfg.saturating_add(boost).min(100)
+    let steps = level.saturating_sub(1);
+    let steps = if steps > 4 { 4 } else { steps as u8 };
+    let boost = COMBO_CHANCE_STEP.saturating_mul(steps);
+    let sum = cfg.saturating_add(boost);
+    if sum > 100 { 100 } else { sum }
 }
 
 /// Total visible window per tier — the host's `nova_done` edge and ember start.
@@ -179,9 +189,11 @@ pub const SUPER_RADIUS_ROWS: f32 = 6.0;
 /// every `r_max` producer, tests included, on it.
 #[inline]
 #[must_use]
-pub fn r_max_for(cell_h: i32, grid_h: i32) -> f32 {
-    (SUPER_RADIUS_ROWS * cell_h.max(1) as f32)
-        .min((grid_h.max(cell_h) as f32) / 2.0)
+pub const fn r_max_for(cell_h: i32, grid_h: i32) -> f32 {
+    let ch = if cell_h < 1 { 1 } else { cell_h };
+    let gh = if grid_h < cell_h { cell_h } else { grid_h };
+    (SUPER_RADIUS_ROWS * ch as f32)
+        .min((gh as f32) / 2.0)
         .max(1.0)
 }
 
@@ -335,7 +347,7 @@ fn rise_fall(e: f32) -> f32 {
 
 /// `1 − (1 − q)²` ease-out (the nova shockwave curve).
 #[inline]
-fn ease_out(q: f32) -> f32 {
+const fn ease_out(q: f32) -> f32 {
     let u = 1.0 - q.clamp(0.0, 1.0);
     1.0 - u * u
 }
@@ -894,7 +906,7 @@ pub fn emit_super_decos(t_ms: u64, env: &SuperEnv, out: &mut Vec<WordDecoration>
 /// The population the eclipse bound governs, by blend and glyph: light-theme
 /// charge motes and debris are Over too but must not be darkened with the veil.
 #[inline]
-fn is_shade(d: &WordDecoration) -> bool {
+const fn is_shade(d: &WordDecoration) -> bool {
     matches!(d.blend, DecoBlend::Over) && matches!(d.glyph, DecoGlyph::Shade)
 }
 

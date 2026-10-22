@@ -3908,7 +3908,7 @@ pub(crate) fn confine_image_path(sock_dir: &Path, requested: &str) -> Option<Con
 /// against a real planted symlink (`crates/aterm-gui/src/path_confine_conformance_tests.rs`).
 // The anchor expands in every test and debug build, so aterm-gui's own closure gate sees
 // it, and so does aterm-models' from outside the crate.
-// PROJECTION (TRUST_VACUITY_GATE §2.2 / finding 2): `Confine` projects the real
+// PROJECTION (TRUST_VACUITY_GATE §2.2): `Confine` projects the real
 // confine outcome onto the model's `<<decided, committed, target>>` — the projection
 // the `path_confine_conformance_tests` Tier-1 test drives (`Some` → committed inside,
 // `None` → rejected). L2 requires the projection NAME be present (Trust does

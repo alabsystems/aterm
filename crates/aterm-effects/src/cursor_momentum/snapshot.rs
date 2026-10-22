@@ -389,7 +389,7 @@ impl MomentumGlowSnapshot {
     /// The canonical encoding (the module docs' table).
     #[inline]
     #[must_use]
-    pub fn encode(&self) -> [u8; Self::LEN] {
+    pub const fn encode(&self) -> [u8; Self::LEN] {
         let mut out = [0u8; Self::LEN];
         let mut w = Writer(&mut out);
         w.put(MOMENTUM_GLOW_SNAPSHOT_SCHEMA.to_le_bytes());
@@ -413,7 +413,7 @@ impl MomentumGlowSnapshot {
     /// [`SnapshotRefusal::Tag`], [`SnapshotRefusal::NonCanonical`],
     /// [`SnapshotRefusal::NotANumber`] or [`SnapshotRefusal::NegativeZero`].
     #[inline]
-    pub fn decode(bytes: &[u8]) -> Result<Self, SnapshotRefusal> {
+    pub const fn decode(bytes: &[u8]) -> Result<Self, SnapshotRefusal> {
         if bytes.len() != Self::LEN {
             return Err(SnapshotRefusal::Length {
                 expected: Self::LEN,
@@ -421,17 +421,56 @@ impl MomentumGlowSnapshot {
             });
         }
         let mut r = Reader(bytes);
-        let schema = u16::from_le_bytes(r.take()?);
+        let schema_bytes = match r.take() {
+            Ok(b) => b,
+            Err(e) => return Err(e),
+        };
+        let schema = u16::from_le_bytes(schema_bytes);
         if schema != MOMENTUM_GLOW_SNAPSHOT_SCHEMA {
             return Err(SnapshotRefusal::Schema { found: schema });
         }
-        let rate_value = canonical_f32(r.take()?, SnapshotField::RateValue)?;
-        let rate_at = r.offset(SnapshotField::RateAt)?;
-        let fp_last = u64::from_le_bytes(r.take()?);
-        let fp_prev = u64::from_le_bytes(r.take()?);
-        let latched = canonical_f32(r.take()?, SnapshotField::Latched)?;
-        let stamp = r.offset(SnapshotField::Stamp)?;
-        let tau = canonical_f32(r.take()?, SnapshotField::Tau)?;
+        let rate_bytes = match r.take() {
+            Ok(b) => b,
+            Err(e) => return Err(e),
+        };
+        let rate_value = match canonical_f32(rate_bytes, SnapshotField::RateValue) {
+            Ok(v) => v,
+            Err(e) => return Err(e),
+        };
+        let rate_at = match r.offset(SnapshotField::RateAt) {
+            Ok(v) => v,
+            Err(e) => return Err(e),
+        };
+        let fp_last_bytes = match r.take() {
+            Ok(b) => b,
+            Err(e) => return Err(e),
+        };
+        let fp_last = u64::from_le_bytes(fp_last_bytes);
+        let fp_prev_bytes = match r.take() {
+            Ok(b) => b,
+            Err(e) => return Err(e),
+        };
+        let fp_prev = u64::from_le_bytes(fp_prev_bytes);
+        let latched_bytes = match r.take() {
+            Ok(b) => b,
+            Err(e) => return Err(e),
+        };
+        let latched = match canonical_f32(latched_bytes, SnapshotField::Latched) {
+            Ok(v) => v,
+            Err(e) => return Err(e),
+        };
+        let stamp = match r.offset(SnapshotField::Stamp) {
+            Ok(v) => v,
+            Err(e) => return Err(e),
+        };
+        let tau_bytes = match r.take() {
+            Ok(b) => b,
+            Err(e) => return Err(e),
+        };
+        let tau = match canonical_f32(tau_bytes, SnapshotField::Tau) {
+            Ok(v) => v,
+            Err(e) => return Err(e),
+        };
         Ok(Self {
             rate_value,
             rate_at,
@@ -454,14 +493,14 @@ impl MomentumGlowSnapshot {
     /// [`SnapshotRefusal::Fingerprint`], [`SnapshotRefusal::HotWithoutRate`],
     /// [`SnapshotRefusal::Tau`], [`SnapshotRefusal::History`] or
     /// [`SnapshotRefusal::Horizon`].
-    pub fn validate(&self) -> Result<(), SnapshotRefusal> {
+    pub const fn validate(&self) -> Result<(), SnapshotRefusal> {
         let one = 1.0f32.to_bits();
         let credited = MOMENTUM_GLOW_KEY_CREDIT.to_bits();
         let live_floor = LIVE_CREDIT_FLOOR.to_bits();
         let hot_floor = MOMENTUM_GLOW_HOT.to_bits();
         let rate_ok = self.rate_value == 0
             || self.rate_value == credited
-            || (live_floor..=one).contains(&self.rate_value);
+            || (self.rate_value >= live_floor && self.rate_value <= one);
         if !rate_ok {
             return Err(SnapshotRefusal::RateValue {
                 bits: self.rate_value,
@@ -473,7 +512,7 @@ impl MomentumGlowSnapshot {
                 stamped: self.rate_at.is_some(),
             });
         }
-        if self.latched != 0 && !(hot_floor..=one).contains(&self.latched) {
+        if self.latched != 0 && !(self.latched >= hot_floor && self.latched <= one) {
             return Err(SnapshotRefusal::Latched { bits: self.latched });
         }
         let hot = self.latched != 0;
@@ -484,13 +523,17 @@ impl MomentumGlowSnapshot {
                 fp_last: self.fp_last,
             });
         }
-        for (field, value) in [
-            (SnapshotField::FpLast, self.fp_last),
-            (SnapshotField::FpPrev, self.fp_prev),
-        ] {
-            if value != 0 && value & 1 == 0 {
-                return Err(SnapshotRefusal::Fingerprint { field, value });
-            }
+        if self.fp_last != 0 && self.fp_last & 1 == 0 {
+            return Err(SnapshotRefusal::Fingerprint {
+                field: SnapshotField::FpLast,
+                value: self.fp_last,
+            });
+        }
+        if self.fp_prev != 0 && self.fp_prev & 1 == 0 {
+            return Err(SnapshotRefusal::Fingerprint {
+                field: SnapshotField::FpPrev,
+                value: self.fp_prev,
+            });
         }
         if hot && self.rate_value == 0 {
             return Err(SnapshotRefusal::HotWithoutRate {
@@ -501,7 +544,7 @@ impl MomentumGlowSnapshot {
         // positive τ (subnormals included, as the rate's `τ > 0` gate admits
         // them) up to the profile's ceiling.
         let tau_ok = if hot {
-            (1..=MOMENTUM_PROFILE.max_tau_s.to_bits()).contains(&self.tau)
+            self.tau >= 1 && self.tau <= MOMENTUM_PROFILE.max_tau_s.to_bits()
         } else {
             self.tau <= f32::MAX.to_bits()
         };
@@ -521,20 +564,29 @@ impl MomentumGlowSnapshot {
             });
         }
         // Every `Duration` is below 2^94 ns, so the horizon's nanoseconds fit.
-        let horizon = i128::try_from(
-            MOMENTUM_PROFILE
-                .horizon
-                .min(MOMENTUM_ENVELOPE.horizon)
-                .as_nanos(),
-        )
-        .unwrap_or(i128::MAX);
-        for (field, offset) in [
-            (SnapshotField::RateAt, self.rate_at),
-            (SnapshotField::Stamp, self.stamp),
-        ] {
-            if let Some(offset) = offset.filter(|&o| o > horizon) {
-                return Err(SnapshotRefusal::Horizon { field, offset });
-            }
+        let p_ns = MOMENTUM_PROFILE.horizon.as_nanos();
+        let env_ns = MOMENTUM_ENVELOPE.horizon.as_nanos();
+        let min_ns = if p_ns < env_ns { p_ns } else { env_ns };
+        let horizon = if min_ns > i128::MAX as u128 {
+            i128::MAX
+        } else {
+            min_ns as i128
+        };
+        if let Some(offset) = self.rate_at
+            && offset > horizon
+        {
+            return Err(SnapshotRefusal::Horizon {
+                field: SnapshotField::RateAt,
+                offset,
+            });
+        }
+        if let Some(offset) = self.stamp
+            && offset > horizon
+        {
+            return Err(SnapshotRefusal::Horizon {
+                field: SnapshotField::Stamp,
+                offset,
+            });
         }
         Ok(())
     }
@@ -649,7 +701,10 @@ fn instant_at(
 
 /// A float's bits, refused when NaN or `-0.0`.
 #[inline]
-fn canonical_f32(bytes: [u8; F32_BYTES], field: SnapshotField) -> Result<u32, SnapshotRefusal> {
+const fn canonical_f32(
+    bytes: [u8; F32_BYTES],
+    field: SnapshotField,
+) -> Result<u32, SnapshotRefusal> {
     let bits = u32::from_le_bytes(bytes);
     if f32::from_bits(bits).is_nan() {
         return Err(SnapshotRefusal::NotANumber { field, bits });
@@ -667,8 +722,9 @@ struct Writer<'a>(&'a mut [u8]);
 
 impl Writer<'_> {
     #[inline]
-    fn put<const N: usize>(&mut self, bytes: [u8; N]) {
-        let rest = std::mem::take(&mut self.0);
+    const fn put<const N: usize>(&mut self, bytes: [u8; N]) {
+        #[expect(clippy::mem_replace_with_default, reason = "mem::take is not const fn")]
+        let rest = std::mem::replace(&mut self.0, &mut []);
         if let Some((head, tail)) = rest.split_first_chunk_mut::<N>() {
             *head = bytes;
             self.0 = tail;
@@ -676,9 +732,13 @@ impl Writer<'_> {
     }
 
     #[inline]
-    fn offset(&mut self, offset: Option<i128>) {
-        self.put([u8::from(offset.is_some())]);
-        self.put(offset.unwrap_or(0).to_le_bytes());
+    const fn offset(&mut self, offset: Option<i128>) {
+        self.put([offset.is_some() as u8]);
+        let v = match offset {
+            Some(v) => v,
+            None => 0,
+        };
+        self.put(v.to_le_bytes());
     }
 }
 
@@ -688,26 +748,32 @@ struct Reader<'a>(&'a [u8]);
 
 impl Reader<'_> {
     #[inline]
-    fn take<const N: usize>(&mut self) -> Result<[u8; N], SnapshotRefusal> {
-        let (head, tail) = self
-            .0
-            .split_first_chunk::<N>()
-            .ok_or(SnapshotRefusal::Length {
+    const fn take<const N: usize>(&mut self) -> Result<[u8; N], SnapshotRefusal> {
+        let Some((head, tail)) = self.0.split_first_chunk::<N>() else {
+            return Err(SnapshotRefusal::Length {
                 expected: MomentumGlowSnapshot::LEN,
                 found: self.0.len(),
-            })?;
+            });
+        };
         self.0 = tail;
         Ok(*head)
     }
 
     #[inline]
-    fn offset(&mut self, field: SnapshotField) -> Result<Option<i128>, SnapshotRefusal> {
-        let [tag] = self.take::<TAG_BYTES>()?;
-        let payload = self.take::<OFFSET_BYTES>()?;
+    const fn offset(&mut self, field: SnapshotField) -> Result<Option<i128>, SnapshotRefusal> {
+        let [tag] = match self.take::<TAG_BYTES>() {
+            Ok(b) => b,
+            Err(e) => return Err(e),
+        };
+        let payload = match self.take::<OFFSET_BYTES>() {
+            Ok(b) => b,
+            Err(e) => return Err(e),
+        };
+        let v = i128::from_le_bytes(payload);
         match tag {
-            0 if payload == [0; OFFSET_BYTES] => Ok(None),
+            0 if v == 0 => Ok(None),
             0 => Err(SnapshotRefusal::NonCanonical { field }),
-            1 => Ok(Some(i128::from_le_bytes(payload))),
+            1 => Ok(Some(v)),
             tag => Err(SnapshotRefusal::Tag { field, tag }),
         }
     }

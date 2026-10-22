@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE `.seq` REPLAY CORPUS (design §9 "Replay"; plan 5B-1; rulings T3, T4,
-//! T5, T29): host sequences written as text in `tests/sequences/*.seq`,
+//! THE `.seq` REPLAY CORPUS (design §9 "Replay"):
+//! host sequences written as text in `tests/sequences/*.seq`,
 //! replayed through the real [`Log`] and [`TurnTracker`].
 //!
 //! A file is read whole, in name order, from the directory (no list names
@@ -50,7 +50,7 @@
 //! checked against the derived `TurnTracker` model as `drive` checks it
 //! (T29), and it adds `half`, `elapse`, `wake`, `vendor-turn` (the open
 //! turn's vendor turn is prompted and ends), `judge-refutes`, and the
-//! inputs of ruling T1: `admit <actor> [act=approve|deny|answer]` (the host
+//! inputs of `admit <actor> [act=approve|deny|answer]` (the host
 //! admits an input under the lock it takes before a byte; one in flight),
 //! `accept` (its bytes are written) and `person` (a person's key: both at
 //! once). The
@@ -2577,8 +2577,8 @@ fn folded(p: &seq_twins::Path) -> (Vec<FoldedCall>, Vec<String>) {
     )
 }
 
-/// A `.seq` WITH PROGRAM MARKS INTERLEAVED FOLDS TO THE SAME LINES (phase 6,
-/// 6F-4; ruling U17: the fold never reads a program mark). Every corpus
+/// A `.seq` WITH PROGRAM MARKS INTERLEAVED FOLDS TO THE SAME LINES (the fold never reads a program mark).
+/// Every corpus
 /// file on a session's ring whose steps name no record by its seq
 /// (`ctl cause=`), replayed with a `program` step before each of its steps,
 /// takes the same path: the same host calls, the same model state after

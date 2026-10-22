@@ -136,7 +136,7 @@ impl CardShape {
 
     /// The card-local scene a frame of this shape is drawn from.
     #[inline]
-    pub(super) fn scene(&self) -> &CardScene {
+    pub(super) const fn scene(&self) -> &CardScene {
         &self.local
     }
 
@@ -170,7 +170,7 @@ pub struct CardFrame {
 /// their ids from frame to frame and two cards never share one.
 #[must_use]
 #[inline]
-pub fn card_layer_id(card: u64, slot: FxSlot) -> u64 {
+pub const fn card_layer_id(card: u64, slot: FxSlot) -> u64 {
     let salt = match slot {
         FxSlot::Under => 0x4341_5244_5544_4552,
         FxSlot::Glow => 0x4341_5244_474C_4F57,
@@ -296,7 +296,7 @@ impl CardFrames {
     /// The frame kept, if any: the settled frame or a flow step.
     #[inline]
     #[must_use]
-    pub fn kept(&self) -> Option<&KeptFrame> {
+    pub const fn kept(&self) -> Option<&KeptFrame> {
         self.kept.as_ref()
     }
 
@@ -310,7 +310,7 @@ impl CardFrames {
     /// height), for a host that hands them to the renderer ahead of use.
     #[must_use]
     #[inline]
-    pub fn arts(&self) -> Option<&Arc<CardArts>> {
+    pub const fn arts(&self) -> Option<&Arc<CardArts>> {
         self.arts.as_ref()
     }
 
@@ -365,7 +365,7 @@ fn refill(content: &mut Arc<FxContent>, f: impl FnOnce(&mut Vec<FxItem>, &mut Ve
 
 /// A paint as a palette entry.
 #[inline]
-fn fx_ink(p: Paint) -> FxInk {
+const fn fx_ink(p: Paint) -> FxInk {
     FxInk::over(p.color, p.alpha)
 }
 
@@ -600,7 +600,7 @@ impl CardArts {
     /// The cell height these arts are for.
     #[must_use]
     #[inline]
-    pub fn ch(&self) -> u16 {
+    pub const fn ch(&self) -> u16 {
         self.ch
     }
 
@@ -842,7 +842,7 @@ fn rim(cx: &Emit<'_>, arts: &CardArts, items: &mut Vec<FxItem>, palette: &mut Ve
 
 /// A card rectangle as an fx one (card-local pixels fit in `i32`).
 #[inline]
-fn px_rect(r: Rect) -> PxRect {
+const fn px_rect(r: Rect) -> PxRect {
     PxRect::new(r.x0 as i32, r.y0 as i32, r.x1 as i32, r.y1 as i32)
 }
 

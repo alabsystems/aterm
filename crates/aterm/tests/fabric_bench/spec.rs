@@ -136,7 +136,7 @@ impl Scenario {
 }
 
 /// The bridge's `--log` mode, as a run names it (`log=auto|off`): `auto`,
-/// what ships (session log step 6E-3, owner decision D4), mirrors the session
+/// what ships (owner decision D4), mirrors the session
 /// logs' bus class onto the sessions' `ev` faces while the broker retains
 /// them; `off` mirrors nothing. The harness passes `--log off` on the bridge's
 /// `serve` line for `off`, and nothing for `auto`, the bridge's default.

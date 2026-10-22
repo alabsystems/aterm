@@ -156,7 +156,7 @@ impl CursorDroplet {
     /// water is surging (typing, or a splash calming).
     #[must_use]
     #[inline]
-    pub fn is_active(&self) -> bool {
+    pub const fn is_active(&self) -> bool {
         self.surge > SETTLED_SURGE
     }
 

@@ -52,6 +52,194 @@ fn the_tool_script_is_answered_one_call_per_request_from_toolstart() {
     assert_eq!(tool_turn(&two, &script), Some(ToolTurn::Done));
 }
 
+/// A `calls` step is several tool uses in ONE assistant message (parallel
+/// calls), answered by one request holding all their results: one step.
+#[test]
+fn a_calls_step_makes_its_calls_in_one_message_and_counts_as_one_step() {
+    let script = J::parse(
+        r#"[{"calls":[{"name":"Bash","input":{"command":"echo a"}},{"name":"Bash","input":{"command":"echo b"}}]},
+            {"name":"Read","input":{}}]"#,
+    )
+    .unwrap();
+    let start = body(r#"{"messages":[{"role":"user","content":"toolstart"}]}"#);
+    match tool_turn(&start, &script) {
+        Some(ToolTurn::Calls(calls, 0)) => {
+            let commands: Vec<Option<&str>> = calls
+                .iter()
+                .map(|(n, i)| {
+                    assert_eq!(n, "Bash");
+                    i.get("command").and_then(J::as_str)
+                })
+                .collect();
+            assert_eq!(commands, [Some("echo a"), Some("echo b")]);
+        }
+        other => panic!("{other:?}"),
+    }
+    // Both results ride in one user message: the next step is the Read.
+    let both = body(
+        r#"{"messages":[{"role":"user","content":"toolstart"},{"role":"assistant","content":[{"type":"tool_use","name":"Bash"},{"type":"tool_use","name":"Bash"}]},{"role":"user","content":[{"type":"tool_result","content":"a"},{"type":"tool_result","content":"b"}]}]}"#,
+    );
+    assert!(matches!(tool_turn(&both, &script), Some(ToolTurn::Call(n, _, 1)) if n == "Read"));
+    // NEGATIVE CONTROL: a `calls` list of no named call is no step.
+    let empty = J::parse(r#"[{"calls":[{"input":{}}]},{"name":"Read","input":{}}]"#).unwrap();
+    assert!(matches!(tool_turn(&start, &empty), Some(ToolTurn::Call(n, _, 0)) if n == "Read"));
+}
+
+/// Each input of a `calls` step has its `@SID:<k>@` filled from the `k`th
+/// tool result, as a single call's is ([`fill_sids`]): every call in the
+/// message, not the first alone.
+///
+/// NEGATIVE CONTROL: with no result yet, the same step's inputs keep the
+/// placeholder as written.
+#[test]
+fn a_calls_steps_inputs_have_their_sids_filled() {
+    let script = J::parse(
+        r#"[{"name":"Bash","input":{"command":"spawn"}},
+            {"calls":[{"name":"Bash","input":{"command":"result @SID:1@"}},{"name":"Bash","input":{"command":"await @SID:1@"}}]}]"#,
+    )
+    .unwrap();
+    let commands = |b: &[u8]| match tool_turn(b, &script) {
+        Some(ToolTurn::Calls(calls, _)) => calls
+            .iter()
+            .map(|(_, i)| i.get("command").and_then(J::as_str).unwrap().to_string())
+            .collect::<Vec<_>>(),
+        other => panic!("{other:?}"),
+    };
+    let after = body(
+        r#"{"messages":[{"role":"user","content":"toolstart"},{"role":"assistant","content":[{"type":"tool_use","name":"Bash"}]},{"role":"user","content":[{"type":"tool_result","content":"spawned s-1a2b"}]}]}"#,
+    );
+    assert_eq!(commands(&after), ["result s-1a2b", "await s-1a2b"]);
+    // NEGATIVE CONTROL: the calls step first, no result to fill from.
+    let first =
+        J::parse(r#"[{"calls":[{"name":"Bash","input":{"command":"result @SID:1@"}}]}]"#).unwrap();
+    let start = body(r#"{"messages":[{"role":"user","content":"toolstart"}]}"#);
+    match tool_turn(&start, &first) {
+        Some(ToolTurn::Calls(calls, 0)) => assert_eq!(
+            calls[0].1.get("command").and_then(J::as_str),
+            Some("result @SID:1@")
+        ),
+        other => panic!("{other:?}"),
+    }
+}
+
+/// Served for real: a `calls` step streams one assistant message with one
+/// `tool_use` block per call, at indexes 0, 1, …, each block's input
+/// reassembled from its own `input_json_delta`s, and stops for `tool_use`
+/// (what Claude Code answered with two boxes in the breaker-4 lab), each
+/// block with an id of its own (Claude Code pairs each result with its call
+/// by that id).
+///
+/// NEGATIVE CONTROL: a script of one named call streams one block, index 0.
+#[test]
+fn served_a_calls_step_streams_every_call_in_one_message() {
+    let scratch = aterm_tempfile::Builder::new()
+        .prefix("lab-stub-calls-")
+        .tempdir()
+        .unwrap();
+    let dir = scratch.path();
+    let tool_file = dir.join("tool.json");
+    let mode_file = dir.join("mode");
+    std::fs::write(&mode_file, "tool\n").unwrap();
+    let args = Args {
+        mode_file: Some(mode_file),
+        tool_file: Some(tool_file.clone()),
+        ..Args::default()
+    };
+    let (port, _) = start(args).unwrap();
+    let client = aterm_http::Client::new(
+        aterm_http::Trust::PlatformVerifier,
+        aterm_http::ProxyMode::Direct,
+        Duration::from_secs(60),
+    );
+    let turn = r#"{"model":"claude-x","stream":true,"max_tokens":32000,"tools":[{}],"messages":[{"role":"user","content":"toolstart"}]}"#;
+    // Each tool_use block's name and its input, by index, its id, and the stop
+    // reason.
+    let streamed = || -> (Vec<(String, J)>, Vec<String>, Option<String>) {
+        let r = client
+            .post(&format!("http://127.0.0.1:{port}/v1/messages"))
+            .send(turn.as_bytes())
+            .unwrap();
+        assert_eq!(r.status(), 200);
+        let events: Vec<J> = String::from_utf8_lossy(r.body())
+            .lines()
+            .filter_map(|l| l.strip_prefix("data: "))
+            .filter_map(|d| J::parse(d).ok())
+            .collect();
+        let mut blocks: Vec<(String, String)> = Vec::new();
+        let mut ids: Vec<String> = Vec::new();
+        let mut stop = None;
+        for e in &events {
+            let index = e
+                .get("index")
+                .and_then(J::as_i64)
+                .and_then(|i| usize::try_from(i).ok());
+            match e.get("type").and_then(J::as_str) {
+                Some("content_block_start") => {
+                    let b = e.get("content_block").unwrap();
+                    assert_eq!(b.get("type").and_then(J::as_str), Some("tool_use"));
+                    assert_eq!(index, Some(blocks.len()));
+                    let name = b.get("name").and_then(J::as_str).unwrap().to_string();
+                    blocks.push((name, String::new()));
+                    ids.push(b.get("id").and_then(J::as_str).unwrap().to_string());
+                }
+                Some("content_block_delta") => {
+                    let part = e
+                        .get("delta")
+                        .and_then(|d| d.get("partial_json"))
+                        .and_then(J::as_str)
+                        .unwrap();
+                    blocks[index.unwrap()].1.push_str(part);
+                }
+                Some("message_delta") => {
+                    stop = e
+                        .get("delta")
+                        .and_then(|d| d.get("stop_reason"))
+                        .and_then(J::as_str)
+                        .map(str::to_string);
+                }
+                _ => {}
+            }
+        }
+        let blocks = blocks
+            .into_iter()
+            .map(|(n, js)| (n, J::parse(&js).unwrap()))
+            .collect();
+        (blocks, ids, stop)
+    };
+    std::fs::write(
+        &tool_file,
+        r#"[{"calls":[{"name":"Bash","input":{"command":"echo a","description":"A"}},{"name":"Bash","input":{"command":"echo b","description":"B"}}]}]"#,
+    )
+    .unwrap();
+    let (blocks, ids, stop) = streamed();
+    assert_eq!(ids.len(), 2, "{ids:?}");
+    assert!(ids.iter().all(|id| id.starts_with("toolu_lab")), "{ids:?}");
+    assert_ne!(ids[0], ids[1], "each call its own id");
+    let commands: Vec<(&str, Option<&str>)> = blocks
+        .iter()
+        .map(|(n, i)| (n.as_str(), i.get("command").and_then(J::as_str)))
+        .collect();
+    assert_eq!(
+        commands,
+        [("Bash", Some("echo a")), ("Bash", Some("echo b"))]
+    );
+    assert_eq!(stop.as_deref(), Some("tool_use"));
+    // NEGATIVE CONTROL
+    std::fs::write(
+        &tool_file,
+        r#"[{"name":"Bash","input":{"command":"echo c"}}]"#,
+    )
+    .unwrap();
+    let (blocks, ids, stop) = streamed();
+    assert_eq!(blocks.len(), 1, "{blocks:?}");
+    assert_eq!(ids.len(), 1, "{ids:?}");
+    assert_eq!(
+        blocks[0].1.get("command").and_then(J::as_str),
+        Some("echo c")
+    );
+    assert_eq!(stop.as_deref(), Some("tool_use"));
+}
+
 #[test]
 fn a_call_with_when_belongs_to_the_subagent_whose_prompt_holds_it() {
     let script = J::parse(r#"[{"name":"Agent","input":{}},{"when":"SUBLAB","name":"Bash","input":{"command":"touch x"}}]"#).unwrap();

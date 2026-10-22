@@ -4,7 +4,7 @@
 //! `machines-root-door`: the root tools `aterm machines` runs on a managed Mac stay inside
 //! its crate (docs/DESIGN-machines-2026-10-16.md §3.6).
 //!
-//! The owner's ruling M1 authorizes root actions for the `aterm machines agent` lane alone;
+//! Root actions are authorized for the `aterm machines agent` lane alone;
 //! aterm's install path keeps "no admin prompt, no privileged helper". A line of shipped code
 //! elsewhere that names one of these tools, or reaches the agent past the one door
 //! (`aterm_machines::cli::main_entry`, whose `agent` arm is the only caller of
@@ -12,10 +12,10 @@
 //! `launchctl` writes have no literal a line rule can tell from their read-only uses, so the
 //! crate's own review keeps them.
 //!
-//! One spelling is not root work, and is admitted (owner ruling R1, 2026-10-22, recorded in
-//! the design's §3.6): atpkg's Rosetta 2 install, `softwareupdate --install-rosetta
-//! --agree-to-license`, which installs as the user who runs it, with no administrator
-//! (measured 2026-10-18 and 2026-10-21). It passes only as that whole argv array, in the one
+//! One spelling is not root work, and is admitted (docs/DESIGN-machines-2026-10-16.md §3.6):
+//! atpkg's Rosetta 2 install, `softwareupdate --install-rosetta
+//! --agree-to-license`, which installs as the user who runs it, with no administrator.
+//! It passes only as that whole argv array, in the one
 //! atpkg file that holds it ([`ROSETTA_INSTALL`]); `softwareupdate` with any other words, in
 //! any other shape or file, is still a finding.
 
@@ -42,7 +42,7 @@ const ROOT_TOOLS: &[&str] = &[
 /// The agent's module, named by path.
 const AGENT_PATH: &str = "aterm_machines::agent";
 
-/// The one admitted spelling (owner ruling R1): the file, the tool, and the whole argv the
+/// The one admitted spelling: the file, the tool, and the whole argv the
 /// tool may appear in there, as the array literal's text with the whitespace between its
 /// tokens removed (a trailing comma before `]` is rustfmt's, and allowed).
 const ROSETTA_INSTALL: (&str, &str, &str) = (
@@ -100,7 +100,7 @@ fn machines_root_door(tree: &Tree<'_>, out: &mut Vec<Finding>) {
     }
 }
 
-/// Whether `line`'s one root tool is ruling R1's Rosetta 2 install: in its one file, the
+/// Whether `line`'s one root tool is the admitted Rosetta 2 install: in its one file, the
 /// line names no root tool but `softwareupdate`, once, as the first element of an array
 /// literal that is exactly [`ROSETTA_INSTALL`]'s argv, however rustfmt wraps it.
 fn is_rosetta_install(file: &SourceFile, line: &Line<'_>, tool: &str) -> bool {
@@ -233,7 +233,7 @@ mod tests {
         );
     }
 
-    /// Ruling R1's one admitted spelling, and every near miss of it. Positive: the whole
+    /// The one admitted Rosetta 2 install spelling, and every near miss of it. Positive: the whole
     /// argv array in atpkg's platform file, as rustfmt wraps it and on one line. Negative:
     /// the same array in another file; in that file, `softwareupdate` with other words, an
     /// extra word, a word missing, `sudo` before it, outside an array, a second tool on the

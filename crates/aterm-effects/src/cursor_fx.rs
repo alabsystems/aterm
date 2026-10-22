@@ -1084,9 +1084,9 @@ struct OverInkShares(u64);
 
 impl OverInkShares {
     #[inline]
-    fn fold(&mut self, share: f32) {
+    const fn fold(&mut self, share: f32) {
         if share < 1.0 {
-            self.0 = aterm_hash::fnv_mix_u64(self.0 | 1, u64::from(share.to_bits()));
+            self.0 = aterm_hash::fnv_mix_u64(self.0 | 1, share.to_bits() as u64);
         }
     }
 }
@@ -1187,7 +1187,7 @@ impl CursorFx {
     /// the scheduler's frame-cadence set this step owns.
     #[inline]
     #[must_use]
-    pub fn bodies_active(&self) -> bool {
+    pub const fn bodies_active(&self) -> bool {
         self.rainbow.is_active()
             || self.droplet.is_active()
             || self.momentum.is_active()
@@ -1204,7 +1204,7 @@ impl CursorFx {
     /// [`Self::bodies_next_change_deadline`] on its coarse one-shot arm.
     #[inline]
     #[must_use]
-    pub fn bodies_settling(&self) -> bool {
+    pub const fn bodies_settling(&self) -> bool {
         self.rainbow.settling() || self.momentum.settling()
     }
 

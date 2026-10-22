@@ -564,14 +564,14 @@ impl Line {
     /// Get the length in bytes.
     #[must_use]
     #[inline]
-    pub fn len(&self) -> usize {
+    pub const fn len(&self) -> usize {
         self.content.len()
     }
 
     /// Check if empty.
     #[must_use]
     #[inline]
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.content.is_empty()
     }
 

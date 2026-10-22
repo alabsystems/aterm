@@ -1173,7 +1173,7 @@ fn a_fork_lane_successor_gets_the_page_once_its_reading_is_its_own() {
     assert!(app.fda_panel_up());
 }
 
-// DEBUGGER ACCESS ON A NEW MAC (owner ruling O29, 2026-10-19; `debugger_access`)
+// DEBUGGER ACCESS ON A NEW MAC (`debugger_access`)
 
 /// One alert as the stand-in was asked it: title, body and proceed button.
 type Alert = (String, String, String);

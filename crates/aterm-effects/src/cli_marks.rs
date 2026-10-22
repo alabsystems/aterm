@@ -118,8 +118,24 @@ impl CliMark {
     /// `kitty_registry` keys flagship art by, and `Program::name`'s word);
     /// `None` for any other program.
     #[must_use]
-    pub fn for_app(app_id: &str) -> Option<Self> {
-        Self::ALL.into_iter().find(|m| m.word() == app_id)
+    pub const fn for_app(app_id: &str) -> Option<Self> {
+        let target = app_id.as_bytes();
+        let mut i = 0;
+        while i < Self::ALL.len() {
+            let m = Self::ALL[i];
+            let word = m.word().as_bytes();
+            if word.len() == target.len() {
+                let mut j = 0;
+                while j < word.len() && word[j] == target[j] {
+                    j += 1;
+                }
+                if j == word.len() {
+                    return Some(m);
+                }
+            }
+            i += 1;
+        }
+        None
     }
 
     /// The CLI's own lowercase word: its canonical app id, and the name a
@@ -489,32 +505,51 @@ impl Fit {
 /// the placement is centred, floored. An integer scale is whole texel
 /// blocks, so no scale blurs.
 #[must_use]
-pub fn fit(mark: CliMark, cw: u16, ch: u16) -> Option<Fit> {
-    let box_w = u32::from(ICON_CELLS) * u32::from(cw);
-    let box_h = u32::from(ch);
-    let room_h = box_h.checked_sub(u32::from(AIR_PX))?;
+pub const fn fit(mark: CliMark, cw: u16, ch: u16) -> Option<Fit> {
+    let box_w = ICON_CELLS as u32 * cw as u32;
+    let box_h = ch as u32;
+    let Some(room_h) = box_h.checked_sub(AIR_PX as u32) else {
+        return None;
+    };
     let b = brand(mark);
     let mut best: Option<Fit> = None;
-    for master in [Master::Sd, Master::Hd] {
+    let masters = [Master::Sd, Master::Hd];
+    let mut i = 0;
+    while i < masters.len() {
+        let master = masters[i];
+        i += 1;
         let Some(rows) = b.master(master) else {
             continue;
         };
         let (w, h) = (
-            rows.first().map_or(0, |r| r.len()) as u32,
+            match rows.first() {
+                Some(r) => r.len() as u32,
+                None => 0,
+            },
             rows.len() as u32,
         );
         if w == 0 || h == 0 {
             continue;
         }
         // The largest scale in the box, and in a sprite's u16 sides.
-        let most = u32::from(u16::MAX);
-        let s = (box_w / w).min(room_h / h).min(most / w).min(most / h);
-        let Ok(scale) = u16::try_from(s) else {
-            continue;
-        };
-        if scale == 0 {
+        let most = u16::MAX as u32;
+        let mut s = box_w / w;
+        let rh = room_h / h;
+        if rh < s {
+            s = rh;
+        }
+        let mw = most / w;
+        if mw < s {
+            s = mw;
+        }
+        let mh = most / h;
+        if mh < s {
+            s = mh;
+        }
+        if s == 0 || s > u16::MAX as u32 {
             continue;
         }
+        let scale = s as u16;
         let (dw, dh) = (w * s, h * s);
         let cand = Fit {
             master,
@@ -525,7 +560,11 @@ pub fn fit(mark: CliMark, cw: u16, ch: u16) -> Option<Fit> {
             dy: ((box_h - dh) / 2) as u16,
         };
         // SD is offered first, so an equal HD replaces it.
-        if best.is_none_or(|kept| cand.effective() >= kept.effective()) {
+        let replace = match best {
+            None => true,
+            Some(kept) => cand.effective() >= kept.effective(),
+        };
+        if replace {
             best = Some(cand);
         }
     }
@@ -549,9 +588,10 @@ pub fn art(mark: CliMark, master: Master) -> Option<&'static Arc<FxArt>> {
 /// The ink of letter `letter` of `mark`'s name on a ground of polarity
 /// `dark`, before the floor (the last letter's for a letter past the word).
 #[must_use]
-pub fn name_ink(mark: CliMark, letter: usize, dark: bool) -> u32 {
+pub const fn name_ink(mark: CliMark, letter: usize, dark: bool) -> u32 {
     let inks = brand(mark).name.on(dark);
-    inks[letter.min(inks.len() - 1)]
+    let last = inks.len() - 1;
+    inks[if letter < last { letter } else { last }]
 }
 
 /// The ink letter `letter` of `mark`'s name is drawn in on `ground`

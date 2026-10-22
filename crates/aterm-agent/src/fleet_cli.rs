@@ -64,16 +64,11 @@ fn route(mode: Option<&str>) -> Route {
 /// What took a removed mode's work, for its refusal.
 fn gone_to(mode: &str) -> Option<&'static str> {
     Some(match mode {
-        "events" => {
-            "`aterm ctl survey` reads what every session of every instance is doing, and \
-             `aterm ctl subscribe @a,@b events` streams one instance's"
-        }
-        "exec" => "`aterm ctl @<sid> <verb>` reaches a session of any instance on this machine",
+        "events" => "use `aterm ctl survey` or `aterm ctl subscribe @a,@b events`",
+        "exec" => "use `aterm ctl @<sid> <verb>`",
         "status" | "inspect" | "manage" | "unmanage" | "next" | "extend" | "ack" | "reconcile"
         | "clear-fault" | "propose" => {
-            "the attention queue it served is gone: a manager session takes its place, reading \
-             every session with `aterm ctl survey` and starting workers with `aterm ctl @self \
-             spawn agent=claude -`"
+            "use `aterm ctl survey` and `aterm ctl @self spawn agent=claude -`"
         }
         _ => return None,
     })
@@ -83,9 +78,8 @@ fn usage() -> ExitCode {
     #[cfg(unix)]
     let help = crate::fleet_member::USAGE;
     #[cfg(not(unix))]
-    let help = "aterm fleet — this machine's membership in a fleet: the machines \
-         `aterm ctl survey --fleet` reads. This platform keeps no fleet membership.\n\n\
-         See `aterm help fleet`.\n";
+    let help = "aterm fleet — fleet membership (unsupported on this platform; \
+         see `aterm help fleet`).\n";
     aterm_uds::stdout::answer_exit("aterm fleet", help, 0)
 }
 

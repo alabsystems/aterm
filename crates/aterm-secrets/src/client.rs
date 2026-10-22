@@ -221,6 +221,15 @@ pub enum SyncOutcome {
         /// The seq held.
         seq: u64,
     },
+    /// The source held no version of the vault (a server that lost its store), or a long-poll
+    /// said it holds an older one than this machine verified (a server that lost its store
+    /// took an older copy back): this machine's copy was put back ([`sync`]).
+    PutBack {
+        /// The seq held, and now the source's.
+        seq: u64,
+        /// The seq the source held, `None` when it held none.
+        served: Option<u64>,
+    },
     /// No locker opens for this machine (yet, or any more).
     NotIn,
 }
@@ -923,6 +932,97 @@ fn is_envelope(bytes: &[u8]) -> bool {
     bytes.starts_with(envelope::MAGIC.as_bytes())
 }
 
+/// What the vault at a source answers now ([`look`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Look {
+    /// A vault answers: an envelope at a URL, a file at a path (an envelope or a plain text).
+    Answers,
+    /// Nothing answered, or a refusal a later try may get past (no route, a timeout, a `5xx`
+    /// from a server restarting, a `408`): why, naming the source as an error does.
+    Unreached(String),
+    /// Something answered that holds no vault: no file at the path, a `404`, or an answer no
+    /// vault server gives (a redirect, a login page, a page that is not an envelope). A join
+    /// fails at it the same way; why, naming the source as the join would.
+    NoVault(String),
+}
+
+/// Whether a vault answers at `source` now: the fetch a join makes first ([`join`]), one GET
+/// of a URL bounded by `wait` (plus [`transport::FETCH_MARGIN`]) or a read of a path, without
+/// anything a join does (no key made, no source saved, no request). Reads and writes nothing
+/// of this machine's.
+pub fn look(source: &Source, wait: Duration) -> Look {
+    let shown = match source {
+        Source::Url(url) => transport::describe(url),
+        Source::Path(path) => path.display().to_string(),
+    };
+    let fetched = match source {
+        Source::Url(url) => match transport::get(url, None, wait) {
+            Ok(transport::Answer::Fetched(fetched)) => fetched,
+            Ok(transport::Answer::Foreign(why)) => return Look::NoVault(why),
+            Err(error) => return Look::Unreached(error.to_string()),
+        },
+        Source::Path(_) => match transport::fetch(source, None, wait) {
+            Ok(fetched) => fetched,
+            Err(error) => return Look::Unreached(error.to_string()),
+        },
+    };
+    match fetched {
+        // A file at a path that is no envelope is a plain vault; at a URL it is not a vault.
+        Fetched::Body(bytes) if is_envelope(&bytes) || matches!(source, Source::Path(_)) => {
+            Look::Answers
+        }
+        Fetched::Body(_) => Look::NoVault(format!("{shown} does not serve an aterm secrets vault")),
+        Fetched::Missing => Look::NoVault(format!("{shown}: no vault there")),
+        Fetched::NoNewer(_) => Look::NoVault("the source answered with no vault".into()),
+    }
+}
+
+/// Copy this machine's `source.toml` and `state.toml` (where its vault is and the signer it
+/// pinned, the version it holds and the files it wrote), each that exists, into `into` (made
+/// 0700, each copy 0600): copied back, with a sync after, they put this machine in that vault
+/// again under the same key after a join to another. Read together under the existing state
+/// lock; a busy or unavailable lock refuses a configured machine's copy. A machine whose
+/// state directory does not exist has nothing to copy and is left unchanged.
+///
+/// The parent of `into` must exist. Its name is claimed exclusively: an existing directory,
+/// even an empty or partial copy, is never reused or overwritten. A timestamp collision
+/// therefore refuses the next join while preserving the earlier journal's snapshot.
+///
+/// # Errors
+/// The existing state cannot be locked or read, `into` already exists, or the new directory
+/// or a copy cannot be written. A partial new copy is retained and is never reused.
+pub fn keep_config(paths: &Paths, into: &Path) -> crate::Result<()> {
+    use std::os::unix::fs::DirBuilderExt as _;
+    let files = match StateLock::observe(paths)? {
+        Some(_lock) => {
+            let mut files = Vec::new();
+            for (from, name) in [
+                (paths.source_file(), "source.toml"),
+                (paths.state_file(), "state.toml"),
+            ] {
+                if let Some(bytes) = fsx::read_private(&from, 4 << 20)? {
+                    files.push((name, bytes));
+                }
+            }
+            files
+        }
+        None if fsx::kind(&paths.dir)? == fsx::Kind::Missing => Vec::new(),
+        None => {
+            return Err(Error::new(
+                "the vault state lock is busy or unavailable; try again",
+            ));
+        }
+    };
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(into)
+        .map_err(|error| Error::new(format!("{}: {error}", into.display())))?;
+    for (name, bytes) in files {
+        fsx::write_atomic(&into.join(name), bytes.as_slice(), 0o600)?;
+    }
+    Ok(())
+}
+
 /// Write `entries`, judged against what the vault wrote, resuming the pass `state.pending`
 /// names ([`materialize::apply_resuming`]). Before it writes, a pass saves what it is to
 /// write (`pending`) beside the version state.toml held before it, which only its own save
@@ -1047,9 +1147,49 @@ fn files_intact(paths: &Paths, state: &State) -> bool {
         })
 }
 
+/// Where `source` is, as a line names it: a URL without its query or fragment, or a path.
+fn place(source: &Source) -> String {
+    match source {
+        Source::Url(url) => transport::describe(url),
+        Source::Path(path) => path.display().to_string(),
+    }
+}
+
+/// This machine's cached envelope, when it is the version state.toml holds for `config`'s
+/// vault (its seq and digest), that version let this machine in, and it verifies under the
+/// pin: what [`sync`] gives back to a source that holds none, or an older one. An apply that
+/// left an entry unwritten clears the state's source binding but keeps that version, so it
+/// is given back all the same; a binding to another source, vault or signer is not. None
+/// under a pin that gives way, whose versions may be the removed admin's, and None on a
+/// machine that version keeps out: a fork the removed admin led a reader off on carries no
+/// locker for it, and a server whose held key signed or endorsed that fork would take it,
+/// with a seq no real version reaches.
+fn held_copy(paths: &Paths, config: &Config, state: &State) -> Option<Vec<u8>> {
+    let pin = config.signer?;
+    let elsewhere = state
+        .source_identity
+        .is_some_and(|bound| bound != source_identity(config));
+    if state.membership != Stored::In || elsewhere || pin_gives_way(config) {
+        return None;
+    }
+    let cached = fsx::read_private(&paths.cache_file(), envelope::MAX_ENVELOPE)
+        .ok()
+        .flatten()?;
+    let (envelope, _, _) = envelope::verify_for_reader(
+        cached.as_slice(),
+        &config.name,
+        &pin,
+        &config.followed,
+        None,
+    )
+    .ok()?;
+    (envelope.seq == state.seq && Some(envelope.digest()) == state.digest)
+        .then(|| cached.as_slice().to_vec())
+}
+
 fn missing(config: &Config) -> Error {
     Error::new(format!(
-        "the source holds no vault named {}; an admin Mac puts its copy back",
+        "the source holds no vault named {}; a Mac in the vault puts its copy back",
         config.name
     ))
 }
@@ -1062,7 +1202,9 @@ fn quiet(report: &Report) -> bool {
 }
 
 /// Fetch, verify, decrypt and materialize once. `wait` turns the fetch into a long-poll for a
-/// version newer than the one held.
+/// version newer than the one held. A server that holds no version of the vault, or (a
+/// long-poll says) an older one, gets this machine's copy back ([`SyncOutcome::PutBack`]),
+/// and a refusal of it is the error.
 pub fn sync(paths: &Paths, wait: Option<Duration>) -> crate::Result<SyncOutcome> {
     let mut config = config(paths)?.ok_or_else(|| {
         Error::new("no vault configured: run aterm secrets join <url> (or aterm init)")
@@ -1081,7 +1223,7 @@ pub fn sync(paths: &Paths, wait: Option<Duration>) -> crate::Result<SyncOutcome>
         }
         _ => transport::fetch(&config.source, None, Duration::from_secs(30))?,
     };
-    let _lock = StateLock::take(paths)?;
+    let lock = StateLock::take(paths)?;
     if self::config(paths)?.as_ref() != Some(&config) {
         // A join moved this machine to another source while the fetch was out: the next pass
         // reads that one.
@@ -1089,21 +1231,70 @@ pub fn sync(paths: &Paths, wait: Option<Duration>) -> crate::Result<SyncOutcome>
     }
     let mut state = load_state(paths)?;
     let bytes = match fetched {
-        Fetched::NoNewer => {
+        Fetched::NoNewer(served) => {
             if now().saturating_sub(state.heard) >= 60 {
                 state.heard = now();
                 save_state(paths, &state)?;
             }
-            return Ok(SyncOutcome::Unchanged { seq: state.seq });
+            // A source holding an older version than this machine verified took an older copy
+            // back after it lost its store (another Mac's, from before a version this machine
+            // holds): a machine that newer version let in gives it back, signed as it is, over
+            // whatever the stale admin published on top meanwhile. Only the version state.toml
+            // holds, unchanged since the long-poll asked after it, and only once it verifies;
+            // the server takes it as it takes any newer version of its chain. A stale line
+            // that already reached this machine's seq is not seen here: the ETag names a seq
+            // alone, and that line's next version is taken as new.
+            let older = served.filter(|served| {
+                *served < state.seq && (state.seq, state.digest) == (before.seq, before.digest)
+            });
+            let Some((served, copy)) =
+                older.and_then(|served| Some((served, held_copy(paths, &config, &state)?)))
+            else {
+                return Ok(SyncOutcome::Unchanged { seq: state.seq });
+            };
+            drop(lock);
+            transport::publish(&config.source, &copy).map_err(|error| {
+                Error::new(format!(
+                    "{} holds seq {served} of {}, older than this machine's seq {}, and putting this machine's copy back failed: {error}",
+                    place(&config.source),
+                    config.name,
+                    state.seq
+                ))
+            })?;
+            return Ok(SyncOutcome::PutBack {
+                seq: state.seq,
+                served: Some(served),
+            });
         }
         Fetched::Missing => {
-            // A server without the vault lost its store, and the join queue with it: a machine
-            // still waiting asks again at the first pass that finds the vault back.
-            if state.membership == Stored::Pending && state.requested != 0 {
-                state.requested = 0;
-                save_state(paths, &state)?;
-            }
-            return Err(missing(&config));
+            // A server that holds nothing for the vault lost its store, or moved to a Mac with
+            // an empty one: a machine its version let in gives its copy back, signed as it is,
+            // whether or not it is an admin and whatever the vault approves, as an admin
+            // command would (§8). The server takes it from another Mac than its own only for a
+            // name it pins: a refusal, like having no copy to give, is the missing error, which
+            // the subscriber's backoff paces. A machine that slept through versions since may
+            // be first: one that holds a newer version puts it back at its next long-poll (the
+            // arm above). A path is left to an admin command: a file gone from a shared folder
+            // may be one not synced or mounted yet.
+            let copy = match config.source {
+                Source::Url(_) => held_copy(paths, &config, &state),
+                Source::Path(_) => None,
+            };
+            let Some(copy) = copy else {
+                return Err(missing(&config));
+            };
+            drop(lock);
+            transport::publish(&config.source, &copy).map_err(|error| {
+                Error::new(format!(
+                    "{} holds no vault named {}, and putting this machine's copy back failed: {error}",
+                    place(&config.source),
+                    config.name
+                ))
+            })?;
+            return Ok(SyncOutcome::PutBack {
+                seq: state.seq,
+                served: None,
+            });
         }
         Fetched::Body(bytes) => bytes,
     };
@@ -1190,7 +1381,8 @@ pub fn sync(paths: &Paths, wait: Option<Duration>) -> crate::Result<SyncOutcome>
 /// The subscriber (`aterm secrets watch`): long-poll the source and apply every new version,
 /// for ever; ask again every hour while waiting for approval; and on an admin of a vault with
 /// a join password, approve every request that proves it, or of an open vault, every request
-/// from a machine not in it (§7). Errors back off from 5 s to 5 min and are logged once each.
+/// from a machine not in it (§7). Errors back off from 5 s to 5 min, a wait that ends at once
+/// when this machine's network changes, and are logged once each.
 /// `log` gets one line per event (names and counts only).
 pub fn watch(paths: &Paths, log: &(dyn Fn(&str) + Sync)) -> crate::Result<()> {
     let stop = AtomicBool::new(false);
@@ -1224,30 +1416,130 @@ fn nap(stop: &AtomicBool, total: Duration) {
 /// The subscriber's first pause after a pass that left an entry failed ([`pause_after`]).
 const FIRST_RETRY: Duration = Duration::from_secs(5);
 
-/// The longest the subscriber waits between passes that fail, either way.
+/// The longest the subscriber waits between passes that leave an entry failed ([`pause_after`]).
 const LONGEST_RETRY: Duration = Duration::from_secs(300);
+
+/// The longest the subscriber waits between passes that err ([`retry_after`]): a server back
+/// after however long away, its store maybe lost, is asked again within a minute, so it gets
+/// its vault back from a machine in it, and a waiting machine's request again, that soon.
+const LONGEST_ERROR_RETRY: Duration = Duration::from_secs(60);
+
+/// How often a subscriber waiting after a pass that failed looks whether this machine's
+/// network changed ([`nap_unless_moved`]).
+const MOVED_STEP: Duration = Duration::from_secs(5);
+
+/// Wait `total` after a pass that failed, in steps of [`MOVED_STEP`], ending early once
+/// `moved` says this machine's network changed since (the addresses its traffic leaves by):
+/// a vault that did not answer on the last network may answer on this one at once, so an
+/// approval made while this machine was away is applied once it is back, not up to
+/// [`LONGEST_ERROR_RETRY`] later. Whether it ended early.
+fn nap_unless_moved(
+    total: Duration,
+    moved: &mut dyn FnMut() -> bool,
+    sleep: &mut dyn FnMut(Duration),
+) -> bool {
+    let mut left = total;
+    while !left.is_zero() {
+        let step = left.min(MOVED_STEP);
+        sleep(step);
+        left = left.saturating_sub(step);
+        if moved() {
+            return true;
+        }
+    }
+    false
+}
+
+/// The subscriber's wait after a pass that erred, given its wait after the pass before
+/// (`backoff`, 5 s after one that did not err): twice that, up to [`LONGEST_ERROR_RETRY`],
+/// or 5 s again once this machine's network changed (`moved`, [`nap_unless_moved`]).
+fn retry_after(backoff: Duration, moved: bool) -> Duration {
+    if moved {
+        Duration::from_secs(5)
+    } else {
+        backoff.saturating_mul(2).min(LONGEST_ERROR_RETRY)
+    }
+}
 
 /// How long the subscriber waits after a pass that ended in `outcome` from `source`. A source
 /// that answers a long-poll at once with nothing new (one that does not hold, or a stale
 /// copy) is asked again only after a pause. A pass that applied a version at once asks again
 /// (a long-poll), unless an entry failed: such a pass leaves the next one no long-poll (it
 /// fetches and applies again, to retry the entry), so it waits `failing`, which doubles to
-/// [`LONGEST_RETRY`] while entries keep failing; any other pass starts it again at
-/// [`FIRST_RETRY`].
+/// [`LONGEST_RETRY`] while entries keep failing. So does a pass that put this machine's copy
+/// back where the source held none, which the next puts back again while the source keeps
+/// none (a GET that reaches no vault server, as through a proxy that keeps a 404); any other
+/// pass starts it again at [`FIRST_RETRY`].
 fn pause_after(source: &Source, outcome: &SyncOutcome, failing: &mut Duration) -> Duration {
     let pause = match (source, outcome) {
         (Source::Path(_), _) => Duration::from_secs(60),
         (_, SyncOutcome::NotIn) => Duration::from_secs(30),
-        (_, SyncOutcome::Unchanged { .. }) => Duration::from_secs(10),
         (_, SyncOutcome::Applied { report, .. }) if report.failed.is_empty() => Duration::ZERO,
-        (_, SyncOutcome::Applied { .. }) => {
+        (_, SyncOutcome::Applied { .. } | SyncOutcome::PutBack { served: None, .. }) => {
             let pause = *failing;
             *failing = failing.saturating_mul(2).min(LONGEST_RETRY);
             return pause;
         }
+        (_, SyncOutcome::Unchanged { .. } | SyncOutcome::PutBack { .. }) => Duration::from_secs(10),
     };
     *failing = FIRST_RETRY;
     pause
+}
+
+/// What the subscriber logs for a pass that ended in `outcome`, if anything. A pass the next
+/// may do again, one that left an entry failed or put this machine's copy back where the
+/// source held none ([`pause_after`]), is kept in `repeated`, so the next one that ends the
+/// same way says nothing new; any other pass clears it.
+fn pass_line(
+    paths: &Paths,
+    config: &Config,
+    outcome: &SyncOutcome,
+    repeated: &mut String,
+) -> Option<String> {
+    let (line, again) = match outcome {
+        SyncOutcome::Applied { seq, report } => (
+            Some(format!(
+                "applied seq {seq}: {} written, {} unchanged, {} removed, {} moved aside, {} failed",
+                report.written.len(),
+                report.unchanged.len(),
+                report.removed.len(),
+                report.moved_aside.len(),
+                report.failed.len()
+            )),
+            !report.failed.is_empty(),
+        ),
+        SyncOutcome::Unchanged { .. } => (None, false),
+        SyncOutcome::PutBack {
+            seq,
+            served: Some(served),
+        } => (
+            Some(format!(
+                "{} held seq {served} of {}, older than this machine's seq {seq}: put this machine's copy back",
+                place(&config.source),
+                config.name
+            )),
+            false,
+        ),
+        SyncOutcome::PutBack { seq, served: None } => (
+            Some(format!(
+                "{} held no vault named {}: put this machine's copy back (seq {seq})",
+                place(&config.source),
+                config.name
+            )),
+            true,
+        ),
+        SyncOutcome::NotIn => (
+            load_state(paths)
+                .is_ok_and(|s| s.membership == Stored::Revoked)
+                .then(|| "this machine is no longer in the vault".to_string()),
+            false,
+        ),
+    };
+    let last = std::mem::take(repeated);
+    if let (true, Some(line)) = (again, &line) {
+        repeated.clone_from(line);
+    }
+    line.filter(|line| *line != last)
 }
 
 /// Whether the subscriber's next pass is to fetch and apply the version this machine holds
@@ -1284,7 +1576,7 @@ fn subscriber_loop(paths: &Paths, log: &(dyn Fn(&str) + Sync)) -> crate::Result<
     let mut failing = FIRST_RETRY;
     let mut repaired = None;
     let mut last_error = String::new();
-    let mut last_applied = String::new();
+    let mut repeated = String::new();
     let program = program_stamp();
     loop {
         if program.is_some() && program_stamp() != program {
@@ -1296,32 +1588,8 @@ fn subscriber_loop(paths: &Paths, log: &(dyn Fn(&str) + Sync)) -> crate::Result<
             Ok((config, outcome)) => {
                 backoff = Duration::from_secs(5);
                 last_error.clear();
-                match &outcome {
-                    SyncOutcome::Applied { seq, report } => {
-                        let line = format!(
-                            "applied seq {seq}: {} written, {} unchanged, {} removed, {} moved aside, {} failed",
-                            report.written.len(),
-                            report.unchanged.len(),
-                            report.removed.len(),
-                            report.moved_aside.len(),
-                            report.failed.len()
-                        );
-                        // A retry of a failing entry that ends the same way says nothing new.
-                        if line != last_applied {
-                            log(&line);
-                        }
-                        last_applied = if report.failed.is_empty() {
-                            String::new()
-                        } else {
-                            line
-                        };
-                    }
-                    SyncOutcome::Unchanged { .. } => {}
-                    SyncOutcome::NotIn => {
-                        if load_state(paths).is_ok_and(|s| s.membership == Stored::Revoked) {
-                            log("this machine is no longer in the vault");
-                        }
-                    }
+                if let Some(line) = pass_line(paths, &config, &outcome, &mut repeated) {
+                    log(&line);
                 }
                 ask_again_if_due(paths, &config, log);
                 let pause = pause_after(&config.source, &outcome, &mut failing);
@@ -1330,11 +1598,18 @@ fn subscriber_loop(paths: &Paths, log: &(dyn Fn(&str) + Sync)) -> crate::Result<
             Err(error) => {
                 let text = error.to_string();
                 if text != last_error {
-                    log(&format!("{text}; retrying with backoff up to 5 min"));
+                    log(&format!(
+                        "{text}; retrying with backoff up to 1 min, at once on a new network"
+                    ));
                     last_error = text;
                 }
-                std::thread::sleep(backoff);
-                backoff = (backoff * 2).min(LONGEST_RETRY);
+                let routes = crate::server::route_sources();
+                let moved = nap_unless_moved(
+                    backoff,
+                    &mut || crate::server::route_sources() != routes,
+                    &mut std::thread::sleep,
+                );
+                backoff = retry_after(backoff, moved);
             }
         }
     }
@@ -1343,7 +1618,9 @@ fn subscriber_loop(paths: &Paths, log: &(dyn Fn(&str) + Sync)) -> crate::Result<
 /// One of the subscriber's passes: long-poll a URL for a newer version, or fetch and apply the
 /// one held when a repair is due ([`repair_due`]) or the source is a path. A repair counts as
 /// made only once its pass succeeds: one that cannot reach the server leaves it due, so the
-/// next pass that does puts the files back, rather than long-polling until a new version.
+/// next pass that does puts the files back, rather than long-polling until a new version. So
+/// is a waiting machine's request: a pass that fails may have met a server that lost its
+/// store, and the join queue with it, so the re-ask falls due ([`ask_again_if_due`]).
 fn subscriber_pass(
     paths: &Paths,
     repaired: &mut Option<([u8; 32], u64)>,
@@ -1359,6 +1636,16 @@ fn subscriber_pass(
         Ok(outcome) => Ok((config, outcome)),
         Err(error) => {
             *repaired = before;
+            // Another Mac in the vault may put the vault back before the next pass, which then
+            // finds nothing new and never sees it missing: the first pass that reaches the server
+            // asks again, whatever it finds. The same request again costs the server no write.
+            let _ = change_request(paths, &config, |state| {
+                let due = state.membership == Stored::Pending && state.requested != 0;
+                if due {
+                    state.requested = 0;
+                }
+                due
+            });
             Err(error)
         }
     }
@@ -1366,29 +1653,32 @@ fn subscriber_pass(
 
 /// A machine still waiting for approval re-queues its request every hour (the queue keeps
 /// requests seven days), with the proof it made when the person typed the password, and at
-/// once after a request that was never queued ([`request_join`]) or that the server lost
-/// with its store ([`sync`]). The state is read under the lock with source.toml, and only
-/// while that still names `config`'s vault: a join to another vault since (its request cut
-/// off, so due at once) holds a proof made for that one, which must never reach this one's
-/// queue, where anyone may read it and test guesses at that vault's password.
+/// once after a request that was never queued ([`request_join`]) or after a pass that failed,
+/// as one does at a server that lost its store and the queue with it ([`subscriber_pass`]).
+/// The state is read under the lock with source.toml, and only while that still names
+/// `config`'s vault: a join to another vault since (its request cut off, so due at once) holds
+/// a proof made for that one, which must never reach this one's queue, where anyone may read
+/// it and test guesses at that vault's password. The request names the host source.toml
+/// names then, which the proof was made for: a join of the same vault under another name
+/// drops the old name's proof as it saves the new name ([`join`]).
 fn ask_again_if_due(paths: &Paths, config: &Config, log: &dyn Fn(&str)) {
-    let due = || -> crate::Result<Option<Option<String>>> {
+    let due = || -> crate::Result<Option<(Config, Option<String>)>> {
         let _lock = StateLock::take(paths)?;
-        if self::config(paths)?.is_none_or(|current| {
-            (&current.source, &current.name) != (&config.source, &config.name)
-        }) {
+        let Some(current) = self::config(paths)?
+            .filter(|current| (&current.source, &current.name) == (&config.source, &config.name))
+        else {
             return Ok(None);
-        }
+        };
         let state = load_state(paths)?;
         Ok(
             (state.membership == Stored::Pending && now().saturating_sub(state.requested) >= 3600)
-                .then_some(state.proof),
+                .then_some((current, state.proof)),
         )
     };
-    let Ok(Some(proof)) = due() else {
+    let Ok(Some((current, proof))) = due() else {
         return;
     };
-    match request_join(paths, config, proof) {
+    match request_join(paths, &current, proof, Asker::Again) {
         Ok(code) => log(&format!("asked to join again (code {code})")),
         Err(error) => log(&format!("join request failed: {error}")),
     }
@@ -1536,7 +1826,8 @@ pub fn approving_here(paths: &Paths) -> crate::Result<Option<Approval>> {
 /// costs one GET a pass, never another admin open, key derivation or publish. A queue whose
 /// requests keep changing (a host posting new proofs) costs at most one admin open and one key
 /// derivation a pass, whatever it lists: one [`auto_approve`] judges them all. A server that
-/// no longer holds the vault gets this admin's copy back ([`put_back_lost`]).
+/// no longer holds the vault gets it back from the subscriber beside it ([`sync`]): an admin
+/// is a machine of every version it can approve at, so that version let it in.
 fn approver_loop(paths: &Paths, log: &(dyn Fn(&str) + Sync), stop: &AtomicBool) {
     let mut approver = Approver::default();
     while !stop.load(Ordering::Relaxed) {
@@ -1550,8 +1841,6 @@ fn approver_loop(paths: &Paths, log: &(dyn Fn(&str) + Sync), stop: &AtomicBool) 
 struct Approver {
     settled: Settled,
     checked: Option<ApprovalCheck>,
-    /// When it last looked for a vault its server lost.
-    lost_checked: Option<Instant>,
 }
 
 /// One of the approver's passes ([`approver_loop`]): how long to wait before the next.
@@ -1561,12 +1850,8 @@ fn approver_pass(paths: &Paths, log: &dyn Fn(&str), approver: &mut Approver) -> 
         Ok(None) => return Duration::from_secs(30),
         Err(_) => return Duration::from_secs(2),
     };
-    let pending = match requests_for(&config, None) {
-        Ok(pending) => pending,
-        Err(_) => {
-            put_back_lost(paths, &config, &mut approver.lost_checked, log);
-            return Duration::from_secs(10);
-        }
+    let Ok(pending) = requests_for(&config, None) else {
+        return Duration::from_secs(10);
     };
     let by = match approval {
         Approval::Password => "by the join password",
@@ -1593,46 +1878,6 @@ fn approver_pass(paths: &Paths, log: &dyn Fn(&str), approver: &mut Approver) -> 
         }
     }
     Duration::from_secs(2)
-}
-
-/// How often the approver checks whether its server lost the vault, while the queue cannot
-/// be read ([`put_back_lost`]).
-const PUT_BACK_EVERY: Duration = Duration::from_secs(60);
-
-/// The approver could not read the join queue: when that is because the server answers that
-/// it holds no vault of this name (its Mac's store was lost, or the server moved to another
-/// Mac with an empty one), put this admin's cached copy back, as its next admin command
-/// would ([`admin_open`]), and say so in the log. At most once a minute (`last`), so a
-/// server that keeps refusing the copy (another `--pin` for the name) is asked no more often;
-/// a server that cannot be reached, or refuses the listing for another reason, is left as it
-/// is.
-fn put_back_lost(paths: &Paths, config: &Config, last: &mut Option<Instant>, log: &dyn Fn(&str)) {
-    if last.is_some_and(|at| at.elapsed() < PUT_BACK_EVERY) {
-        return;
-    }
-    *last = Some(Instant::now());
-    let lost = transport::fetch(&config.source, None, Duration::from_secs(30));
-    if !matches!(lost, Ok(Fetched::Missing)) {
-        return;
-    }
-    let place = |config: &Config| match &config.source {
-        Source::Url(url) => transport::describe(url),
-        Source::Path(path) => path.display().to_string(),
-    };
-    match admin_open(paths) {
-        Ok(admin) if admin.put_back => log(&format!(
-            "{} held no vault named {}: put this admin's copy back (seq {})",
-            place(&admin.config),
-            admin.config.name,
-            admin.seq
-        )),
-        Ok(_) => {}
-        Err(error) => log(&format!(
-            "{} holds no vault named {}, and putting this admin's copy back failed: {error}",
-            place(config),
-            config.name
-        )),
-    }
 }
 
 /// A join request as [`auto_approve`] read it. A machine that asks again under the same key
@@ -1820,7 +2065,7 @@ pub fn probe(url: &str, pin: &[u8; 32], wait: Duration) -> crate::Result<ProbeOu
     let name = transport::vault_name(&Source::Url(url.to_string()))?;
     let body = match transport::get(url, None, wait)? {
         transport::Answer::Fetched(Fetched::Body(body)) => body,
-        transport::Answer::Fetched(Fetched::Missing | Fetched::NoNewer) => {
+        transport::Answer::Fetched(Fetched::Missing | Fetched::NoNewer(_)) => {
             return Ok(ProbeOutcome::Absent);
         }
         transport::Answer::Foreign(why) => return Ok(ProbeOutcome::NotThisVault(why)),
@@ -1849,11 +2094,27 @@ pub fn probe_default(wait: Duration) -> crate::Result<ProbeOutcome> {
 
 // ── Join ────────────────────────────────────────────────────────────────────
 
-/// Queue this machine's join request (a URL; a path has no queue) and record it. A request
-/// the server did not queue (unreachable, or refusing it for now) is recorded as never
-/// asked, with the proof the person gave, so the subscriber's next pass asks again rather
-/// than an hour on. The error returned is the request's.
-fn request_join(paths: &Paths, config: &Config, proof: Option<String>) -> crate::Result<String> {
+/// Who asks to join, which says what [`request_join`] records.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Asker {
+    /// A person's join: it records the proof it asked with, and when it asked.
+    Join,
+    /// The subscriber asking again with the proof it read ([`ask_again_if_due`]): it records
+    /// only when it asked, and only while the state still holds that proof. A join since (its
+    /// person typed the password again) recorded its own, which the re-ask must not undo.
+    Again,
+}
+
+/// Queue this machine's join request (a URL; a path has no queue) and record it, as `asker`
+/// records. A request the server did not queue (unreachable, or refusing it for now) is
+/// recorded as never asked, with the proof the person gave, so the subscriber's next pass
+/// asks again rather than an hour on. The error returned is the request's.
+fn request_join(
+    paths: &Paths,
+    config: &Config,
+    proof: Option<String>,
+    asker: Asker,
+) -> crate::Result<String> {
     let identity = machine_identity(paths)?;
     let recipient = identity.recipient();
     let code = join_code(&recipient);
@@ -1869,25 +2130,32 @@ fn request_join(paths: &Paths, config: &Config, proof: Option<String>) -> crate:
     };
     let queued = posted.is_ok();
     let recorded = change_request(paths, config, |state| {
-        state.requested = if queued { now() } else { 0 };
-        state.proof = proof;
-        // A revoked machine that asks again waits like a new one, so its subscriber re-queues
-        // the request hourly.
-        if matches!(state.membership, Stored::None | Stored::Revoked) {
-            state.membership = Stored::Pending;
+        if asker == Asker::Again && state.proof != proof {
+            return false;
         }
+        state.requested = if queued { now() } else { 0 };
+        if asker == Asker::Join {
+            state.proof = proof;
+            // A revoked machine that asks again waits like a new one, so its subscriber
+            // re-queues the request hourly.
+            if matches!(state.membership, Stored::None | Stored::Revoked) {
+                state.membership = Stored::Pending;
+            }
+        }
+        true
     });
     posted.and(recorded).map(|()| code)
 }
 
-/// Change, under the lock, the join request state of the vault `config` names. The state is
-/// the vault's that source.toml names now: a join to another vault since (a person's, while
-/// the subscriber asked again) reset it for that one, and it is left alone. The same vault
-/// under a pin moved since (a rotation the join's own sync followed) is still `config`'s.
+/// Change, under the lock, the join request state of the vault `config` names, saved only
+/// when `change` says it changed it. The state is the vault's that source.toml names now: a
+/// join to another vault since (a person's, while the subscriber asked again) reset it for
+/// that one, and it is left alone. The same vault under a pin moved since (a rotation the
+/// join's own sync followed) is still `config`'s.
 fn change_request(
     paths: &Paths,
     config: &Config,
-    change: impl FnOnce(&mut State),
+    change: impl FnOnce(&mut State) -> bool,
 ) -> crate::Result<()> {
     let _lock = StateLock::take(paths)?;
     let current = self::config(paths)?;
@@ -1898,7 +2166,9 @@ fn change_request(
         return Ok(());
     }
     let mut state = load_state(paths)?;
-    change(&mut state);
+    if !change(&mut state) {
+        return Ok(());
+    }
     save_state(paths, &state)
 }
 
@@ -1944,7 +2214,7 @@ pub fn join(paths: &Paths, options: &JoinOptions<'_>) -> crate::Result<JoinOutco
     let bytes = match transport::fetch(&source, None, Duration::from_secs(30))? {
         Fetched::Body(bytes) => bytes,
         Fetched::Missing => return Err(Error::new(format!("{source_display}: no vault there"))),
-        Fetched::NoNewer => return Err(Error::new("the source answered with no vault")),
+        Fetched::NoNewer(_) => return Err(Error::new("the source answered with no vault")),
     };
     let previous = self::config(paths)?;
     if !is_envelope(&bytes) {
@@ -2042,6 +2312,17 @@ pub fn join(paths: &Paths, options: &JoinOptions<'_>) -> crate::Result<JoinOutco
             state.requested = now();
             prepare_materialization(paths, &mut state)?;
         } else if previous.as_ref() != Some(&config) {
+            if previous
+                .as_ref()
+                .is_some_and(|previous| previous.host != host)
+            {
+                // A proof is made for the host name its request carries, which the approver
+                // checks it against: the old name's never goes out beside the new one, as it
+                // would from a re-ask while the person is asked for the password, or after a
+                // Ctrl-C there. The re-ask counts from now, as above.
+                state.proof = None;
+                state.requested = now();
+            }
             prepare_materialization(paths, &mut state)?;
         }
         save_config(paths, &config)?;
@@ -2050,7 +2331,10 @@ pub fn join(paths: &Paths, options: &JoinOptions<'_>) -> crate::Result<JoinOutco
     // and none to come from this join: the subscriber's first pass that reaches the server
     // asks.
     let synced = sync(paths, None).inspect_err(|_| {
-        let _ = change_request(paths, &config, |state| state.requested = 0);
+        let _ = change_request(paths, &config, |state| {
+            state.requested = 0;
+            true
+        });
     });
     if let SyncOutcome::Applied { seq, report } = synced? {
         return Ok(JoinOutcome::Joined {
@@ -2067,7 +2351,7 @@ pub fn join(paths: &Paths, options: &JoinOptions<'_>) -> crate::Result<JoinOutco
                 join::Key::derive(&name, password.as_slice()).prove(&name, &recipient_text, &host)
             });
             let by_password = proof.is_some();
-            request_join(paths, &config, proof)?;
+            request_join(paths, &config, proof, Asker::Join)?;
             (options.say)(&if by_password {
                 format!(
                     "asked to join {name} with the join password; an admin Mac's subscriber approves it"
@@ -2187,8 +2471,6 @@ pub struct Admin {
     /// How many handoff pairs the version opened carried (fewer than `handoff` when this
     /// machine's copy put back links that version dropped).
     opened_pairs: usize,
-    /// Whether opening it gave the source this machine's copy back.
-    put_back: bool,
 }
 
 impl Drop for Admin {
@@ -2234,7 +2516,7 @@ pub fn admin_open(paths: &Paths) -> crate::Result<Admin> {
     };
     let served = match transport::fetch(&config.source, None, Duration::from_secs(30))? {
         Fetched::Body(bytes) => Some(bytes),
-        Fetched::Missing | Fetched::NoNewer => None,
+        Fetched::Missing | Fetched::NoNewer(_) => None,
     };
     let cached = fsx::read_private(&paths.cache_file(), envelope::MAX_ENVELOPE)?
         .map(|bytes| bytes.as_slice().to_vec())
@@ -2354,10 +2636,10 @@ pub fn admin_open(paths: &Paths) -> crate::Result<Admin> {
             "the admin locker's key does not match the envelope's signer",
         ));
     }
-    if let Some(over) = &put_back {
+    if let Some(over) = put_back {
         let _lock = configured_admin(paths, &config)?;
         match over {
-            Some(over) => transport::replace(&config.source, &bytes, over)?,
+            Some(over) => transport::replace(&config.source, &bytes, &over)?,
             None => transport::publish(&config.source, &bytes)?,
         }
     }
@@ -2368,7 +2650,6 @@ pub fn admin_open(paths: &Paths) -> crate::Result<Admin> {
         seq: envelope.seq,
         handoff,
         opened_pairs: envelope.handoff.len(),
-        put_back: put_back.is_some(),
     })
 }
 
@@ -2701,12 +2982,17 @@ pub struct Created {
     pub fingerprint: String,
     /// Names imported into `[everyone]`.
     pub imported: Vec<String>,
+    /// Why this machine's own sync after the publish failed, if it did. The vault is out and
+    /// source.toml names it: the next sync (the subscriber's) applies it.
+    pub local: Option<String>,
 }
 
 /// Create a vault at `source` (§8): a new signing key, this machine its only machine and
 /// admin, a generated join password, the regular files of `import` (non-recursive; dot files
 /// skipped) in `[everyone]`. Refuses a path where anything already exists, and a URL that
-/// answers with anything but "no vault here".
+/// answers with anything but "no vault here". Once the vault is published and source.toml
+/// names it, a failure of this machine's own sync is no failure of the create, which could
+/// not be run again ("already exists there"): it is [`Created::local`].
 pub fn create(
     paths: &Paths,
     source: &str,
@@ -2795,12 +3081,13 @@ pub fn create(
         prepare_materialization(paths, &mut state)?;
         save_config(paths, &config)?;
     }
-    sync(paths, None)?;
+    let local = sync(paths, None).err().map(|error| error.to_string());
     Ok(Created {
         name,
         signer: crate::b64::encode_padded(&signer),
         fingerprint: envelope::fingerprint(&signer),
         imported,
+        local,
     })
 }
 
@@ -3145,6 +3432,192 @@ impl Scratch {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The bound on a wait for what must happen: a hang detector, never a latency budget.
+    const HANG_DETECTOR: Duration = Duration::from_secs(60);
+
+    /// A subscriber waiting after a failed pass asks again as soon as this machine's network
+    /// changes, an approval made while it was away among what it then applies. Negative
+    /// control: on the same network it waits the whole backoff.
+    #[test]
+    fn a_wait_after_an_error_ends_once_the_network_changes() {
+        let mut slept = Duration::ZERO;
+        let mut looks = 0;
+        let moved = nap_unless_moved(
+            LONGEST_ERROR_RETRY,
+            &mut || {
+                looks += 1;
+                looks == 3
+            },
+            &mut |step| slept += step,
+        );
+        assert!(moved);
+        assert_eq!(slept, MOVED_STEP * 3);
+
+        let mut slept = Duration::ZERO;
+        assert!(!nap_unless_moved(
+            LONGEST_ERROR_RETRY,
+            &mut || false,
+            &mut |step| slept += step
+        ));
+        assert_eq!(slept, LONGEST_ERROR_RETRY);
+        // A wait shorter than a step is one step of its own length.
+        let mut steps = Vec::new();
+        nap_unless_moved(Duration::from_secs(2), &mut || false, &mut |step| {
+            steps.push(step)
+        });
+        assert_eq!(steps, [Duration::from_secs(2)]);
+    }
+
+    /// A pass that errs (a server gone, or one that holds no vault and takes no copy back) is
+    /// tried again after 5 s, doubling to a minute however long it keeps erring: a server back
+    /// after five minutes away, its store lost, is asked again within a minute, and the first
+    /// machine in the vault to ask puts the vault back. A new network starts the waits again.
+    #[test]
+    fn a_pass_that_errs_is_tried_again_within_a_minute() {
+        let mut backoff = Duration::from_secs(5);
+        let waits: Vec<u64> = (0..8)
+            .map(|_| {
+                let wait = backoff;
+                backoff = retry_after(backoff, false);
+                wait.as_secs()
+            })
+            .collect();
+        assert_eq!(waits, [5, 10, 20, 40, 60, 60, 60, 60]);
+        assert_eq!(retry_after(backoff, true), Duration::from_secs(5));
+    }
+
+    /// The look before a join tells a vault that answers from nothing answering and from an
+    /// answer that holds no vault, and makes nothing: no key, no source, no state.
+    #[test]
+    fn a_look_tells_an_answering_vault_from_none_and_makes_nothing() {
+        let root = aterm_tempfile::tempdir().expect("tempdir");
+        let reader = Paths::for_home(&root.path().join("reader"));
+
+        // A path: a file there (a plain vault) answers; none there is no vault.
+        let plain = root.path().join("team.secrets");
+        let missing = Source::Path(root.path().join("unplugged").join("team.vault"));
+        assert!(
+            matches!(look(&missing, HANG_DETECTOR), Look::NoVault(why) if why.ends_with("team.vault: no vault there"))
+        );
+        fsx::write_atomic(&plain, b"token=inert-token\n", 0o600).expect("plain vault");
+        assert_eq!(look(&Source::Path(plain), HANG_DETECTOR), Look::Answers);
+
+        // A URL: a server without that vault answers 404; once created it answers. Nothing
+        // here keeps its socket, so once it stops nothing listens there.
+        let running = serve(&root.path().join("store"), &bound());
+        let url = format!("http://{}/v1/alab", running.addr);
+        let source = Source::Url(url.clone());
+        assert_eq!(
+            look(&source, HANG_DETECTOR),
+            Look::NoVault(format!("{url}: no vault there"))
+        );
+        let admin = Paths::for_home(&root.path().join("ma"));
+        create(&admin, &url, None, Some("ma")).expect("create");
+        assert_eq!(look(&source, HANG_DETECTOR), Look::Answers);
+        running.stop();
+        // Nothing listening: nothing answered, which a later try may get past.
+        assert!(
+            matches!(look(&source, HANG_DETECTOR), Look::Unreached(why) if why.starts_with(&format!("fetching {url}"))),
+            "{:?}",
+            look(&source, HANG_DETECTOR)
+        );
+        assert!(!reader.dir.exists(), "a look makes nothing");
+    }
+
+    /// A kept copy of this machine's vault files, copied back with a sync after, puts it in
+    /// the vault it read before a join to another (what the setup's revert of that join
+    /// says). Negative control: without the copy back it stays in the other one.
+    #[test]
+    fn a_kept_config_copied_back_reads_the_vault_this_machine_read_before() {
+        let root = aterm_tempfile::tempdir().expect("tempdir");
+        let first = root.path().join("first.secrets");
+        let second = root.path().join("second.secrets");
+        fsx::write_atomic(&first, b"token=first-token\n", 0o600).expect("first vault");
+        fsx::write_atomic(&second, b"token=second-token\n", 0o600).expect("second vault");
+        let reader = Paths::for_home(&root.path().join("reader"));
+        join_pinned(&reader, first.to_str().unwrap(), "reader");
+        let kept = reader.dir.join("before-join-1800000000");
+        keep_config(&reader, &kept).expect("kept");
+        use std::os::unix::fs::PermissionsExt as _;
+        let mode = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&kept), 0o700);
+        assert_eq!(mode(&kept.join("source.toml")), 0o600);
+        assert_eq!(mode(&kept.join("state.toml")), 0o600);
+        let kept_source = std::fs::read(kept.join("source.toml")).unwrap();
+        let kept_state = std::fs::read(kept.join("state.toml")).unwrap();
+
+        join_pinned(&reader, second.to_str().unwrap(), "reader");
+        let token = materialize::target_path(&reader.home, "token").unwrap();
+        assert_eq!(std::fs::read(&token).unwrap(), b"second-token");
+        assert_eq!(
+            pinned(&reader).name,
+            "second",
+            "the control: still the other"
+        );
+
+        // Two journaled joins can have the same second's name. The second must not
+        // change the snapshot the first journal line names, even if its source changed.
+        keep_config(&reader, &kept).expect_err("the earlier snapshot owns this name");
+        assert_eq!(
+            std::fs::read(kept.join("source.toml")).unwrap(),
+            kept_source
+        );
+        assert_eq!(std::fs::read(kept.join("state.toml")).unwrap(), kept_state);
+
+        let partial = root.path().join("partial-kept");
+        fsx::ensure_private_dir(&partial).unwrap();
+        fsx::write_atomic(&partial.join("source.toml"), b"partial copy", 0o600).unwrap();
+        keep_config(&reader, &partial).expect_err("a partial snapshot stays as it is");
+        assert_eq!(
+            std::fs::read(partial.join("source.toml")).unwrap(),
+            b"partial copy"
+        );
+        assert!(!partial.join("state.toml").exists());
+
+        // A writer owns the state: never read half of its source/state change. Once
+        // it releases the same lock, a new snapshot of the current vault succeeds.
+        let busy = root.path().join("busy-kept");
+        {
+            let _writer = StateLock::take(&reader).expect("the writer owns the state");
+            keep_config(&reader, &busy).expect_err("the state is being changed");
+            assert!(!busy.exists(), "no snapshot was admitted");
+        }
+        keep_config(&reader, &busy).expect("the coherent current state can be kept");
+        assert_eq!(
+            std::fs::read(busy.join("source.toml")).unwrap(),
+            std::fs::read(reader.source_file()).unwrap()
+        );
+        assert_eq!(
+            std::fs::read(busy.join("state.toml")).unwrap(),
+            std::fs::read(reader.state_file()).unwrap()
+        );
+
+        let unlocked = Paths::for_home(&root.path().join("unlocked"));
+        fsx::ensure_private_dir(&unlocked.dir).unwrap();
+        fsx::write_atomic(&unlocked.source_file(), &kept_source, 0o600).unwrap();
+        fsx::write_atomic(&unlocked.state_file(), &kept_state, 0o600).unwrap();
+        let unavailable = root.path().join("unavailable-kept");
+        keep_config(&unlocked, &unavailable).expect_err("existing state needs its lock");
+        assert!(!unavailable.exists());
+        assert_eq!(std::fs::read(unlocked.source_file()).unwrap(), kept_source);
+        assert_eq!(std::fs::read(unlocked.state_file()).unwrap(), kept_state);
+
+        for name in ["source.toml", "state.toml"] {
+            std::fs::copy(kept.join(name), reader.dir.join(name)).expect("copied back");
+        }
+        sync(&reader, None).expect("sync");
+        assert_eq!(pinned(&reader).name, "first");
+        assert_eq!(std::fs::read(&token).unwrap(), b"first-token");
+        assert!(materialization_ready(&reader).unwrap());
+
+        // An unconfigured machine has nothing to keep: an empty copy, nothing else made.
+        let fresh = Paths::for_home(&root.path().join("fresh"));
+        let into = root.path().join("fresh-kept");
+        keep_config(&fresh, &into).expect("nothing to keep");
+        assert_eq!(std::fs::read_dir(&into).unwrap().count(), 0);
+        assert!(!fresh.dir.exists());
+    }
 
     #[test]
     fn a_vault_too_large_to_seal_is_refused_saying_why() {
@@ -3927,6 +4400,8 @@ mod tests {
                 sync(&reader, None).expect("sync"),
                 SyncOutcome::Applied { seq: 2, .. }
             ));
+            // What an admin Mac the rotation removed held when it went to sleep.
+            let stale = std::fs::read(store.join("alab.vault")).expect("the store's copy");
 
             // The vault's key rotates, and an admin the rotation removed kept the old one.
             let old = admin_open(&admin).expect("open").seed;
@@ -3973,6 +4448,25 @@ mod tests {
             }
             spoof.stop();
 
+            // A server that lost its store and took back the copy of an admin Mac from before
+            // the rotation, signed by the old key. The long-poll says it holds an older seq,
+            // but the reader, kept out by what it followed, gives nothing back: the server's
+            // held key signed or endorsed that version, so it would take it, and no real
+            // version would pass its seq again.
+            let lost = serve(&root.path().join("lost"), &socket);
+            transport::publish(&Source::Url(url.clone()), &stale).expect("the stale copy");
+            let poll = Some(Duration::from_millis(100));
+            assert_eq!(
+                sync(&reader, poll).expect("polled"),
+                SyncOutcome::Unchanged { seq: 1 << 40 }
+            );
+            assert_eq!(
+                std::fs::read(root.path().join("lost").join("alab.vault")).ok(),
+                Some(stale),
+                "nothing put back"
+            );
+            lost.stop();
+
             // The vault's own server again. A build that does not know the old key is retired
             // keeps the reader off it (the control): (a) pinned to the fork, or (b) under a
             // floor no version passes, which a long-poll waits above for ever.
@@ -3984,11 +4478,11 @@ mod tests {
                 "rollback"
             };
             assert!(error.0.contains(why), "{error}");
-            let poll = Some(Duration::from_millis(100));
             assert_eq!(
                 sync(&reader, poll).expect("polled"),
                 SyncOutcome::Unchanged { seq: 1 << 40 }
             );
+            assert_eq!(load_state(&reader).expect("state").seq, 1 << 40);
             // The build that retires it: the pin gives way, what it held floors nothing, and
             // the reader is in the vault again, pinned to the key that signs it, whether its
             // subscriber reads the vault or a person joins it again at the same address.
@@ -4536,11 +5030,17 @@ mod tests {
             (state.seq, state.membership, state.proof, state.requested)
         };
         let before = held();
-        request_join(&reader, &left, Some("a-proof-for-the-vault-it-left".into())).expect("asked");
+        request_join(
+            &reader,
+            &left,
+            Some("a-proof-for-the-vault-it-left".into()),
+            Asker::Join,
+        )
+        .expect("asked");
         assert_eq!(held(), before);
         // The request for the vault it is in is kept.
         let current = pinned(&reader);
-        request_join(&reader, &current, Some("its-proof".into())).expect("asked");
+        request_join(&reader, &current, Some("its-proof".into()), Asker::Join).expect("asked");
         assert_eq!(
             load_state(&reader).expect("state").proof.as_deref(),
             Some("its-proof")
@@ -4907,8 +5407,205 @@ mod tests {
         team_server.stop();
     }
 
+    /// A subscriber pass begun before its person joined the same vault again under another
+    /// name, a join whose request was cut off too, asks again under the name source.toml holds
+    /// now: the one the proof it sends was made for, and the approver checks it against.
+    #[test]
+    fn a_reask_asks_under_the_name_source_toml_holds_now() {
+        let root = aterm_tempfile::tempdir().expect("tempdir");
+        let store = root.path().join("store");
+        let socket = bound();
+        let server = std::cell::RefCell::new(Some(serve(&store, &socket)));
+        let url = format!("http://{}/v1/team", socket.local_addr().expect("address"));
+        let admin = Paths::for_home(&root.path().join("ma"));
+        let created = create(&admin, &url, None, Some("ma")).expect("create");
+        let mac = Paths::for_home(&root.path().join("mb"));
+        // Each join's server goes as the person is asked for the join password, so nothing is
+        // queued and the re-ask is due at once.
+        let cut_off = |host: &str| {
+            let gone = std::cell::RefCell::new(None);
+            let joined = join(
+                &mac,
+                &JoinOptions {
+                    source: format!("{url}#{}", created.signer),
+                    host: Some(host.to_string()),
+                    interactive: false,
+                    wait: Duration::ZERO,
+                    confirm: &|_| false,
+                    password: &|| {
+                        server.borrow_mut().take().expect("running").stop();
+                        *gone.borrow_mut() = Some(Unserved::at(&socket));
+                        None
+                    },
+                    requested: &|| {},
+                    say: &|_| {},
+                },
+            );
+            assert!(joined.is_err(), "{host}: {joined:?}");
+            gone.borrow_mut().take().expect("stopped").end();
+            *server.borrow_mut() = Some(serve(&store, &socket));
+        };
+        cut_off("mb");
+        let begun = pinned(&mac);
+        cut_off("renamed");
+        ask_again_if_due(&mac, &begun, &|_| {});
+        let queued: Vec<String> = requests(&admin, None)
+            .expect("requests")
+            .into_iter()
+            .map(|request| request.host)
+            .collect();
+        assert_eq!(queued, ["renamed"]);
+        server.borrow_mut().take().expect("running").stop();
+    }
+
+    /// A join of the same vault under another name drops the proof made for the old one, as it
+    /// saves the new name: a proof is made for the host name its request carries, and the
+    /// approver refuses one made for another. While the person is asked for the password
+    /// (where a Ctrl-C leaves the state as it is), the subscriber's re-ask never sends the new
+    /// name beside the old name's proof, nor races the join's own request with the password,
+    /// which a server refuses within seconds of a change.
+    #[test]
+    fn a_join_under_another_name_drops_the_old_names_proof() {
+        let root = aterm_tempfile::tempdir().expect("tempdir");
+        let store = root.path().join("store");
+        let socket = bound();
+        let server = std::cell::RefCell::new(Some(serve(&store, &socket)));
+        let url = format!("http://{}/v1/team", socket.local_addr().expect("address"));
+        let admin = Paths::for_home(&root.path().join("ma"));
+        let created = create(&admin, &url, None, Some("ma")).expect("create");
+        let password = admin_open(&admin)
+            .expect("admin opens")
+            .doc
+            .join_password()
+            .expect("create makes a join password");
+        let key = join::Key::derive("team", password.as_slice());
+        let mac = Paths::for_home(&root.path().join("mb"));
+        let asked = |host: &str, password: &dyn Fn() -> Option<SecretBytes>| {
+            join(
+                &mac,
+                &JoinOptions {
+                    source: format!("{url}#{}", created.signer),
+                    host: Some(host.to_string()),
+                    interactive: false,
+                    wait: Duration::ZERO,
+                    confirm: &|_| false,
+                    password,
+                    requested: &|| {},
+                    say: &|_| {},
+                },
+            )
+        };
+        // Asked as mb with the password as the server went: nothing queued, the proof made for
+        // mb kept, and the re-ask due at once.
+        let gone = std::cell::RefCell::new(None);
+        let first = asked("mb", &|| {
+            server.borrow_mut().take().expect("running").stop();
+            *gone.borrow_mut() = Some(Unserved::at(&socket));
+            Some(password.clone())
+        });
+        assert!(first.is_err(), "{first:?}");
+        gone.borrow_mut().take().expect("stopped").end();
+        *server.borrow_mut() = Some(serve(&store, &socket));
+        let held = load_state(&mac).expect("state");
+        assert!(
+            held.proof.is_some() && held.requested == 0,
+            "due, with mb's proof"
+        );
+
+        // Each request whose proof was not made for the name it carries, by host (a proof is
+        // never printed).
+        let misproved = |queued: &[Request]| -> Vec<String> {
+            queued
+                .iter()
+                .filter(|request| {
+                    request.proof.as_ref().is_some_and(|proof| {
+                        !key.verify("team", &request.recipient, &request.host, proof)
+                    })
+                })
+                .map(|request| request.host.clone())
+                .collect()
+        };
+        let seen = std::cell::RefCell::new(None);
+        let renamed = asked("renamed", &|| {
+            ask_again_if_due(&mac, &pinned(&mac), &|_| {});
+            *seen.borrow_mut() = Some((
+                load_state(&mac).expect("state").proof,
+                requests(&admin, None).expect("requests"),
+            ));
+            Some(password.clone())
+        });
+        let (proof, queued) = seen.take().expect("asked for the password");
+        assert!(misproved(&queued).is_empty(), "{:?}", misproved(&queued));
+        assert!(
+            proof.is_none(),
+            "no proof made for mb beside the name renamed"
+        );
+        assert!(
+            matches!(renamed, Ok(JoinOutcome::Pending { ref host, .. }) if host == "renamed"),
+            "{renamed:?}"
+        );
+        let queued = requests(&admin, None).expect("requests");
+        assert!(misproved(&queued).is_empty(), "{:?}", misproved(&queued));
+        let held: Vec<(&str, bool)> = queued
+            .iter()
+            .map(|request| (request.host.as_str(), request.proof.is_some()))
+            .collect();
+        assert_eq!(held, [("renamed", true)], "with renamed's proof");
+        server.borrow_mut().take().expect("running").stop();
+    }
+
+    /// A re-ask records only when it asked, and only while the state still holds the proof it
+    /// read: a person's join between its read and its record (the password typed again)
+    /// recorded a newer proof, which the re-ask, whatever its own request met, never undoes.
+    #[test]
+    fn a_reask_never_puts_back_a_proof_a_join_replaced() {
+        let root = aterm_tempfile::tempdir().expect("tempdir");
+        let socket = bound();
+        let gone = Unserved::at(&socket);
+        let mac = Paths::for_home(&root.path().join("mb"));
+        let config = Config {
+            source: Source::Url(format!(
+                "http://{}/v1/team",
+                socket.local_addr().expect("address")
+            )),
+            name: "team".to_string(),
+            signer: Some([7; 32]),
+            followed: Vec::new(),
+            host: "mb".to_string(),
+        };
+        save_config(&mac, &config).expect("source.toml");
+        let read = Some(crate::b64::encode_padded(&[1; 32]));
+        let typed = Some(crate::b64::encode_padded(&[2; 32]));
+        let state = |proof: &Option<String>, requested: u64| State {
+            membership: Stored::Pending,
+            requested,
+            proof: proof.clone(),
+            ..State::default()
+        };
+        let held = || {
+            let state = load_state(&mac).expect("state");
+            (state.proof, state.requested, state.membership)
+        };
+        save_state(&mac, &state(&typed, 1_000)).expect("state.toml");
+        request_join(&mac, &config, read.clone(), Asker::Again).expect_err("unanswered");
+        assert_eq!(
+            held(),
+            (typed.clone(), 1_000, Stored::Pending),
+            "left alone"
+        );
+        // While it still holds the proof read, the re-ask records when it asked: here, never.
+        request_join(&mac, &config, typed.clone(), Asker::Again).expect_err("unanswered");
+        assert_eq!(held(), (typed.clone(), 0, Stored::Pending));
+        // A person's join records the proof it asked with, whatever the state held.
+        request_join(&mac, &config, read.clone(), Asker::Join).expect_err("unanswered");
+        assert_eq!(held(), (read, 0, Stored::Pending));
+        gone.end();
+    }
+
     /// A Mac waiting for approval whose request the server lost with its store (moved to a Mac
-    /// with an empty one) asks again at its first pass once the vault is back, not an hour on.
+    /// with an empty one) asks again at its first pass once the vault is back, not an hour on:
+    /// also when another Mac in the vault put it back before that pass, so the Mac, whose
+    /// passes failed only while the server was gone, never saw the vault missing.
     #[test]
     fn a_request_the_server_lost_with_its_store_is_asked_again_once_the_vault_is_back() {
         let root = aterm_tempfile::tempdir().expect("tempdir");
@@ -4936,13 +5633,23 @@ mod tests {
             "{asked:?}"
         );
         server.stop();
-        let server = serve(&root.path().join("moved"), &socket);
+        let gone = Unserved::at(&socket);
         assert!(
             subscriber_pass(&mac, &mut None).is_err(),
-            "the vault is gone"
+            "the server is gone"
         );
-        admin_open(&admin).expect("the admin puts its copy back");
-        let (config, _) = subscriber_pass(&mac, &mut None).expect("a pass");
+        gone.end();
+        let server = serve(&root.path().join("moved"), &socket);
+        let (_, restored) = subscriber_pass(&admin, &mut None).expect("the admin's pass");
+        assert!(
+            matches!(restored, SyncOutcome::PutBack { served: None, .. }),
+            "the admin's subscriber put the vault back: {restored:?}"
+        );
+        let (config, outcome) = subscriber_pass(&mac, &mut None).expect("a pass");
+        assert!(
+            matches!(outcome, SyncOutcome::Unchanged { .. }),
+            "{outcome:?}"
+        );
         ask_again_if_due(&mac, &config, &|_| {});
         let queued: Vec<String> = requests(&admin, None)
             .expect("requests")
@@ -5202,11 +5909,360 @@ mod tests {
         assert_eq!(settled.judged.len(), 1);
     }
 
+    /// [`serve`] as a server on another Mac than the test's machines (every connection is
+    /// another Mac's): a name its store holds nothing for takes a first version only under
+    /// `pins`.
+    fn serve_apart(
+        store: &Path,
+        socket: &std::net::TcpListener,
+        pins: &[(String, [u8; 32])],
+    ) -> crate::server::Running {
+        crate::server::start_apart(
+            socket.try_clone().expect("a copy of the socket"),
+            &crate::server::Options {
+                listen: "127.0.0.1:0".parse().expect("addr"),
+                store: store.to_path_buf(),
+                advertise: None,
+                pins: pins.to_vec(),
+                hold: Duration::from_millis(200),
+                keep_awake: false,
+            },
+        )
+        .expect("server starts")
+    }
+
+    /// The vault `team` served at `socket` from a store under `root`: made by the admin `ma`,
+    /// with the machine `mb` in it and synced at seq 2, which holds one entry. The server, the
+    /// URL, the admin and the machine.
+    fn a_vault_with_a_member(
+        root: &Path,
+        socket: &std::net::TcpListener,
+    ) -> (crate::server::Running, String, Paths, Paths) {
+        let server = serve(&root.join("store"), socket);
+        let url = format!("http://{}/v1/team", server.addr);
+        let admin = Paths::for_home(&root.join("ma"));
+        let created = create(&admin, &url, None, Some("ma")).expect("create");
+        let member = Paths::for_home(&root.join("mb"));
+        join_pinned(&member, &format!("{url}#{}", created.signer), "mb");
+        let key = status(&member)
+            .expect("status")
+            .machine
+            .expect("a key")
+            .0
+            .to_bech32();
+        let opened = admin_open(&admin).expect("open");
+        let mut doc = opened.doc.clone();
+        doc.add_machine("mb", &key).expect("add");
+        doc.set_entry(&Audience::Everyone, "token", b"inert-token")
+            .expect("set");
+        admin_publish(&admin, &opened, &doc).expect("publish");
+        assert!(matches!(
+            sync(&member, None).expect("sync"),
+            SyncOutcome::Applied { seq: 2, .. }
+        ));
+        (server, url, admin, member)
+    }
+
+    /// What `source` serves: `None` when it holds no vault.
+    fn served_at(source: &Source) -> Option<Vec<u8>> {
+        match transport::fetch(source, None, Duration::from_secs(30)) {
+            Ok(Fetched::Body(bytes)) => Some(bytes),
+            Ok(Fetched::Missing) => None,
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// The `--pin` a server gives the vault `paths` is configured for: its name and signer.
+    fn pin_of(paths: &Paths) -> Vec<(String, [u8; 32])> {
+        let config = pinned(paths);
+        vec![(config.name, config.signer.expect("signed"))]
+    }
+
     /// A server that lost the vault (its Mac's store gone, or the server moved to a Mac with an
-    /// empty one) answers the approver's read of the queue that it holds no such vault: the
-    /// approver puts this admin's copy back, says so, and looks again only a minute on.
+    /// empty one) and pins its name gets it back from the next pass of the subscriber of any
+    /// machine in it, admin or not: its copy of the version it holds, put back as it is, which
+    /// the pass says; the next pass, 5 s later, long-polls. So does a machine whose last apply
+    /// left an entry unwritten: it still holds that version.
     #[test]
-    fn the_approver_puts_back_a_vault_its_server_lost() {
+    fn a_machine_in_the_vault_puts_back_a_vault_its_server_lost() {
+        let root = aterm_tempfile::tempdir().expect("tempdir");
+        let socket = bound();
+        let (server, url, admin, member) = a_vault_with_a_member(root.path(), &socket);
+        let source = Source::Url(url);
+        let pin = pin_of(&admin);
+        let lose = |server: crate::server::Running, store: &str| {
+            server.stop();
+            let empty = serve_apart(&root.path().join(store), &socket, &pin);
+            assert!(served_at(&source).is_none(), "the server holds no vault");
+            empty
+        };
+        let copy = std::fs::read(member.cache_file()).expect("the member's copy");
+
+        let server = lose(server, "moved");
+        let (config, outcome) = subscriber_pass(&member, &mut None).expect("a pass");
+        assert_eq!(
+            outcome,
+            SyncOutcome::PutBack {
+                seq: 2,
+                served: None
+            }
+        );
+        assert!(
+            served_at(&source) == Some(copy.clone()),
+            "the member's copy is served"
+        );
+        let mut failing = FIRST_RETRY;
+        assert_eq!(
+            pause_after(&config.source, &outcome, &mut failing),
+            FIRST_RETRY
+        );
+
+        let token = materialize::target_path(&member.home, "token").expect("target");
+        std::fs::remove_file(&token).expect("the token removed");
+        std::fs::create_dir(&token).expect("the entry blocked");
+        let SyncOutcome::Applied { report, .. } = sync(&member, None).expect("a partial apply")
+        else {
+            panic!("the blocked entry is applied again");
+        };
+        assert!(!report.failed.is_empty());
+        let server = lose(server, "again");
+        let (_, outcome) = subscriber_pass(&member, &mut None).expect("a pass");
+        assert_eq!(
+            outcome,
+            SyncOutcome::PutBack {
+                seq: 2,
+                served: None
+            }
+        );
+        assert!(served_at(&source) == Some(copy), "the member's copy again");
+        server.stop();
+    }
+
+    /// A source that takes this machine's copy back and holds none again at the next pass (a
+    /// GET that reaches no vault server, as through a proxy that keeps a 404) is given it again
+    /// 5 s later, doubling to five minutes while it keeps none, and the log says so once; a
+    /// pass that finds the vault there starts both again. An entry that keeps failing logs its
+    /// retries once the same way.
+    #[test]
+    fn a_put_back_the_source_keeps_no_more_backs_off_and_is_logged_once() {
+        let root = aterm_tempfile::tempdir().expect("tempdir");
+        let paths = Paths::for_home(root.path());
+        let config = Config {
+            source: Source::Url("http://127.0.0.1:7484/v1/team".to_string()),
+            name: "team".into(),
+            signer: Some([1u8; 32]),
+            followed: Vec::new(),
+            host: "mb".into(),
+        };
+        let put_back = SyncOutcome::PutBack {
+            seq: 2,
+            served: None,
+        };
+        let (mut failing, mut repeated) = (FIRST_RETRY, String::new());
+        let mut pass = |outcome: &SyncOutcome| {
+            (
+                pause_after(&config.source, outcome, &mut failing).as_secs(),
+                pass_line(&paths, &config, outcome, &mut repeated),
+            )
+        };
+        let passes: Vec<(u64, bool)> = (0..8)
+            .map(|_| {
+                let (pause, line) = pass(&put_back);
+                (pause, line.is_some())
+            })
+            .collect();
+        assert_eq!(
+            passes,
+            [
+                (5, true),
+                (10, false),
+                (20, false),
+                (40, false),
+                (80, false),
+                (160, false),
+                (300, false),
+                (300, false)
+            ]
+        );
+        assert_eq!(pass(&SyncOutcome::Unchanged { seq: 2 }), (10, None));
+        let (pause, line) = pass(&put_back);
+        assert_eq!(pause, 5);
+        let line = line.expect("logged again");
+        assert!(
+            line.contains("held no vault named team: put this machine's copy back (seq 2)"),
+            "{line}"
+        );
+        let failed = SyncOutcome::Applied {
+            seq: 2,
+            report: crate::materialize::Report {
+                failed: vec![("token".to_string(), "is a symlink".to_string())],
+                ..Default::default()
+            },
+        };
+        assert!(pass(&failed).1.is_some());
+        assert_eq!(pass(&failed).1, None);
+    }
+
+    /// A server that takes no first version of the vault from another Mac (a name it does not
+    /// pin) refuses the copy: the pass is the missing error with the refusal in it, and the
+    /// next pass the same error, which the subscriber logs once and backs off from, so it never
+    /// asks in a tight loop. The store stays empty.
+    #[test]
+    fn a_server_that_does_not_pin_the_vault_refuses_its_copy_and_the_pass_errs() {
+        let root = aterm_tempfile::tempdir().expect("tempdir");
+        let socket = bound();
+        let (server, url, _, member) = a_vault_with_a_member(root.path(), &socket);
+        let source = Source::Url(url);
+        server.stop();
+        let server = serve_apart(&root.path().join("moved"), &socket, &[]);
+        let first = subscriber_pass(&member, &mut None)
+            .expect_err("refused")
+            .to_string();
+        assert!(
+            first
+                .contains("holds no vault named team, and putting this machine's copy back failed")
+                && first.contains("403")
+                && first.contains(
+                    "only from the server's own Mac, or under aterm secrets serve --pin <vault>=<key>"
+                ),
+            "{first}"
+        );
+        assert!(served_at(&source).is_none(), "nothing stored");
+        let second = subscriber_pass(&member, &mut None)
+            .expect_err("refused again")
+            .to_string();
+        assert_eq!(second, first, "one line in the log, then the backoff");
+        assert!(served_at(&source).is_none(), "nothing stored");
+        server.stop();
+    }
+
+    /// A machine its version keeps out (one waiting for approval) gives a server that lost the
+    /// vault nothing back, nor does a machine whose cached copy is not the version it holds or
+    /// does not verify: each pass is the missing error alone and the store stays empty, and the
+    /// waiting machine's request falls due at once, as the server lost its queue too. The same
+    /// server takes the machine's own copy once it is back.
+    #[test]
+    fn a_machine_kept_out_or_without_a_verified_copy_puts_nothing_back() {
+        let root = aterm_tempfile::tempdir().expect("tempdir");
+        let socket = bound();
+        let (server, url, admin, member) = a_vault_with_a_member(root.path(), &socket);
+        let source = Source::Url(url.clone());
+        let signer = crate::b64::encode_padded(&pinned(&admin).signer.expect("signed"));
+        let waiting = Paths::for_home(&root.path().join("mc"));
+        assert!(matches!(
+            join_pinned(&waiting, &format!("{url}#{signer}"), "mc"),
+            JoinOutcome::Pending { .. }
+        ));
+        // A version the member never synced.
+        let opened = admin_open(&admin).expect("open");
+        let mut doc = opened.doc.clone();
+        doc.set_entry(&Audience::Everyone, "later", b"inert-later")
+            .expect("set");
+        admin_publish(&admin, &opened, &doc).expect("publish");
+        let newer = served_at(&source).expect("seq 3");
+        let copy = std::fs::read(member.cache_file()).expect("the member's copy");
+        server.stop();
+        let server = serve_apart(&root.path().join("moved"), &socket, &pin_of(&admin));
+        let missing_here = |paths: &Paths| missing(&pinned(paths)).to_string();
+
+        let error = subscriber_pass(&waiting, &mut None).expect_err("kept out");
+        assert_eq!(error.to_string(), missing_here(&waiting));
+        assert!(
+            served_at(&source).is_none(),
+            "a waiting machine puts nothing back"
+        );
+        assert_eq!(
+            load_state(&waiting).expect("state").requested,
+            0,
+            "asked again at once"
+        );
+
+        // The signature line ends `…xx==` and a LF: a character well inside it changed.
+        let mut forged = copy.clone();
+        let at = forged.len() - 10;
+        forged[at] = if forged[at] == b'A' { b'B' } else { b'A' };
+        let held = load_state(&member).expect("state").digest;
+        let record = |digest: Option<[u8; 32]>| {
+            let mut state = load_state(&member).expect("state");
+            state.digest = digest;
+            save_state(&member, &state).expect("state.toml");
+        };
+        for (what, cached, recorded) in [
+            ("a cache that is not the version held", &newer, held),
+            (
+                "a cache that does not verify, though state.toml holds it",
+                &forged,
+                Some(sha256(&forged)),
+            ),
+        ] {
+            record(recorded);
+            fsx::write_atomic(&member.cache_file(), cached, 0o600).expect("cache");
+            let error = subscriber_pass(&member, &mut None).expect_err(what);
+            assert_eq!(error.to_string(), missing_here(&member), "{what}");
+            assert!(served_at(&source).is_none(), "{what}: nothing put back");
+        }
+        record(held);
+        fsx::write_atomic(&member.cache_file(), &copy, 0o600).expect("cache");
+        let (_, outcome) = subscriber_pass(&member, &mut None).expect("a pass");
+        assert_eq!(
+            outcome,
+            SyncOutcome::PutBack {
+                seq: 2,
+                served: None
+            }
+        );
+        assert!(
+            served_at(&source) == Some(copy),
+            "the member's copy is served"
+        );
+        server.stop();
+    }
+
+    /// A signed vault at a path whose file is gone (a volume not mounted, a shared folder not
+    /// synced yet) is left to an admin command: a machine in the vault writes nothing there,
+    /// and its pass is the missing error alone. The admin's next command puts its copy back.
+    #[test]
+    fn a_machine_in_the_vault_writes_nothing_to_a_path_that_holds_no_vault() {
+        let root = aterm_tempfile::tempdir().expect("tempdir");
+        let shared = root.path().join("shared").join("team.vault");
+        std::fs::create_dir_all(shared.parent().expect("parent")).expect("dir");
+        let path = shared.to_str().expect("utf-8");
+        let admin = Paths::for_home(&root.path().join("ma"));
+        let created = create(&admin, path, None, Some("ma")).expect("create");
+        let member = Paths::for_home(&root.path().join("mb"));
+        join_pinned(&member, &format!("{path}#{}", created.signer), "mb");
+        let key = status(&member)
+            .expect("status")
+            .machine
+            .expect("a key")
+            .0
+            .to_bech32();
+        let opened = admin_open(&admin).expect("open");
+        let mut doc = opened.doc.clone();
+        doc.add_machine("mb", &key).expect("add");
+        admin_publish(&admin, &opened, &doc).expect("publish");
+        assert!(matches!(
+            sync(&member, None).expect("sync"),
+            SyncOutcome::Applied { seq: 2, .. }
+        ));
+        std::fs::remove_file(&shared).expect("the file gone");
+
+        let error = subscriber_pass(&member, &mut None).expect_err("missing");
+        assert_eq!(error.to_string(), missing(&pinned(&member)).to_string());
+        assert!(!shared.exists(), "nothing written at the path");
+        admin_open(&admin).expect("open");
+        assert_eq!(
+            std::fs::read(&shared).ok(),
+            std::fs::read(admin.cache_file()).ok(),
+            "the admin's copy is back"
+        );
+    }
+
+    /// An admin of a vault closed to joins (no join password, not open), for which no approver
+    /// reads the queue, puts back a vault its server lost all the same: its subscriber's next
+    /// pass does, as any machine in the vault's does.
+    #[test]
+    fn an_admin_of_a_vault_closed_to_joins_puts_back_a_vault_its_server_lost() {
         let root = aterm_tempfile::tempdir().expect("tempdir");
         let socket = bound();
         let server = serve(&root.path().join("store"), &socket);
@@ -5216,58 +6272,100 @@ mod tests {
         create(&admin, &url, None, Some("ma")).expect("create");
         let opened = admin_open(&admin).expect("open");
         let mut doc = opened.doc.clone();
+        doc.set_join_password(None).expect("closed");
+        admin_publish(&admin, &opened, &doc).expect("publish");
+        assert_eq!(approving_here(&admin).expect("read"), None, "no approver");
+        server.stop();
+        let server = serve_apart(&root.path().join("moved"), &socket, &pin_of(&admin));
+        let (_, outcome) = subscriber_pass(&admin, &mut None).expect("a pass");
+        assert_eq!(
+            outcome,
+            SyncOutcome::PutBack {
+                seq: 2,
+                served: None
+            }
+        );
+        let copy = std::fs::read(admin.cache_file()).expect("the admin's copy");
+        assert!(
+            served_at(&source) == Some(copy),
+            "the admin's copy is served"
+        );
+        server.stop();
+    }
+
+    /// A server that lost its store and took an older copy back (an admin Mac that slept
+    /// through the versions since put its own back) answers a long-poll from a machine holding
+    /// a newer version with nothing newer, naming the seq it holds: that machine, which the
+    /// newer version let in, puts its copy back over the older one. A cached copy that is not
+    /// the version state.toml holds, or does not verify, is never published.
+    #[test]
+    fn a_machine_puts_its_newer_copy_back_over_an_older_one_a_server_took() {
+        let root = aterm_tempfile::tempdir().expect("tempdir");
+        let socket = bound();
+        let server = serve(&root.path().join("store"), &socket);
+        let url = format!("http://{}/v1/team", server.addr);
+        let source = Source::Url(url.clone());
+        let served = || match transport::fetch(&source, None, Duration::from_secs(30)) {
+            Ok(Fetched::Body(bytes)) => bytes,
+            other => panic!("{other:?}"),
+        };
+        let admin = Paths::for_home(&root.path().join("ma"));
+        let created = create(&admin, &url, None, Some("ma")).expect("create");
+        let member = Paths::for_home(&root.path().join("mb"));
+        join_pinned(&member, &format!("{url}#{}", created.signer), "mb");
+        let key = status(&member)
+            .expect("status")
+            .machine
+            .expect("a key")
+            .0
+            .to_bech32();
+        let opened = admin_open(&admin).expect("open");
+        let mut doc = opened.doc.clone();
+        doc.add_machine("mb", &key).expect("add");
+        admin_publish(&admin, &opened, &doc).expect("publish");
+        // What an admin Mac held when it went to sleep.
+        let stale = served();
+        let opened = admin_open(&admin).expect("open");
+        let mut doc = opened.doc.clone();
         doc.set_entry(&Audience::Everyone, "token", b"inert-token")
             .expect("set");
         admin_publish(&admin, &opened, &doc).expect("publish");
-        let served = || match transport::fetch(&source, None, Duration::from_secs(30)) {
-            Ok(Fetched::Body(bytes)) => Some(bytes),
-            Ok(Fetched::Missing | Fetched::NoNewer) => None,
-            Err(error) => panic!("{error}"),
-        };
-        let lines = std::sync::Mutex::new(Vec::new());
-        let log = |line: &str| lines.lock().expect("log").push(line.to_string());
-        let mut approver = Approver::default();
-        let lose = |server: crate::server::Running, store: &str| {
-            server.stop();
-            let empty = serve(&root.path().join(store), &socket);
-            assert!(served().is_none(), "the server holds no vault");
-            empty
-        };
+        assert!(matches!(
+            sync(&member, None).expect("sync"),
+            SyncOutcome::Applied { seq: 3, .. }
+        ));
+        let newest = std::fs::read(member.cache_file()).expect("the member's copy");
 
-        let empty = lose(server, "empty");
-        assert_eq!(
-            approver_pass(&admin, &log, &mut approver),
-            Duration::from_secs(10)
-        );
-        let cached = std::fs::read(admin.cache_file()).expect("cache");
-        assert!(
-            served() == Some(cached.clone()),
-            "the admin's copy is served"
-        );
-        assert_eq!(
-            lines.lock().expect("log").as_slice(),
-            [format!(
-                "{} held no vault named team: put this admin's copy back (seq 2)",
-                transport::describe(&url)
-            )]
-        );
-        // The queue reads again: the approver goes on as before.
-        assert_eq!(
-            approver_pass(&admin, &log, &mut approver),
-            Duration::from_secs(2)
-        );
+        // The server moves to a Mac with an empty store, and the sleeping admin's copy is the
+        // first to reach it.
+        server.stop();
+        let server = serve(&root.path().join("moved"), &socket);
+        transport::publish(&source, &stale).expect("the stale copy is taken");
 
-        // Lost again within the minute: left until a minute on.
-        let again = lose(empty, "again");
-        approver_pass(&admin, &log, &mut approver);
-        assert!(served().is_none(), "not looked at again yet");
-        approver.lost_checked = approver
-            .lost_checked
-            .and_then(|at| at.checked_sub(PUT_BACK_EVERY));
-        approver_pass(&admin, &log, &mut approver);
-        assert!(served() == Some(cached), "the admin's copy is served again");
-        assert_eq!(lines.lock().expect("log").len(), 2);
-        again.stop();
+        // The signature line ends `…xx==` and a LF: a character well inside it changed.
+        let mut forged = newest.clone();
+        let at = forged.len() - 10;
+        forged[at] = if forged[at] == b'A' { b'B' } else { b'A' };
+        for (what, cached) in [
+            ("a cache that is not the version held", &stale),
+            ("a cache that does not verify", &forged),
+        ] {
+            fsx::write_atomic(&member.cache_file(), cached, 0o600).expect("cache");
+            let (_, outcome) = subscriber_pass(&member, &mut None).expect(what);
+            assert_eq!(outcome, SyncOutcome::Unchanged { seq: 3 }, "{what}");
+            assert!(served() == stale, "{what}: nothing published");
+        }
+        fsx::write_atomic(&member.cache_file(), &newest, 0o600).expect("cache");
+        let (_, outcome) = subscriber_pass(&member, &mut None).expect("a pass");
+        assert_eq!(
+            outcome,
+            SyncOutcome::PutBack {
+                seq: 3,
+                served: Some(2)
+            }
+        );
+        assert!(served() == newest, "the newest copy is served");
+        server.stop();
     }
 }
 

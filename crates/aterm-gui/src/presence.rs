@@ -799,19 +799,28 @@ pub(crate) fn classify(
     )
 }
 
-/// The prompt's kind word and, for a Bash approval, the read-only classifier's
-/// verdict (`bash:read-only` only when every reading of the box's command rows
-/// is). Never the command itself. Advisory: the supervisor's decider decides.
+/// The prompt's kind word and, for a Bash approval, the read-only rule's
+/// verdict on the box's command (`bash:read-only` only when every reading of
+/// its command rows classifies read-only and none turns on a blank the
+/// screen cannot show: the policy's own
+/// [`aterm_agent::supervise::policy::approval::readings_read_only`], with the
+/// classifier's default python allowlist). Never the command itself.
+/// Advisory: it is the rule's verdict on the command alone, and the
+/// supervisor's decider decides on the box and the session too (a vendor
+/// note, bypass, a breaker's options, the shell's startup, zsh, git
+/// configuration), so it may refuse a box whose word is `read-only`.
 fn prompt_detail(p: &aterm_phase::PromptV2) -> String {
     let kind = sanitize_token(p.kind.name(), 24);
     if p.kind != aterm_phase::PromptKind::Bash || p.command.trim().is_empty() {
         return kind;
     }
-    let readings = p.readings();
-    let read_only = !readings.is_empty()
-        && readings
-            .iter()
-            .all(|r| aterm_agent::supervise::classify::classify_command(r).read_only);
+    let python_allow: Vec<String> = aterm_agent::supervise::DEFAULT_PYTHON_ALLOW
+        .iter()
+        .map(|g| (*g).to_string())
+        .collect();
+    let read_only =
+        aterm_agent::supervise::policy::approval::readings_read_only(&p.readings(), &python_allow)
+            .is_ok();
     let verdict = if read_only {
         "read-only"
     } else {
@@ -2296,6 +2305,76 @@ mod tests {
             "bash:not-read-only"
         };
         assert_eq!(detail_of(&wrapped).as_deref(), Some(want));
+    }
+
+    /// THE WORD IS THE READ-ONLY RULE'S VERDICT ON THE COMMAND AS DRAWN
+    /// ([`aterm_agent::supervise::policy::approval::readings_read_only`],
+    /// the function the rule itself calls). MEASURED 2026-10-22 (2.1.308, the
+    /// real-Claude lab): a `find` continued over four barred rows, a `\`
+    /// ending each of the first three, classifies read-only in every reading,
+    /// but a blank after a `\`, which the screen does not show, would end the
+    /// line instead of joining the next, so the rule refuses it and the word
+    /// is `bash:not-read-only`. The classifier alone, this word's reading
+    /// before, said `bash:read-only` for a command the policy refuses.
+    ///
+    /// NEGATIVE CONTROL: an `awk` program over four barred rows with its
+    /// newlines inside the quotes and no `\` (MEASURED, the same lab) is
+    /// read-only in every reading and read as drawn: `bash:read-only`.
+    #[test]
+    fn a_bash_verdict_is_the_read_only_rules_on_the_command_as_drawn() {
+        use aterm_agent::supervise::classify::classify_command;
+        use aterm_agent::supervise::policy::approval::readings_read_only;
+        use aterm_phase::prompt::fixtures::{
+            BOX_BASH_AWK_MULTI_LINE_2_1_308, BOX_BASH_FIND_CONTINUED_2_1_308, screen,
+        };
+        let continued = screen(BOX_BASH_FIND_CONTINUED_2_1_308);
+        let p = aterm_phase::parse_prompt_v2(&continued).expect("the box");
+        assert_eq!(p.readings().len(), 2, "{:?}", p.readings());
+        for reading in p.readings() {
+            assert!(classify_command(&reading).read_only, "{reading:?}");
+        }
+        let refused = readings_read_only(&p.readings(), &[]);
+        assert!(
+            refused
+                .as_ref()
+                .is_err_and(|e| e.contains("a backslash ends a line")),
+            "{refused:?}"
+        );
+        assert_eq!(detail_of(&continued).as_deref(), Some("bash:not-read-only"));
+        // NEGATIVE CONTROL
+        let awk = screen(BOX_BASH_AWK_MULTI_LINE_2_1_308);
+        let p = aterm_phase::parse_prompt_v2(&awk).expect("the box");
+        assert_eq!(readings_read_only(&p.readings(), &[]), Ok(()));
+        assert_eq!(detail_of(&awk).as_deref(), Some("bash:read-only"));
+    }
+
+    /// THE WORD READS THE CLASSIFIER'S DEFAULT PYTHON ALLOWLIST
+    /// ([`aterm_agent::supervise::DEFAULT_PYTHON_ALLOW`], empty), the one the
+    /// read-only rule reads unless the owner names scripts: `python3
+    /// report.py` is `bash:not-read-only`, as the rule refuses it.
+    ///
+    /// NEGATIVE CONTROL: the allowlist is the only refusal — with the script
+    /// on it, [`readings_read_only`] of the same readings is `Ok`.
+    ///
+    /// [`readings_read_only`]: aterm_agent::supervise::policy::approval::readings_read_only
+    #[test]
+    fn a_bash_verdict_reads_the_default_python_allowlist() {
+        use aterm_agent::supervise::policy::approval::readings_read_only;
+        let rows = bash_box(&["python3 report.py"]);
+        let p = aterm_phase::parse_prompt_v2(&rows).expect("a box");
+        let refused = readings_read_only(&p.readings(), &[]);
+        assert!(
+            refused
+                .as_ref()
+                .is_err_and(|e| e.contains("not on the read-only script allowlist")),
+            "{refused:?}"
+        );
+        assert_eq!(detail_of(&rows).as_deref(), Some("bash:not-read-only"));
+        // NEGATIVE CONTROL
+        assert_eq!(
+            readings_read_only(&p.readings(), &["report.py".to_string()]),
+            Ok(())
+        );
     }
 
     /// A node-run vendor `codex` (npm's launcher leads its group as `node`)

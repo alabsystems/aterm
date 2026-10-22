@@ -1,0 +1,426 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Andrew Yates
+
+//! The built-in rules' decider, by tables: when each is due, what its caps and the pace leave,
+//! and which guard holds it — every guard with its negative control, the same break with nothing
+//! holding.
+
+use super::super::reading::SlotsSeen;
+use super::*;
+use crate::supervise::memory::Pressure;
+
+const MIN: i64 = 60_000;
+const HOUR: i64 = 60 * MIN;
+
+/// The board's stamp in these tables (unix ms).
+const T0: i64 = 1_760_000_000_000;
+
+/// One fact a table takes off a board.
+type Unset = fn(&mut OccupancyReading);
+
+/// One guard a table sets.
+type SetGuard = fn(&mut Guards);
+
+/// A hold open since 0, undeclared.
+fn hold() -> Option<HoldSeen> {
+    Some(HoldSeen {
+        since_ms: 0,
+        declared: false,
+    })
+}
+
+/// A board on which every one of `hold-room`'s machine terms holds, taken at `T0`, a slot held
+/// by this session a minute before.
+fn room() -> OccupancyReading {
+    OccupancyReading {
+        taken_ms: T0,
+        stale: false,
+        avail_mib: Some(96 * 1024),
+        pressure: Some(Pressure::Normal),
+        disk: Some(Level::Ok),
+        slots: Some(SlotsSeen { usable: 1, n: 3 }),
+        slots_free_ms: Some(20 * 60_000),
+        room: Some(true),
+        held_slot_last_ms: Some(T0 - MIN),
+    }
+}
+
+/// The verdict of `rule` at `now_ms`.
+fn verdict(
+    rule: RuleId,
+    r: &OccupancyReading,
+    hold: Option<HoldSeen>,
+    books: &Books,
+    g: &Guards,
+    now_ms: i64,
+) -> Verdict {
+    let mut books = books.clone();
+    if let Some(h) = hold {
+        books.hold(h.since_ms);
+    }
+    decide(r, hold, &books, g, now_ms)[rule.index()].1.clone()
+}
+
+fn cruise() -> Guards {
+    Guards::clear(Autopilot::Cruise)
+}
+
+fn is_due(v: &Verdict, rule: RuleId) -> bool {
+    matches!(v, Verdict::Due(line) if line.rule() == rule)
+}
+
+/// Books in which the nudge went at `at_ms`, in the hold since 0.
+fn nudged_at(at_ms: i64) -> Books {
+    let mut b = Books::default();
+    b.hold(0);
+    b.fired(RuleId::WaitNudge, at_ms, true);
+    b
+}
+
+/// `wait-nudge` is due from 30 minutes into an undeclared hold, not a millisecond before, and
+/// with no hold at all never.
+#[test]
+fn the_nudge_is_due_at_thirty_minutes_not_before() {
+    let b = Books::default();
+    let r = OccupancyReading::default();
+    let at = |ms| verdict(RuleId::WaitNudge, &r, hold(), &b, &cruise(), ms);
+    assert_eq!(at(WAIT_NUDGE_AFTER_MS - 1), Verdict::Quiet);
+    assert!(is_due(&at(WAIT_NUDGE_AFTER_MS), RuleId::WaitNudge));
+    assert_eq!(
+        verdict(RuleId::WaitNudge, &r, None, &b, &cruise(), 10 * HOUR),
+        Verdict::Quiet,
+        "no hold, no nudge"
+    );
+}
+
+/// A DECLARED hold gets no nudge (the agent said what it waits for), but `hold-room` still goes
+/// on it (§10 Q2: a declared wait may name the wrong event, as on 10-19).
+#[test]
+fn a_declared_hold_gets_no_nudge_but_hold_room_still_goes() {
+    let declared = Some(HoldSeen {
+        since_ms: 0,
+        declared: true,
+    });
+    let b = Books::default();
+    let v = decide(&room(), declared, &b, &cruise(), HOLD_ROOM_AFTER_MS);
+    assert_eq!(v[RuleId::WaitNudge.index()].1, Verdict::Quiet);
+    assert!(is_due(&v[RuleId::HoldRoom.index()].1, RuleId::HoldRoom));
+    // NEGATIVE CONTROL: the same hold undeclared is nudged.
+    let v = decide(&room(), hold(), &b, &cruise(), WAIT_NUDGE_AFTER_MS);
+    assert!(is_due(&v[RuleId::WaitNudge.index()].1, RuleId::WaitNudge));
+}
+
+/// The nudge goes ONCE A HOLD: told, it is quiet for the rest of that hold, and due again in the
+/// next.
+#[test]
+fn the_nudge_goes_once_a_hold() {
+    let r = OccupancyReading::default();
+    let b = nudged_at(WAIT_NUDGE_AFTER_MS);
+    assert_eq!(
+        verdict(RuleId::WaitNudge, &r, hold(), &b, &cruise(), 5 * HOUR),
+        Verdict::Quiet
+    );
+    let next = Some(HoldSeen {
+        since_ms: 6 * HOUR,
+        declared: false,
+    });
+    assert!(is_due(
+        &verdict(RuleId::WaitNudge, &r, next, &b, &cruise(), 7 * HOUR),
+        RuleId::WaitNudge
+    ));
+}
+
+/// At most three nudges a rolling day: the fourth hold's is SPENT until the first of them is a
+/// day old.
+#[test]
+fn three_nudges_a_day_then_spent() {
+    let r = OccupancyReading::default();
+    let mut b = Books::default();
+    for k in 0..3 {
+        let since = k * 2 * HOUR;
+        b.hold(since);
+        b.fired(RuleId::WaitNudge, since + WAIT_NUDGE_AFTER_MS, true);
+    }
+    let fourth = |since: i64| {
+        Some(HoldSeen {
+            since_ms: since,
+            declared: false,
+        })
+    };
+    assert_eq!(
+        verdict(
+            RuleId::WaitNudge,
+            &r,
+            fourth(6 * HOUR),
+            &b,
+            &cruise(),
+            7 * HOUR
+        ),
+        Verdict::Spent
+    );
+    // NEGATIVE CONTROL: once the first is a day old, the cap has room again.
+    let late = DAY_MS + WAIT_NUDGE_AFTER_MS;
+    assert!(is_due(
+        &verdict(
+            RuleId::WaitNudge,
+            &r,
+            fourth(late - WAIT_NUDGE_AFTER_MS),
+            &b,
+            &cruise(),
+            late
+        ),
+        RuleId::WaitNudge
+    ));
+}
+
+/// `hold-room` is due from two hours into the hold on a board where all its terms hold.
+#[test]
+fn hold_room_is_due_at_two_hours_on_room() {
+    let b = nudged_at(WAIT_NUDGE_AFTER_MS);
+    let at = |ms| verdict(RuleId::HoldRoom, &room(), hold(), &b, &cruise(), ms);
+    assert_eq!(at(HOLD_ROOM_AFTER_MS - 1), Verdict::Quiet);
+    assert!(is_due(&at(HOLD_ROOM_AFTER_MS), RuleId::HoldRoom));
+}
+
+/// `hold-room` lines stand two hours apart, at most four a hold: past the fourth it is SPENT.
+#[test]
+fn hold_room_goes_two_hours_apart_four_a_hold() {
+    let mut b = nudged_at(WAIT_NUDGE_AFTER_MS);
+    b.fired(RuleId::HoldRoom, 2 * HOUR, true);
+    let at = |b: &Books, ms| verdict(RuleId::HoldRoom, &room(), hold(), b, &cruise(), ms);
+    assert_eq!(at(&b, 4 * HOUR - 1), Verdict::Quiet);
+    assert!(is_due(&at(&b, 4 * HOUR), RuleId::HoldRoom));
+    for k in 2..=4 {
+        b.fired(RuleId::HoldRoom, 2 * k * HOUR, true);
+    }
+    assert_eq!(b.this_hold(RuleId::HoldRoom), 4);
+    assert_eq!(at(&b, 20 * HOUR), Verdict::Spent);
+    // NEGATIVE CONTROL: the next hold has its own four.
+    let next = Some(HoldSeen {
+        since_ms: 21 * HOUR,
+        declared: true,
+    });
+    assert!(is_due(
+        &verdict(RuleId::HoldRoom, &room(), next, &b, &cruise(), 23 * HOUR),
+        RuleId::HoldRoom
+    ));
+}
+
+/// EVERY MACHINE TERM OF `hold-room` IS NEEDED: a board that is stale or absent (the empty
+/// reading), a slot term not held for 20 min, the machine's terms unmet or unjudged, a disk not
+/// `ok`, no slot of this session's held in the hold, or a figure the line needs unread — each is
+/// quiet. The control, every term held, is due.
+#[test]
+fn every_term_of_hold_room_is_needed() {
+    let b = nudged_at(WAIT_NUDGE_AFTER_MS);
+    let at = |r: &OccupancyReading| {
+        verdict(
+            RuleId::HoldRoom,
+            r,
+            hold(),
+            &b,
+            &cruise(),
+            HOLD_ROOM_AFTER_MS,
+        )
+    };
+    assert!(is_due(&at(&room()), RuleId::HoldRoom), "the control");
+    let unmet: [(&str, Unset); 12] = [
+        ("empty", |r| *r = OccupancyReading::default()),
+        ("stale", |r| r.stale = true),
+        ("no slot latch", |r| r.slots_free_ms = None),
+        ("machine unmet", |r| r.room = Some(false)),
+        ("machine unjudged", |r| r.room = None),
+        ("disk low", |r| r.disk = Some(Level::Low)),
+        ("disk unjudged", |r| r.disk = None),
+        ("never held a slot", |r| r.held_slot_last_ms = None),
+        ("held before the hold", |r| {
+            r.held_slot_last_ms = Some(T0 - HOLD_ROOM_AFTER_MS - 1);
+        }),
+        ("no slots read", |r| r.slots = None),
+        ("no slot usable", |r| {
+            r.slots = Some(SlotsSeen { usable: 0, n: 3 })
+        }),
+        ("no memory read", |r| r.avail_mib = None),
+    ];
+    for (why, unset) in unmet {
+        let mut r = room();
+        unset(&mut r);
+        assert_eq!(at(&r), Verdict::Quiet, "{why}");
+    }
+}
+
+/// EACH GUARD HOLDS A DUE LINE, under its own word; with none, the same break's line is due.
+#[test]
+fn each_guard_holds_a_due_line() {
+    let r = OccupancyReading::default();
+    let b = Books::default();
+    let now = WAIT_NUDGE_AFTER_MS;
+    let at = |g: Guards| verdict(RuleId::WaitNudge, &r, hold(), &b, &g, now);
+    // NEGATIVE CONTROL: nothing holds.
+    assert!(is_due(&at(cruise()), RuleId::WaitNudge));
+    let cases: [(Guard, SetGuard); 16] = [
+        (Guard::Stall, |g| g.brake = Some(Guard::Stall)),
+        (Guard::LimitEpisode, |g| g.brake = Some(Guard::LimitEpisode)),
+        (Guard::ActUntaken, |g| g.brake = Some(Guard::ActUntaken)),
+        (Guard::WakeSettle, |g| g.brake = Some(Guard::WakeSettle)),
+        (Guard::Credits, |g| g.brake = Some(Guard::Credits)),
+        (Guard::Person, |g| g.person = true),
+        (Guard::Halted, |g| g.halted = true),
+        (Guard::Draft, |g| g.draft = true),
+        (Guard::Taskless, |g| g.taskless = true),
+        (Guard::Exchange, |g| g.exchange = true),
+        (Guard::Memory, |g| g.memory = true),
+        (Guard::Reach, |g| g.reach_down = true),
+        (Guard::Autopilot, |g| g.mode = Autopilot::Land),
+        (Guard::Autopilot, |g| g.mode = Autopilot::Off),
+        // The first that holds is the one said.
+        (Guard::Stall, |g| {
+            g.person = true;
+            g.brake = Some(Guard::Stall);
+        }),
+        (Guard::Draft, |g| {
+            g.taskless = true;
+            g.draft = true;
+        }),
+    ];
+    for (want, set) in cases {
+        let mut g = cruise();
+        set(&mut g);
+        assert_eq!(at(g), Verdict::Held(want), "{g:?}");
+    }
+}
+
+/// A spent cap is said as spent whatever holds the break: the cap is the rule's own.
+#[test]
+fn a_spent_cap_is_said_before_a_guard() {
+    let mut b = nudged_at(WAIT_NUDGE_AFTER_MS);
+    for k in 1..=i64::try_from(HOLD_ROOM_PER_HOLD).expect("a small cap") {
+        b.fired(RuleId::HoldRoom, k * 2 * HOUR, true);
+    }
+    let mut g = cruise();
+    g.person = true;
+    assert_eq!(
+        verdict(RuleId::HoldRoom, &room(), hold(), &b, &g, 20 * HOUR),
+        Verdict::Spent
+    );
+    // Said spent with no board at all: a cap needs no reading.
+    assert_eq!(
+        verdict(
+            RuleId::HoldRoom,
+            &OccupancyReading::default(),
+            hold(),
+            &b,
+            &cruise(),
+            20 * HOUR
+        ),
+        Verdict::Spent
+    );
+}
+
+/// ONE LINE A SESSION PER 20 MINUTES: a line due within the pace of the last is paced to its
+/// end, and at most one is due at a break — the second waits a whole pace behind it.
+#[test]
+fn the_session_pace_holds_a_second_line() {
+    // The nudge went at 1h50m (a hold declared late, say): hold-room at 2h is paced to 2h10m.
+    let b = nudged_at(HOUR + 50 * MIN);
+    let at = |ms| verdict(RuleId::HoldRoom, &room(), hold(), &b, &cruise(), ms);
+    assert_eq!(
+        at(2 * HOUR),
+        Verdict::Paced {
+            next_ms: 2 * HOUR + 10 * MIN
+        }
+    );
+    assert!(is_due(&at(2 * HOUR + 10 * MIN), RuleId::HoldRoom));
+    // Both due at one break (a loop first reached at 2h): the nudge goes, hold-room waits.
+    let v = decide(&room(), hold(), &Books::default(), &cruise(), 2 * HOUR);
+    assert!(is_due(&v[RuleId::WaitNudge.index()].1, RuleId::WaitNudge));
+    assert_eq!(
+        v[RuleId::HoldRoom.index()].1,
+        Verdict::Paced {
+            next_ms: 2 * HOUR + SESSION_PACE_MS
+        }
+    );
+}
+
+/// THE READING IS WANTED only where `hold-room` could be due by all but the machine (F9): not
+/// before two hours, not within its spacing, not past its cap, never with no hold.
+#[test]
+fn the_reading_is_wanted_only_where_hold_room_could_be_due() {
+    let mut b = Books::default();
+    b.hold(0);
+    assert!(!wants_reading(hold(), &b, HOLD_ROOM_AFTER_MS - 1));
+    assert!(wants_reading(hold(), &b, HOLD_ROOM_AFTER_MS));
+    assert!(!wants_reading(None, &b, 10 * HOUR));
+    b.fired(RuleId::HoldRoom, 2 * HOUR, true);
+    assert!(!wants_reading(hold(), &b, 3 * HOUR));
+    assert!(wants_reading(hold(), &b, 4 * HOUR));
+    for k in 2..=4 {
+        b.fired(RuleId::HoldRoom, 2 * k * HOUR, true);
+    }
+    assert!(
+        !wants_reading(hold(), &b, 20 * HOUR),
+        "past the cap: nothing the board says can let it go"
+    );
+}
+
+/// A WOULD ROW READS BACK: its rule, its stamp and its hold's age, for this session only and
+/// under its own rule only; a row this build did not write is passed over.
+#[test]
+fn would_rows_read_back_for_this_session() {
+    let row = |sid: &str, rule: &str, ts: i64, reason: &str| {
+        format!(
+            r#"{{"ts":{ts},"sid":"{sid}","rule_id":"{rule}","outcome":"waiting","reason":"{reason}"}}"#
+        )
+    };
+    let nudge = would_reason(RuleId::WaitNudge, 7, 30 * MIN, false);
+    let room_said = would_reason(RuleId::HoldRoom, 9, 2 * HOUR, true);
+    let body = [
+        row("s-1", WOULD_RULE, T0, &nudge),
+        row("s-2", WOULD_RULE, T0 + 1, &nudge),
+        row("s-1", "fact-hold@v1", T0 + 2, "hold=open held_ms=600000"),
+        row("s-1", WOULD_RULE, T0 + 3, "rule=later-rule@v9 held_ms=1"),
+        row("s-1", WOULD_RULE, T0 + 4, &room_said),
+    ]
+    .join("\n");
+    assert_eq!(
+        would_rows_in(&body, Some("@s-1")),
+        [
+            WouldRow {
+                rule: RuleId::WaitNudge,
+                row_ms: T0,
+                held_ms: 30 * MIN,
+            },
+            WouldRow {
+                rule: RuleId::HoldRoom,
+                row_ms: T0 + 4,
+                held_ms: 2 * HOUR,
+            },
+        ]
+    );
+    assert_eq!(would_rows_in(&body, Some("s-3")), []);
+}
+
+/// An episode's id is the rule's, the hold's and its ordinal's: the same three give the same id
+/// (a successor that carries the hold names it alike), any other gives another.
+#[test]
+fn an_episode_is_its_rule_hold_and_ordinal() {
+    let id = episode(RuleId::WaitNudge, T0, 0);
+    assert_eq!(id, episode(RuleId::WaitNudge, T0, 0));
+    for other in [
+        episode(RuleId::HoldRoom, T0, 0),
+        episode(RuleId::WaitNudge, T0 + 1, 0),
+        episode(RuleId::WaitNudge, T0, 1),
+    ] {
+        assert_ne!(id, other);
+    }
+}
+
+/// A rule's name reads back, and no other name does.
+#[test]
+fn rule_names_read_back() {
+    for rule in RuleId::ALL {
+        assert_eq!(RuleId::of_name(rule.name()), Some(rule));
+        assert_eq!(RuleId::ALL[rule.index()], rule);
+    }
+    assert_eq!(RuleId::of_name("wait-nudge@v2"), None);
+}

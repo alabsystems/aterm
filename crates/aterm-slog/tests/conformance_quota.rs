@@ -10,7 +10,7 @@
 //!
 //! A seeded walk drives a real eight-record ring (a quota of two marks):
 //! observations (a bell) and claims (`note` marks, `src=mark`) appended, the
-//! readers fenced and the fence lifted (ruling R4), the byte budget lowered
+//! readers fenced and the fence lifted, the byte budget lowered
 //! until one claim fills the marks' quarter. After every step the live
 //! records are projected onto the model (observations and marks, fenced or
 //! not, the newest's kind, the log's own `lost`), and the step must be the

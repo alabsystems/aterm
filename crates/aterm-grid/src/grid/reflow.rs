@@ -228,7 +228,7 @@ impl RewrapCursors {
     /// Tracked points for a line chunked from `cells`: each cursor's logical
     /// offset into the line, from the `offsets` its rows give it. The saved
     /// cursor keeps a gap past the line's content (`TrackedPoint::keeps_gap`).
-    fn points(offsets: [Option<usize>; 3]) -> [TrackedPoint; 3] {
+    const fn points(offsets: [Option<usize>; 3]) -> [TrackedPoint; 3] {
         let [live, saved, base] = offsets;
         [
             TrackedPoint {
@@ -2412,7 +2412,7 @@ struct RowCountChange {
 
 impl RowCountChange {
     /// A change that owes nothing.
-    fn revealed(revealed: usize, extras: Vec<(u16, Box<ScrolledRowExtras>)>) -> Self {
+    const fn revealed(revealed: usize, extras: Vec<(u16, Box<ScrolledRowExtras>)>) -> Self {
         Self {
             revealed,
             extras,

@@ -2,8 +2,8 @@
 // Copyright 2026 Andrew Yates
 
 //! THE NEEDS STORE (`docs/DESIGN-harness-autopilot-2026-10-15.md` §12.2.3
-//! items 3-4, §12.2.6; slice 2c): the window's host hears the worker's whole
-//! NEEDS YOU set from its loop (`IdleHost::needs_standing`, slice 2b), stores
+//! items 3-4, §12.2.6): the window's host hears the worker's whole
+//! NEEDS YOU set from its loop (`IdleHost::needs_standing`), stores
 //! it on the session's timeline on the loop's own thread before the entry's
 //! `meta set` goes out (`Hooks::needs`, `store_needs`,
 //! `SessionTimeline::set_harness_needs`), keeps the set it replaces beside
@@ -11,7 +11,7 @@
 //! window with a fact that carries nothing (`HarnessFact::Needs`) only where
 //! what a reader reads beside the entry standing moved. The words are read
 //! only beside the entry they were told with (`NeedFacts::told_needs`).
-//! Nothing is drawn from them yet (slice 2d).
+//! Nothing is drawn from them yet.
 //!
 //! The host here is the real one (`HostHandle`, its `WorkerIdle`), its
 //! `needs` hook the live `store_needs` over a real headless App's store; the

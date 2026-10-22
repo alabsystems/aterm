@@ -623,7 +623,7 @@ fn amend_out(log: &mut Log, node: aterm_slog::Node, kind: Kind, out: &str, conf:
     .expect("amends");
 }
 
-/// PHASE 3B (A5, ruling S9): an EXACT amend refines a held turn's outcome
+/// PHASE 3B: an EXACT amend refines a held turn's outcome
 /// and moves it between the totals' buckets, the bus totals following; a
 /// STRONG one (an unmeasured build's transcript) never overrules the
 /// screen's close, whatever its seq.

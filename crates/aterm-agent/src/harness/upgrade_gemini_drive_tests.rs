@@ -1215,8 +1215,7 @@ fn a_bare_restart_before_its_first_turn_is_resumed_on_its_session() {
 
     // NEGATIVE CONTROL: a bare worker launch's crash whose session took no
     // turn, its word gone by the attempt (another command's block newest):
-    // the crash the look read stands, never its own restart on a guess (the
-    // review of 3a4586a01e, R2).
+    // the crash the look read stands, never its own restart on a guess.
     let rig = Rig::new("crash-turnless-bare", 1, true, false, Files::default());
     turnless_files(&rig);
     let snap = bare(&rig);
@@ -1229,7 +1228,7 @@ fn a_bare_restart_before_its_first_turn_is_resumed_on_its_session() {
 }
 
 /// WHAT THE LOOK READ AT A WORKER'S EXIT STANDS WHEN ITS WORD IS GONE BY THE
-/// ATTEMPT (`relaunch::ExitRecord::Restarted`; the review of 3a4586a01e, R2):
+/// ATTEMPT (`relaunch::ExitRecord::Restarted`):
 /// its own restart (`42`) read at the look is kept as one, and resumed
 /// quietly (`done:resumed`) with another command's block newest by the
 /// attempt; a worker's crash (`1`) read at the look is continued after its
@@ -2387,7 +2386,7 @@ fn the_told_line_is_safe_to_run() {
 /// `Decide` does — a crash continued after its line, its own restart quiet
 /// (`done:resumed`) — and types nothing where it does not. Every exit is
 /// replayed on a worker's `--session-id` launch, prompted or not (whose `42`
-/// would be its own restart: the review of 3a4586a01e, R2, found the
+/// would be its own restart: an earlier version the
 /// binding gave its crashes a `--resume` launch alone), and the exits no own
 /// restart can be once more on a `--resume` launch. Negative controls:
 /// where the `Buggy = 1` model looks at the exit as Claude Code's

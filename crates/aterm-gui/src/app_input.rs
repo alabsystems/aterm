@@ -3926,7 +3926,7 @@ pub(crate) fn note_person(ctx: &crate::SessionCtx, gesture: crate::human_input::
 /// ([`crate::human_input::reaches_program`]): every gesture stamps the
 /// person's clock, counts, and writes the burst's `human` row and mark; only
 /// one that reached the program can dismiss a box or answer delivered mail
-/// in the session log (rulings T1, T39). Its delivery to the log is once per
+/// in the session log. Its delivery to the log is once per
 /// count ([`crate::session_log::SessionLog::person_input`]).
 pub(crate) fn note_person_reaching(
     ctx: &crate::SessionCtx,
@@ -3942,7 +3942,7 @@ pub(crate) fn note_person_reaching(
 /// The timeline half of [`note_person_reaching`], for the gesture `noted`
 /// counted: a burst's delivery and its row under the lock, any other's
 /// delivery through a `try_lock`. The `human` row is the burst mark's
-/// (phase 6, the review of 6F-8; ruling U13): paid after the delivery wrote
+/// (the review of 6F-8): paid after the delivery wrote
 /// the mark ([`crate::session_timeline::SessionTimeline::pay_burst_rows`]),
 /// and none here for a burst a reconciling entry marked first while this
 /// waited on the lock, whose row that entry's hold owed and paid where the

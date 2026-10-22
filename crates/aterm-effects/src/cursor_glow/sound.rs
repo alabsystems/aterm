@@ -262,7 +262,7 @@ impl CursorGlow {
     /// [`Self::sound_cues`], so no credit mutes the first click after the
     /// aurora returns.
     #[inline]
-    pub(super) fn clear_keyed_clicks(&mut self) {
+    pub(super) const fn clear_keyed_clicks(&mut self) {
         self.keyed_clicks = 0;
         self.keyed_click_at = None;
     }
@@ -330,7 +330,7 @@ impl CursorGlow {
     /// that never read `intensity`). Every tick that may open the key seam calls
     /// this first.
     #[inline]
-    pub(super) fn store_key_timbre(&mut self, cfg: &GlowConfig) {
+    pub(super) const fn store_key_timbre(&mut self, cfg: &GlowConfig) {
         self.heat_gain_live = Self::heat_gain(matches!(cfg.style, GlowStyle::Fire));
         self.heat_tau_live = Self::heat_tau(cfg);
     }

@@ -6,24 +6,24 @@
 //! `aterm-session-log`, so `log @<sid>` and `brief @<sid>` answer for a
 //! session from an earlier run or a crash (`session_log_journal_read`).
 //!
-//! ON BY DEFAULT (D3, ruled 2026-10-19; Phase 6 ruling U21): the journal
+//! ON BY DEFAULT (D3, ruled 2026-10-19): the journal
 //! follows the desk ([`gate`]: `restore_session` and `Desk::kept`, whose lab
 //! seam gives a private headless instance a window's desk), on macOS and
-//! Linux. `[session_log] journal = false` is the opt-out (ruling R10): then,
+//! Linux. `[session_log] journal = false` is the opt-out: then,
 //! as headless, with `restore_session` off and on Windows, [`Lane::new`]
 //! makes an inert lane: no directory, no file, no thread, no wake installed
 //! in any log, no read, no deletion, on every path. No data migration: an
 //! older build after a downgrade neither writes nor prunes the folder.
 //!
 //! THE WRITER pulls. A producer's append does no I/O and touches no channel:
-//! the log rings the lane's [`aterm_slog::Notify`] (ruling R6: inside the
+//! the log rings the lane's [`aterm_slog::Notify`] (inside the
 //! log, so no producer path bypasses it), one relaxed swap and at most one
 //! unpark per writer pass. The thread parks while clean (an idle machine arms
 //! nothing), coalesces wakes to one pass per [`COALESCE`], and ticks once a
 //! second only while a retry is owed. A pass:
 //! 1. takes the store's write lock with `try_write`, clones live timelines
 //!    and moves the bounded retirement handoff out atomically (a session
-//!    that retired before its first snapshot is included, ruling R7);
+//!    that retired before its first snapshot is included);
 //! 2. for each track takes its timeline with `try_lock` (busy: skipped and
 //!    owed), copies at most [`BATCH_RECORDS`] records past its cursor
 //!    (`aterm_slog::journal::take`), and lets go: the lock is held for the
@@ -32,7 +32,7 @@
 //!    path first in each segment and after any loss) and appends them in one
 //!    `write(2)`.
 //!
-//! Every process writes only its own fresh files (ruling R3): segments
+//! Every process writes only its own fresh files: segments
 //! `<inst>.<n>.slog` created exclusive, 0600, rotated at
 //! `journal::SEGMENT_BYTES` (a pass stops adding lines at that size, so no
 //! segment passes it by more than one take's lines, and every segment is one
@@ -41,8 +41,8 @@
 //! abandoned, never repaired: the cursors of lines not wholly written stay,
 //! and the next pass writes them into a new segment (a reader drops the torn
 //! tail). The instance's liveness is its `<inst>.lock`, taken before any
-//! segment and held for the journal's life (ruling R2); no `flock`, no
-//! journal. Retention (ruling R9) runs at start and at each rotation, under
+//! segment and held for the journal's life; no `flock`, no
+//! journal. Retention runs at start and at each rotation, under
 //! `prune.lock`, removing eligible inactive files toward
 //! `journal::BUDGET_BYTES` and `journal::FILES_MAX`. Live or locked files
 //! can keep the directory above those targets.
@@ -63,7 +63,7 @@
 //! journal already holds before what it has not reached: a burst between two
 //! coalesced passes loses nothing the writer could still write.
 //!
-//! ACROSS AN UPDATE (ruling R5) the outgoing process drains each fenced log
+//! ACROSS AN UPDATE the outgoing process drains each fenced log
 //! to its carry's fence and ends its chain with `#handed fence=<H>` per
 //! session and `#fin why=handoff`; the Commit never waits on it. The
 //! successor is ARMED until its Commit lands: it writes nothing, takes no
@@ -71,7 +71,7 @@
 //! nothing on any exit path. Its journal then starts each carried session
 //! after the carried head (`SessionLog::journal_start`).
 //!
-//! A CLEAN QUIT (ruling R14) drains, writes each open session's `out=app-quit`
+//! A CLEAN QUIT drains, writes each open session's `out=app-quit`
 //! closes (each stamped by its own session's clock, so each says how long it
 //! lived) and `#fin why=quit`, within [`QUIT_BUDGET`] on the writer thread,
 //! only once every session is journaled to its log's head; the exit never
@@ -138,7 +138,7 @@ pub(crate) const RETRY_TICK: Duration = Duration::from_secs(1);
 pub(crate) const BACKOFF_FIRST: Duration = Duration::from_secs(30);
 /// See [`BACKOFF_FIRST`].
 pub(crate) const BACKOFF_MAX: Duration = Duration::from_secs(600);
-/// The most retired sessions held unwritten (ruling R7's backstop): past it
+/// The most retired sessions held unwritten (backstop): past it
 /// the oldest gives up its timeline and keeps only what its `#gap
 /// why=dropped` says, until that is written.
 pub(crate) const RETIRED_MAX: usize = 4096;
@@ -216,7 +216,7 @@ pub(crate) fn gate(config: &crate::app_config::Config, desk: crate::desk::Desk) 
 
 // ---- the wake and the lane's shared state ----------------------------
 
-/// The writer's wake (ruling R6): a dirty flag and the writer's thread.
+/// The writer's wake: a dirty flag and the writer's thread.
 #[derive(Default)]
 pub(crate) struct Wake {
     dirty: AtomicBool,
@@ -442,7 +442,7 @@ pub(crate) fn commit_landed() {
 }
 
 /// The handoff worker fenced every carried log: the writer drains each to
-/// its fence and ends its chain `#handed` (ruling R5).
+/// its fence and ends its chain `#handed`.
 #[cfg(any(unix, test))]
 pub(crate) fn note_handing() {
     if let Some(s) = LANE.get() {
@@ -570,7 +570,7 @@ impl Lane {
         }
     }
 
-    /// THE QUIT (ruling R14): ask the writer for its last lines and wait at
+    /// THE QUIT: ask the writer for its last lines and wait at
     /// most `budget` for them. An armed, stopped or inert lane answers at
     /// once, having written nothing.
     pub(crate) fn finish_at_quit(&self, budget: Duration) {
@@ -1052,7 +1052,7 @@ struct Track {
     handed: bool,
     /// The fence its log stood at when last taken.
     fence: Option<u64>,
-    /// Let go by the backstop (ruling R7): what its `#gap why=dropped`
+    /// Let go by the backstop: what its `#gap why=dropped`
     /// says, kept until that is written whole.
     dropped: Option<Box<Dropped>>,
 }
@@ -1159,7 +1159,7 @@ impl<T: Targets> Writer<T> {
         }
     }
 
-    /// THE START: this instance's lock, before any segment (ruling R2), then
+    /// THE START: this instance's lock, before any segment, then
     /// retention. Without the lock there is no journal.
     pub(crate) fn start(&mut self) {
         match self.fs.lock_instance(&self.inst) {
@@ -1533,7 +1533,7 @@ impl<T: Targets> Writer<T> {
     }
 
     /// The pass's lines: retired tracks first (exempt from the pass's byte
-    /// bound, ruling R7), then the live ones; no track's lines once the
+    /// bound), then the live ones; no track's lines once the
     /// segment (`size` so far) would pass its rotation size, so a segment is
     /// never more than one take's lines past it.
     fn batch(&mut self, n: u32, size: u64) -> (Vec<u8>, Vec<LineMark>) {
@@ -1671,7 +1671,7 @@ impl<T: Targets> Writer<T> {
 
     /// Write `buf` in one `write(2)` (EINTR retried): every mark whose lines
     /// are wholly on disk moves its track's cursor; after a short or failed
-    /// write the segment is abandoned, never repaired (ruling R3).
+    /// write the segment is abandoned, never repaired.
     fn write(&mut self, buf: &[u8], marks: &[LineMark]) -> usize {
         if buf.is_empty() {
             return 0;
@@ -1745,7 +1745,7 @@ impl<T: Targets> Writer<T> {
     }
 
     /// Let go of retired tracks whose close is written (or whose loss is).
-    /// Past the backstop (ruling R7) the oldest retired session gives up its
+    /// Past the backstop the oldest retired session gives up its
     /// timeline and keeps only what its `#gap why=dropped` says, written by
     /// the next pass (a snap first, in its space) and only then forgotten:
     /// no session is let go unsaid. Past [`DROPPED_MAX`] of those, the
@@ -1840,7 +1840,7 @@ impl<T: Targets> Writer<T> {
         }
     }
 
-    /// THE QUIT (ruling R14): drain until a pass has nothing left and every
+    /// THE QUIT: drain until a pass has nothing left and every
     /// session is wholly journaled ([`Writer::quit_lines`]), then each open
     /// session's closes and `#fin why=quit`, all before `deadline` on this
     /// writer's clock and within [`FINISH_PASSES`]. Anything cut short, the
@@ -1943,7 +1943,7 @@ impl<T: Targets> Writer<T> {
         Some(buf)
     }
 
-    /// RETENTION (ruling R9), under `prune.lock` (busy: skipped this time):
+    /// RETENTION, under `prune.lock` (busy: skipped this time):
     /// only private files of the exact segment pattern count; the oldest are
     /// removed, through the pinned directory, until the journal's own files
     /// are within the byte budget AND the count budget

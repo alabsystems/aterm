@@ -2668,8 +2668,8 @@ pub(crate) struct SessionTimeline {
     /// `App::apply_harness_fact`.
     pause: Option<crate::PausePlan>,
     /// THE WORKER'S NEEDS YOU, WHOLE, as its loop told this window's host
-    /// (`docs/DESIGN-harness-autopilot-2026-10-15.md` §12.2.3 item 3, slice
-    /// 2c): the set told last and the outgoing set whose entry still stands
+    /// (`docs/DESIGN-harness-autopilot-2026-10-15.md` §12.2.3 item 3):
+    /// the set told last and the outgoing set whose entry still stands
     /// until the new one's request lands ([`crate::needs::ToldNeeds`]), each
     /// with the needs owner's entry text it was told with. Written only by
     /// the host's live hook (`harness_host::store_needs`), on the loop's
@@ -2679,8 +2679,8 @@ pub(crate) struct SessionTimeline {
     /// age is the entry's, and no surface reads a need's own.
     harness_needs: crate::needs::ToldNeeds,
     /// WHY LAND STILL HOLDS, as the session's loop told this window's host
-    /// (`docs/DESIGN-harness-autopilot-2026-10-15.md` §12.3.3 item 3, slice
-    /// 3c; `IdleHost::land_held`): what `status land_held= land_nudges=
+    /// (`docs/DESIGN-harness-autopilot-2026-10-15.md` §12.3.3 item 3; `IdleHost::land_held`):
+    /// what `status land_held= land_nudges=
     /// land_since=` print (only while this window's host holds the live
     /// claim and the session runs under Land), and what the window's glass
     /// copies (`harness_glass::on_land_held`). `None`: none stands. Written
@@ -3174,26 +3174,32 @@ impl SessionTimeline {
     }
 
     /// An act the session's proven self-claim's holder took (`meta set
-    /// harness_act <act>`, the native harness contract §5): one `harness-act`
-    /// row (`act=<act> holder=<holder>`), and the act kept for `status
-    /// last_act=`. `act` and `holder` are owner tokens, printed verbatim. In
-    /// the same hold, the session log's `act` mark by `by`, the connection's
-    /// actor (plan 5C-2, [`crate::session_log::SessionLog::self_claim_act`]):
-    /// the caller takes the log's wake before it releases the lock.
+    /// harness_act <act>`, the native harness contract §5): the session
+    /// log's `act` mark by `by`, the connection's actor (plan 5C-2,
+    /// [`crate::session_log::SessionLog::self_claim_act`]), then, in the same
+    /// hold, its `harness-act` row (`act=<act> holder=<holder>`), and the act
+    /// kept for `status last_act=`. `act` and `holder` are owner tokens,
+    /// printed verbatim. THE ROW FOLLOWS ITS RECORD (phase 6, 6G-2, as U13
+    /// ruled the `cwd-change` and `title-change` rows): an act the mark
+    /// limiter refuses (its actor's burst spent) is no record, and no row, so
+    /// the timeline's view of the log is the ring's. The caller takes the
+    /// log's wake before it releases the lock. Returns the row's id, if one
+    /// was recorded.
     pub(crate) fn note_harness_act(
         &mut self,
         act: &str,
         holder: &str,
         by: aterm_slog::Actor,
-    ) -> u64 {
+    ) -> Option<u64> {
         self.last_act = Some(act.to_string());
+        // The holder's upgrade is its act, whatever the log's limiter
+        // keeps of it (as `last_act` is): the re-exec's gap reads it.
         if act == aterm_agent::harness::acts::RULE_UPGRADE {
             self.upgrade_recorded = true;
         }
-        let id = self.record(HARNESS_ACT, format!("act={act} holder={holder}"));
         let at = self.slog.now();
-        let _ = self.slog.self_claim_act(act, holder, by, at);
-        id
+        self.slog.self_claim_act(act, holder, by, at)?;
+        Some(self.record(HARNESS_ACT, format!("act={act} holder={holder}")))
     }
 
     /// The last act [`Self::note_harness_act`] kept, if any.
@@ -3275,8 +3281,8 @@ impl SessionTimeline {
     /// ledger: a turn starts at `working` (or `blocked`), ends at `done`,
     /// `idle` or `error`, and a `blocked` row to the next row is a blocked span.
     ///
-    /// IN THE SAME HOLD, THE SESSION LOG'S PROGRAM MARK (phase 6, 6F-4;
-    /// rulings U17, U39, T24's reversal): `mark <run|-> program state=
+    /// IN THE SAME HOLD, THE SESSION LOG'S PROGRAM MARK (T24's reversal):
+    /// `mark <run|-> program state=
     /// [ask=] [coalesced=] src=engine conf=claim`, through the run's
     /// coalescing bucket (`SessionLog::observe_program`), written before the
     /// row so the row's wake finds it. So `await log kind=program` and
@@ -3322,7 +3328,7 @@ impl SessionTimeline {
     ///
     /// Never a [`META_CHANGE`]: that kind has ONE writer,
     /// [`Self::record_meta_change`], so its session log mark and the
-    /// `escalated` need it derives cannot be skipped (ruling S14). Asked for
+    /// `escalated` need it derives cannot be skipped. Asked for
     /// one, a debug build panics and a release build appends nothing.
     pub(crate) fn record(&mut self, kind: &'static str, payload: String) -> u64 {
         debug_assert_ne!(kind, META_CHANGE, "a meta-change is record_meta_change's");
@@ -3332,8 +3338,8 @@ impl SessionTimeline {
         self.append(kind, payload)
     }
 
-    /// THE ONE `meta-change` WRITER (session log phase 3B; ruling S14,
-    /// addendum A16), under the meta → timeline hold its writer already
+    /// THE ONE `meta-change` WRITER,
+    /// under the meta → timeline hold its writer already
     /// takes (`meta` is the store as the write left it): the timeline row,
     /// the session log's `mark - meta field= value=` by its writer, and the
     /// `escalated` need derived from the effective attention owner — raised
@@ -3367,8 +3373,8 @@ impl SessionTimeline {
         self.push_row(kind, payload)
     }
 
-    /// THE `human` ROWS THE SESSION LOG'S BURST MARKS OWE (phase 6, the
-    /// review of 6F-8; ruling U13): one row for each burst mark
+    /// THE `human` ROWS THE SESSION LOG'S BURST MARKS OWE (the
+    /// review of 6F-8): one row for each burst mark
     /// [`crate::session_log::SessionLog::person_input`] wrote since the last
     /// payment, recorded now. Paid before every row ([`Self::append`]) and
     /// at the end of the key's own delivery
@@ -3404,7 +3410,7 @@ impl SessionTimeline {
     /// log's `cwd` mark moved (the GUI observes cwd on every output wake, so
     /// the dedup lives in the mark), its text the mark's. A `None`/empty cwd
     /// (OSC 7 cleared) records `cwd=-`; a session's first read with none
-    /// records nothing. Since phase 6 (6F-8, ruling U13) the row follows its
+    /// records nothing. Since phase 6 the row follows its
     /// record: the mark's dedup is its fingerprint, which a seamless update
     /// carries, so a successor whose timeline starts empty does not restate
     /// the directory it carried, and the row is the record's, row for
@@ -3422,7 +3428,7 @@ impl SessionTimeline {
         self.record(CWD_CHANGE, payload);
     }
 
-    /// THE `title-change` WRITER (phase 6, 6F-8, ruling U13; DESIGN
+    /// THE `title-change` WRITER (DESIGN
     /// §8: "the C-tier title keeps the `title-change` rows"): the drift
     /// flush's informative title ([`crate::tab_label::informative`]), on
     /// every session, as the session log's content-tier `title` mark takes
@@ -3595,7 +3601,7 @@ impl SessionTimeline {
     /// (`keeper_link`, which carries no count, so the recovery starts at 1),
     /// one seamless update's `HANDOFF_ID_RESERVE` above it. Filtered, a
     /// driver tailing `timeline since=<last id>` read `OK 0` for some 65,540
-    /// events after the crash (round eight of the update audit, U13); read
+    /// events after the crash; read
     /// from the recovery's first row, its `handoff` row, it reads on at once.
     pub(crate) fn since(
         &self,
@@ -3618,8 +3624,11 @@ impl SessionTimeline {
     /// write.
     #[cfg(any(unix, test))]
     pub(crate) fn handoff_id(&mut self) -> u64 {
+        // The view's ids too (6G-2): the session log's row count runs beside
+        // the ring's, and the successor continues both from the one number.
         let carried = self
             .next_id
+            .max(self.slog.row_head())
             .saturating_add(HANDOFF_ID_RESERVE)
             .min(i64::MAX as u64);
         self.handoff_ceiling = Some(carried);
@@ -3627,12 +3636,13 @@ impl SessionTimeline {
     }
 
     /// Whether this process has handed out an id past the one the last manifest carried
-    /// ([`Self::handoff_id`]), or a session-log id past its carry ([`Self::handoff_log_ids`]);
-    /// the successor would hand it out again, so the Commit stands down.
+    /// ([`Self::handoff_id`]: a ring id, or a row id of the session log's view, 6G-2), or a
+    /// session-log id past its carry ([`Self::handoff_log_ids`]); the successor would hand it
+    /// out again, so the Commit stands down.
     #[cfg(any(unix, test))]
     pub(crate) fn past_handoff_ceiling(&self) -> bool {
         self.handoff_ceiling
-            .is_some_and(|ceiling| self.next_id > ceiling)
+            .is_some_and(|ceiling| self.next_id > ceiling || self.slog.row_head() > ceiling)
             || self.slog.past_handoff_ceiling()
     }
 
@@ -3673,7 +3683,7 @@ impl SessionTimeline {
 
     /// A timeline whose session log is the test constructor's
     /// ([`crate::session_log::SessionLog::for_test`]: `ep=1`, an allocator
-    /// of its own), for a unit test that reads epochs by hand (ruling U46).
+    /// of its own), for a unit test that reads epochs by hand.
     #[cfg(test)]
     pub(crate) fn for_test() -> SessionTimeline {
         SessionTimeline {
@@ -3715,9 +3725,12 @@ impl SessionTimeline {
 
     /// Count on from a seamless update: ids continue above the last one the old process handed
     /// out, so a `timeline since=<id>` anchor taken before the update sees the `handoff` row
-    /// and everything after. Called before the first record; never lowers the count.
+    /// and everything after. Called before the first record; never lowers the count. The
+    /// session log's view counts on from the same number (6G-2): its rows' ids are the ring's.
     pub(crate) fn continue_ids(&mut self, carried: u64) {
-        self.next_id = self.next_id.max(carried.min(i64::MAX as u64));
+        let carried = carried.min(i64::MAX as u64);
+        self.next_id = self.next_id.max(carried);
+        self.slog.continue_rows(carried);
     }
 
     /// The highest recorded event id, or `None` when empty — the events digest
@@ -3787,8 +3800,8 @@ impl SessionTimeline {
     }
 
     /// Publish the session's need verdict ([`Self::need`]). Returns whether
-    /// it moved (any of its facts). THE SHOWN MARK (phase 6, 6F-9; ruling
-    /// U26), in the same hold: keyed on what the verdict prints (the need's
+    /// it moved (any of its facts). THE SHOWN MARK,
+    /// in the same hold: keyed on what the verdict prints (the need's
     /// word, its severity and the hold, [`crate::session_log::observed::ShownTuple`]),
     /// never on `moved`, which counts the wait and the recheck instant too;
     /// the caller takes the log's wake ([`Self::slog_take_wake`]).
@@ -3986,8 +3999,8 @@ impl SessionTimeline {
         let payload = format!("{word} rev={} gen={generation} fp={fp}", self.agent.rev);
         // The session log first: `mark agent word= rev= gen= fp=` and the
         // turn tracker's transitions (a settle it arms is read back by the
-        // caller, `Self::slog_wake`). Its entry reconciles the person first
-        // (ruling T2), so a key it delivers is marked before the verdict,
+        // caller, `Self::slog_wake`). Its entry reconciles the person first,
+        // so a key it delivers is marked before the verdict,
         // and that key's `human` row, owed, is paid by the row below before
         // its own (the review of 6F-8: row for record, in order).
         let at = self.slog.now();
@@ -5017,7 +5030,7 @@ impl SessionTimeline {
     }
 
     /// The worker's NEEDS YOU sets as its loop told this window's host,
-    /// whole, each with the entry's text it was told with — what slice 2d's
+    /// whole, each with the entry's text it was told with — what
     /// readers read, a set only beside its own entry
     /// ([`crate::needs::NeedFacts::told_needs`]). Two `Arc`s.
     pub(crate) fn harness_needs(&self) -> crate::needs::ToldNeeds {

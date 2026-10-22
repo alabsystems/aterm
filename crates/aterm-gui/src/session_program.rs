@@ -452,7 +452,7 @@ struct Job {
     pgid: i32,
     shell: i32,
     /// What the footer read this job starts wakes when it moves the
-    /// session's log (`claude_footer::LogWake`, session log Phase 3B).
+    /// session's log (`claude_footer::LogWake`).
     wake: crate::claude_footer::LogWake,
 }
 

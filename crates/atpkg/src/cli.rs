@@ -7774,7 +7774,7 @@ fn apply_machine_settings() -> MachineApply {
         println!("{line}");
     }
     // Rosetta 2, where it applies (macOS on Apple silicon): installed when missing, as
-    // this user — the one `softwareupdate` verb atpkg runs (owner ruling R1).
+    // this user — the one `softwareupdate` verb atpkg runs.
     if crate::machine::ROSETTA_APPLIES {
         if cfg.rosetta() {
             out.acts = true;
@@ -8094,6 +8094,12 @@ fn cache_plan_words(why: crate::build_cache::Unused) -> String {
         Unused::Unfinished => {
             "an earlier pass moved it aside and did not finish removing it".to_owned()
         }
+        Unused::Tooling { idle, after } => format!(
+            "goes whole: a pinned tool nothing ran for {} (the pass takes one unused \
+             {}; `targo --unverified verify provision` lays it again)",
+            days(idle),
+            days(after)
+        ),
         Unused::Stale {
             incremental,
             units,

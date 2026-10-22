@@ -1066,13 +1066,13 @@ impl CellExtras {
 
     /// Translate an external row to the internal HashMap key row.
     #[inline(always)]
-    pub(crate) fn internal_row(&self, row: u16) -> u16 {
+    pub(crate) const fn internal_row(&self, row: u16) -> u16 {
         row.wrapping_add(self.row_offset)
     }
 
     /// Translate an external coordinate to the internal HashMap key.
     #[inline(always)]
-    fn internal_coord(&self, coord: CellCoord) -> CellCoord {
+    const fn internal_coord(&self, coord: CellCoord) -> CellCoord {
         CellCoord::new(self.internal_row(coord.row), coord.col)
     }
 
@@ -1178,7 +1178,7 @@ impl CellExtras {
     /// image ref; `true` merely permits the scroll-off scan.
     #[must_use]
     #[inline]
-    pub fn any_image(&self) -> bool {
+    pub const fn any_image(&self) -> bool {
         self.any_image
     }
 
@@ -1634,7 +1634,7 @@ impl CellExtras {
     /// Take the accumulated row offset, resetting it to 0, so a region shift can
     /// compact and shift keys in one drain pass.
     #[inline]
-    pub(crate) fn take_row_offset(&mut self) -> u16 {
+    pub(crate) const fn take_row_offset(&mut self) -> u16 {
         let offset = self.row_offset;
         self.row_offset = 0;
         offset
@@ -1643,7 +1643,7 @@ impl CellExtras {
     /// Current row offset (for diagnostics / test assertions).
     #[cfg(test)]
     #[must_use]
-    pub(crate) fn row_offset(&self) -> u16 {
+    pub(crate) const fn row_offset(&self) -> u16 {
         self.row_offset
     }
 
@@ -1749,7 +1749,7 @@ impl CellExtras {
     /// truecolor write after each [`Self::invalidate_rings`], so `false` means
     /// the resize's harvest of ring colours into the map has nothing to read.
     #[inline]
-    pub(crate) fn has_rgb_ring(&self) -> bool {
+    pub(crate) const fn has_rgb_ring(&self) -> bool {
         self.rgb_ring.is_some()
     }
 
@@ -1876,7 +1876,7 @@ impl CellExtras {
     /// The current hyperlink upper bound (for the invariant tests).
     #[cfg(test)]
     #[must_use]
-    pub(crate) fn hyperlink_upper_bound(&self) -> usize {
+    pub(crate) const fn hyperlink_upper_bound(&self) -> usize {
         self.hyperlink_upper_bound
     }
 

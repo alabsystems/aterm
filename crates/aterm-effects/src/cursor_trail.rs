@@ -130,7 +130,7 @@ impl BridgeReach {
     /// (`(row, col)` each)?
     #[must_use]
     #[inline]
-    pub fn admits(self, from: (u16, u16), to: (u16, u16)) -> bool {
+    pub const fn admits(self, from: (u16, u16), to: (u16, u16)) -> bool {
         let dr = to.0.abs_diff(from.0);
         let dc = to.1.abs_diff(from.1);
         if dr > self.rows || dc > self.cols {
@@ -164,17 +164,22 @@ impl BridgeReach {
 /// pane's first column ([`BridgeReach::line_start`]).
 #[must_use]
 #[inline]
-pub fn hide_bridge_reach(
+pub const fn hide_bridge_reach(
     typed_hint_fresh: bool,
     nav_hint_fresh: bool,
     pane: Option<(u16, u16)>,
 ) -> BridgeReach {
     if nav_hint_fresh {
-        let (col0, cols) = pane
-            .filter(|(_, cols)| *cols > 0)
-            .unwrap_or((0, HIDE_BRIDGE_NAV_UNPANED_COLS));
+        let (col0, cols) = match pane {
+            Some((c0, c)) if c > 0 => (c0, c),
+            _ => (0, HIDE_BRIDGE_NAV_UNPANED_COLS),
+        };
         BridgeReach {
-            cols: cols.max(HIDE_BRIDGE_TYPED_MAX_DIST),
+            cols: if cols > HIDE_BRIDGE_TYPED_MAX_DIST {
+                cols
+            } else {
+                HIDE_BRIDGE_TYPED_MAX_DIST
+            },
             rows: HIDE_BRIDGE_NAV_MAX_ROWS,
             line_start: Some(col0),
         }
@@ -208,17 +213,20 @@ fn lerp_u32(a: u32, b: u32, q: f32) -> u32 {
 /// while a cell is visible (`0 == idle`); the sentinel bit keeps a black colour from folding to
 /// nothing.
 #[inline]
-fn trail_presentation_fingerprint(cells: &[TrailCell], color: u32) -> u64 {
+const fn trail_presentation_fingerprint(cells: &[TrailCell], color: u32) -> u64 {
     let mut fp: u64 = 0;
-    for cell in cells {
+    let mut i = 0;
+    while i < cells.len() {
+        let cell = &cells[i];
         fp = fp
             .wrapping_mul(1_000_003)
             .wrapping_add(((cell.row as u64) << 24) ^ ((cell.col as u64) << 8) ^ cell.alpha as u64);
+        i += 1;
     }
     if !cells.is_empty() {
         fp = fp
             .wrapping_mul(1_000_003)
-            .wrapping_add(u64::from(color) | (1 << 32));
+            .wrapping_add((color as u64) | (1 << 32));
     }
     fp
 }
@@ -390,7 +398,7 @@ impl CursorTrail {
     /// Hidden→visible relocations the hide bridge admitted or declined ([`BridgeTally`]).
     #[must_use]
     #[cfg(test)]
-    pub fn bridge_tally(&self) -> BridgeTally {
+    pub const fn bridge_tally(&self) -> BridgeTally {
         self.bridge_tally
     }
 
@@ -398,9 +406,14 @@ impl CursorTrail {
     /// arming a candidate; an unseeded or reset pair fails closed.
     #[must_use]
     #[inline]
-    pub fn cursor_anchor(&self) -> Option<(u16, u16)> {
-        self.last
-            .or_else(|| self.last_visible.map(|(cell, _)| cell))
+    pub const fn cursor_anchor(&self) -> Option<(u16, u16)> {
+        match self.last {
+            Some(cell) => Some(cell),
+            None => match self.last_visible {
+                Some((cell, _)) => Some(cell),
+                None => None,
+            },
+        }
     }
 
     /// Host key hint: one plain typed-glyph or Backspace echo keypress (never
@@ -435,21 +448,21 @@ impl CursorTrail {
     /// DECTCEM-hide-inside-DEC-2026, as Claude Code does per keystroke).
     /// Feeds the alt-screen re-anchor classifier; not movement evidence.
     #[inline]
-    pub fn note_repaint_blink(&mut self, now: Instant) {
+    pub const fn note_repaint_blink(&mut self, now: Instant) {
         self.blink_hint = Some(now);
     }
 
     /// Drop the blink hint: a tab/pane switch pointed this window at a
     /// different terminal.
     #[inline]
-    pub fn clear_blink(&mut self) {
+    pub const fn clear_blink(&mut self) {
         self.blink_hint = None;
     }
 
     /// Host per-frame context (see `CursorGlow::note_context`): whether the
     /// probed terminal is on the alt screen this frame.
     #[inline]
-    pub fn note_context(&mut self, alt: bool) {
+    pub const fn note_context(&mut self, alt: bool) {
         self.ctx_alt = alt;
     }
 
@@ -457,18 +470,19 @@ impl CursorTrail {
     /// to [`Self::tick`]. This changes morphology only; the normal fresh key
     /// license remains mandatory at [`Self::spawn`].
     #[inline]
-    pub fn note_pane_columns(&mut self, first_col: u16, cols: usize) {
-        self.pane_columns = u16::try_from(cols)
-            .ok()
-            .filter(|cols| *cols > 0)
-            .map(|cols| (first_col, cols));
+    pub const fn note_pane_columns(&mut self, first_col: u16, cols: usize) {
+        self.pane_columns = if cols > 0 && cols <= u16::MAX as usize {
+            Some((first_col, cols as u16))
+        } else {
+            None
+        };
     }
 
     /// Disarm dangling movement state (see `CursorGlow::clear_typed`): a newer
     /// key with its own semantics (plain Enter, nav, kills, Tab) supersedes a
     /// swallowed typed or generic move.
     #[inline]
-    pub fn clear_typed(&mut self) {
+    pub const fn clear_typed(&mut self) {
         self.type_hint.clear();
         self.nav_hint = None;
         self.move_hint = None;
@@ -477,14 +491,14 @@ impl CursorTrail {
     /// Arm the navigation veto (see `CursorGlow::note_navigation`): it licenses the following
     /// move and classifies it as scrubbing, which the comet does not paint.
     #[inline]
-    pub fn note_navigation(&mut self, now: Instant) {
+    pub const fn note_navigation(&mut self, now: Instant) {
         self.clear_typed();
         self.nav_hint = Some(now);
     }
 
     /// Arm one generic movement license, superseding any swallowed typed/navigation classifier.
     #[inline]
-    fn note_move(&mut self, now: Instant) {
+    const fn note_move(&mut self, now: Instant) {
         self.clear_typed();
         self.move_hint = Some(now);
     }
@@ -494,7 +508,7 @@ impl CursorTrail {
     /// flight, so the bank is kept. It closes the nav class, where the glow keeps its nav
     /// one-shot; the two differ only for an arrow whose hop is in flight when Tab is pressed.
     #[inline]
-    pub fn note_user_gesture(&mut self, now: Instant) {
+    pub const fn note_user_gesture(&mut self, now: Instant) {
         self.nav_hint = None;
         self.move_hint = Some(now);
     }
@@ -502,20 +516,20 @@ impl CursorTrail {
     /// Classify a plain Return, bank-preserving like
     /// [`Self::note_user_gesture`], in lockstep with `CursorGlow::note_return`.
     #[inline]
-    pub fn note_return(&mut self, now: Instant) {
+    pub const fn note_return(&mut self, now: Instant) {
         self.move_hint = Some(now);
     }
 
     /// Classify a settled user resize/re-grid.
     #[cfg(test)]
-    pub fn note_reflow(&mut self, now: Instant) {
+    pub const fn note_reflow(&mut self, now: Instant) {
         self.note_move(now);
     }
 
     /// Explicit test/preview driver for a deliberately scripted move.
     #[doc(hidden)]
     #[inline]
-    pub fn note_synthetic_move(&mut self, now: Instant) {
+    pub const fn note_synthetic_move(&mut self, now: Instant) {
         self.note_move(now);
     }
 
@@ -531,14 +545,14 @@ impl CursorTrail {
     /// queued Tab's or ⌃V's [`Self::note_user_gesture`]): the licence revoked at enqueue is put
     /// back at the writer's completed write (`CursorGlow::note_delivered`'s twin).
     #[inline]
-    pub fn note_move_delivered(&mut self, at: Instant) {
+    pub const fn note_move_delivered(&mut self, at: Instant) {
         self.move_hint = Some(at);
     }
 
     /// The nav-slot twin of [`Self::note_move_delivered`]: a queued
     /// navigation key's licence, put back at delivery.
     #[inline]
-    pub fn note_motion_delivered(&mut self, at: Instant) {
+    pub const fn note_motion_delivered(&mut self, at: Instant) {
         self.nav_hint = Some(at);
     }
 
@@ -597,7 +611,7 @@ impl CursorTrail {
 
     /// Whether any spark is still alive (the host keeps the animation timer armed).
     #[inline]
-    pub fn is_active(&self) -> bool {
+    pub const fn is_active(&self) -> bool {
         !self.sparks.is_empty()
     }
 
@@ -957,7 +971,7 @@ fn decay_heat(heat: f32, dt: Duration, half_life: Duration) -> f32 {
 /// `knee_lo` (a few keys never ignite) and `1.0` above `knee_hi`.
 #[must_use]
 #[inline]
-pub fn ignition_intensity(heat: f32, knee_lo: f32, knee_hi: f32) -> f32 {
+pub const fn ignition_intensity(heat: f32, knee_lo: f32, knee_hi: f32) -> f32 {
     // A positive valid-interval test: NaN, inverted or equal knees fall to the
     // `else` and step at the single threshold rather than dividing by zero.
     if knee_hi > knee_lo {
@@ -1031,7 +1045,7 @@ impl TypingCadence {
     /// The heat→warmth mapping shared by [`Self::warmth`] and [`Self::sample`];
     /// see [`Self::warmth`].
     #[inline]
-    fn warmth_of(&self, heat: f32) -> f32 {
+    const fn warmth_of(&self, heat: f32) -> f32 {
         let span = (self.params.knee_lo - self.params.gain).max(f32::EPSILON);
         ((heat - self.params.gain) / span).clamp(0.0, 1.0)
     }

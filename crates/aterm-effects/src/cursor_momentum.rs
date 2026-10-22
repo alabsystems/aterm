@@ -260,6 +260,15 @@ pub struct MomentumGlowFrame {
     pub fp: u64,
 }
 
+impl MomentumGlowFrame {
+    /// Inert frame (`fill: None, hot: false, fp: 0`).
+    pub const DEFAULT: Self = Self {
+        fill: None,
+        hot: false,
+        fp: 0,
+    };
+}
+
 /// Cached light-page glow ink and text-alpha ceiling for `(hue, theme_fg, theme_bg)`.
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct LightInkMemo {
@@ -285,6 +294,20 @@ pub struct MomentumGlow {
 }
 
 impl MomentumGlow {
+    /// Resting momentum glow state.
+    pub const DEFAULT: Self = Self {
+        rate: TypingRate {
+            value: 0.0,
+            at: None,
+        },
+        fp_last: 0,
+        fp_prev: 0,
+        latched: 0.0,
+        stamp: None,
+        tau: 0.0,
+        light_ink_memo: None,
+    };
+
     /// One printable key. The host calls this for glyph-producing keys only (never a bare
     /// modifier, never delete/kill/navigation).
     #[inline]
@@ -301,15 +324,15 @@ impl MomentumGlow {
 
     /// Back to rest (layout/space resets only).
     #[inline]
-    pub fn reset(&mut self) {
-        *self = Self::default();
+    pub const fn reset(&mut self) {
+        *self = Self::DEFAULT;
     }
 
     /// Frame cadence: the light is hot and its last two frames differed (the
     /// rainbow body's fingerprint law).
     #[must_use]
     #[inline]
-    pub fn is_active(&self) -> bool {
+    pub const fn is_active(&self) -> bool {
         self.latched >= MOMENTUM_GLOW_HOT && self.fp_last != self.fp_prev
     }
 
@@ -322,7 +345,7 @@ impl MomentumGlow {
     /// Disjoint from [`Self::is_active`]; their OR is "hot".
     #[must_use]
     #[inline]
-    pub fn settling(&self) -> bool {
+    pub const fn settling(&self) -> bool {
         self.latched >= MOMENTUM_GLOW_HOT && self.fp_last == self.fp_prev
     }
 
@@ -481,12 +504,12 @@ impl MomentumGlow {
     }
 
     #[inline]
-    fn inert(&mut self) -> MomentumGlowFrame {
+    const fn inert(&mut self) -> MomentumGlowFrame {
         self.latched = 0.0;
         self.stamp = None;
         self.fp_prev = self.fp_last;
         self.fp_last = 0;
-        MomentumGlowFrame::default()
+        MomentumGlowFrame::DEFAULT
     }
 }
 
@@ -671,7 +694,7 @@ fn emit_light_halo(
 }
 
 #[inline]
-fn smoothstep(x: f32) -> f32 {
+const fn smoothstep(x: f32) -> f32 {
     let x = x.clamp(0.0, 1.0);
     x * x * (3.0 - 2.0 * x)
 }

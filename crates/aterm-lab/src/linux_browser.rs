@@ -12,7 +12,8 @@
 //! The site is copied into the guest, and for each arch the guest builds
 //! aterm-verify with its own stock Rust (STOCK EXCEPTION, as the rest of the
 //! lane: [`crate::linux_guest::RUST`]), fetches that arch's pinned browsers
-//! (`verify fetch-browser`, each held to its sha256) and runs `verify
+//! (`verify provision chrome-headless-shell firefox`, each held to its sha256)
+//! and runs `verify
 //! browser-drive` on the site. Its sessions hold every GPU frame to the CPU
 //! frames and to the wgpu-WebGL recording within the CPU tolerance, with the
 //! negative controls those judges carry, the pages' and the worker's alike:
@@ -324,13 +325,21 @@ fn drive(
         let verify = format!("{}/aterm-verify", arch.bin_dir(&format!("{lane}/target")));
         let fetched = up.lima.shell_streamed(
             &up.home,
-            &guest::with_env(&env, &[verify.clone(), "fetch-browser".into()]),
+            &guest::with_env(
+                &env,
+                &[
+                    verify.clone(),
+                    "provision".into(),
+                    "chrome-headless-shell".into(),
+                    "firefox".into(),
+                ],
+            ),
             "  | ",
         );
         if !fetched.ok() {
             rows.push(row(
                 Verdict::NotRun,
-                format!("verify fetch-browser:\n{}", fetched.tail(8)),
+                format!("verify provision:\n{}", fetched.tail(8)),
             ));
             continue;
         }

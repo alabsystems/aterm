@@ -17,7 +17,8 @@
 //! * `tab`: a tab opened or closed;
 //! * `orphan`: a tab closed and left processes behind (pids its rows held in
 //!   the snapshot before, still alive under the same name);
-//! * `lane`: a reader became unavailable, or available again;
+//! * `lane`: a reader became unavailable, or available again (the
+//!   coalitions' from one split tick's facts to the next);
 //! * `job`: a job's verdict moved ([`JobWatch`], run on the stuck engine's
 //!   view, which the host attaches after the model's pass).
 //!
@@ -142,7 +143,7 @@ pub enum EventKind {
     },
     /// A reader became unavailable or available again.
     Lane {
-        /// `cores`, `gpu`, `mem` or `procs`.
+        /// `cores`, `gpu`, `mem`, `procs` or `coalitions`.
         lane: &'static str,
         /// Available now.
         available: bool,
@@ -214,6 +215,8 @@ pub struct Detector {
     load: HashMap<LoadScope, LoadWatch>,
     tabs: Option<HashMap<u64, String>>,
     lanes: [Option<bool>; 4],
+    /// Whether the last facts' coalition lane read.
+    coalitions: Option<bool>,
     /// Each tab's live processes in the last snapshot that swept them, for
     /// `orphan`: `(pid, name, cores-worth)`.
     tab_procs: HashMap<u64, Vec<(u32, String, f32)>>,
@@ -413,6 +416,17 @@ impl Detector {
                 None if seeds => self.lanes[i] = Some(now),
                 _ => {}
             }
+        }
+        // The coalitions are read on split ticks only: a snapshot carrying
+        // no facts says nothing about their lane.
+        if let Some(now) = s.why.as_ref().map(|w| w.lane.on()) {
+            if self.coalitions.is_some_and(|was| was != now) {
+                push(EventKind::Lane {
+                    lane: "coalitions",
+                    available: now,
+                });
+            }
+            self.coalitions = Some(now);
         }
         out
     }

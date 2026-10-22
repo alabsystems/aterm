@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE TWINS (plan 5B-3; rulings T5, T29): every hand sequence of
+//! THE TWINS: every hand sequence of
 //! `turn_replays.rs` and `transcript_replays.rs` that the `.seq` corpus
 //! holds is run both ways, the Rust test (every assert of it) and its
 //! `.seq` file, and the two take the same PATH: step for step the same

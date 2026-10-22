@@ -4,7 +4,9 @@
 
 //! THE STUCK VERDICT (`docs/DESIGN-system-awareness-2026-10-16.md` §11.7,
 //! §17): how one job's verdict moves with its class, its suspect quiet and
-//! the readings, in `aterm_vitals::jobs::step::classify_tick`.
+//! the readings, in `aterm_vitals::jobs::step::classify_tick`. THE SCOPE
+//! BALANCE (§7.7, §17): how `aterm_vitals::explain::split` divides the busy
+//! CPU of one window into parts that add up.
 
 use aterm_spec::derive::*;
 
@@ -200,5 +202,197 @@ pub fn stuck_verdict_liveness() -> Liveness {
             "IdleChurnAsProgress",
             "RefusedResetsAge",
         ],
+    }
+}
+
+/// THE SCOPE BALANCE, CPU (`docs/DESIGN-system-awareness-2026-10-16.md` §7.7,
+/// §17): how `aterm_vitals::explain::split` divides the machine's busy CPU
+/// over one matched window into the caller's tab, the rest of aterm, others,
+/// services and a signed residual.
+///
+/// The readings, in units of work over the window (each environment action
+/// adds one): `g` the cores' busy figure; `a` aterm's coalitions `C(I)`; `t`
+/// the caller tab's live members in them over the split's window, and `tf`
+/// over the last sweep's window (the fast set); `d` the tab's delegated
+/// members under a launcher outside aterm, live; `l` that launcher's
+/// coalition, `d`'s work in it; `o` the user's other coalitions; `s` the
+/// services' coalitions. `Move` moves the delegated work to aterm's side,
+/// capped at the launcher's figure, and takes the tab's figure; `Close`
+/// makes the rest of aterm and the residual. `fresh` is 0 once a reading
+/// moved, 1 after `Move`, 2 after `Close`: the laws read the printed parts.
+///
+/// Laws (each broken by its own mutant):
+///
+/// * `PartsSumToWhole`: the four parts and the residual add up to the busy
+///   figure exactly (Buggy 2 `ChargeSharedLauncher`: the launcher keeps the
+///   work its tab counts; Buggy 1 too);
+/// * `PartsNeverNegative` (Buggy 3: the delegated subtraction uncapped, so a
+///   member read ahead of its launcher's counter takes the launcher below 0);
+/// * `ResidualIsShown`: the residual is the work outside every listed
+///   coalition, signed, plus the tab's live figure past aterm's coalitions,
+///   never clamped and never folded into a part (Buggy 1
+///   `ClampResidualSilently`; Buggy 4 `ServicesSwallowUnaccountedWithLaneOn`,
+///   the built split's subtraction with the lane on);
+/// * `DelegatedCountedOnce`: the launcher gives up exactly what the split
+///   moved to aterm's side (Buggy 2);
+/// * `MatchedWindowsOnly`: every part is over the split's window, so the
+///   printed tab is its live members' work over it, `t + d` (Buggy 5
+///   `MixFastAndSplitWindows`: the tab's figure from the last sweep, a 1 s
+///   rate against a 5 s split, shows once the two differ).
+///
+/// Tier-1: `aterm-vitals`' `tests/conformance_scope_balance.rs` reads scenes
+/// through the real `Vitals::absorb`, projects each scene's readings and the
+/// split's parts onto this model, and requires `Move` and then `Close` to
+/// take the one to the other with every law holding. NEGATIVE CONTROLS: the
+/// real split with one injected defect (`aterm_vitals::explain::Fault`) is
+/// refused at Buggy 0 and admitted only by its own mutant, which breaks its
+/// own law — services by subtraction with the lane on (Buggy 4,
+/// `ResidualIsShown`) and the tab over the sweep's window (Buggy 5,
+/// `MatchedWindowsOnly`). No `#[refines]` anchors: the binding is the
+/// conformance test.
+#[must_use]
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn scope_balance_model() -> Model {
+    aterm_spec::ty_model! {
+        ScopeBalance {
+            const Buggy = 0;
+            const Work = 3;
+            var n = 0;
+            var g = 0;
+            var a = 0;
+            var t = 0;
+            var tf = 0;
+            var d = 0;
+            var l = 0;
+            var o = 0;
+            var s = 0;
+            var moved = 0;
+            var tab = 0;
+            var rest = 0;
+            var others = 0;
+            var services = 0;
+            var residual = 0;
+            var fresh = 2;
+
+            // Work in aterm's coalitions beside the caller tab's live
+            // members: aterm itself, its helpers, other tabs, finished work.
+            action AtermWork when (n <= Work - 1) {
+                n = n + 1;
+                g = g + 1;
+                a = a + 1;
+                fresh = 0;
+            }
+            // The caller tab's live members work, in aterm's coalitions.
+            action TabWork when (n <= Work - 1) {
+                n = n + 1;
+                g = g + 1;
+                a = a + 1;
+                t = t + 1;
+                tf = tf + 1;
+                fresh = 0;
+            }
+            // A build starts: the tab's last-sweep rate runs past its
+            // window's average.
+            action BuildStarts when (n <= Work - 1) {
+                n = n + 1;
+                tf = tf + 1;
+                fresh = 0;
+            }
+            // The tab's live figure read ahead of aterm's coalition counter.
+            action TabAhead when (n <= Work - 1) {
+                n = n + 1;
+                t = t + 1;
+                tf = tf + 1;
+                fresh = 0;
+            }
+            action LauncherWork when (n <= Work - 1) {
+                n = n + 1;
+                g = g + 1;
+                l = l + 1;
+                fresh = 0;
+            }
+            // A delegated member works: its launcher's coalition counts it,
+            // and so does its tab.
+            action DelegatedWork when (n <= Work - 1) {
+                n = n + 1;
+                g = g + 1;
+                l = l + 1;
+                d = d + 1;
+                fresh = 0;
+            }
+            // A delegated member's live figure read ahead of its launcher's
+            // counter.
+            action DelegatedAhead when (n <= Work - 1) {
+                n = n + 1;
+                d = d + 1;
+                fresh = 0;
+            }
+            action OthersWork when (n <= Work - 1) {
+                n = n + 1;
+                g = g + 1;
+                o = o + 1;
+                fresh = 0;
+            }
+            action ServicesWork when (n <= Work - 1) {
+                n = n + 1;
+                g = g + 1;
+                s = s + 1;
+                fresh = 0;
+            }
+            // Work no listed coalition read: a kernel thread, a coalition
+            // reaped inside the window.
+            action Unread when (n <= Work - 1) {
+                n = n + 1;
+                g = g + 1;
+                fresh = 0;
+            }
+            // A coalition's counter read past the end of the cores' window.
+            action CounterAhead when (n <= Work - 1) {
+                n = n + 1;
+                s = s + 1;
+                fresh = 0;
+            }
+
+            action Move when (fresh == 0) {
+                moved = if (Buggy == 3 || d <= l) { d } else { l };
+                others = if (Buggy == 2) {
+                    o + l
+                } else {
+                    if (Buggy == 3 || d <= l) { o + l - d } else { o }
+                };
+                tab = if (Buggy == 5) { tf + d } else { t + d };
+                fresh = 1;
+            }
+            action Close when (fresh == 1) {
+                rest = if (tab <= a + moved) { a + moved - tab } else { 0 };
+                services = if (Buggy == 4 && g > a + l + o + s) { g - a - l - o } else { s };
+                residual = if (Buggy == 4 && g > a + l + o + s) {
+                    if (a + moved <= tab) { a + moved - tab } else { 0 }
+                } else {
+                    if (Buggy == 1
+                        && g + (if (a + moved <= tab) { a + moved - tab } else { 0 })
+                            <= a + l + o + s)
+                    {
+                        0
+                    } else {
+                        g - a - l - o - s + (if (a + moved <= tab) { a + moved - tab } else { 0 })
+                    }
+                };
+                fresh = 2;
+            }
+
+            invariant PartsSumToWhole:
+                fresh <= 1 || g == tab + rest + others + services + residual;
+            invariant PartsNeverNegative:
+                fresh <= 1 || (0 <= tab && 0 <= rest && 0 <= others && 0 <= services);
+            invariant ResidualIsShown:
+                fresh <= 1
+                    || residual
+                        == g - a - l - o - s
+                            + (if (a + moved <= tab) { a + moved - tab } else { 0 });
+            invariant DelegatedCountedOnce: fresh == 0 || others + moved == o + l;
+            invariant MatchedWindowsOnly: fresh == 0 || tab == t + d;
+            bound Box: n <= Work;
+        }
     }
 }

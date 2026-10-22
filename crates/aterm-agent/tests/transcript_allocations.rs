@@ -176,7 +176,7 @@ fn transcript_readers_keep_allocation_proportional_to_input() {
         assert!(!within("task scan", 32 * 1024, 128, || {
             upgrade::TaskScan::default().line(&row)
         }));
-        // The session log's step fold (addendum A8, ruling S6): the calls'
+        // The session log's step fold: the calls'
         // ids and names, never their inputs (24 × 5 KB here); a plain-string
         // content is validated and never copied. Its budget holds the 24
         // small part maps and the 25 queued steps (about 190 B each), well
@@ -221,7 +221,7 @@ fn transcript_readers_keep_allocation_proportional_to_input() {
     codex_step_rows_materialize_no_text();
 }
 
-/// The session log's Codex step fold (5G-2, ruling S6), over a rollout's
+/// The session log's Codex step fold, over a rollout's
 /// rows as Codex 0.163.0 writes them, each carrying about 72 KB where Codex
 /// writes text: the base instructions, a call's arguments, a script's
 /// input, a result's output, a message, a compaction's history and a turn's

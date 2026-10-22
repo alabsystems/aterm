@@ -352,7 +352,7 @@ pub(crate) struct State {
     notes: Vec<String>,
 }
 
-/// A SIBLING THAT RACES ONE OF THE NODE'S ATTACHES (finding F4's review,
+/// A SIBLING THAT RACES ONE OF THE NODE'S ATTACHES (
 /// `super::world::Opts::race`): a copy of the state dir, under the node's id
 /// and so its producer, whose bridge read the node face before this node's
 /// attach presented anything and takes the incarnation above it — one this

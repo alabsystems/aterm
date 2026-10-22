@@ -4219,7 +4219,7 @@ impl Ctl for MarkFake {
     }
 }
 
-/// THE ACT MARKS' LATCH (ruling S28): a server that refuses the verb (an
+/// THE ACT MARKS' LATCH: a server that refuses the verb (an
 /// older build's `ERR unknown verb`) or the mark itself (`ERR usage: mark`,
 /// `ERR mark:`) is sent ONE mark, and the loop sends no other after it,
 /// queued then or later; `ERR busy retry_ms=` drops that mark alone, never
@@ -10072,7 +10072,7 @@ mod task_face_loop {
 }
 
 /// Why Land still holds, as the loop tells it (`hold_loop_tests.rs`, the
-/// Autopilot design's §12.3.3, slice 3b).
+/// Autopilot design's §12.3.3).
 mod hold_loop {
     use super::*;
     include!("hold_loop_tests.rs");

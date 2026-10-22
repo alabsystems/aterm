@@ -1054,9 +1054,9 @@ fn only_a_proven_claims_holder_records_an_act() {
     assert!(ctx.timeline.lock().unwrap().take_self_tasks().is_empty());
 }
 
-/// A PROVEN HOLDER'S ACT IS ONE ACT MARK (plan 5C-2; rulings T21, T24): in
+/// A PROVEN HOLDER'S ACT IS ONE ACT MARK: in
 /// the hold that records the `harness-act` row, an act the log has a word
-/// for writes `mark act word=<w> rule=<act, @ written .> by=<the
+/// for writes `mark act word=<w> rule=<act, @ written.> by=<the
 /// connection's actor> src=mark conf=claim`, and its wake is taken in that
 /// hold (the caller's change wake notifies). The mark lands on the deepest
 /// open node, as `aterm help` teaches (`mark <node> act`): the session (`-`)

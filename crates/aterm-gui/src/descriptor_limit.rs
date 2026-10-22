@@ -16,12 +16,12 @@ use crate::handoff_env::HandoffName;
 /// A LaunchServices-launched app runs at launchd's soft limit, 256 — not the
 /// parent's, which a forked successor inherits. A grant of up to
 /// [`MAX_CHUNKED_SESSIONS`] masters, and then a wake pipe and an exit
-/// witness's `kqueue` (round seven, finding 26) per adopted session, needs
+/// witness's `kqueue` per adopted session, needs
 /// about four descriptors a session: at 256 the later chunks'
 /// descriptors could not be received at all (the kernel discards rights past
 /// the limit and the receive fails `EMSGSIZE`), and at a few dozen sessions
-/// fewer every later open failed `EMFILE` (round six of the update audit,
-/// item 39). 4096 covers the largest grant with room to spare, and stays under
+/// fewer every later open failed `EMFILE`.
+/// 4096 covers the largest grant with room to spare, and stays under
 /// Darwin's `OPEN_MAX` (10240), past which `setrlimit` refuses.
 const SUCCESSOR_DESCRIPTOR_FLOOR: u64 = 4096;
 
@@ -48,7 +48,7 @@ enum SuccessorLane {
 ///
 /// THE FORK LANE NEEDS IT TOO. Only the launched lane's
 /// claim raised the limit, and a forked successor inherits its predecessor's. A
-/// producer that never raised its own — any build before round eight's park
+/// producer that never raised its own — any build before the park raise
 /// raise, started from the Dock at launchd's 256 — handed its sessions to a
 /// successor that then added three descriptors for each, and from a few dozen
 /// sessions ran out of them after Commit. A cold launch raises nothing.
@@ -119,8 +119,8 @@ pub(crate) fn raised_soft_limit(soft: u64, hard: u64) -> Option<u64> {
 /// had room).
 static LAUNCHER_SOFT_NOFILE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
 
-/// The soft descriptor limit a shell this process spawns must be handed back
-/// (round six of the update audit, item 39, review round two): `Some(soft)`
+/// The soft descriptor limit a shell this process spawns must be handed back:
+/// `Some(soft)`
 /// when a claim, a park or a recovery raised this process's own limit from
 /// `soft` (or a predecessor carried it), `None` when none did and the
 /// process's limit is still the launcher's.
@@ -135,11 +135,11 @@ pub(crate) fn launcher_soft_descriptor_limit() -> Option<u64> {
     LAUNCHER_SOFT_NOFILE.get().copied()
 }
 
-/// The soft `RLIMIT_NOFILE` this process would hold had no PARK raised it
-/// (round eight's second review of #3); 0 when it holds no park's raise.
+/// The soft `RLIMIT_NOFILE` this process would hold had no PARK raised it;
+/// 0 when it holds no park's raise.
 ///
-/// Only [`raise_descriptor_limit_for_park`] is new in round eight: a claim's
-/// raise (round six, item 39) and a recovery's (round seven, finding 26)
+/// Only [`raise_descriptor_limit_for_park`] is new in a claim's
+/// raise and a recovery's
 /// were made before it, so a successor of a process they raised always
 /// inherited the raise. A park's raise is the one nothing before it made, and
 /// so the one an OLDER successor must not be started at
@@ -163,8 +163,8 @@ fn forget_park_raise() {
 }
 
 /// The launch variable in which a predecessor tells its successor the soft
-/// descriptor limit it held before a PARK raised it (round eight's second
-/// review of #3), beside [`ENV_LAUNCHER_NOFILE`] and for the same two lanes
+/// descriptor limit it held before a PARK raised it,
+/// beside [`ENV_LAUNCHER_NOFILE`] and for the same two lanes
 /// ([`carry_launcher_limit`]): a successor that inherits a park's raise is
 /// told so, and hands an older successor of its own what it would have held
 /// without it. Read by [`adopt_carried_launcher_limit`]; a successor that
@@ -173,7 +173,7 @@ pub(crate) const ENV_PARK_RAISED_FROM: HandoffName =
     HandoffName::new("ATERM_HANDOFF_PARK_RAISED_FROM");
 
 /// The launch variable in which a FORK-LANE parent tells its successor the
-/// soft descriptor limit its shells are owed (round seven, item 107): the
+/// soft descriptor limit its shells are owed: the
 /// launcher's, when [`launcher_soft_descriptor_limit`] knows it. A forked
 /// successor inherits the parent's RAISED soft limit and never claims, so
 /// without this every tab it opened got 4096 back — the launcher's 256 held
@@ -204,16 +204,16 @@ const TAKES_PARK_RAISED_FROM_BUILD: u64 = 1_791_501_389;
 /// Such a successor's shells get what it inherits, as before 06b06e74e; one
 /// built before [`ENV_PARK_RAISED_FROM`] is told the launcher's limit alone.
 ///
-/// THE COLD LANE OWES IT TOO (round eight of the update audit, #81): `execve`
+/// THE COLD LANE OWES IT TOO (#81): `execve`
 /// keeps the raised soft limit exactly as a fork does, and the new image's
 /// record starts empty, so a cold-lane update after a launched-lane one (or
 /// after any attempt that raised the limit for its park) handed every later
 /// tab 4096 instead of the launcher's 256 — the leak item 107 closed for the
 /// fork-lane hop only.
 ///
-/// A PARK'S RAISE IS NAMED BESIDE IT (round eight's second review of #3,
+/// A PARK'S RAISE IS NAMED BESIDE IT (
 /// [`ENV_PARK_RAISED_FROM`]): the successor keeps that raise too, and must
-/// know it is one no successor inherited before round eight.
+/// know it is one no successor inherited before
 pub(crate) fn carry_launcher_limit(
     command: &mut aterm_uds::spawnfd::StdCommand,
     target_build: u64,
@@ -287,7 +287,7 @@ pub(crate) fn adopt_carried_launcher_limit(env: &crate::handoff_env::HandoffEnv)
         return None;
     }
     // A park's raise the predecessor held, and this process inherited with
-    // its limit (round eight's second review of #3): the same bounds, since it
+    // its limit: the same bounds, since it
     // too only ever names less than this process runs at.
     if let Some(from) =
         carried_launcher_limit(env.string(ENV_PARK_RAISED_FROM).as_deref(), limit.rlim_cur)
@@ -333,8 +333,8 @@ pub(crate) fn raise_descriptor_limit_for_claim() -> std::io::Result<Option<(u64,
     Ok(Some((soft, target)))
 }
 
-/// THE KEEPER'S RECOVERY needs the same room (round seven of the update
-/// audit, finding 26's review): a cold launch with `[keeper] enabled` takes
+/// THE KEEPER'S RECOVERY needs the same room:
+/// a cold launch with `[keeper] enabled` takes
 /// every master a crashed window left in the keeper's custody at its boot
 /// HELLO and adopts each — a master, a wake pipe and an exit witness's
 /// `kqueue` apiece — at launchd's soft 256, where only a handoff's claim
@@ -361,8 +361,8 @@ pub(crate) fn raise_descriptor_limit_for_recovery() {
     }
 }
 
-/// THE OUTGOING PROCESS needs the same room at its park (round eight of the
-/// update audit, #3). A window started from the Dock, Finder or a login item
+/// THE OUTGOING PROCESS needs the same room at its park (#3).
+/// A window started from the Dock, Finder or a login item
 /// runs at launchd's soft 256, and each of its sessions already holds three
 /// descriptors (the master and both ends of the reader's wake pipe); both
 /// lanes then duplicate every master before the park, and the attempt adds
@@ -376,8 +376,8 @@ pub(crate) fn raise_descriptor_limit_for_recovery() {
 /// handed the launcher's ([`launcher_soft_descriptor_limit`]). A failure is
 /// said, and the attempt goes ahead as it would have.
 ///
-/// NOT TOWARD AN OLDER TARGET, AND NOT INTO ONE (round eight's two reviews
-/// of #3). An attempt whose `target_build` is older than this `build` — an
+/// NOT TOWARD AN OLDER TARGET, AND NOT INTO ONE.
+/// An attempt whose `target_build` is older than this `build` — an
 /// installed activation of an older bundle put back in /Applications, a
 /// channel switch — makes no raise: a successor built before 06b06e74e (every
 /// release up to v0.99.0) never reads [`ENV_LAUNCHER_NOFILE`], and would hand
@@ -416,18 +416,18 @@ pub(crate) fn raise_descriptor_limit_for_park(target_build: u64, build: u64) {
     }
 }
 
-/// THE LIMIT AN OLDER SUCCESSOR IS STARTED AT (round eight's second review
-/// of #3). A park's raise ([`raise_descriptor_limit_for_park`]) is made once
+/// THE LIMIT AN OLDER SUCCESSOR IS STARTED AT.
+/// A park's raise ([`raise_descriptor_limit_for_park`]) is made once
 /// and kept, and a successor inherits it across a fork and across an `exec`
 /// alike; one built before 06b06e74e never reads the launcher's limit it is
-/// told, so every shell it opened got the raise — where, before round eight,
+/// told, so every shell it opened got the raise — where, before the park raise,
 /// a Dock-launched window's older successor inherited the launcher's limit
 /// and handed its shells that. So toward a target OLDER than this build, both
 /// lanes that can reach one (the fork lane, the only seamless lane toward it,
 /// and the cold lane's `exec`) start its image at the limit this process held
 /// before the park's raise ([`park_raised_from`]). A limit a claim or a
 /// recovery raised is left as it always was: a successor inherited that one
-/// before round eight too.
+/// before the park raise too.
 ///
 /// ONLY WHERE THE IMAGE FITS UNDER IT. An older image's shell strip reaches
 /// only the numbers below the soft limit (its `inherited_fd_ceiling`; this
@@ -437,7 +437,7 @@ pub(crate) fn raise_descriptor_limit_for_park(target_build: u64, build: u64) {
 /// under the launcher's limit normally hands it nothing up there (a
 /// duplicate takes the lowest free number). One that needed the park's raise
 /// to duplicate its masters — a desk an older target could not be parked
-/// with before round eight, when the duplicate failed `EMFILE` — hands the
+/// with before the park raise, when the duplicate failed `EMFILE` — hands the
 /// successor duplicates above it, and that successor keeps the raise it
 /// inherits, as the log says.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -648,7 +648,7 @@ pub(crate) mod tests {
         unsafe { (OwnedFd::from_raw_fd(raw[0]), OwnedFd::from_raw_fd(raw[1])) }
     }
 
-    /// THE LAUNCHER'S LIMIT OUTLIVES A FORK-LANE HOP (round seven, item 107).
+    /// THE LAUNCHER'S LIMIT OUTLIVES A FORK-LANE HOP.
     /// A launched successor records the soft limit it raised from; its next
     /// update may take the fork lane, whose child inherits the raised limit and
     /// never claims. The parent names the recorded limit on the child's
@@ -672,8 +672,8 @@ pub(crate) mod tests {
         assert_eq!(carried_launcher_limit(None, 4096), None, "an older parent");
     }
 
-    /// THE LAUNCHER'S LIMIT OUTLIVES A COLD-LANE EXEC TOO (round eight of the
-    /// update audit, #81). A process that raised its soft descriptor limit — a
+    /// THE LAUNCHER'S LIMIT OUTLIVES A COLD-LANE EXEC TOO (#81).
+    /// A process that raised its soft descriptor limit — a
     /// launched successor's claim, or any attempt's park — later updates with
     /// no terminal open, so the cold lane `exec`s. `execve` keeps the raised
     /// limit, and the new image's record starts empty: unless the exec names
@@ -788,8 +788,8 @@ pub(crate) mod tests {
             .expect("a limit")
     }
 
-    /// AN OLDER SUCCESSOR STARTS AT THE LIMIT HELD BEFORE A PARK'S RAISE
-    /// (round eight's second review of #3). A Dock-launched window, at
+    /// AN OLDER SUCCESSOR STARTS AT THE LIMIT HELD BEFORE A PARK'S RAISE.
+    /// A Dock-launched window, at
     /// launchd's soft limit, begins an attempt toward this build (or a newer
     /// one) that raises its limit for the park and then stands down — the
     /// activity re-check, a recording, a launched-lane hold. Nothing lowers
@@ -797,7 +797,7 @@ pub(crate) mod tests {
     /// switches channel, and an attempt targets an OLDER build: no raise is
     /// made for it, but the one already made is still held — and a successor
     /// built before 06b06e74e never reads the launcher's limit it is told, so
-    /// every shell it opened got the raise, where before round eight it
+    /// every shell it opened got the raise, where before the park raise it
     /// inherited launchd's limit. Driven in a child of the test binary whose
     /// limit is launchd's in miniature: the fork lane's hook starts the older
     /// successor at the launchd limit (its stand-in's `ulimit -n` reads it),
@@ -807,7 +807,7 @@ pub(crate) mod tests {
     /// same-or-newer target inherits the room; a descriptor the image would
     /// keep at or above the launchd limit leaves the raise (its strip would
     /// not reach it); and a raise a recovery or a claim made — one every
-    /// successor inherited before round eight — is left as it was.
+    /// successor inherited before is left as it was.
     ///
     /// RED before the fix: the older successor's stand-in read the raise.
     #[test]
@@ -953,15 +953,15 @@ pub(crate) mod tests {
         image.spawn().passed();
 
         // A RECOVERY'S RAISE (a claim's alike) is one a successor inherited
-        // before round eight: after it, an older successor inherits the
+        // before after it, an older successor inherits the
         // raise, as it always did.
         raise_descriptor_limit_for_recovery();
         assert_eq!(park_raised_from(), None, "the raise is a recovery's now");
         assert_eq!(successor_soft_nofile(BUILD - 1, BUILD, &[]), raised);
     }
 
-    /// …AND THE RAISE STAYS THE SUCCESSOR'S (round six, item 39, review round
-    /// two). A shell this process spawns after the claim — a new tab, with the
+    /// …AND THE RAISE STAYS THE SUCCESSOR'S.
+    /// A shell this process spawns after the claim — a new tab, with the
     /// daily-driver limits `spawn_session` hands the PTY — must see the soft
     /// limit the process was launched with, not the one it raised itself to.
     /// Driven through the real actuator (`Limits::apply` before `exec`) and read

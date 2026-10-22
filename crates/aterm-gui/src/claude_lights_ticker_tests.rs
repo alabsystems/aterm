@@ -893,9 +893,9 @@ fn a_reader_chip_click_commits_an_open_in_grid_rename() {
     assert_eq!(pinned(&app).as_deref(), Some("reader off chip"));
 }
 
-/// A HOVERED TITLE WITH A TRAIL GIVES ITS PARTS UP IN ORDER (§9.2.1; review
-/// of fix/autopilot-menu-wiring, finding 2; owner-eye-1 of the post-landing
-/// check of Autopilot v3 wave 1): walked from 240 columns down to 60 with
+/// A HOVERED TITLE WITH A TRAIL GIVES ITS PARTS UP IN ORDER (§9.2.1)
+/// :
+/// walked from 240 columns down to 60 with
 /// one act taken, the hovered Autopilot title beside the whole facts is the
 /// WHOLE (the trail and the menu's line), then the whole WITHOUT ITS TRAIL
 /// (the menu still offered), then V1'S WORDS (the menu's line given up

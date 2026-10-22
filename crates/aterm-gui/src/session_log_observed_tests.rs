@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The remaining marks (session log Phase 3B, plan §3.5): each site's record
+//! The remaining marks (plan §3.5): each site's record
 //! and its fields through the site's own entry point where a test can reach
 //! it (the status sweep on a headless App), dedup (a value written twice
 //! writes one mark), the wake, the carry, and the leak rule (a
@@ -27,7 +27,7 @@ fn having<'a>(got: &'a [String], needle: &str) -> Vec<&'a String> {
     got.iter().filter(|l| l.contains(needle)).collect()
 }
 
-/// THE ENGINE'S MARKS through the status sweep (plan §3.2; ruling S19): an
+/// THE ENGINE'S MARKS through the status sweep (plan §3.2): an
 /// OSC 9 sent with notifications off is counted (`mark - notify n=1`) and
 /// its body is in no record; bells are counted; an OSC 9;4 is progress
 /// (`state=normal pct=42`), never a notification; the integration's posture
@@ -358,7 +358,7 @@ fn every_render_transition_is_one_mark_with_its_row() {
     );
 }
 
-/// THE CARRY (ruling S5): what the marks last wrote crosses an update as
+/// THE CARRY: what the marks last wrote crosses an update as
 /// words and tenths on the `state` line, so a successor does not restate
 /// them. NEGATIVE CONTROL: a line without the tokens (an older build's)
 /// reads as nothing known, and an unknown word is none.
@@ -492,8 +492,8 @@ fn the_drift_flush_marks_the_cwd_and_the_title_when_they_move() {
     assert!(!cwd[1].contains(" cwd="), "{cwd:?}");
 }
 
-/// The cwd and the title cross an update as fingerprints, never as text
-/// (ruling S5): a successor that reads the same directory and title says
+/// The cwd and the title cross an update as fingerprints, never as text:
+/// a successor that reads the same directory and title says
 /// neither again. NEGATIVE CONTROL: one that reads a new title says it.
 #[test]
 fn the_cwd_and_the_title_cross_an_update_as_fingerprints() {
@@ -685,7 +685,7 @@ pub(super) fn returned(rx: &std::sync::mpsc::Receiver<String>, site: &str) -> St
         .unwrap_or_else(|_| panic!("{site}: the parked await never returned"))
 }
 
-/// A WORKER'S TASK MOVES ARE TASK MARKS (plan 5C-3; ruling T21), each through
+/// A WORKER'S TASK MOVES ARE TASK MARKS, each through
 /// its production entry point — `task mark` (the verb a worker's harness and
 /// a manager use) and the supervisor's attention (`meta set attention
 /// owner=supervisor`, whose caller wakes on `changed` as `serve_meta`'s
@@ -998,7 +998,7 @@ fn meta_marks(ctx: &crate::SessionCtx) -> Vec<String> {
         .collect()
 }
 
-/// THE META WRITERS' MARK (plan §3.2; ruling S14): a wire `meta set` is
+/// THE META WRITERS' MARK (plan §3.2): a wire `meta set` is
 /// `mark - meta field=<f> value=<v>` by the connection's `log_actor`
 /// (`ctl` for an Owner instance client), through the dispatch's own
 /// `serve_meta`; an unset has no `value=`; the window's editor writes
@@ -1163,10 +1163,10 @@ fn the_supervisors_attention_is_one_escalated_need_by_aterm() {
     );
 }
 
-/// THE SUPERVISOR'S ATTENTION TEXT NEVER LEAVES RAM (phase 6, 6F-8, ruling
-/// U13, which turned "never stored" into the ring's own exposure; the
+/// THE SUPERVISOR'S ATTENTION TEXT NEVER LEAVES RAM (which turned "never stored" into the ring's own exposure; the
 /// design's tier table: box commands, question text and the screen's last
-/// line are never journaled, carried or published): an escalation over a
+/// line are never journaled, carried or published):
+/// an escalation over a
 /// Bash box whose command holds a sentinel, the shape `supervise::escalate`
 /// writes, is `mark - meta field=attention fp=<16 hex>`, the text's
 /// fingerprint, with the text beside it at `Tier::Content` (`attn_text=`),
@@ -1281,11 +1281,11 @@ fn the_supervisors_attention_text_never_leaves_ram() {
     assert!(leaks.is_empty(), "{}", leaks.join("\n"));
 }
 
-/// THE META A SUCCESSOR RESTORES IS NO NEWS (ruling S5's `meta_fp`): the
+/// THE META A SUCCESSOR RESTORES IS NO NEWS (`meta_fp`): the
 /// carry's `state` line holds each meta field's value as the log last said
 /// it, a fingerprint, never its text, and a successor that reads it back
 /// and restores the same value (`restore_carried_meta`, by aterm) writes
-/// its row's mark (one a row since phase 6, 6F-8, ruling U13) saying
+/// its row's mark (one a row since phase 6) saying
 /// `carried=1`: no news. NEGATIVE CONTROL: a restore of another value, or
 /// of a field the predecessor never said, is a mark with no `carried=`.
 #[test]
@@ -1518,7 +1518,7 @@ fn a_told_story_is_one_mark_by_its_teller_and_no_text() {
     assert!(got.iter().all(|l| !l.contains("SENTINEL")), "{got:?}");
 }
 
-/// ONE `meta-change` WRITER BY CONSTRUCTION (ruling S14): the general
+/// ONE `meta-change` WRITER BY CONSTRUCTION: the general
 /// recorder refuses the kind (a debug build panics, a release build appends
 /// nothing), so no writer can skip the helper's mark and its derived
 /// `escalated`.
@@ -1592,8 +1592,8 @@ fn claude_in_front(
     );
 }
 
-/// (a) A HARNESS RELAUNCH LIFTS THE FAILURE IT CAUSED (Phase 6 step 6C-1,
-/// ruling U3): the old `claude` command, an agent in front of it, ends 143
+/// (a) A HARNESS RELAUNCH LIFTS THE FAILURE IT CAUSED:
+/// the old `claude` command, an agent in front of it, ends 143
 /// (`need=failure` on its run), the relaunched `claude` opens a new `cmd`
 /// run, and the relaunch's act writes `mark - seen by=harness src=aterm
 /// conf=strong` after it, so no failure need is left and `brief` names none.

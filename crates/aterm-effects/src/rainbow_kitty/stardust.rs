@@ -1603,13 +1603,13 @@ impl Star {
 
     /// The birth pixel — `x`, `y` are integers by construction (§5.4).
     #[inline]
-    fn origin(&self) -> (i32, i32) {
+    const fn origin(&self) -> (i32, i32) {
         (self.x.round() as i32, self.y.round() as i32)
     }
 
     /// `origin + round(v₀ · k)`, the one integer step every position is.
     #[inline]
-    fn at_k(&self, k: f32) -> (i32, i32) {
+    const fn at_k(&self, k: f32) -> (i32, i32) {
         let (bx, by) = self.origin();
         if self.v0.0 == 0.0 && self.v0.1 == 0.0 {
             return (bx, by);
@@ -1624,7 +1624,7 @@ impl Star {
     /// walk-back, [`Stardust::settle`]). `k` is the motion's end factor, so
     /// `at_k(k)` returns `rest` to the pixel.
     #[inline]
-    fn aim(&mut self, rest: (i32, i32), k: f32) {
+    const fn aim(&mut self, rest: (i32, i32), k: f32) {
         let (bx, by) = self.origin();
         if k <= 0.0 {
             self.v0 = (0.0, 0.0);
@@ -1666,7 +1666,7 @@ impl StarBudget {
     /// A full bucket (see [`StarBudget::at`]).
     #[inline]
     #[must_use]
-    pub fn new() -> Self {
+    pub const fn new() -> Self {
         Self {
             tokens: GLINT_CAP,
             at: None,
@@ -1688,7 +1688,7 @@ impl StarBudget {
     /// exactly one glint at that star's column this frame. Refuses only when
     /// the bucket is dry (§13).
     #[inline]
-    pub fn try_spend(&mut self) -> bool {
+    pub const fn try_spend(&mut self) -> bool {
         if self.tokens < 1.0 {
             return false;
         }
@@ -1699,14 +1699,14 @@ impl StarBudget {
     /// A meteor empties the bucket on its move edge (§8.1 no. 2, §13), so the
     /// ~250 ms of typing under the rain is silent.
     #[inline]
-    pub fn empty(&mut self) {
+    pub const fn empty(&mut self) {
         self.tokens = 0.0;
     }
 
     /// Tokens on hand — `trail status` and the budget tests.
     #[inline]
     #[must_use]
-    pub fn tokens(&self) -> f32 {
+    pub const fn tokens(&self) -> f32 {
         self.tokens
     }
 }
@@ -1942,7 +1942,7 @@ impl GlyphProbe {
     /// scroll or band move (the host re-probes before the next deal). The
     /// rows' bitsets are kept as retired storage ([`Self::live`]).
     #[inline]
-    pub fn clear(&mut self) {
+    pub const fn clear(&mut self) {
         self.live = 0;
         self.at = 0;
     }
@@ -2045,7 +2045,7 @@ impl GlyphProbe {
     /// True when the probe has no rows at all.
     #[must_use]
     #[cfg(test)]
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.live == 0
     }
 }
@@ -2251,14 +2251,14 @@ impl Stardust {
     /// (§5.4). Until then every in-grid cell is unknown and no sky star is
     /// born.
     #[inline]
-    pub fn probe_mut(&mut self) -> &mut GlyphProbe {
+    pub const fn probe_mut(&mut self) -> &mut GlyphProbe {
         &mut self.probe
     }
 
     /// Read-only view of the frame's glyph truth.
     #[inline]
     #[must_use]
-    pub fn probe(&self) -> &GlyphProbe {
+    pub const fn probe(&self) -> &GlyphProbe {
         &self.probe
     }
 
@@ -2598,7 +2598,7 @@ impl Stardust {
     /// exceeds [`STAR_POOL_MAX`].
     #[inline]
     #[must_use]
-    pub fn live(&self) -> usize {
+    pub const fn live(&self) -> usize {
         self.stars.len()
     }
 
@@ -2606,7 +2606,7 @@ impl Stardust {
     /// `Engine::next_change_deadline` folds (§18).
     #[must_use]
     #[cfg(test)]
-    pub fn at_rest(&self) -> bool {
+    pub const fn at_rest(&self) -> bool {
         self.stars.is_empty() && self.veil.is_empty()
     }
 
@@ -3785,7 +3785,7 @@ impl Stardust {
     /// stands in for `born`: a pure function of the event sequence, so the
     /// same events at the same `now` produce identical frames.
     #[inline]
-    fn mint_seed(&mut self, row: u16, col: u16) -> u32 {
+    const fn mint_seed(&mut self, row: u16, col: u16) -> u32 {
         self.minted = self.minted.wrapping_add(1);
         cell_hash(row, col, self.minted)
     }
@@ -3904,7 +3904,7 @@ impl Stardust {
 /// The fan's class at throw position `k` (§5.6, D6): 1 gold m1 + 4 m2 + rest
 /// m3 in throw order, or with no hero (an Enter, D8) 1 m2 + rest m3.
 #[inline]
-fn fan_class(k: usize, hero: bool) -> StarClass {
+const fn fan_class(k: usize, hero: bool) -> StarClass {
     match (k, hero) {
         (0, true) => StarClass::M1,
         (0, false) | (1..=4, true) => StarClass::M2,
@@ -3926,7 +3926,7 @@ fn star_over_cell(star: &Star, cell: (u16, u16), geom: Geom) -> bool {
 /// deals scale their probability instead ([`deal`]), and the exhaust thins
 /// its ink, not its throw ([`Star::inks`]).
 #[inline]
-fn light_keeps(seed: u32, cfg: &Config) -> bool {
+const fn light_keeps(seed: u32, cfg: &Config) -> bool {
     cfg.dark_theme || hash01(mix32(seed ^ SALT_LIGHT)) < LIGHT_COUNT_SCALE
 }
 
@@ -4429,7 +4429,7 @@ const SALT_EXHAUST: u32 = 0x0000_0E7A;
 
 /// The family's avalanche mix (the rounds `cursor_glow` uses).
 #[inline]
-pub(super) fn mix32(mut h: u32) -> u32 {
+pub(super) const fn mix32(mut h: u32) -> u32 {
     h ^= h >> 16;
     h = h.wrapping_mul(0x7FEB_352D);
     h ^= h >> 15;
@@ -4441,17 +4441,17 @@ pub(super) fn mix32(mut h: u32) -> u32 {
 /// `(row, col, salt)` → seed (§18: every seed is hashed at the spawn edge; no
 /// per-frame RNG anywhere).
 #[inline]
-fn cell_hash(row: u16, col: u16, salt: u32) -> u32 {
+const fn cell_hash(row: u16, col: u16, salt: u32) -> u32 {
     mix32(
-        u32::from(row).wrapping_mul(73_856_093)
-            ^ u32::from(col).wrapping_mul(19_349_663)
+        (row as u32).wrapping_mul(73_856_093)
+            ^ (col as u32).wrapping_mul(19_349_663)
             ^ salt.wrapping_mul(83_492_791),
     )
 }
 
 /// A seed's uniform draw on `[0, 1)`.
 #[inline]
-pub(super) fn hash01(h: u32) -> f32 {
+pub(super) const fn hash01(h: u32) -> f32 {
     (h >> 8) as f32 / 16_777_216.0
 }
 
@@ -4459,7 +4459,7 @@ pub(super) fn hash01(h: u32) -> f32 {
 /// probability test rather than a modulo, so the light fork's × 0.6 thins the
 /// same sky instead of reshuffling which cells are starred.
 #[inline]
-fn deal(cell: u32, salt: u32, den: u32, scale: f32) -> bool {
+const fn deal(cell: u32, salt: u32, den: u32, scale: f32) -> bool {
     hash01(mix32(cell ^ salt)) < scale / den as f32
 }
 
@@ -4467,7 +4467,7 @@ fn deal(cell: u32, salt: u32, den: u32, scale: f32) -> bool {
 /// such as flow's field share): the same draw as [`deal`] with
 /// `share == scale / den`, to the bit.
 #[inline]
-fn deal_p(cell: u32, salt: u32, share: f32) -> bool {
+const fn deal_p(cell: u32, salt: u32, share: f32) -> bool {
     hash01(mix32(cell ^ salt)) < share
 }
 
@@ -4488,7 +4488,7 @@ enum Rung {
 /// nothing (a broken run owes nothing).
 #[inline]
 #[must_use]
-fn ladder_rung(combo: u32) -> Option<Rung> {
+const fn ladder_rung(combo: u32) -> Option<Rung> {
     if combo == 0 {
         None
     } else if combo.is_multiple_of(LADDER_GOLD_KEYS) {
@@ -4505,7 +4505,7 @@ fn ladder_rung(combo: u32) -> Option<Rung> {
 /// The seeded arm-size scintillation rate in Hz, `8 + 4·hash01` (§5.5). The
 /// audio glint that rides a star twinkles at this same number (§13).
 #[inline]
-fn scint_rate(seed: u32) -> f32 {
+const fn scint_rate(seed: u32) -> f32 {
     SCINT_F_MIN + (SCINT_F_MAX - SCINT_F_MIN) * hash01(mix32(seed ^ SALT_RATE))
 }
 
@@ -4513,8 +4513,8 @@ fn scint_rate(seed: u32) -> f32 {
 /// is never gold (it has no glints); an m1 or m2 takes the [`deal_tint`]
 /// deal.
 #[inline]
-fn class_tint(class: StarClass, seed: u32, field_t: f32) -> (u32, bool) {
-    if class == StarClass::M3 {
+const fn class_tint(class: StarClass, seed: u32, field_t: f32) -> (u32, bool) {
+    if matches!(class, StarClass::M3) {
         (spectrum_snap(field_t), false)
     } else {
         deal_tint(seed, field_t)
@@ -4527,7 +4527,7 @@ fn class_tint(class: StarClass, seed: u32, field_t: f32) -> (u32, bool) {
 /// 15 % gold, the only class with diagonal glints. Gold-ness is the deal's
 /// answer, not the colour's: the arc's yellow stop has gold's RGB.
 #[inline]
-fn deal_tint(seed: u32, field_t: f32) -> (u32, bool) {
+const fn deal_tint(seed: u32, field_t: f32) -> (u32, bool) {
     let u = hash01(mix32(seed ^ SALT_TINT));
     if u < TINT_FIELD_SHARE {
         (spectrum_snap(field_t), false)
@@ -4543,7 +4543,7 @@ fn deal_tint(seed: u32, field_t: f32) -> (u32, bool) {
 /// sums three or four bytes, so truncating would shed up to a unit each (a
 /// sky m2 would land at 126, not §5.2's 130).
 #[inline]
-fn cov_byte(v: f32) -> u8 {
+const fn cov_byte(v: f32) -> u8 {
     if v.is_nan() {
         0
     } else {
@@ -4577,7 +4577,7 @@ fn in_sky_of_row(y: f32, row: u16, geom: Geom) -> bool {
 /// plus the `head` band, §5.4's row-0 sky). The glass test for every birth
 /// and rest in this file.
 #[inline]
-pub(super) fn on_glass(p: (i32, i32), geom: Geom) -> bool {
+pub(super) const fn on_glass(p: (i32, i32), geom: Geom) -> bool {
     p.0 >= geom.fx_left() && p.0 < geom.fx_right() && p.1 >= geom.fx_top() && p.1 < geom.fx_bot()
 }
 
@@ -4599,7 +4599,7 @@ fn clamp_to_glass(p: (i32, i32), geom: Geom) -> (i32, i32) {
 /// may rise into the `Geom.head` band, but only up to the same 1.6 ch.
 /// Computed once per landing.
 #[inline]
-fn fan_rise(reach: f32, at_px: (f32, f32), geom: Geom) -> (f32, f32) {
+const fn fan_rise(reach: f32, at_px: (f32, f32), geom: Geom) -> (f32, f32) {
     let squash = reach * FAN_SQUASH;
     let ceiling = FAN_RISE_MAX_CH * geom.ch as f32;
     let room_up = (at_px.1 - geom.fx_top() as f32).max(0.0);
@@ -5008,7 +5008,7 @@ impl SkyIndex {
     /// The grid cell a window pixel falls in — the same floor division the
     /// pushers tag their row with, on both axes.
     #[inline]
-    fn cell_at(&self, x: i32, y: i32) -> (i32, i32) {
+    const fn cell_at(&self, x: i32, y: i32) -> (i32, i32) {
         (
             if self.cell.0 > 0 {
                 (x - self.origin.0).div_euclid(self.cell.0)
@@ -5026,7 +5026,7 @@ impl SkyIndex {
     /// The chain a cell hashes to ([`SKY_INDEX_WIDE_CELLS`] keeps it
     /// injective within one lay).
     #[inline]
-    fn slot((cx, cy): (i32, i32)) -> usize {
+    const fn slot((cx, cy): (i32, i32)) -> usize {
         let k = (cx as u32)
             .wrapping_mul(0x9E37_79B9)
             .wrapping_add((cy as u32).wrapping_mul(0x85EB_CA6B));

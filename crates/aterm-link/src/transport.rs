@@ -127,7 +127,7 @@ where
     }
 }
 
-/// THE FLOOR A READ WAS TOLD (astream's R4, session log Phase 6 step 6E-2):
+/// THE FLOOR A READ WAS TOLD (astream's R4):
 /// `Some(<oldest>)` when `e` is a broker's refusal of a `Fetch` from `from`
 /// below what its filter still keeps — `ERR retained-from=<oldest>`, the
 /// records below `<oldest>` given up by the broker's retention rules
@@ -147,8 +147,8 @@ pub fn retained_past(e: &io::Error, from: u64) -> Option<u64> {
 /// caller's.
 pub const KEPT_TRIES: usize = 4;
 
-/// A `Fetch` of `filter` from `from` that READS ON AT THE FLOOR (session log
-/// Phase 6 step 6E-2): a broker that retains its log (`aterm link broker`
+/// A `Fetch` of `filter` from `from` that READS ON AT THE FLOOR:
+/// a broker that retains its log (`aterm link broker`
 /// does by default, [`crate::broker_rules`]) refuses a read below what the
 /// filter still keeps, `ERR retained-from=<oldest>`, instead of a page that
 /// silently starts later; this reads from `<oldest>` then, and answers the
@@ -528,8 +528,8 @@ mod tests {
         );
     }
 
-    /// A READ BELOW A RETAINING BROKER'S FLOOR READS ON FROM IT (session log
-    /// Phase 6 step 6E-2): three records on one face, the log cut below the
+    /// A READ BELOW A RETAINING BROKER'S FLOOR READS ON FROM IT:
+    /// three records on one face, the log cut below the
     /// second. A plain `Fetch` from the first is refused `retained-from=` the
     /// second ([`retained_past`] reads it; a floor at the read is none past
     /// it), and [`fetch_kept`] from the first answers the kept two with the

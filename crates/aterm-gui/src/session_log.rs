@@ -13,7 +13,7 @@
 //! |---|---|
 //! | `SessionStore::register` | `open - spawn\|adopt\|restore parent=<sid> epoch=<ep> state=<w>`, a restore's with `prev=<sid> lineage=<sid>`; `mark - state state=<w> carried=1` for a carried session already open (phase 6, 6F-7) |
 //! | `App::carry_restored_lineage` | `amend - restore prev= lineage=` when a window's already-open bootstrap fills a restored leaf |
-//! | `SessionStore::deregister_local_as` | `close - out=<reason> by= code= closer=<raw actor>` (the closer at the content tier, ruling U12) |
+//! | `SessionStore::deregister_local_as` | `close - out=<reason> by= code= closer=<raw actor>` (the closer at the content tier) |
 //! | the status sweep's block read | `open r<n> cmd blk= detail=` at OSC 133 C; `close r<n> out= code= dur_ms=` at D (the program and agent runs under it first, at the same instant); both, `dur=wall`, for a block the sweep saw only finished; `gap why=evicted` for blocks the terminal dropped unread |
 //! | `note_foreground_group`, `set_program` | `open`/`close r<n> prog\|agent prog=`; `amend r<n> agent prog=` when a group's name confirms the agent the screen named |
 //! | `settle_agent_word` | `mark agent word= rev= gen= fp=`, and the [`TurnTracker`]'s turns and steps |
@@ -106,7 +106,7 @@ pub(crate) fn told_epoch(ep: u32) -> Option<u32> {
     (FIRST_EPOCH..=EPOCH_CEILING).contains(&ep).then_some(ep)
 }
 
-/// THE EPOCH ALLOCATOR (session log phase 6, step 6A-2, ruling U1): it
+/// THE EPOCH ALLOCATOR: it
 /// issues the first epoch of every log this process starts, fresh or
 /// uncarried (a spawn's, a restore's, an adoption told nothing of its
 /// predecessor's, a crash recovery's) as
@@ -284,7 +284,7 @@ pub(crate) struct LogAdopt {
     pub(crate) keeper_ep: Option<u32>,
     /// THE BUS MIRROR's cursor and `ms` head in the predecessor's seq space,
     /// as its export drew them under the readers' fence (the control
-    /// sidecar's `log_mirror` member, session log phase 4 ruling Q7): only
+    /// sidecar's `log_mirror` member): only
     /// for a mirrored log the update did NOT carry, whose successor then says
     /// the old space's tail as one exact `gap why=reset`. `None` otherwise.
     pub(crate) mirror: Option<aterm_slog::Prior>,
@@ -662,7 +662,7 @@ pub(crate) struct SessionLog {
     fg: Option<FgRun>,
     /// The agent run and its turn tracker.
     agent: Option<AgentRun>,
-    /// THE COMMANDS AN AGENT RAN UNDER (Phase 6 step 6C-1): the `cmd` runs
+    /// THE COMMANDS AN AGENT RAN UNDER: the `cmd` runs
     /// the session's newest agent runs hung under, oldest first, at most
     /// [`AGENT_CMDS_MAX`] ([`Self::note_agent_cmd`]). A relaunch lifts a
     /// failure only on one of them ([`Self::harness_saw_failure`]): an
@@ -688,7 +688,7 @@ pub(crate) struct SessionLog {
     /// restores keeps naming the session it began with; a seamless update's
     /// leaf hands it to the shell it names ([`Self::seed_lineage`]).
     lineage: Option<ShortId>,
-    /// THE JOURNAL'S START (phase 2B, ruling R5): the carried head a seamless
+    /// THE JOURNAL'S START: the carried head a seamless
     /// update's predecessor journaled up to (its carry's `journal` host
     /// line), which this process's journal writer starts after; `None`: from
     /// the log's first record. Written once, at the adoption.
@@ -701,7 +701,7 @@ pub(crate) struct SessionLog {
     /// What the remaining §4.1 marks last wrote (phase 3B,
     /// `session_log_observed`): one mark per value.
     observed: observed::Observed,
-    /// THE PERSON'S COUNT (ruling T2): the session's lock-free gesture count
+    /// THE PERSON'S COUNT: the session's lock-free gesture count
     /// (`HumanInputStamp::seq`, the `if-human=` fence), bound when the store
     /// registers the session, and what this log last delivered of it
     /// (`HumanInputStamp::counts`): the count, and the number of the last
@@ -717,8 +717,8 @@ pub(crate) struct SessionLog {
     person_seen: u64,
     reached_seen: u64,
     marked_through: u64,
-    /// THE `human` ROWS THE TIMELINE OWES (phase 6, the review of 6F-8;
-    /// ruling U13): one per burst mark [`Self::person_input`] wrote, the
+    /// THE `human` ROWS THE TIMELINE OWES (the review of 6F-8):
+    /// one per burst mark [`Self::person_input`] wrote, the
     /// key's own delivery's or a reconcile's that took over a burst whose
     /// own call had not run yet. The timeline pays them
     /// ([`crate::session_timeline::SessionTimeline::pay_burst_rows`]) before
@@ -743,7 +743,7 @@ pub(crate) struct PersonGesture {
 /// A session ring's bounds: [`Limits::SESSION`], or, in a development build
 /// only, `ATERM_SLOG_RING=<records>,<bytes>` (`aterm_types::dev_seam!`, `None`
 /// in a release build), read once: the bus mirror's world tests reach an
-/// eviction in a handful of commands with it (session log phase 4).
+/// eviction in a handful of commands with it.
 pub(crate) fn ring_limits() -> Limits {
     static RING: std::sync::OnceLock<Limits> = std::sync::OnceLock::new();
     *RING.get_or_init(|| {
@@ -772,7 +772,7 @@ impl SessionLog {
         SessionLog::at_epoch(epochs, ep)
     }
 
-    /// THE TEST CONSTRUCTOR (ruling U46): a fresh log at [`FIRST_EPOCH`],
+    /// THE TEST CONSTRUCTOR: a fresh log at [`FIRST_EPOCH`],
     /// with an allocator of its own (a simulated process that issued
     /// nothing else), so a unit test that sets its clock by hand reads
     /// `ep=1` and an adoption it drives takes its hand clock's seconds. No
@@ -787,9 +787,12 @@ impl SessionLog {
 
     fn at_epoch(epochs: std::sync::Arc<Epochs>, ep: u32) -> SessionLog {
         let mut log = Log::with_limits(ep, ring_limits());
-        // The journal writer's wake (ruling R6), when this process keeps a
+        // The journal writer's wake, when this process keeps a
         // journal: every append and eviction of this log rings it.
         log.set_notify(crate::session_log_journal::notify());
+        // THE TIMELINE'S ROWS (6G-1/6G-2): the view's
+        // grammar flags each record it prints, numbered from 1.
+        log.keep_rows(crate::session_timeline_view::row_span, 0);
         SessionLog {
             log,
             clock: Clock::default(),
@@ -840,7 +843,7 @@ pub(crate) fn exit_actor(actor: &crate::session_store::ExitActor) -> Actor {
     use crate::session_store::ExitActor;
     match actor {
         // An edge's source as `grant` took it: a session only when it reads
-        // as a minted sid (phase 3A ruling R1).
+        // as a minted sid.
         ExitActor::Sid(sid) => sid_actor(sid).unwrap_or(Actor::Nobody),
         ExitActor::Human => Actor::Human,
         ExitActor::Ctl => Actor::Ctl,
@@ -851,7 +854,7 @@ pub(crate) fn exit_actor(actor: &crate::session_store::ExitActor) -> Actor {
 }
 
 /// The session `sid` names as the log's actor: a minted sid's
-/// ([`aterm_session::is_minted_sid`]), else none (phase 3A ruling R1: a name
+/// ([`aterm_session::is_minted_sid`]), else none (a name
 /// someone chose is never a session's, and never a trusted actor).
 pub(crate) fn sid_actor(sid: &str) -> Option<Actor> {
     aterm_session::is_minted_sid(sid)
@@ -937,8 +940,8 @@ impl SessionLog {
         self.mirror_seen = 0;
     }
 
-    /// THE PERSON'S COUNT, bound when the store registers the session
-    /// (ruling T2): every gesture counted so far has been delivered (each
+    /// THE PERSON'S COUNT, bound when the store registers the session:
+    /// every gesture counted so far has been delivered (each
     /// reached [`Self::person_input`], or found no session to attribute).
     pub(crate) fn bind_person(
         &mut self,
@@ -951,7 +954,7 @@ impl SessionLog {
         self.person = Some(count);
     }
 
-    /// RECONCILE THE PERSON (ruling T2): when the count moved past what this
+    /// RECONCILE THE PERSON: when the count moved past what this
     /// log last delivered, a person's key found the timeline held
     /// (`note_person`'s `try_lock`): it is delivered now, before the entry
     /// that called this reaches the tracker or writes mail, so it binds the
@@ -980,11 +983,35 @@ impl SessionLog {
     }
 
     /// Put `log` in place of this one, keeping its journal wake: no path that
-    /// replaces a session's log can leave it unrung.
+    /// replaces a session's log can leave it unrung. And its rows (6G-1,
+    /// 6G-2): the view's grammar flags the new log's own records, numbered
+    /// on past every id this one issued or was continued at (a seamless
+    /// update's carried count, [`Self::continue_rows`]), so no row id of this
+    /// process is handed out twice; a crash adoption's log, whose host
+    /// carried no count, counts on from this process's own.
     pub(crate) fn replace_log(&mut self, log: Log) {
         let notify = self.log.notify().cloned();
+        let rows = self.log.row_head();
         self.log = log;
         self.log.set_notify(notify);
+        self.log
+            .keep_rows(crate::session_timeline_view::row_span, rows);
+    }
+
+    /// Continue the timeline's row ids past `carried`, the count a seamless
+    /// update's manifest carried (`SessionRecord::timeline_id`, which holds
+    /// the predecessor's overlap reserve): called before the successor's
+    /// first record ([`crate::session_timeline::SessionTimeline::continue_ids`]).
+    pub(crate) fn continue_rows(&mut self, carried: u64) {
+        self.log.continue_rows(carried);
+    }
+
+    /// The last timeline row id this log issued, or the count it was
+    /// continued at (read by the seamless update's id ceiling, as its
+    /// callers are compiled: unix, and tests).
+    #[cfg(any(unix, test))]
+    pub(crate) fn row_head(&self) -> u64 {
+        self.log.row_head()
     }
 
     /// The time now, on this log's clock.
@@ -992,8 +1019,8 @@ impl SessionLog {
         self.clock.now()
     }
 
-    /// THE CHROME'S CLAUSE (phase 3B, plan §5; addendum A12, rulings S10 and
-    /// S11) at `now_ms` on [`crate::turn_ledger::now_ms`]'s clock: the
+    /// THE CHROME'S CLAUSE (phase 3B, plan §5)
+    /// at `now_ms` on [`crate::turn_ledger::now_ms`]'s clock: the
     /// clause a person's tooltip may show ([`aterm_slog::clause_of_proven`]:
     /// a `ctl` label neither shows nor hides the row beneath it) over the
     /// state a reader is shown, as the cache's key and the line it composes.
@@ -1021,7 +1048,7 @@ impl SessionLog {
             by: clause.by,
             since_wall: now_wall.saturating_sub(clause.age_ms),
         };
-        // A shown label says whose it is (D6, ruling U22); no other row does.
+        // A shown label says whose it is; no other row does.
         let by = (clause.row == aterm_slog::ClauseRow::Label)
             .then(|| crate::session_chrome::ClauseAuthor::of(&clause.by))
             .flatten();
@@ -1118,7 +1145,7 @@ impl SessionLog {
         };
         self.replace_log(log);
         // A mirrored log the update did not carry: its old space's tail is
-        // owed to the bus as one exact cover (ruling Q7).
+        // owed to the bus as one exact cover.
         if !keeper && let Some(prior) = carry.mirror {
             self.log.note_prior_space(prior);
         }
@@ -1278,8 +1305,7 @@ impl SessionLog {
     /// let it go. Everything still open closes under it, innermost first,
     /// `out=gone`. `closer` is the raw actor that closed it (the timeline's
     /// `closing by=`, `-` for none): CONTENT tier, RAM only, beside `by=`,
-    /// which says `-` for a sid no one minted (3A's R1; phase 6, 6F-7,
-    /// ruling U12).
+    /// which says `-` for a sid no one minted (3A's R1).
     pub(crate) fn close_session(
         &mut self,
         out: SessionOut,
@@ -1787,8 +1813,8 @@ impl SessionLog {
         );
     }
 
-    /// A HARNESS RELAUNCH LIFTS THE FAILURE IT CAUSED, AND ONLY THAT ONE
-    /// (session log Phase 6, step 6C-1, ruling U3). Run right after the act
+    /// A HARNESS RELAUNCH LIFTS THE FAILURE IT CAUSED, AND ONLY THAT ONE.
+    /// Run right after the act
     /// mark of a relaunch row whose step brought a new agent process up
     /// ([`Self::observe_relaunch_act`] with `started`,
     /// [`aterm_agent::harness::upgrade_drive::started`]); a row that typed a
@@ -2192,17 +2218,17 @@ impl SessionLog {
     /// that opens within 5 s to them (a run a waiting name opens later too,
     /// [`Typed`]); a gesture that reached the program
     /// ([`crate::human_input::reaches_program`]) makes the approval or
-    /// question step open now the person's to dismiss (ruling T1); and the
+    /// question step open now the person's to dismiss; and the
     /// first input of a burst writes `mark - human by=human` on the session
     /// (the bytes are never recorded), as does the first program-bound one
-    /// after a `mail dir=in` mark, whatever its burst (ruling T39; the mail
+    /// after a `mail dir=in` mark, whatever its burst (the mail
     /// latch is [`aterm_slog::Fold::in_since_human`], the log's own fold's,
-    /// which a carry crosses an update with: 6C-5, ruling U19). A burst's
+    /// which a carry crosses an update with: 6C-5). A burst's
     /// mark that no program-bound input is delivered with says so,
     /// `reached=0` (a view scroll, a
     /// selection, a composition): the fold reads it as no answer to waiting
     /// mail, and the latch stays for the input that does reach the program.
-    /// THE LATCH'S MARK ALONE SAYS SO (phase 6, 6F-8, ruling U13): a mark
+    /// THE LATCH'S MARK ALONE SAYS SO: a mark
     /// no burst opened, the timeline's `human` row's none, is `why=mail`,
     /// which the log's view of the timeline filters on (the fold reads no
     /// `why=`), so every row is one mark and every other mark is a
@@ -2217,7 +2243,7 @@ impl SessionLog {
     /// `own` is the calling gesture's ([`PersonGesture`]), `None` for
     /// [`Self::reconcile_person`]'s.
     ///
-    /// ONCE PER COUNT (ruling T2): on a log bound to the person's count, what
+    /// ONCE PER COUNT: on a log bound to the person's count, what
     /// the counts moved past since the last delivery is delivered, whoever
     /// calls first — a key whose own call waited on the timeline while a
     /// reconciling entry delivered it does nothing twice — and a burst's mark
@@ -2316,7 +2342,7 @@ impl SessionLog {
                 let _ = a.tracker.person(log, at);
             }
         }
-        // The latch is the fold's (6C-5, ruling U19): the mark written below
+        // The latch is the fold's: the mark written below
         // clears it, as its record folds.
         let after_mail = reached && self.log.fold().in_since_human();
         if burst || after_mail {
@@ -2716,7 +2742,7 @@ impl crate::App {
                 .lock()
                 .unwrap_or_else(|p| p.into_inner());
             timeline.slog_mut().lift_read_fence();
-            // The readers see past the overlap now (ruling R9): the owed wake
+            // The readers see past the overlap now: the owed wake
             // rings them in this hold.
             let _ = timeline.slog_take_wake();
         }
@@ -2830,7 +2856,7 @@ impl crate::App {
 
 /// The `log` verb's usage line.
 pub(crate) const LOG_USAGE: &str = "ERR usage: log [<node>] [lvl=session|run|turn|step] [since=<seq> ep=<epoch>] [n=<count>] [kinds=<k>[,...]] [class=turn] [tier=content] [--json]\n";
-/// `log n`'s usage line (the instance's node log, session log 5J-3).
+/// `log n`'s usage line (the instance's node log).
 pub(crate) const NODE_LOG_USAGE: &str =
     "ERR usage: log n [since=<seq> ep=<epoch>] [n=<count>] [kinds=<k>[,...]] [--json]\n";
 /// The `brief` verb's usage line.
@@ -3128,7 +3154,7 @@ impl LogCopy {
         }
     }
 
-    /// The node log's records `q` asks for (`log n`, session log 5J-3): the
+    /// The node log's records `q` asks for (`log n`): the
     /// same header, `oldest=` the oldest live seq (the ring is a FIFO, whole
     /// from there). Only `since=`/`ep=`, `n=` and `kinds=` select; every
     /// record is node `n`'s.
@@ -3245,7 +3271,7 @@ pub(crate) struct BriefCopy {
     gap: Option<Gap>,
     state: aterm_slog::SessionState,
     /// The fold's heuristic mail links, which the brief prints as
-    /// `mail=@<off>~` (Phase 6 step 6C-3, ruling U5).
+    /// `mail=@<off>~`.
     links: Vec<(Node, aterm_slog::MailLink)>,
 }
 

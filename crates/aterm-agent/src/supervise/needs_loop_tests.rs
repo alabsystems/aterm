@@ -704,7 +704,7 @@ fn beside_a_self_claim_a_given_back_or_released_claim_unsets_no_needs_entry() {
     }
 }
 
-// -- the window hears the whole set (§12.2.3, slice 2b) -----------------------
+// -- the window hears the whole set (§12.2.3) -----------------------
 
 /// A need of 150 characters: whole on the window's host, cut to the entry's
 /// 64 cells on the wire.
@@ -1758,8 +1758,8 @@ fn agys_need_at(shown: &[String], prefix: &str) -> Vec<String> {
     rows
 }
 
-/// A PERSON'S PARAGRAPHS ABOVE THE ROWS READ ARE NEVER AGY'S NEED (the
-/// review of 3a4586a01e, R1): on a pane taller than the loop's 40-row tail
+/// A PERSON'S PARAGRAPHS ABOVE THE ROWS READ ARE NEVER AGY'S NEED:
+/// on a pane taller than the loop's 40-row tail
 /// whose reply under the person's message runs past it — the message's
 /// caret row, its blank row and its `NEEDS YOU:` paragraph above the tail's
 /// first row, so its read bounds nothing and the reply reads cut at the
@@ -1815,8 +1815,8 @@ fn a_persons_paragraphs_above_the_rows_read_are_never_agys_need() {
     assert!(p.needs.iter().any(|n| n == THEIRS), "{:#?}", p.needs);
 }
 
-/// A PERSON'S PARAGRAPHS SCROLLED INTO THE HISTORY ARE NEVER AGY'S NEED
-/// (the review of 3a4586a01e, T1): the person's message's caret row, its
+/// A PERSON'S PARAGRAPHS SCROLLED INTO THE HISTORY ARE NEVER AGY'S NEED:
+/// the person's message's caret row, its
 /// blank row and its `NEEDS YOU:` paragraph scrolled up out of the grid, its
 /// reply's later rows and the composer on it, the point's read of the turn
 /// whole joins the history above the grid and bounds the message there by
@@ -1878,7 +1878,7 @@ fn a_persons_paragraphs_scrolled_into_the_history_are_never_agys_need() {
 }
 
 /// A MESSAGE'S CELLS FOLD NOTHING THEY DO NOT PROVE
-/// (`Session::message_cells`; the review of 3a4586a01e, T2): on agy's
+/// (`Session::message_cells`): on agy's
 /// measured screen, the message's blank rows are taken out only where the
 /// caret row's cell reads agy's caret, every blank row taken out reads a
 /// blank in its style, and a plain blank row under them ends the message —

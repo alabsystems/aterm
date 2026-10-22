@@ -914,7 +914,7 @@ pub(crate) fn resync_forced_chrome_palette() -> bool {
 
 /// How far ONE wheel notch travels, per the user's Windows mouse settings: the
 /// platform-neutral [`crate::input::WheelNotch`], so Windows' wheel rule runs on
-/// every host (`input::WheelPlatform`, session log phase 6, 6A-4).
+/// every host (`input::WheelPlatform`).
 pub(crate) use crate::input::WheelNotch;
 
 /// Interpret a raw `SPI_GETWHEELSCROLLLINES` value. `0` is legal and means "wheel

@@ -239,11 +239,11 @@ pub trait Timeline {
 /// WHAT A FABRIC RECORD SAYS, TYPED, for the session log's mark beside it
 /// ([`FabricSession::record_fact`]), so nothing parses a timeline payload
 /// back: ids, words and offsets — never a body. Every field of the record's
-/// row is the fact's (session log phase 6, 6F-5 and 6F-6), so the mark beside
+/// row is the fact's (6F-5 and 6F-6), so the mark beside
 /// it reads the row's whole payload: a topic's name and its `since=` token,
 /// an advisory's or a hold's reason are the record's too, and the session
 /// log holds each at its content tier alone, beside a fingerprint where one
-/// names it (ruling U11): never journaled, carried or published. A post's
+/// names it: never journaled, carried or published. A post's
 /// relay hops and its caller's key are host tier: never on the bus.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FabricFact<'a> {
@@ -322,7 +322,7 @@ pub enum FabricFact<'a> {
         generation: u64,
     },
     /// A parked `inbox get @<off>` asked the bridge for the record at `off`
-    /// (the `fetch` row the bridge drains; 6F-5, ruling U15).
+    /// (the `fetch` row the bridge drains).
     Fetch { off: u64 },
 }
 
@@ -1341,7 +1341,7 @@ pub struct Inbox {
     /// `bus_head` that the broker's retention still keeps is on its log
     /// whether or not the ring still holds it, so `inbox get @<off>` can fetch
     /// it, and one retention gave up answers `ERR retained-from=<floor>`
-    /// (astream's R4, session log Phase 6 step 6E-2); the offsets in between
+    /// (astream's R4); the offsets in between
     /// are the whole fleet's, and most are other lanes' (`ERR no such
     /// record`). `None` until the first delivery.
     oldest_on_bus: Option<u64>,
@@ -1377,7 +1377,7 @@ pub struct Inbox {
     /// at zero under the same sid, so a retirement left unanswered keeps the
     /// bridge's durable sequence pin for an id that successor hands out again,
     /// and its post (or receipt) with that id is deduplicated into the old
-    /// record (round seven, finding 28). For that pairing the retirement is
+    /// record. For that pairing the retirement is
     /// answered, as every earlier build answered it.
     retirements_fenced: bool,
     /// The `inbox get @<off>` reads parked for the bridge (`Pending`, listed on
@@ -1504,8 +1504,8 @@ fn owe_receipt(
     }
 }
 
-/// THE MAILBOX A SEAMLESS UPDATE CARRIES beside the topics and the hold (round
-/// seven of the update audit, findings 6, 8 and 28): the three per-session id
+/// THE MAILBOX A SEAMLESS UPDATE CARRIES beside the topics and the hold:
+/// the three per-session id
 /// counters, every post still waiting for a bridge, and every receipt still
 /// owed — on the session's handoff record (`SessionRecord::fabric`), put back
 /// by [`SessionFabric::seed_carry`] before the adopted session is registered.
@@ -1699,8 +1699,7 @@ const CARRY_INT_MAX: u64 = i64::MAX as u64;
 /// park's draw and its `_exit` ([`SessionFabric::handoff_carry`]). The bridge
 /// keeps delivering in that overlap — a peer's post, a topic broadcast, a
 /// refill — and each row takes an id; the successor counts on from above the
-/// reserve, so no id is ever handed to two rows (round seven's review of group
-/// J, item 2).
+/// reserve, so no id is ever handed to two rows.
 ///
 /// WHAT REACHES THE SUCCESSOR AGAIN IS EVERY ROW ITS AGENT HAS NOT HANDLED.
 /// The ring is not carried: the successor's bridge refills each session's
@@ -1709,8 +1708,8 @@ const CARRY_INT_MAX: u64 = i64::MAX as u64;
 /// addressed row taken in the overlap is listed there again under an id of
 /// its own, and an `inbox seen <old id>` there names no row rather than a
 /// wrong one. A BROADCAST comes back the same way from a bridge that refills
-/// them (`hello … refill=in,say`, [`InboxRow::refill`]; round seven's review
-/// of group J, open problem 201): the bridge moves the topic cursor past a
+/// them (`hello … refill=in,say`, [`InboxRow::refill`]; open problem 201):
+/// the bridge moves the topic cursor past a
 /// broadcast on the `OK`, but first writes down the topic's REFILL FLOOR —
 /// the lowest offset the ring took and `inbox seen` has not passed — and the
 /// successor's bridge rewinds the cursor to it and offers the stretch again,
@@ -1774,8 +1773,8 @@ impl FabricCarry {
     }
 
     /// GIVE UP THE ROWS, KEEP THE COUNTERS — what the manifest writer does
-    /// when the manifest is over its cap with nothing else optional left
-    /// (round seven's review, item 1): every carried post is named in
+    /// when the manifest is over its cap with nothing else optional left:
+    /// every carried post is named in
     /// `uncarried` instead (the successor retires it dead, `not-carried`),
     /// every receipt is counted in `receipts_uncarried`. The id counters stay,
     /// and so do the loss counts (`dropped`, `broadcasts_uncarried`,
@@ -1844,8 +1843,8 @@ impl FabricCarry {
     }
 }
 
-/// THE FABRIC A PTY KEEPER RECOVERY CARRIES (the fabric audit's fourth round,
-/// findings 2-5): what a session's keeper META says of its fabric beside the
+/// THE FABRIC A PTY KEEPER RECOVERY CARRIES (the fabric audit's fourth round):
+/// what a session's keeper META says of its fabric beside the
 /// screen's scalars ([`SessionFabric::keeper_carry`],
 /// `seamless::keeper_meta_of`), read back by `seamless::recovered_fabric`
 /// into the [`FabricCarry`], topics and hold `spawn::seed_adopted_fabric`
@@ -2427,8 +2426,8 @@ impl SessionFabric {
     /// The fenced stretch is the successor's activation, the Commit's
     /// answers, the identity markers, the harness suspend and one pipe write —
     /// milliseconds — and, when those answers took real time, one more
-    /// input-dispatch fence the Commit holds its claim through (round eight of
-    /// the update audit, #18): up to the drain gate's deadline
+    /// input-dispatch fence the Commit holds its claim through (#18):
+    /// up to the drain gate's deadline
     /// (`HANDOFF_INPUT_DRAIN_DEADLINE`, 3 s), across turns of the main
     /// thread's run loop. This is the bound for a Commit that is stuck, so a
     /// control connection never waits on one for good. The main thread never
@@ -2665,8 +2664,8 @@ impl SessionFabric {
         *set = topics.into_iter().collect();
     }
 
-    /// Whether broker offset `off` names mail THIS session holds (phase 3A
-    /// ruling R7, what `send|turn cause=@<off>` may name): a row of its inbox
+    /// Whether broker offset `off` names mail THIS session holds (what `send|turn cause=@<off>` may name):
+    /// a row of its inbox
     /// ring, an offset its dedup set remembers delivering, or the offset a
     /// post of its own landed at. Never an offset of the fleet's lane merely
     /// below `bus_head` (other sessions' mail): an answer about one of those
@@ -2759,8 +2758,8 @@ impl SessionFabric {
 
     /// The one sum [`Self::carry_serial`] and [`Self::fence_hold`] return.
     ///
-    /// The inbox row id is NOT in it (round seven's review of group J, item
-    /// 2): mail from outside this desk arriving in the overlap would revoke
+    /// The inbox row id is NOT in it:
+    /// mail from outside this desk arriving in the overlap would revoke
     /// every attempt. Ids are kept apart by [`INBOX_ID_RESERVE`] instead, and
     /// only a process that outruns it stands down
     /// ([`Self::past_handoff_ceiling`]).
@@ -2789,8 +2788,8 @@ impl SessionFabric {
     ///
     /// * a row that would be numbered past the manifest's carried id
     ///   ([`Inbox::msg_id_ceiling`]) — the successor hands that id out too;
-    /// * ANY BROADCAST (`topic=`), whatever its id (round seven's review of
-    ///   group J, open problem 201). The bridge refills a relaunched session's
+    /// * ANY BROADCAST (`topic=`), whatever its id (open problem 201).
+    ///   The bridge refills a relaunched session's
     ///   ADDRESSED lane from its refill floor ([`addressed_floor`]), but it
     ///   moves a topic's cursor past a broadcast on the `OK` and resumes the
     ///   successor from there, so a broadcast answered under the fence would
@@ -2913,7 +2912,7 @@ impl SessionFabric {
     /// Commit's fence stands — it has read the serial and is on its way to
     /// `_exit` — this waits ([`Self::wait_unfenced`]), so the update lands with
     /// the reset unanswered, never answered `OK` and then undone by the
-    /// successor's restore (the review of handoff finding 2).
+    /// successor's restore.
     ///
     /// AFTER THE RESET, NEVER BEFORE: a park reads the serial before it takes
     /// the carry, so a move it read is a reset already on the engine, in that
@@ -3539,8 +3538,8 @@ struct LinkReport {
     /// grammar and its build. `None` for a bridge from before the handshake,
     /// and before the first `hello` of a fresh attach.
     hello: Option<BridgeHello>,
-    /// THE BUS MIRROR as THIS incarnation last reported it (`link mirror`,
-    /// session log phase 4): `None` before any report, and always for a
+    /// THE BUS MIRROR as THIS incarnation last reported it (`link mirror`):
+    /// `None` before any report, and always for a
     /// bridge whose `hello` did not ask for the mirror.
     mirror: Option<MirrorReport>,
     /// How many of THIS incarnation's bridge-only lines this endpoint answered
@@ -3556,9 +3555,8 @@ struct BridgeHello {
     lane: u32,
     build: Option<String>,
     refills_broadcasts: bool,
-    /// What it said of the session-log mirror (`log=`, session log phase 4):
-    /// `turns` is acknowledged in the answer only when the hello was recorded
-    /// (ruling Q10).
+    /// What it said of the session-log mirror (`log=`):
+    /// `turns` is acknowledged in the answer only when the hello was recorded.
     log: HelloLog,
 }
 
@@ -3567,8 +3565,8 @@ struct BridgeHello {
 enum HelloLog {
     /// No `log=`, or a word this endpoint does not read: no mirror.
     Off,
-    /// `log=auto` (`[fabric] log = "auto"`, the default, session log Phase 6
-    /// step 6E-3): the bridge mirrors once it has attached to a broker that
+    /// `log=auto` (`[fabric] log = "auto"`, the default):
+    /// the bridge mirrors once it has attached to a broker that
     /// retains its node's `ev` faces, and says `hello` again with `log=turns`
     /// then; until it does it asks for nothing, and over a broker that
     /// retains nothing it reports `link mirror unretained`.
@@ -3579,13 +3577,13 @@ enum HelloLog {
 
 /// The bus mirror's state as the bridge reported it: `on`, `stopped` (a
 /// definite refusal that is not the subject budget: the mirror stops for that
-/// bridge's life, its pin kept for a later one, ruling Q10), `capped` (the
-/// node's total of mirrored bytes reached on a broker that retains nothing,
-/// ruling Q13), `budget` (the node's bytes in a retaining broker's window
+/// bridge's life, its pin kept for a later one), `capped` (the
+/// node's total of mirrored bytes reached on a broker that retains nothing),
+/// `budget` (the node's bytes in a retaining broker's window
 /// at their budget: the mirror waits, and goes on once the broker gives the
-/// oldest up, session log Phase 6 step 6E-2, ruling U41) or `unretained` (an
+/// oldest up) or `unretained` (an
 /// `auto` bridge over a broker that retains none of its `ev` faces: the
-/// mirror does not run, step 6E-3), with a reason token.
+/// mirror does not run), with a reason token.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct MirrorReport {
     state: &'static str,
@@ -3740,8 +3738,8 @@ pub enum LinkSaid {
     Lost,
 }
 
-/// One STORED transition of the link: the instance node log's `link state=`
-/// (session log 5J-2, ruling T27). The node log is aterm-gui's and this crate
+/// One STORED transition of the link: the instance node log's `link state=`.
+/// The node log is aterm-gui's and this crate
 /// has no aterm-slog dependency, so a transition reaches it through
 /// [`on_link_moved`]'s hook. Only stored states move: the derived `stale`
 /// ([`fabric_state`]) has no event to report it at.
@@ -4490,9 +4488,9 @@ pub fn cmd_hello(rest: &str, generation: Option<BridgeGeneration>) -> String {
     let mut log = HelloLog::Off;
     for tok in rest.split_whitespace() {
         if let Some(v) = kv(tok, "log") {
-            // THE BUS MIRROR (session log phase 4): `log=turns` asks this
+            // THE BUS MIRROR: `log=turns` asks this
             // endpoint to serve `log-take`/`log-landed`; `log=auto` asks for
-            // nothing yet (step 6E-3); any other word is read past, as any
+            // nothing yet; any other word is read past, as any
             // other `key=value` is.
             log = match v {
                 "turns" => HelloLog::Turns,
@@ -4556,7 +4554,7 @@ pub fn cmd_hello(rest: &str, generation: Option<BridgeGeneration>) -> String {
             aterm_types::control_verbs::BRIDGE_LANE
         );
     }
-    // Only a recorded hello is told its mirror is served (ruling Q10): a ghost
+    // Only a recorded hello is told its mirror is served: a ghost
     // lane's `OK stale=1` above never says it.
     if log == HelloLog::Turns {
         format!("OK {answer} log=turns\n")
@@ -4567,7 +4565,7 @@ pub fn cmd_hello(rest: &str, generation: Option<BridgeGeneration>) -> String {
 
 /// Whether `generation` is the bridge incarnation that owns the link: the
 /// gate every bridge-only line that moves state passes (`link`, `hello`, and
-/// the bus mirror's `log-take`/`log-landed`, ruling Q10). A ghost lane's line
+/// the bus mirror's `log-take`/`log-landed`). A ghost lane's line
 /// is answered `OK stale=1` and changes nothing.
 #[must_use]
 pub fn lane_owns(generation: Option<BridgeGeneration>) -> bool {
@@ -4610,8 +4608,8 @@ pub fn bridge_mirrors_logs() -> bool {
 /// store's `session_log_mirror::Shared::served` keeps): `Some(true)` for a
 /// recorded `hello … log=turns`, `Some(false)` for one without `log=` and for
 /// an `auto` one whose bridge then reported `link mirror unretained`, and
-/// `None` for an `auto` hello not yet judged by an attach (session log Phase
-/// 6 step 6E-3), which leaves the store's word as it was: an `auto` bridge's
+/// `None` for an `auto` hello not yet judged by an attach,
+/// which leaves the store's word as it was: an `auto` bridge's
 /// restart is the window the word is sticky across, as a `turns` one's is.
 #[must_use]
 pub fn bridge_mirror_word() -> Option<bool> {
@@ -4636,7 +4634,7 @@ pub fn bridge_mirror_word() -> Option<bool> {
 /// said `log=turns` or `log=auto`, and nothing otherwise, so a bridge with
 /// `[fabric] log = "off"` leaves the line the bytes it was. An `auto` bridge
 /// over a broker that retains nothing says `bridge_log=auto
-/// mirror=unretained` (session log Phase 6 step 6E-3); over one that retains,
+/// mirror=unretained`; over one that retains,
 /// its second `hello` makes it `turns`.
 #[must_use]
 pub fn fabric_mirror_facts() -> String {
@@ -6589,7 +6587,7 @@ fn deliver_fetched(ctx: &dyn FabricSession, toks: &[&str]) -> String {
             err = Some(v.to_string());
         } else if let Some(v) = kv(tok, "floor") {
             // `err=retained`'s floor: what the broker keeps of this session's
-            // lane starts there (session log Phase 6 step 6E-2).
+            // lane starts there.
             match v.parse() {
                 Ok(n) => floor = Some(n),
                 Err(_) => return DELIVER_USAGE.to_string(),
@@ -7325,8 +7323,8 @@ fn deliver_row(ctx: &dyn FabricSession, toks: &[&str], wake: &dyn Fn()) -> Strin
         return DELIVER_USAGE.to_string();
     };
 
-    // A ROW IN THE UPDATE'S OVERLAP IS NUMBERED BELOW THE SUCCESSOR'S IDS
-    // (round seven's review of group J, item 2): the manifest carried the last
+    // A ROW IN THE UPDATE'S OVERLAP IS NUMBERED BELOW THE SUCCESSOR'S IDS:
+    // the manifest carried the last
     // id plus [`INBOX_ID_RESERVE`], so a delivery between the park's draw and
     // the `_exit` lands here as ever. An ADDRESSED row reaches the successor
     // again — its bridge refills the session's addressed lane from the floor
@@ -7594,8 +7592,8 @@ pub fn cmd_topic(ctx: &dyn FabricSession, rest: &str) -> String {
             if words.next().is_some() {
                 return TOPIC_USAGE.to_string();
             }
-            // A COMMITTING UPDATE HOLDS THE CHANGE BACK (round eight of the
-            // update audit, finding 751): the successor carries the set the
+            // A COMMITTING UPDATE HOLDS THE CHANGE BACK:
+            // the successor carries the set the
             // park drew, and the Commit compares it again under this fence
             // (`App::carried_claims_held`), so a change that took the inbox
             // guard first stands that Commit down, and one after it waits.
@@ -7812,8 +7810,8 @@ fn valid_since(s: &str) -> bool {
 const TOPIC_USAGE: &str = "ERR usage: topic add <t> [since=head|@<off>] | topic drop <t> | \
                            topic ls (topic is [a-z0-9][a-z0-9._-]{0,31})\n";
 
-/// The most broadcast topics one session opts into (round eight of the update
-/// audit, U54). Topics are named channels a session asks for, and nothing else
+/// The most broadcast topics one session opts into.
+/// Topics are named channels a session asks for, and nothing else
 /// bounded how many: every opt-in rides the session's handoff record
 /// (`SessionRecord::topics`), which the writer may not shed — a topic is
 /// consent, and dropping one silently would stop broadcasts the session asked
@@ -8145,7 +8143,7 @@ fn inbox_get_at_within(ctx: &dyn FabricSession, off: u64, wait: std::time::Durat
             // rings the session's watchers as it lands, before the park. The
             // roster round still finds a lost event.
             // The session log's `mail-fetch off=` mark rides the same
-            // record (6F-5, ruling U15: the bridge drains these rows).
+            // record (the bridge drains these rows).
             let _ = ctx.record_fact("fetch", format!("off={off}"), FabricFact::Fetch { off });
         }
     }
@@ -8203,7 +8201,7 @@ fn unfetched(inbox: &Inbox, off: u64, why: String) -> String {
 /// The reply a failed fetch gives: `no-record` is the one answer that is the
 /// same for "another session's" and "nothing there", on purpose. Below what
 /// the broker's retention keeps of this session's lane it is that floor,
-/// `ERR retained-from=<floor>` (session log Phase 6 step 6E-2): the floor is
+/// `ERR retained-from=<floor>`: the floor is
 /// this lane's own, so it says nothing of whose record `off` was.
 fn fetch_failure(why: &str, off: u64) -> String {
     if why == "no-record" {
@@ -9065,7 +9063,7 @@ pub fn cmd_await_inbox(ctx: &dyn FabricSession, args: &[&str], timeout_ms: u64) 
     let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
     let mut guard = ctx.fabric().lock();
     // AN ANCHOR ABOVE EVERY ID THIS SESSION HAS HANDED OUT names no row of
-    // this process's (round seven of the update audit, finding 8): nothing
+    // this process's: nothing
     // here can have told a caller an id it has not minted, so it was taken
     // from another process — a producer before the id carry, whose successor
     // counts from 1 again. Parked, it waited for a count the ring may never
@@ -10141,8 +10139,8 @@ mod inbox_hold {
         });
     }
 
-    /// THE BUS MIRROR IS ACKNOWLEDGED ONLY TO A RECORDED HELLO (session log
-    /// phase 4, ruling Q10): `log=turns` is echoed to the lane that owns the
+    /// THE BUS MIRROR IS ACKNOWLEDGED ONLY TO A RECORDED HELLO:
+    /// `log=turns` is echoed to the lane that owns the
     /// link and recorded there; a ghost lane's hello is answered `OK stale=1`
     /// without it and records nothing; `fabric status`'s tail is empty until
     /// the owning hello asked, and `link mirror` is the owner's alone. Its
@@ -10163,7 +10161,7 @@ mod inbox_hold {
             assert!(bridge_mirrors_logs());
             assert_eq!(fabric_mirror_facts(), " bridge_log=turns mirror=starting");
             // Lane 5: the node at its window budget on a retaining broker, a
-            // wait the next `on` ends (session log Phase 6 step 6E-2).
+            // wait the next `on` ends.
             assert_eq!(cmd_link(&store, "mirror budget", Some(generation)), "OK\n");
             assert_eq!(fabric_mirror_facts(), " bridge_log=turns mirror=budget");
             assert_eq!(
@@ -10196,8 +10194,8 @@ mod inbox_hold {
         });
     }
 
-    /// AN `auto` HELLO ASKS FOR NOTHING AND IS SAID (session log Phase 6 step
-    /// 6E-3): `log=auto` is recorded, never acknowledged with `log=turns`, so
+    /// AN `auto` HELLO ASKS FOR NOTHING AND IS SAID:
+    /// `log=auto` is recorded, never acknowledged with `log=turns`, so
     /// nothing serves `log-take` to it; `fabric status` says `bridge_log=auto`
     /// and, once the bridge reports a broker that retains nothing,
     /// `mirror=unretained`; the second hello an attach to a retaining broker
@@ -10553,7 +10551,7 @@ mod inbox_hold {
         assert!(cmd_inbox(&ctx, "--peek").contains(" seen=0 "));
     }
 
-    /// THE SESSION LOG'S ONE TYPED HOOK (session log phase 3B, addendum A14):
+    /// THE SESSION LOG'S ONE TYPED HOOK:
     /// each fabric site hands its record's facts — ids, words and offsets,
     /// never a body — to `record_fact` in the record's own call. A bridge
     /// verb's wake follows exactly when the hook owes one, once per record;
@@ -11491,8 +11489,8 @@ mod inbox_hold {
         });
     }
 
-    /// THE NODE LOG HEARS EVERY STORED LINK TRANSITION, ONCE, IN ORDER (session
-    /// log 5J-2, ruling T27): an attach (`stalled`, a new incarnation), the
+    /// THE NODE LOG HEARS EVERY STORED LINK TRANSITION, ONCE, IN ORDER:
+    /// an attach (`stalled`, a new incarnation), the
     /// bridge's report moving the state, its evidence moving it, and the
     /// owner's loss. A report that stores the state it found, a ghost's report
     /// and a second loss move nothing, and nothing is heard of them.
@@ -11541,8 +11539,8 @@ mod inbox_hold {
         });
     }
 
-    /// A BRIDGE THAT NEVER REPORTS ITS LINK IS READ BY WHAT IT DOES (the
-    /// review's finding 1). Both lanes of a 0.85 bridge attach and
+    /// A BRIDGE THAT NEVER REPORTS ITS LINK IS READ BY WHAT IT DOES.
+    /// Both lanes of a 0.85 bridge attach and
     /// no `link` record ever comes; its first delivery moves the endpoint to
     /// `connected` with no round trip and the delivery as the ack, and a
     /// `post --wait` under `stalled reason=starting` PARKS (here: runs its
@@ -13093,8 +13091,8 @@ mod inbox_hold {
                 reader.join().expect("the reader finished"),
                 "ERR no such record off=7\n"
             );
-            // Below what the broker's retention keeps of this session's lane
-            // (session log Phase 6 step 6E-2): its floor, never `no such
+            // Below what the broker's retention keeps of this session's lane:
+            // its floor, never `no such
             // record`. NEGATIVE CONTROL, run: `floor=` read past.
             let reader = {
                 let ctx = ctx.clone();

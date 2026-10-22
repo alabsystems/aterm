@@ -26,7 +26,8 @@
 //!
 //! The 0.2.108 CLI is looked for on PATH, beside rustup, in the checkout's
 //! `target/tooling` and in the machine's `tooling` ([`host_tooling`]), where
-//! a full `ship provision` installs it for every checkout. A machine without
+//! `targo --unverified verify provision --record` lays it for every checkout
+//! (adopting a copy already there at the pin). A machine without
 //! node, the stable wasm32 std or the CLI skips the row with the fix.
 //! Progress goes to the caller's log, never the terminal.
 
@@ -44,7 +45,7 @@ use crate::perf::{LaneRun, Status};
 /// web modules left (aterm-wasm at WP.7, aterm-gpu-web at WP.8). This row is
 /// the only user of the CLI: no module aterm ships is bound with it. The pin is
 /// the `wasm-bindgen` row of `aterm_uds::host::TOOLS` (a `When::Record` row,
-/// which S7's provisioning verb will provide), which the resolver reads too.
+/// which `verify provision --record` provides), which the resolver reads too.
 pub const BINDGEN: &str = aterm_uds::host::pinned_version("wasm-bindgen");
 
 /// The machine-wide tooling directory's name in aterm's user cache.
@@ -53,8 +54,8 @@ const TOOLING: &str = aterm_uds::host::TOOLING;
 /// The machine-wide tooling directory under `home` and `xdg_cache`: aterm's
 /// `tooling` in the user's cache ([`crate::user_cache`]: on macOS
 /// `~/Library/Caches/aterm/tooling.noindex`, elsewhere
-/// `$XDG_CACHE_HOME/aterm/tooling`, else `~/.cache/aterm/tooling`). A full
-/// `ship provision` installs the CLI here ([`bindgen_root`]), and this row
+/// `$XDG_CACHE_HOME/aterm/tooling`, else `~/.cache/aterm/tooling`).
+/// `verify provision --record` lays the CLI here ([`bindgen_root`]), and this row
 /// reads it from every checkout and worktree; `None` where no home names one.
 #[must_use]
 pub fn tooling(home: Option<&Path>, xdg_cache: Option<&Path>) -> Option<PathBuf> {
@@ -76,8 +77,9 @@ pub fn bindgen_root(tooling: &Path) -> PathBuf {
 }
 
 /// `targo --unverified`'s arguments that lay the CLI at [`BINDGEN`], `--locked`
-/// to its own lockfile, ahead of `--root` and a [`bindgen_root`]: the skip's
-/// fix and `ship provision` both run it. `--force` because each runs it only
+/// to its own lockfile, ahead of `--root` and a [`bindgen_root`]: `verify
+/// provision --record` runs it into a scratch root it places whole, and the skip
+/// names it where no `$HOME` names the machine's tooling. `--force` because each runs it only
 /// where the root holds no wasm-bindgen that answers the pin, and cargo
 /// replaces neither one its records there do not know (laid by hand: it
 /// refuses) nor one they call current (one that stopped answering: it says
@@ -142,8 +144,8 @@ fn find_bindgen(
 }
 
 /// The wasm-bindgen CLI at exactly [`BINDGEN`] ([`find_bindgen`], with
-/// `rustup`'s directory appended to PATH), or the skip naming its install into
-/// the machine-wide `tooling`, where `ship provision` puts it.
+/// `rustup`'s directory appended to PATH), or the skip naming `verify provision
+/// --record`, which lays it in the machine-wide `tooling`.
 fn bindgen_at(root: &Path, rustup: &Path) -> Result<PathBuf, LaneRun> {
     let mut path_dirs: Vec<PathBuf> = std::env::var_os("PATH")
         .map(|p| std::env::split_paths(&p).collect())
@@ -157,9 +159,9 @@ fn bindgen_at(root: &Path, rustup: &Path) -> Result<PathBuf, LaneRun> {
         .ok_or_else(|| bindgen_skip(root, tooling.as_deref()))
 }
 
-/// The skip for a machine without the CLI: its install, by hand, into the
-/// machine-wide `tooling`, which a full `ship provision` runs itself; into the
-/// checkout's `target/tooling` where no `$HOME` names the machine's.
+/// The skip for a machine without the CLI: `verify provision --record`, which
+/// lays it in the machine-wide `tooling`; where no `$HOME` names that, its
+/// install into the checkout's `target/tooling`.
 fn bindgen_skip(root: &Path, tooling: Option<&Path>) -> LaneRun {
     let install = |into: &Path| {
         format!(
@@ -174,10 +176,7 @@ fn bindgen_skip(root: &Path, tooling: Option<&Path>) -> LaneRun {
                 "wasm-bindgen {BINDGEN} is not on PATH, beside rustup, in target/tooling or in {}",
                 t.display()
             ),
-            format!(
-                "{} (a full `targo --unverified ship provision` installs it there)",
-                install(t)
-            ),
+            "targo --unverified verify provision --record",
         ),
         None => LaneRun::skip(
             format!(
@@ -709,9 +708,10 @@ mod tests {
             }
             _ => false,
         };
-        assert!(installs_into(
-            bindgen_skip(&checkout, Some(&machine)),
-            &machine
+        // Where the machine names its tooling, the fix is the verb that lays it there.
+        assert!(matches!(
+            bindgen_skip(&checkout, Some(&machine)).status,
+            Status::Skip { fix, .. } if fix == "targo --unverified verify provision --record"
         ));
         assert!(installs_into(
             bindgen_skip(&checkout, None),

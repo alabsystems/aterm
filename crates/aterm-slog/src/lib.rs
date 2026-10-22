@@ -76,8 +76,9 @@ pub use log::{
     CarryError, CarryOut, CarrySnapshot, CarryStats, Close, Cursor, Dur, EvictClass, Gap, GapWhy,
     IdCounters, JOURNAL_IMAGE_MAX_RECORDS, JournalImage, Limits, Log, MAX_BYTES, MAX_HOLES,
     MAX_OPEN, MAX_RECORDS, Mark, NodeView, Notify, Open, OpenEntry, PROGRAM_SHARE_MAX,
-    PreparedCarry, Read, Refused, Rollup, SEQ_LIMIT, SharedRead, closes_over_half, evict_class,
-    log_owned, low_water, mark_quota, natural_parent, over_limits, program_share,
+    PreparedCarry, ROW_SPAN_MAX, Read, Refused, Rollup, Row, RowRule, SEQ_LIMIT, SharedRead,
+    closes_over_half, evict_class, log_owned, low_water, mark_quota, natural_parent, over_limits,
+    program_share, row_floor,
 };
 pub use node_log::{NODE_LOG_RECORDS, NODE_MARKS, NodeLog};
 pub use rec::{Rec, Stamp};

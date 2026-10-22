@@ -126,11 +126,11 @@ pub fn for_each_ngram_bucket(text: &str, mut f: impl FnMut(usize)) -> usize {
     const ORDER_SALT: u64 = 0x9e37_79b9_7f4a_7c15;
 
     #[inline]
-    fn fold(h: u64, cb: &[u8; 4]) -> u64 {
+    const fn fold(h: u64, cb: &[u8; 4]) -> u64 {
         fnv1a_64_extend(h, cb)
     }
     #[inline]
-    fn bucket(h: u64) -> usize {
+    const fn bucket(h: u64) -> usize {
         (h as usize) & (BUCKETS - 1)
     }
 
@@ -226,11 +226,13 @@ const HEADER_LEN: usize = 8 + 16 + 12;
 const ASSET_LEN: usize = HEADER_LEN + EMB_LEN + W1_LEN + W2_LEN + (HIDDEN + TONE_COUNT) * 4 + 4;
 
 #[inline]
-fn fnv1a32(bytes: &[u8]) -> u32 {
+const fn fnv1a32(bytes: &[u8]) -> u32 {
     let mut h: u32 = 0x811c_9dc5;
-    for &b in bytes {
-        h ^= u32::from(b);
+    let mut i = 0;
+    while i < bytes.len() {
+        h ^= bytes[i] as u32;
         h = h.wrapping_mul(0x0100_0193);
+        i += 1;
     }
     h
 }

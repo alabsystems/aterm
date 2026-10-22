@@ -2,7 +2,7 @@
 // Copyright 2026 Andrew Yates
 
 //! LANDED IS LANDED (`docs/DESIGN-harness-autopilot-2026-10-15.md` §12.4.1 and
-//! §12.4.3 item 1; slice 4a): every word the window has for a landing says
+//! §12.4.3 item 1): every word the window has for a landing says
 //! `landed`, seen or not. The menu bar's worker and its manager read a
 //! record's `why=landed` and keep an older build's `done`; This Mac counts a
 //! landed tab that is no worker, and an exited worker apart; a Done for you

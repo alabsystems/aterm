@@ -1446,8 +1446,8 @@ pub fn supervisor_land_liveness() -> Liveness {
 /// aterm-agent `supervise/beside.rs`). Neither moves `Term`: the stall alone
 /// decides, beside a self-claim as for every agent — a TUI that stopped
 /// reading its input mid-turn keeps a record that says `busy` for ever, so
-/// a remedy that waited on its rest would never come (amended 2026-10-16,
-/// the review's finding 2; `withheld` a remedy so held back). `Buggy = 1`
+/// a remedy that waited on its rest would never come (amended 2026-10-16; `withheld` a remedy so held back).
+/// `Buggy = 1`
 /// adds four dead actions, each caught alone by an invariant of its own: a
 /// kill a minute after the term (`Kill`), a term blind to a person's hand
 /// (`TermBlind`), one that forgets it already signalled (`TermAgain`), and

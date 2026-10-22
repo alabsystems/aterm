@@ -3641,15 +3641,13 @@ impl SettingsViewState {
         })
     }
 
-    /// Book a config request with the exact matching drafts it owns now.
-    fn pend_config(
-        &mut self,
-        operation: OperationId,
-        patch: ConfigPatch,
-        follows: Vec<OperationId>,
-        shown_before: BTreeMap<String, Option<String>>,
-    ) {
-        let submitted = patch
+    /// The exact drafts matching a request's values, before default elision
+    /// can turn a submitted number into a key removal.
+    fn matching_config_inputs(
+        &self,
+        patch: &ConfigPatch,
+    ) -> Vec<(String, crate::native_text_input::TextInputState)> {
+        patch
             .edits
             .iter()
             .filter_map(|edit| {
@@ -3659,7 +3657,18 @@ impl SettingsViewState {
                     .filter(|input| input.value().trim() == text)
                     .map(|input| (edit.key.clone(), input.clone()))
             })
-            .collect();
+            .collect()
+    }
+
+    /// Book a config request with the exact matching drafts it submitted.
+    fn pend_config(
+        &mut self,
+        operation: OperationId,
+        patch: ConfigPatch,
+        submitted: Vec<(String, crate::native_text_input::TextInputState)>,
+        follows: Vec<OperationId>,
+        shown_before: BTreeMap<String, Option<String>>,
+    ) {
         self.pending.insert(
             operation,
             PendingAction::Config(PendingConfig {
@@ -4994,6 +5003,7 @@ impl SettingsApp {
         cx: &mut UpdateCx<'_>,
         mut patch: ConfigPatch,
     ) -> Option<OperationId> {
+        let submitted = view.matching_config_inputs(&patch);
         let base = view.projected_config_text();
         let edits = patch
             .edits
@@ -5018,7 +5028,7 @@ impl SettingsApp {
         if writes_nothing && patch.edits.iter().all(edit_changes_nothing) {
             return None;
         }
-        Some(Self::send_config(view, cx, patch))
+        Some(Self::send_config_with_inputs(view, cx, patch, submitted))
     }
 
     /// THE PAGE'S ONE WAY TO SEND A WRITE. A press is never refused because
@@ -5035,6 +5045,17 @@ impl SettingsApp {
         view: &mut SettingsViewState,
         cx: &mut UpdateCx<'_>,
         patch: ConfigPatch,
+    ) -> OperationId {
+        let submitted = view.matching_config_inputs(&patch);
+        Self::send_config_with_inputs(view, cx, patch, submitted)
+    }
+
+    /// Send the normalized patch while retaining its pre-normalization drafts.
+    fn send_config_with_inputs(
+        view: &mut SettingsViewState,
+        cx: &mut UpdateCx<'_>,
+        patch: ConfigPatch,
+        submitted: Vec<(String, crate::native_text_input::TextInputState)>,
     ) -> OperationId {
         let follows = {
             let keys: BTreeSet<&str> = patch.edits.iter().map(|edit| edit.key.as_str()).collect();
@@ -5070,7 +5091,7 @@ impl SettingsApp {
             reapplies: edits.clone(),
         });
         view.next_undo_seated = false;
-        view.pend_config(operation, patch, follows, shown_before);
+        view.pend_config(operation, patch, submitted, follows, shown_before);
         view.lay_over(&edits);
         operation
     }
@@ -6714,8 +6735,8 @@ impl SettingsApp {
                 EventResult::Handled
             }
             MACOS_ACCESS_DEBUGGER_ON | MACOS_ACCESS_DEBUGGER_OFF => {
-                // THE OWNER'S DEBUGGER-ACCESS CHANGE (debugger design §3.4;
-                // owner rulings O7 and O8, 2026-09-29). The id carries the
+                // THE OWNER'S DEBUGGER-ACCESS CHANGE (debugger design §3.4).
+                // The id carries the
                 // direction. The press is taken only where the row drew its
                 // button live (`DebuggerFacts::offers`: nothing under way, the
                 // cached probe shows the precondition) — aterm's own hardening
@@ -7448,8 +7469,8 @@ impl SettingsApp {
             }
             #[cfg(any(unix, test))]
             UpdateOutcome::InstalledNeedsRelaunch { message, .. } => message,
-            // NOT "until terminal activity settles" (round eight of the update
-            // audit, U35's review): a person's press is deferred for reasons
+            // NOT "until terminal activity settles":
+            // a person's press is deferred for reasons
             // that are not activity — an installed build being replaced — and
             // nothing here knows whether the automatic lane comes back for it.
             // The fact, and its reason.
@@ -30768,7 +30789,7 @@ fn debugger_press_refusal(
 }
 
 /// Who raises [`debugger_access_alert`]: the owner's press on the Security
-/// page, or the App's once-per-Mac launch ask (owner ruling O29), whose alert
+/// page, or the App's once-per-Mac launch ask, whose alert
 /// says first that aterm asks this once on this Mac — once for each account:
 /// the record of the Macs asked lives in the account's config folder — and sends
 /// the undo to the Security page.
@@ -30800,7 +30821,7 @@ fn debugger_alert_not_hardened_bullet(
 }
 
 /// aterm's own alert before a debugger-access change (debugger design §3.4
-/// step 1; owner rulings O7, O8 and O29). A pure function of the facts, so
+/// step 1). A pure function of the facts, so
 /// what it must say is tested without an alert (no test reaches
 /// `menu::confirm_owner`): the not-hardened bullet exactly when aterm is not
 /// hardened, a measured or hedged administrator-password line by the
@@ -31061,7 +31082,7 @@ fn macos_access_reset_lines(report: &MacosAccessReset, warmup_offered: bool) -> 
 
 /// The action ids this block owns. They are the ONLY way to reach the warm-up
 /// (§3.5) and the reset and *Move to Trash* (§3.7) from Settings, and with the
-/// App's once-per-Mac launch ask (owner ruling O29; the same alert, raised by
+/// App's once-per-Mac launch ask (the same alert, raised by
 /// aterm itself and by nothing a session can send) the only ways to the owner's
 /// debugger-access change (`docs/DESIGN-macos-debugger-access-2026-09-29.md`
 /// §3.4): none is a `VERBS` row, no config key, environment variable or band
@@ -31270,7 +31291,7 @@ impl OwnerQuiet {
 /// button. It has two callers: the Security page's presses
 /// ([`SettingsViewState::owner_confirms`]) and the App's once-per-Mac
 /// debugger-access launch ask (`App::spend_debugger_offer_at_launch`, through
-/// `DebuggerChangeLane::offer`; owner ruling O29). The debugger-access change is built on it all the way down: only
+/// `DebuggerChangeLane::offer`). The debugger-access change is built on it all the way down: only
 /// `DebuggerChangeLane::begin` mints a `debugger_access::ChangeTicket`, and
 /// only from a yes; a `DevtoolsJob` — what the worker that runs
 /// `DevToolsSecurity` takes — is built only from a ticket. So no control verb,

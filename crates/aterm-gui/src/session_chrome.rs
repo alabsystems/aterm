@@ -156,11 +156,11 @@ pub(crate) struct ClauseLine {
     /// When its state began, on [`crate::turn_ledger::now_ms`]'s clock.
     pub since_ms: u64,
     /// When a shown label leaves (its `until`, on the same clock), the clause
-    /// being that label; `None` for every other row (ruling S10).
+    /// being that label; `None` for every other row.
     pub until_ms: Option<u64>,
     /// A shown label's author (`aterm_slog::Clause::by` on a label row, D6):
     /// printed after the head, outside its 48 bytes. `None` for every other
-    /// row: a need, a step, a turn or a run says no author (ruling U22).
+    /// row: a need, a step, a turn or a run says no author.
     pub by: Option<ClauseAuthor>,
 }
 
@@ -387,7 +387,7 @@ pub(crate) struct CachedChrome {
     /// switch that flipped, misses the cache.
     pub clause: Option<ClauseKey>,
     /// The clause line composed from it, served again when the timeline is
-    /// contended at the next compose (ruling S16).
+    /// contended at the next compose.
     pub clause_line: Option<ClauseLine>,
     /// The composed extension handed to the native strip.
     pub ext: TabChromeExt,
@@ -428,7 +428,7 @@ pub(crate) struct ExpiryProgress {
 /// closed menu's ages).
 ///
 /// With `[session_log] clause` on, a label the clause shows leaves at its
-/// `until` (ruling S10): the expiry is the earlier of the upgrade's term and
+/// `until`: the expiry is the earlier of the upgrade's term and
 /// that instant. Off (no clause), it is exactly the upgrade's term.
 #[must_use]
 pub(crate) fn clock_expiry_ms(composed_ms: u64, input: &SessionChromeInput) -> Option<u64> {
@@ -1039,8 +1039,8 @@ mod tests {
     /// ([`crate::turn_ledger::now_ms`]'s clock).
     const NOW: u64 = 1_000_000_000;
 
-    /// THE CLOCK MOVES A COMPOSITION ONLY BY AN UPGRADE'S WORDS (D5, the
-    /// Together run, and the review of ba16cabbe5): a timeline row carries
+    /// THE CLOCK MOVES A COMPOSITION ONLY BY AN UPGRADE'S WORDS (the
+    /// Together run): a timeline row carries
     /// its event's stamp and is aged where the menu is shown, so one
     /// composition reads `2m ago` now and `3m ago` a minute on and arms no
     /// wake; the upgrade's words read the clock, so a tab with one is
@@ -1735,7 +1735,7 @@ mod tests {
         }
     }
 
-    /// D6 (session log Phase 6 step 6B-2, ruling U22): a shown label's line
+    /// D6: a shown label's line
     /// names its author after its words, outside the head's 48 bytes, in the
     /// tooltip and in the menu's aged row: `by the harness` or `by you`. A
     /// row with no author (a need, a step, a turn, a run) names none.
@@ -1851,7 +1851,7 @@ mod tests {
         assert_eq!(compose_tab_menu(&input), compose_tab_menu(&full_input()));
     }
 
-    /// RULING S10: a shown label leaves at its `until`, so the composition's
+    /// a shown label leaves at its `until`, so the composition's
     /// expiry is the earlier of the upgrade's term and that instant, and
     /// with the switch off (no clause) it is exactly the upgrade's term —
     /// `None` for a quiet tab, never `composed + 30 s`. A step or turn

@@ -1532,15 +1532,15 @@ fn attempt_files(nonce: &str, suffix: &str) -> Vec<std::path::PathBuf> {
 /// command's exit status (2) in the status observer, and keeps the `meta set`
 /// the person gave it.
 ///
-/// AND AS THE PANE IT WAS (round six of the update audit, findings 46, 49 and
-/// 35): drawn in the successor's configured theme, not the engine's built-in
+/// AND AS THE PANE IT WAS:
+/// drawn in the successor's configured theme, not the engine's built-in
 /// colours; exited in the status observer, with the exit status its command
 /// ended with (2), not re-read from its screen as an idle prompt; and wearing
 /// the `meta set` metadata the person gave it. RED before
 /// the fix on each: the engine's default background, a phase that was not
 /// `Exited`, and no user title.
 ///
-/// AND UNDER ITS SESSION ID (round eight, finding 21): an adopted shell keeps
+/// AND UNDER ITS SESSION ID: an adopted shell keeps
 /// its sid, so `aterm ctl @<sid>` still reaches it; the held pane was minted a
 /// new one on every update. RED before the fix: the restored pane's sid was
 /// not the one it had.
@@ -2018,7 +2018,7 @@ fn a_held_exited_pane_keeps_its_screen() {
     ptys.release(app);
 }
 
-/// ROUND EIGHT, FINDING 730: A HELD PANE'S TURN LEDGER CROSSES. A pane a
+/// A HELD PANE'S TURN LEDGER CROSSES. A pane a
 /// manager drove with `turn` before its command ended keeps the records, so
 /// `history` lists them (`carried=1`) and the report reader finds them: they
 /// ride the pane's own control sidecar, read before the proof as a handed

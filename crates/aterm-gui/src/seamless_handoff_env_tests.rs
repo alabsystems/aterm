@@ -1021,7 +1021,7 @@ fn the_hint_never_reaches_the_adoption_proof() {
 
 /// A FORK-LANE SUCCESSOR MAKES ROOM FOR THE SESSIONS IT ADOPTS (
 /// U9). A successor forked by a producer that never raised its soft descriptor
-/// limit — any build before round eight's park raise, started from the Dock at
+/// limit — any build before the park raise raise, started from the Dock at
 /// launchd's 256 — inherits that limit, and each session it adopts then costs
 /// three descriptors more than the master it was handed: its reader's wake pipe
 /// and its exit witness's `kqueue` (`aterm_uds::exitwatch`). Only the launched

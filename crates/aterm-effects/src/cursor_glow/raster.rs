@@ -216,7 +216,7 @@ pub(super) const LIGHT_INK_BOLD_MAX_CHANNEL: f32 = 215.0;
 /// [`LIGHT_INK_BOLD_MAX_CHANNEL`] leaves. Channel order is preserved. Pinned by
 /// `light_ink_bold_holds_one_ink_weight_across_the_spectrum`.
 #[inline]
-pub(super) fn light_ink_bold(rgb: u32) -> u32 {
+pub(super) const fn light_ink_bold(rgb: u32) -> u32 {
     let (r, g, b) = (
         ((rgb >> 16) & 0xff) as f32,
         ((rgb >> 8) & 0xff) as f32,
@@ -232,10 +232,10 @@ pub(super) fn light_ink_bold(rgb: u32) -> u32 {
     // has zero span and no hue to saturate, so it keeps its ratios (all 1)
     // and takes the bar as a neutral grey rather than turning black.
     let span = hi - lo;
-    let pure = |c: f32| {
+    const fn pure(c: f32, lo: f32, span: f32) -> f32 {
         if span <= 1e-3 { 1.0 } else { (c - lo) / span }
-    };
-    let (pr, pg, pb) = (pure(r), pure(g), pure(b));
+    }
+    let (pr, pg, pb) = (pure(r, lo, span), pure(g, lo, span), pure(b, lo, span));
     // The pure hue's own luma, 0..1: why one scale factor cannot reach the
     // bar for red (0.21) or violet (0.13).
     let y0 = 0.2126 * pr + 0.7152 * pg + 0.0722 * pb;
@@ -251,8 +251,10 @@ pub(super) fn light_ink_bold(rgb: u32) -> u32 {
         ((1.0 - yt / vmax) / (1.0 - y0)).clamp(0.0, 1.0)
     };
     let v = (yt / (1.0 - s + s * y0)).min(vmax);
-    let ch = |c: f32| ((255.0 * v * (1.0 - s + s * c)) + 0.5).clamp(0.0, 255.0) as u32;
-    (ch(pr) << 16) | (ch(pg) << 8) | ch(pb)
+    const fn ch(v: f32, s: f32, c: f32) -> u32 {
+        ((255.0 * v * (1.0 - s + s * c)) + 0.5).clamp(0.0, 255.0) as u32
+    }
+    (ch(v, s, pr) << 16) | (ch(v, s, pg) << 8) | ch(v, s, pb)
 }
 
 /// Light-theme ink: `rgb` scaled uniformly (hue and saturation intact) until
@@ -260,18 +262,24 @@ pub(super) fn light_ink_bold(rgb: u32) -> u32 {
 /// colour already under both is returned unchanged. Pinned by
 /// `light_ink_darkens_every_band_to_one_bar`.
 #[inline]
-pub(super) fn light_ink(rgb: u32) -> u32 {
+pub(super) const fn light_ink(rgb: u32) -> u32 {
     let rgb = rgb & 0x00FF_FFFF;
     let y = luma709(rgb);
-    let hi = ((rgb >> 16) & 0xff).max((rgb >> 8) & 0xff).max(rgb & 0xff) as f32;
+    let r = (rgb >> 16) & 0xff;
+    let g = (rgb >> 8) & 0xff;
+    let b = rgb & 0xff;
+    let hi_rg = if r > g { r } else { g };
+    let hi = (if hi_rg > b { hi_rg } else { b }) as f32;
     let k = (LIGHT_INK_MAX_LUMA / y.max(1.0))
         .min(LIGHT_INK_MAX_CHANNEL / hi.max(1.0))
         .min(1.0);
     if k >= 1.0 {
         return rgb;
     }
-    let ch = |sh: u32| ((((rgb >> sh) & 0xff) as f32 * k) + 0.5) as u32;
-    (ch(16) << 16) | (ch(8) << 8) | ch(0)
+    const fn ch(rgb: u32, k: f32, sh: u32) -> u32 {
+        ((((rgb >> sh) & 0xff) as f32 * k) + 0.5) as u32
+    }
+    (ch(rgb, k, 16) << 16) | (ch(rgb, k, 8) << 8) | ch(rgb, k, 0)
 }
 
 /// The compositing role of one light-theme mark (see the one light-ink rule).
@@ -294,7 +302,7 @@ pub(crate) enum InkRole {
 impl InkRole {
     /// This role's darkening policy.
     #[inline]
-    pub(crate) fn ink(self, rgb: u32) -> u32 {
+    pub(crate) const fn ink(self, rgb: u32) -> u32 {
         match self {
             Self::Leading => light_ink_bold(rgb),
             Self::OverText => light_ink(rgb),
@@ -366,7 +374,7 @@ pub(super) const RAINBOW_END_DWELL: f32 = 0.0;
 /// nameable on a thin underline.
 #[inline]
 #[cfg(test)]
-pub(crate) fn rainbow_band_of(sweep: f32) -> u32 {
+pub(crate) const fn rainbow_band_of(sweep: f32) -> u32 {
     spectrum_snap(sweep)
 }
 
@@ -828,7 +836,7 @@ pub(super) const CLASSIC_RING_LIFE_PER_IMPACT: f32 = 0.267;
 /// How much wider a ring of impact `scale` expands: `1.0` at impact 1 (and for
 /// anything non-finite or below), `2.0` at the 3.5 cap.
 #[inline]
-pub(super) fn classic_ring_radius_factor(scale: f32) -> f32 {
+pub(super) const fn classic_ring_radius_factor(scale: f32) -> f32 {
     if !scale.is_finite() {
         return 1.0;
     }
@@ -839,7 +847,7 @@ pub(super) fn classic_ring_radius_factor(scale: f32) -> f32 {
 /// A ring's life in seconds: `base` graded by impact `scale` — `base` itself at
 /// impact 1, `base · 1.667` at the cap (0.18 s → 0.30 s).
 #[inline]
-pub(super) fn classic_ring_life(base: f32, scale: f32) -> f32 {
+pub(super) const fn classic_ring_life(base: f32, scale: f32) -> f32 {
     if !scale.is_finite() {
         return base;
     }
@@ -1126,7 +1134,7 @@ pub(super) fn push_velocity_dash_over(
     clippy::too_many_arguments,
     reason = "position + live velocity + trail + the two tints + coverage"
 )]
-fn dash_verts(
+const fn dash_verts(
     x: f32,
     y: f32,
     vx: f32,
@@ -1475,7 +1483,7 @@ pub(super) fn fract(x: f32) -> f32 {
 /// pixel a bolt lights rises once and falls once, so lightning's flash count
 /// is its onset count (`CursorGlow::admit_bolt`).
 #[inline]
-pub(super) fn bolt_flash(u: f32) -> f32 {
+pub(super) const fn bolt_flash(u: f32) -> f32 {
     if u < BOLT_HOLD {
         1.0
     } else {
@@ -1526,7 +1534,7 @@ pub(crate) fn hsv2rgb(h: f32, s: f32, v: f32) -> u32 {
 
 /// Cubic smoothstep `0..1` (Hermite): the classic AA/feather easing.
 #[inline]
-pub(super) fn smoothstep01(x: f32) -> f32 {
+pub(super) const fn smoothstep01(x: f32) -> f32 {
     let x = x.clamp(0.0, 1.0);
     x * x * (3.0 - 2.0 * x)
 }

@@ -208,14 +208,14 @@ impl ClassicWake {
     /// typing ~0.28×, sustained fast typing ~1.2×. Jump comets and rings are
     /// navigation feedback and stay at 1×.
     #[inline]
-    fn typing_boost(&self) -> f32 {
+    const fn typing_boost(&self) -> f32 {
         0.28 + 0.92 * self.heat
     }
 
     /// Any light still alive → keep the animation timer armed.
     #[must_use]
     #[inline]
-    pub fn is_active(&self) -> bool {
+    pub const fn is_active(&self) -> bool {
         !self.sparks.is_empty() || self.ring.is_some() || self.crown_until.is_some()
     }
 
@@ -223,7 +223,7 @@ impl ClassicWake {
     /// wake lights every observed move, typed or not, and the host records it
     /// in the same spawn count and diagnosis ring the other styles fill.
     #[inline]
-    pub fn take_spawn(&mut self) -> Option<((u16, u16), (u16, u16))> {
+    pub const fn take_spawn(&mut self) -> Option<((u16, u16), (u16, u16))> {
         self.spawned.take()
     }
 
@@ -231,14 +231,14 @@ impl ClassicWake {
     /// would spawn a comet on a move.
     #[must_use]
     #[inline]
-    pub fn has_last(&self) -> bool {
+    pub const fn has_last(&self) -> bool {
         self.last.is_some()
     }
 
     /// Live swept-path samples, for `trail status`'s `sparks=` count.
     #[must_use]
     #[inline]
-    pub fn live_sparks(&self) -> usize {
+    pub const fn live_sparks(&self) -> usize {
         self.sparks.len()
     }
 
@@ -842,12 +842,12 @@ impl ClassicWake {
     /// Whether the mono face draws as the spectrum face does on a dark
     /// ground: never in a build, only for a test's control.
     #[cfg(test)]
-    fn mono_unbedded(&self) -> bool {
+    const fn mono_unbedded(&self) -> bool {
         self.mono_unbedded
     }
     #[cfg(not(test))]
     #[inline(always)]
-    fn mono_unbedded(&self) -> bool {
+    const fn mono_unbedded(&self) -> bool {
         false
     }
 
@@ -1194,7 +1194,7 @@ impl ClassicWake {
 }
 
 #[inline]
-fn chf_of(geom: Geom) -> f32 {
+const fn chf_of(geom: Geom) -> f32 {
     geom.ch as f32
 }
 

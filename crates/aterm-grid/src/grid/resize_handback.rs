@@ -1102,13 +1102,13 @@ impl Grid {
     }
 
     /// Whether this resize runs as one pass ([`Self::forget_handback`]).
-    pub(super) fn handback_one_pass(&self) -> bool {
+    pub(super) const fn handback_one_pass(&self) -> bool {
         self.storage.handback.one_pass
     }
 
     /// Offer the next pass, a split's width change, `refill`
     /// ([`Self::begin_pass`]).
-    pub(super) fn offer_refill(&mut self, refill: Refill) {
+    pub(super) const fn offer_refill(&mut self, refill: Refill) {
         self.storage.handback.refill = refill;
     }
 
@@ -1132,7 +1132,7 @@ impl Grid {
 
     /// The offloaded resize lifted `rows` rows off the top of the screen into
     /// its history job before its pass ([`Self::settled_rows`]).
-    pub(super) fn note_rows_lifted(&mut self, rows: usize) {
+    pub(super) const fn note_rows_lifted(&mut self, rows: usize) {
         self.storage.handback.lifted = row_u16(rows);
     }
 
@@ -1141,7 +1141,7 @@ impl Grid {
     /// the pass, which its rewrap lays out again as the synchronous resize's
     /// own lift does. A pass that keeps this height moves no rows, so it keeps
     /// what is owed and is not split again.
-    pub(super) fn settled_rows(&self) -> u16 {
+    pub(super) const fn settled_rows(&self) -> u16 {
         self.storage
             .visible_rows
             .saturating_add(self.storage.handback.lifted)
@@ -1438,12 +1438,12 @@ impl Grid {
 
     /// The offloaded resize made `plan` before it took the history away: the
     /// pass spends it rather than plan against a history it no longer has.
-    pub(super) fn offer_plan(&mut self, plan: RewrapPlan) {
+    pub(super) const fn offer_plan(&mut self, plan: RewrapPlan) {
         self.storage.handback.planned = Some(plan);
     }
 
     /// The plan the offloaded resize offered, spent.
-    pub(super) fn take_plan(&mut self) -> Option<RewrapPlan> {
+    pub(super) const fn take_plan(&mut self) -> Option<RewrapPlan> {
         self.storage.handback.planned.take()
     }
 
@@ -1510,13 +1510,13 @@ impl Grid {
 
     /// The resize law this grid lays its rows out under ([`ResizeLaw`]).
     #[must_use]
-    pub fn resize_law(&self) -> ResizeLaw {
+    pub const fn resize_law(&self) -> ResizeLaw {
         self.storage.resize_law
     }
 
     /// Lay the rows out under `law` from the next resize on: an older law for
     /// the replay of a recording made under it (`cast drift`).
-    pub fn set_resize_law(&mut self, law: ResizeLaw) {
+    pub const fn set_resize_law(&mut self, law: ResizeLaw) {
         self.storage.resize_law = law;
     }
 

@@ -635,13 +635,15 @@ impl PressCredits {
     /// appeared or were suppressed: drop their unpaid credits so they cannot
     /// fund unrelated program output. The slot is identified by ring
     /// position, since two keys can share an input timestamp.
-    pub(super) fn retire_before_slot(&mut self, selected: usize) {
-        for k in 0..TYPED_STAMP_DEPTH {
+    pub(super) const fn retire_before_slot(&mut self, selected: usize) {
+        let mut k = 0;
+        while k < TYPED_STAMP_DEPTH {
             let i = (self.head + k) & STAMP_RING_MASK;
             if i == selected {
                 return;
             }
             self.slots[i] = None;
+            k += 1;
         }
     }
 
@@ -829,8 +831,15 @@ impl PressCredits {
     /// Whether no press is banked at all (spent or unspent — a slot with
     /// zero credits left is `None`).
     #[inline]
-    pub(super) fn is_empty(&self) -> bool {
-        self.slots.iter().all(Option::is_none)
+    pub(super) const fn is_empty(&self) -> bool {
+        let mut i = 0;
+        while i < self.slots.len() {
+            if self.slots[i].is_some() {
+                return false;
+            }
+            i += 1;
+        }
+        true
     }
 }
 

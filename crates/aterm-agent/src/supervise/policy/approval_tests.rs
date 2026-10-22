@@ -3370,6 +3370,56 @@ fn a_transcript_call_cannot_remove_the_boxes_other_readings() {
     );
 }
 
+/// THE MEASURED STALE CALL IS ONE MORE READING, NEVER THE BOX'S ALONE
+/// (MEASURED 2026-10-22, 2.1.308, the measured note's breaker-4 section):
+/// the transcript as it stood under N's too-many box names S, an older call
+/// whose result was never written, and S's command draws as N's box and its
+/// call's row. S alone is a read; N is not. `breaker-read-only@v4` adds S's
+/// reading and keeps the screen's, so N's box goes to a person, in manual
+/// mode and under a zsh startup alike, the reason saying that the matching
+/// call removes no reading. A rule that took the drawn-alike call in place
+/// of the screen's readings (breaker-3's never-landed v3) would approve N.
+///
+/// NEGATIVE CONTROL: the same box with no transcript call is refused on the
+/// same newline reading, without the transcript's words.
+#[test]
+fn the_measured_stale_call_is_one_more_reading_never_the_boxes_alone() {
+    use super::super::box_command::pending_bash;
+    use super::super::box_command::tests::{STALE_PENDING, STALE_S_ID, STALE_SCREEN};
+    let label = "the rm circuit breaker (not ruled out: too many command substitutions to \
+                 analyze; the command need not name rm)";
+    let rows = phase_fixtures::screen(STALE_SCREEN);
+    let call = pending_bash(STALE_PENDING, &[]).expect("S, waiting");
+    assert_eq!(call.id, STALE_S_ID);
+    assert!(classify_command(&call.command).read_only);
+    let zsh = || Ok(ShellStartup::of_parts(Vec::new(), true));
+    for c in [
+        ApprovalCtx {
+            box_command: Some(Ok(call.clone())),
+            ..ctx()
+        },
+        ApprovalCtx {
+            box_command: Some(Ok(call.clone())),
+            shell: zsh(),
+            ..ctx()
+        },
+    ] {
+        let d = on_screen(&rows, &c);
+        let r = reason(&d).to_string();
+        assert!(r.starts_with(&format!("{label}: ")), "{r}");
+        assert!(r.contains("not read-only (newline reading)"), "{r}");
+        assert!(
+            r.ends_with("(the matching transcript call does not remove screen readings)"),
+            "{r}"
+        );
+    }
+    // NEGATIVE CONTROL
+    let r = reason(&on_screen(&rows, &ctx())).to_string();
+    assert!(r.starts_with(&format!("{label}: ")), "{r}");
+    assert!(r.contains("not read-only (newline reading)"), "{r}");
+    assert!(!r.contains("transcript"), "{r}");
+}
+
 /// `breaker-read-only@v4` ADDS THE TRANSCRIPT'S COMMAND FOR A TOO-MANY BOX
 /// OVER TABS OR WIDE CHARACTERS, AND KEEPS THE SCREEN'S READINGS (MEASURED
 /// 2026-10-22, 2.1.308): the captured boxes over `echo` lines with tabs, with
@@ -3552,6 +3602,64 @@ fn a_reading_that_turns_on_a_blank_the_screen_cannot_show_proves_no_box() {
     refused(&d, "rm circuit breaker: ", tab, "the rm breaker");
     let d = on_screen(&rm_box(&format!("{rm}; echo a\\ b")), &bypass());
     assert_eq!(approved(&d), Some(RULE_RM_BREAKER), "{d:?}");
+}
+
+/// [`readings_read_only`] CHECKS THE CLASSIFIER FIRST, THEN THE BLANKS, AND
+/// RETURNS THE FIRST REFUSAL: a reading that both writes and turns on a blank
+/// the screen cannot show (`touch x \⏎y`) is refused as not read-only, and
+/// the same blank after a read (`ls x \⏎y`) as not read as drawn. The order
+/// is what the read-only rule's reason and the window's advisory word name
+/// (aterm-agent SPECS `approval-safe-bash-sound`, aterm-gui
+/// `prompt-detail-bash-verdict`).
+///
+/// NEGATIVE CONTROL: a reading that is read-only and read as drawn is `Ok`.
+#[test]
+fn readings_read_only_names_the_classifiers_refusal_before_the_blanks() {
+    let both = ["touch x \\\ny".to_string()];
+    assert!(!classify_command(&both[0]).read_only);
+    assert!(
+        blanks_shown(&both).is_err(),
+        "the reading also holds a blank"
+    );
+    let r = readings_read_only(&both, &[]).expect_err("a write");
+    assert!(r.starts_with("not read-only (newline reading): "), "{r}");
+    let blank_only = ["ls x \\\ny".to_string()];
+    assert!(classify_command(&blank_only[0]).read_only);
+    let r = readings_read_only(&blank_only, &[]).expect_err("an unshown blank");
+    assert!(
+        r.starts_with("not read as drawn (newline reading): "),
+        "{r}"
+    );
+    // NEGATIVE CONTROL
+    assert_eq!(readings_read_only(&["ls x".to_string()], &[]), Ok(()));
+}
+
+/// THE READ-ONLY RULE APPROVES NO BOX WHOSE AWK PROGRAM OR ABBREVIATED SORT
+/// OPTION WRITES (the classifier's measured forms, `classify_tests`'s
+/// `an_awk_program_that_runs_or_writes_in_any_spelling_is_no_read` and
+/// `an_abbreviated_write_option_is_the_write`): before, each of these boxes
+/// was approved under `read-only@classify-v5`. NEGATIVE CONTROL: the same
+/// tools reading are approved.
+#[test]
+fn a_box_whose_awk_or_sort_writes_in_a_spelling_it_reads_is_not_approved() {
+    for cmd in [
+        "awk '{print $1 > $2}' f",
+        "awk 'BEGIN{system (\"date\")}'",
+        "sort --o=out f",
+        "sort --compress=./x.sh f",
+    ] {
+        let d = on_screen(&bash_box(&[cmd], Some("Read the file")), &ctx());
+        let r = reason(&d);
+        assert!(
+            r.starts_with("not read-only (space reading): "),
+            "{cmd}: {r}"
+        );
+    }
+    // NEGATIVE CONTROL
+    for cmd in ["awk '{print $1}' f", "sort -t: -k2 f"] {
+        let d = on_screen(&bash_box(&[cmd], Some("Read the file")), &ctx());
+        assert_eq!(approved(&d), Some(RULE_READ_ONLY), "{cmd}: {d:?}");
+    }
 }
 
 /// THE RM BREAKER'S TOO-MANY BOX OVER A COMMAND PROVEN A READ IS APPROVED

@@ -430,7 +430,7 @@ impl App {
 
     /// [`Self::open_overview`] on `wid`, which comes forward with it. Where
     /// this aterm's fabric is configured, the card lists what the last read
-    /// of the fabric's log said ("On the fabric", step 6E-7) and kicks the
+    /// of the fabric's log said ("On the fabric") and kicks the
     /// next read ([`Self::kick_fabric_read`]), whose landing re-renders it.
     fn open_overview_on(&mut self, wid: WindowId) -> Result<(), String> {
         let (groups, manages) = self.overview_parts();
@@ -1763,7 +1763,7 @@ mod tests {
     }
 
     /// THE OVERVIEW SAYS WHY A LANDING HOLDS, ON A LINE OF ITS OWN (Autopilot
-    /// v5 §12.3.1, slice 3c and its review): a Claude Code under Land this
+    /// v5 §12.3.1): a Claude Code under Land this
     /// host supervises reads `driven by aterm (land)` on its chip's line
     /// throughout — the hover's long words there pushed `typed by` past the
     /// card's width — and, once its loop tells a hold whose yield was read,

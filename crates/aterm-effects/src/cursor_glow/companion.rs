@@ -37,7 +37,7 @@ impl CursorCatMotionPulse {
     /// into [`crate::kitty_cursor::CursorCat`]'s canonical momentum instance.
     #[must_use]
     #[cfg(test)]
-    pub fn advances_momentum(self) -> bool {
+    pub const fn advances_momentum(self) -> bool {
         matches!(
             self.kind,
             CursorCatMotionKind::Advance | CursorCatMotionKind::FoldForward
@@ -70,11 +70,11 @@ impl CursorGlow {
     /// echo-correlated source; a non-echoing keystream pulses neither.
     #[must_use]
     #[cfg(test)]
-    pub fn take_momentum_pulse(&mut self) -> Option<Instant> {
-        self.momentum_pulse
-            .take()
-            .filter(|pulse| pulse.advances_momentum())
-            .map(|pulse| pulse.at)
+    pub const fn take_momentum_pulse(&mut self) -> Option<Instant> {
+        match self.momentum_pulse.take() {
+            Some(pulse) if pulse.advances_momentum() => Some(pulse.at),
+            _ => None,
+        }
     }
 
     /// Read and clear this tick's cursor-cat motion pulse, which keeps the
@@ -82,7 +82,7 @@ impl CursorGlow {
     /// a large cursor relocation.
     #[inline]
     #[must_use]
-    pub fn take_cursor_cat_motion_pulse(&mut self) -> Option<CursorCatMotionPulse> {
+    pub const fn take_cursor_cat_motion_pulse(&mut self) -> Option<CursorCatMotionPulse> {
         self.momentum_pulse.take()
     }
 
@@ -94,7 +94,7 @@ impl CursorGlow {
     /// pulse still comes from [`Self::take_cursor_cat_motion_pulse`].
     #[inline]
     #[must_use]
-    pub fn take_companion_impulse(&mut self) -> Option<CompanionImpulse> {
+    pub const fn take_companion_impulse(&mut self) -> Option<CompanionImpulse> {
         if self.v2.engaged() {
             self.v2.take_companion_impulse()
         } else {
@@ -147,7 +147,7 @@ impl CursorGlow {
     /// no light: it only prices the next key typed
     /// ([`rk::spine::Spine::note_verdict`]).
     #[inline]
-    pub fn note_command_verdict(&mut self, now: Instant) {
+    pub const fn note_command_verdict(&mut self, now: Instant) {
         if self.v2.engaged() {
             self.v2.note_verdict(now);
         }
@@ -159,7 +159,7 @@ impl CursorGlow {
     /// [`crate::cursor_rainbow::RainbowConfig::flare_at`].
     #[inline]
     #[must_use]
-    pub fn caret_flare_at(&self) -> Option<Instant> {
+    pub const fn caret_flare_at(&self) -> Option<Instant> {
         if self.v2.engaged() {
             self.v2_caret.flare_at
         } else {
@@ -219,7 +219,7 @@ impl CursorGlow {
     /// fourth bar) or the armed celebration's drop fan. Reaches v2 only;
     /// every other style is unaffected.
     #[inline]
-    pub fn party(&mut self, now: Instant, n: u8, ring: bool) {
+    pub const fn party(&mut self, now: Instant, n: u8, ring: bool) {
         if self.v2.engaged() {
             self.v2.party(now, n, ring);
         }

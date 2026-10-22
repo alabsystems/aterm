@@ -3379,7 +3379,7 @@ pub(crate) fn apply_host_chrome_at(
 #[path = "app_render_drop_overlay_tests.rs"]
 mod drop_overlay_tests;
 
-/// Pure pixel→terminal-cell mapping (the body of [`App::pixel_to_cell`]): `x`
+/// Pure pixel→terminal-cell mapping (the body of [`App::pixel_to_cell_with`]): `x`
 /// insets by `pad`, `y` by `pad_top + head` (a click above saturates toward row
 /// 0) and then by the tab strip (`strip_rows * ch`, clamping to row 0). The
 /// result is clamped to the terminal grid.
@@ -21244,6 +21244,9 @@ impl App {
                     visible_match_range(&search.matches, offset, region.rows, search.max_match_rows)
                 })
         };
+        // The grid this splice lays the panel on: its band answers the pointer
+        // on it alone (`App::laid_cell_at`).
+        let laid = self.glass_grid(wid);
         let Some(ws) = self.windows.get_mut(&wid) else {
             return;
         };
@@ -21577,6 +21580,7 @@ impl App {
                 .map_or(painted.field_scroll, |bar| bar.scroll),
             band,
             cols: region.col0..region.col0 + region.cols,
+            laid,
         });
         ws.input_scratch.snapshot_seq = ws.input_scratch.snapshot_seq.wrapping_add(1);
         if let Some(cell) = ime_caret.or(fallback_cell) {

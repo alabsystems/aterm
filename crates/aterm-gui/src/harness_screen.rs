@@ -571,7 +571,7 @@ pub(crate) struct HarnessSession {
     /// sessions it stands on (`· 2 need you`); its row's state line leads
     /// with it.
     pub(crate) need: Option<crate::needs::HarnessAsk>,
-    /// WHY LAND STILL HOLDS (§12.3.3 item 4, slice 3c): the hold on its
+    /// WHY LAND STILL HOLDS (§12.3.3 item 4): the hold on its
     /// glass, with its `since` stamped where it arrived, where this host's
     /// live claim is on it and its chip wears `⤓ land` (`App::shown_hold`);
     /// its row's state line says it ([`HarnessSessionRow::state_line`]).
@@ -1430,7 +1430,7 @@ pub(crate) const TODAY_READING: &str = "reading\u{2026}";
 
 /// Whether STATUS's today `line` counts (`37 approved today · …`), as
 /// against one of its notes ([`TODAY_NOTHING_YET`], [`TODAY_READING`]):
-/// only a line of counts is drawn in Hero type (the post-check of wave 1,
+/// only a line of counts is drawn in Hero type (
 /// owner-eye-7).
 #[must_use]
 pub(crate) fn today_counts(line: &str) -> bool {
@@ -1478,7 +1478,7 @@ impl Families {
     }
 }
 
-/// ONE NAME FOR EACH COUNT (the post-check of wave 1, owner-eye-6): the
+/// ONE NAME FOR EACH COUNT (owner-eye-6): the
 /// words a count is said in on Settings ▸ Harness — STATUS's today line,
 /// each SESSIONS row's day line, and its label in WHAT THE HARNESS DID — so
 /// a count is named one way on the whole page, and, where the chip lights
@@ -1516,11 +1516,11 @@ impl CountWords {
 pub(crate) const APPROVED: CountWords =
     CountWords::act("Approved", aterm_agent::harness::acts::Act::Approved);
 /// THE PRESSES NO SAFE RULE PROVED (the ledger's `unproven:` approvals, the
-/// review of v3/polish-page's fixes, finding 4): of the approved, those full
+/// review of v3/polish-page's fixes): of the approved, those full
 /// power made where no safe rule proved the box. One wording wherever the
 /// page says them — DECIDED FOR YOU's sentence for one (`…; no safe rule
 /// proved it`) and WHAT THE HARNESS DID's row under Approved, labelled as a
-/// part of it ([`UNPROVEN_OF_APPROVED`]: `of those  no safe rule proved 40
+/// part of it ([`UNPROVEN_OF_APPROVED`]: `of those no safe rule proved 40
 /// today · 45 in 7 days`), so no one adds it to the approved. Never
 /// "unproven", the ledger's word.
 pub(crate) const NO_SAFE_RULE_PROVED: &str = "no safe rule proved";
@@ -1954,7 +1954,7 @@ impl HarnessSessionRow {
     /// The SESSIONS card draws it under the row's head
     /// (`native_settings_harness`'s `session_row`).
     ///
-    /// UNDER `⤓ land`, WHERE A HOLD STANDS (§12.3.1, slice 3c): why Land
+    /// UNDER `⤓ land`, WHERE A HOLD STANDS (§12.3.1): why Land
     /// still holds, then the pause — `not landed yet: needs you: rotate the
     /// deploy key; 2 unpushed commits; open work in its report: follow-up ·
     /// landing since 14:02 · 3 nudges · pausing until 14:40 (3 short turns

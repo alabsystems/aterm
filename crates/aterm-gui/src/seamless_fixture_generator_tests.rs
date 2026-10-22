@@ -292,7 +292,7 @@ struct FxDesk {
     fabric_attached: Vec<String>,
     /// The panes kept open after their command exited (`--hold`): in the
     /// layout, never handed, their final screens carried beside the
-    /// manifest since v0.100.0 (round five, item 19). Empty on every desk
+    /// manifest since v0.100.0. Empty on every desk
     /// but `held-pane` and the held-history desks.
     held: Vec<FxHeld>,
     /// What the park draws from its store beside the records
@@ -1485,7 +1485,7 @@ fn fx_write(desk: &FxDesk, scratch_root: &std::path::Path) {
     // THE LAYOUT, captured after the screens and committed at the park
     // (`App::capture_handoff_layout`, then `commit_handoff_layout`). Since
     // v0.101.0 the capture folds a desk past the layout's caps into what one
-    // layout holds (`RestoreManifest::fold_into_caps`, round eight's D5): a
+    // layout holds (`RestoreManifest::fold_into_caps`): a
     // desk within them is left exactly as it was, and one past them
     // (`folded`) is folded.
     let mut layout = desk.layout.clone();
@@ -1519,7 +1519,7 @@ fn fx_write(desk: &FxDesk, scratch_root: &std::path::Path) {
     // by the worker once the capture is done (`App::history_sessions`, which
     // exports only to a successor that imports the sidecars). Since
     // v0.101.0 the held panes' scrollback is exported too, after the handed
-    // sessions' (round eight's finding 39).
+    // sessions'.
     assert!(
         crate::handoff_history::exports_for_target(
             crate::running_build_number(),
@@ -4801,8 +4801,8 @@ fn fx_engine_state_desk() -> FxDesk {
 /// shell in front, and behind it a document in each of [`MAX_WINDOWS`] windows
 /// — the config open in the Editor with two selections, notes read in Markdown,
 /// one with a passage selected — so the capture folds the last window's tab
-/// into the one before it (`RestoreManifest::fold_into_caps`, round eight's
-/// D5), and the layout says what it folded and which pane was in front.
+/// into the one before it (`RestoreManifest::fold_into_caps`),
+/// and the layout says what it folded and which pane was in front.
 ///
 /// [`MAX_WINDOWS`]: crate::restore::MAX_WINDOWS
 fn fx_fold_desk() -> FxDesk {

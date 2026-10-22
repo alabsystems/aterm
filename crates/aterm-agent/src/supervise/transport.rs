@@ -167,8 +167,7 @@ impl RelayCtl {
     /// answer `ERR auth` (a seamless update's successor rebound the socket,
     /// and does not know a token this process held only in memory), the
     /// token beside the socket from then on: the request is sent again on
-    /// that connection, once — the refused one ran nothing (design §2.5,
-    /// phase 3A ruling R10).
+    /// that connection, once — the refused one ran nothing (design §2.5).
     pub fn preferring(endpoint: Endpoint, token: String) -> Self {
         Self {
             beside_on_refusal: true,

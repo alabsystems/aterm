@@ -1527,7 +1527,7 @@ fn latch_task_news<F: Fn(&Store) -> bool>(
     }
 }
 
-/// `await log` (phase 3A, design §7.2; ruling R2): answer the first record past
+/// `await log` (design §7.2): answer the first record past
 /// the cursor that satisfies the wait — `OK seq=<n> ep=<e>[ gap=<why>:<lost>]
 /// <record>` — or a gap with no match (`OK gap why= lost= resync_to= ep=`, whose
 /// `resync_to` a wait re-armed there reads past), `OK timeout` at the deadline,
@@ -2779,7 +2779,7 @@ pub(crate) fn turn_options(rest: &str) -> Result<TurnOptions<'_>, String> {
     // `if-rows=<first>-<last>:<hex16>`: the narrow fence, type only while those rows still
     // hash to the value; checked with `if-gen=` under the same lock hold.
     let mut if_rows: Option<aterm_types::control_verbs::RowsFence> = None;
-    // `cause=@<off>|<seq>` (phase 3A, ruling R6): in any position among the
+    // `cause=@<off>|<seq>`: in any position among the
     // options, once (with a leading one too, the dispatch refuses the pair),
     // checked against what this session holds before any byte is typed.
     let mut cause_opt: Option<crate::session_log::CauseRef> = None;

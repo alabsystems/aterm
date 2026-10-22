@@ -29,7 +29,7 @@
 //! `prose-long-term@v1`/`prose-short-term@v1` texts per question priority):
 //! the harness answers and goes on.
 //!
-//! Forever cruise: a continuation's reply that claims done
+//! Cruise: a continuation's reply that claims done
 //! (`WorkedClaimsDone`, the retired token on its last line) ends nothing —
 //! the point's act is the defend-and-find-more prompt
 //! (`continue-done-check@v1`) in the continuation's place, on the same gates
@@ -706,7 +706,7 @@ fn tier1_the_real_decider_types_exactly_where_the_model_allows() {
         );
     }
 
-    // Forever cruise: at a continuation's done claim, past the back-off it
+    // Cruise: at a continuation's done claim, past the back-off it
     // earned, the Buggy model has ended the task (nothing enabled, the
     // policy before it) — the real decider types the defend prompt, and its
     // task is not done.

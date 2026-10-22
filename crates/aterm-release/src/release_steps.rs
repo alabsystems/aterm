@@ -2228,77 +2228,18 @@ pub fn export_outcome(
 }
 
 /// The wasm32 clause of `publish/config.sh`'s `CHECK_CMD_DEFAULT` and the stock
-/// channel it names.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct WasmClause {
-    pub clause: String,
-    pub pin: String,
-}
+/// channel it names: one reader, aterm-verify's, whose `verify provision` acquires the pin.
+pub use aterm_verify::rustup::WasmClause;
 
 /// Read the wasm32 clause out of `config` (the engine's own line shape,
-/// `CHECK_CMD_DEFAULT="…"`), with every refusal the stage would meet for it.
+/// `CHECK_CMD_DEFAULT="…"`), with every refusal the stage would meet for it
+/// (`aterm_verify::rustup::wasm_clause`, as a release refusal).
 ///
 /// # Errors
 /// No clause; no stock channel; no target-add before it; no `RUSTC` naming the pin's
 /// own rustc.
 pub fn wasm_clause(config: &str) -> Result<WasmClause, Refusal> {
-    let line = config
-        .lines()
-        .find_map(|l| l.strip_prefix("CHECK_CMD_DEFAULT=\""))
-        .and_then(|l| l.trim_end().strip_suffix('"'))
-        .unwrap_or_default();
-    let Some(clause) = line
-        .split(" && ")
-        .find(|c| c.contains("--target wasm32-unknown-unknown"))
-        .map(str::trim)
-    else {
-        return Err(Refusal::new(
-            "publish/config.sh's CHECK_CMD_DEFAULT has no wasm32 clause — nothing before the \
-             promote compiles the site's /terminal engine",
-            "restore its `cargo check --locked --target wasm32-unknown-unknown -p aterm-wasm` \
-             clause (publish/config.sh, THE WASM32 CLAUSE)",
-        ));
-    };
-    let pin = clause
-        .split_once("rustup run ")
-        .and_then(|(_, rest)| rest.split_once(" cargo "))
-        .map(|(pin, _)| pin.to_string())
-        .filter(|p| !p.is_empty() && !p.contains(' '));
-    let Some(pin) = pin else {
-        return Err(Refusal::new(
-            format!(
-                "publish/config.sh's wasm32 clause names no stock channel — the wasm32 pin is the \
-                 compiler this check and the stage's gate both run: {clause}"
-            ),
-            "spell the clause `rustup run <channel> cargo check …`",
-        ));
-    };
-    let add = format!("rustup target add --toolchain {pin} wasm32-unknown-unknown");
-    if !line.contains(&format!("{add} && ")) {
-        return Err(Refusal::new(
-            format!(
-                "publish/config.sh's CHECK_CMD_DEFAULT does not add the wasm32 target to {pin} \
-                 before its wasm32 clause — `pub stage` on a host without that target fails after \
-                 the verified build"
-            ),
-            format!("put `{add} && ` before the wasm32 clause"),
-        ));
-    }
-    let rustc = format!("RUSTC=$(rustup which --toolchain {pin} rustc) ");
-    if !clause.contains(&rustc) {
-        return Err(Refusal::new(
-            format!(
-                "publish/config.sh's wasm32 clause does not name {pin}'s own rustc — cargo would \
-                 take `rustc` from the host PATH (the gate's fresh CARGO_HOME holds no rustup \
-                 proxy): {clause}"
-            ),
-            format!("put `{rustc}` before `rustup run {pin} cargo` in the wasm32 clause"),
-        ));
-    }
-    Ok(WasmClause {
-        clause: clause.to_string(),
-        pin,
-    })
+    aterm_verify::rustup::wasm_clause(config).map_err(|e| Refusal::new(e.why, e.remedy))
 }
 
 /// The problems with the source manifest pair a completed `pub publish` leaves on the
@@ -4867,35 +4808,6 @@ mod tests {
                 gates,
             };
             assert_eq!(found.exit_code(), code);
-        }
-    }
-
-    #[test]
-    fn the_wasm32_clause_is_read_out_of_the_engines_own_line() {
-        // the committed line's shape (publish/config.sh, which the public snapshot
-        // withholds, so it is quoted here rather than read)
-        let good = "CHECK_CMD_DEFAULT=\"rustup run trust targo trust check && rustup target add \
-                    --toolchain 1.95.0 wasm32-unknown-unknown && sh -c \
-                    'RUSTFLAGS=-Ctarget-feature=+simd128 RUSTC=$(rustup which --toolchain 1.95.0 \
-                    rustc) rustup run 1.95.0 cargo check --locked --target wasm32-unknown-unknown \
-                    -p aterm-wasm'\"\n";
-        let clause = wasm_clause(good).unwrap();
-        assert_eq!(clause.pin, "1.95.0");
-        assert!(
-            clause
-                .clause
-                .starts_with("sh -c 'RUSTFLAGS=-Ctarget-feature=+simd128 RUSTC=")
-        );
-        for config in [
-            "CHECK_CMD_DEFAULT=\"targo check\"\n",
-            &good.replace(
-                "rustup target add --toolchain 1.95.0 wasm32-unknown-unknown && ",
-                "",
-            ),
-            &good.replace("RUSTC=$(rustup which --toolchain 1.95.0 rustc) ", ""),
-            &good.replace("rustup run 1.95.0 cargo", "cargo"),
-        ] {
-            assert!(wasm_clause(config).is_err(), "{config}");
         }
     }
 

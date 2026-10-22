@@ -1,8 +1,8 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! The verb dispatch. Each verb parses its own typed flags in its own module; the only
-//! environment knobs are what [`crate::ctx::Ctx::from_env`] reads.
+//! Verb dispatch. Each verb parses its own typed flags; [`crate::ctx::Ctx::from_env`]
+//! reads the environment.
 
 use std::process::ExitCode;
 
@@ -10,23 +10,23 @@ use crate::ctx::Ctx;
 use crate::error::{Error, Result};
 use crate::{artifact, channel, lane};
 
-/// One verb: its name, its synopsis, and what it does.
+/// One CLI verb: name, synopsis, and one-line summary.
 #[derive(Clone, Copy, Debug)]
 pub struct Verb {
-    /// The verb.
+    /// Verb name.
     pub name: &'static str,
-    /// Its synopsis.
+    /// Usage synopsis.
     pub synopsis: &'static str,
-    /// What it does, in one line.
+    /// One-line summary.
     pub does: &'static str,
 }
 
-/// Every verb, in the order `help` lists them.
+/// Every verb, in `help` order.
 pub const VERBS: &[Verb] = &[
     Verb {
         name: "pack",
         synopsis: "pack <program> --checkout <dir> [--triple T] [--build N] [--merge-from PKG] [--toolchain BIN] [--out DIR] [--trust-repo DIR] [--unsigned] [--upload]",
-        does: "build, gate, stage and sign one program build for one target",
+        does: "build, gate, stage and sign one program for one target",
     },
     Verb {
         name: "pack-bundle",
@@ -36,27 +36,27 @@ pub const VERBS: &[Verb] = &[
     Verb {
         name: "pack-package",
         synopsis: artifact::package::SYNOPSIS,
-        does: "pack a prebuilt package tree whole (codex-alab), gate it as a client stages it, and sign it",
+        does: "pack, gate and sign a prebuilt package tree (codex-alab)",
     },
     Verb {
         name: "build-local",
         synopsis: "build-local <program> <checkout> [--plan] [--policy repository|unverified] [--profile release|dev] [--jobs N] [--toolchain BIN] [--out DIR] [--link]",
-        does: "the development build of a program, with no pack or signature",
+        does: "development build of a program, unsigned and unpacked",
     },
     Verb {
         name: "sign",
         synopsis: "sign <pkg.toml>… [--trust-repo DIR]",
-        does: "sign staged manifests with this machine's key, then verify them",
+        does: "sign staged manifests with this machine's key and verify them",
     },
     Verb {
         name: "index",
         synopsis: "index [--baseline QUAD-DIR | --first CHANNEL --index-build N] [--pin P=B]… [--target-pin T:P=B[,…]]… [--yank …] [--unyank …] [--min-build N [--lower-min-build]] [--retire P]… [--retire-target T[:P]]… [--allow-triple-drop P=T --reason …] [--valid-until TS] [--out DIR] [--pack-dir DIR | --upload]",
-        does: "publish the next signed index: a typed delta over the verified head",
+        does: "publish the next signed index as a typed delta over the verified head",
     },
     Verb {
         name: "mirror",
         synopsis: "mirror <quad-dir> | --quad DIR [--dry-run]",
-        does: "make exactly the signed packs an index pins public",
+        does: "make public the signed packs an index pins",
     },
     Verb {
         name: "publish-group",
@@ -66,16 +66,16 @@ pub const VERBS: &[Verb] = &[
     Verb {
         name: "status",
         synopsis: "status [--quad DIR]",
-        does: "the verified channel head, or a quad: pins, overlays, yanks, floors, horizon",
+        does: "print the verified channel head or a local quad",
     },
     Verb {
         name: "lane",
         synopsis: "lane run <alab|linux> [--dry-run] [--sha256 HEX] [--log FILE] [--triple T]… | lane install <alab|linux> [--allow-dirty] [--no-arm] [--keyless] | lane disarm <alab|linux>",
-        does: "the unattended lanes: run, install a snapshot under a unit, disarm",
+        does: "run, install or disarm an unattended lane",
     },
 ];
 
-/// The binary's entry point.
+/// Binary entry point (`0` pass, `1` finding/refused, `2` usage, `3` could not run).
 pub fn main_entry(args: impl IntoIterator<Item = String>) -> ExitCode {
     let args: Vec<String> = args.into_iter().skip(1).collect();
     match run(&args) {
@@ -87,11 +87,7 @@ pub fn main_entry(args: impl IntoIterator<Item = String>) -> ExitCode {
     }
 }
 
-/// Run one command line (without the program name).
-///
-/// # Errors
-///
-/// Whatever the verb answers; a usage error for an unknown verb.
+/// Run one command line (without argv[0]).
 pub fn run(args: &[String]) -> Result<()> {
     let Some((verb, rest)) = args.split_first() else {
         eprint!("{}", usage());
@@ -105,11 +101,7 @@ pub fn run(args: &[String]) -> Result<()> {
     dispatch(&ctx, verb, rest)
 }
 
-/// Route one verb against `ctx`.
-///
-/// # Errors
-///
-/// Whatever the verb answers; a usage error for an unknown verb.
+/// Route `verb` against `ctx`.
 pub fn dispatch(ctx: &Ctx, verb: &str, rest: &[String]) -> Result<()> {
     match verb {
         "pack" => artifact::pack::run(ctx, rest),
@@ -128,15 +120,16 @@ pub fn dispatch(ctx: &Ctx, verb: &str, rest: &[String]) -> Result<()> {
     }
 }
 
-/// The help text.
+/// Top-level help text.
 #[must_use]
 pub fn usage() -> String {
     let mut s = String::from(
-        "atpkg-publish — the atpkg producer (owner-side; never shipped)\n\n\
+        "atpkg-publish — owner-side atpkg producer (never shipped)\n\n\
          usage: atpkg-publish <verb> [args]\n\n",
     );
     for v in VERBS {
         s.push_str(&format!("  {}\n      {}\n", v.synopsis, v.does));
     }
+    s.push_str("\nExit: 0 pass, 1 finding (refused), 2 usage, 3 could not run.\n");
     s
 }

@@ -473,7 +473,7 @@ impl<T, const N: usize> IntoIter<T, N> {
     /// Whether the iterator drains an inline buffer (so consuming an inline
     /// `SmallVec` did not allocate).
     #[cfg(test)]
-    fn is_inline(&self) -> bool {
+    const fn is_inline(&self) -> bool {
         matches!(self.repr, IntoIterRepr::Inline { .. })
     }
 }

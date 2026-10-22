@@ -44,14 +44,12 @@ fn parse(argv: Vec<std::ffi::OsString>) -> Result<Opts, String> {
             }
             "--dial" | "--remote" => {
                 return Err(format!(
-                    "unknown option '{a}': `aterm drive` reaches no other machine; another \
-                     machine's sessions are read with `aterm ctl survey --host <h>`"
+                    "unknown option '{a}': use `aterm ctl survey --host <h>` for remote sessions"
                 ));
             }
             other if other.starts_with("--") => {
                 return Err(format!(
-                    "unknown option '{other}' (the one option is --socket PATH); run \
-                     `aterm drive --help`"
+                    "unknown option '{other}' (only --socket PATH); run `aterm drive --help`"
                 ));
             }
             _ => {
@@ -145,7 +143,7 @@ fn parse_sub(verb: &str, args: &[String]) -> Result<SubArgs, String> {
                 it.next(),
             )?),
             "--since" => {
-                ledgers("--since", "a time it drops everything before")?;
+                ledgers("--since", "start time")?;
                 let what = "a time: Unix milliseconds, or YYYY-MM-DD[THH:MM[:SS]][Z|±HH:MM]";
                 let v = need("--since", what, it.next())?;
                 out.since_ms = Some(
@@ -154,7 +152,7 @@ fn parse_sub(verb: &str, args: &[String]) -> Result<SubArgs, String> {
                 );
             }
             s if s == "--source" || s.starts_with("--source=") => {
-                ledgers("--source", "anchor or log: what places its times")?;
+                ledgers("--source", "anchor or log")?;
                 let what = "anchor or log";
                 let v = match s.strip_prefix("--source=") {
                     Some(v) => v.to_string(),
@@ -166,7 +164,7 @@ fn parse_sub(verb: &str, args: &[String]) -> Result<SubArgs, String> {
                 );
             }
             "--journal" => {
-                ledgers("--journal", "the supervisor's journal it reads back")?;
+                ledgers("--journal", "supervisor journal")?;
                 out.journal = Some(PathBuf::from(need("--journal", "a FILE", it.next())?));
             }
             "--format" => {
@@ -179,14 +177,12 @@ fn parse_sub(verb: &str, args: &[String]) -> Result<SubArgs, String> {
                 );
             }
             "--out" => {
-                ledgers("--out", "every other verb prints to stdout")?;
+                ledgers("--out", "output path")?;
                 out.out = Some(PathBuf::from(need("--out", "a PATH", it.next())?));
             }
             "--box" => {
                 if verb != "answer" {
-                    return Err(format!(
-                        "{verb}: --box is answer's (the dialog the answer was decided on)"
-                    ));
+                    return Err(format!("{verb}: --box is answer's (question box token)"));
                 }
                 out.box_token = Some(need("--box", "a TOKEN from `drive phase`", it.next())?);
             }
@@ -291,17 +287,11 @@ fn gone_to(verb: &str) -> Option<&'static str> {
         "shot" => "`aterm ctl @<sid> image <name.png>`",
         "await" => "`aterm ctl @<sid> await <cond>`",
         "await-turn" => "`aterm ctl @<sid> await agent idle,prompt,question,wall`",
-        "supervise" | "watch" => {
-            "the window's own host, which supervises every agent session (`aterm help harness`)"
-        }
+        "supervise" | "watch" => "the window's host (`aterm help harness`)",
         "task" => {
-            "a worker: `aterm ctl @self spawn agent=claude -` with the task on stdin, then \
-             `aterm ctl await task @<sid> since=0`"
+            "`aterm ctl @self spawn agent=claude -` then `aterm ctl await task @<sid> since=0`"
         }
-        "report" => {
-            "`aterm ctl @<sid> result` for a worker; `aterm ctl @<sid> offscreen` or `text` for \
-             any session"
-        }
+        "report" => "`aterm ctl @<sid> result` (or `offscreen` / `text`)",
         _ => return None,
     })
 }
@@ -368,8 +358,7 @@ fn run(opts: &Opts) -> Result<Reply, String> {
     let answer = sub.rest.join(" ");
     if answer.trim().is_empty() {
         return Err(
-            "answer needs the answer: an option's number or label, `a, b` for a multi-select, \
-             `submit` on the review, `recommended`, or `human`"
+            "answer needs a choice: option number or label, `a, b`, `submit`, `recommended`, or `human`"
                 .to_string(),
         );
     }
@@ -404,8 +393,7 @@ fn ledger_verb(opts: &Opts, args: &[String]) -> Result<Reply, String> {
         Some(sid) => sid,
         None => {
             return Err(
-                "ledger needs the worker: `aterm drive ledger @s-… ` (or a --journal \
-                        whose lines name one)"
+                "ledger needs the worker: `aterm drive ledger @s-…` (or a single-session --journal)"
                     .to_string(),
             );
         }
@@ -744,8 +732,7 @@ fn candidate_file_with_limit(
     let (policy, notes) = SupervisorConfig::from_aterm_toml(text);
     if !notes.is_empty() {
         return Err(format!(
-            "--policy {named}: the reader did not take it as written, so no counterfactual runs \
-             under it: {}",
+            "--policy {named}: rejected by policy reader: {}",
             show::shown(&notes.join("; "))
         ));
     }
@@ -839,8 +826,7 @@ fn replay_args(args: &[String]) -> Result<ReplayArgs, String> {
         // point, and decides nothing again.
         if why || at.is_some() || format.is_some() || shadow || options.until.is_some() {
             return Err(format!(
-                "--check replays every tape whole, as a corpus replays it: it takes FILEs, \
-                 DIRs and a candidate, nothing else: {USAGE}"
+                "--check takes only FILEs, DIRs, and --set/--policy: {USAGE}"
             ));
         }
         if !sets.is_empty() || policy.is_some() {
@@ -863,30 +849,21 @@ fn replay_args(args: &[String]) -> Result<ReplayArgs, String> {
     }
     let why = match (why, at) {
         (false, None) if format.is_none() => None,
-        (false, _) => {
-            return Err(format!(
-                "--at and --format name the decision --why explains: {USAGE}"
-            ));
-        }
+        (false, _) => return Err(format!("--at and --format require --why: {USAGE}")),
         (true, None) => return Err(format!("--why needs --at: {USAGE}")),
         (true, Some(_)) if options.until.is_some() => {
-            return Err(format!(
-                "--why replays to its own point, so it takes no --until: {USAGE}"
-            ));
+            return Err(format!("--why takes no --until: {USAGE}"));
         }
         (true, Some(at)) => Some((at, format.unwrap_or_default())),
     };
     let counterfactual = shadow || !sets.is_empty() || policy.is_some();
     if why.is_some() && counterfactual {
         return Err(format!(
-            "--why explains a decision under the recorded policy; --shadow decides every one \
-             again under a candidate: {USAGE}"
+            "--why cannot be combined with --shadow, --set, or --policy: {USAGE}"
         ));
     }
     if shadow && options.until.is_some() {
-        return Err(format!(
-            "--shadow decides every point on the tape, so it takes no --until: {USAGE}"
-        ));
+        return Err(format!("--shadow takes no --until: {USAGE}"));
     }
     if counterfactual {
         options.candidate = Some(Candidate { file: policy, sets });
@@ -948,7 +925,7 @@ fn tape_reply_with_limit(
         return Err(format!("tape {verb} needs the tape's FILE: {USAGE}"));
     };
     if verb == "show" && !decisions {
-        return Err("tape show needs --decisions (the one view it has)".to_string());
+        return Err("tape show needs --decisions".to_string());
     }
     let bytes = read_tape_bytes(&file, read_limit)
         .map_err(|e| format!("tape {verb}: cannot read {}: {e}", file.display()))?;

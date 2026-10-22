@@ -970,7 +970,7 @@ mod tests {
     use crate::core::RecordState;
     use crate::wire::{CAP_SENDS_BYE, PeerClass};
 
-    /// A LAB DESK'S MARKER IS READ AS ANY MARKER IS (session log Phase 6, step 6C-4): `aterm-gui`'s
+    /// A LAB DESK'S MARKER IS READ AS ANY MARKER IS: `aterm-gui`'s
     /// lab desk names its marker `crash-marker-<pid>-<nanos>-lab.log`, and the keeper reads it as
     /// it reads an `app` or `other` one: missing, the exit path ran (Released); there with its
     /// lock free, a death with no exit path (Dead), and so its consumed `.seen` name; held, a live

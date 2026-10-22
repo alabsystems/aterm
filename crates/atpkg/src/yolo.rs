@@ -3,7 +3,7 @@
 
 //! The `--yolo` alias, and yolo by default: on every managed agent name, a launch
 //! runs with every approval and sandbox off — aterm's posture is that AIs have
-//! full access to do the work (owner ruling, 2026-10-19). Each vendor CLI spells
+//! full access to do the work (owner ruling). Each vendor CLI spells
 //! that posture differently (claude and agy `--dangerously-skip-permissions`,
 //! codex `--dangerously-bypass-approvals-and-sandbox`, muse four switches), and
 //! claude and agy refuse the literal

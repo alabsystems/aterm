@@ -3,7 +3,7 @@
 
 //! THE ONE END, THE TAB'S `•` AND THE LOOK THAT QUIETS IT
 //! (`docs/DESIGN-harness-autopilot-2026-10-15.md` §11.2; the tests of
-//! §11.2.5 but the carry, slice 2b's), under Autopilot Cruise / Land,
+//! §11.2.5 but the carry), under Autopilot Cruise / Land,
 //! where the one end is Land's landing and Cruise never ends:
 //! `is_a_task_end`'s table; a background session's landing after 45 s of the
 //! agent's busy time, fed through the A/B book as the status sweep feeds it

@@ -584,6 +584,12 @@ pub(crate) struct OverlayInputs {
     pub ground: [u8; 3],
     /// The fade ramps (`MotionEffect::ScrollPill`); `false` hides binary.
     pub animated: bool,
+    /// The grid the frame lays the bars on ([`crate::app_mouse::GlassGrid`]):
+    /// under any other — a re-grid since, its frame not yet painted — they
+    /// answer no pointer (`App::laid_grid`), since their lanes were laid with
+    /// this frame's cell, inset and columns and the pointer is read with the
+    /// window's.
+    pub laid: Option<crate::app_mouse::GlassGrid>,
 }
 
 /// A window's overlay state: this frame's facts, the quads they make, what
@@ -909,6 +915,7 @@ impl App {
             animated: self
                 .effect_policy(crate::motion::MotionEffect::ScrollPill, focus)
                 .animate(crate::motion::MotionEffect::ScrollPill),
+            laid: self.glass_grid(wid),
         })
     }
 
@@ -991,6 +998,17 @@ impl App {
         (fx - self.win_pad(wid) as f64, fy - top as f64)
     }
 
+    /// The geometry the last frame laid window `wid`'s bars with, while the
+    /// window still has the grid they were laid on ([`App::laid_grid`]):
+    /// between a re-grid and the frame that lays them again, `None`, so no
+    /// pointer event hovers, grabs, pages or drags a lane laid at a cell,
+    /// inset or width the window no longer has.
+    fn laid_overlay_inputs(&self, wid: WindowId) -> Option<OverlayInputs> {
+        let inputs = self.windows.get(&wid)?.pane_overlay.inputs?;
+        self.laid_grid(wid, inputs.laid)?;
+        Some(inputs)
+    }
+
     /// The scrollbar under window pixel `(x, y)`: its pane's facts, lane and
     /// thumb, and what part of it is hit.
     fn scrollbar_at(
@@ -999,8 +1017,8 @@ impl App {
         x: f64,
         y: f64,
     ) -> Option<(PaneFacts, scrollbar::Lane, (u32, u32), scrollbar::Hit)> {
+        let inputs = self.laid_overlay_inputs(wid).filter(|i| i.scrollbar)?;
         let ws = self.windows.get(&wid)?;
-        let inputs = ws.pane_overlay.inputs.filter(|i| i.scrollbar)?;
         let (gx, gy) = self.grid_pixel(wid, x, y);
         let (cw, ch) = inputs.cell;
         let m = Metrics::for_cell(u32::try_from(cw).ok()?, u32::try_from(ch).ok()?);
@@ -1119,10 +1137,10 @@ impl App {
     /// One drag step: put the dragged thumb's top under the pointer, less the
     /// grab, and scroll its pane to the offset that puts it there.
     fn drag_scrollbar(&mut self, wid: WindowId, drag: Drag, x: f64, y: f64) {
-        let Some(ws) = self.windows.get(&wid) else {
+        let Some(inputs) = self.laid_overlay_inputs(wid) else {
             return;
         };
-        let Some(inputs) = ws.pane_overlay.inputs else {
+        let Some(ws) = self.windows.get(&wid) else {
             return;
         };
         let Some(facts) = ws

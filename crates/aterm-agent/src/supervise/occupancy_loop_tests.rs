@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE OCCUPANCY HOLD IN THE LOOP (`run/occupancy_loop.rs`; the occupancy design's slice 1a):
+//! THE OCCUPANCY HOLD IN THE LOOP (`run/occupancy_loop.rs`):
 //! what the loop feeds the hold's clock, the `OCCUPANCY` lines it journals and the
 //! `fact-hold@v1` rows it books — on hosted, unattended loops under a policy whose occupancy is
 //! not `off` alone (the red-team's F2 and F4) — and the successor that carries the hold only
@@ -854,3 +854,6 @@ fn the_hosted_loop_carries_the_hold_across_its_restarts() {
         ]
     );
 }
+
+#[path = "occupancy_door_tests.rs"]
+mod door;

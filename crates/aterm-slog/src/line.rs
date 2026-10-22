@@ -139,7 +139,7 @@ pub fn encode_bus(rec: &Rec, tier: Tier, ep: u32, ms: Option<u64>) -> Result<Str
 
 /// `rec` as the bus mirror's `v=2` body (§5.5, phase 4): [`encode_bus`] for
 /// a record of the bus class only, with an edge's actor written as its
-/// stable alias (ruling Q6). `alias` maps a session's sid to the token the
+/// stable alias. `alias` maps a session's sid to the token the
 /// bus shows for it (`e<8 hex>`, a keyed hash only this node can make), so
 /// two records by one edge still name one actor and the sid stays local;
 /// `None` writes `by=-`. No other actor is rewritten: `human ctl harness

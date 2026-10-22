@@ -124,7 +124,7 @@
 //! face, once the session's mirrored tail has landed (`bridge_mirror.rs`'s
 //! `mirror_retire_face`) — so only while the session-log mirror runs
 //! (`[fabric] log`: on by default over a broker that retains the node's `ev`
-//! faces, session log Phase 6 step 6E-3; never with "off"). No `presence` subject is
+//! faces; never with "off"). No `presence` subject is
 //! retired (the `exited` row a quitting instance or `aterm fabric doctor
 //! --retire-ghosts` writes is an update of it, which every roster reads), nor
 //! a `say/<topic>` face, nor a mail lane. So the ceiling is real: roughly two
@@ -220,7 +220,7 @@ use crate::subject::{self, Reject};
 use crate::transport::{self, Backoff, Conn};
 use crate::wait_tally::Recorder;
 
-/// THE BUS MIRROR's wiring (session log phase 4, `[fabric] log`):
+/// THE BUS MIRROR's wiring (`[fabric] log`):
 /// a child of this module, so it moves the bridge's own state.
 #[path = "bridge_mirror.rs"]
 mod mirror_run;
@@ -1541,8 +1541,8 @@ fn refusal_is_ack(e: &io::Error) -> bool {
 /// is no rows.
 ///
 /// A dedup is checked against its record by reading the record's face from the
-/// answered offset `off` ([`Bridge::publish_reserved`], [`Bridge::mirror_settle`],
-/// ruling Q3), and retention may take the record between the answer and the
+/// answered offset `off` ([`Bridge::publish_reserved`], [`Bridge::mirror_settle`]),
+/// and retention may take the record between the answer and the
 /// read. A broker before astream's R4 answered that read with a page clamped to
 /// its base, which held no record at `off`; a broker of R4 refuses it outright
 /// (`ERR_RECORD_REFUSED` under `retained-from=<oldest>`,
@@ -1634,8 +1634,8 @@ const LINK_SET_ASIDE_LANE: u32 = 4;
 /// with the endpoint's, which reads it off this bridge's `hello lane=`.
 const LINK_QUARANTINE_LANE: u32 = aterm_types::control_verbs::LINK_QUARANTINE_LANE;
 
-/// The bridge lane that added the mirror's WAITING states to `link mirror`
-/// (session log Phase 6): `budget`, the node at its window budget on a
+/// The bridge lane that added the mirror's WAITING states to `link mirror`:
+/// `budget`, the node at its window budget on a
 /// retaining broker ([`crate::mirror::NODE_WINDOW_BYTES`]), and
 /// `unretained`. An endpoint below it answers the word `ERR usage`, so it is
 /// not told (stderr says it).
@@ -1810,7 +1810,7 @@ enum Then {
     /// The node's ack of the fleet halt at `off`: the durable `halt-acked`
     /// watermark moves only once it LANDED ([`Bridge::ack_halt`]).
     HaltAck { off: u64 },
-    /// A pinned slot of the bus mirror's batch (session log phase 4): its
+    /// A pinned slot of the bus mirror's batch: its
     /// answer, deduped or not, goes to [`Bridge::conclude_mirror`].
     Mirror { slot: usize },
     /// A FRESH POST a drain sent without waiting ([`Bridge::send_post`]): it is
@@ -2002,8 +2002,8 @@ enum Opens {
     /// A directed `in/` lane — to a sid, or a `p/<principal>` lane: leaves
     /// [`LANE_RESERVE_DIVISOR`]'s share.
     Lane,
-    /// A session's `ev` face the bus mirror would open (session log phase
-    /// 4, ruling Q8): leaves [`SAY_RESERVE_DIVISOR`]'s share, a quarter, so the
+    /// A session's `ev` face the bus mirror would open:
+    /// leaves [`SAY_RESERVE_DIVISOR`]'s share, a quarter, so the
     /// mirror never spends the room a new session's presence row needs.
     Mirror,
 }
@@ -2077,10 +2077,10 @@ pub struct Config {
     /// however the bridge was set up: with it off nothing can release a `post
     /// --wait-ack`. `--no-receipts` and `[fabric] receipts = false` turn it off.
     pub receipts: bool,
-    /// `--log auto|off|turns` / `[fabric] log` (session log phase 4): whether
+    /// `--log auto|off|turns` / `[fabric] log`: whether
     /// the bridge mirrors the session logs' bus class onto the sessions' `ev`
-    /// faces. `auto` by default (owner decision D4, session log Phase 6 step
-    /// 6E-3): on while the broker retains them.
+    /// faces. `auto` by default (owner decision D4):
+    /// on while the broker retains them.
     pub log: crate::mirror::LogMode,
 }
 
@@ -2144,7 +2144,7 @@ pub struct Bridge {
     /// bridge writes carries under [`crate::state::PRESENCE_MARK`]: a row of a
     /// lower incarnation that carries it was written by an earlier bridge of
     /// this dir in this kernel boot, dead while this one holds the dir's lock,
-    /// and is this bridge's to retire (finding F4, [`adoptable`]). `None`
+    /// and is this bridge's to retire ([`adoptable`]). `None`
     /// without an inode or kernel boot: no row is then this dir's by its mark.
     mark: Option<String>,
     state: StateDir,
@@ -2380,12 +2380,12 @@ pub struct Bridge {
     /// build it named. A token added to the lane at lane N is written only
     /// when this is N or later (`aterm_types::control_verbs::BRIDGE_LANE`).
     endpoint_lane: u32,
-    /// THE BUS MIRROR (session log phase 4): `None` with `[fabric] log =
+    /// THE BUS MIRROR: `None` with `[fabric] log =
     /// "off"`, the opt-out, and then nothing of it runs ([`mirror_run`]).
     mirror: Option<Box<mirror_run::MirrorRun>>,
     /// WHETHER THE BROKER RETAINS THIS NODE'S `ev` FACES, as the current
     /// connection's `Hello` advertised its rules
-    /// ([`crate::broker_rules::retains_ev`], session log Phase 6 step 6E-2):
+    /// ([`crate::broker_rules::retains_ev`]):
     /// `None` before any attach. Judged at every attach
     /// ([`Bridge::note_broker_retention`]); the mirror keeps to its window
     /// budget over such a broker, and to its lifetime total over any other.
@@ -4392,7 +4392,7 @@ impl Bridge {
     /// reader can turn back into a path. A later bridge of the same dir in
     /// the same boot retires the ghost rows an earlier one left by it. A copy
     /// of the dir under the same node id has another mark, even when a cloned
-    /// disk repeats device and inode on another boot (finding F4,
+    /// disk repeats device and inode on another boot (
     /// [`Bridge::retire_ghost_presence`]).
     ///
     /// ## After `bye quit`, nothing but the withdrawal
@@ -6439,8 +6439,8 @@ impl Bridge {
         let started = fx.now();
         // A record the broker's retention gave up is no record: its
         // `retained-from=` is no rows, never the link down ([`read_back_rows`]),
-        // and the answer names the floor THIS SESSION'S LANE is kept from
-        // (session log Phase 6 step 6E-2): what is below it is gone, whoever's
+        // and the answer names the floor THIS SESSION'S LANE is kept from:
+        // what is below it is gone, whoever's
         // record `off` was, so it says nothing of another session's.
         let page = conn.fetch(off, &filter, 1);
         let floor = page
@@ -6840,7 +6840,7 @@ impl Bridge {
     ///
     /// NO ENTRY A POWER CUT BROUGHT BACK IS HERE, where a boot can be named.
     /// After an unclean stop in an earlier boot the start retired every whole
-    /// one unpublished ([`Bridge::retire_in_flight_state`], finding F2): a
+    /// one unpublished ([`Bridge::retire_in_flight_state`]): a
     /// power cut can bring back the entry of a record that landed, and where
     /// the log on its own lost that record after its sender's later posts,
     /// publishing it here landed it behind them. What is here is this boot's,
@@ -9079,7 +9079,7 @@ impl Bridge {
     /// * the row's `inc=` is this bridge's own incarnation or a LOWER one AND
     ///   it carries this state dir's mark (`statedir=`, [`StateDir::mark`]),
     ///   so an earlier bridge of the dir in this boot wrote it, dead while
-    ///   this one holds the dir's lock (finding F4: before the mark, a ghost whose writer's
+    ///   this one holds the dir's lock (before the mark, a ghost whose writer's
     ///   successors all died inside the five minutes stood for good); or the
     ///   exact writer `(incarnation, mark)` whose will this attach witnessed
     ///   ([`adoptable`]). A bridge that
@@ -9154,8 +9154,8 @@ impl Bridge {
             // ONLY WHAT THIS INCARNATION CAN PROVE UNHOSTED.
             let marked = self.mark.is_some()
                 && body.unknown.get(crate::state::PRESENCE_MARK) == self.mark.as_ref();
-            // NEGATIVE CONTROL (`crate::sim`): no row's mark read, as before
-            // finding F4's decision — this incarnation and the will its attach
+            // NEGATIVE CONTROL (`crate::sim`): no row's mark read, before the fix
+            // decision — this incarnation and the will its attach
             // witnessed are the only ones whose rows are its to retire.
             #[cfg(test)]
             let marked = marked && !self.fx.mutant(crate::sim::world::Mutant::ReadNoMark);
@@ -11439,7 +11439,7 @@ impl Bridge {
                 self.note_ack(rtt);
             }
             // An `auto` mirror follows the retention this broker's `Hello`
-            // advertised (session log Phase 6 step 6E-3).
+            // advertised.
             self.mirror_attached();
         } else {
             self.attach_rtt = None;
@@ -11522,7 +11522,7 @@ impl Bridge {
             return false;
         };
         // The `Hello` the identity read guarantees also advertised the
-        // broker's retention rules (session log Phase 6 step 6E-2).
+        // broker's retention rules.
         self.note_broker_retention();
         let lineage = self.conn_now().and_then(|c| c.log_lineage().cloned());
         #[cfg(test)]
@@ -12216,7 +12216,7 @@ impl Bridge {
         {
             return true;
         }
-        // NEGATIVE CONTROL (`crate::sim`): finding F1's first fix — a file is
+        // NEGATIVE CONTROL (`crate::sim`): a file is
         // whole when its reader takes it, so a cut that still reads stays.
         #[cfg(test)]
         let swept = if self
@@ -12263,7 +12263,7 @@ impl Bridge {
 
     /// AFTER AN UNCLEAN STOP IN AN EARLIER BOOT, every whole in-flight entry
     /// is retired — moved aside, never published again
-    /// ([`StateDir::retire_in_flight_of_an_earlier_boot`], finding F2): a power
+    /// ([`StateDir::retire_in_flight_of_an_earlier_boot`]): a power
     /// cut can bring back the entry of a record that landed, and when the log
     /// on its own lost that record after the sender's later posts, the attach's
     /// republish ([`Bridge::settle_in_flight`]) landed it behind them. The
@@ -12313,7 +12313,7 @@ impl Bridge {
         }
     }
 
-    /// RULINGS Q6 AND Q13 ACROSS A POWER CUT: after an unclean stop in an
+    /// after an unclean stop in an
     /// earlier boot, the bus mirror's pin is RECONCILED with its durable copies
     /// ([`StateDir::reconcile_logpin`]): a torn one is moved aside — counted
     /// with the torn files, for aterm ([`Bridge::set_aside`]) — a whole one
@@ -12400,7 +12400,7 @@ impl Bridge {
     /// THE RECOVERY AN UNCLEAN STOP IN AN EARLIER BOOT OWES, ALL OF IT BEFORE
     /// `run` SAYS A BRIDGE RUNS IN THIS ONE (sim item S7): the torn files set
     /// aside ([`Bridge::set_aside_torn_state`]), the whole in-flight entries of
-    /// that boot retired ([`Bridge::retire_in_flight_state`], finding F2), the
+    /// that boot retired ([`Bridge::retire_in_flight_state`]), the
     /// mirror's pin reconciled ([`Bridge::reconcile_logpin_state`]).
     ///
     /// All three act on one verdict, `run`'s
@@ -12410,8 +12410,8 @@ impl Bridge {
     /// full disk, an I/O error) is done again BEFORE that record is written,
     /// or never — and never cost the boot every attach: a torn in-flight entry
     /// left where it is was refused at each one, a wedge no clean disk healed;
-    /// a pin left unreconciled stopped the mirror, or counted below its floor
-    /// (ruling Q13). Until it completes nothing that reads what it recovers
+    /// a pin left unreconciled stopped the mirror, or counted below its floor.
+    /// Until it completes nothing that reads what it recovers
     /// goes on: `run` is not written, no attach runs (the attach's own wait,
     /// [`Bridge::run_names_this_boot`], tries it again first), and the
     /// mirror judges no pin ([`Bridge::mirror_hello_answered`]).
@@ -12905,7 +12905,7 @@ impl Bridge {
         // attach reads the in-flight journal and the reservations — and before
         // this run's record says, for the next boot, that a bridge runs in this
         // one: the torn files set aside, then the whole in-flight entries of
-        // that earlier boot retired (finding F2), and the mirror's pin
+        // that earlier boot retired, and the mirror's pin
         // reconciled with its durable copies, whose verdict `begin_run`
         // ends — and where the disk refuses it, no attach goes on until it
         // has ([`Bridge::run_names_this_boot`]).
@@ -13091,7 +13091,7 @@ impl Bridge {
     /// park judged BEFORE the round settles what the items before left owed
     /// ([`Bridge::duty_wait`]): OFF IS NOTHING ([`mirror_run`]), the wait
     /// included. With the mirror engaged, the mirror's pass, a round item of
-    /// its own (ruling Q10) — nothing on the queue waits behind it, and its
+    /// its own — nothing on the queue waits behind it, and its
     /// acks are read when the round runs out of work — then the round, whose
     /// park is judged AFTER that settle ([`Bridge::park_wait`]): the acks just
     /// read may have concluded the mirror's batch, whose landing is owed at
@@ -13130,7 +13130,7 @@ impl Bridge {
 
     /// HOW LONG A LOOP WHOSE MIRROR IS ENGAGED MAY PARK NOW: until the first
     /// duty that has work ([`Bridge::duty_wait`]), and not at all while the
-    /// bus mirror has work it can do now (ruling Q10; until its retry while a
+    /// bus mirror has work it can do now (until its retry while a
     /// busy answer waits, [`Bridge::mirror_due`]).
     fn park_wait(&self, now: Instant) -> Duration {
         let wait = self.duty_wait(now);
@@ -13201,7 +13201,7 @@ impl Bridge {
             // — and nothing else would read it before the idle backstop's
             // grace ([`IDLE_ACK_GRACE`]), since nothing wakes the loop when an
             // ack arrives; and the BUS MIRROR'S BATCH, whose landing is the
-            // mirror's next work and the park's measure (ruling Q10,
+            // mirror's next work and the park's measure (
             // [`Bridge::mirror_then_round`]). The loop is idle, so the wait
             // holds up nothing queued; an item that comes during it is taken
             // once the batch's flush lands. A group commit sent ahead of a
@@ -14046,8 +14046,7 @@ fn carried_elsewhere(body: &Body, inc: u64, self_inc: u64, host: &str) -> Option
 ///
 /// * `inc` at or below `self_inc` and the row `marked` with this state dir's own
 ///   mark ([`StateDir::mark`]) — an earlier bridge of this dir in this boot
-///   wrote it, dead because one state dir is one bridge and this one holds its lock (finding
-///   F4: before the mark, a ghost whose writer's successors all died inside
+///   wrote it, dead because one state dir is one bridge and this one holds its lock (before the mark, a ghost whose writer's successors all died inside
 ///   the five minutes stood for good).
 /// * `Some(inc) == witnessed_dead` — a will's incarnation, passed here ONLY
 ///   after its writer mark matched the session row's. Concurrent copied dirs
@@ -14073,8 +14072,8 @@ fn carried_elsewhere(body: &Body, inc: u64, self_inc: u64, host: &str) -> Option
 /// AND NOT "an incarnation this state dir took", which is what the dir could
 /// remember: a copy of the dir takes its numbers as this dir does, so it can
 /// take one this dir took and never presented, or one whose rows a log that
-/// lost power no longer shows, and run under it with live sessions (finding
-/// F4's review). The number does not say whose rows are under it; the mark
+/// lost power no longer shows, and run under it with live sessions.
+/// The number does not say whose rows are under it; the mark
 /// does.
 fn adoptable(inc: Option<u64>, self_inc: u64, witnessed_dead: Option<u64>, marked: bool) -> bool {
     match inc {
@@ -15379,7 +15378,7 @@ mod tests {
             !adoptable(Some(1), 3, Some(2), false),
             "`inc <= witnessed` is the generous reading, and it is not proven"
         );
-        // ITS OWN DIR'S EARLIER BRIDGES (finding F4): a lower incarnation's
+        // ITS OWN DIR'S EARLIER BRIDGES: a lower incarnation's
         // row with this dir's mark, each writer dead while B holds the lock —
         // and not a copy's row under one of the very numbers the dir took.
         assert!(adoptable(Some(1), 3, None, true));
@@ -15608,7 +15607,7 @@ mod tests {
     }
 
     /// **A FETCH BELOW WHAT THE BROKER KEEPS OF THE SESSION'S LANE NAMES THE
-    /// LANE'S FLOOR** (session log Phase 6 step 6E-2): two mails on the
+    /// LANE'S FLOOR**: two mails on the
     /// session's lane, the broker's cut past the first. `inbox get @<off>` of
     /// the first is answered `err=retained floor=<n>` (the endpoint's `ERR
     /// retained-from=<n>`), with the floor past it and at or below the kept
@@ -16530,7 +16529,7 @@ mod tests {
         outbox_retires: Arc<std::sync::atomic::AtomicBool>,
         /// Every `deliver` line, whole, in the order the lane read them.
         deliveries: Arc<std::sync::Mutex<Vec<String>>>,
-        /// THE BUS MIRROR's endpoint (session log phase 4): real session
+        /// THE BUS MIRROR's endpoint: real session
         /// logs by sid, `log-take` and `log-landed` answered with their real
         /// take and landing, as the GUI's handlers answer them.
         mirror: Arc<std::sync::Mutex<FakeMirror>>,
@@ -16540,10 +16539,10 @@ mod tests {
     #[derive(Default)]
     struct FakeMirror {
         logs: BTreeMap<String, aterm_slog::Log>,
-        /// A sid it does not hold is `adopting` while set (ruling Q1), `gone`
+        /// A sid it does not hold is `adopting` while set, `gone`
         /// otherwise.
         adopting: bool,
-        /// BROKEN CALLS for the negative controls (rulings Q1, Q12): answer
+        /// BROKEN CALLS for the negative controls: answer
         /// `gone` while adopting; drop every cover from a take.
         gone_while_adopting: bool,
         skip_covers: bool,
@@ -17881,7 +17880,7 @@ mod tests {
     }
 
     /// **A REPLY'S IN-FLIGHT ENTRY CUT BEFORE ITS WITNESS DOES NOT WEDGE THE
-    /// NEXT BOOT'S ATTACH** — the review of finding F1's fix, as its probe ran
+    /// NEXT BOOT'S ATTACH** — as its probe ran
     /// it. In boot 1 the bridge attaches and journals a reply to a local
     /// session (`re=` in its body, the log it was decided on as its witness),
     /// and stops uncleanly. A power cut leaves the entry cut just before its
@@ -17889,8 +17888,7 @@ mod tests {
     /// [`Bridge::settle_in_flight`] refuses at every attach. In boot 2 the
     /// sweep sets it aside and the attach goes on. NEGATIVE CONTROL: without
     /// the sweep — the start's, and the attach's own wait's, which does what
-    /// a start's recovery left undone (sim item S7) — boot 2's attach refuses:
-    /// finding F1's wedge.
+    /// a start's recovery left undone (sim item S7) — boot 2's attach refuses.
     #[test]
     fn a_reply_entry_cut_before_its_witness_is_set_aside_and_the_next_boot_attaches() {
         for sweep in [true, false] {
@@ -18132,7 +18130,7 @@ mod tests {
         }
     }
 
-    /// **FINDING F2, DECIDED, AT THE BRIDGE: THE NEXT BOOT'S FIRST BRIDGE RETIRES
+    /// **THE NEXT BOOT'S FIRST BRIDGE RETIRES
     /// AN IN-FLIGHT ENTRY, AND ITS ATTACH PUBLISHES NOTHING FOR IT.** In boot 1
     /// the bridge attaches, holds a whole entry for a note to a local session
     /// whose record the log does not hold — what a power cut leaves when it
@@ -18203,8 +18201,8 @@ mod tests {
     }
 
     /// **NO ATTACH RUNS WHILE `run` NAMES AN EARLIER BOOT'S UNCLEAN STOP, SO A
-    /// RELAUNCH IN THE SAME BOOT RETIRES NOTHING LIVE** — the review of
-    /// finding F2's fix, as its probe ran it. The last bridge of boot 1 did
+    /// RELAUNCH IN THE SAME BOOT RETIRES NOTHING LIVE** —
+    /// as its probe ran it. The last bridge of boot 1 did
     /// not stop cleanly; in boot 2 the first bridge's start sweeps and
     /// retires, and then the disk refuses its `run` write (full), which is
     /// said and survived. Had its attach gone on, `run` would still say "open,
@@ -20186,7 +20184,7 @@ mod tests {
             backlog[first - 1] + 1
         );
 
-        // ROUND TWO: the rest of the backlog, then both shouts, in offset order.
+        // the rest of the backlog, then both shouts, in offset order.
         round(&mut bridge);
         let mut want = backlog.clone();
         want.extend([live, later]);
@@ -20349,7 +20347,7 @@ mod tests {
     }
 
     /// **A NEW LANE PAST THE BUDGET IS RETIRED, AND THE QUEUE BEHIND IT LANDS**
-    /// (finding 03, the subject-budget half). The node's producer holds every
+    /// (the subject-budget half). The node's producer holds every
     /// subject of its budget. s-a's note to @s-b would open a new lane, below
     /// the lane reserve: it is retired `reason=subject-budget` at the door
     /// ([`Bridge::budget_allows`]). s-a's ask to @s-b is a lane the door
@@ -24043,8 +24041,8 @@ mod tests {
         (records, writer, socket, broker, server)
     }
 
-    /// **A REFILL BELOW A RETAINING BROKER'S FLOOR READS ON FROM IT** (session
-    /// log Phase 6 step 6E-2). Three records on a session's inbox lane and no
+    /// **A REFILL BELOW A RETAINING BROKER'S FLOOR READS ON FROM IT**.
+    /// Three records on a session's inbox lane and no
     /// `seen` cursor, so the refill reads from [`REFILL_FLOOR_SPAN`] behind the
     /// head, offset 0; the broker then cuts its log below the second record,
     /// so a plain read from there is refused `retained-from=` the second, as it
@@ -28350,8 +28348,8 @@ mod tests {
         assert_eq!(ring_refusal(&ring(s, 1, None), &[], s), None);
     }
 
-    /// THE BUS MIRROR's bridge half against the derived `LogMirror` model
-    /// (session log phase 4): the Tier-1 binding and its negative controls.
+    /// THE BUS MIRROR's bridge half against the derived `LogMirror` model:
+    /// the Tier-1 binding and its negative controls.
     mod mirror_conformance {
         include!("bridge_mirror_tests.rs");
     }

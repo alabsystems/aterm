@@ -69,6 +69,10 @@ atpkg-keys = { workspace = true }
 # found the way the STOCK EXCEPTION lanes find it. First-party, no cycle: nothing
 # links this binary-only crate.
 aterm-verify = { workspace = true }
+# The release layer `ship provision` audits (provision/layer.rs, design §4.6) is
+# aterm-converge items: one engine with `aterm init`, whose base report it reads back
+# from the installed aterm in the engine's own schema.
+aterm-converge = { workspace = true }
 
 # Same-filesystem clock stamps own an exclusive scratch directory in the slot;
 # they never remove a fixed pre-existing marker merely to read its mtime.

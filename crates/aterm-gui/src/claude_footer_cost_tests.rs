@@ -713,8 +713,8 @@ fn read_only_while_read(word: &str, what: &str, change: fn(&mut App, u64, usize)
     }
 }
 
-/// A NEED THAT MOVES WHILE NOBODY READS COSTS NO FRAME (§12.2.4, §12.2.6;
-/// slice 2e): a harness's need published anew under Cruise, three times
+/// A NEED THAT MOVES WHILE NOBODY READS COSTS NO FRAME (§12.2.4, §12.2.6):
+/// a harness's need published anew under Cruise, three times
 /// with the pointer elsewhere and three with it on the chip
 /// ([`read_only_while_read`]). NEGATIVE CONTROLS (as run): the trail's
 /// generation folded into the footer's term at rest (`glass_bits` keying
@@ -726,8 +726,8 @@ fn a_need_that_moves_while_nobody_reads_costs_no_frame() {
     read_only_while_read("cruise", "a need", need);
 }
 
-/// A HOLD THAT MOVES WHILE NOBODY READS COSTS NO FRAME (§12.3.4, §12.3.6;
-/// slice 3d): Land's hold told anew under Land, a nudge at a time, three
+/// A HOLD THAT MOVES WHILE NOBODY READS COSTS NO FRAME (§12.3.4, §12.3.6):
+/// Land's hold told anew under Land, a nudge at a time, three
 /// times with the pointer elsewhere and three with it on the chip
 /// ([`read_only_while_read`]). NEGATIVE CONTROL (as run): the trail's
 /// generation folded into the footer's term at rest fails `nobody

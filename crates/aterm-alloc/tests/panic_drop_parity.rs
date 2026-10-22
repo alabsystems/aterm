@@ -47,7 +47,7 @@ fn drain_log() -> Vec<usize> {
     DROPS.with(|d| std::mem::take(&mut *d.borrow_mut()))
 }
 
-fn recorder(index: usize, boom_at: usize) -> Recorder {
+const fn recorder(index: usize, boom_at: usize) -> Recorder {
     Recorder {
         index,
         boom: index == boom_at,

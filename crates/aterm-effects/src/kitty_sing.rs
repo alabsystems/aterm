@@ -748,11 +748,17 @@ impl KittySing {
     /// or live celebration while keeping the external-arm cooldown
     /// (`last_external_arm`) intact. Idempotent.
     #[inline]
-    pub fn drain_serious(&mut self) {
-        *self = Self {
-            last_external_arm: self.last_external_arm,
-            ..Self::default()
-        };
+    pub const fn drain_serious(&mut self) {
+        self.run = None;
+        self.count = 0;
+        self.last = None;
+        self.session = None;
+        self.armed_at = None;
+        self.wind_from = None;
+        self.handover_from = None;
+        self.armed_external = None;
+        self.external = None;
+        self.fan_bar = None;
     }
 }
 

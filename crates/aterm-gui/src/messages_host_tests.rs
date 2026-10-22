@@ -162,7 +162,7 @@ fn finished_workstation_setup_clears_existing_and_queued_exceptions() {
     assert!(!app.owes_exception(&settings.key()));
 }
 
-/// TORN FABRIC STATE FILES ARE A FACT FOR LATER (finding F1): the bridge's
+/// TORN FABRIC STATE FILES ARE A FACT FOR LATER: the bridge's
 /// `link set-aside files=<n>`, handed to the store as the fabric's registry
 /// ([`crate::fabric::Registry::torn_state_set_aside`]), is queued on the
 /// endpoint's thread and raised at the next park as ONE exceptions entry
@@ -2567,11 +2567,10 @@ fn a_carried_unhealed_stall_never_silences_the_successors_own_watchdog() {
 }
 
 #[cfg(unix)]
-/// ROUND-EIGHT UPDATE AUDIT, FINDINGS 15 (the check case) AND 301 (scenario
-/// A), WITH 302's REALISTIC NEXT EVENT — A CARRIED CHECK WARNING IS HEALED
+/// A CARRIED CHECK WARNING IS HEALED
 /// BY THE SUCCESSOR'S FIRST HEALTHY CHECK, AND NEVER MUTES ITS NEXT EPISODE.
 /// The parent raised "Couldn't check for updates"; a build landed (which
-/// answers only an install warning, finding 54). The successor's first
+/// answers only an install warning). The successor's first
 /// check came back up to date, which clears the streak in the ledger — and
 /// its updater, which had announced nothing, sent nothing: the latch stood
 /// for the launch, and hours later a new failing episode was a log line, no
@@ -2606,7 +2605,7 @@ fn a_carried_check_warning_heals_by_the_successors_first_healthy_check() {
             "its digest line crosses the update (automatic: {automatic})"
         );
         // Still failing: the adopting updater restates it, quietly — and the
-        // landing, which proves nothing about checking (finding 54), left the
+        // landing, which proves nothing about checking, left the
         // carried row standing, never a second beside it.
         assert!(!successor.note_update_health(aterm_update::HEALTH_RESTATED_TITLE, body));
         assert!(healings(&successor).is_empty());
@@ -2691,16 +2690,15 @@ fn a_carried_warnings_digest_line_says_what_the_parents_would_have() {
 }
 
 #[cfg(unix)]
-/// ROUND-EIGHT UPDATE AUDIT, FINDINGS 15 AND 301 (lock-held), WITH 302's
-/// REALISTIC NEXT EVENT — A CARRIED LOCK-HELD WARNING IS THE SUCCESSOR'S
+/// A CARRIED LOCK-HELD WARNING IS THE SUCCESSOR'S
 /// WATCHDOG'S TO HEAL. A landing proves nothing about a sibling aterm holding
 /// the machine's check lock, but the successor's own checker sees the
 /// streak's end: its first check completed without deferring (as for a
-/// replacement generation, round six's finding 9). Latched with nothing to
+/// replacement generation). Latched with nothing to
 /// heal it, the next lock-held episode was swallowed. The same holds for a
 /// carried STALL ("Update check stopped", about the parent's check thread:
-/// the successor runs a new one and heals it by the same proof, finding 301
-/// scenario B). NEGATIVE CONTROLS: no checker yet, or one that has checked
+/// the successor runs a new one and heals it by the same proof).
+/// NEGATIVE CONTROLS: no checker yet, or one that has checked
 /// nothing, heals nothing; and a sibling still stuck is taken over by the
 /// successor's own deferrals — said once, not twice, healed when it ends.
 #[test]
@@ -3497,8 +3495,8 @@ fn a_record_the_parked_parent_makes_never_shares_an_id_with_the_successor() {
 }
 
 #[cfg(unix)]
-/// A NOTICE WHILE PARKED IS TOLD TO RETRY (round-seven update audit,
-/// finding 32): the carry was captured at the park, so a post the parked
+/// A NOTICE WHILE PARKED IS TOLD TO RETRY (round-seven update audit):
+/// the carry was captured at the park, so a post the parked
 /// parent accepted was never shown by the successor and its id was handed
 /// out again. Now the parent answers the transient `ERR busy` class and
 /// mints nothing; unparked, the same post is taken.
@@ -4838,8 +4836,8 @@ fn a_warning_heals_only_on_the_proof_that_answers_it() {
     assert_eq!(healed(&check), 1);
 }
 
-/// A CARRIED WARNING HEALED BY THE LANDING IS ON THE SUCCESSOR'S RECORD (round
-/// six, finding 54): the parent `_exit`s at Commit and never learns its warning
+/// A CARRIED WARNING HEALED BY THE LANDING IS ON THE SUCCESSOR'S RECORD:
+/// the parent `_exit`s at Commit and never learns its warning
 /// healed, so what it said crosses the handoff as its own field — surviving the
 /// manifest's own encoding — and the successor's landing records "aterm
 /// updates work again" once, against the parent's words: on the explicit lane

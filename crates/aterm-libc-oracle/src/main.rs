@@ -1,31 +1,22 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `aterm-libc-oracle` — decides `crates/aterm-libc` against the pinned
-//! reference libc on the ABI cell this box is native to.
+//! `aterm-libc-oracle` — checks `crates/aterm-libc` against the pinned
+//! reference `libc = "=0.2.186"` on this host's native ABI cell, and
+//! regenerates cell modules across all four cells.
 //!
-//! `libc-oracle/` is a separate workspace with no `[patch]` table, so its
-//! `libc = "=0.2.186"` reaches the registry crate while `under-test/` names the
-//! shim's own sources; inside this workspace the patch would make the oracle
-//! compare the shim with itself. One run, all under the pinned Trust toolchain:
+//! `libc-oracle/` is a standalone workspace without `[patch]` so the reference
+//! resolves from the registry while `under-test/` compiles the shim's sources.
+//! Under the pinned Trust toolchain, the gate runs five phases:
+//! 1. `inputs` — `Cargo.lock` current, locked deps offline, `union.json`;
+//! 2. `siblings` — same-OS hand-written cell bodies identical ([`siblings`]);
+//! 3. `conformance` — generated layout/const assertions compile and pass (`targo test -p libc-conformance`);
+//! 4. `shape` & `symbols` — rustdoc public shape and extern linker symbols match reference ([`shape`], [`symbols`]);
+//! 5. `controls` — planted defects are caught ([`controls`]).
 //!
-//! 1. inputs — `Cargo.lock` current, locked dependencies offline, `union.json`;
-//! 2. siblings — each same-OS pair's hand-written bodies identical ([`siblings`]);
-//! 3. conformance — the cell's generated assertions compile and its runtime
-//!    tests pass (`targo test -p libc-conformance`);
-//! 4. shape and symbols — fresh rustdoc of both crates: the shim's public
-//!    shape and every extern's linker symbol against the reference's
-//!    ([`shape`], [`symbols`]);
-//! 5. controls — planted defects the oracle must catch ([`controls`]).
-//!
-//! A finding outranks a stop: a run the machine cannot finish still exits 1
-//! when it found a defect before stopping.
-//!
-//! Two authoring verbs share its modules, so the generator and the gate read the
-//! reference, the cell table and the declaration set through ONE implementation:
-//! `regen` ([`regen`]) rewrites the shim's cell modules and the oracle's
-//! conformance modules, and `harvest` ([`harvest`]) widens `union.json` from a
-//! workspace check's errors.
+//! Authoring verbs share the same cell table and declaration closure:
+//! `regen` ([`regen`]) rewrites the shim and conformance cell modules, and
+//! `harvest` ([`harvest`]) widens `libc-oracle/union.json` from a check log.
 
 mod cargo;
 mod cells;
@@ -55,14 +46,11 @@ use crate::run::{Observer, Options};
 use crate::union::Union;
 use crate::verdict::{EXIT_USAGE, PhaseReport, Report};
 
-/// The oracle workspace's own build directory under the checkout, named so
-/// Spotlight skips it and all it holds (`aterm-verify`'s libc-oracle lane is the
-/// same directory).
+/// Default build directory for the oracle workspace (`*.noindex` so Spotlight skips it).
 const ORACLE_TARGET: &str = "libc-oracle/target.noindex";
 
 const USAGE: &str = "\
-aterm-libc-oracle — decide crates/aterm-libc against the pinned reference libc
-on the ABI cell this box is native to, and regenerate it
+aterm-libc-oracle — check crates/aterm-libc against reference libc 0.2.186 on the native ABI cell
 
 usage: aterm-libc-oracle [--root <checkout>] [--target-dir <dir>]
        aterm-libc-oracle regen [--root <checkout>] [--out <dir>] [--work <dir>]
@@ -70,34 +58,24 @@ usage: aterm-libc-oracle [--root <checkout>] [--target-dir <dir>]
        aterm-libc-oracle harvest --cell <key> [--root <checkout>] [--work <dir>]
                                  [--docs <dir>] [--stock <toolchain>] [--write] <log>
 
-  --root <checkout>   the aterm checkout (default: the one containing the
-                      working directory)
-  --target-dir <dir>  the oracle workspace's builds (default:
-                      <checkout>/libc-oracle/target.noindex, which
-                      Spotlight skips); one per checkout, never shared
-                      with another
-  -h, --help          this text
+  --root <checkout>   aterm checkout (default: ancestor of cwd)
+  --target-dir <dir>  gate build dir (default: <checkout>/libc-oracle/target.noindex)
+  -h, --help          print this help
 
-regen: rewrite crates/aterm-libc/src/<cell>.rs and
-libc-oracle/conformance/src/cell_<cell>.rs for all four cells from the
-reference libc's rustdoc and const-eval probes, then trustfmt them. The cell
-this box is native to is compiled under Trust; the others under a stock rustup
-toolchain with their std installed (STOCK EXCEPTION: Trust ships std for its
-host only).
-  --out <dir>         write under this checkout-shaped directory instead
-  --work <dir>        scratch (default:
-                      <checkout>/libc-oracle/target.noindex/regen)
-  --docs <dir>        libc-0.2.186-<triple>.json dumps made elsewhere, used
-                      for the cells they cover
-  --stock <toolchain> the rustup toolchain for the other cells (default: stable)
-  --no-format         leave the output as emitted
+regen: rewrite crates/aterm-libc/src/<cell>.rs and libc-oracle/conformance/src/cell_<cell>.rs
+for all four cells from reference libc rustdoc and const-eval probes, then trustfmt.
+The native cell compiles under Trust; non-host cells use stock rustup with target std
+installed (STOCK EXCEPTION: Trust ships std for its host only).
+  --out <dir>         write into this checkout-shaped directory instead of --root
+  --work <dir>        scratch dir (default: <checkout>/libc-oracle/target.noindex/regen)
+  --docs <dir>        use prebuilt libc-0.2.186-<triple>.json rustdoc dumps from <dir>
+  --stock <toolchain> rustup toolchain for non-host cells (default: stable)
+  --no-format         skip trustfmt on emitted files
 
-harvest: read a `--message-format short` workspace check log built for one
-cell; print the names it says libc lacks that the reference exports there,
-and with --write add them to libc-oracle/union.json (then regen).
+harvest: parse a `--message-format short` check log for `--cell <key>`, list missing symbols
+exported by reference libc on that cell, and with `--write` add them to libc-oracle/union.json.
 
-exit: 0 pass · 1 finding (even if the run then stopped) · 2 usage ·
-      3 could not run, nothing found (the reason names its fix)";
+Exit: 0 pass, 1 finding (even if the run then stopped), 2 usage, 3 could not run.";
 
 /// What a run does.
 #[derive(Debug, Default, PartialEq, Eq)]

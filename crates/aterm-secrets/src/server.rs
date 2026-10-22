@@ -376,6 +376,24 @@ pub fn start_with_join_change_gap(
     )
 }
 
+/// [`start`] as a server on another Mac than its clients': no connection comes from this
+/// machine, so a name the store holds nothing for takes a first version only under a pin
+/// ([`refuse_unheld`]), as from every Mac but the server's own.
+#[cfg(test)]
+pub(crate) fn start_apart(
+    listener: std::net::TcpListener,
+    options: &Options,
+) -> crate::Result<Running> {
+    launch(
+        listener,
+        options,
+        Tuning {
+            is_local: |_, _| false,
+            ..Tuning::default()
+        },
+    )
+}
+
 /// The clocks a server keeps and how it tells this machine's connections from others':
 /// the constants above and [`this_machine`] in a served server; tests shorten and fake them.
 #[derive(Clone, Copy)]
@@ -588,9 +606,10 @@ fn note(line: &str) {
 }
 
 /// What [`serve`] logs at start when its store holds no vault yet (a new server, or one moved
-/// to another Mac): a machine that asks to join finds none until an admin Mac puts its copy
-/// here, as any admin command there does (`client::admin_open`), and a first version comes
-/// from another Mac only for a name `pins` covers ([`refuse_unheld`]). `None` once it holds one.
+/// to another Mac): a machine that asks to join finds none until a Mac in the vault puts its
+/// copy here, as its subscriber's next pass does (`client::sync`) and any admin command there
+/// (`client::admin_open`), and a first version comes from another Mac only for a name `pins`
+/// covers ([`refuse_unheld`]). `None` once it holds one.
 fn unheld_note(state: &State, pins: &[(String, [u8; 32])]) -> Option<String> {
     if !state.vaults.is_empty() {
         return None;
@@ -605,7 +624,7 @@ fn unheld_note(state: &State, pins: &[(String, [u8; 32])]) -> Option<String> {
         )
     };
     Some(format!(
-        "the store holds no vault yet: an admin Mac puts its copy here (any aterm secrets admin command there does), and until then a machine that asks to join finds none; a first version is taken {from}"
+        "the store holds no vault yet: a Mac in the vault puts its copy here (its subscriber does, and any aterm secrets admin command there), and until then a machine that asks to join finds none; a first version is taken {from}"
     ))
 }
 
@@ -1384,11 +1403,12 @@ fn refuse_unheld(shared: &Shared, state: &State, name: &str, local: bool) -> Opt
         return None;
     }
     // Trust on first use, from this machine only: whoever is first pins the name, and a
-    // stranger on the LAN must not be first.
+    // stranger on the LAN must not be first. The reason is read on another Mac, so it names
+    // this one as the server's, and what lets the version in.
     if !local && !shared.pins.iter().any(|(pinned, _)| pinned == name) {
         return Some(Reply::text(
             403,
-            "the first version of a vault is accepted only from this machine, or under --pin",
+            "the first version of a vault is accepted only from the server's own Mac, or under aterm secrets serve --pin <vault>=<key>",
         ));
     }
     if state.vaults.len() >= MAX_VAULTS {
@@ -1910,6 +1930,18 @@ pub fn caffeinate_args(pid: u32) -> Vec<String> {
     vec!["-i".to_owned(), "-w".to_owned(), pid.to_string()]
 }
 
+/// The addresses this Mac's traffic leaves by: the default route's over IPv4, the LAN's (the
+/// one `<name>.local` is reached by) and the default route's over IPv6, each `None` without a
+/// route. What changes when the Mac joins or leaves a network (a Wi-Fi, a cable, a VPN), so a
+/// vault that did not answer is asked again at once; no packet is sent.
+pub fn route_sources() -> [Option<IpAddr>; 3] {
+    [
+        primary_ipv4().map(IpAddr::V4),
+        lan_ipv4().map(IpAddr::V4),
+        primary_ipv6().map(IpAddr::V6),
+    ]
+}
+
 /// The IPv4 address of the interface the default route leaves by: a UDP socket connected to
 /// TEST-NET-1 (no packet is sent) and its local address. `None` when there is no route.
 pub fn primary_ipv4() -> Option<Ipv4Addr> {
@@ -2271,10 +2303,10 @@ mod tests {
     }
 
     /// A server whose store holds no vault yet says so in its log at start: a joining machine
-    /// finds none until an admin Mac puts its copy here, which another Mac can do only for a
-    /// vault the server pins. A store that holds one says nothing.
+    /// finds none until a Mac in the vault puts its copy here, which another Mac than the
+    /// server's can do only for a vault the server pins. A store that holds one says nothing.
     #[test]
-    fn a_store_that_holds_no_vault_says_an_admin_mac_puts_its_copy_here() {
+    fn a_store_that_holds_no_vault_says_a_mac_in_the_vault_puts_its_copy_here() {
         let root = aterm_tempfile::tempdir().expect("tempdir");
         let running = run(&options(
             &root.path().join("served"),
@@ -2285,7 +2317,7 @@ mod tests {
             |pins: &[(String, [u8; 32])]| unheld_note(&running.shared.lock_server_state(), pins);
         let pinned = unheld(&pins).expect("an empty store says so");
         assert!(
-            pinned.contains("an admin Mac puts its copy here"),
+            pinned.contains("a Mac in the vault puts its copy here"),
             "{pinned}"
         );
         assert!(
@@ -2634,7 +2666,11 @@ mod tests {
         let running = run(&options(root.path(), Duration::from_millis(200)));
         put(&running, &envelope(&OLD, 5)).expect("first");
         let fetched = transport::fetch(&source(&running), Some(5), HANG_DETECTOR).expect("held");
-        assert_eq!(fetched, Fetched::NoNewer);
+        assert_eq!(
+            fetched,
+            Fetched::NoNewer(Some(5)),
+            "the 204 names the seq held"
+        );
         running.stop();
 
         let running = run(&options(root.path(), HANG_DETECTOR));
@@ -2644,7 +2680,7 @@ mod tests {
         running.stop();
         assert_eq!(
             waiter.join().expect("waiter").expect("ended"),
-            Fetched::NoNewer
+            Fetched::NoNewer(Some(5))
         );
     }
 
@@ -3752,7 +3788,9 @@ mod tests {
         let error = put(&running, &envelope(&OLD, 1)).expect_err("from another machine");
         assert!(error.0.contains("403"), "{error}");
         assert!(
-            error.0.contains("only from this machine, or under --pin"),
+            error.0.contains(
+                "only from the server's own Mac, or under aterm secrets serve --pin <vault>=<key>"
+            ),
             "{error}"
         );
         assert!(stored(&store).is_none());
@@ -3849,7 +3887,7 @@ mod tests {
         // The held long-poll was answered, not cut.
         assert_eq!(
             waiter.join().expect("waiter").expect("ended"),
-            Fetched::NoNewer
+            Fetched::NoNewer(Some(1))
         );
         until("every connection has closed", || {
             shared.active.load(Ordering::SeqCst) == 0
@@ -3887,7 +3925,7 @@ mod tests {
         assert!(shared.stopping.load(Ordering::SeqCst));
         assert_eq!(
             waiter.join().expect("waiter").expect("ended"),
-            Fetched::NoNewer
+            Fetched::NoNewer(Some(1))
         );
     }
 

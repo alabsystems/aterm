@@ -874,7 +874,7 @@ pub const STALE_S: u64 = 300;
 /// out, never timed out: the line has [`STALE_S`] once it lifts (LC-7 of the
 /// 2026-10-15 sweep: a hold landing just after the upgrade's SIGTERM expired
 /// the restart `stale-exit` under it, and nothing relaunched the agent once
-/// the hold lifted; ruling 20 of 2026-10-14 for the explicit restart's exit).
+/// the hold lifted).
 #[must_use]
 pub(super) fn exit_clock(at_s: u64, exited_at: u64, hand_seen_s: u64) -> u64 {
     at_s.max(exited_at).max(hand_seen_s)
@@ -4742,8 +4742,8 @@ pub fn follow_record(snap: &mut Snapshot, sf: &SessionFile) -> bool {
 /// crash is also an upgrade), else the program it ran (`same`). Configuration
 /// only takes power away: with the switch off, a crash never moves the
 /// session onto another build. NOR DOES A BUILD THE CONVERSATION'S UPGRADE
-/// RECORD HOLDS IT OFF (`held`, [`St::holds_off`]): the owner's word (round
-/// eight, #24) — a build the owner skipped, or any while their `Not today`
+/// RECORD HOLDS IT OFF (`held`, [`St::holds_off`]): the owner's word (#24)
+/// — a build the owner skipped, or any while their `Not today`
 /// stands, is no relaunch target, where a crash moved the session straight
 /// onto the build the owner had refused; a build newer than a skipped one
 /// is ("until a NEWER build is the target") — and a build that failed to
@@ -4816,7 +4816,7 @@ pub enum ExitRecord {
     /// typed after it, whatever the shell draws by the attempt: the word
     /// that told it is gone once another command's block is the newest, and
     /// a crash read there as a restart (any `--session-id` launch's) went
-    /// with no continuation (the review of 3a4586a01e, R2).
+    /// with no continuation.
     Restarted,
 }
 
@@ -5201,8 +5201,7 @@ fn after_exit_as(
     // relaunch. A line read here on an exit of its own rode a snapshot past
     // the copy that validated it (a seamless update's handed leaf, the agent
     // still running at the Commit): its end, before the successor's
-    // re-proof, is nobody's, left (fail closed; the review of 2026-10-16,
-    // finding 1).
+    // re-proof, is nobody's, left (fail closed; the review of 2026-10-16).
     match &snap.run {
         AgentRun::Codex(_) => {
             if cause != ExitCause::Exit
@@ -5942,7 +5941,7 @@ fn carry_own_step(opts: &Opts, r: Report, mut st: St, session: &str, tab: &str) 
         return said(r, "landed");
     }
     // A HAND ON THE TAB IS WAITED OUT, UNCOUNTED (LC-7 of the 2026-10-15
-    // sweep; what ruling 20 of 2026-10-14 gave the explicit restart's exit):
+    // sweep; the explicit restart's exit):
     // a restart whose line is still to type, read while a hold or any hand
     // the line waits on stands on its tab, attempts nothing — no lease, no
     // model ask, no line — and answers [`WAIT_HAND_LIFTS`]: the host's
@@ -6600,7 +6599,7 @@ fn settle_look(opts: &Opts, r: &Report, st: &mut St, key: &str, now: u64) -> Opt
 pub const WAIT_ACT_ENDS: &str = "wait:not-exited:act-ends";
 
 /// THE WORD FOR AN EXIT THE HARNESS MADE, CARRIED THROUGH A HAND THAT WAITS:
-/// the explicit restart's (ruling 20 of 2026-10-14, the host's word,
+/// the explicit restart's (the host's word,
 /// `aterm-gui`'s `on_agent_left`: an exit the act's stamp names, read while a
 /// hold or any hand the relaunch line waits on holds the tab
 /// ([`hand_on_tab`]), is the act's still — [`on_exit`] answers
@@ -6727,10 +6726,10 @@ pub enum OnExit {
 /// `[harness] human_grace_s`; `asked`: the explicit restart ended it (its
 /// stamp names the process: the stall's remedy, or a person's own
 /// `restart`), so a keystroke just before was no `/exit`, and a hold, a lease
-/// or a turn on the tab is waited out, never handed the exit (ruling 20 of
-/// 2026-10-14: the host types its relaunch only once that hand lifts,
+/// or a turn on the tab is waited out, never handed the exit (the host types its relaunch only once that hand lifts,
 /// [`hand_on_tab`], [`WAIT_HAND_LIFTS`], as the harness's own restart's
-/// relaunch line waits on `held`); `restarted`: the harness's own restart ended it
+/// relaunch line waits on `held`);
+/// `restarted`: the harness's own restart ended it
 /// ([`restarted`]), asked first because that exit is the restart's whoever is
 /// at the tab ([`OnExit::Restarted`]). A person or holder owns any other exit
 /// before the configuration limit is asked, which holds an asked exit too;

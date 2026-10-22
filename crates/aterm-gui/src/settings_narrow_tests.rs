@@ -1022,7 +1022,7 @@ fn messages_small_buttons_stay_on_the_page() {
 
 /// HARNESS KEEPS ITS WORDS WITH SESSIONS OPEN (the narrow sweep):
 /// the page with its sessions — and again with three under Land and a
-/// reading of landings (slice 4c) — at 22 to 42 columns, short and tall, 1×
+/// reading of landings — at 22 to 42 columns, short and tall, 1×
 /// and 2× — every row's title, detail, setting, state and day whole on as many
 /// lines as its column needs, every face of its buttons whole, nothing past
 /// its card; a row taller than one screen of its card listed a part at a time
@@ -1035,8 +1035,7 @@ fn harness_keeps_its_words_with_sessions_open() {
         let mut parts = 0;
         for width in NARROW_WIDTHS {
             for height in NARROW_HEIGHTS {
-                // The page as published, and with landings counted (slice
-                // 4c: the Every row's `landed` and `quiet`, `Landed`, the
+                // The page as published, and with landings counted (the Every row's `landed` and `quiet`, `Landed`, the
                 // done claims checked, today's lines led by landings).
                 for (fixture, state) in [
                     ("", super::harness::fixture()),
@@ -2297,8 +2296,8 @@ fn every_control_and_word_of_a_system_page_is_on_some_screen() {
                                             3
                                         ));
                                     }
-                                    // Harness with its sessions and landings counted
-                                    // (slice 4c): the Every row's parts, Landed, the done
+                                    // Harness with its sessions and landings counted:
+                                    // the Every row's parts, Landed, the done
                                     // claims checked, today's line led by landings.
                                     if toolless && route == SettingsRoute::Harness {
                                         assert!(runtime.replace_settings_harness(

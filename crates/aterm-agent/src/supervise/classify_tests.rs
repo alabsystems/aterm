@@ -473,6 +473,7 @@ fn awk_programs_and_sed_scripts_are_read_not_dropped() {
     assert!(!ro("awk -v n=3 'NR > n' f"));
     assert!(ro("awk '{print \"a>b|c\"}' f"));
     assert!(ro("awk '{ s += $1 } END { print s / NR }' f"));
+    assert!(ro("awk -- '{print}' f"));
 
     assert!(!ro("sed 's/a/b/w /tmp/out' file"));
     assert!(!ro("sed -n '/x/w out' f"));
@@ -511,6 +512,119 @@ fn awk_programs_and_sed_scripts_are_read_not_dropped() {
         sed_script_writes("k").is_some(),
         "an unknown command is unparsed"
     );
+}
+
+/// AN AWK PROGRAM RUNS OR WRITES IN EVERY SPELLING AWK READS. MEASURED
+/// 2026-10-22 on macOS awk 20200816 in a scratch directory, each of the first
+/// ten ran a command or made a file the classifier called a read: `system`
+/// with a blank before its `(`, a bare `system` (it runs `$0`), a `print` or
+/// `printf` redirect to a field or a number (`>` in a print statement is a
+/// redirect whatever follows), one continued over a `,` newline, one after a
+/// `#` comment that held a `"`, one after a regex that held a `"`, and a pipe
+/// after a pattern regex on a new line. A `/` after `++`, which may divide
+/// or start a regex, is refused unplaced. An `awk` that is gawk (Linux, a
+/// Homebrew PATH) has options and forms the classifier skipped, refused too: a
+/// program it does not see (`-E`, `--exec`, a second `-e`, `--source=`), a
+/// file it writes (`-d`, `-o`, `-W`), and `@include`/`@load` and its indirect
+/// calls.
+///
+/// NEGATIVE CONTROL: the reads beside each stay reads — a comparison in an
+/// `if`'s or in print's own parentheses, a string or a comment holding the
+/// characters, an escaped `/` in a regex, `systemd` as text, a pattern
+/// comparison on the line after a `print`, and the separator and variable
+/// options.
+#[test]
+fn an_awk_program_that_runs_or_writes_in_any_spelling_is_no_read() {
+    for cmd in [
+        "awk 'BEGIN{system (\"touch m1\")}'",
+        "awk '{system}' cmds.txt",
+        "awk '{print $1 > $1}' f",
+        "awk 'BEGIN{print 1 > 4}'",
+        "awk 'BEGIN { if (1) print \"y\" > 5 }'",
+        "awk 'BEGIN { printf \"%s\", \"z\" > -6 }'",
+        "awk 'BEGIN { print \"a\",\n \"b\" > 10 }'",
+        "awk 'BEGIN { # \"\nprint 1 > 2\n# \"\n}'",
+        "awk 'BEGIN { print /\"/ > 9 }'",
+        "awk '{ x = 1 }\n/\"/ { print \"touch m8\" | \"sh\" }' in1",
+        "awk '{ n++ / 2 }' f",
+        "awk -E prog.awk f",
+        "awk --exec=prog.awk f",
+        "awk -d/tmp/x 'BEGIN{}'",
+        "awk -o 'BEGIN{}'",
+        "awk -W dump-variables=/tmp/x 'BEGIN{}'",
+        "awk -e 'BEGIN{}' -e 'BEGIN{system(\"x\")}'",
+        "awk --source='BEGIN{system(\"x\")}' f",
+        "awk --source 'BEGIN { print 1 > 2 }'",
+        "awk '@include \"x.awk\"'",
+        "awk 'BEGIN { f = \"sys\" \"tem\"; @f(\"date\") }'",
+    ] {
+        let v = classify_command(cmd);
+        assert!(!v.read_only, "{cmd:?} is no read");
+    }
+    // NEGATIVE CONTROL
+    for cmd in [
+        "awk '{ if ($1 > 3) print $2 }' f",
+        "awk '{print ($1 > 3)}' f",
+        "awk '{print \"a>b\"}' f",
+        "awk '{ n++ } END { print n }' f",
+        "awk -F'\\t' -v OFS=, '{print $1, $2}' f",
+        "awk '/a\\/b/ {print}' f",
+        "awk '# a \"quoted\" comment\n{print $1}' f",
+        "awk '{print \"systemd\"}' f",
+        "awk '{ print $1 }\n$2 > 3 { print $3 }' f",
+        "awk --assign=n=3 --field-separator=: '{print $n}' f",
+        "awk -e '{print $1}' f",
+    ] {
+        let v = classify_command(cmd);
+        assert!(v.read_only, "{cmd:?} refused: {}", v.reason);
+    }
+}
+
+/// SORT AND GIT TAKE AN ABBREVIATED LONG OPTION FOR THE WHOLE ONE
+/// ([`long_option_spells`]). MEASURED 2026-10-22 in a scratch directory:
+/// macOS sort 2.3-Apple wrote `--outp`'s file and ran `--compress=`'s and
+/// `--co=`'s program (with `-S 100K` over 200000 lines), and git 2.54.0 (a
+/// scratch repository and HOME) removed a key on `config --unset-a`, a
+/// section on `config --rem`, the branch's upstream on `branch --unset-u` and
+/// wrote its description on `branch --edit-d` (`config --ed` opens the
+/// editor on the file). `tag -l --del v1` git refuses (`--delete` and `-l`
+/// cannot be used together): taking the prefix there only over-refuses.
+///
+/// NEGATIVE CONTROL: the read options sort and git share no prefix with stay
+/// reads.
+#[test]
+fn an_abbreviated_write_option_is_the_write() {
+    for cmd in [
+        "sort --o=out f",
+        "sort --outp out f",
+        "sort --compress=./x.sh -S 100K f",
+        "sort --co=./x.sh f",
+        "git config --unset-a user.name",
+        "git config --rem a",
+        "git config --ed",
+        "git branch --unset-u",
+        "git branch --edit-d",
+        "git tag -l --del v1",
+    ] {
+        let v = classify_command(cmd);
+        assert!(!v.read_only, "{cmd:?} is no read");
+    }
+    // NEGATIVE CONTROL
+    for cmd in [
+        "sort -t: -k2 f",
+        "sort --numeric-sort --reverse --unique --key=2 f",
+        "sort --random-sort f",
+        "git config --get user.name",
+        "git config --get-all k",
+        "git config --list --show-origin",
+        "git branch --list --sort=-committerdate",
+        "git branch --format='%(refname)' --list",
+        "git branch --contains HEAD --no-color",
+        "git tag --list --sort=v:refname",
+    ] {
+        let v = classify_command(cmd);
+        assert!(v.read_only, "{cmd:?} refused: {}", v.reason);
+    }
 }
 
 /// A substitution is a word of its command here too, its body's words a

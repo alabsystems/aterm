@@ -975,7 +975,7 @@ impl Grid {
     /// so XOR-ing `UNDERLINE` alone could turn curly into dotted. Reverse mode 4
     /// therefore maps any underline to none and none to single.
     #[inline]
-    fn reverse_cell_attrs(
+    const fn reverse_cell_attrs(
         flags: super::CellFlags,
         toggle: super::CellFlags,
         toggle_underline: bool,

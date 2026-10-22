@@ -102,7 +102,7 @@ fn write_shards_file(dir: &Path, shards: u32) -> io::Result<()> {
     {
         let mut f = crate::store::create_fresh(&tmp, &mut std::fs::OpenOptions::new())?;
         f.write_all(format!("{shards}\n").as_bytes())?;
-        f.sync_all()?;
+        astream_sys::full_sync(&f)?;
     }
     crate::store::rename_path(&tmp, &target)?;
     crate::store::sync_parent_dir(&target)

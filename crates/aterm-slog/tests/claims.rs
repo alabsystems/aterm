@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Claims (design §3.7, §7.4; phase 3A rulings R1, R13): a claim is an
+//! Claims (design §3.7, §7.4): a claim is an
 //! attributed opinion that never overrides an observation, the trusted
 //! authors' newest claims are kept beside the newest of any author, a label
 //! reaches `brief` and the clause only from the harness or the owner, and no
@@ -655,7 +655,7 @@ fn a_need_stays_its_raisers() {
     );
 }
 
-/// No CHOSEN NAME is an actor word (ruling R1's class): an `as=` naming one,
+/// No CHOSEN NAME is an actor word (class): an `as=` naming one,
 /// in any case, is no field at all — refused by the fields a mark is built
 /// from, skipped by the line decoder, refused by the fold snapshot — so
 /// nothing reads `by=- as=harness`. NEGATIVE CONTROL: any other name holds.

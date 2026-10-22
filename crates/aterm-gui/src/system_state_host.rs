@@ -146,6 +146,8 @@ pub(crate) struct Host {
     offer_presented: bool,
     action_refusal: Option<SetupStatusRow>,
     latest_status: SetupStatus,
+    /// The last status read this Mac synced by setup ([`SetupStatus::vault_synced`]).
+    vault_synced: bool,
     #[cfg(target_os = "macos")]
     notice_shown: bool,
 }
@@ -339,6 +341,14 @@ impl App {
     ) {
         #[cfg(not(target_os = "macos"))]
         let _ = present_notice;
+        // A run whose Secrets stage now reads this Mac in and subscribed ends the vault's
+        // digest lines, once per report that says so: a line raised later beside the same
+        // report stands.
+        let synced = status.vault_synced();
+        let was = std::mem::replace(&mut self.system_state_host.vault_synced, synced);
+        if synced && !was {
+            self.secrets_synced_by_setup();
+        }
         self.system_state_host.latest_status = status.clone();
         if self
             .system_state_host

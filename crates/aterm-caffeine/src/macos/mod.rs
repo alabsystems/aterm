@@ -45,6 +45,12 @@ pub(crate) fn serve(ctx: ServeContext) -> ExitCode {
     app::run(ctx)
 }
 
+/// Let a bridge an update restart left go: a `serve` that will not run holds nothing for it to
+/// bridge to ([`bridge::release`]).
+pub(crate) fn release_bridge(paths: &Paths) {
+    bridge::release(paths);
+}
+
 /// `aterm caffeine bridge`: keep the Mac awake while the mug restarts onto an update
 /// ([`bridge`]); what a restarting mug runs.
 pub(crate) fn bridge() -> ExitCode {

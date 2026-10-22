@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `lab reduce` held to ruling T7 over every `supervise/fixtures` transcript:
+//! `lab reduce` over every `supervise/fixtures` transcript:
 //! the reduction folds as its source and keeps no text; and the negative
 //! controls (a reducer that keeps content, one that replaces `type`, one that
 //! blanks a notice's text) each fail the check they break.
@@ -614,7 +614,7 @@ const CLAUDE_PLANT_KEPT: [(usize, &str); 12] = [
 /// and a string under a time key that is no whole stamp is replaced whole,
 /// so the planted words survive nowhere and the text check passes; a whole
 /// stamp is still rebased, and an attachment's `type` and a queued prompt's
-/// `origin`, closed words the harness's readers read, are kept (ruling U7).
+/// `origin`, closed words the harness's readers read, are kept.
 /// NEGATIVE CONTROL: each planted row as an earlier rule
 /// reduced it (its keys as written, the stamp's tail and the attachment's
 /// word kept) fails the text check, naming the words.
@@ -743,8 +743,7 @@ fn a_reduction_keeps_no_key_or_stamp_tail_anyone_wrote() {
     }
 }
 
-/// The committed 2.1.303 reduction (5H-2b), reduced again by ruling U7's
-/// rule (6D-2, ruling U8).
+/// The committed 2.1.303 reduction (5H-2b).
 const STEPS_2_1_303: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../aterm-agent/src/harness/testdata/steps/2.1.303.jsonl"
@@ -791,8 +790,8 @@ fn rows_of(text: &str) -> Vec<Node> {
 }
 
 /// T7, THE ARGUMENT CHECK, which finds a tool's arguments by their shape
-/// and not by the reducer's rule, over the committed 2.1.303 reduction as
-/// ruling U8 re-reduced it: no row keeps a tool's argument name as written
+/// and not by the reducer's rule, over the committed 2.1.303 reduction:
+/// no row keeps a tool's argument name as written
 /// (its `api-request-shape` row's tool list and Bash's input are renamed
 /// whole), and the file is the reducer's fixed point, reduced again it is
 /// itself, its `#` line too; so are the committed Codex reductions. The
@@ -961,8 +960,8 @@ fn a_codex_reduction_keeps_no_text() {
     check_no_text("codex", &src, &r, Program::Codex).expect("no text");
     assert!(!r.text.contains("quokka"), "{}", r.text);
     let rows: Vec<&str> = r.text.lines().collect();
-    // A parsed command's `type` is a closed word no reader reads (ruling
-    // U7); a call's namespace the step fold reads.
+    // A parsed command's `type` is a closed word no reader reads;
+    // a call's namespace the step fold reads.
     assert!(
         rows[2].contains(r#""parsed_cmd":[{"type":"","cmd":"","name":"","path":""}]"#),
         "{}",
@@ -1028,8 +1027,7 @@ impl Rules for BlanksNotices {
     }
 }
 
-/// A reducer that keeps EVERY candidate closed word, read or not (the rule
-/// before ruling U7).
+/// A reducer that keeps EVERY candidate closed word, read or not.
 struct KeepsEveryCandidate;
 
 impl Rules for KeepsEveryCandidate {
@@ -1111,7 +1109,7 @@ fn a_reducer_that_blanks_notice_text_fails_the_wall_check() {
 }
 
 /// A transcript holding a closed word no reader reads and one a reader
-/// reads (ruling U7): a prompt; a `mode` row, whose `type` and `mode` no
+/// reads: a prompt; a `mode` row, whose `type` and `mode` no
 /// reader opens, the mode a word someone wrote; the model's reply; and the
 /// turn's end, a `system` row whose `subtype` the step fold reads.
 const WORDS_PLANT: [&str; 4] = [
@@ -1121,7 +1119,7 @@ const WORDS_PLANT: [&str; 4] = [
     r#"{"type":"system","subtype":"turn_duration","durationMs":1200,"timestamp":"2026-10-16T10:00:02.000Z","uuid":"31111111-1111-4111-8111-111111111111","parentUuid":"21111111-1111-4111-8111-111111111111","version":"2.1.303"}"#,
 ];
 
-/// RULING U7: a closed word is kept only where a reader reads it. The
+/// a closed word is kept only where a reader reads it. The
 /// planted `"mode":"quokkaledger"` (a word under a closed key, which the
 /// rule before U7 kept as written) is emptied, while its row's `type`, which
 /// the harness reads of every row, is kept; so is the turn end's `subtype`,
@@ -1169,7 +1167,7 @@ fn a_closed_word_is_kept_only_where_a_reader_reads_it() {
     assert!(e.contains("steps became"), "{e}");
 }
 
-/// THE OUTPUT-SIDE CHECK (ruling U7) over every `supervise/fixtures`
+/// THE OUTPUT-SIDE CHECK over every `supervise/fixtures`
 /// transcript and the planted Codex rollout: each closed word a reduction
 /// keeps, blanked alone, changes its readings. NEGATIVE CONTROL: a reducer
 /// that keeps every candidate keeps an unread word in every fixture.
@@ -1202,7 +1200,7 @@ fn every_closed_word_a_reduction_keeps_is_read() {
     );
 }
 
-/// NEGATIVE CONTROL (ruling U7): a reducer that blanks a word a reader
+/// NEGATIVE CONTROL: a reducer that blanks a word a reader
 /// reads (each `subtype` the readers keep: a turn's `turn_duration`, a
 /// compaction's `compact_boundary`) fails the fold check on every fixture
 /// whose reduction keeps one.
@@ -1225,8 +1223,8 @@ fn a_reducer_that_blanks_a_read_word_fails_the_fold_check() {
     );
 }
 
-/// A file no choice of words can make read as its source is refused (ruling
-/// U7): a rule that empties every `subtype` loses the turn's end, which no
+/// A file no choice of words can make read as its source is refused:
+/// a rule that empties every `subtype` loses the turn's end, which no
 /// word put back restores. NEGATIVE CONTROL: the plant itself reduces.
 #[test]
 fn a_reduction_nothing_restores_is_refused() {
@@ -1236,7 +1234,7 @@ fn a_reduction_nothing_restores_is_refused() {
     assert!(reduce(&src, Program::Claude).is_ok());
 }
 
-/// A reduction reduced again is itself (ruling U8): the readers keep the
+/// A reduction reduced again is itself: the readers keep the
 /// same words, each id and key keeps its name, the times move no further
 /// and the header says the source was a reduction, its day count the whole
 /// move from the first source. NEGATIVE CONTROL: the first reduction's own
@@ -1463,7 +1461,7 @@ fn a_codex_rollout_keeps_words_ids_and_numbers_only() {
         rows[0]
     );
     // A `session_meta`'s `type` and its build are words the harness reads
-    // (the limits reader's first line, the step fold's build: ruling U7);
+    // (the limits reader's first line, the step fold's build);
     // its path and instructions go.
     assert_eq!(
         rows[1],
@@ -1490,7 +1488,7 @@ fn a_codex_rollout_keeps_words_ids_and_numbers_only() {
 /// `collaboration` starts a subagent), and so is the `session_meta` that
 /// makes the call, 10 ms on, the thread's own, its build and an event's
 /// `type` the step fold reads; an abort's `reason` and an item's own `type`,
-/// which no reader reads, go (ruling U7); the millisecond stamps
+/// which no reader reads, go; the millisecond stamps
 /// (`started_at_ms`) and an item's fractional `create_time` move with the
 /// stamps; a call's free-form `arguments` and a message's `content` go.
 /// NEGATIVE CONTROL: the source's own epochs appear nowhere in the
@@ -1656,7 +1654,7 @@ fn harness_reads_as(source: &str, red: &Reduction) -> Result<(), String> {
     Ok(())
 }
 
-/// THE HARNESS'S OWN READERS (the review of 6D-1: ruling U7's readings are
+/// THE HARNESS'S OWN READERS (the review of 6D-1: readings are
 /// the committed readers', and a notice's typed words, its quota's and the
 /// login's are theirs), held apart from the reducer's [`readings`]: over
 /// every `supervise/fixtures` transcript, each prefix of the reduction
@@ -1729,7 +1727,7 @@ const ENDS_PLANT: [&str; 10] = [
     r#"{"type":"system","subtype":"turn_duration","durationMs":4000,"timestamp":"2026-10-16T10:00:09.000Z","uuid":"a1111111-1111-4111-8111-111111111111","parentUuid":"91111111-1111-4111-8111-111111111111","version":"2.1.303"}"#,
 ];
 
-/// THE ENDS AFTER EVERY ROW ARE A READING (ruling U7's fold check): a
+/// THE ENDS AFTER EVERY ROW ARE A READING (fold check): a
 /// reduction whose only fault is the time of the first turn's last words
 /// (an hour late) keeps every step, the losses, the last end and every
 /// notice, and fails the fold check by the end after that row. NEGATIVE
@@ -1755,7 +1753,7 @@ fn an_end_after_a_row_is_read() {
     assert!(e.contains("the end after row 3"), "{e}");
 }
 
-/// THE CHOICE ([`choose`], ruling U7) on readings made to need each of its
+/// THE CHOICE ([`choose`]) on readings made to need each of its
 /// legs: two pairs read redundantly (either restores the reading, so
 /// blanking each alone changes nothing) are put back the first-seen one
 /// first, until the choice reads as every pair kept; and a pair put back

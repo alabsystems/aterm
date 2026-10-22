@@ -170,7 +170,7 @@ fn json_needs(json: &str, sid: &str) -> Option<String> {
 /// ask (`needs=ask`), then the supervisor's newer wait — under which the
 /// survey's attention excerpt is still the ask's words — and the bare entry's
 /// clear — which moves no effective value, only an entry under it — must
-/// still reach the need (review of 742e292c3). The clear's own wake is
+/// still reach the need. The clear's own wake is
 /// pinned in-process (`needs_tests::clearing_an_older_ask_under_a_newer_wait_
 /// moves_the_need`): a live instance republishes a session on more than one
 /// path (its screen re-read among them). NEGATIVE CONTROL: the wait — read without its kind, the

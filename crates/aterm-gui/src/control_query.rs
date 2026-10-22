@@ -2475,7 +2475,7 @@ fn write_styled_cell_json(
 }
 
 /// The wire name of a DEC [`LineSize`](aterm_core::grid::LineSize): the renderer
-/// scales these rows, so a lossless frame must carry them (audit finding F2).
+/// scales these rows, so a lossless frame must carry them.
 pub(crate) fn line_size_name(s: aterm_core::grid::LineSize) -> &'static str {
     use aterm_core::grid::LineSize;
     match s {
@@ -2501,7 +2501,7 @@ pub(crate) fn row_line_size(t: &Terminal, r: usize) -> aterm_core::grid::LineSiz
 /// Every DISTINCT inline image on the live screen, each at its top-left grid
 /// anchor `(row, col)` (deduplicated by payload identity), whatever the
 /// viewport shows. Shared shape with `cmd_image_read`'s screen mode; consumed
-/// by the styled frame (audit finding F1) so a `subscribe cells` / `screen`
+/// by the styled frame so a `subscribe cells` / `screen`
 /// watcher sees images, not blank cells, on the rows its cells describe.
 ///
 /// ROW-MAJOR, ascending column within a row: a socket client indexes into this

@@ -131,7 +131,7 @@ impl CursorGlow {
     /// [`Self::clear_transient_state`]. The zero-amplitude path does not call this: a momentary
     /// unfocus only cools by the elapsed gap, so earned forge momentum survives a focus blip.
     #[inline]
-    pub(super) fn clear_thermals(&mut self) {
+    pub(super) const fn clear_thermals(&mut self) {
         self.heat = 0.0;
         self.heat_at = None;
         self.flare = 0.0;

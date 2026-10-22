@@ -140,7 +140,7 @@ pub(crate) const fn agent_switch_off(agent: aterm_phase::Program) -> &'static st
 }
 
 /// ONE MODE'S SENTENCE (`docs/DESIGN-harness-autopilot-2026-10-15.md`
-/// §12.4.1, slice 4d), in the form each surface says it: the owner's own
+/// §12.4.1), in the form each surface says it: the owner's own
 /// words ("keep finding more to do", "wrap it up") around the engine's
 /// truth, the remote main branch.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -158,7 +158,7 @@ pub(crate) struct ModeWords {
     pub(crate) button: &'static str,
 }
 
-/// EVERY MODE'S SENTENCE, ONE TABLE (§12.4.1, slice 4d): the chip's title,
+/// EVERY MODE'S SENTENCE, ONE TABLE (§12.4.1): the chip's title,
 /// the records, Settings ▸ Harness and the manual (`aterm help harness`'s
 /// AUTOPILOT) read it, so a mode is never said two ways. In
 /// [`Autopilot::ALL`]'s order; [`mode_words`] looks one up.

@@ -234,7 +234,7 @@ const CORE_HOT: u32 = 0x00FF_E9B0;
 /// Heat -> dust, on one clock for the whole cloud. Cooling starts once the bloom is well
 /// underway, so the cap first appears fire-lit.
 #[inline]
-fn cool(t_ms: u64) -> f32 {
+const fn cool(t_ms: u64) -> f32 {
     aterm_scene::smoothstep((t_ms.saturating_sub(1500) as f32 / 1600.0).clamp(0.0, 1.0))
 }
 

@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE SESSION JOURNAL ON BY DEFAULT (session log Phase 6, step 6B-1; D3,
-//! ruled 2026-10-19; ruling U21), across real aterm processes sharing one
+//! THE SESSION JOURNAL ON BY DEFAULT (D3,
+//! ruled 2026-10-19), across real aterm processes sharing one
 //! scratch world whose config has NO `[session_log]` table:
 //!
 //! 1. A, a headless instance under the lab's desk seam

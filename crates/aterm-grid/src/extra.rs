@@ -139,7 +139,7 @@ impl CellExtra {
     /// Check if this extra has any data (non-empty).
     #[must_use]
     #[inline]
-    pub fn has_data(&self) -> bool {
+    pub const fn has_data(&self) -> bool {
         self.hyperlink.is_some()
             || self.complex_char.is_some()
             || !self.combining.is_empty()
@@ -398,7 +398,7 @@ impl CellExtra {
     /// colours, without the bit (`Cell::bce_blank`).
     #[must_use]
     #[inline]
-    pub(crate) fn has_claimable_data(&self) -> bool {
+    pub(crate) const fn has_claimable_data(&self) -> bool {
         self.hyperlink.is_some()
             || self.complex_char.is_some()
             || !self.combining.is_empty()

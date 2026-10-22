@@ -2,7 +2,7 @@
 // Copyright 2026 Andrew Yates
 
 //! The instance's node log (design §2.1 "node", §2.6 "Per instance"; phase 5
-//! sub-phase 5J, ruling T27): [`NODE_LOG_RECORDS`] records at node `n`, what
+//! sub-phase 5J): [`NODE_LOG_RECORDS`] records at node `n`, what
 //! the instance itself did rather than any session.
 //!
 //! ```text

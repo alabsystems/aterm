@@ -3905,8 +3905,8 @@ fn a_parked_control_apply_rides_the_next_newer_facts_instead_of_going_stale() {
     );
 }
 
-/// A SEAMLESS SUCCESSOR'S OWN UPDATE FACTS OUTLIVE ITS COMMIT WAIT (round eight of
-/// the update audit, U14). The successor asks the facts worker for its Startup
+/// A SEAMLESS SUCCESSOR'S OWN UPDATE FACTS OUTLIVE ITS COMMIT WAIT.
+/// The successor asks the facts worker for its Startup
 /// read as it boots; the answer usually lands inside the overlap, before the
 /// Commit, and nothing asks again after it. Swallowed there, a restored Settings ▸
 /// Software Update page kept the pristine reducer's "You're up to date." while the

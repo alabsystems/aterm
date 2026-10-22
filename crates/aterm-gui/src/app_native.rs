@@ -6586,7 +6586,7 @@ impl App {
         }
     }
 
-    /// The node log's `config key=` (session log 5J-2): the schema keys whose
+    /// The node log's `config key=`: the schema keys whose
     /// authored values `snapshot` moved since the last one this App
     /// compared, by NAME only. Every admitted snapshot is published here, so
     /// this is the one place a config change reaches the node log.
@@ -7695,7 +7695,7 @@ impl App {
     /// own trial `check_boot_health` may count before any swap. A candidate
     /// that stays that build because its boot apply had nothing it may do now,
     /// or deferred on a passing refusal, refuses its target as no verdict on
-    /// it — exit 75 — and gives that launch back on its way out (round eight,
+    /// it — exit 75 — and gives that launch back on its way out (
     /// #75). One whose boot apply DEFERRED ON A VERDICT (the running build's
     /// own trial whose recovery proof fails, "trial recovery proof: …") does
     /// neither: `seamless::passing_refusal_exit` answers no 75, and the parent
@@ -8560,9 +8560,9 @@ impl App {
     /// process cannot run
     /// ([`crate::update_words::ApplyPosture::HandoffDisabled`]), or unsaved work
     /// a person has to save ([`Self::update_blocker_for_person`]), whose own row
-    /// STANDS while it holds the lane ([`crate::update_words::waits_for_you`];
-    /// round eight, lead U38: it was a 45-s warning, and after it folded nothing
-    /// said why the update never landed), or a process that keeps its image with
+    /// STANDS while it holds the lane ([`crate::update_words::waits_for_you`]; lead U38: it was a 45-s warning, and after it folded nothing
+    /// said why the update never landed),
+    /// or a process that keeps its image with
     /// no terminal open, whose only lane waits for one
     /// ([`Self::kept_image_waits_for_terminal`]).
     pub(crate) fn update_lands_by_itself(&self, auto_apply_on: bool) -> bool {

@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Live-headless check of session log phase 3B's transcript steps (plan §2,
-//! rulings S1, S6, S30), driven through the one `aterm` binary against a real
+//! Live-headless check of transcript steps,
+//! driven through the one `aterm` binary against a real
 //! headless instance and its real control socket.
 //!
 //! * A CLAUDE-SHAPED STAND-IN: a POSIX `sh` script run as `claude` via
@@ -22,7 +22,7 @@
 //!   names it (`amend … vref=`, exactly one turn per vref, S30), its Bash
 //!   step opens and closes (`await log kind=tool` returns), and the idle
 //!   screen's settle closes the turn (`await log close=turn` returns).
-//! * THE CLAUSE (plan §5, rulings S11; on by default since D6, so the config
+//! * THE CLAUSE (plan §5; on by default since D6, so the config
 //!   names no `[session_log]`; the in-grid strip, whose menu `open tab-menu`
 //!   reads headless): the tab's menu says `now: running shell` while the
 //!   step is open, and a `ctl` client's label shows in `log`, never in the

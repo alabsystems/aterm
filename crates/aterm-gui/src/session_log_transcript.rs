@@ -2,7 +2,7 @@
 // Copyright 2026 Andrew Yates
 
 //! TRANSCRIPT STEPS REACH THE SESSION LOG (phase 3B, plan §2; addendum A13,
-//! A20; rulings S1, S2, S9, S12, S16, S23, S27): the glue between the footer
+//! A20): the glue between the footer
 //! resolver's step tap (`aterm_agent::harness::steps`, folded on the
 //! resolver thread from the transcript lines it already reads) and the agent
 //! run's turn tracker, whose [`aterm_slog::TurnTracker::transcript`] is the
@@ -13,8 +13,8 @@
 //!   log holds an open agent run whose agent its [`Source`] reads (an
 //!   exhaustive match on the program, so a new agent answers here): Claude
 //!   Code's transcript, by the footer resolver's tap, and a codex-alab's
-//!   rollout, by the rollout tap (`crate::codex_rollout_tap`, session log
-//!   5G-3), each handed the run's watermark and floor. A tap never applies to
+//!   rollout, by the rollout tap (`crate::codex_rollout_tap`),
+//!   each handed the run's watermark and floor. A tap never applies to
 //!   another agent's run. A run with no watermark binds at the file's length
 //!   (S1): what the file held is history, said once by the tracker's
 //!   `source … skipped=` mark, never replayed (a rollout, fed from its first
@@ -56,7 +56,7 @@ use aterm_slog::{
 use super::SessionLog;
 use crate::session_timeline::SessionTimeline;
 
-/// The most transcript events one timeline hold applies (ruling S16): a
+/// The most transcript events one timeline hold applies: a
 /// catch-up read of a long resumed conversation never makes the footer
 /// thread a long holder of the lock the composer and the sweep take.
 pub(crate) const CHUNK: usize = 32;
@@ -177,7 +177,7 @@ impl SessionLog {
 pub(crate) enum Source {
     /// Claude Code's transcript, by the footer resolver's tap (plan §2.1).
     Transcript,
-    /// A codex-alab's rollout, by the rollout tap (5G-3; ruling T15).
+    /// A codex-alab's rollout, by the rollout tap.
     Rollout,
 }
 
@@ -509,7 +509,7 @@ fn ordered(batch: &StepBatch) -> impl Iterator<Item = Item<'_>> {
         .chain(rest.iter().map(Item::Step))
 }
 
-/// Which hold of [`apply_batch`] a hold-time sample is of (ruling T31;
+/// Which hold of [`apply_batch`] a hold-time sample is of (
 /// `metrics percentiles`' `tx_chunk_*` and `tx_last_*`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Hold {

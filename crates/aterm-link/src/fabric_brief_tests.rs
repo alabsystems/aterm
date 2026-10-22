@@ -2,8 +2,8 @@
 // Copyright 2026 Andrew Yates
 
 //! `aterm fabric brief`'s fold over bodies a real session log's mirror makes:
-//! per seq space (ruling Q9), deduped, partial without its start, `node-gone`
-//! after its node's will (ruling Q4), opaque bodies counted, hostile bytes
+//! per seq space, deduped, partial without its start, `node-gone`
+//! after its node's will, opaque bodies counted, hostile bytes
 //! made safe.
 
 use super::*;
@@ -119,7 +119,7 @@ fn the_brief_folds_each_session_from_the_bus_alone() {
     );
 }
 
-/// A SPAWNED SESSION'S OPEN STILL FOLDS (session log Phase 6 step 6E-4):
+/// A SPAWNED SESSION'S OPEN STILL FOLDS:
 /// its open names its parent locally (`parent=`, HOST since this step), the
 /// mirror's wire body carries the open without it, and the brief folds the
 /// session whole from that body (`partial=0`), its parent named nowhere.
@@ -154,7 +154,7 @@ fn a_spawned_sessions_open_folds_without_its_parent() {
     assert!(!text.contains(parent), "{text}");
 }
 
-/// RULING Q9: a keeper-recovered session restarts its seqs in a new space;
+/// a keeper-recovered session restarts its seqs in a new space;
 /// the brief folds the newest space on its own (never dropping its records
 /// as reordered behind the old space's higher seqs), and says the session
 /// has two.
@@ -194,7 +194,7 @@ fn a_keeper_recovered_sid_folds_its_new_space_alone() {
     );
 }
 
-/// RULING Q4: a session whose node's presence ended without the session's
+/// a session whose node's presence ended without the session's
 /// close is `partial why=node-gone`; one whose window holds neither its start
 /// nor a snapshot is `partial why=no-start`.
 #[test]
@@ -318,7 +318,7 @@ fn the_brief_reads_its_words_within_their_bounds() {
     }
 }
 
-/// RULING Q4 PAST A RELAUNCH (fixer F7): a session whose close never reached
+/// a session whose close never reached
 /// the bus is partial when its own presence says it exited (`no-close`), or
 /// when its presence row is an earlier incarnation's than its node's live one
 /// (`node-gone`: the relaunch never re-announced it). A live session of the
@@ -485,8 +485,8 @@ fn a_brief_refuses_a_roster_or_fold_past_its_session_bound() {
     );
 }
 
-/// A WINDOW BELOW A RETAINING BROKER'S FLOOR READS FROM IT (session log Phase 6
-/// step 6E-2): a session's bodies on its `ev` face, the log then cut below the
+/// A WINDOW BELOW A RETAINING BROKER'S FLOOR READS FROM IT:
+/// a session's bodies on its `ev` face, the log then cut below the
 /// second. The brief's window reaches offset 0, below what the broker keeps; the
 /// read folds from the floor (`from=` says where), never refuses the whole
 /// brief. NEGATIVE CONTROL, run: the plain `fetch` the read made before is
@@ -590,7 +590,7 @@ fn json_opts() -> BriefOpts {
     }
 }
 
-/// THE MACHINE FORM (session log Phase 6 step 6E-6): a two-session fold
+/// THE MACHINE FORM: a two-session fold
 /// renders ONE object whose `sessions` hold each session in the closed
 /// schema, newest first. The one in its approval box says
 /// `"need":"approval:bash"` with its open path run, turn and step; the one
@@ -685,7 +685,7 @@ fn the_json_brief_holds_each_session_in_its_closed_schema() {
     assert_eq!(get(f, "age_s").as_u64(), Some(99));
 }
 
-/// THE MACHINE FORM NAMES ONLY AN OBSERVED NEED (step 6E-6, as the text
+/// THE MACHINE FORM NAMES ONLY AN OBSERVED NEED (as the text
 /// brief; D1): a `need` mark is a claim (`src=mark conf=claim`), which any
 /// process holding a cap on a node can put on the bus, so a session whose
 /// only need is a claim says `"need":null` — no consumer of the stream (the
@@ -746,7 +746,7 @@ fn the_json_brief_names_no_claimed_need() {
     assert_eq!(need("s-beside").as_str(), Some("failure"), "{text}");
 }
 
-/// NO HOST OR CONTENT FIELD (step 6E-6, as the text brief): a session whose
+/// NO HOST OR CONTENT FIELD (as the text brief): a session whose
 /// log holds a cwd, a title, a label's text and a mail's party — host and
 /// content facts, each a sentinel — renders a machine form that holds none
 /// of them, and every key it prints is either one of the schema's own names
@@ -803,7 +803,7 @@ fn the_json_brief_prints_no_host_or_content_field() {
     }
 }
 
-/// THE MACHINE FORM IS HELD TO THE BUDGET (step 6E-6): sixty sessions under
+/// THE MACHINE FORM IS HELD TO THE BUDGET: sixty sessions under
 /// a small budget print newest first while their objects fit, `used` never
 /// past `budget`, and the rest are counted `more`. NEGATIVE CONTROL, run: a
 /// renderer that prints every object passes the budget.

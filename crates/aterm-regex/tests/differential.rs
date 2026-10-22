@@ -92,7 +92,7 @@ const HAYSTACKS: &[&str] = &[
     "wrapped <https://example.com/x> and [https://example.com/y] and (https://z.io)",
     "/usr/local/bin/aterm ./rel/path ../up/one C:\\Users\\a\\b.txt .\\rel\\x",
     "error at crates/aterm-regex/src/pikevm.rs:118:9",
-    "mail trex.m21@proton.me or a+b%c@sub.domain.co.uk!",
+    "mail trex.m21@example.test or a+b%c@sub.domain.co.uk!",
     "not-an-email@localhost and @nope and a@b.c",
     "127.0.0.1:8080 255.255.255.255 256.1.1.1 10.0.0.1 1.2.3.4:65535",
     "[::1]:8080 fe80::1 2001:0db8:85a3:0000:0000:8a2e:0370:7334 :: ::ffff:1",
@@ -204,8 +204,8 @@ fn builtin_patterns_select_what_they_are_for() {
         Some("C:\\Users\\dev\\notes.txt".to_string())
     );
     assert_eq!(
-        find(by_name("email"), "write to trex.m21@proton.me today"),
-        Some("trex.m21@proton.me".to_string())
+        find(by_name("email"), "write to trex.m21@example.test today"),
+        Some("trex.m21@example.test".to_string())
     );
     assert_eq!(
         find(by_name("ipv4"), "bound 127.0.0.1:8080 ok"),
@@ -1013,7 +1013,7 @@ fn escape_round_trips() {
     pin(ESCAPE_DIGEST);
 }
 
-const BUILTIN_DIGEST: &str = "811be2e87727fce6";
+const BUILTIN_DIGEST: &str = "e064f89e51c0542c";
 const SYNTAX_DIGEST: &str = "d9526bd496b9392f";
 const PERL_DIGEST: &str = "6212cb3a3e2938ec";
 const FOLD_DIGEST: &str = "b91b2d673464fac8";

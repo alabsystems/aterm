@@ -402,6 +402,7 @@ fn jobs_view(rows: Vec<aterm_vitals::jobs::JobRow>) -> Arc<aterm_vitals::jobs::J
         findings: aterm_vitals::jobs::Findings::default(),
         demand: aterm_vitals::jobs::Demand::Fast,
         lanes_off: Vec::new(),
+        parked_tabs: Vec::new(),
     })
 }
 

@@ -125,7 +125,7 @@ fn rss_text(mb: u64) -> String {
 /// `driver-lease` or `driver-turn` (a driver's) — the server's
 /// `input_stall::host_hand_refusal`. Uncounted, as `busy` and `ERR halted`
 /// are: a short manager turn never ends a remedy for good (the review of
-/// 2026-10-16, finding 4). Every other `restart unavailable` (not the host's
+/// 2026-10-16). Every other `restart unavailable` (not the host's
 /// agent, not relaunchable, not supervised) is the act's for good.
 pub(super) fn refusal_lifts(r: &CtlReply) -> bool {
     ["halted", "driver-lease", "driver-turn"]
@@ -453,7 +453,7 @@ impl<C: Ctl> Session<'_, C> {
         // remedy). The agent's record is NOT read for an idle point here: a
         // TUI that stopped reading its input mid-turn keeps a record that
         // says `busy` for ever, and gated on its rest it was never restarted
-        // and nobody was warned (the review of 2026-10-16, finding 2).
+        // and nobody was warned (the review of 2026-10-16).
         if !self.stall_term {
             // The default: a warning where the restart would be, once per episode.
             self.stall_termed = true;

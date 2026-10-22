@@ -573,7 +573,7 @@ fn each_mode_phrase_holds_no_cut_mark() {
                 assert!(explained <= at, "the explanation leads the trail: {whole}");
                 assert!(whole.contains(&format!(" \u{b7} last: {trail} \u{b7} click: ")));
             }
-            // THE LEANER FORMS (finding 2 of the wiring's review): the whole
+            // THE LEANER FORMS: the whole
             // without its trail, where it has one, then v1's words — the
             // whole with neither the trail nor the menu's line — each wider
             // than the short form and narrower than the one before.
@@ -643,14 +643,14 @@ fn each_mode_phrase_holds_no_cut_mark() {
     assert_eq!(lean_titles("autopilot: cruise"), [("", ""); LEAN_FORMS]);
 }
 
-/// EVERY FACE KEEPS ITS CLICKS AFTER ITS EXPLANATION (owner-eye-1 of the
-/// post-landing check of Autopilot v3 wave 1, Claude Code 2.1.302: hovering
+/// EVERY FACE KEEPS ITS CLICKS AFTER ITS EXPLANATION (Claude Code 2.1.302: hovering
 /// `∞ ✓ done` on a 160-column rule showed `autopilot: cruise, done 13:04`
 /// alone, its explanation and both clicks gone below about 240 columns,
-/// where main before wave 1 kept `click: land` from 120). For every face of
+/// where main before wave 1 kept `click: land` from 120).
+/// For every face of
 /// the table, with a trail and without one, the hovered block laid as a
-/// frame lays it and fitted beside the whole facts (`◆ Opus 5.5 xhigh   ⌂
-/// ~/aterm   ⎇ main`) over every room from 400 cells down: the title is the
+/// frame lays it and fitted beside the whole facts (`◆ Opus 5.5 xhigh ⌂
+/// ~/aterm ⎇ main`) over every room from 400 cells down: the title is the
 /// whole, then without its trail (where it has one), then v1's words, then
 /// the phrase with both clicks (where that is narrower), then the phrase
 /// with the click, then the phrase alone, then none — in that order, never
@@ -1242,7 +1242,7 @@ fn the_trail_moves_the_term_only_while_the_chip_is_read() {
 }
 
 /// A FACE THAT KEEPS ITS KIND AND MOVES ITS CLOCK REPAINTS A TITLE BEING
-/// READ (§10.2, slice 1c: the title carries the face's clock, `landed 17:42`
+/// READ (§10.2, the title carries the face's clock, `landed 17:42`
 /// then `landed 18:05`): the footer's term moves while the Autopilot chip is
 /// hovered, and not while no one reads its title, which a frame at rest
 /// does not draw.
@@ -1393,7 +1393,7 @@ fn lands_amber_clears_the_text_floor_on_every_builtin_theme() {
 }
 
 /// THE PERMISSION LIGHT'S OWN HUE CLEARS THE SAME FLOOR (the honest chip's
-/// review, finding 4: F2's defect on the light beside Land's chip): the mode
+/// review, F2's defect on the light beside Land's chip): the mode
 /// light in Claude Code's bypass red or auto amber — drawn at rest only where
 /// it deviates, and in those hues where it is hovered or selected, just
 /// switched, refused or revealed — is floored on each built-in scheme's own
@@ -1604,7 +1604,7 @@ fn every_face_says_a_hold_and_a_need_where_its_harness_explains() {
     }
 }
 
-/// A NEED IN THE TITLE KEEPS ITS CUT MARKS (§12.2.3 item 6, slice 2e): a
+/// A NEED IN THE TITLE KEEPS ITS CUT MARKS (§12.2.3 item 6): a
 /// worker's need holding ` · last: `, ` · click: ` and ` — ` gives a title
 /// with the very words and the same four lean forms as the need already
 /// written with `, ` — under a pause and a trail, so every cut stands — on
@@ -1670,7 +1670,7 @@ fn a_need_in_the_title_keeps_its_cut_marks() {
     }
 }
 
-/// A HELD LANDING KEEPS THE TITLE'S FOUR LEAN FORMS (§12.3.1, slice 3d):
+/// A HELD LANDING KEEPS THE TITLE'S FOUR LEAN FORMS (§12.3.1):
 /// under `⤓ land` with a read hold whose need holds ` · ` and ` — `, a
 /// pause and a trail, every leg's words hold no ` — `, ` · last: ` or ` ·
 /// pausing until `; the four lean forms stand (without the trail; v1's
@@ -1769,4 +1769,106 @@ fn a_held_landing_keeps_the_titles_four_lean_forms() {
         "glyph-free: {description}"
     );
     assert!(description.contains(" Pausing until "), "{description}");
+}
+
+/// THE HANDS-OFF FACES AND THE ROW'S INK READ ON EVERY GROUND (design §8):
+/// the chips' dim ([`dim_of`]) — `○ off`, `⊘ off`, the unhosted chip, a
+/// worker's label — is the row's ink halfway to its ground, a word greyed
+/// on purpose, and the row's ink (a light's word, `✋ you`) is the pane's own.
+/// Under every built-in instance's accent, on every built-in tab theme and
+/// on a theme of one's own whose ink reads low (`#7a7a7a` on white), every
+/// glyph of a dim face reads at 3:1 or more on the row's ground and below
+/// the row's ink, which reads at 4.5:1 or more; each is the theme's own ink
+/// exactly where that already reads so.
+///
+/// NEGATIVE CONTROLS: halfway reads under 3:1 on Solarized Light's and
+/// Default Light's grounds, and the soft theme's ink under 4.5:1.
+#[test]
+fn the_dim_faces_and_the_rows_ink_read_on_every_ground() {
+    use aterm_effects::cli_marks::{ICON_CONTRAST, NAME_CONTRAST};
+    let pack = |c: [u8; 3]| u32::from_be_bytes([0, c[0], c[1], c[2]]);
+    let reads =
+        |a: [u8; 3], b: [u8; 3]| aterm_effects::color_math::contrast_ratio(pack(a), pack(b));
+    let halfway = |b: RenderCell| -> [u8; 3] {
+        std::array::from_fn(|i| ((u16::from(b.fg[i]) + u16::from(b.bg[i])) / 2) as u8)
+    };
+    let rgb = |c: aterm_types::Rgb| [c.r, c.g, c.b];
+    let blank_of = |name: &str| {
+        let scheme = aterm_types::scheme::builtin(name).expect("a built-in");
+        RenderCell {
+            ch: ' ',
+            fg: rgb(scheme.foreground),
+            bg: rgb(scheme.background),
+            ..RenderCell::default()
+        }
+    };
+    let names = aterm_types::scheme::builtin_names();
+    let accents: Vec<[u8; 3]> = names
+        .iter()
+        .map(|name| {
+            let scheme = aterm_types::scheme::builtin(name).expect("a built-in");
+            crate::chrome_band::band_colors(aterm_render::Theme::from(&scheme)).accent
+        })
+        .collect();
+    let soft = RenderCell {
+        ch: ' ',
+        fg: [0x7a; 3],
+        bg: [0xff; 3],
+        ..RenderCell::default()
+    };
+    let tabs: Vec<(&str, RenderCell)> = names
+        .iter()
+        .map(|&name| (name, blank_of(name)))
+        .chain(std::iter::once(("a soft theme of one's own", soft)))
+        .collect();
+    let (mut checked, mut kept) = (0usize, 0usize);
+    for &(tab, blank) in &tabs {
+        let ink = Inks::of(blank, ACCENT).ink;
+        let ink_k = reads(ink, blank.bg);
+        assert!(
+            ink_k >= NAME_CONTRAST,
+            "{tab}: the row's ink at {ink_k:.2}:1"
+        );
+        if reads(blank.fg, blank.bg) >= NAME_CONTRAST {
+            assert_eq!(ink, blank.fg, "{tab}: an ink that reads is kept");
+        }
+        let old = halfway(blank);
+        for &accent in &accents {
+            for view in [
+                AutopilotView::Off,
+                AutopilotView::MasterOff,
+                AutopilotView::Unhosted,
+            ] {
+                let block = Block::of_autopilot(view, blank, accent);
+                for c in block.lights.iter().filter(|c| c.ch != ' ') {
+                    let k = reads(c.fg, blank.bg);
+                    assert!(
+                        k >= ICON_CONTRAST && k < ink_k,
+                        "{tab}, {view:?}: {:?} at {k:.2}:1, the row's ink at {ink_k:.2}:1",
+                        c.ch
+                    );
+                    if reads(old, blank.bg) >= ICON_CONTRAST {
+                        assert_eq!(c.fg, old, "{tab}, {view:?}: halfway that reads is kept");
+                        kept += 1;
+                    }
+                    checked += 1;
+                }
+            }
+        }
+    }
+    assert!(checked >= tabs.len() * accents.len() * 3 * 2, "{checked}");
+    assert!(kept > 0, "some theme's halfway reads and is kept");
+    for name in ["Solarized Light", "Default Light"] {
+        let blank = blank_of(name);
+        assert!(
+            reads(halfway(blank), blank.bg) < ICON_CONTRAST,
+            "CONTROL: halfway at {:.2}:1 on {name}",
+            reads(halfway(blank), blank.bg)
+        );
+    }
+    assert!(
+        reads(soft.fg, soft.bg) < NAME_CONTRAST,
+        "CONTROL: the soft theme's ink at {:.2}:1",
+        reads(soft.fg, soft.bg)
+    );
 }

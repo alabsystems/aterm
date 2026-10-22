@@ -2,7 +2,7 @@
 // Copyright 2026 Andrew Yates
 
 //! The files `aterm machines init` writes once: the inventory and the lab baseline the owner
-//! asked for (design ruling M1). Both are the owner's to edit afterwards; `init` never
+//! asked for. Both are the owner's to edit afterwards; `init` never
 //! overwrites an existing file. The one exception is a starter baseline nobody edited
 //! ([`EARLIER_DEFAULT_BASELINES`]), which follows the starter shipped now.
 //!

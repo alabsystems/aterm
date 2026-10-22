@@ -252,8 +252,22 @@ impl Spine {
     /// A fresh spine at rest.
     #[inline]
     #[must_use]
-    pub fn new() -> Self {
-        Self::default()
+    pub const fn new() -> Self {
+        Self {
+            momentum: TypingMomentum::new(),
+            disp: 0.0,
+            disp_peak: 0.0,
+            phase: 0.0,
+            at: None,
+            slamming: false,
+            mark: None,
+            run: 0,
+            best: 0,
+            prev_birth: 0.0,
+            key_rise: 0.0,
+            driven_at: None,
+            verdict: None,
+        }
     }
 
     // -- the metric's edges (no follower motion happens here) ---------------
@@ -364,7 +378,7 @@ impl Spine {
     /// door at `now`, keeping `phase` and `best` intact so the family's colour
     /// wheel does not jump and the session's high-water mark survives.
     #[inline]
-    pub fn hush(&mut self, now: Instant) {
+    pub const fn hush(&mut self, now: Instant) {
         self.momentum.set_value(now, 0.0);
         self.disp = 0.0;
         self.disp_peak = 0.0;
@@ -607,8 +621,8 @@ impl Spine {
     /// clock stamp too, so the next [`Spine::update`] latches rather than
     /// integrating across the gap.
     #[inline]
-    pub fn reset(&mut self) {
-        *self = Self::default();
+    pub const fn reset(&mut self) {
+        *self = Self::new();
     }
 }
 

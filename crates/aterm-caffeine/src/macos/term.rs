@@ -127,8 +127,10 @@ extern "C" fn on_term(sig: libc::c_int, info: *mut libc::siginfo_t, _context: *m
     }
 }
 
-/// Route SIGTERM to [`on_term`]; whether it took. `SA_RESTART` keeps the process's blocking
-/// calls running through it.
+/// Route SIGTERM to [`on_term`]; whether it took. `SA_RESTART` restarts the restartable calls
+/// it interrupts (`read`, `write`, `waitpid`, ...); `poll`, `select`, `kevent` and the sleeps
+/// still return `EINTR`, which every wait the mug makes retries (`aterm_uds::deadline`'s
+/// `poll`, std's sleep).
 fn install() -> bool {
     // SAFETY: all-zero is a valid action, filled in below.
     let mut action: libc::sigaction = unsafe { std::mem::zeroed() };

@@ -223,7 +223,7 @@ pub fn read_bounded_regular_utf8(path: &Path, max_bytes: usize) -> io::Result<St
 
 /// Delimit and fold in the byte count, so the result fingerprints content, not hasher state.
 #[inline]
-fn seal_fingerprint(mut hash: Fnv1a64, len: u64) -> u64 {
+const fn seal_fingerprint(mut hash: Fnv1a64, len: u64) -> u64 {
     hash.write_u8(0xff);
     hash.write(&len.to_le_bytes());
     hash.finish()
@@ -234,7 +234,7 @@ fn seal_fingerprint(mut hash: Fnv1a64, len: u64) -> u64 {
 /// race).
 #[inline]
 #[must_use]
-pub fn fingerprint_admitted_utf8(contents: &str) -> u64 {
+pub const fn fingerprint_admitted_utf8(contents: &str) -> u64 {
     let mut hash = Fnv1a64::new();
     hash.write(contents.as_bytes());
     seal_fingerprint(hash, contents.len() as u64)

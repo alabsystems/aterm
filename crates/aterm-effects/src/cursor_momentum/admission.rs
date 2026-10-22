@@ -315,7 +315,7 @@ impl std::error::Error for AdmitRefusal {}
 ///
 /// [`AdmitRefusal::Tau`].
 #[inline]
-pub fn admit_tau(p: &MomentumProfile, tau_s: f32) -> Result<(), AdmitRefusal> {
+pub const fn admit_tau(p: &MomentumProfile, tau_s: f32) -> Result<(), AdmitRefusal> {
     let ok = tau_s.is_finite()
         && tau_s > 0.0
         && tau_s <= p.max_tau_s
@@ -333,8 +333,11 @@ pub fn admit_tau(p: &MomentumProfile, tau_s: f32) -> Result<(), AdmitRefusal> {
 ///
 /// [`AdmitRefusal::FrameInterval`].
 #[inline]
-pub fn admit_frame_interval(p: &MomentumProfile, d: Duration) -> Result<(), AdmitRefusal> {
-    if d <= p.max_frame_interval && d <= MOMENTUM_ENVELOPE.max_frame_interval {
+pub const fn admit_frame_interval(p: &MomentumProfile, d: Duration) -> Result<(), AdmitRefusal> {
+    let ns = d.as_nanos();
+    if ns <= p.max_frame_interval.as_nanos()
+        && ns <= MOMENTUM_ENVELOPE.max_frame_interval.as_nanos()
+    {
         Ok(())
     } else {
         Err(AdmitRefusal::FrameInterval(d))
@@ -349,10 +352,16 @@ pub fn admit_frame_interval(p: &MomentumProfile, d: Duration) -> Result<(), Admi
 ///
 /// [`AdmitRefusal::Horizon`] or [`AdmitRefusal::TimeWentBack`].
 #[inline]
-pub fn admit_time(p: &MomentumProfile, last: Option<i128>, at: i128) -> Result<(), AdmitRefusal> {
-    let horizon = p.horizon.min(MOMENTUM_ENVELOPE.horizon);
+pub const fn admit_time(
+    p: &MomentumProfile,
+    last: Option<i128>,
+    at: i128,
+) -> Result<(), AdmitRefusal> {
+    let p_ns = p.horizon.as_nanos();
+    let env_ns = MOMENTUM_ENVELOPE.horizon.as_nanos();
+    let horizon_ns = if p_ns < env_ns { p_ns } else { env_ns };
     // Every `Duration` is below 2^94 ns, so its nanoseconds fit in `i128`.
-    let within = i128::try_from(horizon.as_nanos()).is_ok_and(|limit| (0..=limit).contains(&at));
+    let within = horizon_ns <= i128::MAX as u128 && at >= 0 && at <= horizon_ns as i128;
     if !within {
         return Err(AdmitRefusal::Horizon(at));
     }
@@ -426,48 +435,54 @@ struct Grid {
     head: u16,
 }
 
-fn admit_geometry(p: &MomentumProfile, geom: &Geom) -> Result<Grid, AdmitRefusal> {
-    let refuse = |fault| Err(AdmitRefusal::Geometry(fault));
+const fn admit_geometry(p: &MomentumProfile, geom: &Geom) -> Result<Grid, AdmitRefusal> {
     if geom.cw == 0 {
-        return refuse(GeometryFault::CellWidthZero);
+        return Err(AdmitRefusal::Geometry(GeometryFault::CellWidthZero));
     }
     if geom.ch == 0 {
-        return refuse(GeometryFault::CellHeightZero);
+        return Err(AdmitRefusal::Geometry(GeometryFault::CellHeightZero));
     }
-    let limit = p.max_extent_px.min(MOMENTUM_ENVELOPE.max_extent_px);
+    let limit = if p.max_extent_px < MOMENTUM_ENVELOPE.max_extent_px {
+        p.max_extent_px
+    } else {
+        MOMENTUM_ENVELOPE.max_extent_px
+    };
     // `origin + max(cells, 1) · cell ≤ limit`, checked; a pass bounds every
     // factor by `limit ≤ u16::MAX`.
-    let fits = |origin: u16, cells: usize, cell: usize| -> Option<(u16, u16)> {
-        let edge = cells
-            .max(1)
-            .checked_mul(cell)?
-            .checked_add(usize::from(origin))?;
-        if u64::try_from(edge).ok()? > u64::from(limit) {
+    const fn fits(origin: u16, cells: usize, cell: usize, limit: u32) -> Option<(u16, u16)> {
+        let cells_floor = if cells > 1 { cells } else { 1 };
+        let Some(prod) = cells_floor.checked_mul(cell) else {
+            return None;
+        };
+        let Some(edge) = prod.checked_add(origin as usize) else {
+            return None;
+        };
+        if edge as u64 > limit as u64 || cells > u16::MAX as usize || cell > u16::MAX as usize {
             return None;
         }
-        Some((u16::try_from(cells).ok()?, u16::try_from(cell).ok()?))
-    };
-    let Some((cols, cw)) = fits(geom.origin_x, geom.cols, geom.cw) else {
-        return refuse(GeometryFault::GridWidth {
+        Some((cells as u16, cell as u16))
+    }
+    let Some((cols, cw)) = fits(geom.origin_x, geom.cols, geom.cw, limit) else {
+        return Err(AdmitRefusal::Geometry(GeometryFault::GridWidth {
             origin_x: geom.origin_x,
             cols: geom.cols,
             cw: geom.cw,
             limit,
-        });
+        }));
     };
-    let Some((rows, ch)) = fits(geom.origin_y, geom.rows, geom.ch) else {
-        return refuse(GeometryFault::GridHeight {
+    let Some((rows, ch)) = fits(geom.origin_y, geom.rows, geom.ch, limit) else {
+        return Err(AdmitRefusal::Geometry(GeometryFault::GridHeight {
             origin_y: geom.origin_y,
             rows: geom.rows,
             ch: geom.ch,
             limit,
-        });
+        }));
     };
     if geom.head > geom.origin_y {
-        return refuse(GeometryFault::HeadAboveOrigin {
+        return Err(AdmitRefusal::Geometry(GeometryFault::HeadAboveOrigin {
             head: geom.head,
             origin_y: geom.origin_y,
-        });
+        }));
     }
     Ok(Grid {
         cw,

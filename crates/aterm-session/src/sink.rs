@@ -591,6 +591,19 @@ enum WhenFull {
     Refuse,
 }
 
+/// Where the bytes a write put in the kernel's input queue came from, as the
+/// input hook's watcher tells them apart
+/// ([`SinkWriter::take_input_hook_driven`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Landing {
+    /// A key, a paste, a report, a control verb's bytes, and whatever the sink
+    /// cannot attribute (a drained spill, a blocking write).
+    Driven,
+    /// The terminal's own answer to its program's query
+    /// ([`SinkWriter::write_reply`]) on the non-parking direct lane.
+    Answer,
+}
+
 /// Whether [`Shared::spill_append`] waits out the `SPILL_CAP` backpressure.
 /// Windows compiles only the `spill_append` stub, which reads neither the meter
 /// nor `NoWait`, hence the lint allowance there.
@@ -874,6 +887,11 @@ struct Shared {
     input_hook: std::sync::OnceLock<Box<dyn Fn() + Send + Sync>>,
     /// The hook has fired since the last [`SinkWriter::rearm_input_hook`].
     input_hook_armed: AtomicBool,
+    /// Bytes other than the terminal's own answer landed, or a caller woke the
+    /// hook, since the watcher last took it
+    /// ([`SinkWriter::take_input_hook_driven`]). Set at the landing, never at a
+    /// reservation, and whether or not the hook fired then.
+    input_hook_driven: AtomicBool,
     /// How many times [`SinkWriter::discard_unread_input`] has dropped unread
     /// input. Bumped under the `spill` mutex in the section that empties `buf`.
     /// Every frame takes the value on entry, and the drainer with each chunk it
@@ -1207,7 +1225,21 @@ impl SinkWriter {
     /// Let the input hook fire again on the next write. A watcher calls this
     /// before each probe, so a write racing the probe re-wakes it.
     pub fn rearm_input_hook(&self) {
-        self.shared.input_hook_armed.store(false, Ordering::Release);
+        self.shared.input_hook_armed.store(false, Ordering::SeqCst);
+    }
+
+    /// Whether anything but the terminal's own answer to its program's query
+    /// ([`Self::write_reply`]) put bytes in the input queue, or a caller woke
+    /// the hook ([`Self::wake_input_hook`]), since the last take; and take it.
+    /// A watcher takes it after [`Self::rearm_input_hook`] and before it looks
+    /// at the queue: what lands after the take marks it again and fires the
+    /// rearmed hook, and what landed before is in the queue it looks at. It is
+    /// marked where bytes land, never where a write is reserved, so a key that
+    /// waited for the fd lock across a look still marks it when it lands
+    /// (unlike [`Self::driven_input`], which moves at the reservation). Bytes
+    /// the sink cannot attribute (a drained spill, a blocking write) mark it.
+    pub fn take_input_hook_driven(&self) -> bool {
+        self.shared.input_hook_driven.swap(false, Ordering::SeqCst)
     }
 
     /// Fire the input hook as a landing write does (at most once until
@@ -2225,7 +2257,7 @@ impl SinkWriter {
             return Ok(WriteReceipt::new(0, None));
         }
         self.reserve_input_attempt();
-        self.write_frame_nonparking_after_reserve(bytes)
+        self.write_frame_nonparking_after_reserve(bytes, Landing::Driven)
     }
 
     /// The terminal's own answer to a query its program sent (DA, DSR/CPR, a colour or
@@ -2237,23 +2269,25 @@ impl SinkWriter {
             return Ok(0);
         }
         self.reserve_attempt();
-        self.write_frame_nonparking_after_reserve(bytes)
+        self.write_frame_nonparking_after_reserve(bytes, Landing::Answer)
             .map(WriteReceipt::accepted)
             .map_err(WriteReceiptError::into_error)
     }
 
     /// [`Self::write_frame_nonparking_with_receipt`]'s body after its one
-    /// reservation, shared with [`Self::write_reply`].
+    /// reservation, shared with [`Self::write_reply`]; `landing` says which
+    /// of the two the bytes are ([`Landing`]).
     #[cfg(unix)]
     fn write_frame_nonparking_after_reserve(
         &self,
         bytes: &[u8],
+        landing: Landing,
     ) -> Result<WriteReceipt, WriteReceiptError> {
         // Bulk takes the blocking path so `SPILL_CAP` applies (see `NONPARK_MAX`).
         if bytes.len() > Self::NONPARK_MAX {
             return self.write_frame_after_reserve(bytes, None);
         }
-        self.write_frame_unparked(bytes, WhenFull::Park)
+        self.write_frame_unparked(bytes, WhenFull::Park, landing)
     }
 
     /// Windows: the ordered blocking write, as
@@ -2262,6 +2296,7 @@ impl SinkWriter {
     fn write_frame_nonparking_after_reserve(
         &self,
         bytes: &[u8],
+        _landing: Landing,
     ) -> Result<WriteReceipt, WriteReceiptError> {
         self.write_frame_after_reserve(bytes, None)
     }
@@ -2297,7 +2332,7 @@ impl SinkWriter {
             return Ok(WriteReceipt::new(0, None));
         }
         self.reserve_input_attempt();
-        self.write_frame_unparked(bytes, WhenFull::Refuse)
+        self.write_frame_unparked(bytes, WhenFull::Refuse, Landing::Driven)
     }
 
     /// Windows twin of [`Self::write_frame_interactive_with_receipt`]: ConPTY has no
@@ -2316,12 +2351,15 @@ impl SinkWriter {
 
     /// The non-parking body [`Self::write_frame_nonparking_with_receipt`] and
     /// [`Self::write_frame_interactive_with_receipt`] share; `when_full` is
-    /// what happens where the frame cannot be taken without waiting.
+    /// what happens where the frame cannot be taken without waiting, and
+    /// `landing` what the bytes it lands on the direct lane are to the input
+    /// hook ([`Landing`]; a spilled or parked frame lands as driven).
     #[cfg(unix)]
     fn write_frame_unparked(
         &self,
         bytes: &[u8],
         when_full: WhenFull,
+        landing: Landing,
     ) -> Result<WriteReceipt, WriteReceiptError> {
         if self.shared.is_severed() {
             return Err(Shared::severed_error().into());
@@ -2416,7 +2454,7 @@ impl SinkWriter {
                     Err(e) => {
                         drop(guard);
                         if off > 0 {
-                            let _ = self.shared.fire_input_hook();
+                            let _ = self.shared.fire_input_hook_for(landing);
                         }
                         return Err(WriteReceiptError::after_write(e, off, order));
                     }
@@ -2450,7 +2488,7 @@ impl SinkWriter {
                 aterm_pty::NonParkWrite::Fatal(e) => {
                     drop(guard);
                     if off > 0 {
-                        let _ = self.shared.fire_input_hook();
+                        let _ = self.shared.fire_input_hook_for(landing);
                     }
                     return Err(WriteReceiptError::after_write(e, off, order));
                 }
@@ -2458,7 +2496,7 @@ impl SinkWriter {
         }
         drop(guard);
         if off > 0 {
-            let _ = self.shared.fire_input_hook();
+            let _ = self.shared.fire_input_hook_for(landing);
         }
         Ok(WriteReceipt::completed(off, bytes.len(), order))
     }
@@ -2697,6 +2735,7 @@ impl Shared {
             ledger: Mutex::new(InputLedger::new(Instant::now())),
             input_hook: std::sync::OnceLock::new(),
             input_hook_armed: AtomicBool::new(false),
+            input_hook_driven: AtomicBool::new(false),
             discards: AtomicU64::new(0),
             restarts: AtomicU64::new(0),
             severed: AtomicBool::new(false),
@@ -2837,10 +2876,23 @@ impl Shared {
     /// landing write ([`Self::ledger_end`]) and an explicit wake
     /// ([`SinkWriter::wake_input_hook`]), so the two share one arming.
     fn fire_input_hook(&self) -> bool {
+        self.fire_input_hook_for(Landing::Driven)
+    }
+
+    /// [`Self::fire_input_hook`] for bytes that came from `landing`: anything
+    /// but the terminal's own answer marks the hook driven first, whether or
+    /// not the arming lets it fire ([`SinkWriter::take_input_hook_driven`]).
+    /// Sequentially consistent with the watcher's rearm and take: a landing
+    /// whose fire the arming swallowed marked it before the rearm the watcher
+    /// then takes it after.
+    fn fire_input_hook_for(&self, landing: Landing) -> bool {
+        if landing == Landing::Driven {
+            self.input_hook_driven.store(true, Ordering::SeqCst);
+        }
         let Some(hook) = self.input_hook.get() else {
             return false;
         };
-        if self.input_hook_armed.swap(true, Ordering::AcqRel) {
+        if self.input_hook_armed.swap(true, Ordering::SeqCst) {
             return false;
         }
         hook();
@@ -3520,6 +3572,50 @@ mod tests {
         assert_eq!(sink.tty_echo(), None);
         assert_eq!(SinkWriter::new(-1).input_backlog(), None);
         assert_eq!(SinkWriter::new(-1).tty_echo(), None);
+    }
+
+    /// THE HOOK SAYS WHETHER ANYTHING BUT AN ANSWER LANDED
+    /// ([`SinkWriter::take_input_hook_driven`]): the terminal's own answer to
+    /// its program's query fires the hook and marks nothing (Gemini CLI's
+    /// OSC 11 at rest, docs/measured/vitals-multi-tab-2026-10-22.md).
+    /// NEGATIVE CONTROLS: a key marks it even when the arming swallowed its
+    /// fire, an explicit wake marks it, and so do the interactive and the
+    /// blocking writes; a take clears it.
+    #[test]
+    fn the_input_hook_says_whether_anything_but_an_answer_landed() {
+        let (_reader, writer) = std::os::unix::net::UnixStream::pair().expect("socketpair");
+        let sink = SinkWriter::new(writer.as_raw_fd());
+        let fired = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::clone(&fired);
+        sink.install_input_hook(move || {
+            seen.fetch_add(1, Ordering::SeqCst);
+        });
+        assert!(!sink.take_input_hook_driven(), "nothing landed");
+        assert_eq!(sink.write_reply(b"\x1b[?62c").expect("answer"), 6);
+        assert_eq!(fired.load(Ordering::SeqCst), 1, "an answer fires the hook");
+        assert!(!sink.take_input_hook_driven(), "but drove nothing");
+
+        assert_eq!(sink.write_frame_nonparking(b"k").expect("a key"), 1);
+        assert_eq!(fired.load(Ordering::SeqCst), 1, "the arming took the fire");
+        assert!(sink.take_input_hook_driven(), "the key marked it");
+        assert!(!sink.take_input_hook_driven(), "taken");
+
+        sink.rearm_input_hook();
+        assert!(sink.wake_input_hook(), "an explicit wake fires");
+        assert!(sink.take_input_hook_driven(), "and marks it");
+        let interactive = sink
+            .write_frame_interactive_with_receipt(b"i")
+            .expect("an interactive key");
+        assert_eq!(interactive.accepted(), 1);
+        assert!(sink.take_input_hook_driven(), "an interactive key marks it");
+        assert_eq!(sink.write_frame(b"p").expect("a blocking write"), 1);
+        assert!(sink.take_input_hook_driven(), "a blocking write marks it");
+        assert_eq!(sink.write_reply(b"\x1b[0n").expect("answer"), 4);
+        assert!(
+            !sink.take_input_hook_driven(),
+            "an answer still marks nothing"
+        );
+        drop(writer);
     }
 
     /// Two landing writes wake once, an empty frame never, and after a rearm the next

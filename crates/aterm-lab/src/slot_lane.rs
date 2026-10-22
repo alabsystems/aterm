@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The build slots' lanes (`docs/DESIGN-harness-occupancy-2026-10-20.md`
-//! slice 0): what `aterm_sysprobe::slots` reads, held to the real
+//! The build slots' lanes (`docs/DESIGN-harness-occupancy-2026-10-20.md`):
+//! what `aterm_sysprobe::slots` reads, held to the real
 //! `build-slot` and to a real aterm.
 //!
 //! * `slot-capture`: the record capture (design §10 Q8's unread-format

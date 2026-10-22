@@ -322,7 +322,7 @@ pub(crate) struct SpliceLists {
     /// The rule row's coverable cells ([`rule_mask_into`]), one pane's at a time.
     mask: Vec<bool>,
     /// Sessions whose log the launch card's amend moved: their watchers are
-    /// woken after the frame (addendum A28, ruling S29).
+    /// woken after the frame.
     log_owed: Vec<u64>,
     /// The agents panels this frame lights (`crate::claude_panel`).
     panels: Vec<crate::claude_panel::PanelLeaf>,
@@ -1397,6 +1397,11 @@ impl PaneTextCache {
         self.footers.get(leaf_index)?.top.mark.as_ref()
     }
 
+    /// Leaf `leaf_index`'s composed top rule's switch mark ([`switch_icon`]).
+    fn top_switch_mark(&self, leaf_index: usize) -> Option<aterm_core::render::ChromeIcon> {
+        self.footers.get(leaf_index)?.top.switch_mark
+    }
+
     /// Leaf `leaf_index`'s composed top rule's cells ([`compose_top`]).
     fn top_cells(&self, leaf_index: usize) -> &[RenderCell] {
         self.footers
@@ -2018,8 +2023,8 @@ fn still_watched(
     now.saturating_duration_since(asked) < WATCH_FOR || walled_alive()
 }
 
-/// THE LOG'S WAKE from this thread (session log Phase 3B, rulings S12, A12,
-/// A13): the session's watchers are rung under the timeline lock when the
+/// THE LOG'S WAKE from this thread:
+/// the session's watchers are rung under the timeline lock when the
 /// transcript's steps moved what a reader of the session's log sees
 /// (`SessionTimeline::slog_take_wake`) — no hop through the loop, which a
 /// headless test App does not run — and under the `[session_log] clause`
@@ -3278,7 +3283,7 @@ fn resolve_into(
     }
     let (moved, found) = resolve_facts(timeline, identity, tail, fold, roster, asks);
     // The steps the read tapped, applied after the facts were published, at
-    // most `transcript::CHUNK` events a hold (ruling S16).
+    // most `transcript::CHUNK` events a hold.
     let logged = if fold.steps_armed() {
         let batch = fold.take_steps();
         let applied = crate::session_log::transcript::apply_batch(
@@ -3882,8 +3887,9 @@ fn rule_mask_into(
 ///
 /// The facts are `Script::Sub` and bold, below the cursor trail's rail
 /// (`aterm_render::SUB_CEILING`), set as a line of type (`footer::set_facts`): values in
-/// Claude's rule gray lifted [`VALUE_LIFT`] toward the pane's ink, marks in `mark_fg` mixed
-/// halfway toward the rule gray, floored to 3:1 on the pane's ground ([`visible_on`]). The
+/// Claude's rule gray lifted [`VALUE_LIFT`] toward the pane's ink, floored to 4.5:1 on the
+/// pane's ground ([`FactInks`]), marks in `mark_fg` mixed halfway toward the rule gray,
+/// floored to 3:1 on it ([`visible_on`]). The
 /// chips stay full-size, since they are clicked, and their place depends on nothing a title
 /// or the facts change, so a chip stays under the pointer while its title comes and goes.
 ///
@@ -3894,8 +3900,9 @@ fn rule_mask_into(
 /// And where the facts' cells start, and where each fact lies past that
 /// start's blank (`footer::fact_spans`): the targets a click acts on. A
 /// hidden fact's greyed `off` is drawn in Claude's rule gray (`rule.fg`),
-/// not bold. The fact `lit` (hovered or selected) is drawn lit: its values
-/// in the pane's ink, its mark in `mark_fg` floored to 4.5:1 on the pane's
+/// not bold, floored to 3:1 and kept below the values ([`greyed_on`]). The
+/// fact `lit` (hovered or selected) is drawn lit: its values in the pane's
+/// ink floored to 4.5:1, its mark in `mark_fg` floored to 4.5:1 on the pane's
 /// ground ([`legible_on`]), underlined where its glyphs are drawn
 /// (`footer::drawn_cells`), each stretch of the line in the ink of the lit
 /// glyph drawn over it.
@@ -3951,11 +3958,14 @@ fn compose_rule_spans(
         // is ([`legible_on`]).
         let mark = quiet(visible_on(mix(mark_fg, rule.fg, 0.5), blank.bg));
         let accent = legible_on(mark_fg, blank.bg);
-        let value = quiet(mix(rule.fg, blank.fg, VALUE_LIFT));
-        // A hidden fact's `off`: Claude's own rule gray, not bold.
+        // The words are the pane's own inks, each held to its floor
+        // ([`FactInks`]): the values 4.5:1, a hidden fact's greyed `off`,
+        // not bold, 3:1 and below them.
+        let words = FactInks::of(rule.fg, blank.fg, blank.bg);
+        let value = quiet(words.value);
         let stub = RenderCell {
             bold: false,
-            ..quiet(rule.fg)
+            ..quiet(words.stub)
         };
         let lifted = |cell: RenderCell, fg: [u8; 3]| RenderCell { fg, ..cell };
         // The set line, a blank cell either side: the rule meets it there.
@@ -3986,7 +3996,7 @@ fn compose_rule_spans(
                 (false, true, false) => stub,
                 (false, true, true) => lifted(stub, value.fg),
                 (false, false, false) => value,
-                (false, false, true) => lifted(value, blank.fg),
+                (false, false, true) => lifted(value, words.lit),
             };
             let cell = RenderCell {
                 ch: glyph.ch,
@@ -6102,12 +6112,18 @@ impl App {
             // card's own record, so every strip of the card's takes it back
             // (`claude_card::strip`: the top of a frame, of a compose and of
             // this splice, and the capture's one-pane refill, which runs no
-            // footer undo).
+            // footer undo). So with the switch's state mark (`switch_icon`).
             for t in &lists.tops {
-                if claude_footer_undo.took(t.frame_row, t.col)
-                    && let Some(layer) = texts.top_mark(t.leaf_index)
-                {
+                if !claude_footer_undo.took(t.frame_row, t.col) {
+                    continue;
+                }
+                if let Some(layer) = texts.top_mark(t.leaf_index) {
                     claude_card.paint_layer(input_scratch, layer.clone());
+                }
+                if let Some(icon) = texts.top_switch_mark(t.leaf_index)
+                    && let Ok(row) = u16::try_from(t.frame_row)
+                {
+                    claude_card.paint_icon(input_scratch, row, icon);
                 }
             }
             // So with the lockups: only one the glass shows answers the
@@ -6857,6 +6873,23 @@ fn switch_face(paint: SwitchPaint, tier: usize) -> Option<SwitchFace> {
     Some(f)
 }
 
+/// THE SWITCH'S STATE MARK, DRAWN: face `f` laid from frame column `col`
+/// puts its `●`, `○` or `◐` at the returned column, which the frame draws as
+/// the chrome's own icon of it (`BandIcon::switch_mark`, a `ChromeIcon` on
+/// the line's row) in the cell's ink, while the cell keeps its character for
+/// the text grid, a screen reader and copy. The default macOS face (SF Mono)
+/// has `●` and `○` but no half disc: its fallback's `◐` drew 5 × 5 pixels
+/// beside their 8 × 9 at 1×, so the three are drawn, one set. `None` for a
+/// face with no mark (an off switch's narrowest form).
+fn switch_icon(f: &SwitchFace, col: usize) -> Option<aterm_core::render::ChromeIcon> {
+    f.cells().iter().enumerate().find_map(|(k, &(ch, _))| {
+        Some(aterm_core::render::ChromeIcon {
+            col: u16::try_from(col + k).ok()?,
+            icon: aterm_core::render::BandIcon::switch_mark(ch)?,
+        })
+    })
+}
+
 /// The off switch's `on` button ([`switch_face`]): a pill, `▐ on ▌`, its
 /// letters the ground's ink on the accent's fill, its caps half a cell of
 /// the fill on the ground.
@@ -6987,20 +7020,97 @@ pub(crate) fn legible_on(ink: [u8; 3], ground: [u8; 3]) -> [u8; 3] {
 /// `ink` floored along its own hue to read 3:1 on `ground`
 /// ([`aterm_effects::cli_marks::ICON_CONTRAST`], WCAG 1.4.11): the floor a
 /// graphic aterm lays on a pane's lines meets — a fact's mark, a reply's
-/// bullet. A quiet ink that already reads is kept as it is: it may sit at
-/// the floor, never under it.
-fn visible_on(ink: [u8; 3], ground: [u8; 3]) -> [u8; 3] {
+/// bullet — and a word it greys on purpose ([`greyed_on`], the lights' dim).
+/// A quiet ink that already reads is kept as it is: it may sit at the floor,
+/// never under it.
+pub(crate) fn visible_on(ink: [u8; 3], ground: [u8; 3]) -> [u8; 3] {
     floored_on(ink, ground, aterm_effects::cli_marks::ICON_CONTRAST)
 }
 
 /// `ink` floored along its own hue to read `min`:1 on `ground`.
 fn floored_on(ink: [u8; 3], ground: [u8; 3], min: f32) -> [u8; 3] {
-    let pack = |c: [u8; 3]| u32::from_be_bytes([0, c[0], c[1], c[2]]);
     rgb_of(aterm_effects::color_math::floor_contrast_keeping_hue(
-        pack(ink),
-        pack(ground),
+        pack_rgb(ink),
+        pack_rgb(ground),
         min,
     ))
+}
+
+/// The contrast `ink` reads at on `ground` (WCAG).
+fn reads_on(ink: [u8; 3], ground: [u8; 3]) -> f32 {
+    aterm_effects::color_math::contrast_ratio(pack_rgb(ink), pack_rgb(ground))
+}
+
+/// `c` as `0x00RRGGBB`.
+fn pack_rgb(c: [u8; 3]) -> u32 {
+    u32::from_be_bytes([0, c[0], c[1], c[2]])
+}
+
+/// THE FACTS' WORDS' INKS on a pane (§8): made from what the pane itself
+/// gives the glass — the program's rule `gray`, the pane's ink and its
+/// ground — not from the instance theme, yet no surer to read: a program's
+/// grey is chosen for no theme in particular, and on a light tab it sits
+/// near the paper (Claude's `#999999` panel grey read 2.66:1 on Default
+/// Light, its values 4.30:1). Each is floored along its own hue on the
+/// ground it is laid on, and one that already reads is kept as it is, byte
+/// for byte, so a quiet theme stays quiet. The bottom rule's facts are laid
+/// in them ([`compose_rule_spans`]), and the top-effort key's ghost
+/// ([`compose_top`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct FactInks {
+    /// A value at rest: the grey lifted [`VALUE_LIFT`] toward the ink
+    /// ([`value_fg`]), floored to 4.5:1 ([`legible_on`]): words the owner
+    /// reads.
+    value: [u8; 3],
+    /// A lit value: the pane's ink, floored the same way.
+    lit: [u8; 3],
+    /// A word greyed on purpose: a hidden fact's `off`, the key's ghost at
+    /// rest ([`greyed_on`]).
+    stub: [u8; 3],
+}
+
+impl FactInks {
+    /// The inks under a rule drawn in `gray`, on a pane whose ink is `ink`,
+    /// laid on `ground`.
+    fn of(gray: [u8; 3], ink: [u8; 3], ground: [u8; 3]) -> Self {
+        let value = legible_on(value_fg(gray, ink), ground);
+        Self {
+            value,
+            lit: legible_on(ink, ground),
+            stub: greyed_on(gray, value, ground),
+        }
+    }
+}
+
+/// [`FactInks::stub`] under a rule drawn in `gray` on `blank`'s pane: a
+/// greyed word's ink, as the tests outside this module read it.
+#[cfg(test)]
+pub(crate) fn greyed_ink(gray: [u8; 3], blank: RenderCell) -> [u8; 3] {
+    FactInks::of(gray, blank.fg, blank.bg).stub
+}
+
+/// How far a greyed word is quieted from the live value toward the ground
+/// where the program's grey reads no quieter than the value
+/// ([`greyed_on`]): the share the harness switch's quiet label is quieted by
+/// ([`switch_cell`]).
+const GREYED_QUIET: f32 = 0.3;
+
+/// A WORD GREYED ON PURPOSE on `ground` — a hidden fact's `off` (owner: a
+/// clicked-off fact shows "greyed out text and say off"), the top-effort
+/// key's ` KEY off ` ghost — quieter than the live `value` beside it, but
+/// still read: the program's `gray` as it drew its rule, floored to 3:1
+/// along its own hue ([`visible_on`]), which keeps it below the value, held
+/// to 4.5:1. Where that grey reads as loud as the value or louder — a rule
+/// drawn in the pane's own ink, or an ink dimmer than the grey (Solarized
+/// Dark under `#999999`, 5.27:1 beside a value at 5.08:1) — it is the value
+/// quieted [`GREYED_QUIET`] toward the ground instead, floored the same way.
+fn greyed_on(gray: [u8; 3], value: [u8; 3], ground: [u8; 3]) -> [u8; 3] {
+    let ink = if reads_on(gray, ground) < reads_on(value, ground) {
+        gray
+    } else {
+        mix(value, ground, GREYED_QUIET)
+    };
+    visible_on(ink, ground)
 }
 
 /// The mark a program's top line wears ([`aterm_effects::cli_marks`]): one
@@ -7249,7 +7359,8 @@ fn ghost_chars() -> impl Iterator<Item = char> {
 /// where it is drawn, the lockup's frame columns (pads included; empty: none
 /// laid) and its icon's first, and the mark's sprite over the icon's cells —
 /// one layer per pane, kept while the key holds, so a frame at rest hands
-/// the renderer the same `Arc` ([`mark_layer`]).
+/// the renderer the same `Arc` ([`mark_layer`]) — and the switch's state mark
+/// (`● ○ ◐`): its frame column and the icon drawn there ([`switch_icon`]).
 #[derive(Debug, Default)]
 struct ComposedTop {
     key: Option<TopKey>,
@@ -7264,6 +7375,7 @@ struct ComposedTop {
     lockup: std::ops::Range<usize>,
     icon: Option<usize>,
     mark: Option<aterm_core::render::FxLayer>,
+    switch_mark: Option<aterm_core::render::ChromeIcon>,
 }
 
 /// Where [`compose_top`] laid a harness switch, in frame columns: its form
@@ -7339,8 +7451,9 @@ fn rgb_of(c: u32) -> [u8; 3] {
 ///
 /// THE TOP-EFFORT KEY's ghost (`key.face`, design §10.6.14) takes Claude's slot
 /// at the run's right end, the `─` after it left as Claude's: ` KEY off ` in
-/// Claude's rule gray, not bold, at full size — lifted and underlined while
-/// the pointer is on it — the tint, the switch and the lockup laid in the
+/// Claude's rule gray, not bold, at full size, greyed as a hidden fact's `off`
+/// is ([`FactInks::stub`]) — lifted to the facts' value ink and underlined
+/// while the pointer is on it — the tint, the switch and the lockup laid in the
 /// span short of it. Its mark (`◐`, `▸`) takes the `─` left of its leading
 /// blank, or of Claude's tag's: the span's last cell, which no rung takes.
 /// Where no rung fits, only the ghost and its mark are written.
@@ -7383,6 +7496,7 @@ fn compose_top_in(key: &TopKey, top: &mut ComposedTop, version: Option<&str>, ti
     top.ghost = None;
     top.lockup = 0..0;
     top.icon = None;
+    top.switch_mark = None;
     let TopKey {
         line,
         program,
@@ -7418,11 +7532,14 @@ fn compose_top_in(key: &TopKey, top: &mut ComposedTop, version: Option<&str>, ti
         bold: false,
         ..rule_cell
     });
+    // The ghost's words are a fact's ([`FactInks`]): at rest greyed, as a
+    // hidden fact's `off` is, lit the value's ink, on the run's ground.
+    let ghost_inks = FactInks::of(rule_cell.fg, blank.fg, rule_cell.bg);
     let ghost_cells = |lit: bool| {
         let fg = if lit {
-            value_fg(rule_cell.fg, blank.fg)
+            ghost_inks.value
         } else {
-            rule_cell.fg
+            ghost_inks.stub
         };
         ghost_chars().map(move |ch| RenderCell {
             ch,
@@ -7624,6 +7741,7 @@ fn compose_top_in(key: &TopKey, top: &mut ComposedTop, version: Option<&str>, ti
         for (k, &(ch, ink)) in f.cells().iter().enumerate() {
             cells[at.start + k - lo] = switch_cell(ch, ink, paint, palette, blank, mark_fg);
         }
+        top.switch_mark = switch_icon(&f, run.col + at.start);
     }
     if let (Some(at), Some(mark)) = (mark_at, mark_cell) {
         cells[at - lo] = mark;
@@ -7988,7 +8106,13 @@ fn push_agy_inline_markdown(
 /// it is floored along its own hue on the ground it is laid on (§8): a
 /// graphic to 3:1 ([`visible_on`]), letters to 4.5:1 ([`legible_on`]), the
 /// inline code's on its pill; one that already reads is kept as it is. The
-/// rule's inks are the pane's own and stand as the program drew them.
+/// inks made from the rule's grey and the pane's ink are no surer to read
+/// on a light tab (a quote's words read 3.22:1 on Solarized Light under a
+/// `#999999` rule), and those that carry words or state are floored the
+/// same way: an H3's and a quote's letters to 4.5:1, an unchecked box and a
+/// nested bullet to 3:1. The rule's own grey stands as the program drew it
+/// where it draws structure, neither words nor state: a horizontal rule, a
+/// quote's bar.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct MarkdownInks {
     /// The accent as a graphic: a reply's lead `●` or `◆`, a checked box's
@@ -8006,8 +8130,13 @@ struct MarkdownInks {
     code_bg: [u8; 3],
     /// A link: the accent 42% toward the pane's ink.
     link: [u8; 3],
-    /// A quiet glyph and a quote: the rule's grey lifted [`VALUE_LIFT`].
+    /// An H3 or H4 heading: the rule's grey 78% toward the pane's ink.
+    h3: [u8; 3],
+    /// A quiet glyph, an unchecked box's `☐` and a nested bullet's `◦`: the
+    /// rule's grey lifted [`VALUE_LIFT`] toward the pane's ink, as a graphic.
     quiet: [u8; 3],
+    /// A quote's words: the same lift, as letters.
+    quote: [u8; 3],
     /// The rule's grey: a horizontal rule, a quote's bar.
     rule: [u8; 3],
 }
@@ -8027,7 +8156,9 @@ impl MarkdownInks {
             code: legible_on(toward_ink(0.55), code_bg),
             code_bg,
             link: legible_on(toward_ink(0.42), ground),
-            quiet: mix(rule.fg, blank.fg, VALUE_LIFT),
+            h3: legible_on(mix(rule.fg, blank.fg, 0.78), ground),
+            quiet: visible_on(value_fg(rule.fg, blank.fg), ground),
+            quote: legible_on(value_fg(rule.fg, blank.fg), ground),
             rule: rule.fg,
         }
     }
@@ -8057,7 +8188,9 @@ fn render_agy_markdown_row(
         code: code_fg,
         code_bg,
         link: link_fg,
+        h3: h3_fg,
         quiet: quiet_fg,
+        quote: quote_fg,
         rule: rule_fg,
     } = *inks;
     let (lead, body, lead_glyph) = if let Some(rest) = trimmed_end.strip_prefix("● ") {
@@ -8101,7 +8234,7 @@ fn render_agy_markdown_row(
                 ..blank
             },
             _ => RenderCell {
-                fg: mix(rule_fg, blank.fg, 0.78),
+                fg: h3_fg,
                 bold: true,
                 italic: true,
                 ..blank
@@ -8193,7 +8326,7 @@ fn render_agy_markdown_row(
             out.push(blank);
         }
         let quote_base = RenderCell {
-            fg: quiet_fg,
+            fg: quote_fg,
             italic: true,
             ..blank
         };
@@ -8643,8 +8776,8 @@ mod yolo_tests;
 #[path = "claude_footer_registry_tests.rs"]
 mod registry_tests;
 
-/// THE FOOTER READ FOR OTHER MODULES' TESTS (session log Phase 3B, addendum
-/// A25): a Claude home on disk, and one read of a process in it through the
+/// THE FOOTER READ FOR OTHER MODULES' TESTS:
+/// a Claude home on disk, and one read of a process in it through the
 /// resolver's own path ([`resolve_into`], then the wake [`LogWake::after`]),
 /// the process's exec read and the roster answered here, never the machine's.
 #[cfg(test)]
@@ -13623,7 +13756,7 @@ mod tests {
         host.shutdown_and_join();
     }
 
-    /// NO `ctx auto` (`docs/DESIGN-harness-autopilot-2026-10-15.md` §12.4.3 item 5, slice 4e):
+    /// NO `ctx auto` (`docs/DESIGN-harness-autopilot-2026-10-15.md` §12.4.3 item 5):
     /// the context fact is a reading or nothing. A fresh Claude Code pane (its facts from its
     /// registry row, through the resolver), a fresh agy and a fresh Muse Code pane (the facts
     /// the frame makes for them) and an agy pane the resolver fills with no registry row show
@@ -13834,7 +13967,7 @@ mod tests {
         );
     }
 
-    /// A READING GOES WITH CLAUDE CODE'S INDICATOR (the review of slice 4e). The rule draws
+    /// A READING GOES WITH CLAUDE CODE'S INDICATOR. The rule draws
     /// `◐ ctx 61% left` while 2.1.306's mode row ends with `61% until auto-compact`, and keeps
     /// it while Claude Code's `◐ medium · /effort` holds the indicator's slot, while the `/`
     /// menu stands in the mode row's place and while a box stands over the composer; once the

@@ -139,12 +139,16 @@ USAGE
                            make this machine a publisher (without the Trust
                            toolchain, run `aterm pkg install trust` first). Seeds
                            the newest master-signed roster pair from the channel
-                           into dist/, acquires rustup, the stable slices and the
-                           wasm32 pin, audits the whole publishing stack (the
-                           Trust toolchain and its drivers, the stable slices,
-                           the Apple identity, a live-tested notary credential,
-                           the credentials profile, gh auth, the channel token)
-                           and prints every gap with its remedy. Only on a clean
+                           into dist/, runs `targo --unverified verify provision`
+                           (rustup, the stable slices, the wasm32 pin, fish,
+                           pwsh, binaryen, the browsers) and rustup's trust link,
+                           audits the whole publishing stack (the Trust toolchain
+                           and its drivers, the stable slices, the base layer,
+                           the develop layer, LibreSSL, the publication engine,
+                           the site checkout, node and firebase-tools, the Apple
+                           identity, a live-tested notary credential, the
+                           credentials profile, gh auth, the channel token) and
+                           prints every gap with its remedy. Only on a clean
                            pass does it mint this machine's key, by the join
                            ceremony: the paper phrase, typed once, is the only
                            input, and a roster id is never spent on a machine

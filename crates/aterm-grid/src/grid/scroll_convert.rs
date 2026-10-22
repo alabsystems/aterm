@@ -635,7 +635,7 @@ impl CellPool {
 
     /// Heap bytes held by the free-list (bodies + the `Vec<Vec<Cell>>` spine).
     #[inline]
-    fn memory_used(&self) -> usize {
+    const fn memory_used(&self) -> usize {
         self.bufs
             .capacity()
             .saturating_mul(std::mem::size_of::<Vec<Cell>>())
@@ -647,7 +647,7 @@ impl CellPool {
 
     /// Test-only: pooled body count, for the recycling/bound tests.
     #[cfg(test)]
-    pub(crate) fn len(&self) -> usize {
+    pub(crate) const fn len(&self) -> usize {
         self.bufs.len()
     }
 }
@@ -959,7 +959,7 @@ impl LazyBuffer {
 
     /// Test-only: pooled cell-body count.
     #[cfg(test)]
-    pub(crate) fn pooled_bodies(&self) -> usize {
+    pub(crate) const fn pooled_bodies(&self) -> usize {
         self.pool.len()
     }
 
@@ -1128,7 +1128,7 @@ impl ScrolledRowExtras {
     /// per-row share. Every holder (the ring, staged rows, the resize undo)
     /// charges this, so a row costs the same wherever it waits.
     pub(crate) fn retained_memory_used(&self) -> usize {
-        fn capacity_bytes<T>(values: &Vec<T>) -> usize {
+        const fn capacity_bytes<T>(values: &Vec<T>) -> usize {
             values.capacity().saturating_mul(std::mem::size_of::<T>())
         }
         let mut total = std::mem::size_of::<Self>()
@@ -1157,7 +1157,7 @@ impl ScrolledRowExtras {
 
     /// True when all fields are empty (common case: plain ASCII text).
     #[inline]
-    pub(crate) fn is_empty(&self) -> bool {
+    pub(crate) const fn is_empty(&self) -> bool {
         self.hyperlinks.is_empty()
             && self.complex_chars.is_empty()
             && self.combining.is_empty()
@@ -1698,7 +1698,7 @@ struct AttrRunBuilder {
 impl AttrRunBuilder {
     /// Not named `new`: the lock-order census resolves one-hop held calls by
     /// callee name, so a `new` would merge with every other `new` in the tree.
-    fn empty() -> Self {
+    const fn empty() -> Self {
         Self {
             rle: Rle::new(),
             value: CellAttrs::DEFAULT,

@@ -4,7 +4,7 @@
 //! THE KITTY CHEERS THE LANDING, WHEN YOU ARE THERE TO SEE IT
 //! (`docs/DESIGN-harness-autopilot-2026-10-15.md` §11.3; §11.3.5's aterm-gui
 //! tests), on the real redraw path (a scripted CPU surface, the resident pet
-//! the trail, Full motion): a task end told the way slice 2a tells one (a
+//! the trail, Full motion): a task end told the way the host tells one (a
 //! session under Land claimed by this host, open, 45 s of its agent's busy
 //! time, landed) is the room's `landed` on that session's frames. An unfocused
 //! window's frames do not consume it; the first focused frame of the pane
@@ -105,7 +105,7 @@ fn publish(app: &App, word: &'static str) -> bool {
         )
 }
 
-/// Session 0's task comes down the way slice 2a counts an end: its loop
+/// Session 0's task comes down the way the host counts an end: its loop
 /// tells open, its agent works 45 s on the ledger clock (moved on, not
 /// waited), and its loop tells landed (Land's end; Cruise never ends). The
 /// end standing on its glass.

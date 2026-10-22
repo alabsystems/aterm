@@ -1618,6 +1618,7 @@ mod tests {
             findings: Findings::default(),
             demand: Demand::Fast,
             lanes_off: Vec::new(),
+            parked_tabs: Vec::new(),
         }));
         let ended = [
             EndedJob {
@@ -1664,6 +1665,7 @@ mod tests {
             findings: Findings::default(),
             demand: Demand::Fast,
             lanes_off: Vec::new(),
+            parked_tabs: Vec::new(),
         }));
         assert!(evaluate(&machine("sys job=a5 done"), &s2, &[7]).holds);
         assert_eq!(
@@ -1692,6 +1694,7 @@ mod tests {
             findings: Findings::default(),
             demand: Demand::Fast,
             lanes_off: Vec::new(),
+            parked_tabs: Vec::new(),
         }));
         let o = evaluate(&machine("sys jobs.stuck=1 and jobs.running>=1"), &s, &[7]);
         assert!(o.holds, "{o:?}");

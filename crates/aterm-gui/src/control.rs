@@ -971,7 +971,7 @@ fn argument_escalation(verb: &str, rest: &str) -> Option<Need> {
         {
             Some(Need::OwnerOnly)
         }
-        // `log n` reads the INSTANCE's node log (session log 5J-3): Owner-only
+        // `log n` reads the INSTANCE's node log: Owner-only
         // like `brief all`. Any bare `n` word names it (`n=<count>` is a count),
         // so no spelling of it passes as a session's read.
         "log" if crate::session_log_node::names_node_log(rest) => Some(Need::OwnerOnly),
@@ -1337,8 +1337,8 @@ fn await_commit_to_publish(gate: Option<&crate::spawn::DeferredReaderGate>) -> b
     gate.is_none_or(|gate| gate.wait_until_released(&AtomicBool::new(false)))
 }
 
-/// `update check`'s answer when the main thread refuses the settings read
-/// (finding 40): the refusal in its own words behind the verb's prefix —
+/// `update check`'s answer when the main thread refuses the settings read:
+/// the refusal in its own words behind the verb's prefix —
 /// `ERR update check: aterm is showing a dialog; answer it, then retry`, or
 /// `… main thread stalled <N>s; retry`, which the harness rides
 /// out as a request turned away.
@@ -1641,7 +1641,7 @@ fn cmd_update(rest: &str, scope: Scope, proxy: &EventLoopProxy<Wake>) -> String 
         // Status reply and desync every following read on a pipelined connection
         // (the same hazard `changelog=` below is encoded for).
         // `trial_wait=`: this build's boot trial waiting for a window to confirm or
-        // revert it, and until when (round eight, #8 and S1's second review), or the
+        // revert it, and until when (#8 and second review), or the
         // recovery proof that refused a launch's confirmation of it.
         for (name, value) in [
             ("apply_refusal", apply.last_refusal.as_str()),
@@ -5677,7 +5677,7 @@ fn fabric_status_line() -> String {
     let (lane, bridge_build, faults) = crate::fabric::fabric_bridge_facts();
     let n = |v: Option<u64>| v.map_or_else(|| "-".to_string(), |n| n.to_string());
     // The bus mirror's tail, empty (the line as it was) unless the bridge's
-    // recorded `hello` asked for it (session log phase 4).
+    // recorded `hello` asked for it.
     let mirror = crate::fabric::fabric_mirror_facts();
     format!(
         "OK state={} supervised={} command={command} reason={reason} rtt_ms={} link_age_ms={} \
@@ -5820,7 +5820,7 @@ fn dispatch_bridge_verb(
         // The bridge's own broker link, gated to the lane's incarnation. A
         // replaced bus log (`forgot=1`) is another log's offsets to the bus
         // mirror too: its cursors start over.
-        // `link mirror unretained` (session log Phase 6 step 6E-3) is an
+        // `link mirror unretained` is an
         // `auto` bridge's word that the node does not mirror: the store hears
         // it as it hears a hello ([`note_mirror_word`]).
         "link" => {
@@ -5832,7 +5832,7 @@ fn dispatch_bridge_verb(
             }
             reply
         }
-        // THE BUS MIRROR (session log phase 4), gated the same way.
+        // THE BUS MIRROR, gated the same way.
         "log-take" => crate::session_log_mirror::cmd_log_take(store, rest, generation),
         "log-landed" => crate::session_log_mirror::cmd_log_landed(store, rest, generation),
         // Its lane grammar and build, gated the same way. A RECORDED hello
@@ -5938,7 +5938,7 @@ fn dispatch_await_task(
 /// THE STORE HEARS WHETHER THE NODE MIRRORS (`session_log_mirror::Shared`)
 /// from the owning bridge's word on it (`fabric::bridge_mirror_word`): a
 /// recorded `hello`, and its `link mirror` report — an `auto` bridge's
-/// `unretained` (session log Phase 6 step 6E-3). An `auto` hello not yet
+/// `unretained`. An `auto` hello not yet
 /// judged leaves the word as it was. Read off the link before the store's
 /// read guard is taken, so the two locks never nest here.
 fn note_mirror_word(store: &Store, generation: Option<crate::fabric::BridgeGeneration>) {
@@ -6301,8 +6301,8 @@ fn app_verb_halt(
 /// ([`sessionless_front`]).
 ///
 /// Two forms name no session of their own and are answered first, whatever
-/// terminal there is or is not: `log n`, the instance's node log (session log
-/// 5J-3, Owner-only like `brief all`, [`node_log_reply`]), and `await task`'s
+/// terminal there is or is not: `log n`, the instance's node log (Owner-only like `brief all`, [`node_log_reply`]),
+/// and `await task`'s
 /// list form, which names its targets as an argument like `subscribe` and
 /// resolves them itself ([`dispatch_await_task`]; a leading selector keeps the
 /// single form, answered by the session's `cmd_await`).
@@ -11531,7 +11531,7 @@ struct InputWords {
 
 /// THE REQUEST'S OWN WORDS, asked at the input admission's usage step
 /// ([`admit_with`]), before the exactly-once claim, so a refusal consumes no
-/// `id=`: a leading `cause=@<off>|<seq>` (phase 3A, rulings R6 and R7), checked
+/// `id=`: a leading `cause=@<off>|<seq>`, checked
 /// against what THIS session holds ([`cause_of`]), and `turn`'s own option
 /// grammar and patterns with a `cause=` among its options (R6's any-position
 /// form), checked as a leading one is and taken once (both is

@@ -1292,7 +1292,7 @@ pub(crate) fn rename_path(from: &Path, to: &Path) -> io::Result<()> {
 /// `anti-rollback` features'.)
 #[cfg(any(feature = "retention", feature = "anti-rollback"))]
 pub(crate) fn flush_file(f: &File, at: &Path) -> io::Result<()> {
-    f.sync_all()?;
+    astream_sys::full_sync(f)?;
     #[cfg(all(test, unix, feature = "retention"))]
     crate::power_loss::flushed(at);
     #[cfg(not(all(test, unix, feature = "retention")))]
@@ -2676,7 +2676,7 @@ pub(crate) fn sync_parent_dir(path: &Path) -> io::Result<()> {
         _ => Path::new("."),
     };
     let res = match File::open(parent) {
-        Ok(d) => d.sync_all(),
+        Ok(d) => astream_sys::full_sync(&d),
         Err(e) => Err(e),
     };
     match res {
@@ -4704,7 +4704,7 @@ impl BrokerLog {
         let marker = replica_marker_path(&self.path);
         let mut f = create_fresh(&marker, &mut FsOpenOptions::new())?;
         f.write_all(REPLICA_MARKER_NOTE)?;
-        f.sync_all()?;
+        astream_sys::full_sync(&f)?;
         sync_parent_dir(&marker)?;
         self.replica = true;
         eprintln!(

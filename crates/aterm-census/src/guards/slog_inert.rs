@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! slog-inert (design §7.4, phase 3A ruling R5): a mark never becomes input.
+//! slog-inert (design §7.4): a mark never becomes input.
 //!
 //! A tripwire, not the proof: the session log's code — the engine crate
 //! `aterm-slog`, and aterm-gui's files that implement marks and the log —
@@ -30,7 +30,7 @@ const SLOG_ENGINE: &str = "crates/aterm-slog/src/";
 /// the same prefix).
 const GUI_SLOG: &str = "crates/aterm-gui/src/session_log";
 
-/// The transcript's step fold (phase 3B, ruling S26 / addendum A24): what it
+/// The transcript's step fold: what it
 /// reads becomes marks, so it names no PTY path either.
 const AGENT_STEPS: &str = "crates/aterm-agent/src/harness/steps.rs";
 
@@ -530,7 +530,7 @@ mod tests {
         }
     }
 
-    /// PHASE 3B'S FILES (ruling S26): a PTY-path symbol planted in the
+    /// PHASE 3B'S FILES: a PTY-path symbol planted in the
     /// transcript glue, the observed-marks glue or the step fold is one
     /// finding on its line. NEGATIVE CONTROL: the same symbol in the step
     /// fold's test file, or in a harness file beside it, is none.

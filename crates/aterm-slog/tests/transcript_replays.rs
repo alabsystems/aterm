@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Hand sequences of the transcript join (plan §2.4-§2.6, rulings S1-S5,
-//! S9, S13, S21, S23, S24, S27, A1, A3, A21): screen verdicts and
+//! Hand sequences of the transcript join (plan §2.4-§2.6):
+//! screen verdicts and
 //! [`TxEvent`]s interleaved through a real [`Log`] and [`TurnTracker`], one
 //! test per row of the join's tables, each with its negative control. Every
 //! log a test builds keeps the runs' time order

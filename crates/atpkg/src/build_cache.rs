@@ -16,13 +16,17 @@
 //! the environment (`CARGO_BUILD_BUILD_DIR`); every other command is handed a `--config`,
 //! which a nested cargo started by the build never inherits. [`reclaim`] removes what
 //! nobody builds into any more: whole build directories, and inside one that stays what no
-//! build reads again ([`stale`]).
+//! build reads again ([`stale`]); [`reclaim_home_watched`] also takes the pinned tools
+//! nobody ran for a month from the tooling cache `verify provision` fills ([`tooling`]).
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 #[path = "build_cache_stale.rs"]
 pub mod stale;
+
+#[path = "build_cache_tooling.rs"]
+pub mod tooling;
 
 pub use stale::RECLAIM_STALE;
 
@@ -248,6 +252,10 @@ pub enum Unused {
     Idle { idle: Duration },
     /// What an earlier pass renamed aside and did not finish removing.
     Unfinished,
+    /// A completed pinned tool of the tooling cache nothing ran for `idle`, at least
+    /// `after` ([`RECLAIM_IDLE`]). Unfinished provisioning scratches are retained
+    /// ([`tooling`]).
+    Tooling { idle: Duration, after: Duration },
     /// PART of a build directory that stays ([`stale`]): `incremental` crate folders and
     /// `units` an old compiler built, each unwritten for `after` ([`RECLAIM_STALE`]) or more.
     /// The path that goes is the stage they were moved into.
@@ -709,8 +717,8 @@ fn compiler_store(_: Option<&Path>) -> Option<PathBuf> {
     None
 }
 
-/// [`reclaim_watched`] over this user's cache, now, `record` asked before each removal;
-/// nothing off macOS or without a home.
+/// [`reclaim_watched`] over this user's cache, now, then [`tooling::reclaim`] over its
+/// tooling cache, `record` asked before each removal; nothing off macOS or without a home.
 pub fn reclaim_home_watched(
     gone_after: Duration,
     placing: Option<&checkout::Placing>,
@@ -720,14 +728,17 @@ pub fn reclaim_home_watched(
         return Vec::new();
     }
     aterm_types::dirs::home_dir().map_or_else(Vec::new, |home| {
-        reclaim_watched(
+        let now = SystemTime::now();
+        let mut removed = reclaim_watched(
             &cache_root(&home),
             Some(&home),
-            SystemTime::now(),
+            now,
             gone_after,
             placing,
             record,
-        )
+        );
+        removed.extend(tooling::reclaim(&tooling::root(&home), now, record));
+        removed
     })
 }
 
@@ -776,21 +787,18 @@ pub fn plan(
     planned
 }
 
-/// [`plan`] for this user's cache now, with the day's window ([`reclaim_home`]'s); nothing
-/// off macOS or without a home.
+/// [`plan`] for this user's cache now, with the day's window ([`reclaim_home`]'s), then
+/// [`tooling::plan`] for its tooling cache; nothing off macOS or without a home.
 #[must_use]
 pub fn plan_home() -> Vec<Planned> {
     if !cfg!(target_os = "macos") {
         return Vec::new();
     }
     aterm_types::dirs::home_dir().map_or_else(Vec::new, |home| {
-        plan(
-            &cache_root(&home),
-            Some(&home),
-            SystemTime::now(),
-            RECLAIM_GONE,
-            None,
-        )
+        let now = SystemTime::now();
+        let mut planned = plan(&cache_root(&home), Some(&home), now, RECLAIM_GONE, None);
+        planned.extend(tooling::plan(&tooling::root(&home), now));
+        planned
     })
 }
 

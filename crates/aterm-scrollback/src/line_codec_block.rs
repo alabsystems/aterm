@@ -137,7 +137,7 @@ const _: () = assert!(
 ///
 /// Format: `[flags:1][len:4][content:len]`
 /// Returns `None` if `data` is truncated or size overflows.
-fn line_size_v0(data: &[u8]) -> Option<usize> {
+const fn line_size_v0(data: &[u8]) -> Option<usize> {
     if data.len() < 5 {
         return None;
     }

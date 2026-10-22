@@ -2178,10 +2178,7 @@ fn bash(prompt: &PromptV2, rows: &[String], ctx: &ApprovalCtx) -> Decision {
     if ctx.bypass_mode {
         return Decision::escalate("a box in a bypass session is a vendor circuit breaker");
     }
-    if let Err(why) = read_only_every_reading(&readings, &ctx.python_allow) {
-        return Decision::escalate(why);
-    }
-    if let Err(why) = blanks_shown(&readings) {
+    if let Err(why) = readings_read_only(&readings, &ctx.python_allow) {
         return Decision::escalate(why);
     }
     if let Err(why) = shell_models_hold(&readings, prompt.runs_on().as_deref(), ctx) {
@@ -2301,6 +2298,29 @@ pub(crate) fn read_only_every_reading(
         }
     }
     Ok(())
+}
+
+/// THE READ-ONLY RULE'S VERDICT ON A BASH BOX'S COMMAND ALONE: `Ok` when
+/// every reading of it classifies read-only ([`read_only_every_reading`])
+/// and none turns on a blank the screen cannot show ([`blanks_shown`]),
+/// checked in that order, the first refusal returned. [`bash`]'s read-only
+/// rule needs this before its vendor-note, mode, startup, zsh and git checks
+/// (which read the box and the session, not the command), and the window's
+/// advisory word for a Bash box (`aterm-gui`'s `presence::prompt_detail`,
+/// `bash:read-only`) is this: the rule's verdict on the command alone, never
+/// read-only for a command this refuses. The word reads neither the box nor
+/// the session, so the rules still refuse some boxes it calls read-only (a
+/// vendor note, bypass, a breaker's options or a removal it names, the
+/// shell's startup, a line not plain under zsh, git configuration that runs
+/// a program).
+///
+/// # Errors
+///
+/// The first reading that is not read-only, else the first that holds a
+/// form the shell may read otherwise than drawn, named.
+pub fn readings_read_only(readings: &[String], python_allow: &[String]) -> Result<(), String> {
+    read_only_every_reading(readings, python_allow)?;
+    blanks_shown(readings)
 }
 
 /// `Ok` when no reading of a Bash box's rows ([`command_readings`]) holds a

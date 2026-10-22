@@ -9,7 +9,7 @@
 //! holds thousandths of a token and refills one token per
 //! [`MARK_REFILL_MS`], up to the burst.
 //!
-//! THE AUTHORS (ruling R11). The harness, the bridge, the Owner's clients
+//! THE AUTHORS. The harness, the bridge, the Owner's clients
 //! (`ctl`) and the person each have a bucket of their own, outside every
 //! table, so no flood of other authors delays them. Sessions (edge sources)
 //! share [`MARK_ACTORS`] named buckets; a slot is reused only when its
@@ -19,7 +19,7 @@
 //! table is bounded and a flood of minted sources marks at most as fast as
 //! the named slots and the overflow together allow, whatever their number.
 //!
-//! THE MARKS A BUCKET WAS SHORT OF (phase 5, ruling T1): a host that counts
+//! THE MARKS A BUCKET WAS SHORT OF: a host that counts
 //! a mark instead of making it, its author's bucket short
 //! ([`MarkLimiter::note_short`]), keeps the count, and the next mark the
 //! same author makes says it ([`MarkLimiter::owed`], [`MarkLimiter::said`]):
@@ -28,7 +28,7 @@
 //! when no free slot or idle slot owing nothing is left, and its count then
 //! goes with its last holder, not with the slot.
 //!
-//! THE OVERFLOWED AUTHORS' OWN COUNTS (Phase 6 step 6C-6, ruling U18): the
+//! THE OVERFLOWED AUTHORS' OWN COUNTS: the
 //! authors past the named slots (the sessions past the table, and `-`,
 //! `aterm` and a vendor) share the overflow bucket's tokens, but not their
 //! counts: [`MARK_OWED_AUTHORS`] owed-only entries, one per such author,
@@ -51,7 +51,7 @@ pub const MARK_BURST: u32 = 20;
 pub const MARK_REFILL_MS: u64 = 1000;
 /// The named buckets sessions share before the overflow.
 pub const MARK_ACTORS: usize = 16;
-/// The overflowed authors whose short counts are kept apart (ruling U18):
+/// The overflowed authors whose short counts are kept apart:
 /// past them, the shared pool.
 pub const MARK_OWED_AUTHORS: usize = 32;
 

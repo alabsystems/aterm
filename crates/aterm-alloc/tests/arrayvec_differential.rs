@@ -50,16 +50,16 @@ mod model {
         pub fn new() -> Self {
             Self(Vec::with_capacity(N))
         }
-        pub fn as_slice(&self) -> &[T] {
-            &self.0
+        pub const fn as_slice(&self) -> &[T] {
+            self.0.as_slice()
         }
-        pub fn is_full(&self) -> bool {
+        pub const fn is_full(&self) -> bool {
             self.0.len() == N
         }
-        pub fn capacity(&self) -> usize {
+        pub const fn capacity(&self) -> usize {
             N
         }
-        pub fn remaining_capacity(&self) -> usize {
+        pub const fn remaining_capacity(&self) -> usize {
             N - self.0.len()
         }
         pub fn try_push(&mut self, v: T) -> Result<(), Full<T>> {

@@ -1,0 +1,50 @@
+# claude-code 2.1.308 · MEASURED 2026-10-22, `aterm ctl text` of a private headless aterm (144x50, aterm 0.114.0) running the real Claude Code, launched by path with a scratch `CLAUDE_CONFIG_DIR`, a fake `apiKeyHelper` key and `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>` (a local stub of the API, crates/aterm-lab) · N's box (the newline twin of h-wrap-same) while the transcript file refused writes: S (h-wrap-same, the same description) answered Yes, its result and N's call dropped
+✻ Cogitated for 0s · done 11:34 AM
+
+❯ toolstart
+
+⏺ Bash(echo $(true) $(true) $(true) $(true) $(true) $(true) $(true) $(true) $(true) $(true) $(true) $(true) $(true) $(true) $(true) $(true)
+      $(true) $(true) $(true) $(t…)
+  ⎿  LP2A
+
+⏺ Bash(echo $(true) $(true) $(true) $(true) $(true) $(true) $(true) $(true) $(true) $(true) $(true) $(true) $(true) $(true) $(true) $(true)
+      $(true) $(true) $(true) $(t…)
+  ⎿  Interrupted · What should Claude do instead?
+
+✻ Cogitated for 0s · done 11:34 AM
+
+❯ toolstart
+
+⏺ Bash(echo $(true) $(true) $(true) $(true) $(true) $(true) $(true) $(true) $(true) $(true) $(true) $(true) $(true) $(true) $(true) $(true)
+      $(true) $(true) $(true) $(t…)
+  ⎿  Interrupted · What should Claude do instead?
+
+✻ Crunched for 0s · done 11:34 AM
+
+❯ toolstart
+
+⏺ Bash(echo $(true) $(true) $(true) $(true) $(true) $(true) $(true) $(true) $(true) $(true) $(true) $(true) $(true) $(true) $(true) $(true)
+      cccccccccc $(true) $(true)…)
+  ⎿  cccccccccc
+
+⏺ Bash(echo $(true) $(true) $(true) $(true) $(true) $(true) $(true) $(true) $(true) $(true) $(true) $(true) $(true) $(true) $(true) $(true)
+      cccccccccc $(true) $(true)…)
+  ⎿  Waiting…
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+ Bash command
+ Probe stale
+╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+ │ echo $(true) $(true) $(true) $(true) $(true) $(true) $(true) $(true) $(true) $(true) $(true) $(true) $(true) $(true) $(true) $(true)
+ │ cccccccccc $(true) $(true) $(true) $(true) $(true) $(true) $(true) $(true) $(true) $(true) $(true) $(true) $(true) $(true) $(true) $(true)
+ │ $(true) $(true) $(true) $(true) $(true) $(true) $(true) $(true) $(true) $(true) $(true) $(true) $(true) $(true) $(true) $(true) $(true)
+ │ $(true) $(true) $(true) $(true) $(true) $(true) $(true) $(true) $(true) $(true) $(true) $(true) $(true) $(true) $(true) $(true) $(true)
+ │ $(true) $(true) $(true) $(true) $(true) $(true) $(true) $(true) $(true) $(true) $(true) $(true) $(true) $(true) $(true)
+╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+ │ Dangerous rm operation not ruled out — too many command substitutions to analyze (81)
+
+ Do you want to proceed?
+ ❯ 1. Yes
+   2. No
+
+ Esc to cancel · Tab to amend

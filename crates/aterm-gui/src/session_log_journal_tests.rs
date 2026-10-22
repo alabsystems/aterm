@@ -247,7 +247,7 @@ fn host(r: &aterm_slog::Rec) -> aterm_slog::Rec {
 
 // ---- the gate and the default ------------------------------------------
 
-/// D3 ON (Phase 6 step 6B-1, ruling U21): with no `[session_log]` table the
+/// D3 ON: with no `[session_log]` table the
 /// journal is asked for, and the gate opens on a window's desk and the lab's
 /// seam, on macOS and Linux. It stays shut for an explicit `journal =
 /// false`, a plain headless instance, `restore_session = false` and a
@@ -300,7 +300,7 @@ fn the_gate_is_on_by_default_and_follows_the_desk() {
     assert!(!gate(&default, Desk::Headless), "headless keeps no desk");
 }
 
-/// RULING R10: with `journal = false` (the opt-out since D3 is on) the lane
+/// with `journal = false` (the opt-out since D3 is on) the lane
 /// is inert on every path: no thread, no wake in any log, no read, no file;
 /// and the reader's open creates nothing. NEGATIVE CONTROL: the writer's
 /// open makes the directory, 0700.
@@ -572,7 +572,7 @@ fn records_evicted_between_passes_read_as_one_counted_gap() {
     assert_eq!(read.gap.map(|g| g.lost), Some(gaps[0].1));
 }
 
-/// RULING R7: a session that closes between passes, forty of them at once,
+/// a session that closes between passes, forty of them at once,
 /// still gets its close journaled through the timeline the writer kept.
 #[test]
 fn sessions_closed_between_passes_still_get_their_closes() {
@@ -807,7 +807,7 @@ fn eio_eacces_eintr_and_eagain_each_do_what_the_table_says() {
     assert_eq!(rig.report.attention().1, Attention::Stopped(Cause::Denied));
 }
 
-/// RULING R2: no `flock`, no journal: the lock is refused, nothing is
+/// no `flock`, no journal: the lock is refused, nothing is
 /// written, and the owner is told why.
 #[test]
 fn without_flock_there_is_no_journal() {
@@ -919,7 +919,7 @@ fn the_writer_never_blocks_a_producer() {
     bad.join().expect("joins");
 }
 
-/// RULING R13: content-tier fields written straight through the log never
+/// content-tier fields written straight through the log never
 /// reach the journal's bytes; a command's later argument never reaches its
 /// `detail=`. NEGATIVE CONTROL: the same record with the title mistiered as
 /// host carries it.
@@ -985,7 +985,7 @@ fn the_content_tier_never_reaches_the_journal() {
 
 // ---- an update, the quit, the reader ---------------------------------
 
-/// RULING R5: the outgoing writer drains each fenced log to its fence and
+/// the outgoing writer drains each fenced log to its fence and
 /// ends its chain `#handed`; the successor journals above the fence; a
 /// reader shows each seq once across both. A drain cut short reads as `gap
 /// why=handoff lost=<k>`. A rollback writes on in a new segment.
@@ -1104,7 +1104,7 @@ fn an_update_hands_off_at_the_fence_and_the_successor_goes_on() {
     assert!(!newest, "the newest segment holds no trailer");
 }
 
-/// D3 ON ACROSS AN UPDATE (Phase 6 step 6B-1, ruling U21): a predecessor
+/// D3 ON ACROSS AN UPDATE: a predecessor
 /// that kept no journal (`journal = false`, or an older build that shipped it
 /// off) carries no `journal v=1` host line, so a successor on the default
 /// config, whose gate is open, journals each carried log itself from its
@@ -1287,7 +1287,7 @@ fn a_journal_off_predecessor_hands_to_a_default_on_successor() {
     );
 }
 
-/// RULING R14: a clean quit writes each open session's closes and `#fin`; the
+/// a clean quit writes each open session's closes and `#fin`; the
 /// next read finds no crash. A deadline that passes first writes no `#fin`,
 /// and the chain then reads as a crash.
 #[test]
@@ -1536,7 +1536,7 @@ fn the_real_directory_keeps_its_rules() {
     assert_eq!(std::fs::read_dir(&target).expect("target").count(), 0);
 }
 
-/// THE HOSTILE DIRECTORY (ruling R9): retention, with a 1 KiB budget, removes
+/// THE HOSTILE DIRECTORY: retention, with a 1 KiB budget, removes
 /// only real, private segments of dead instances, oldest first, and stops at
 /// the budget. A symlink, a directory, a hard link, a FIFO, a 0644 file and
 /// foreign names that match loose patterns are all left as they are, and
@@ -1693,7 +1693,7 @@ fn version_skew_both_ways() {
     );
     // An older build's config reads a table it does not know the same way:
     // skipped, not refused; a config without `[session_log]` asks for the
-    // journal (D3 on, ruling U21).
+    // journal (D3 on).
     let older: crate::app_config::Config =
         aterm_toml::from_str("[a_future_table]\nanything = true\n").expect("skipped");
     assert!(older.session_log_journal());
@@ -1733,7 +1733,7 @@ fn a_long_running_writer_keeps_its_own_segments_within_the_budget() {
 
 // ---- the fixer's findings: bounds, a rollback, the quit, the backstop -----
 
-/// RETENTION BOUNDS THE COUNT AS WELL AS THE BYTES (ruling R9): a journal of
+/// RETENTION BOUNDS THE COUNT AS WELL AS THE BYTES: a journal of
 /// 5000 small dead segments (far under the byte budget, far over a
 /// listing's 4096 names, some of the oldest visited last) is pruned, oldest
 /// first, to within `journal::FILES_MAX` files and the byte budget, so one
@@ -1791,7 +1791,7 @@ fn retention_keeps_the_count_budget_and_sees_past_a_listing() {
 
 use std::ops::Not as _;
 
-/// A CUT LISTING DERIVES NO CRASH (ruling R11): a chain that quit cleanly
+/// A CUT LISTING DERIVES NO CRASH: a chain that quit cleanly
 /// across two segments, its second (holding the closes and `#fin`) past a
 /// listing's 4096 names, reads `gap why=unread`, never a crash. CONTROL: the
 /// same chain listed whole reads its `out=app-quit` close.
@@ -1836,7 +1836,7 @@ fn a_cut_listing_reads_unread_and_never_a_crash() {
     assert!(says(&v, "unread"), "the cut is said");
 }
 
-/// PRESENCE IS NEVER GUESSED FROM A DECODE BUDGET (ruling R11): a session
+/// PRESENCE IS NEVER GUESSED FROM A DECODE BUDGET: a session
 /// whose segments are all older than a decode budget's reach is still read
 /// (the index knows where it is, and its newest segments are decoded
 /// whatever their size), the same on every request; a read whose index
@@ -1966,7 +1966,7 @@ fn transient_errors_keep_the_segment_and_back_off() {
     assert_eq!(all(&v.log).len(), 101, "nothing lost");
 }
 
-/// RULING R5, A ROLLBACK BEFORE THE DRAIN IS WHOLE: an idle session that
+/// an idle session that
 /// wrote its `#handed` while a busy one held the drain back is restated
 /// when the update stands down, so a later crash reads it closed.
 #[test]
@@ -2084,7 +2084,7 @@ fn a_quit_while_backing_off_tries_once_more() {
     assert!(!rig.view("s-bq").crashed);
 }
 
-/// THE BACKSTOP SAYS EVERY SESSION IT LETS GO (ruling R7): past
+/// THE BACKSTOP SAYS EVERY SESSION IT LETS GO: past
 /// `retired_max`, a retired session gives up its timeline but keeps what its
 /// `#gap why=dropped` says until that is written whole, a snap first, so a
 /// write that fails meanwhile loses nothing and the reader places the loss.
@@ -2288,7 +2288,7 @@ fn the_reader_probes_with_its_index_lock_free() {
     assert!(spy.held.load(Ordering::Relaxed));
 }
 
-/// A QUIT WHOSE DRAIN OUTLASTS ITS PASSES ENDS NOTHING (ruling R14): every
+/// A QUIT WHOSE DRAIN OUTLASTS ITS PASSES ENDS NOTHING: every
 /// session is journaled and snapped, then each gains a backlog, more
 /// sessions than [`FINISH_PASSES`] passes reach (one session a pass). The
 /// quit writes no closes and no `#fin`, so each session reads as a crash
@@ -2347,7 +2347,7 @@ fn a_quit_whose_drain_outlasts_its_passes_reads_as_a_crash() {
     }
 }
 
-/// A QUIT NEVER ENDS A CHAIN OVER A SESSION BEHIND ITS LOG (ruling R14): a
+/// A QUIT NEVER ENDS A CHAIN OVER A SESSION BEHIND ITS LOG: a
 /// session busy at the drain's last pass, or one a producer appended to
 /// after it, is behind its head, so no closes and no `#fin` are written
 /// while it is; once the drain catches it up they are.
@@ -2371,7 +2371,7 @@ fn a_quit_never_ends_a_chain_over_a_session_behind_its_log() {
     assert_eq!(all(&v.log).len(), 3, "open, the mark, the quit close");
 }
 
-/// A COLD READ DECODES WHAT A WARM ONE DOES (ruling R11): the index refresh
+/// A COLD READ DECODES WHAT A WARM ONE DOES: the index refresh
 /// reads the whole journal but decodes none of it, so the first read after
 /// launch decodes the newest segments holding the session within the decode
 /// budget, exactly as a later one does, and answers the same.

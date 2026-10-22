@@ -5,7 +5,7 @@
 //! THE BUS MIRROR (design §5.5, phase 4): one session's bus-class records on
 //! their way from the GUI's ring to the bus, through the bridge's pin, across
 //! evictions, a broker that may hold another writer's record at a pinned
-//! seq, and a seamless update. The laws are the READER'S VIEW (ruling Q0):
+//! seq, and a seamless update. The laws are the READER'S VIEW:
 //! a reader dedupes records by `(node, sid, ep, seq)`, so a body the bus
 //! holds twice is shown once and exactly-once publication is no law; what
 //! the reader must never be shown is an `ms` twice (a record and a cover of
@@ -14,22 +14,22 @@
 
 use aterm_spec::derive::Model;
 
-/// THE LOG MIRROR (phase 4, rulings Q0-Q3 and Q12).
+/// THE LOG MIRROR.
 ///
 /// One session of three bus-class records (`ms` 1..3; `ms` 1 the session's
 /// open, which the ring never evicts). `head` records appended; `e2`/`e3`
-/// evicted, in any order (ruling Q2: eviction is the ring's, a set with a
+/// evicted, in any order (eviction is the ring's, a set with a
 /// pinned record, so a hole can sit between two live records); `landed` the
 /// GUI's cursor. One batch in flight: `pin` the bridge's pin of one slot,
 /// `[plo, phi]` the `ms` it covers, `pgap` whether it is a cover, `onbus`
 /// whether the broker holds it at its pinned seq, `foreign` another writer's
-/// record at that seq (a co-holder of the node cap, ruling Q3). The reader's
+/// record at that seq (a co-holder of the node cap). The reader's
 /// view: `rec<i>` it holds `ms` i's record (deduped), `cov<i>` a cover of it
 /// is on the bus. The update: `Export` fences the readers at `fh` (the `ms`
 /// head) and draws the cursor `lc`; `Commit` hands the session to the
 /// successor, which holds the carry (`head = fh`, the overlap's records
 /// gone) and continues the drawn cursor; `succ`, and `adopted` until the
-/// successor has registered the session (`AdoptLate`, ruling Q1: until
+/// successor has registered the session (`AdoptLate`, until
 /// then the GUI answers a take `ERR busy adopting=1` and a landing of the
 /// session `adopting`, and the bridge keeps its pin).
 ///

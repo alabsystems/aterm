@@ -3,7 +3,8 @@
 
 //! LANE L1: THE KERNEL'S RESOURCE COALITIONS (macOS), what the cause engine
 //! splits the machine's CPU and memory by
-//! (`docs/DESIGN-resource-details-2026-10-20.md` §2.4).
+//! (`docs/DESIGN-resource-details-2026-10-20.md` §3.1–§3.2; the full
+//! design's §2.4 at `f1a02c38bd`).
 //!
 //! A resource coalition is the kernel's group of one launchd job or app and
 //! every process it started since. Its counters (CPU time, by thread QoS too,
@@ -95,6 +96,10 @@ pub struct CoalitionUsage {
 pub struct CoalitionRead {
     /// How many coalitions the kernel listed.
     pub listed: u32,
+    /// The highest id the kernel listed, answered or not (`None` for an
+    /// empty list): the kernel numbers coalitions in order and never reuses
+    /// an id, so one a later read lists above it was made after this one.
+    pub newest: Option<u64>,
     /// Whether the list filled its buffer, so coalitions past it (the
     /// newest) may be missing.
     pub truncated: bool,
@@ -201,6 +206,7 @@ pub(crate) fn read_of(
 ) -> CoalitionRead {
     CoalitionRead {
         listed: u32::try_from(listed.len()).unwrap_or(u32::MAX),
+        newest: listed.iter().map(|&(id, _)| id).max(),
         truncated,
         rows: listed
             .iter()

@@ -340,12 +340,15 @@ impl Inks {
     /// put Cruise's `∞` at 1.0:1 on a Default Light tab — so it is floored
     /// along its own hue to the chips' floor on the row's ground, as the top
     /// line's accent is (`claude_footer::legible_on`). An accent that already
-    /// reads is kept as it is.
+    /// reads is kept as it is. The row's own ink (a light's word, `✋ you`)
+    /// is the pane's, held to the same floor, and the dim to 3:1 ([`dim_of`]):
+    /// a theme whose own ink reads low gives its chips' words the floor
+    /// every other letter on the rule meets.
     fn of(blank: RenderCell, accent: [u8; 3]) -> Self {
         Self {
             accent: crate::claude_footer::legible_on(accent, blank.bg),
             amber: land_ink(blank.bg),
-            ink: blank.fg,
+            ink: crate::claude_footer::legible_on(blank.fg, blank.bg),
             dim: dim_of(blank),
             title: title_ink(blank),
             ground: blank.bg,
@@ -3550,14 +3553,22 @@ fn title_ink(blank: RenderCell) -> [u8; 3] {
 }
 
 /// `blank`'s ink halfway to its ground: the off light and the hands-off
-/// tones.
+/// tones, words greyed on purpose as a hidden fact's `off` is
+/// (`claude_footer::greyed_on`): `○ off`, `⊘ off`, `quiet`, a worker's
+/// label. Floored to 3:1 on the ground along its own hue
+/// (`claude_footer::visible_on`), where halfway read 2.01:1 on Solarized
+/// Light and 2.91:1 on Default Light; below the row's ink, held to 4.5:1
+/// ([`Inks::of`]). Halfway that already reads is kept as it is.
 fn dim_of(blank: RenderCell) -> [u8; 3] {
     let mix = |a: u8, b: u8| ((u16::from(a) + u16::from(b)) / 2) as u8;
-    [
-        mix(blank.fg[0], blank.bg[0]),
-        mix(blank.fg[1], blank.bg[1]),
-        mix(blank.fg[2], blank.bg[2]),
-    ]
+    crate::claude_footer::visible_on(
+        [
+            mix(blank.fg[0], blank.bg[0]),
+            mix(blank.fg[1], blank.bg[1]),
+            mix(blank.fg[2], blank.bg[2]),
+        ],
+        blank.bg,
+    )
 }
 
 #[cfg(test)]
@@ -4471,7 +4482,7 @@ impl App {
     /// gesture's second click and does nothing either: a frame paints
     /// between a double click's two clicks in a real window, so the second
     /// would find the face the first lit and turn it back (review of
-    /// k2/harnesson, finding 1). A write of aterm.toml's shows `◐ turning
+    /// k2/harnesson). A write of aterm.toml's shows `◐ turning
     /// on` until the policy reads it back or
     /// [`crate::autopilot::SWITCH_SETTLE`] passes. Nothing is sent to the
     /// PTY, and nothing opens.
@@ -5575,7 +5586,7 @@ impl App {
                 // its cells does. The `on` button stands only on an off
                 // switch, so a press of it is one only there: a stale or
                 // repeated request for `on` once the switch is lit never
-                // turns the harness off (review of k2/harnesson, finding 3).
+                // turns the harness off (review of k2/harnesson).
                 let shown = self.windows.get(&wid).and_then(|ws| {
                     ws.claude_lights
                         .border_toggles
@@ -8056,7 +8067,7 @@ mod gesture_tests {
         );
     }
 
-    /// THE BLANK BETWEEN TWO CHIPS IS THEIRS (the review of 97e5ad4f2): in
+    /// THE BLANK BETWEEN TWO CHIPS IS THEIRS: in
     /// `∞ ⏸ plan` a click on the blank cell between two chips, in a pane
     /// that tracks the mouse, sends NOTHING to the PTY — no press or release
     /// report — writes no word, opens no Settings and toggles no light, and
@@ -8361,10 +8372,10 @@ mod gesture_tests {
         );
     }
 
-    /// THE HOVERED TITLE OFFERS THE MENU WHERE IT FITS, AND V1'S WORDS
-    /// WHEREVER THEY FIT, AND THE CLICKS AFTER THEM (design §9.2.1, §9.3.2;
-    /// review of fix/autopilot-menu-wiring, finding 2; owner-eye-1 of the
-    /// post-landing check of Autopilot v3 wave 1): walked over every pane
+    /// THE HOVERED TITLE OFFERS THE MENU WHERE IT FITS, and WORDS
+    /// WHEREVER THEY FIT, AND THE CLICKS AFTER THEM (design §9.2.1, §9.3.2)
+    /// :
+    /// walked over every pane
     /// width from 60 to 170 columns, Claude Code's rule under the pointer on
     /// the Autopilot chip shows the WHOLE title (v1's words, then `·
     /// right-click: more`) beside the whole facts, else V1'S WORDS
@@ -8523,7 +8534,7 @@ mod gesture_tests {
     /// chip says `⊘ off`, dim, titled with where it is switched, and a click
     /// turns the master switch on instead of cycling, as the top rule's `on`
     /// does (owner, 2026-10-20: "remove the harness settings button in the
-    /// UX"; review of k2/harnesson, finding 2): `harness.enabled = true` is
+    /// UX"; review of k2/harnesson): `harness.enabled = true` is
     /// written on the config lane, the switch says `◐ turning on` until the
     /// write lands or is refused (here, at once: it was armed and let go),
     /// no word is written (a session ON never lifts a global off), nothing
@@ -8612,7 +8623,7 @@ mod gesture_tests {
 
     /// THE OFF CHIP TURNS THE AGENT'S SWITCH ON (§10.2.1; owner, 2026-10-20:
     /// "remove the harness settings button in the UX"; review of
-    /// k2/harnesson, finding 2): under Claude Code's own switch off, a click
+    /// k2/harnesson): under Claude Code's own switch off, a click
     /// on `⊘ off` writes `harness.claude.enabled = true` — not the master's,
     /// no word — and lands no page: with Settings ▸ Harness open in another
     /// tab at its top, the page stays there and Claude's tab stays in front

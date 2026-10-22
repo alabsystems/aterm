@@ -2,7 +2,7 @@
 // Copyright 2026 Andrew Yates
 
 //! THE HOLD IN THE WINDOW (`docs/DESIGN-harness-autopilot-2026-10-15.md`
-//! §12.3.1, §12.3.3 item 3, §12.3.6; slice 3c): why Land still holds, as
+//! §12.3.1, §12.3.3 item 3, §12.3.6): why Land still holds, as
 //! the window says it. The loop's hold (`LandHeld`, told through the host's
 //! hook onto the session's timeline, then a `HarnessFact::LandHeld` wake that
 //! carries nothing) goes onto the glass with its `since` stamped once

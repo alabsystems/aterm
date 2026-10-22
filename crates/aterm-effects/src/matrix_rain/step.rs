@@ -40,7 +40,7 @@ impl RainLatches {
     /// session). Called every frame, rain on or off, so an enable mid-command
     /// does not read the command's start as news.
     #[inline]
-    pub fn note_shell_executing(&mut self, session: u64, executing: bool) -> bool {
+    pub const fn note_shell_executing(&mut self, session: u64, executing: bool) -> bool {
         let rising =
             matches!(self.shell_executing, Some((sid, false)) if sid == session) && executing;
         self.shell_executing = Some((session, executing));
@@ -66,7 +66,12 @@ impl RainLatches {
     /// on enable reads neither a running command's start nor a completion
     /// from while the rain was off as news.
     #[inline]
-    pub fn observe_without_engine(&mut self, session: u64, executing: bool, cmd_seq: Option<u64>) {
+    pub const fn observe_without_engine(
+        &mut self,
+        session: u64,
+        executing: bool,
+        cmd_seq: Option<u64>,
+    ) {
         let _ = self.note_shell_executing(session, executing);
         self.baseline_completion(session, cmd_seq);
     }

@@ -164,7 +164,7 @@ impl CursorBeamRod {
     /// beam is charged (typing or a jump flare cooling).
     #[must_use]
     #[inline]
-    pub fn is_active(&self) -> bool {
+    pub const fn is_active(&self) -> bool {
         self.blaze > SETTLED_BLAZE
     }
 

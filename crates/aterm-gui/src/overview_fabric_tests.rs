@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The Overview's "On the fabric" group (session log Phase 6 step 6E-7,
-//! ruling U42): the read parsed and composed from a captured brief, a chip
+//! The Overview's "On the fabric" group:
+//! the read parsed and composed from a captured brief, a chip
 //! that nothing acts on, a read landing on the open card and a later one
 //! clearing it, the minute's wake, one read at a time, the last good read
 //! kept, and no read where the fabric is off. Every clock is a hand-set

@@ -1,402 +1,58 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE SAFETY THEOREM of predictive local echo: a prediction can never corrupt
-//! the session, for ANY interleaving of typing, program output and time.
+//! Safety theorem for predictive local echo: predictions never corrupt the
+//! reconciled view across any interleaving of typing, program output, and time.
 //!
-//! The donor is astream-term's verified speculation
-//! (`vendor/astream/crates/astream-term/tests/suite/predict.rs`,
-//! `predictions_never_corrupt_the_final_screen`): there the reconciled view
-//! equals the pure authoritative fold for any interleaving of predictions and
-//! output. This file states and checks the same theorem for `aterm-predict` as
-//! aterm actually wires it, against aterm's real engine.
+//! ## Views and coordinate space
 //!
-//! ## What "the reconciled view" is in aterm
+//! * **Authoritative view (`A`)**: `aterm-core`'s `Terminal` fed only program
+//!   output and read through `cell_frame_into` / `visual_col`.
+//! * **Overlay (`O`)**: `Predictor::overlay(now)` after `reconcile` against `A`.
+//! * **Displayed view (`D`)**: `A` with `O` painted via
+//!   `RenderInput::paint_prediction_ghost` or `paint_prediction_span`.
+//! * **Coordinate space**: `(coordinate_generation, screen_epoch)` on the main
+//!   screen at the armed geometry.
 //!
-//! The AUTHORITATIVE view `A` is the engine's active screen: `aterm-core`'s
-//! `Terminal`, fed the program's output and nothing else, read through the same
-//! extraction the GUI paints from (`cell_frame_into` -> `RenderInput::cells`,
-//! columns through `visual_col`). The predictor never writes it: it sees `A` only
-//! through the `observe` closure the host hands `reconcile`.
+//! ## Clauses
 //!
-//! The OVERLAY `O` is what `Predictor::overlay(now)` returns on a frame, after
-//! that frame's `reconcile` against `A` (aterm-gui's order: reconcile against the
-//! unpainted snapshot, then overlay). The DISPLAYED view `D` is `A` with the
-//! guesses in `O` painted by the painter aterm-gui runs on its frames
-//! (`paint_prediction_ghosts` is a loop over aterm-core's
-//! `RenderInput::paint_prediction_ghost`; a state chain's cells are one span
-//! through `RenderInput::paint_prediction_span`, which paints text a shift moved
-//! as the cell it came from), so `D` is what goes on glass, every field of every
-//! cell, the grapheme clusters and combining marks included; the GUI also draws
-//! its cursor one past the newest guess, or a chain's own, which changes no cell.
+//! * **Locality**: `D` differs from `A` only at `O`'s cells, never on half of a
+//!   wide glyph; every guess in `O` is in bounds and on a distinct cell.
+//! * **Provenance**: Every guess in `O` matches the keystroke and coordinate
+//!   space it was armed in. State chains match an independent key fold
+//!   (`Sim::oracle_check`) over the last matched authoritative screen.
+//! * **Secrecy (Adaptive)**: Keys typed into a visible no-echo prompt are never
+//!   in `O`.
+//! * **Fidelity (Adaptive)**: Without intervening unprompted output, a space
+//!   change, or a predecessor whose output arrived past the predictor's glitch
+//!   window (`Sim::late_predecessor`), a displayed guess's echo lands on the
+//!   cell it was painted on.
+//! * **Frame fidelity (Adaptive)**: On a settled base within fidelity's scope,
+//!   every displayed frame matches the screen its newest painted guess's output
+//!   settles to (`Sim::settled`), except stale italic decoration cells and
+//!   vacated blanks under newly drawn decoration.
+//! * **Timeliness**: Every ghost on glass is still pending and younger than the
+//!   predictor's glitch window (at most 2 s).
+//! * **Attribution**: Every guess credited with its echo has had its own output
+//!   begin (`Sim::attributed`), within the link model's scope and on a boundary
+//!   between keys' output.
+//! * **Atomicity**: A state chain paints all of its displayed cells or none.
+//! * **Cursor locality**: A state chain's drawn cursor is in bounds and never
+//!   on a wide glyph's continuation cell.
+//! * **Eventual**: Once all keys are read, all output is delivered, and the
+//!   clock passes the 2 s ceiling, `O` is empty and `D = A`.
 //!
-//! A guess's coordinates are absolute (row, col) in the COORDINATE SPACE it was
-//! armed in: one content-coordinate generation (`ContentScrollState::
-//! coordinate_generation`, which moves exactly when rows move under the screen),
-//! one screen (main, not the alternate screen) and one host geometry (a resize or
-//! a pane swap resets the predictor). Painting a guess in any other space paints
-//! a cell it never predicted: the row now holds some other line.
+//! ## Simulation and negative controls
 //!
-//! ## The theorem
-//!
-//! On every frame, for every interleaving this file generates:
-//!
-//! * **Locality.** `D` differs from `A` only at the cells of `O`, and never on
-//!   half of a wide glyph (the renderer draws a wide glyph as one unit across
-//!   its lead and continuation, so a ghost on either half changes the other,
-//!   which no guess predicted); every guess in `O` is inside the grid; no two
-//!   guesses in `O` share a cell (two guesses on one cell is a typed glyph
-//!   painted over another typed glyph).
-//! * **Provenance.** Every guess in `O` is a keystroke the host predicted, in
-//!   the coordinate space it was armed in — hence nothing is painted while the
-//!   alternate screen is up, and nothing armed before rows moved survives the
-//!   move — at the cell, with the glyph, it was armed with. (The last part pins
-//!   that a guess never moves or changes once armed; the space is the part a
-//!   host can get wrong.) A STATE CHAIN (the edit lane: `←`, `→`, and glyphs and
-//!   erases at the end of the text or inside it, which SHIFT the text right of
-//!   the cursor, armed on the line its epoch watched echo) is held to an ORACLE
-//!   instead (`Sim::oracle_check`): from the screen `A` showed
-//!   when the chain last retired to a state it matched, fold the keys of its
-//!   displayed ops, independently of the predictor's fold; the frame must show
-//!   that text on the chain's row from its `lo` to the furthest end any of
-//!   those states reaches (a blank on every cell it vacated), with the cursor
-//!   the fold leaves. Only `lo` and the text's end come from the predictor.
-//! * **Secrecy (Adaptive).** A key typed into a no-echo prompt the program has
-//!   visibly put up (`Password: ` delivered, echo off) is never in `O`, even on a
-//!   remote link where the host cannot read the far end's termios.
-//! * **Fidelity (Adaptive).** A displayed guess is where its keystroke's echo
-//!   lands: if the program echoes the key with no unprompted output in between
-//!   and in the same coordinate space, the echo lands on the very cell the guess
-//!   was painted on. A wrong glyph flashed and then corrected is a corruption of
-//!   what the user read, if not of what the program holds. Claimed for a line
-//!   editor that knows its own column (a standard one; the far end here does,
-//!   until unprompted output or a resize leaves it guessing) and for a link
-//!   that honours the predictor's echo deadline: an echo arriving later than
-//!   the predictor's own glitch window at its arrival (never less than 250 ms)
-//!   after its keystroke can stand in a later guess's cell, and with no
-//!   `caused_by` on a PTY nothing positional can tell whose echo it is
-//!   (`Sim::late_predecessor`, THE LINK MODEL). `Always` makes no fidelity
-//!   claim: it paints guesses no echo has proven.
-//! * **Frame fidelity (Adaptive).** Every displayed frame is the screen its
-//!   newest painted guess's output settles to: once the last byte that key
-//!   caused lands, and nothing a later key caused has, the screen equals the
-//!   frame on every cell of every row, and on the cursor the GUI drew one past
-//!   that guess (`Sim::settled`). Within FIDELITY's scope, for every key from
-//!   the frame's oldest pending guess through its newest, on a SETTLED BASE:
-//!   every key before that oldest guess read and its output landed (a frame
-//!   caught mid-way through an earlier key's output shows the program's own
-//!   transit, which FIDELITY still holds each ghost's cell against). Unprompted
-//!   output is counted in bytes, so a frame inside an unprompted segment is
-//!   out of scope for what lands after it. It subsumes FIDELITY,
-//!   which sees one cell: a frame can put every guess on its echo's cell and
-//!   still show a tail that is about to move. The DECORATION RULE: a cell the
-//!   far end draws as decoration (here a right prompt or an autosuggestion,
-//!   drawn in italics) may be stale on glass, which is counted
-//!   (`stale_decoration`), and so may the blank a state chain paints on a cell
-//!   its erase vacated, where the settled screen draws decoration (no glyph was
-//!   shown there; the frame only lacked what the far end drew); a ghost glyph
-//!   that the settled screen contradicts is a violation, decoration or not.
-//! * **Timeliness (every mode).** Every ghost on glass is a guess still pending,
-//!   typed no longer ago than the predictor's glitch window (at most 2 s), so
-//!   nothing flushed or expired is shown after the flush and a wrong cell lives
-//!   at most one window.
-//! * **Attribution (every mode).** A guess the predictor credits with its echo
-//!   (measuring the link with it, perhaps proving its epoch on it) is one whose
-//!   own key has echoed, within the link model's scope and on a boundary between
-//!   keys' output (`Sim::attributed`). A credit with no echo behind it is a
-//!   sample of nothing, and the window every owe is judged by, which the link
-//!   model reads, shrinks with it: so this clause is held directly, not through
-//!   a consequence the link model could excuse.
-//! * **Atomicity (every mode).** A state chain's frame paints every cell of its
-//!   displayed state, or none and draws the engine's cursor: a part of a state
-//!   is a frame no program draws (`chain_paint_clauses`), and a shift painted
-//!   in part shows its tail both moved and not.
-//! * **Cursor locality (every mode).** A state chain's drawn cursor is inside
-//!   the grid and never on a wide glyph's right half. With LOCALITY for a chain
-//!   (its cells on its row, from its `lo`), these two are what painting a state
-//!   rather than a set of guesses adds.
-//!
-//! And once the program has read every key, every byte of output is applied and
-//! reconciled, and the clock has passed the longest glitch window (the crate's
-//! documented 2 s ceiling), **`O` is empty**, so `D = A`, the pure fold of the
-//! output: the astream statement. (In aterm `A` is the pure fold by construction,
-//! since the predictor has no path that writes the engine; the settle compares it
-//! with a second engine fed only the output, which pins the harness, not the
-//! predictor. The predictor's part is that nothing is left on glass.)
-//!
-//! ## The world
-//!
-//! A deterministic simulation with a seeded `aterm_spec::rng::XorShift` (the
-//! generator behind every generated-input test here) over: keystrokes (printable,
-//! wide and combining glyphs, Backspace, Enter, Tab, arrows, Home, End, Delete,
-//! Alt-B, Up, Escape, the keypad's Left, kill chords, ^C, paste bursts, now and
-//! then a typo fixed mid-line, and LINE EDITING: a word typed, the cursor walked
-//! back and forth over it, glyphs erased at its end, Enter now and then with
-//! keys still in flight, and SHIFTS: the cursor walked into a word and glyphs
-//! or erases typed there, the first one a round trip, the rest in a burst; in
-//! a third of the cases now and then a right-to-left letter, which the engine's
-//! BiDi draws reversed with the run it joins), a far-end program (a line editor in the byte forms
-//! measured from it (`Editor`): readline, which inserts mid-line by writing the
-//! glyph, then the tail it shifts, then stepping back, and beeps at an edge;
-//! readline with ICH, which reprints the glyph `→` steps over; zle, silent at
-//! an edge; a cooked tty, which echoes `←` as `^[[D`; readline in OVERWRITE
-//! mode, which replaces the glyph under the cursor where the others shift the
-//! tail, and whose rubout blanks a glyph in place; and zle with an
-//! AUTOSUGGESTION plugin, whose suggestion (decoration) a glyph that continues
-//! it consumes, any other edit clears and now and then fetches anew after the
-//! buffer's new end, an erase at the end fetches anew into the cell it vacated,
-//! and `→` or End at the end accepts; each rotated per case;
-//! a command that starts `cat`, cooked, until ^C; the line editor now and then
-//! draws an autosuggestion after an append's
-//! echo, erases back across the right margin and up a wrapped row, either
-//! leaves the terminal parked in the deferred-wrap slot or wraps itself, and in
-//! half the cases draws a right prompt with each prompt and hides it before the
-//! line reaches it, as zsh does; a password mode that does not echo; a
-//! full-screen app on the alternate screen; in two cases in three aterm's SHELL
-//! INTEGRATION, the host authorizing a capability nonce and requiring it and the
-//! shell signing its OSC 133 marks with it, so Home, End, Ctrl-A, Ctrl-E and
-//! Delete are learned keys, each bound as the case's KEYMAP binds it (readline's
-//! and the integrated zsh's canonical edges, `zsh -f` with Home and End unbound
-//! and a `~` inserted for Delete, zsh's vi insert mode inserting `^A`), the
-//! shell now and then re-executing with the next keymap under a new nonce, a
-//! program printing an unsigned mark, Kitty `DISAMBIGUATE` pushed or popped, and
-//! a command that clears the screen and reads a line after a `$ ` of its own)
-//! whose output reaches the engine in
-//! arbitrary byte splits, calm stretches included,
-//! UNPROMPTED program output (job notices, prompt redraws, right prompts,
-//! autosuggestions, status lines, clears, cursor jumps, line inserts and scrolls,
-//! RIS, alt-screen enter and leave, password prompts on a new row or the same row,
-//! echo switched off with no prompt at all), host resets (resize, pane swap), and
-//! clock advances from a local link to a 2.6 s stall. The host side is wired the
-//! way `aterm-gui` wires it (`app_input.rs`, `app_render.rs`): the key-time
-//! cursor, generation, grid and alt-screen sample, and the cursor row when the
-//! predictor wants it (`predict_glyph`), projected to `Seen` as the GUI's
-//! `predict_seen` projects it for the press and for the frame's observe
-//! (`reconcile_seen`); at the no-echo gate (that
-//! sample saw the alternate screen, or the local termios has ECHO clear,
-//! `tty_swallows`) a glyph or an edit key is refused as `note_unmodelled_input`;
-//! past it, `set_mode` and `set_ambiguous_width_double` with the terminal's
-//! policy before the glyph is predicted or the edit key (a bare arrow, a
-//! Backspace) handed to `predict_edit` with the cursor row; `note_line_submit`
-//! on Enter; `note_unmodelled_input` on every other non-glyph press and on
-//! paste; each note with the press's clock. A state chain's frame is painted
-//! as aterm-gui paints it (`paint_chain`): one span, all or none, its cursor
-//! drawn only when the span was painted. Every configuration runs under both
-//! ambiguous-width policies: `ambiguous_width = "wide"` writes `é` two cells
-//! wide, in the engine and in the far end's column arithmetic alike.
-//!
-//! Every run is a pure function of its seed and op list. A failing case is
-//! shrunk (delta debugging over the op list) and reported with its seed, its case
-//! index, the minimal ops that still fail the same clause, and a step-by-step
-//! trace of them (each press, delivery and frame, with the screen, the pending
-//! guesses and what was painted).
-//!
-//! Mutant hosts are the negative controls, one or more per clause, each run
-//! through the same checker on the same seed, which must report THAT clause: a
-//! host that hands the predictor a frozen coordinate generation (it forgot that
-//! rows scroll) and one that never reports the alternate screen (PROVENANCE); a
-//! painter that paints each ghost one cell right, and the painter as it was
-//! before it refused wide glyphs (LOCALITY); a host that displays Adaptive's
-//! guesses as `Always` does (SECRECY); a host that never reports a line
-//! terminator, and one that never tells the predictor the wide ambiguous width
-//! (FIDELITY); a host that reads the row right of the cursor as blank (FRAME
-//! FIDELITY); a host that skips the erase frame and one that reads its clock
-//! only at a keypress (TIMELINESS, one per half); a host that hands the
-//! predictor Alt-B, or the keypad's Left under Kitty DISAMBIGUATE, as a bare `←`, and one
-//! that draws a chain's cursor one past its newest glyph (FRAME FIDELITY); a
-//! host that moves the rest of the row with a shift, as ICH would (LOCALITY);
-//! a host that hands on the last input start it read, one that takes it from a
-//! mark with the nonce gate never on, one whose editor context never changes,
-//! and one that never asks the Kitty mode (FRAME FIDELITY: a program's prompt,
-//! a forged mark, a new shell's keymap, a chord sent as `CSI u`);
-//! and a predictor with one of its rules switched off (`Host::Rule`, each in the
-//! clause it keeps, which is how ATTRIBUTION has its controls). ATOMICITY and
-//! CURSOR LOCALITY are held on a frame the world cannot reach (a chain flushes on
-//! any opaque cell of its line), with a host painting what it can, one drawing a
-//! chain's cursor over a span the painter refused, and one drawing it on a wide
-//! glyph's right half (`the_chain_painter_paints_all_or_none`).
-//! So a clause whose check went vacuous fails the test instead of passing it.
-//!
-//! What it found, on its committed seed, before the fixes it pins: a glyph typed
-//! after a line terminator was armed on the cell of the submitted line's oldest
-//! unechoed guess (LOCALITY, `Always`, three ops: `n`, Enter, `i`), and an echo
-//! still owed to a flushed guess confirmed a later guess for the same glyph,
-//! proving the epoch one keystroke behind so the next glyph was painted one cell
-//! early (FIDELITY, Adaptive). `aterm-predict`'s unit tests pin both. Review then
-//! found three more interleavings the sweep had not reached, each a FIDELITY
-//! break inside the clause's scope, now pinned as directed cases
-//! (`the_reviewed_interleavings_hold`): a guess retired by an earlier key's
-//! echo whose own echo was not owed, a tab switched away and back that forgot
-//! its owed echo, and a key refused at the no-echo gate that was never owed.
-//!
-//! The link model was then scaled from the 250 ms floor to the predictor's own
-//! window, which a fixed deadline had made vacuous on every link slower than
-//! 250 ms, and the sweep found that an expiry owed nothing and kept the epoch's
-//! proof (FIDELITY, thirteen ops). FRAME FIDELITY then found that the echo of a
-//! key typed mid-line proved its epoch like an append, painting the next glyph
-//! over the tail it shifted (`abeicd` shown, `abei cd` settled; FIDELITY's one
-//! cell was right). Run over forty seeds rather than one, the sweep then found
-//! that a glyph typed after a Backspace cancelled our own guess anchored on the
-//! live cursor (the cancelled glyph's echo lands before the erase's, the screen
-//! a cell ahead or parked at the margin, and that glyph was credited with the
-//! next key's echo, or wrapped, a cell off); and that the harness itself
-//! claimed too much in four places, each now scoped: a key whose own echo
-//! leaves the editor's model (an insert from the parked slot, or one pushing
-//! the tail past the margin, which a real editor rewraps) is not reliable; a
-//! frame inside an unprompted segment; a frame on an unsettled base; and a late
-//! echo that landed with a later key of its epoch already typed taints that
-//! epoch (`KeyLog::ends_epoch`).
-//!
-//! Review then found what the sweep could not reach. A far end that writes a
-//! mid-line glyph before it redraws the tail it shifts (`Editor::Readline`, the
-//! form a line editor without ICH, or one that rewrites the tail, sends) proved
-//! on the frame between the two, and the next glyph was painted over the tail
-//! about to move (THE STANDING TAIL, `a_glyph_echoed_before_its_tail_moves_proves_nothing_after`);
-//! a run typed along an autosuggestion was credited before the far end read a
-//! key of it, collapsing the window the link model judges lateness by, which
-//! hid the misplaced glyph that followed from FIDELITY (ATTRIBUTION, added for
-//! it, sees the credits; `cursor_advance_is_the_echo_s_evidence`); and an
-//! autosuggestion drawn, changed or cleared beside the end of the line darkened
-//! the keys after it (the predictor's unit tests pin that liveness). With
-//! ATTRIBUTION and the rewriting far end in the world, sixty seeds found a guess
-//! retired without credit that left its epoch's proof standing on a cell its
-//! own echo was still to take (FIDELITY, `an_uncredited_retirement_leaves_no_proof`),
-//! and two more places the harness claimed too much, now scoped: a credit made
-//! while an earlier key's output is overdue but not yet arrived
-//! (`Sim::overdue_predecessor`), and one made while the line editor has lost
-//! its column. The "run typed back into a wrapped line" the forty-seed sweep
-//! reported came from an insert pushing the tail past the margin, which the
-//! first scope above then excluded: the rule it prompted (every guess of a run
-//! typed over nothing or its own glyph) is pinned by the predictor's unit tests,
-//! not here.
-//!
-//! With the edit lane in the world (state chains, the four editors, the cooked
-//! `cat`), eighty seeds found a glyph-lane FIDELITY break the edit lane had made
-//! reachable: a run typed while an erase we did not place was still unread was
-//! placed a cell right of where it echoes, and the next key's echo, a repeated
-//! glyph, credited its first guess once the erase's owe lapsed
-//! (`a_run_placed_before_an_erase_lands_is_not_credited_by_the_next_key`, the
-//! STALE ANCHOR); and one more place the harness claimed too much, now scoped:
-//! a credit made inside output nobody typed for, part-way when the credit is
-//! made (an unprompted suggestion drawn with the cursor not yet stepped back),
-//! which ATTRIBUTION now excludes as FRAME FIDELITY already did.
-//!
-//! With the SHIFTS in the world (glyphs and erases typed inside the known text,
-//! readline in overwrite mode and zle with an autosuggestion plugin among the
-//! far ends, and now and then a right-to-left letter), two hundred seeds found
-//! two breaks, each now a named case with its control. The glyph lane showed a
-//! space and two letters typed after a lone right-to-left letter in the order
-//! typed, which the engine's BiDi reorders once their echoes join one run
-//! (`a_right_to_left_run_is_never_shown`: a break on main before this round,
-//! reachable as soon as the world typed such a letter). And overwrite mode's
-//! echo, beside a suggestion's glyph standing where the insert's state moved
-//! the typed one, matched that state, whose line, a cell longer than the
-//! buffer, then showed a shift and a `→` the editor did not make
-//! (`a_shift_a_suggestion_could_show_proves_nothing`). The same two hundred
-//! seeds, run after the fixes, found none.
-//!
-//! Review of that round found what the sweep had not. A rubout and a glyph
-//! typed inside the text, which overwrite mode echoes as the very screen of the
-//! two shifts, proved both kinds, each judged alone against a state no frame
-//! showed (`overwrite_mode_s_burst_proves_no_shift`); the smallest match
-//! credited keys overwrite mode had not read, its screen after fewer keys being
-//! the chain's state after more (`overwrite_mode_s_screen_with_fewer_keys_credits_none`,
-//! ATTRIBUTION); and a Backspace popped a glyph of an unproven shift as a pair
-//! that cancels (`a_backspace_cancels_no_glyph_of_an_unproven_shift`). Each
-//! retirement now asks the in-place worlds. Two thousand seeds after those fixes
-//! found two breaks on main before the round, each a named case with its control
-//! (`a_redrawn_line_keeps_no_proof`, SECRECY: a proof whose echo's cell a redraw
-//! took; `a_cancelled_glyph_s_erase_is_no_space_s_echo`, ATTRIBUTION), and one
-//! place the world claimed too much: its unprompted right prompt and suggestion
-//! were drawn plain, so FRAME FIDELITY took an erase that cleared one beside
-//! correct ghosts for a wrong frame. They are decoration, drawn in italics, as
-//! every right prompt and suggestion of the world is. Run whole after those
-//! fixes, the same two cases found a state an earlier op's echo shows part-way
-//! taken for a later state of a chain (`an_erase_caught_part_way_is_no_later_state`,
-//! ATTRIBUTION, seen only at the later credit it led to, since the clause leaves
-//! out a credit made inside an earlier key's output), and a second over-claim:
-//! the world's far end redrew its secret buffer at a no-echo read, displaying
-//! the very keys SECRECY holds dark. Its redraw there shows the prompt alone.
-//!
-//! With the LEARNED KEYS in the world (the integration, three keymaps, a shell
-//! re-executing under a new nonce, a forged mark, Kitty's mode pushed and
-//! popped, a program's prompt where the shell's stood), the committed seed
-//! found no break: FRAME FIDELITY compared 4813 whole frames where it had
-//! compared 1568, 144 of them showing a learned key at once (180 displayed
-//! frames showed one and held the chain's clauses; the rest repeated the frame
-//! before them or fell out of FRAME FIDELITY's scope, unprompted output or an
-//! unreliable editor since). Each of the
-//! predictor's three new rules and each of the four new host mutants is caught
-//! at a named case of its own, and the sweep catches three of them besides; the
-//! world's change moved the sweep's case that caught `Host::TailBlind`, which
-//! its named case (`mid_line_over_a_space`) still catches. Three hundred seeds
-//! then found two breaks, each a named case with its control: End's echo,
-//! which reprints the line a cell at a time, caught part-way where a later
-//! `←`'s state puts the cursor, credited that `←` unread
-//! (`a_line_end_caught_part_way_is_no_later_state`, ATTRIBUTION); and, a break
-//! on main before this increment, a zero-width mark the far end's forced wrap
-//! carried onto the next guess's cell left that guess painted plain where it
-//! settled marked (`a_mark_carried_onto_the_next_guess_s_cell_flushes_it`,
-//! FRAME FIDELITY). The rest were the world's own making, each now corrected:
-//! its far end read Ctrl-A by the Kitty mode it had pushed since the key was
-//! pressed, where the terminal had already sent it in the mode of the press;
-//! its zle stepped `→` over a zero-width mark with `ESC [ 0 C`, which a
-//! terminal reads as a cell, losing its column while it claimed to know it;
-//! and its readline with ICH inserted in front of a mark, the gap leaving the
-//! mark drawn on the glyph before while the buffer paired it with the one
-//! inserted, which no longer knows its screen and is beyond the model now. Four
-//! hundred seeds after these fixes found no break.
-//!
-//! Review of that increment found the world's far end always sent its `B`
-//! over an empty buffer, where zsh sends it after a line pre-filled from its
-//! buffer stack, and that a run typed at the `B`'s cell after other keys, or at
-//! a `B` zsh's `reset-prompt` left behind, was taken for the buffer's start.
-//! The world now pre-fills a prompt from a pushed line (zle's `B` after the
-//! text, readline's before it), redraws its prompt in another width with no
-//! new `B`, pushes modifyOtherKeys as well as Kitty's mode, and teaches and
-//! shows Delete; the integration's `B` says where it stands at the buffer's
-//! start, THE FIRST KEY's gate takes only the first key typed at a prompt, and
-//! each is caught switched off at a named case. Its sweep of two thousand
-//! seeds then found six breaks the committed seed misses (`review_4_cases`):
-//! two SECRECY breaks, a password prompt and a reverse index bringing the
-//! cursor back onto a proven line (THE FLOOR, DARK BEHIND A WAIT), two
-//! ATTRIBUTION breaks, an autosuggestion drawn part-way crediting the typed
-//! glyph it begins with (THE CREDIT TAKEN BACK), a FIDELITY break of a cursor
-//! on text in the last column taken for the deferred-wrap park (the engine's
-//! own flag now), and a far end drawing a prompt over a wrapped line's text
-//! (the world's: it clears the row now). A sweep of seed indices 0 to 2400 after
-//! those fixes found three more, each a named case: the floor beside a wrapped
-//! guess, an engine bug (a mark on a blank lost from its row by an erase after
-//! it, fixed in aterm-grid) and the world's own erase in front of a mark. A
-//! second sweep of the same indices found one more, the floor excusing any
-//! text on a cell a wrapped guess names, where it excuses that guess's own
-//! glyph now (`a_prompt_drawn_over_the_guesses_on_the_floor_voids_the_proof`);
-//! a third found none.
-//!
-//! The review of increment 5 (the measurement, `tests/editing_win.rs`) swept
-//! past the 2400 seed indices swept before it and found three breaks on main,
-//! at seed indices 2482, 2748 and 3942 (`review_5_cases`): the transit wait
-//! took every blank for an echo part-way, so a prompt redrawn narrower under a
-//! chain had the line painted
-//! twice (FRAME FIDELITY, `Rule::TransitBlanks`); a Delete's echo split on its
-//! step back stood the cursor on End's state and then Home's, each credited
-//! unread (ATTRIBUTION, `Rule::PartWayStepBack`); and a cancelled stale guess's
-//! cell anchored a fresh run a cell right of its echoes (FIDELITY,
-//! `Rule::StaleCancel`). `Rule::TransitBlanks` also closes the named case of
-//! `Rule::CancelsOnlyKnownShifts`, which keeps no clause of its own since.
-//!
-//! Each such rule of the predictor is a [`Rule`] the debug-only
-//! `Predictor::disable_rule_for_test` seam switches off, run as the mutant host
-//! `Host::Rule`, and its negative control is caught in its clause by the sweep
-//! (`MUTANT_HOSTS`) or at a NAMED CASE (`each_named_case_holds_and_catches_its_mutant`),
-//! a directed interleaving the faithful predictor holds; usually both, and
-//! `every_rule_has_a_negative_control` holds each rule to at least one.
+//! `common/world.rs` drives `Sim` with deterministic `XorShift` op streams and
+//! shrinks any failure by delta debugging. Every clause and predictor [`Rule`]
+//! is guarded by mutant negative controls in [`MUTANT_HOSTS`] and [`named_cases`].
 
 use aterm_predict::{GhostCell, PredictMode, Rule};
 
 use crate::world::*;
 
-/// THE THEOREM, over every shipped configuration.
+/// Checks the safety theorem across all shipped configurations.
 #[test]
 fn a_prediction_never_corrupts_the_reconciled_view() {
     let mut adaptive = Stats::default();
@@ -417,27 +73,16 @@ fn a_prediction_never_corrupts_the_reconciled_view() {
             Err(report) => panic!("{report}"),
         }
     }
-    // THE COVERAGE COUNTERS, printed under `--nocapture`: what every clause
-    // was checked on over the committed seed, per mode, which the floors
-    // below hold and the docs quote.
     eprintln!(
         "coverage, Adaptive, {} configurations: {adaptive:?}\ncoverage, Always, {} \
          configurations: {always:?}",
         configs.len() / 2,
         configs.len() / 2
     );
-    // Non-vacuity: the world reached every clause it claims to check.
+    // Non-vacuity floors across clauses and lanes.
     let all_cases = (CASES * faithful_configs().len() / 2) as u64;
     assert_eq!(adaptive.settled_cases, all_cases, "{adaptive:?}");
     assert_eq!(always.settled_cases, all_cases, "{always:?}");
-    // The floors sit under what the committed seed reaches over both
-    // ambiguous-width policies (5214 painting frames, 4180 fidelity comparisons,
-    // 1336 secrets, 12866 row moves, 12 ghosts the painter refused on a wide
-    // glyph in `Always`: 394 before DARK OVER TEXT kept a guess waiting over the
-    // line's text off the glass, 28 before it held the run's first guess over
-    // text behind a head that hides nothing): a generator change that starves a
-    // clause fails here instead of passing vacuously. They count comparisons,
-    // not whether a comparison can fail; the mutant hosts below are that half.
     assert!(
         adaptive.frames_displaying > 1000,
         "Adaptive must actually paint guesses for the theorem to mean anything: {adaptive:?}"
@@ -466,16 +111,6 @@ fn a_prediction_never_corrupts_the_reconciled_view() {
         always.ghosts_refused >= 10,
         "guesses displayed on half of a wide glyph, which the painter must refuse: {always:?}"
     );
-    // The phase-0 floors, again well under the committed seed's counts over the
-    // four Adaptive configurations (4806 whole frames compared with the screen
-    // they settle to, 630 credited echoes refused proof over a moved tail, 94
-    // standing proofs voided when the tail moved after them, 6710 expired
-    // guesses owed, 12956 typed owes, 3896 turns holding a guess on a glyph
-    // shown before its echo, 13228 credits checked against their key's output,
-    // 1214 frames painting beside a right prompt, 2380 proofs over decoration
-    // the echo kept, 580 stale decoration cells counted), and every ghost on
-    // glass in either mode checked against the window (10744 Adaptive, 233488
-    // Always; 287802 in `Always` with `Rule::DarkOverText` off).
     assert!(
         adaptive.frame_fidelity_checks > 500,
         "displayed frames compared whole with their settled screen: {adaptive:?}"
@@ -504,17 +139,10 @@ fn a_prediction_never_corrupts_the_reconciled_view() {
         adaptive.advance_waits > 1000 && adaptive.attribution_checks > 1000,
         "turns holding a guess on a glyph shown before its echo, and credits checked: {adaptive:?}"
     );
-    // DARK OVER TEXT: turns a guess typed over text where the line's end is
-    // not known was held off the glass, the head waiting on the screen as it
-    // was or the first such guess behind it (26889 over the four `Always`
-    // configurations, the same reconcile decisions as Adaptive's).
     assert!(
         always.text_waits > 5000,
         "guesses waiting over the line's text, held off the glass: {always:?}"
     );
-    // A line with a right prompt proves through it and paints (decoration the
-    // snapshot keeps), and a frame shows a right prompt the settled screen hid
-    // (the decoration rule's counted case).
     assert!(
         adaptive.rprompt_frames > 20 && adaptive.decorated_proofs > 50,
         "lines with a right prompt that proved and painted: {adaptive:?}"
@@ -523,19 +151,6 @@ fn a_prediction_never_corrupts_the_reconciled_view() {
         adaptive.stale_decoration > 10,
         "cells of decoration shown stale and counted, not failed: {adaptive:?}"
     );
-    // The edit lane's floors (state chains on the known line), again under what
-    // the committed seed reaches over the four Adaptive configurations: 860 edit
-    // keys armed, 524 frames displaying a chain, every one held to the
-    // PROVENANCE oracle, 200 of them showing a motion, 144 motions that proved
-    // their class, 76 arrows armed over a cooked tty and never shown, 12 net-null
-    // tails, 78 part-way echoes waited on (most of them a shift's glyph written
-    // before its tail), 32904 arrows declined with their pixels kept, and 32
-    // frames of a chain carried across its terminator (the
-    // named case `enter_with_keys_in_flight` holds that one to its control).
-    // The part-way echoes were 34 while the transit wait held a cursor anywhere
-    // on the chain's row: most were a cooked tty's `^[[D`, whose cursor stands
-    // right of every state and now flushes the chain at once
-    // (`Rule::TransitReach`), as the divergence it is.
     assert!(
         adaptive.edit_keys_armed > 300 && adaptive.edit_frames_displaying > 200,
         "edit keys armed as chains, and chains displayed: {adaptive:?}"
@@ -560,16 +175,6 @@ fn a_prediction_never_corrupts_the_reconciled_view() {
         adaptive.oracle_checks > 200,
         "displayed chains held to the PROVENANCE oracle: {adaptive:?}"
     );
-    // The shifts' floors (glyphs and erases typed inside the known text), under
-    // what the committed seed reaches over the four Adaptive configurations: 56
-    // frames displaying a shift (298 in `Always`), 32 shifts that proved their
-    // class, 44 shifts armed while the far end was in overwrite mode and none of
-    // them ever shown (an exact count: the class ladder's whole claim), 20
-    // retirements an in-place world also showed, which left their line
-    // unknown, 32 glyphs inside the text a chain could not place, 12 vacated
-    // blanks under a suggestion the erase fetched, 4 erases refused beside text
-    // past the line, 15545 keys refused on a row a right-to-left letter
-    // reorders, and 2 chains flushed for an opaque cell of their line.
     assert!(
         adaptive.shifts_displayed > 25 && adaptive.shifts_proven > 15,
         "shifts that proved their class, and frames showing one: {adaptive:?}"
@@ -595,18 +200,6 @@ fn a_prediction_never_corrupts_the_reconciled_view() {
         adaptive.bidi_refusals > 1000 && adaptive.opaque_refusals > 0,
         "keys refused on a right-to-left row, and chains on an opaque cell: {adaptive:?}"
     );
-    // The learned keys' floors (Home, End, Ctrl-A, Ctrl-E and Delete under the
-    // shell integration, two cases in three), under what the committed seed
-    // reaches over the four Adaptive configurations: 292 lines started by the
-    // first key typed at the shell's authenticated buffer start (798 before
-    // THE FIRST KEY's gate took the rest), 950 learned keys armed, 742 of them
-    // probes, 268 bindings learned and 94 contradicted (a key bound to nothing
-    // or to a glyph, a late echo, a new shell's keymap), 140 frames showing a
-    // learned key at once (208 in `Always`), 120 of them compared whole with
-    // their settled screen, 32 showing a learned Delete (every one compared),
-    // and 196 Ctrl-A or Ctrl-E refused under Kitty's mode or modifyOtherKeys,
-    // which send them escaped. With them FRAME FIDELITY compared 4694 whole
-    // frames (1568 before the learned keys) and found nothing wrong.
     assert!(
         adaptive.witnessed_lines > 150 && adaptive.bindings_learned > 130,
         "lines started at the authenticated buffer start, and bindings learned: {adaptive:?}"
@@ -630,29 +223,17 @@ fn a_prediction_never_corrupts_the_reconciled_view() {
     );
 }
 
-/// The seed indices (`seed_index`) the committed sweep below adds to the
-/// committed seed (index 0): as many as run in the time the theorem takes,
-/// every faithful configuration of each (16 sweeps of 600 cases in 0.71 s on
-/// 18 cores, beside the theorem's 8 in 0.64 s).
+/// Additional seed indices swept alongside [`SEED`] (index 0).
 const SWEPT_SEED_INDICES: std::ops::RangeInclusive<u64> = 1..=2;
 
-/// THE THEOREM OVER MORE SEEDS: the committed sweep of every faithful
-/// configuration over the seed indices `SWEPT_SEED_INDICES`, where the theorem
-/// holds index 0 alone. A sweep over many seeds found what the committed seed
-/// never reached (`sweep_cases`); this keeps a few of them in every run,
-/// deterministically, with every clause of the theorem in force. Its floors
-/// are the theorem's: they are counted on index 0.
+/// Checks the safety theorem over [`SWEPT_SEED_INDICES`].
 #[test]
 fn a_prediction_never_corrupts_the_reconciled_view_over_more_seeds() {
     let failures = sweep_seed_indices(SWEPT_SEED_INDICES);
     assert!(failures.is_empty(), "{}", failures.join("\n=====\n"));
 }
 
-/// THE REVIEW'S SWEEP, run on demand (`--ignored`): the theorem over seed
-/// indices 0 to 999, every faithful configuration of each, each failure
-/// shrunk. About seven minutes on 18 cores, too long for every run; a review
-/// of the predictor runs it, and each break it finds becomes a named case
-/// (`sweep_cases`).
+/// On-demand 1000-seed sweep across all faithful configurations.
 #[test]
 #[ignore = "the review's sweep: 8000 sweeps of 600 cases, minutes on every core"]
 fn a_prediction_never_corrupts_the_reconciled_view_over_a_thousand_seeds() {
@@ -668,15 +249,7 @@ fn a_prediction_never_corrupts_the_reconciled_view_over_a_thousand_seeds() {
     );
 }
 
-/// NEGATIVE CONTROLS, one or more per clause: each mutant host breaks one clause
-/// (`Host::breaks`), and the same checker, on the same seed, must report THAT
-/// clause, or the theorem above is vacuous in it. A frozen generation and a host
-/// blind to the alternate screen paint a guess in a space it was not armed in; a
-/// painter one cell off, and the painter that wrote over wide glyphs, change a
-/// cell no guess predicted; a host showing Adaptive's guesses as `Always` paints a
-/// password; a host that never reports Enter paints the next line's glyphs where
-/// they do not echo, and so does one that never tells the predictor the wide
-/// ambiguous width (an `é` guessed one cell where its echo takes two).
+/// Verifies that every mutant in [`MUTANT_HOSTS`] fails its declared [`Host::breaks`] clause.
 #[test]
 fn the_checker_catches_every_mutant_host_in_its_clause() {
     let missed = aterm_spec::check::each(&MUTANT_HOSTS, |&host| {
@@ -707,9 +280,7 @@ fn the_checker_catches_every_mutant_host_in_its_clause() {
     assert!(missed.is_empty(), "{}", missed.join("\n"));
 }
 
-/// Interleavings review found that the sweep had not reached, each a FIDELITY
-/// break inside the clause's scope before its fix (every echo within 250 ms of
-/// its key, a reliable editor, no unprompted output between a guess and its echo).
+/// Directed fidelity regressions from early interleaving reviews.
 #[test]
 fn the_reviewed_interleavings_hold() {
     let adaptive = adaptive_remote();
@@ -726,11 +297,8 @@ fn the_reviewed_interleavings_hold() {
     }
 }
 
-/// The interleavings review found (see `the_reviewed_interleavings_hold`), each
-/// with its label. The first is also the named case of the typed owe's
-/// same-glyph rule.
+/// Directed fidelity interleavings checked by [`the_reviewed_interleavings_hold`].
 fn reviewed_interleavings() -> [(&'static str, Vec<Op>); 3] {
-    // `b`, `c`, `n`, `o`, `n`: glyphs 1, 2, 6, 7 and 118 of `Sim::key_for`.
     let proven_line = [
         Op::Key(0, 1),
         Op::Program(1, 0),
@@ -743,11 +311,7 @@ fn reviewed_interleavings() -> [(&'static str, Vec<Op>); 3] {
     ];
     [
         (
-            // `n` painted, then flushed by a frame caught mid status-line redraw;
-            // `nnc` typed 190 ms later. The flushed key's echo retires the first
-            // new guess without credit; that guess's own echo, landing after the
-            // flushed key's window, proved the second one cell behind, and `c`
-            // was painted where the second `n` echoed.
+            // Guess retired without credit by an earlier key's echo still owes its own echo.
             "a guess retired without credit owes its own echo",
             [
                 &[
@@ -781,9 +345,7 @@ fn reviewed_interleavings() -> [(&'static str, Vec<Op>); 3] {
             .concat(),
         ),
         (
-            // `n` painted; the pane swapped away and straight back (take and
-            // restore) 10 ms later; `n` typed again at the live cursor. The
-            // first `n`'s echo, forgotten at the swap, proved the second.
+            // Pane swap away and back preserves the owed echo.
             "a tab switched away and back keeps its owed echo",
             [
                 &proven_line[..],
@@ -804,10 +366,7 @@ fn reviewed_interleavings() -> [(&'static str, Vec<Op>); 3] {
             .concat(),
         ),
         (
-            // Enter starts a full-screen app; Enter in it quits; `n` is typed
-            // while the host still samples the alternate screen, so it is refused
-            // at the no-echo gate — and the shell, back on the main screen, echoes
-            // it. Never owed, that echo proved the `n` typed again at the prompt.
+            // Key refused at the no-echo gate still owes its echo.
             "a key refused at the no-echo gate is owed",
             [
                 &proven_line[..],
@@ -840,21 +399,16 @@ fn reviewed_interleavings() -> [(&'static str, Vec<Op>); 3] {
     ]
 }
 
-/// A named directed case: an interleaving that breaks one clause when one rule
-/// of the predictor (or of its host) is off, and that the faithful predictor
-/// holds. Each rule's negative control is caught HERE, at its case, as well as
-/// anywhere the seeded sweep happens to reach it, so a generator change that
-/// stops reaching it cannot turn the control vacuous.
+/// Directed interleaving that holds under [`Host::Faithful`] and breaks each mutant's clause.
 struct NamedCase {
     name: &'static str,
     cfg: Config,
     ops: Vec<Op>,
-    /// The hosts, or predictor rules switched off, each of which must break its
-    /// own clause ([`Host::breaks`]) here.
+    /// Mutants that must fail [`Host::breaks`] on this case.
     mutants: Vec<Host>,
 }
 
-/// Adaptive, remote, narrow: where every fidelity clause is claimed.
+/// Adaptive, remote, narrow configuration.
 fn adaptive_remote() -> Config {
     Config {
         mode: PredictMode::Adaptive,
@@ -870,7 +424,7 @@ fn adaptive_remote() -> Config {
     }
 }
 
-/// One key read and echoed on a 60 ms link: press, read, deliver.
+/// Press `key`, read it, and deliver its echo over a 60 ms link.
 fn echoed(key: Op) -> [Op; 4] {
     [key, Op::Program(1, 0), Op::Advance(60), Op::Deliver(1024)]
 }
@@ -878,13 +432,7 @@ fn echoed(key: Op) -> [Op; 4] {
 fn named_cases() -> Vec<NamedCase> {
     vec![
         NamedCase {
-            // A guess expires on a slow link; the glyph typed after it anchors on
-            // the live cursor, which still stands on the expired guess's cell, and
-            // the epoch's proof named that cell. Kept, the proof painted the new
-            // glyph there; the expired key's echo then took the cell, inside the
-            // predictor's own window, and the new glyph echoed one cell on. The
-            // sweep's shrunk counterexample once the link model was scaled to the
-            // predictor's window.
+            // Expired guess owes its late echo inside the predictor's glitch window.
             name: "an_expired_guess_s_late_echo_is_owed",
             cfg: Config {
                 remote: false,
@@ -908,19 +456,7 @@ fn named_cases() -> Vec<NamedCase> {
             mutants: vec![Host::Rule(Rule::ExpiryOwes)],
         },
         NamedCase {
-            // `ab cd` echoed on a slow link, the cursor taken back onto the space
-            // by keys the predictor does not place (Alt-B to `c`, then a `←` it
-            // declines, the known line gone with Alt-B), a pause past the window,
-            // then `e` and `i`. `e`'s echo inserts it and shifts ` cd` right; it
-            // is `e`'s own (nothing owed in the window) and the cursor advanced, so
-            // positional evidence credited it. Proving the epoch, it put `i` on
-            // glass over the shifted space: the frame read `abeicd`, the screen
-            // settled to `abei cd`. FIDELITY's one cell was right (`i` echoes
-            // where it was painted); only the whole frame was wrong. The tail
-            // guard sees the row right of `e` changed since the press, and proves
-            // nothing. (With three predicted `←` the run starts inside the known
-            // text, which proves nothing by knowledge, `run_inside`:
-            // `a_run_typed_inside_the_known_text_proves_nothing`.)
+            // Mid-line insert shifting a tail right of the cursor does not prove the epoch.
             name: "mid_line_over_a_space",
             cfg: adaptive_remote(),
             ops: [
@@ -939,37 +475,14 @@ fn named_cases() -> Vec<NamedCase> {
             mutants: vec![Host::Rule(Rule::TailGuard), Host::TailBlind],
         },
         NamedCase {
-            // The reviewed `n`, `n`, `c` interleaving: a guess retired by an
-            // earlier key's echo owes its own, which lands in the second `n`'s
-            // cell. Owed typed, as `n`, it refuses credit to that `n` and to no
-            // other glyph; a typed owe that refused nothing credited it, proved
-            // the epoch one cell behind and painted `c` where the second `n`
-            // echoed.
+            // Uncredited retirement owes only its own glyph.
             name: "a_guess_retired_without_credit_owes_its_own_glyph",
             cfg: adaptive_remote(),
             ops: reviewed_interleavings()[0].1.clone(),
             mutants: vec![Host::Rule(Rule::TypedOwesSameGlyph)],
         },
         NamedCase {
-            // `s` typed, ` ` typed and cancelled by a Backspace before either
-            // echoes, then three spaces. The cancelled space's echo lands (the
-            // screen one cell ahead), so the first new space, anchored on the
-            // live cursor, was armed a cell right of where it echoes; the erase
-            // then lands, and the SECOND space's echo stands in the first one's
-            // cell, the cursor advancing past it, which is how a space confirms.
-            // Credited, that proved the epoch one cell behind and painted the
-            // third space at (0, 4), where it does not echo. Anchored on the
-            // cancelled cell, the first space echoes where it is armed. Shrunk
-            // from the sweep's seed 13, case 27, once the sweep ran forty seeds.
-            //
-            // Anchored there, though, the cancelled space's echo lands in the
-            // first new space's cell with the cursor past it, and credited it
-            // with the cancelled key's echo (ATTRIBUTION). The cancelled glyph's
-            // echo is now owed as its glyph (`CancelOwes`), which refuses that
-            // credit; and it refuses the second space's credit in the cell a
-            // cell-right anchor would give, so `CancelTransit` off no longer
-            // breaks this case: its control is
-            // `a_cancelled_glyph_s_cell_anchors_what_follows` below.
+            // Cancelled glyph owes its echo so it cannot credit a subsequent same-glyph guess.
             name: "a_cancelled_glyph_leaves_its_cell_as_the_anchor",
             cfg: Config {
                 remote: false,
@@ -995,21 +508,7 @@ fn named_cases() -> Vec<NamedCase> {
             mutants: vec![Host::Rule(Rule::CancelOwes)],
         },
         NamedCase {
-            // A proven line reaches the last column, where `c` is painted; a
-            // Backspace cancels it before it echoes, and `c`'s echo then parks
-            // the terminal in the deferred-wrap slot without moving the cursor.
-            // The `c` typed next, anchored on that live cursor, matched the
-            // proof's cell and was wrapped to the next row; the erase un-parked
-            // the line and it echoed in the last column. Shrunk from the sweep's
-            // seed 39, case 323.
-            //
-            // `CancelTransit` is no longer the only rule that keeps it: since the
-            // standing tail, a guess wrapped off the cursor's row carries no
-            // snapshot, so the parked `c` right of the proof's echo voids the
-            // proof at the frame after the press, before anything is painted on
-            // it. The case holds with `CancelTransit` off as well, and stays as the
-            // interleaving both keep; the rule's negative control is
-            // `a_cancelled_glyph_s_cell_anchors_what_follows` below.
+            // Cancelled glyph at the right margin does not wrap the next guess.
             name: "a_cancelled_glyph_at_the_margin_does_not_wrap_the_next",
             cfg: Config {
                 remote: false,
@@ -1046,16 +545,7 @@ fn named_cases() -> Vec<NamedCase> {
             mutants: vec![],
         },
         NamedCase {
-            // `mid_line_over_a_space` on a far end that writes the glyph before
-            // it redraws the tail (`Editor::Readline`), its echo delivered in two
-            // pieces: `e` alone, a frame, then ` cd` and the cursor stepped back.
-            // The frame between them shows `abecd` with the cursor past `e`; the
-            // row right of `e` is what the press saw, so `e` proves. Once the
-            // redraw lands (`abe cd`), `i`, anchored on that proof, was painted
-            // over the shifted space: `abeicd` on glass, settling to `abei cd`.
-            // The standing tail re-reads the row at the frame after the redraw,
-            // finds it moved, and voids the proof first. Found by review; the
-            // sweep reaches it once calm stretches split their deliveries.
+            // Mid-line glyph echoed before its shifted tail redraws voids the standing proof.
             name: "a_glyph_echoed_before_its_tail_moves_proves_nothing_after",
             cfg: Config {
                 editor: Editor::Readline,
@@ -1083,20 +573,7 @@ fn named_cases() -> Vec<NamedCase> {
             mutants: vec![Host::Rule(Rule::StandingTail)],
         },
         NamedCase {
-            // Every echo 300 ms after its key: a proven line, then an
-            // autosuggestion `dice` drawn after the cursor, and `d`, `i`, `c`, `e`
-            // typed along it with no frame between. Their cells already show
-            // their glyphs; retired on that, before the far end read one of them,
-            // they measured the link at 0 ms each, and the smoothed RTT fell from
-            // 300 to 72 ms, the window from 900 to 250. Then the reviewed `n`,
-            // `n`, `c` interleaving: the flushed `n`'s echo, 300 ms after its key
-            // and so on time for this link, outlived its owe, was credited to the
-            // second `n` one cell behind, and `c` was painted where that `n`
-            // echoes. Held for the cursor to pass them, the guesses retire on
-            // their own echoes, with their real samples. FIDELITY cannot see it:
-            // the link model calls the 300 ms echo late against the window the
-            // collapse left. ATTRIBUTION sees its cause, the four credits with no
-            // echo behind them, at the frame that makes them.
+            // Guesses typed over an autosuggestion require cursor advance before retirement.
             name: "cursor_advance_is_the_echo_s_evidence",
             cfg: adaptive_remote(),
             ops: {
@@ -1113,10 +590,8 @@ fn named_cases() -> Vec<NamedCase> {
                     &slow(glyph('o')),
                     &[
                         Op::Advance(1000),
-                        // `dice`, drawn dim, the cursor stepped back over it.
                         Op::Unprompted(Unprompted::Suggest, 3),
                         Op::Deliver(1024),
-                        // `d`, `i`, `c`, `e`, each with no frame of its own.
                         Op::Key(0, 36),
                         Op::Key(0, 16),
                         Op::Key(0, 24),
@@ -1126,20 +601,16 @@ fn named_cases() -> Vec<NamedCase> {
                         Op::Advance(300),
                         Op::Deliver(1024),
                         Op::Advance(400),
-                        // `n`, painted, then flushed by a frame caught mid
-                        // status-line redraw.
                         Op::Key(0, 6),
                         Op::Unprompted(Unprompted::StatusLine, 0),
                         Op::Advance(10),
                         Op::Deliver(755),
                         Op::Deliver(1024),
                         Op::Advance(100),
-                        // `n`, `n`, `c`, with no frame of their own.
                         Op::Key(0, 28),
                         Op::Key(0, 118),
                         Op::Key(0, 2),
                         Op::Advance(190),
-                        // The flushed `n` read, its echo 300 ms after its key.
                         Op::Program(1, 0),
                         Op::Deliver(1024),
                         Op::Frame,
@@ -1156,16 +627,7 @@ fn named_cases() -> Vec<NamedCase> {
             mutants: vec![Host::Rule(Rule::CursorAdvance)],
         },
         NamedCase {
-            // `n` echoed (a proof at (0, 1)); `s` typed and read; ` ` typed and
-            // cancelled by a Backspace; `s` and the cancelled ` ` echo, the
-            // screen a cell ahead with the erase unread, and `s`'s credit moves
-            // the proof to (0, 2). A space typed then anchors on the cancelled
-            // cell (0, 2) and is retired by the cancelled space's echo with the
-            // cursor past it, without credit (that echo is owed). Its own echo is
-            // still to come, and the erase lands next, putting the cursor back on
-            // (0, 2): with the proof left standing there, `e` was painted at
-            // (0, 2) and echoed at (0, 3), after the space. Shrunk from seed 43,
-            // case 144 of the sixty-seed sweep.
+            // Uncredited retirement voids the epoch proof on its cell.
             name: "an_uncredited_retirement_leaves_no_proof",
             cfg: Config {
                 remote: false,
@@ -1192,17 +654,7 @@ fn named_cases() -> Vec<NamedCase> {
             mutants: vec![Host::Rule(Rule::UncreditedVoids)],
         },
         NamedCase {
-            // `s`, `b` typed and read; `b` cancelled by a Backspace before its
-            // echo; `s` and `b` echo, the screen a cell ahead with the erase
-            // unread. `n`, `n` typed, then `i`. Anchored on the live cursor
-            // (0, 2) rather than the cancelled cell (0, 1), the first `n` is a
-            // cell right of where it echoes: once the erase lands and both `n`s
-            // echo, the second `n`'s echo stands in the first `n`'s cell with
-            // the cursor past it and is credited to it, and the proof one cell
-            // behind paints what follows a cell off. Shrunk from seed 35, case
-            // 69 of the sixty-seed sweep, once the cancelled glyph's echo was
-            // owed (`CancelOwes`) and the earlier controls of `CancelTransit`
-            // held without it.
+            // Cancelled glyph's cell anchors the next guess while its erase is unread.
             name: "a_cancelled_glyph_s_cell_anchors_what_follows",
             cfg: Config {
                 remote: false,
@@ -1240,39 +692,25 @@ fn named_cases() -> Vec<NamedCase> {
     .collect()
 }
 
-/// The named cases of the SHIFTS (glyphs and erases typed inside the known
-/// text, whose states move the text right of the cursor).
+/// Directed cases for mid-line insert and erase shifts.
 fn shift_cases() -> Vec<NamedCase> {
     vec![
         NamedCase {
-            // `ab` proven, `←` echoed onto `b`, `o` typed there. Readline in
-            // overwrite mode REPLACES `b`, where an insert shifts it right. The
-            // first mid-line insert of the epoch is the proof of its class, and
-            // overwrite mode never gives it, so `o` stays dark: its state matches
-            // no screen and the chain waits out its window. Shown on the glyph
-            // proof alone, `aob` was on glass while the screen settled to `ao`.
+            // Mid-line insert stays dark until the insert shift class is proven.
             name: "overwrite_mode_never_shows_a_shift",
             cfg: adaptive_on(Editor::Overwrite),
             ops: [&typed("ab")[..], &echoed(LEFT), &echoed(glyph('o'))].concat(),
             mutants: vec![Host::Rule(Rule::InsertShiftProof)],
         },
         NamedCase {
-            // `abc` proven, `←` echoed onto `c`, Backspace: overwrite mode's
-            // rubout BLANKS `b` and moves nothing (`a c`), where an erase shifts
-            // `c` left (`ac`). Shown on the glyph proof alone, `ac` was on glass.
+            // Mid-line rubout in overwrite mode never proves the erase shift class.
             name: "overwrite_rubout_never_shows_a_shift",
             cfg: adaptive_on(Editor::Overwrite),
             ops: [&typed("abc")[..], &echoed(LEFT), &echoed(BACKSPACE)].concat(),
             mutants: vec![Host::Rule(Rule::EraseShiftProof)],
         },
         NamedCase {
-            // `a` and two spaces proven, `←` twice onto the first space, a space
-            // typed there: overwrite mode replaces the space with a space, and
-            // the insert's state, its tail all spaces, is the very same screen.
-            // Credited, it proves no class: it moved no glyph. Taken as the
-            // class proof, `←` twice back onto `a` and `o` typed there showed
-            // `oa` (the insert shifting `a`) while overwrite mode settled to
-            // `o` with a blank after it.
+            // Shifting a tail of all spaces cannot distinguish insert from overwrite.
             name: "a_shift_of_spaces_proves_nothing",
             cfg: adaptive_on(Editor::Overwrite),
             ops: [
@@ -1288,14 +726,7 @@ fn shift_cases() -> Vec<NamedCase> {
             mutants: vec![Host::Rule(Rule::ShiftProofDistinguishes)],
         },
         NamedCase {
-            // `abc` proven, `c`'s echo bringing up a dim suggestion `ion` after
-            // it; `←` twice, and `o` typed inside the line, each echoed (readline
-            // writes `o`, then `bc`, `c` over the suggestion's first cell): the
-            // insert class is proven. `n` typed there shows at once, `bc` moved
-            // one cell right, `c` over the suggestion's `o`, and the rest of the
-            // row left as the far end leaves it. A host that moves the rest of
-            // the row with the shift, as ICH would, moved the suggestion, which
-            // no cell of the state names.
+            // Mid-line insert paints only the chain's span, not suggestion cells past the line.
             name: "insert_mid_line_beside_a_suggestion",
             cfg: adaptive_on(Editor::Readline),
             ops: [
@@ -1315,11 +746,7 @@ fn shift_cases() -> Vec<NamedCase> {
             mutants: vec![Host::PaintsPastTheLine],
         },
         NamedCase {
-            // `abc` proven with a shift: `←` twice and `o` echoed inside it. `←` is
-            // armed and shown, and `日`, typed right after it, is a wide glyph
-            // the chain cannot place: its echo shifts the text after the cursor
-            // two cells. It is owed and the chain flushed (R-ROW), whose shown
-            // `←` goes dark before the wide glyph's echo lands.
+            // Unplaceable wide glyph mid-line flushes the active state chain.
             name: "a_wide_glyph_mid_line_retires_the_tail",
             cfg: adaptive_on(Editor::Readline),
             ops: [
@@ -1329,7 +756,6 @@ fn shift_cases() -> Vec<NamedCase> {
                 &echoed(glyph('o')),
                 &[
                     LEFT,
-                    // `日`: `Sim::key_for`'s glyph 12, with no frame of its own.
                     Op::Key(0, 12),
                     Op::Frame,
                     Op::Program(2, 0),
@@ -1341,15 +767,7 @@ fn shift_cases() -> Vec<NamedCase> {
             mutants: vec![],
         },
         NamedCase {
-            // `א`, a space and `א` `א` typed, the first read and echoed: a lone
-            // right-to-left letter keeps the row in logical order, so its echo
-            // proved the line, and the three after it were shown `א אא` in the
-            // order typed. Their echoes join one right-to-left run, which the
-            // engine draws reversed: the row settled to `אא א`. A glyph that
-            // makes its row reorder is declined, and so is one typed on such a
-            // row. Found by the two-hundred-seed sweep (seed index 125, case 509,
-            // a readline far end: `o` and `אא א` shown while the row settled to
-            // `א אא`), written out here on zle.
+            // Right-to-left glyphs that trigger BiDi reordering are declined.
             name: "a_right_to_left_run_is_never_shown",
             cfg: Config {
                 remote: false,
@@ -1372,17 +790,7 @@ fn shift_cases() -> Vec<NamedCase> {
             mutants: vec![Host::Rule(Rule::RightToLeftRows)],
         },
         NamedCase {
-            // `si` typed, `i`'s echo bringing up a suggestion `dice` after it;
-            // `c` echoed over the suggestion's `d` (`sicice`); `c` again, `←`
-            // and `e` typed before any is read. Readline in OVERWRITE mode
-            // appends `c`, steps back and REPLACES it with `e`: `sicece`, the
-            // suggestion's own `c` standing where the insert's state moves the
-            // typed one. Matched there and taken as the line, `sicec` was a
-            // cell longer than the buffer, the insert class proven on it, and
-            // `o` typed next was shown shifted (`siceoc`) while overwrite mode
-            // settled to `siceoe`. A shift no edit in place can be told from
-            // leaves the line unknown. The two-hundred-seed sweep's seed index
-            // 21, case 79, shrunk.
+            // Shift indistinguishable from an in-place overwrite beside a suggestion proves nothing.
             name: "a_shift_a_suggestion_could_show_proves_nothing",
             cfg: Config {
                 remote: false,
@@ -1412,15 +820,7 @@ fn shift_cases() -> Vec<NamedCase> {
             mutants: vec![Host::Rule(Rule::ShiftProofDistinguishes)],
         },
         NamedCase {
-            // `abc` proven, `←` echoed onto `c`, then a Backspace and `o`
-            // typed inside the text and read together. Overwrite mode blanks
-            // `b` and writes `o` over the blank: `aoc`, the very screen of the
-            // two shifts, though no frame showed the state between them. The
-            // world that edits both in place shows it too, so neither kind is
-            // proven, and `n` typed next stays dark. Judged op by op against the
-            // fold's own intermediate state, both kinds were proven, and `n`
-            // was shown shifted (`aonc`) while overwrite mode settled to `aon`.
-            // Found by review.
+            // Multi-op burst matching an in-place overwrite screen proves neither shift class.
             name: "overwrite_mode_s_burst_proves_no_shift",
             cfg: adaptive_on(Editor::Overwrite),
             ops: [
@@ -1439,13 +839,7 @@ fn shift_cases() -> Vec<NamedCase> {
             mutants: vec![Host::Rule(Rule::ShiftProofDistinguishes)],
         },
         NamedCase {
-            // `ab` proven, `←` echoed onto `b`, then `o`, `→` and a Backspace
-            // typed before any is read. Overwrite mode reads `o` and replaces
-            // `b`: `ao` with the cursor after it, which is the chain's state
-            // after all three keys. Retired there, `→` and the Backspace were
-            // credited before the far end read either. An in-place world shows
-            // the screen with fewer keys read, so nothing is credited. Found by
-            // review.
+            // Screen reachable by fewer keys in overwrite mode credits no chain ops.
             name: "overwrite_mode_s_screen_with_fewer_keys_credits_none",
             cfg: adaptive_on(Editor::Overwrite),
             ops: [
@@ -1467,19 +861,7 @@ fn shift_cases() -> Vec<NamedCase> {
             mutants: vec![Host::Rule(Rule::InPlaceReadsFewer)],
         },
         NamedCase {
-            // `n` typed inside the text, a shift whose kind is not proven, and
-            // a Backspace after it, then `←`. Overwrite mode replaced the glyph
-            // under the cursor with `n` and its rubout then erased `n`: the
-            // line lost a glyph. Popped as a pair that cancels, the chain kept
-            // its line, and `←` was shown with the lost `a` on glass while the
-            // screen settled to `dse`. The Backspace is an op of the chain, an
-            // erase, dark like the glyph before it. Found by review (its
-            // sweep's seed index 152, case 65, shrunk: the failure that
-            // `VacateRefusal` off exposed, `VacateRefusal` masking it there).
-            // The transit wait now masks it too: `a`'s cell reads blank where
-            // every state holds `a`, and the `←` in flight writes no blank
-            // (`Rule::TransitBlanks`), so the chain is flushed before the frame;
-            // the unit test of the same name holds the rule with both off.
+            // Backspace does not cancel a prior glyph from an unproven mid-line shift.
             name: "a_backspace_cancels_no_glyph_of_an_unproven_shift",
             cfg: Config {
                 remote: false,
@@ -1513,8 +895,7 @@ fn shift_cases() -> Vec<NamedCase> {
     ]
 }
 
-/// A case of the sweep over more seeds than the committed one, shrunk: on a
-/// local far end, narrow, with the case's editor, right prompt and wrap policy.
+/// Local narrow configuration with the given `editor`, `rprompt`, and `forced_wrap`.
 fn swept(editor: Editor, rprompt: bool, forced_wrap: bool) -> Config {
     Config {
         remote: false,
@@ -1524,25 +905,11 @@ fn swept(editor: Editor, rprompt: bool, forced_wrap: bool) -> Config {
     }
 }
 
-/// The interleavings found by running the sweep over more seeds than the
-/// committed one, each shrunk and each a break of its clause before its fix:
-/// seven by the review of increment 2 (four of them on main before the edit
-/// lane too), and five by this round's own eight-hundred-seed sweep after
-/// their fixes (two on one seed, the second once the first held), four in the
-/// edit lane and one in the glyph lane. The last is the decoration rule's,
-/// where nothing was wrong on glass.
+/// Directed cases for edit-lane and glyph-lane interactions.
 fn edit_review_cases() -> Vec<NamedCase> {
     vec![
         NamedCase {
-            // `dcee` on screen, a Backspace we did not place still unread. `n`,
-            // `n` typed: a STALE ANCHOR at (0, 4), a cell right, the erase not
-            // yet landed. A Backspace cancels the second `n`, and `i` is typed.
-            // The first `n` echoes at (0, 3); the second `n`'s echo then lands
-            // at (0, 4), the first guess's cell, with the cursor past it. The
-            // stale anchor asked only about a later `n` still PENDING, and this
-            // one was cancelled, owed typed: credited, the first `n` proved the
-            // line at (0, 5) and `i` was painted there while it echoes at
-            // (0, 4). Sweep seed index 151, case 409.
+            // Stale-anchored run is not credited by the echo of a later cancelled key.
             name: "a_stale_run_is_not_credited_by_a_later_key_it_cancelled",
             cfg: swept(Editor::Readline, true, false),
             ops: vec![
@@ -1584,17 +951,7 @@ fn edit_review_cases() -> Vec<NamedCase> {
             mutants: vec![Host::Rule(Rule::StaleAnchor)],
         },
         NamedCase {
-            // `d` and `a` typed; `d` echoes and the far end draws a dim
-            // suggestion `ab` after it, the frame falling before its cursor
-            // steps back: `dab` with the cursor at (0, 3). `a`'s cell shows `a`
-            // with the cursor past it, so it retired; `n`, `n` typed next were
-            // anchored at (0, 3), a cell right of where they echo, the first
-            // credited with the second's echo, and `o` painted at (0, 5) while
-            // it echoes at (0, 4). The cursor is two cells past the newest
-            // guess's: no echo of the run puts it there. Sweep seed index 490,
-            // case 407, which typed two spaces where this types `n`, `n`: a
-            // space now proves no line by itself (`a_space_proves_no_line_by_itself`),
-            // which holds that one too, and the rule's control needs a glyph.
+            // Cursor past every cell the run could reach does not retire the run.
             name: "a_cursor_past_every_echo_of_the_run_is_not_an_echo",
             cfg: swept(Editor::Readline, false, true),
             ops: vec![
@@ -1615,14 +972,7 @@ fn edit_review_cases() -> Vec<NamedCase> {
             mutants: vec![Host::Rule(Rule::CursorReach)],
         },
         NamedCase {
-            // `n` proven on a cooked tty; ` `, ` `, `s` typed, `s` cancelled by
-            // a Backspace, `←`, `→`, `s` again, all within one round trip. The
-            // tty echoes ` `, ` ` and the FIRST `s`: `n  s`, the cursor at (0,
-            // 4), matches only the chain's last state. Retired front first, the
-            // spaces and both arrows were credited before the re-typed `s` was
-            // found owed (the cancelled `s`'s echo) and the chain flushed: two
-            // arrows credited that the tty would echo as `^[[D`. Sweep seed
-            // index 65, case 560.
+            // State chain is credited as a whole or not at all.
             name: "a_chain_is_credited_whole_or_not_at_all",
             cfg: swept(Editor::Cooked, false, false),
             ops: vec![
@@ -1644,13 +994,7 @@ fn edit_review_cases() -> Vec<NamedCase> {
             mutants: vec![Host::Rule(Rule::ChainAttributedWhole)],
         },
         NamedCase {
-            // `o` typed; 187 ms later a Backspace cancels it; `o`'s echo lands,
-            // the erase still unread; 82 ms later `o` is typed again, on the
-            // cancelled cell. The cancelled glyph's typed owe was dated by its
-            // own press and had lapsed: the old echo, still on screen until the
-            // erase lands, was credited to the new `o`. Dated by the Backspace,
-            // whose erase is what takes it off the screen, it holds. Sweep seed
-            // index 455, case 569.
+            // Cancelled glyph's typed owe is dated from the cancelling Backspace.
             name: "a_cancelled_glyph_is_owed_until_its_erase_is_due",
             cfg: swept(Editor::Cooked, true, false),
             ops: vec![
@@ -1667,12 +1011,7 @@ fn edit_review_cases() -> Vec<NamedCase> {
             mutants: vec![Host::Rule(Rule::CancelOwes)],
         },
         NamedCase {
-            // A paste leaves `$  cisadd` with the cursor on the last `d`, at
-            // (3, 8); `a`, `o`, `o`, `d` typed there, mid-line. Three ICH echoes
-            // push that `d` to (3, 11), the last column, the cursor on it: what
-            // the `d` guess's echo, parked in the deferred-wrap slot, would
-            // show. Credited, it was the shifted tail's `d`, before the `d` key
-            // was read. Sweep seed index 605, case 67.
+            // Shifted tail reaching the last column is not mistaken for a deferred-wrap park.
             name: "a_shifted_tail_in_the_last_column_is_not_a_park",
             cfg: swept(Editor::ReadlineIch, false, false),
             ops: vec![
@@ -1700,14 +1039,7 @@ fn edit_review_cases() -> Vec<NamedCase> {
             mutants: vec![Host::Rule(Rule::ParkedAtTheEnd)],
         },
         NamedCase {
-            // `e`, a combining acute and `←` typed (the mark declined, the arrow
-            // declined with its pixels kept), then `i`, `e`. The far end moves
-            // by code point: `←` put its cursor between `e` and the mark, so `i`
-            // is inserted before the mark, which re-attaches to it (`i` and the
-            // mark, then `e` and the mark). No cell right of `i` moved, and the
-            // run, typed at the end of the row, proved: `e` was shown plain at
-            // (0, 2) and settled to `é`. The echo's own cell came back opaque
-            // where the press saw it plain. Sweep seed index 573, case 27.
+            // Echo that acquires a combining mark does not prove a plain guess.
             name: "an_echo_that_takes_a_mark_was_typed_before_it",
             cfg: swept(Editor::Readline, true, false),
             ops: vec![
@@ -1731,14 +1063,7 @@ fn edit_review_cases() -> Vec<NamedCase> {
             mutants: vec![Host::Rule(Rule::MarkedEcho)],
         },
         NamedCase {
-            // `db` proven over ssh; a Backspace is armed as an erase, shown. The
-            // far end prints `Password: ` on the next row, echo off, and moves
-            // up a row (a reverse index): the chain's row is untouched and the
-            // cursor stands on it at (0, 10), right of every state. Waited on as
-            // a part-way echo, the chain kept displaying, and `8`, typed at the
-            // password prompt, joined it and was painted at (0, 1). Found by the
-            // eight-hundred-seed sweep of this round (seed index 230, case 315), not
-            // by review.
+            // Transit wait only holds when the cursor is within the chain's reachable range.
             name: "a_chain_waits_only_for_a_cursor_its_echoes_can_reach",
             cfg: Config {
                 rprompt: true,
@@ -1762,31 +1087,7 @@ fn edit_review_cases() -> Vec<NamedCase> {
             mutants: vec![Host::Rule(Rule::TransitReach)],
         },
         NamedCase {
-            // `s i` proven, `←`, `←` echoed, the chain retiring with the cursor
-            // on the line's space. `o` typed there is a mid-line insert, its
-            // proof dropped, but the space reads blank, so the run looked typed
-            // over nothing; readline writes `o` before it redraws the tail it
-            // shifts, and the frame between showed `soi` with the row right of
-            // `o` as the press saw it: `o` proved as an append, and ` `, typed
-            // on that proof before the redraw landed, was painted over `i`,
-            // which settled two cells right. A run started inside the known
-            // text proves nothing. Found by the eight-hundred-seed sweep of this
-            // round (seed index 361, case 559: a line that began with the
-            // space), written out here on a line a glyph proves, since a space
-            // now proves no line by itself.
-            //
-            // Since predictive editing's increment 3 a glyph typed inside the
-            // known text is a SHIFT, an op of a state chain, not a glyph-lane
-            // run: the frame between `o` and its tail is a part-way echo the
-            // chain waits through, and ` ` joins the chain. So `TailGuard`, which
-            // guards the glyph lane, no longer reaches this interleaving (its
-            // controls are the sweep and `mid_line_over_a_space`); the run typed
-            // inside the text that the lane cannot place (R-ROW, a line up to
-            // the margin) proves nothing by `Rule::InsideRunsNeverProve`, pinned
-            // with its control by the unit test
-            // `a_run_started_inside_the_text_proves_nothing` (this world cannot
-            // reach it inside the editor's model: `rule_clause`). The case stays:
-            // the faithful predictor must hold it.
+            // Run started inside known text after a retired motion chain proves nothing.
             name: "a_run_typed_inside_the_known_text_proves_nothing",
             cfg: adaptive_on(Editor::Readline),
             ops: [
@@ -1810,19 +1111,7 @@ fn edit_review_cases() -> Vec<NamedCase> {
             mutants: vec![],
         },
         NamedCase {
-            // `i` proven after a space; `←`, `←` read together, the second
-            // declined at the text's edge, and the far end steps the cursor onto
-            // the space: the chain flushes, the known line with it. `o` typed on
-            // the space; zle writes `o` before it redraws the tail it shifts, and
-            // the frame between shows `oi` with the row right of `o` as the
-            // press saw it, so `o` proves. ` ` is typed on that proof and `→`
-            // declined at the edge with the pixels kept, which ends the epoch and
-            // CARRIES ` `; the redraw lands (`o i`), and the standing tail, which
-            // ended with the epoch, no longer looked: ` ` stood on glass over a
-            // tail that had moved. The carried proof is held to its tail while
-            // a carried guess is pending. Found by the eight-hundred-seed sweep
-            // of this round (seed index 361, case 559), once a run typed inside
-            // the known text proved nothing.
+            // Proof carried across an epoch boundary still checks its standing tail.
             name: "a_carried_line_is_held_to_its_standing_tail",
             cfg: swept(Editor::Zle, true, true),
             ops: vec![
@@ -1849,16 +1138,7 @@ fn edit_review_cases() -> Vec<NamedCase> {
             mutants: vec![Host::Rule(Rule::StandingTail)],
         },
         NamedCase {
-            // `ab` proven at the start of an empty row with its motions; `←`,
-            // `←` are armed, the chain's last state with the cursor on (0, 0).
-            // The far end stops echoing (no prompt), Enter is pressed, and it
-            // reads all three: its arrows draw nothing, and the Enter's carriage
-            // return alone puts the cursor on (0, 0), the chain's last state.
-            // Credited, both arrows were measured on the Enter's output. An edit
-            // op is credited only with no later key still echoing. Found by the
-            // eight-hundred-seed sweep of this round (seed index 508, case 102:
-            // the erase of a space a line began with), written out here on a
-            // line a glyph proves, since a space now proves no line by itself.
+            // Edit chain is not credited while a later key's output is owed.
             name: "a_later_key_s_echo_is_not_an_edit_s",
             cfg: adaptive_on(Editor::Zle),
             ops: [
@@ -1877,14 +1157,7 @@ fn edit_review_cases() -> Vec<NamedCase> {
             mutants: vec![Host::Rule(Rule::EditOwedAfter)],
         },
         NamedCase {
-            // `ea o  ` typed and Enter, read and echoed; the far end prints
-            // `Password:` (echo off) in pieces, and a space is typed with the
-            // prompt's own trailing space not yet drawn, on its cell (1, 9).
-            // That space then lands, the cursor past it: the credit of the
-            // typed space, which proved the new line at (1, 10), where the
-            // prompt ends, and `7`, typed at the password prompt, was painted.
-            // A space proves no line by itself. Found by the eight-hundred-seed sweep
-            // of this round (seed index 796, case 462), in the glyph lane.
+            // Space echo alone never proves a line.
             name: "a_space_proves_no_line_by_itself",
             cfg: Config {
                 forced_wrap: true,
@@ -1919,17 +1192,7 @@ fn edit_review_cases() -> Vec<NamedCase> {
             mutants: vec![Host::Rule(Rule::SpaceNeverProves)],
         },
         NamedCase {
-            // `i` and a space typed and read; the far end prints ` Password: `
-            // on the same row (echo off), and a screen clear then redraws `$ `.
-            // `i`'s echo lands and proves the line; then the space's echo, the
-            // prompt, the clear and `$` land in one burst, the cursor back on
-            // the space's cell (`i`'s cell now `$`). `8` is typed at the
-            // password read, and the redraw's trailing space lands: credited
-            // with it, the space carried the proof `i` had earned, and `8` was
-            // painted. The proof stands only while its echo's cell holds its
-            // glyph. Found by the two-thousand-seed sweep of the review of
-            // increment 3 (seed index 1121, case 571), a break on main before
-            // it (the glyph lane alone).
+            // Line proof is voided if the cell that earned it no longer holds its glyph.
             name: "a_redrawn_line_keeps_no_proof",
             cfg: Config {
                 rprompt: true,
@@ -1950,19 +1213,7 @@ fn edit_review_cases() -> Vec<NamedCase> {
             mutants: vec![Host::Rule(Rule::StandingGlyph)],
         },
         NamedCase {
-            // `n` typed and read, then cancelled by a Backspace, also read, and
-            // a space typed on the cancelled cell. zle echoes `n` and erases it
-            // with `\b \b`, and a frame falls after the blank and before the
-            // step back: a blank on the cancelled cell with the cursor past
-            // it, a space's echo exactly. Credited, the space was measured on
-            // output that was not its own. The erase's echo is owed as a
-            // space. Found by the two-thousand-seed sweep of the review of
-            // increment 3 (seed index 1200, case 44), a break on main before it.
-            // The step back onto the credited space's cell now takes that credit
-            // back too (`Rule::CreditTakenBack`): each rule closes it alone, and
-            // neither switched off breaks it (the unit test of the same name
-            // holds `CancelOwesItsBlank` to the part-way frame, the cases of the
-            // review of increment 4 hold `CreditTakenBack`).
+            // Part-way `\b \b` erase of a cancelled glyph does not credit a typed space.
             name: "a_cancelled_glyph_s_erase_is_no_space_s_echo",
             cfg: swept(Editor::Zle, true, true),
             ops: vec![
@@ -1980,17 +1231,7 @@ fn edit_review_cases() -> Vec<NamedCase> {
             mutants: vec![],
         },
         NamedCase {
-            // `n` typed and echoed, proving its line; a Backspace, read, and a
-            // space typed after it: a chain, the erase at the end of the text
-            // and the space appended where it leaves the cursor. zle's erase
-            // (`\b \b`) is caught after its blank and before its step back: a
-            // blank with the cursor past it, the chain's state after BOTH keys.
-            // Retired there, the space was credited before the far end read it,
-            // and once that space's own echo landed it credited the space typed
-            // next. A state an earlier op's echo shows part-way is no evidence
-            // of the keys after it. Found by the two-thousand-seed sweep of the
-            // review of increment 3 (seed index 1200, case 44, once the glyph
-            // lane's cancelled pair owed its blank).
+            // Part-way erase echo matching a later chain state does not credit unread keys.
             name: "an_erase_caught_part_way_is_no_later_state",
             cfg: swept(Editor::Zle, true, true),
             ops: vec![
@@ -2009,14 +1250,7 @@ fn edit_review_cases() -> Vec<NamedCase> {
             mutants: vec![Host::Rule(Rule::PartWayEchoes)],
         },
         NamedCase {
-            // `sc` proven; Backspace, Backspace, `b`: the chain shows `b` with a
-            // blank on the vacated (0, 1) and the cursor there. The far end
-            // answers both erases and `b`, then draws a dim suggestion `e a`
-            // from (0, 1) and steps back: the settled screen holds decoration
-            // where the frame showed the vacated blank. A blank ghost is no
-            // typed glyph: the frame lacked a decoration the far end drew,
-            // which the decoration rule counts (`stale_decoration`). Sweep seed
-            // index 189, case 64.
+            // Vacated blank overwritten by a fetched autosuggestion counts as stale decoration.
             name: "a_vacated_blank_under_a_suggestion_is_stale_decoration",
             cfg: Config {
                 remote: false,
@@ -2043,7 +1277,7 @@ fn edit_review_cases() -> Vec<NamedCase> {
     ]
 }
 
-/// Adaptive, remote, narrow, with the far end's line editor `editor`.
+/// Adaptive remote configuration using `editor`.
 fn adaptive_on(editor: Editor) -> Config {
     Config {
         editor,
@@ -2051,20 +1285,17 @@ fn adaptive_on(editor: Editor) -> Config {
     }
 }
 
-/// `text` typed one glyph a round trip on a 60 ms link, each read and echoed.
+/// Press and echo each character of `text` over a 60 ms link.
 fn typed(text: &str) -> Vec<Op> {
     text.chars().flat_map(|c| echoed(glyph(c))).collect()
 }
 
-/// A proven line `ab` whose motion class is proven too: `←` and `→` echoed in
-/// turn, the cursor back at the end of the line.
+/// Type `ab` and prove the motion class with `←` and `→`.
 fn motions_proven_on_ab() -> Vec<Op> {
     [&typed("ab")[..], &echoed(LEFT), &echoed(RIGHT)].concat()
 }
 
-/// Enter read with command `choice` and its output delivered, then a pause past
-/// the window its owed echo holds: what follows is typed at a fresh prompt (or
-/// in whatever program the command started).
+/// Press Enter with command `choice`, deliver its output, and wait past the glitch window.
 fn enter_and_wait(choice: u32) -> [Op; 5] {
     [
         Op::Key(79, 1),
@@ -2075,35 +1306,23 @@ fn enter_and_wait(choice: u32) -> [Op; 5] {
     ]
 }
 
-/// A FRESH PROMPT under the integration, its first key still to come: Enter
-/// read from the empty screen, which draws the shell's first prompt, then Enter
-/// pressed at that prompt, read with command `choice`, and its output
-/// delivered. The second is a line terminator pressed at an authenticated
-/// prompt, which opens THE FIRST KEY's gate (`Predictor::note_line_submit_at`).
+/// Reach an authenticated fresh prompt with the first-key gate open.
 fn at_a_fresh_prompt(choice: u32) -> Vec<Op> {
     [&enter_and_wait(0)[..], &enter_and_wait(choice)].concat()
 }
 
-/// The named cases of the edit lane (state chains on the known line).
+/// Directed cases for state chains on a known line.
 fn edit_cases() -> Vec<NamedCase> {
     vec![
         NamedCase {
-            // A cooked tty echoes `←` as `^[[D`, four cells after the line with the
-            // cursor past them: no motion is ever exact there. So the class ladder
-            // never shows one: the arrow is tracked dark, its echo matches no state
-            // and the chain waits out its window. Shown on the glyph proof alone,
-            // `ab` with the cursor on `b` was on glass while the screen settled to
-            // `ab^[[D`.
+            // Arrows over a cooked tty never prove the motion class.
             name: "a_cooked_tty_never_shows_a_motion",
             cfg: adaptive_on(Editor::Cooked),
             ops: [&typed("ab")[..], &echoed(LEFT)].concat(),
             mutants: vec![Host::Rule(Rule::MotionClassProof)],
         },
         NamedCase {
-            // `←` proven at the shell; Enter starts `cat`, a cooked program, on
-            // the next row; `cd` typed there proves that line, and `←` is pressed.
-            // Its class proof went with the shell's line, so it stays dark; kept,
-            // it showed the cursor on `d` while `cat`'s tty echoed `^[[D`.
+            // Motion class proof resets when the epoch ends.
             name: "a_proof_does_not_outlive_its_line",
             cfg: adaptive_on(Editor::ReadlineIch),
             ops: [
@@ -2116,10 +1335,7 @@ fn edit_cases() -> Vec<NamedCase> {
             mutants: vec![Host::Rule(Rule::ProofsEndWithTheEpoch)],
         },
         NamedCase {
-            // `ab` typed at a prompt and proven, `←` twice onto the line's first
-            // glyph, then `←` again: at the start of the text the lane knows,
-            // where readline beeps and the cursor stays. Armed, it showed the
-            // cursor on the prompt's space while it settled on `a`.
+            // Left arrow at the start of the known text is declined.
             name: "a_motion_at_the_text_edge_beeps",
             cfg: adaptive_on(Editor::Readline),
             ops: [
@@ -2133,11 +1349,7 @@ fn edit_cases() -> Vec<NamedCase> {
             mutants: vec![Host::Rule(Rule::TextEdges)],
         },
         NamedCase {
-            // `c` typed at the end of a line whose motions are proven, `←`, then
-            // Enter before any of them is read: the chain is carried across its
-            // terminator with `c` painted and the cursor on it. Drawn one past the
-            // newest glyph instead (the glyph lane's cursor), it was a key ahead
-            // of the line the frame shows.
+            // Chain carried across Enter draws its own cursor rather than the glyph lane's.
             name: "enter_with_keys_in_flight",
             cfg: adaptive_on(Editor::ReadlineIch),
             ops: [
@@ -2155,9 +1367,7 @@ fn edit_cases() -> Vec<NamedCase> {
             mutants: vec![Host::Rule(Rule::CarryCursor)],
         },
         NamedCase {
-            // `c` typed at the end of a line whose motions are proven, then `←`:
-            // the chain shows `c` with the cursor on it. A host drawing the glyph
-            // lane's cursor, one past the newest glyph, drew it a cell right.
+            // State chain ending in `←` draws the chain's cursor.
             name: "left_moves_the_cursor",
             cfg: adaptive_on(Editor::ReadlineIch),
             ops: [
@@ -2174,9 +1384,7 @@ fn edit_cases() -> Vec<NamedCase> {
             mutants: vec![Host::CursorAfterNewestGlyph],
         },
         NamedCase {
-            // `abc de` proven with its motions, then Alt-B: readline goes back a
-            // word, to `d`. Handed to the predictor as `←`, the frame put the
-            // cursor on `e`.
+            // Word motion (Alt-B) is not routed as a single-cell arrow.
             name: "a_word_motion_is_not_an_arrow",
             cfg: adaptive_on(Editor::Readline),
             ops: [
@@ -2194,12 +1402,7 @@ fn edit_cases() -> Vec<NamedCase> {
             mutants: vec![Host::WordMotionAsArrow],
         },
         NamedCase {
-            // The keypad's Left, while a Kitty mode that reports the keypad
-            // (DISAMBIGUATE) is on, sends its own code (`CSI 57417 u`), which
-            // readline leaves unbound: it beeps and the cursor stays. Handed to
-            // the predictor as `←`, the frame moved the cursor. (Under the
-            // legacy encoder the keypad's Left is the main block's `ESC [ D`,
-            // an edit key like `←`.)
+            // Keypad Left under Kitty DISAMBIGUATE is not routed as an arrow.
             name: "a_keypad_arrow_kitty_reports_is_not_a_motion",
             cfg: adaptive_on(Editor::Readline),
             ops: [
@@ -2215,12 +1418,7 @@ fn edit_cases() -> Vec<NamedCase> {
             mutants: vec![Host::KeypadArrowAsArrow],
         },
         NamedCase {
-            // `←` and `→` pressed in one burst on a line whose motions are proven,
-            // a frame before either is read: the screen shows the state before
-            // them, which is also the state after them. The smallest match retires
-            // nothing, and the net-null tail retires uncredited, owed. The largest
-            // match, or a credited net-null tail, credited two keys whose output
-            // never began.
+            // Net-null `←` `→` burst matches the smallest prefix and retires uncredited.
             name: "an_ambiguous_match_proves_nothing",
             cfg: adaptive_on(Editor::Readline),
             ops: [
@@ -2234,13 +1432,7 @@ fn edit_cases() -> Vec<NamedCase> {
             ],
         },
         NamedCase {
-            // `abcdei` proven, `←` three times echoed, a fourth pressed (shown),
-            // then a right prompt drawn over `ei` by the far end, the cursor
-            // restored where the unread `←` leaves the chain's first state. That
-            // state's cursor matches, its text does not: a whole-state match
-            // flushes. Matched by the cursor alone, the chain kept its own `ei`
-            // and painted it over the right prompt the screen shows, which the
-            // keys folded over that screen do not give.
+            // State chain requires the whole line text to match, not just the cursor.
             name: "a_redrawn_line_retires_the_edits",
             cfg: adaptive_on(Editor::ReadlineIch),
             ops: [
@@ -2258,25 +1450,14 @@ fn edit_cases() -> Vec<NamedCase> {
             mutants: vec![Host::Rule(Rule::WholeStateMatch)],
         },
         NamedCase {
-            // `←` shown on a line whose motions are proven, and the far end never
-            // reads it: the chain expires whole at its head's window. A chain that
-            // never expires was on glass a second after its key.
+            // Unanswered state chain flushes when its head expires.
             name: "a_chain_no_echo_answers_expires",
             cfg: adaptive_on(Editor::ReadlineIch),
             ops: [&typed("ab")[..], &echoed(LEFT), &[LEFT, Op::Advance(1000)]].concat(),
             mutants: vec![Host::Rule(Rule::StateExpiryFlushes)],
         },
         NamedCase {
-            // Two spaces and `d` echoed, `→` at the end of the line (declined: an
-            // edge), then a Backspace that cancels nothing of ours, and `c`, `c`,
-            // `c` typed while the erase is still unread: the run is placed on the
-            // live cursor, a cell right of where the erase leaves it, a STALE
-            // ANCHOR. The first `c` echoes a cell left of its guess, and the
-            // second `c`'s echo then stands in the first guess's cell with the
-            // cursor past it. The Backspace's owe has lapsed by then; credited, the
-            // first guess proved the line a cell behind and the third `c` was
-            // painted where the second echoed. Shrunk from seed 76, case 91 of the
-            // eighty-seed sweep of the edit lane's world.
+            // Run anchored before an unread Backspace lands is marked as a stale anchor.
             name: "a_run_placed_before_an_erase_lands_is_not_credited_by_the_next_key",
             cfg: Config {
                 remote: false,
@@ -2314,9 +1495,7 @@ fn edit_cases() -> Vec<NamedCase> {
     ]
 }
 
-/// Adaptive, remote, narrow, the far end's line editor `editor` binding the
-/// learned keys as `keymap`, under aterm's shell integration (signed marks,
-/// the nonce gate on).
+/// Adaptive remote configuration with shell integration enabled.
 fn integrated(editor: Editor, keymap: Keymap) -> Config {
     Config {
         integration: true,
@@ -2325,9 +1504,7 @@ fn integrated(editor: Editor, keymap: Keymap) -> Config {
     }
 }
 
-/// The line's start and end keys `(start, end)` each pressed twice in turn,
-/// read and echoed on its own, from the end of the line: on a far end that
-/// binds them canonically, the two echoes each that teach both.
+/// Teach `start` and `end` bindings by pressing and echoing each twice.
 fn learn_edges(start: Op, end: Op) -> Vec<Op> {
     [
         &echoed(start)[..],
@@ -2338,29 +1515,21 @@ fn learn_edges(start: Op, end: Op) -> Vec<Op> {
     .concat()
 }
 
-/// The op that presses Tab (a completion, input the predictor does not model)
-/// and draws a frame.
+/// Tab key op.
 const TAB: Op = Op::Key(87, 13);
 
-/// The named cases of the LEARNED KEYS (Home, End, Ctrl-A, Ctrl-E, Delete):
-/// placed only on a line started at the shell's authenticated buffer start,
-/// shown only once learned in the editor context.
+/// Directed cases for learned line-edge and Delete bindings.
 fn line_edge_cases() -> Vec<NamedCase> {
     vec![
         NamedCase {
-            // `zsh -f` leaves Home unbound: it beeps and the cursor stays. A
-            // probe is never shown, and its expiry unlearns nothing it never
-            // learned. Shown as beginning-of-line on the glyph proof alone, the
-            // cursor stood on `a` while the screen settled with it after `b`.
+            // Unbound Home under `zsh -f` stays a dark probe.
             name: "an_unbound_home_is_not_predicted",
             cfg: integrated(Editor::Zle, Keymap::ZshVanilla),
             ops: [&at_a_fresh_prompt(0)[..], &typed("ab"), &echoed(HOME)].concat(),
             mutants: vec![Host::Rule(Rule::LearnedBindings)],
         },
         NamedCase {
-            // `zsh -f` reads Delete as an undefined prefix and a `~`, which it
-            // inserts. Shown as delete-char, `b` was gone from a frame whose
-            // line settled to `a~bc`.
+            // Delete inserting `~` under `zsh -f` is not shown as delete-char.
             name: "delete_without_a_delete_binding",
             cfg: integrated(Editor::Zle, Keymap::ZshVanilla),
             ops: [
@@ -2374,20 +1543,14 @@ fn line_edge_cases() -> Vec<NamedCase> {
             mutants: vec![Host::Rule(Rule::LearnedBindings)],
         },
         NamedCase {
-            // zsh's vi insert mode inserts Ctrl-A, drawn `^A`. Shown as
-            // beginning-of-line, the cursor stood on `a`.
+            // Ctrl-A inserting `^A` in vi insert mode is not shown as beginning-of-line.
             name: "ctrl_a_in_vi_insert_mode_is_a_glyph",
             cfg: integrated(Editor::Zle, Keymap::ViIns),
             ops: [&at_a_fresh_prompt(0)[..], &typed("ab"), &echoed(CTRL_A)].concat(),
             mutants: vec![Host::Rule(Rule::LearnedBindings)],
         },
         NamedCase {
-            // Home and End learned at an integrated prompt; the shell then
-            // re-executes as `zsh -f` (Home unbound), re-keyed, and prompts
-            // anew. Enter there opens the first-key gate at the new shell's
-            // prompt. A new nonce is a new editor context: Home is a probe there,
-            // dark. A host handing one context forever showed the binding the
-            // first shell taught, the cursor on `c` while the second beeped.
+            // Re-executing the shell with a new nonce resets learned bindings.
             name: "a_new_shell_relearns_its_bindings",
             cfg: integrated(Editor::Zle, Keymap::Canonical),
             ops: [
@@ -2407,11 +1570,7 @@ fn line_edge_cases() -> Vec<NamedCase> {
             mutants: vec![Host::StaleEditorContext],
         },
         NamedCase {
-            // Home learned on `ab`; Tab completes `ion `, which ends the epoch,
-            // and `cd` typed after it starts a line mid-buffer. Home there is
-            // not modelled: the line is not the buffer. Placed on any line with
-            // an authenticated B on its row, it showed the cursor on `c` while
-            // the far end went to `a`.
+            // Line started after Tab completion is not witnessed as the buffer start.
             name: "home_after_a_tab_completion_is_not_predicted",
             cfg: integrated(Editor::Zle, Keymap::Canonical),
             ops: [
@@ -2427,16 +1586,7 @@ fn line_edge_cases() -> Vec<NamedCase> {
             mutants: vec![Host::Rule(Rule::WitnessFreshPrompt)],
         },
         NamedCase {
-            // Home learned on `ab`; the line pushed onto zsh's buffer stack
-            // (push-line), Enter pressed on the empty line, and the next prompt
-            // pops `ab` pre-filled: zle draws it before zle-line-init runs, so
-            // the shell's `B` lands after it and does not say it stands where
-            // the buffer starts. A program then prints an unsigned OSC 133 `A`
-            // and a `B` that says so, at the cursor. The nonce gate drops them,
-            // and no start is handed; a host that never turned the gate on took
-            // that B for the buffer's start, so `c`, the prompt's first key,
-            // typed there started a witnessed line, and Home showed the cursor
-            // on `c` while the far end went to `a`.
+            // Unsigned OSC 133 marks are ignored when the nonce gate is active.
             name: "a_forged_prompt_mark_moves_no_home",
             cfg: integrated(Editor::Zle, Keymap::Canonical),
             ops: [
@@ -2457,15 +1607,7 @@ fn line_edge_cases() -> Vec<NamedCase> {
             mutants: vec![Host::UnsignedInputStart],
         },
         NamedCase {
-            // The same pre-filled prompt with no program printing anything:
-            // the shell's own signed `B`, after the line zle popped from its
-            // buffer stack, does not say it stands where the buffer starts
-            // (aterm's integration says so only over an empty buffer), and
-            // aterm-core names no start. A host that took the signed `B` of the
-            // prompt in front wherever it stood made `c` start a witnessed line
-            // at the end of `ab`, and Home showed the cursor on `c` while zle
-            // went to `a` (measured on zsh 5.9: accept-and-hold's prompt drew
-            // `P> echo hi` with the mark at column 10).
+            // Signed `B` mark without `aterm_input=start` on a pre-filled line is not a buffer start.
             name: "a_line_pre_filled_from_the_buffer_stack_has_no_buffer_start",
             cfg: integrated(Editor::Zle, Keymap::Canonical),
             ops: [
@@ -2481,16 +1623,7 @@ fn line_edge_cases() -> Vec<NamedCase> {
             mutants: vec![Host::UnattestedInputStart],
         },
         NamedCase {
-            // THE FIRST KEY. `ab` typed at the B (witnessed) and its edges
-            // learned, both rubbed out, two spaces typed, Home echoed (the
-            // cursor back on the B) and Home pressed again there, which moves
-            // nothing and is not modelled: the line goes. `c` typed at the B's
-            // cell then starts a run there, but not as the prompt's first key:
-            // the buffer holds the two spaces after it, which the screen draws
-            // as blanks. Its line is no witnessed one, and Home and End are not
-            // placed. Taken for the buffer's start, End showed the cursor after
-            // `c` while the far end went past the spaces (the review of
-            // increment 4).
+            // Only the first key typed at a fresh prompt witnesses an empty buffer.
             name: "only_the_first_key_meets_the_empty_buffer",
             cfg: integrated(Editor::Zle, Keymap::Canonical),
             ops: [
@@ -2512,13 +1645,7 @@ fn line_edge_cases() -> Vec<NamedCase> {
             mutants: vec![Host::Rule(Rule::WitnessFirstKey)],
         },
         NamedCase {
-            // A prompt drawn wide (`$$$ `, its B at column 4), `ab` typed and
-            // its edges learned; then zsh's `reset-prompt` redraws it narrower
-            // (`$ `), the buffer after it, and sends no new B: the engine keeps
-            // the old one at column 4, where the cursor now stands. `s`, typed
-            // there mid-buffer, is no prompt's first key: its line is not
-            // witnessed and Home is not placed. Taken for the buffer's start,
-            // Home showed the cursor on `s` while zle went to `a`.
+            // Stale `B` mark left behind by a narrower `reset-prompt` redraw does not witness a line.
             name: "a_b_left_behind_by_a_narrower_redraw_witnesses_nothing",
             cfg: integrated(Editor::Zle, Keymap::Canonical),
             ops: [
@@ -2542,14 +1669,7 @@ fn line_edge_cases() -> Vec<NamedCase> {
             mutants: vec![Host::Rule(Rule::WitnessFirstKey)],
         },
         NamedCase {
-            // Home learned at a prompt the shell drew after clearing the
-            // screen, its B at (0, 2); then a command clears it again and
-            // reads a line, cooked, after a `$ ` of its own, where the shell's
-            // stood. A command runs: no input region. A host handing on the
-            // last start it read, a cell no line terminator's prompt names, took
-            // the program's prompt for the shell's, and Home showed the cursor on
-            // `c` while the tty echoed `^[[H`. (Handed with the prompt it was read
-            // at, the first-key gate refuses it: Enter was pressed there.)
+            // Child program's prompt at the shell's old coordinates has no input region.
             name: "a_program_s_prompt_is_no_input_region",
             cfg: integrated(Editor::Zle, Keymap::Canonical),
             ops: [
@@ -2564,11 +1684,7 @@ fn line_edge_cases() -> Vec<NamedCase> {
             mutants: vec![Host::StaleInputStart],
         },
         NamedCase {
-            // Ctrl-A and Ctrl-E learned; the shell then pushes Kitty
-            // `DISAMBIGUATE`, under which Ctrl-A goes out as `CSI 97;5u`, which
-            // it does not bind (a beep). Not modelled (R-KITTY), and the
-            // context it is pressed in is another. A host that never asks the
-            // Kitty mode showed the cursor on `a`.
+            // Control chords escaped under Kitty DISAMBIGUATE are not predicted as line edges.
             name: "ctrl_a_under_kitty_disambiguate",
             cfg: integrated(Editor::Zle, Keymap::Canonical),
             ops: [
@@ -2585,11 +1701,7 @@ fn line_edge_cases() -> Vec<NamedCase> {
             mutants: vec![Host::IgnoresKittyChords],
         },
         NamedCase {
-            // As above under xterm's modifyOtherKeys at level 2 (`CSI > 4;2 m`,
-            // a precmd's or a program's left behind): Ctrl-A goes out as
-            // `CSI 27;5;97~`, which zle does not decode. Not modelled
-            // (R-KITTY). A host that asked only Kitty's mode showed the cursor
-            // on `a` (the review of increment 4).
+            // Control chords escaped under modifyOtherKeys level 2 are not predicted as line edges.
             name: "ctrl_a_under_modify_other_keys",
             cfg: integrated(Editor::Zle, Keymap::Canonical),
             ops: [
@@ -2606,13 +1718,7 @@ fn line_edge_cases() -> Vec<NamedCase> {
             mutants: vec![Host::IgnoresModifyOtherKeys],
         },
         NamedCase {
-            // Delete LEARNED and shown shifting the tail: `abcd` typed, two `←`,
-            // and Delete twice at the cursor, each a probe of delete-char its
-            // echo credits (`c`, then `d`, gone, the cursor kept); `on` typed at
-            // the end, three `←`, and Delete shown at once: `o` gone, `n` drawn
-            // where it stood (moved from the cell right of it), the last cell
-            // vacated, the cursor where it was. A host drawing a chain's cursor
-            // one past the newest ghost it painted put it on the vacated cell.
+            // Learned Delete shifts the tail left and keeps the chain's cursor.
             name: "a_learned_delete_shifts_the_tail",
             cfg: integrated(Editor::Zle, Keymap::Canonical),
             ops: [
@@ -2632,14 +1738,7 @@ fn line_edge_cases() -> Vec<NamedCase> {
             mutants: vec![Host::CursorAfterNewestGlyph],
         },
         NamedCase {
-            // Ctrl-E learned (each press with the cursor inside the text); `c`
-            // typed, and its echo brings up a suggestion, `ion`, after it.
-            // Ctrl-E (end-of-line) at the end of the line ACCEPTS the
-            // suggestion, and `d` typed before either is read, with no frame
-            // between them, lands after it. There it is declined with its pixels
-            // kept. Armed as a line end that moves nothing, the frame showed
-            // `abcd`, `d` over the suggestion's `i`, while the line settled to
-            // `abciond`.
+            // Line-end key at the end of the text is declined so it can accept an autosuggestion.
             name: "end_accepts_the_autosuggestion",
             cfg: integrated(Editor::Autosuggest, Keymap::Canonical),
             ops: [
@@ -2654,7 +1753,6 @@ fn line_edge_cases() -> Vec<NamedCase> {
                     Op::Program(1, 3),
                     Op::Advance(60),
                     Op::Deliver(1024),
-                    // Ctrl-E with no frame after it (`Sim::key_for`).
                     Op::Key(87, 20),
                     glyph('d'),
                     Op::Program(2, 0),
@@ -2666,16 +1764,7 @@ fn line_edge_cases() -> Vec<NamedCase> {
             mutants: vec![Host::Rule(Rule::EndRefusal)],
         },
         NamedCase {
-            // `ca` typed at a prompt drawn after a clear; Ctrl-A echoed, the
-            // cursor on `c`; Ctrl-E read, its echo, the line reprinted from the
-            // cursor, delivered only as far as `c`, the cursor on `a`. Then `←`
-            // and Ctrl-E pressed, unread: the chain's state after `←` has the
-            // cursor on `a` too, and the first Ctrl-E's echo caught part-way
-            // matched it, so `←` was credited unread, and once the reprint went
-            // on the second Ctrl-E was credited with the first one's output. A
-            // line edge's echo moves the cursor over the text a cell at a time,
-            // and caught part-way it is no later state. Found by the
-            // three-hundred-seed sweep of increment 4 (seed index 266, case 427).
+            // Part-way line-end reprint matching an intermediate cursor does not credit later ops.
             name: "a_line_end_caught_part_way_is_no_later_state",
             cfg: Config {
                 rprompt: true,
@@ -2698,16 +1787,7 @@ fn line_edge_cases() -> Vec<NamedCase> {
             mutants: vec![Host::Rule(Rule::PartWayEchoes)],
         },
         NamedCase {
-            // A combining mark typed after `a`, then `←` (declined with its
-            // pixels kept): zle moves by code point, so its cursor stands
-            // between `a` and the mark, and every glyph typed after it is
-            // inserted before the mark, written with the mark after it. `e`,
-            // typed into the last column, wraps: zle writes it, moves to the next
-            // row, and writes the mark there, on a blank first cell, the cell of
-            // the guess `c` typed after `e`. That cell reads opaque and blank;
-            // waited on as a blank, `c` was painted plain while it settled
-            // marked. Found by the three-hundred-seed sweep of increment 4 (seed
-            // index 139, case 190), a break on main before it: no integration.
+            // Combining mark carried onto the next guess's cell makes the head opaque and flushes.
             name: "a_mark_carried_onto_the_next_guess_s_cell_flushes_it",
             cfg: Config {
                 remote: false,
@@ -2757,16 +1837,7 @@ fn line_edge_cases() -> Vec<NamedCase> {
     ]
 }
 
-/// A host paints a state chain ALL OR NONE, and draws its cursor only on a cell
-/// that is no wide glyph's right half. The world cannot reach the frames that
-/// tell (a chain flushes on any opaque cell of its line, and its cells and
-/// cursor are inside it), so the painter is held here on one that does: a row
-/// holding a wide glyph, a chain whose second cell, or whose cursor, falls on
-/// its right half, or a shift whose moved glyph would come from it, which the
-/// span painter refuses whole. aterm's host paints none and draws the engine's
-/// cursor; a host painting what it can breaks ATOMICITY, and so does one drawing
-/// the chain's cursor over a span the painter refused; one drawing the cursor
-/// without asking about its cell breaks CURSOR LOCALITY.
+/// Verifies that `paint_chain` enforces atomicity and cursor locality on wide glyphs.
 #[test]
 fn the_chain_painter_paints_all_or_none() {
     let mut term = aterm_core::terminal::Terminal::new(2, 12);
@@ -2778,8 +1849,6 @@ fn the_chain_painter_paints_all_or_none() {
     let cells = [(0, 1, 'x'), (0, 3, 'y')];
     let typed = [GhostCell::Typed; 2];
     let motion: [(u16, u16, char); 0] = [];
-    // A shift whose moved glyph would come from the wide glyph's lead: the
-    // span painter refuses the whole span.
     let shift = [(0, 1, '日')];
     let moved = [GhostCell::Moved { from: 2 }];
     for (shown, kinds, cursor, mutant) in [
@@ -2806,12 +1875,7 @@ fn the_chain_painter_paints_all_or_none() {
     }
 }
 
-/// Every predictor rule that keeps a clause has a negative control: the sweep
-/// catches it (`MUTANT_HOSTS`, run by the checker test) or a named case does
-/// (`each_named_case_holds_and_catches_its_mutant`). The rules come from
-/// `Rule::ALL`, which the predictor derives from the enum, and `rule_clause`'s
-/// exhaustive match makes a new rule name its clause or `None`, so a rule added
-/// with a clause and no control fails here instead of asserting nothing.
+/// Verifies that every [`Rule`] with a safety clause has a negative control in [`MUTANT_HOSTS`] or [`named_cases`].
 #[test]
 fn every_rule_has_a_negative_control() {
     let named: Vec<Host> = named_cases().into_iter().flat_map(|c| c.mutants).collect();
@@ -2826,8 +1890,7 @@ fn every_rule_has_a_negative_control() {
     }
 }
 
-/// Every named case holds for aterm's predictor and host, and breaks its
-/// clause, at the case itself, with its rule switched off.
+/// Verifies that every [`NamedCase`] holds under [`Host::Faithful`] and catches each of its mutants.
 #[test]
 fn each_named_case_holds_and_catches_its_mutant() {
     for case in named_cases() {
@@ -2858,21 +1921,11 @@ fn each_named_case_holds_and_catches_its_mutant() {
     }
 }
 
-/// The breaks the review of increment 4 found with a sweep of two thousand
-/// seeds (seed index `i` is the committed seed xor `i` times the golden-ratio
-/// constant), each on main before the increment, each a named case with the
-/// rule that closes it switched off as its control.
+/// Directed cases for floor validation, wrap flags, and credit revocation.
 fn review_4_cases() -> Vec<NamedCase> {
     vec![
         NamedCase {
-            // `oi` echoed and proving while `a`, a space and `e` were typed
-            // ahead, `e` wrapping onto the next row; then `\r\nPassword: ` on
-            // that row and a reverse index back onto `a`, in one burst. The
-            // floor under the line holds a guess in flight, which is no reason
-            // to read none of it: the cells no guess names show text the press
-            // saw no trace of, and the proof is void; the digit typed at the
-            // password read was shown after `e` (this round's sweep, seed index
-            // 2146, case 131, once the floor skipped a row a guess wrapped onto).
+            // Unexplained text on the row below a wrapped guess voids the line proof.
             name: "a_prompt_beside_a_wrapped_guess_voids_the_proof",
             cfg: Config {
                 editor: Editor::Zle,
@@ -2916,15 +1969,7 @@ fn review_4_cases() -> Vec<NamedCase> {
             mutants: vec![Host::Rule(Rule::FloorBelow)],
         },
         NamedCase {
-            // The same burst with more typed ahead: `d` and `n` fill the line
-            // to the margin, and `aisbda e` wraps onto the floor, so every
-            // cell `Password:` is printed over is one a guess names. A guess
-            // naming a cell excuses its own glyph there (the echo of a glyph
-            // typed ahead lands on the floor), never a different one: `P` over
-            // the guessed `a` is the prompt, and the proof is void; the digit
-            // typed at the password read was shown after `e` (the second sweep
-            // of this round, seed index 2146, case 131, once the floor excused
-            // every cell a guess named).
+            // Prompt text overwriting wrapped guess cells on the row below voids the line proof.
             name: "a_prompt_drawn_over_the_guesses_on_the_floor_voids_the_proof",
             cfg: Config {
                 editor: Editor::Zle,
@@ -2977,15 +2022,7 @@ fn review_4_cases() -> Vec<NamedCase> {
             mutants: vec![Host::Rule(Rule::FloorBelow)],
         },
         NamedCase {
-            // A combining mark typed first at a fresh prompt joins the
-            // prompt's trailing space; `n` typed and rubbed out with
-            // `\b ESC[K`. The engine recounted the row's length from its cells'
-            // bits and dropped the space the mark rides on, so the frames
-            // showed it plain until `c`, written after it, grew the row back
-            // over it: the frame `c` was shown in lacked the mark the screen
-            // settled with. aterm-grid keeps a marked blank in the row
-            // (`Grid::keep_len_over_marks`); no rule of the predictor is
-            // involved (this round's sweep, seed index 778, case 211).
+            // Combining mark on the prompt's trailing space survives an erase after it.
             name: "a_mark_on_the_prompt_s_space_survives_an_erase_after_it",
             cfg: Config {
                 remote: false,
@@ -3015,13 +2052,7 @@ fn review_4_cases() -> Vec<NamedCase> {
             mutants: vec![],
         },
         NamedCase {
-            // The world's own: a `^C` at a wrapped line drew the next prompt and
-            // its right prompt on the row the line had wrapped onto, over its
-            // text, and the erase that hid the right prompt when the typed line
-            // reached it took that text with it, the very frame before a
-            // correct `o` ghost settling otherwise. zsh clears the row it draws
-            // a prompt on (PROMPT_SP), as the world does now; no rule of the
-            // predictor is involved (seed index 1202, case 363).
+            // Prompt drawn after `^C` clears residual wrapped text on its row.
             name: "a_prompt_drawn_over_a_wrapped_line_clears_its_row",
             cfg: Config {
                 remote: false,
@@ -3092,16 +2123,7 @@ fn review_4_cases() -> Vec<NamedCase> {
             mutants: vec![],
         },
         NamedCase {
-            // readline in overwrite mode under `zsh -f`'s keymap (Delete reads
-            // as a `~`, inserted): the buffer edited until the cursor stands on
-            // its own `d` in the last column, moved there by `→`. `i` typed
-            // there: the last reconcile read a filled last column under the
-            // cursor, the terminal's deferred-wrap park by position, and put
-            // `i` on the next row, while the terminal had wrapped nothing and
-            // overwrite mode wrote `i` over that `d`; each guess after it was a
-            // cell right of its echo. The engine's own flag says the cursor is
-            // not parked (the review of increment 4's sweep, seed index 1841,
-            // case 453, reachable once the world's keymaps came in).
+            // Cursor moved onto the last column in overwrite mode is not treated as pending wrap.
             name: "a_cursor_on_text_in_the_last_column_is_not_parked",
             cfg: Config {
                 remote: false,
@@ -3167,15 +2189,7 @@ fn review_4_cases() -> Vec<NamedCase> {
             mutants: vec![Host::Rule(Rule::EngineWrapFlag)],
         },
         NamedCase {
-            // A suggestion, `ab`, drawn (dim, italic) at an empty line, in
-            // pieces: its `a` with the cursor past it, then the rest and the
-            // step back. `a` typed meanwhile is credited with the suggestion's
-            // `a` (a credit inside output nobody typed for, out of
-            // ATTRIBUTION's scope), and once the cursor stepped back onto it the
-            // `a` typed next, anchored there, was credited with the first `a`'s
-            // real echo. An echo never steps back over itself: the cursor found
-            // on the credited cell takes the credit back, owing that key's echo
-            // (the review of increment 4's sweep, seed index 784, case 367).
+            // Credit is revoked if the cursor steps back onto the credited guess's cell.
             name: "a_suggestion_drawn_part_way_is_no_echo",
             cfg: Config {
                 remote: false,
@@ -3197,13 +2211,7 @@ fn review_4_cases() -> Vec<NamedCase> {
             mutants: vec![Host::Rule(Rule::CreditTakenBack)],
         },
         NamedCase {
-            // zle with an autosuggestion plugin: `n`, `o`, `a` typed ahead;
-            // `n` and `o` echoed, and the suggestion `ab` the `o` brought up
-            // drawn after them in pieces, its `a` (the typed one) with the
-            // cursor past it, crediting the pending `a`; then the step back
-            // onto it. The `a` typed next, anchored there, was credited with
-            // the first `a`'s real echo (the review of increment 4's sweep,
-            // seed index 2115, case 383).
+            // Part-way autosuggestion fetch that steps back revokes the credit it triggered.
             name: "a_suggestion_fetched_part_way_is_no_echo",
             cfg: Config {
                 remote: false,
@@ -3228,14 +2236,7 @@ fn review_4_cases() -> Vec<NamedCase> {
             mutants: vec![Host::Rule(Rule::CreditTakenBack)],
         },
         NamedCase {
-            // `so` typed, echoed and proving, `o` rubbed out (its erase echoed);
-            // `a` typed and echoed, then ` Password: ` printed after it on the
-            // same row (only its last space wraps, a blank under the line) and
-            // the cursor moved back onto `a`, in one burst. `a` shows its glyph
-            // with the cursor on it, as a guess typed onto a suggestion does, and
-            // waits; the digit typed at the password read was shown after it.
-            // Nothing typed after a guess held so shows until it retires. (The
-            // blank wrapped under the line is no text: the floor holds.)
+            // Guesses behind a head waiting on its own glyph with the cursor on it stay dark.
             name: "nothing_shows_behind_a_guess_the_cursor_was_brought_back_onto",
             cfg: Config {
                 integration: true,
@@ -3247,7 +2248,6 @@ fn review_4_cases() -> Vec<NamedCase> {
                 .chain([
                     Op::Program(1, 0),
                     Op::Unprompted(Unprompted::PasswordSameRow, 0),
-                    // The cursor to the first row's second column: `a`'s cell.
                     Op::Unprompted(Unprompted::Jump, 7),
                     Op::Advance(60),
                     Op::Deliver(1024),
@@ -3258,17 +2258,7 @@ fn review_4_cases() -> Vec<NamedCase> {
             mutants: vec![Host::Rule(Rule::DarkBehindAWait)],
         },
         NamedCase {
-            // `s`, `a`, `d` typed; `s` echoed and proving; then `a` and `d`
-            // echoed, ` Password: ` printed after them on the same row, which
-            // wraps its `: ` onto the next, and a reverse index back up, in one
-            // burst: the cursor stands on `d`, which shows its glyph, so `d` waits
-            // there as a guess typed onto a suggestion does, and `7`, typed at
-            // the password read, was shown after it. The row under the line,
-            // blank at the run's press, shows the wrapped `:`, which voids the
-            // proof, and `d` held with the cursor brought back onto it holds `7`
-            // dark: each rule closes it alone, so neither switched off breaks it,
-            // and each has its own case as its control (seed index 1909, case
-            // 109).
+            // Password prompt wrapping onto the row below voids the proof and holds guesses dark.
             name: "a_prompt_wrapped_under_the_line_voids_its_proof",
             cfg: Config {
                 forced_wrap: true,
@@ -3292,13 +2282,7 @@ fn review_4_cases() -> Vec<NamedCase> {
             mutants: vec![],
         },
         NamedCase {
-            // A cooked tty: ` sie` echoed and proving, then `\r\nPassword: `
-            // printed on the next row and a reverse index back up, in the same
-            // burst, onto the cell after `e`, where the proof stands. Every
-            // cell of the line holds its glyph and the cursor is where the
-            // proof says; `6`, typed at the password read, was shown there.
-            // The row under the line, blank at the run's press, now shows
-            // text: the proof is void (seed index 1206, case 434).
+            // Text appearing on the previously blank row below a proven line voids its proof.
             name: "text_drawn_under_the_line_voids_its_proof",
             cfg: Config {
                 editor: Editor::Cooked,
@@ -3341,27 +2325,11 @@ fn review_4_cases() -> Vec<NamedCase> {
     ]
 }
 
-/// The breaks the review of increment 5 found sweeping past seed index 2400
-/// (seed index `i` is the committed seed xor `i` times the golden-ratio
-/// constant), each on main before the increment and none of its making, each
-/// a named case with the rule that closes it switched off as its control.
+/// Directed cases for transit blanks, Delete step-backs, and stale cancelled anchors.
 fn review_5_cases() -> Vec<NamedCase> {
     vec![
         NamedCase {
-            // A wide prompt (`$$$ `), `oos` typed and echoed on it, and Home,
-            // End, `←` and Delete leaving `oo` with the cursor at its end, the
-            // motion class proven; then `←` pressed and not yet read. An async
-            // prompt segment resolves and zsh's `reset-prompt` redraws the
-            // prompt narrower, `\r$ oo\e[K`, with no new `B`. The line's text
-            // now stands left of `lo`, its old cells read blank, and the redraw
-            // leaves the cursor on `lo`: no state matches, and the transit wait
-            // took every blank for an echo part-way, kept the chain and painted
-            // `oo` over the blanks, `$ oooo` on glass while the screen settled
-            // to `$ oo`. No echo of `←` writes a blank, and
-            // no echo of the chain's keys writes left of where its first insert
-            // or erase writes: the blanks are unexplained, and the chain is
-            // flushed (the review of increment 5's sweep, seed index 2482,
-            // case 215).
+            // Unexplained blanks left by a narrower prompt redraw flush the chain instead of waiting.
             name: "a_narrower_redraw_is_no_echo_in_transit",
             cfg: Config {
                 forced_wrap: true,
@@ -3406,16 +2374,7 @@ fn review_5_cases() -> Vec<NamedCase> {
             mutants: vec![Host::Rule(Rule::TransitBlanks)],
         },
         NamedCase {
-            // On a witnessed line `ed` with the cursor on `lo`, Delete and End
-            // pressed and read together; Delete's echo, `d`, ` `, `\b\b`,
-            // split after its first `\b`: the cursor one cell right of `lo`,
-            // which is End's state (`d`, the cursor at its end). Delete and End
-            // were retired there, End credited with no output of its own; then
-            // Home pressed, and the rest of Delete's step back put the cursor
-            // on `lo`, Home's state, and Home was credited too, each credit a
-            // sample of nothing and an echo of a binding that never came. A
-            // cursor anywhere on a Delete's step back is that echo part-way
-            // (the review of increment 5's sweep, seed index 2748, case 172).
+            // Cursor caught mid step-back during a Delete echo does not credit later chain ops.
             name: "a_delete_s_step_back_is_no_later_state",
             cfg: Config {
                 forced_wrap: true,
@@ -3468,17 +2427,7 @@ fn review_5_cases() -> Vec<NamedCase> {
             mutants: vec![Host::Rule(Rule::PartWayStepBack)],
         },
         NamedCase {
-            // Over ssh (no integration): `d` typed and echoed; `←` and Delete
-            // pressed (Delete not modelled there: owed, the epoch ended) and
-            // `o` guessed on the live cursor, a stale anchor. The far end's
-            // `\b`, ` `, `\b`, `o` put `o` a cell left of its guess, which
-            // stayed pending; a Backspace cancelled it, and `a`, `a`, `c` were
-            // typed on its cell as a fresh run. The Backspace's echo returned
-            // the cursor a cell left of that cell, and the second `a`'s echo
-            // credited the first guess, so `a` and `c` were shown a cell right
-            // of where they echoed. A cancelled stale guess's cell is a stale
-            // anchor (the review of increment 5's sweep, seed index 3942, case
-            // 141).
+            // Cancelling a stale-anchored guess leaves a stale anchor for the next run.
             name: "a_cancelled_stale_guess_anchors_a_stale_run",
             cfg: Config {
                 forced_wrap: true,
@@ -3515,26 +2464,10 @@ fn review_5_cases() -> Vec<NamedCase> {
     ]
 }
 
-/// The breaks the sweep over many seeds found (`seed_index`, the family the
-/// committed sweep and the review's draw from), each a named case with the
-/// rule that closes it switched off as its control.
+/// Directed cases for mid-line echoes hiding a shifted tail.
 fn sweep_cases() -> Vec<NamedCase> {
     vec![NamedCase {
-        // `i` typed and echoed; Home (owed: no integration) and its echo, the
-        // far end's cursor back on `i`; `i` typed on it. Readline inserts it
-        // before that `i`, writing the glyph, then the tail it shifts, then the
-        // step back (`i`, `i\b`), and the read split after the glyph: the
-        // frame shows `i` with the cursor past it and the row right of it
-        // blank, as the press saw it, so the echo retired as an append,
-        // uncredited while Home's echo was owed, with no proof to watch the
-        // row. `a`, typed on the cursor it left, read a blank row and took
-        // itself to be at the end of the line; the redraw and `a`'s echo
-        // (`ai\b`) landed in one read, `iai`, and `a` proved beside the `i`
-        // the redraw put right of it. `d` typed next was shown over that `i`:
-        // `iad` on glass, `iadi` settled. The `i` was drawn over the glyph it
-        // shifted (a HIDDEN TAIL), so for its window a blank row is no line
-        // end (seed index 97, case 27, shrunk; a break on main since the
-        // review of phase 0, 0376b47967).
+        // Echo drawn over the identical glyph it shifts marks the tail as in flight.
         name: "an_echo_drawn_over_the_glyph_it_shifts_hides_its_tail",
         cfg: Config {
             editor: Editor::Readline,

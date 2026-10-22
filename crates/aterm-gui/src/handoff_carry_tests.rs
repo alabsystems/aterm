@@ -1504,7 +1504,7 @@ fn a_spliced_log_member_reads_as_the_sidecar_and_its_lines() {
 /// FIXER F6: a MIRRORED log's cursor and head ride its sidecar whether or
 /// not its log does, so a successor whose `Log::from_carry` refuses the
 /// carried log still owes the old space's tail as one exact `why=reset`
-/// cover (ruling Q7) — not only one whose log did not cross.
+/// cover — not only one whose log did not cross.
 #[test]
 fn a_mirrored_logs_cursor_crosses_beside_its_log_and_a_refused_carry_still_owes_its_tail() {
     let (term, turns) = session(30);
@@ -1547,7 +1547,7 @@ fn a_mirrored_logs_cursor_crosses_beside_its_log_and_a_refused_carry_still_owes_
 }
 
 /// THE BUS MIRROR'S OLD-SPACE CURSOR rides a sidecar whose log did not
-/// cross (session log phase 4, ruling Q7), spliced in as the log member is:
+/// cross, spliced in as the log member is:
 /// it reads back as the sidecar without it plus the cursor exactly. An
 /// unmirrored session's sidecar holds no byte of it.
 #[test]

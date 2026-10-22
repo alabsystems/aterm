@@ -2,9 +2,9 @@
 // Copyright 2026 Andrew Yates
 
 //! `lab reduce`: A KEY-ONLY REDUCTION of a Claude Code transcript or a Codex
-//! rollout (session log Phase 5, step 5H-1: the plan's P11 as ruling T7
-//! amends it). It is the shape a lab-read build's rows are committed in
-//! (`aterm-agent`'s `harness/testdata/steps/<build>.jsonl`, ruling T8; a
+//! rollout.
+//! It is the shape a lab-read build's rows are committed in
+//! (`aterm-agent`'s `harness/testdata/steps/<build>.jsonl`; a
 //! Codex rollout's `codex-<build>[-<leg>].jsonl`, session log 5G), and it
 //! holds nothing anyone said.
 //!
@@ -22,7 +22,7 @@
 //!   row), and so do a question's words keying its answer and an MCP
 //!   result's own keys. A key that is an id is REMAPPED as that id (below);
 //! - row order, `null`, the booleans, and the numbers as written;
-//! - THE CLOSED WORDS A READER READS (ruling U7). A candidate is a word
+//! - THE CLOSED WORDS A READER READS. A candidate is a word
 //!   ([`is_word`]: no space, at most [`WORD_MAX`] bytes) under a key of
 //!   [`CLAUDE_WORDS`] or [`CODEX_WORDS`] (`type`, `subtype`, `version`,
 //!   `model`, `effort`, a notice's `error` and `apiError`, …), outside a free
@@ -97,7 +97,7 @@
 //! fixtures do; a `#` line of the source (a fixture's header) is dropped.
 //! A source that is itself a reduction (its `#` line is one [`header`]
 //! wrote) is said so in the new line, whose day count is then the whole
-//! move from the first source (ruling U8), so a reduction reduced again is
+//! move from the first source, so a reduction reduced again is
 //! itself. A line that is not one JSON value refuses the whole file.
 //!
 //! Its proof is its tests (`reduce_tests.rs`): over every `supervise/fixtures`
@@ -190,7 +190,7 @@ pub const WORD_MAX: usize = 64;
 /// `type`, the build, the model and effort, a notice's typed fields
 /// (`error`, `apiError`, its quota's words), who asked (`origin.kind`,
 /// `turnOrigin`), a system row's `level`, and the usage figures' words. A
-/// CANDIDATE FILTER only (ruling U7): a word under one is kept when a
+/// CANDIDATE FILTER only: a word under one is kept when a
 /// reading reads it ([`Candidates::by_readings`]), and goes otherwise.
 pub const CLAUDE_WORDS: &[&str] = &[
     "type",
@@ -222,9 +222,9 @@ pub const CLAUDE_WORDS: &[&str] = &[
 ];
 
 /// The keys a Codex rollout's word MAY be kept under, a candidate filter as
-/// [`CLAUDE_WORDS`] is (ruling U7). The five before the last are as the
-/// lab's Codex 0.163.0 rollouts read them (session log 5G, 2026-10-19;
-/// ruling T9 names Codex's keys from a committed reduction, never a guess):
+/// [`CLAUDE_WORDS`] is. The five before the last are as the
+/// lab's Codex 0.163.0 rollouts read them (
+/// Codex's keys from a committed reduction, never a guess):
 /// a call's `namespace` (`functions`, `collaboration`: the step fold's class
 /// table reads it beside the `name`), a `turn_aborted`'s `reason`
 /// (`interrupted`), who began a thread or a turn (`thread_source`: `user`,
@@ -978,7 +978,7 @@ pub enum Treat {
     )]
     Keep,
     /// A CANDIDATE closed word: as written while it is a word ([`is_word`])
-    /// and a reader reads it ([`Rules::words`], ruling U7), else replaced.
+    /// and a reader reads it ([`Rules::words`]), else replaced.
     Word,
     /// Remapped, one to one.
     Id,
@@ -1002,7 +1002,7 @@ pub trait Rules {
 
     /// Which of the file's candidate closed words its reduction keeps: one
     /// flag per pair of [`Candidates::pairs`]. The readers decide
-    /// ([`Candidates::by_readings`], ruling U7).
+    /// ([`Candidates::by_readings`]).
     ///
     /// # Errors
     /// The file is refused: with every candidate kept, its reduction still
@@ -1012,7 +1012,7 @@ pub trait Rules {
     }
 }
 
-/// THE REDUCTION RULE (P11 as ruling T7 amends it; module docs).
+/// THE REDUCTION RULE (module docs).
 pub struct P11;
 
 impl Rules for P11 {
@@ -1036,7 +1036,7 @@ impl Rules for P11 {
                 // content, or any content part's `text`, whatever the part's
                 // `type` says (`wall_confirm`'s `texts`, the step fold's
                 // lead), so a part whose `type` no reader reads, emptied, is
-                // still read and reduced as one (ruling U8: a reduction
+                // still read and reduced as one (a reduction
                 // reduced again is itself).
                 let message_text = at.path.first().map(String::as_str) == Some("message")
                     && at.path.get(1).map(String::as_str) == Some("content")
@@ -1097,12 +1097,12 @@ pub struct Reduction {
     /// Days every time has moved from the first source, through the
     /// reductions the source was itself made by ([`header`]'s count).
     pub moved_days: i64,
-    /// The source was itself a reduction (ruling U8).
+    /// The source was itself a reduction.
     pub again: bool,
     /// The newest build a row named (`version`, Codex's `cli_version`).
     pub build: Option<String>,
     /// Distinct `(key, word)` candidate pairs ([`Candidates::pairs`]), and
-    /// how many of them the reduction keeps (ruling U7).
+    /// how many of them the reduction keeps.
     pub words: (usize, usize),
 }
 
@@ -1262,7 +1262,7 @@ fn walked(source: &str, program: Program, rules: &dyn Rules) -> Result<Walked, S
 /// A reduction's own `#` line: the program, the build its rows named (a
 /// closed word), how many days its times have moved from the first source,
 /// the row count, and, for a source that was itself a reduction (`again`),
-/// that it was reduced again (ruling U8), in fixed words.
+/// that it was reduced again, in fixed words.
 #[must_use]
 pub fn header(
     program: Program,
@@ -1459,7 +1459,7 @@ struct Walk<'r> {
     /// root down to where the walk is ([`Site::trail`]).
     row: usize,
     trail: Vec<usize>,
-    /// THE CANDIDATES (ruling U7): each `(key, word)` pair the rule keeps a
+    /// THE CANDIDATES: each `(key, word)` pair the rule keeps a
     /// word of ([`Treat::Word`] while it is a word), in the order the file
     /// first names it, and every place one sits.
     pairs: Vec<(String, String)>,
@@ -1787,7 +1787,7 @@ impl Walk<'_> {
     /// already such a name ([`is_key_name`]: a reduction's own) is that name
     /// wherever it sits, and a new name is never one the file holds
     /// ([`Walk::taken`]), so a reduction reduced again names its keys as it
-    /// did (ruling U8).
+    /// did.
     fn key(&mut self, k: &str, free: bool) -> String {
         if (!free && is_ident(k)) || is_key_name(k) {
             return k.to_string();
@@ -1807,7 +1807,7 @@ impl Walk<'_> {
     }
 }
 
-// The readings (ruling U7)
+// The readings
 
 /// The fingerprint and identity a reading binds its fold to: any, the same
 /// for every file read.
@@ -1892,7 +1892,7 @@ impl Standing {
     }
 }
 
-/// WHAT THE COMMITTED READERS READ OF A FILE (ruling U7), row by row, which
+/// WHAT THE COMMITTED READERS READ OF A FILE, row by row, which
 /// decides the closed words a reduction keeps ([`Candidates::by_readings`]).
 /// Claude Code's: the step fold's steps (bound at the file's start, floor
 /// 0, every row pushed, then taken twice: a held prompt's release), its
@@ -2205,7 +2205,7 @@ fn same_limits(a: &[CodexLimits], b: &[CodexLimits], shift_s: i64) -> bool {
 }
 
 /// Whether `b`, a reduction's [`Readings`], READS AS `a`, its source's
-/// (ruling T7's fold check, which the reducer and its tests share): the same
+/// (fold check, which the reducer and its tests share): the same
 /// steps at the same rows in the same states, the same closed words and
 /// numbers, ids one to one, times `shift_days` apart (a bind's excepted);
 /// the same losses; the same end after every row and at the last (its wall
@@ -2376,7 +2376,7 @@ fn blank_at(v: &mut Node, trail: &[usize]) {
     }
 }
 
-/// A file's CANDIDATE CLOSED WORDS (ruling U7): its reduction with every one
+/// A file's CANDIDATE CLOSED WORDS: its reduction with every one
 /// kept, each `(key, word)` pair the rule keeps a word of, in the order the
 /// file first names it, and every place one sits; what [`Rules::words`]
 /// chooses from.
@@ -2478,7 +2478,7 @@ impl<'a> Candidates<'a> {
         readings_of(&rows, self.program)
     }
 
-    /// THE READERS DECIDE (ruling U7). With every candidate kept the
+    /// THE READERS DECIDE. With every candidate kept the
     /// reduction must read as its source ([`reads_as`]), else the file is
     /// refused: nothing restores it. Then the pairs are chosen by the
     /// reduction's [`Readings`] ([`choose`]): each is kept only when
@@ -2500,7 +2500,7 @@ impl<'a> Candidates<'a> {
     }
 }
 
-/// THE CHOICE OF `n` CANDIDATE PAIRS BY A READING (ruling U7): `read` of the
+/// THE CHOICE OF `n` CANDIDATE PAIRS BY A READING: `read` of the
 /// flags kept, which with every flag set is the reading to keep. Each pair
 /// is kept only when blanking it alone changes that reading. Blanked
 /// together, the rest may change it (two rows a reader reads either of):
@@ -2543,7 +2543,7 @@ fn choose<R: PartialEq>(n: usize, read: impl Fn(&[bool]) -> R) -> Vec<bool> {
     }
 }
 
-/// THE OUTPUT-SIDE CHECK (ruling U7): the closed words the reduction `text`
+/// THE OUTPUT-SIDE CHECK: the closed words the reduction `text`
 /// keeps that no reading reads — each candidate pair ([`Candidates::pairs`])
 /// whose words, blanked alone, leave its [`readings`] as they were. A
 /// reduction `lab reduce` writes keeps none.
@@ -2572,8 +2572,8 @@ pub fn unread_words(text: &str, program: Program) -> Result<Vec<(String, String)
 }
 
 /// THE VERB'S CHECK OF WHAT IT WRITES: the reduction `r` of `source` reads
-/// as its source ([`reads_as`], ruling T7) and keeps no closed word no
-/// reader reads ([`unread_words`], ruling U7). `lab reduce` writes nothing
+/// as its source ([`reads_as`]) and keeps no closed word no
+/// reader reads ([`unread_words`]). `lab reduce` writes nothing
 /// that fails it.
 ///
 /// # Errors

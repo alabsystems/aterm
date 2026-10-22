@@ -37,7 +37,7 @@
 //! test to read). A LAB DESK ([`crate::crash_signal::Arming::Lab`]: a headless instance
 //! under the lab's desk seam, under a private state root) writes in its own log
 //! directory, which is that root's, and tells its node log, so `prev_end=` is real end
-//! to end (session log Phase 6, step 6C-4, ruling U9); its markers are
+//! to end; its markers are
 //! [`crate::crash_signal::MarkerOwner::Lab`]'s, news to its own root's scan alone
 //! ([`cold_census`]).
 //!
@@ -184,7 +184,7 @@ pub(crate) enum ColdCensus {
 
 /// THE CENSUS GATE of a cold start armed as `arming`: [`ColdCensus::Own`] for the
 /// installed app ([`Arming::App`](crate::crash_signal::Arming::App)) and a lab desk
-/// ([`Arming::Lab`](crate::crash_signal::Arming::Lab), session log 6C-4); else the
+/// ([`Arming::Lab`](crate::crash_signal::Arming::Lab)); else the
 /// development seam's folder when `seam` names one; else [`ColdCensus::Off`].
 pub(crate) fn cold_census(
     arming: crate::crash_signal::Arming,
@@ -236,7 +236,7 @@ fn record_cold_into(
 
 /// [`record`], reading the ledger in the directory `dir` names (on the
 /// census thread) and telling `node`, when given, how the previous run ended:
-/// the node log's `start prev_end=` (session log 5J-2), amended as soon as the
+/// the node log's `start prev_end=`, amended as soon as the
 /// class is known, whether or not the row then appends.
 fn record_into(
     node: Option<&'static crate::session_log_node::NodeLogHost>,
@@ -780,7 +780,7 @@ mod tests {
         )
     }
 
-    /// THE CENSUS PRODUCER of the node log (session log 5J-2, ruling T27):
+    /// THE CENSUS PRODUCER of the node log:
     /// the census thread tells the node log how the run before this launch
     /// ended, read under the one-minute hang detector. A first launch (an
     /// empty ledger) ended `none`; the row is appended after.
@@ -865,7 +865,7 @@ mod tests {
         (kept, row)
     }
 
-    /// THE LAB DESK'S CENSUS (session log Phase 6, step 6C-4, ruling U9), in process
+    /// THE LAB DESK'S CENSUS, in process
     /// over an injected marker directory: a dead `lab` marker under a lab desk's sweep
     /// is left for the census, and the run reads `killed`; the same marker under the
     /// installed app's sweep, or a plain start's, is not news and goes, as a dead

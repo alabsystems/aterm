@@ -129,7 +129,7 @@ pub const EYE_REFLECTION_ECHO_MAX_RADIUS_PX: f32 = 0.52;
 /// `xform` with an extra `(kx, ky)` zoom about the normalized point `(cx, cy)`, which keeps its
 /// device pixel: a feature grows in place instead of sliding across the face.
 #[inline]
-fn zoom_about(xform: PathTransform, cx: f32, cy: f32, kx: f32, ky: f32) -> PathTransform {
+const fn zoom_about(xform: PathTransform, cx: f32, cy: f32, kx: f32, ky: f32) -> PathTransform {
     PathTransform {
         scale_x: xform.scale_x * kx,
         scale_y: xform.scale_y * ky,
@@ -620,20 +620,20 @@ impl<K: ExactTileKey> ExactTileBaker<K> {
 
     /// Resident tile count (`≤ MAX_SLOTS`).
     #[cfg(test)]
-    pub fn len(&self) -> usize {
+    pub const fn len(&self) -> usize {
         self.slots.len()
     }
 
     /// Whether the cache holds no tiles.
     #[cfg(test)]
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.slots.is_empty()
     }
 
     /// Resident texel bytes (`≤ MAX_ATLAS_BYTES`).
     #[doc(hidden)]
     #[cfg(test)]
-    pub fn resident_bytes(&self) -> usize {
+    pub const fn resident_bytes(&self) -> usize {
         self.bytes
     }
 

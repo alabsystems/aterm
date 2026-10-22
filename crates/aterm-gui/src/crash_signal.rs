@@ -71,7 +71,7 @@ pub(crate) enum MarkerOwner {
     /// bundle, a DMG or translocated launch, a `--headless` start, and a handoff
     /// candidate its parent may still reject (and reap with SIGKILL).
     Other,
-    /// A LAB DESK's (session log Phase 6, step 6C-4, ruling U9): a headless
+    /// A LAB DESK's: a headless
     /// instance under the lab's desk seam in a development build, under a
     /// private state root ([`crate::desk::Desk::LabHeadless`]), whose log
     /// directory is that root's. Its dead, empty marker is news to the next
@@ -1238,8 +1238,8 @@ mod marker_tests {
         let_go(fd);
     }
 
-    /// A LAB DESK'S MARKER IS NEWS TO A LAB DESK'S SWEEP ALONE (session log
-    /// Phase 6, step 6C-4, ruling U9): under a lab desk's sweep a dead `lab`
+    /// A LAB DESK'S MARKER IS NEWS TO A LAB DESK'S SWEEP ALONE:
+    /// under a lab desk's sweep a dead `lab`
     /// marker of another process is left for that desk's census (and its own
     /// kill scan finds it), while a dead `other` one beside it goes and this
     /// process's own previous image's `lab` one goes too; under the installed

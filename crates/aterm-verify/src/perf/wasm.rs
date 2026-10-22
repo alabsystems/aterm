@@ -129,7 +129,7 @@ pub(crate) fn build_tools(wasm_opt: bool) -> Result<PathBuf, LaneRun> {
             "rustup target add wasm32-unknown-unknown --toolchain stable",
         ));
     }
-    if wasm_opt && !answers(Path::new("wasm-opt"), &["--version"]) {
+    if wasm_opt && !answers(&wasm_opt_program(), &["--version"]) {
         return Err(LaneRun::skip(
             "wasm-opt not found; the lane applies the shipping -O3 pass and never measures \
              pre-opt modules",
@@ -388,7 +388,7 @@ pub(crate) fn bind_modules(built: &Path, out: &Path, optimise: bool) -> Result<(
             out.join("gpu/aterm_gpu_web_bg.wasm"),
         ] {
             run_step(
-                command("wasm-opt")
+                command(wasm_opt_program())
                     .args(WASM_OPT_FLAGS)
                     .arg("-o")
                     .arg(&bound)
@@ -398,6 +398,13 @@ pub(crate) fn bind_modules(built: &Path, out: &Path, optimise: bool) -> Result<(
         }
     }
     Ok(())
+}
+
+/// The wasm-opt the lane runs: the resolver's (`ATERM_TEST_WASM_OPT`, the pinned
+/// binaryen `verify provision` places, then PATH), else the bare name, whose failure to
+/// start names it.
+fn wasm_opt_program() -> PathBuf {
+    aterm_uds::host::find_tool("wasm-opt").unwrap_or_else(|| "wasm-opt".into())
 }
 
 /// Build, bind, optimise and bench; the bench's JSON report.

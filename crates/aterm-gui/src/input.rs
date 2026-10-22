@@ -678,7 +678,7 @@ pub(crate) enum WheelNotch {
     Page,
 }
 
-/// THE PLATFORM'S WHEEL RULE (session log phase 6, 6A-4): how many lines one
+/// THE PLATFORM'S WHEEL RULE: how many lines one
 /// wheel detent scrolls a surface that scrolls without an app's help
 /// ([`wheel_platform_lines`]: the local viewport and alternate scroll's
 /// arrows). INJECTED, as AGENTS.md has platform probes: the seam's core and

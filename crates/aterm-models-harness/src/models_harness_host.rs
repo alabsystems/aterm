@@ -274,7 +274,7 @@ pub fn harness_restored_carry_model() -> Model {
 /// Actions:
 ///
 /// `Buggy=1` is what shipped, each mutant caught alone: `DecideByPark`
-/// (round ten read a Commit's stop as `Switches::parked`, which the
+/// (an earlier version read a Commit's stop as `Switches::parked`, which the
 /// rollback lifts — a worker deciding after it settled), `StopEndsUnread`
 /// (round eleven read the exit from `left`, which the Commit's stop clears
 /// — a crash handed before the stop was never read), `EndUnhandedForgotten`
@@ -290,7 +290,7 @@ pub fn harness_restored_carry_model() -> Model {
 /// or its relaunch landed — and ended, settled, with nothing holding the
 /// exit — `NoOwedRelaunchLost`; the model missed it while `Back` settled the
 /// worker at once and no crash came while a worker still held the agent),
-/// `SettleGone` (until round two of that audit a relaunch that landed ended
+/// `SettleGone` (previously of that audit a relaunch that landed ended
 /// its worker whatever became of the agent it started: one the host read
 /// back, or one a Commit's stop came for, gone before the worker read it,
 /// left its exit to a worker the host handed it, which could not decide it —
@@ -2441,8 +2441,8 @@ pub fn harness_agy_exit_witness_model() -> Model {
 /// block hid by the attempt resumed as its own restart wherever its `42`
 /// would have been one — every worker's `--session-id` launch — quietly,
 /// and with no turn too (`GoneWordReadAsRestart`: `Crash`, `ShellWord`,
-/// `Look`, `Later`, `GoneWordReadAsRestart` — `ACrashRelaunchedIsContinued`;
-/// the review of 3a4586a01e, R2); and A RESTART CONTINUED, its relaunch
+/// `Look`, `Later`, `GoneWordReadAsRestart` — `ACrashRelaunchedIsContinued`);
+/// and A RESTART CONTINUED, its relaunch
 /// typing a crash's continuation into the session a person restarted
 /// (`RestartContinued`: `Restart`, `ShellWord`, `Look`, `RestartContinued` —
 /// `ARestartTypesNothingAfter`). Tier-1 (aterm-agent
@@ -2863,7 +2863,7 @@ pub fn harness_upgrade_age_model() -> Model {
 ///   another supervisor's claim asked again there (rulings 15 and 17) — and
 ///   with no other hand on the session: an end the act's stamp names, read
 ///   while a hold, a lease or a named turn holds it, is CARRIED through that
-///   hand and relaunched once it lifts (ruling 20 of 2026-10-14,
+///   hand and relaunched once it lifts (
 ///   `relaunch::WAIT_HAND_LIFTS`), which is this `Read` after `HandOff`; its
 ///   `into_claim` is the claim standing at it, none. `ReadByClaim` — an end
 ///   read while another supervisor claims the session is that supervisor's

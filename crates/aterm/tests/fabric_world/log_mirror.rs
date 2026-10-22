@@ -1,19 +1,19 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE BUS MIRROR END TO END (`docs/DESIGN-session-log-2026-10-15.md` §5.5,
-//! session log phase 4): a real headless aterm, its real bridge and a guarded
+//! THE BUS MIRROR END TO END (`docs/DESIGN-session-log-2026-10-15.md` §5.5):
+//! a real headless aterm, its real bridge and a guarded
 //! broker. With `--log off` it writes nothing anywhere; by default (`auto`,
-//! over the world's broker, which retains by aterm's default rules, session
-//! log Phase 6 step 6E-3) it mirrors as `--log turns` does, and over a broker
+//! over the world's broker, which retains by aterm's default rules)
+//! it mirrors as `--log turns` does, and over a broker
 //! that retains nothing it mirrors nothing and says `mirror=unretained`. With
 //! the mirror on every session's bus-class records reach its `ev` face, each `(ep, seq)`
-//! once in the reader's view (ruling Q0), `ms` dense, with one exact cover
-//! per hole an eviction made (ruling Q2), no host or content text crossing,
+//! once in the reader's view, `ms` dense, with one exact cover
+//! per hole an eviction made, no host or content text crossing,
 //! and `aterm fabric brief` folding what the bus holds. Every wait is a
 //! one-minute hang detector.
 //!
-//! Ruling Q12's crashes — a bridge killed at each step of a batch, a broker
+//! crashes — a bridge killed at each step of a batch, a broker
 //! restart (or a power loss that moves the log) with a pin outstanding — are
 //! `aterm-link`'s deterministic simulation's (`sim`): it kills the real bridge
 //! at every I/O step of every seed with the mirror on and holds the reader's
@@ -55,7 +55,7 @@ fn bodies(w: &World, face: &str) -> Vec<String> {
 
 /// A session's mirror as a reader holds it: the view of each seq space, and
 /// how many bodies the bus holds of each `(ep, seq)` (a raw duplicate count:
-/// a rate, never a law, ruling Q0).
+/// a rate, never a law).
 struct Mirrored {
     spaces: BTreeMap<u32, BusSpace>,
     raw: BTreeMap<(u32, u64), usize>,
@@ -141,8 +141,8 @@ fn mirrors_nothing(w: &World) {
     }
 }
 
-/// RULING Q5 END TO END: a bridge with `--log off` (`[fabric] log = "off"`,
-/// the opt-out since session log Phase 6 step 6E-3) mirrors nothing: no
+/// a bridge with `--log off` (`[fabric] log = "off"`,
+/// the opt-out) mirrors nothing: no
 /// `v=2` body on any face, no `logpin` and none of its durable copies, and
 /// `fabric status` says nothing of a mirror. NEGATIVE CONTROL, run: `off`
 /// read as `auto` fails it.
@@ -155,8 +155,8 @@ fn log_off_mirrors_nothing_and_writes_nothing() {
     assert!(!fs.header().contains("bridge_log="), "{}", fs.header());
 }
 
-/// THE DEFAULT MIRRORS TURNS (owner decision D4, session log Phase 6 step
-/// 6E-3): with no `--log` and no `[fabric] log`, over the world's broker,
+/// THE DEFAULT MIRRORS TURNS (owner decision D4):
+/// with no `--log` and no `[fabric] log`, over the world's broker,
 /// which retains by aterm's default rules and advertises them in its
 /// `Hello`, every live turn-class record of a session reaches its `ev` face,
 /// once, `ms` dense, and `fabric status` says the mirror is on. NEGATIVE
@@ -184,7 +184,7 @@ fn the_default_mirrors_turns() {
     );
 }
 
-/// THE DEFAULT FOLLOWS THE BROKER (session log Phase 6 step 6E-3): over
+/// THE DEFAULT FOLLOWS THE BROKER: over
 /// `World::without_retention`'s broker, which retains nothing and advertises
 /// no rule, the default bridge mirrors nothing — no `v=2` body, no `logpin`,
 /// `logkey` or `logfloor` — and `fabric status` says `bridge_log=auto
@@ -235,7 +235,7 @@ fn turns_land_once_with_ms_dense() {
         "{}",
         fs.header()
     );
-    // RULINGS Q6 AND Q13 ON THE MEDIA: the pin's key and total have their
+    // the pin's key and total have their
     // durable copies, written by the real bridge on the real filesystem — the
     // key in `logkey` (owner-only, one line), and a floor at or above the
     // total in `logfloor` — so a power cut that tears the pin stops nothing.
@@ -279,7 +279,7 @@ fn turns_land_once_with_ms_dense() {
         let (fold, _) = space.fold();
         fold.state().closed.is_some().then_some(())
     });
-    // RULING Q8: once its close has landed its `ev` face is retired — out of
+    // once its close has landed its `ev` face is retired — out of
     // the last-value index, its subject back in the node's budget — and its
     // records stay in the log, fetchable.
     let face = format!("/f/{FLEET}/pub/{}/{b}/ev", w.node);
@@ -290,7 +290,7 @@ fn turns_land_once_with_ms_dense() {
     assert!(mirrored(&w, &b).v2 > 0, "the records stay");
 }
 
-/// RULING Q2: with the broker away, a small ring evicts the claims the mark
+/// with the broker away, a small ring evicts the claims the mark
 /// quota retires; once it is back, the bridge backfills each hole with ONE
 /// exact cover — the covers disjoint, never two of one hole, and every `ms`
 /// a record's or a cover's.

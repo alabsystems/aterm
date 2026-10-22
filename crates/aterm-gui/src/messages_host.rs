@@ -923,8 +923,8 @@ impl App {
     /// wait on the writer is bounded (law L5): the person sits through it, at
     /// a frozen Commit or exec as at a Dismiss click. The parent of a seamless
     /// handoff calls it right before it execs the successor, and the seamless
-    /// parent before Commit `_exit`s it (round-seven update audit, finding
-    /// 53): neither runs a destructor, so a line the writer thread still held
+    /// parent before Commit `_exit`s it (round-seven update audit):
+    /// neither runs a destructor, so a line the writer thread still held
     /// — a record a script was answered `OK recorded` for during the park —
     /// died with the process, and the successor, which reads the file again
     /// after Commit ([`Self::reload_messages_log_at_commit`]), never saw it.
@@ -1150,7 +1150,7 @@ impl App {
     }
 
     /// Shells that started in the home folder because their folder was not
-    /// there, could not be entered, or did not answer (audit #7 finding 48;
+    /// there, could not be entered, or did not answer (
     /// [`crate::spawn_folder::Fault`]): ONE row per fault
     /// naming every such folder while it is up, so a restore that meets three
     /// gone folders is one row naming three, and a New Tab from a gone folder
@@ -3366,8 +3366,8 @@ impl App {
     /// WHAT AN UPDATE'S PARENT HAD SAID AND NO PROOF HAD ANSWERED, taken up by
     /// its successor — the seamless lanes' carry
     /// ([`Self::seed_carried_messages`]) and the cold lane's
-    /// (`crate::app_update_handoff::take_cold_lane_health_said`, round eight,
-    /// finding 79): each warning is remembered, so the proof that answers it
+    /// (`crate::app_update_handoff::take_cold_lane_health_said`):
+    /// each warning is remembered, so the proof that answers it
     /// here records its healing against the parent's words — the landing for
     /// an install warning ([`Self::post_update_landed`]) — and each the landing
     /// does not answer is taken up by its producer here

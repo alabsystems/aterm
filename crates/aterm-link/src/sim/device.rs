@@ -18,7 +18,7 @@
 //!   the media or not: the file holds the version before it, or it, or any
 //!   later one, WHOLE — the model the state dir is written against (its module
 //!   doc: "a reader sees the old value or the new one, never a truncation");
-//! * an unlink may or may not have reached the media (finding F2: a landed
+//! * an unlink may or may not have reached the media (a landed
 //!   post's in-flight entry came back, and its republish landed it behind its
 //!   sender's later posts where the log had lost it on its own; the next
 //!   boot's first bridge now retires what a cut brings back,
@@ -50,7 +50,7 @@
 //! cross-log/state ordering of a real device is modelled. A process kill (not
 //! a power cut) keeps everything: the page cache outlives the process.
 //!
-//! ## Torn files: POSIX's worst case, and finding F1
+//! ## Torn files: POSIX's worst case
 //!
 //! POSIX promises nothing of an unflushed file's DATA across a power loss, so
 //! a rename that reached the media may name a file whose bytes did not — an
@@ -59,7 +59,7 @@
 //! an append cut at any byte), and the committed worlds' devices do
 //! (`world::Opts::seed`).
 //!
-//! FINDING F1 was what that did to the bridge: a torn `inflight/<seq>`
+//! a torn `inflight/<seq>`
 //! (`StateDir::in_flight`) or `sent/` reservation
 //! (`StateDir::forget_log_offsets`) was refused as damaged, fail-closed, at
 //! every attach of every later boot, and the bridge never attached again until
@@ -77,7 +77,7 @@
 //! watermark that re-answers, a `seq` the durable `inc` fences), and every
 //! reader that refuses damage is one of `StateDir::set_aside_torn`'s kinds —
 //! but `logpin`, the mirror's pin, which holds what no reboot ends (the alias
-//! key and the lifetime total, rulings Q6 and Q13). It used to be kept torn,
+//! key and the lifetime total). It used to be kept torn,
 //! and the mirror stopped for good. Both now have durable copies, `logkey`
 //! and `logfloor`, on the media before each atomic batch pin or send. The
 //! current version fence is first written durably, before those copies;
@@ -355,11 +355,11 @@ pub(crate) struct Device {
     /// A CONTROL: a device that keeps every write (no power cut loses
     /// anything), so a failure only a lossy cut can cause vanishes under it.
     pub(crate) lossless: bool,
-    /// POSIX's worst case: a power cut may also TEAR an unflushed file (the
-    /// module doc's finding F1). On in the committed worlds.
+    /// POSIX's worst case: a power cut may also TEAR an unflushed file.
+    /// On in the committed worlds.
     pub(crate) tears: bool,
     /// THE HIGHEST TOTAL any write of `logpin` named, in any boot: what the
-    /// node's mirror had counted (ruling Q13), which no later bridge's total
+    /// node's mirror had counted, which no later bridge's total
     /// may fall below, whatever a power cut did to the pin.
     pin_total: Mutex<u64>,
     /// WRITE ERRORS (sim item S7), once armed ([`Device::arm_write_errors`]).

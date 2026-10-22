@@ -28,7 +28,7 @@
 //!   into the running agent, a stop or a wait), and only when the session's
 //!   only failure need is on a closed run an agent ran under and a run of
 //!   its kind that opened after that close is open: the agent's end the
-//!   restart replaced (session log Phase 6 step 6C-1,
+//!   restart replaced (
 //!   `SessionLog::harness_saw_failure`).
 //!   A run's failure also closes when a later run of its kind ends `ok` or
 //!   `fail` ([`lifts_failure`]). That is the log's own rule, not `status
@@ -47,7 +47,7 @@
 //! - **The confidence law** (§3.7): for each (node, key) the value of the
 //!   highest confidence wins, ties to the later seq; a claim never overrides
 //!   an observation. A closed node's OUTCOME is refined only by an exact
-//!   amend ([`amend_refines_out`], phase 3B ruling S9: an unmeasured build's
+//!   amend ([`amend_refines_out`], an unmeasured build's
 //!   transcript adds facts and never overrules the screen), which moves a
 //!   held turn between the totals' buckets ([`turn_out_rebucket`]); an exact
 //!   `confirmed=1` raises its step's need to the amend's source and
@@ -294,7 +294,7 @@ impl Need {
     /// (a box, a wall, a run's failure), never by a `need` mark, which any
     /// author can write. What `brief`'s session line names, and what a
     /// bus reader's machine form names as the session's need (`aterm fabric
-    /// brief --json`, session log Phase 6 step 6E-6): one rule for both.
+    /// brief --json`): one rule for both.
     #[must_use]
     pub fn observed(&self) -> bool {
         self.src != Src::Mark && self.conf != Conf::Claim
@@ -451,7 +451,7 @@ pub struct SessionState {
     pub label: Option<Claim>,
     /// The newest verdict claim of a trusted author ([`Actor::is_trusted`]:
     /// the harness or the owner), kept beside [`Self::verdict`] so no other
-    /// author's newer verdict displaces it (phase 3A ruling R13).
+    /// author's newer verdict displaces it.
     pub verdict_trusted: Option<Claim>,
     /// The newest label claim of a trusted author: the label `brief` and
     /// the clause show when no proven author's stands (§7.3, D6).
@@ -714,10 +714,10 @@ pub struct Fold {
     shell_phase: Option<Phase>,
     /// The delivered `kind=task` mails no turn has taken, oldest first
     /// (phase 5, [`mail`]), at most [`MAX_MAIL_WAITING`]: carried in the
-    /// local carry since Phase 6 (6C-5, ruling U19).
+    /// local carry since Phase 6.
     mail: Vec<MailWaiting>,
-    /// THE MAIL LATCH (phase 5's T39, held here since Phase 6 step 6C-5,
-    /// ruling U19): a `mail dir=in` record since the last `human` mark of an
+    /// THE MAIL LATCH (phase 5's T39):
+    /// a `mail dir=in` record since the last `human` mark of an
     /// input that reached the program (one without `reached=0`). The host
     /// reads it ([`Fold::in_since_human`]) to mark the person's next such
     /// input whatever its burst, so the fold can read "no person between the
@@ -825,7 +825,7 @@ impl Fold {
     /// [`Conf::Heuristic`]; held for the open turns and the newest closed
     /// one. Only the local `brief` prints it, as `mail=@<off>~` on the
     /// turn's line; `log`, the bus and the ledger never do (rulings T10b,
-    /// T36; Phase 6 step 6C-3, ruling U5).
+    /// T36).
     #[must_use]
     pub fn mail_link(&self, node: Node) -> Option<MailLink> {
         self.links.iter().find(|(n, _)| *n == node).map(|(_, l)| *l)
@@ -897,7 +897,7 @@ impl Fold {
         }
     }
 
-    /// THE BUS'S OPEN PATH (phase 4, ruling S17): the deepest open run, the
+    /// THE BUS'S OPEN PATH: the deepest open run, the
     /// open turn and the deepest open step of the bus class (a step a need
     /// is raised from) — never a tool, subagent or compact step, which stays
     /// local, even when one is open beneath it.
@@ -1193,7 +1193,7 @@ impl Fold {
         for (k, v) in r.f.iter() {
             f.offer(*k, v.clone(), r.conf, r.seq);
         }
-        // THE OUTCOME (rulings S9, A5): the close's, unless an exact amend
+        // THE OUTCOME: the close's, unless an exact amend
         // made while the node was open refines it ([`amend_refines_out`]:
         // the transcript's word outranks a screen close that came after it).
         // Either way the held `out=` field says the same as `out`.
@@ -1472,7 +1472,7 @@ impl Fold {
             if let Some(ep) = r.f.get_u(Key::Epoch) {
                 self.st.ep = u32::try_from(ep).unwrap_or(u32::MAX);
             }
-            // Slice 1 carries no open node across an update: what was open
+            // Carries no open node across an update: what was open
             // is unknown now, and a step's need cannot be closed any more.
             self.tracked.clear();
             self.drop_needs(|n| n.node.lvl == Lvl::Step);
@@ -1535,7 +1535,7 @@ pub fn lifts_failure(kind: Kind, out: &str, closed: Node, need: &Need) -> bool {
         && need.node != closed
 }
 
-/// THE OUTCOME REFINEMENT (§2.3, §3.7; phase 3B rulings S9 and A5):
+/// THE OUTCOME REFINEMENT (§2.3, §3.7):
 /// whether an amend's `out=` at (`conf`, `seq`) replaces the outcome a
 /// closed node holds at (`held_conf`, `held_seq`). Only an EXACT amend
 /// refines an outcome (a transcript read on a measured build), and then
@@ -1573,7 +1573,7 @@ pub fn turn_out_rebucket(t: &mut Totals, old: &str, new: &str) {
 /// Whether amend `r` raises `need` to its own source and confidence (phase
 /// 3B, A5): an exact `confirmed=1` of the step that raised it — the
 /// transcript confirmed the wall the screen saw — and never anything below
-/// exact (ruling S9).
+/// exact.
 #[must_use]
 pub fn need_takes_amend(need: &Need, r: &Rec) -> bool {
     r.op == Op::Amend
@@ -1697,8 +1697,8 @@ fn tool_words(cls: Option<&str>) -> &'static str {
     }
 }
 
-/// THE LABEL A READER IS SHOWN (§7.3, D6; phase 3A rulings R13 and the
-/// fixer's): a proven author's live label ([`Actor::is_proven`]: the
+/// THE LABEL A READER IS SHOWN (§7.3, D6):
+/// a proven author's live label ([`Actor::is_proven`]: the
 /// harness's), else a trusted author's (the owner class, `ctl` among it), at
 /// `now_wall`; never another author's. The clause and `brief` both read it,
 /// so the two can never show different labels.
@@ -1741,7 +1741,7 @@ pub fn shown_verdicts(st: &SessionState) -> Vec<&Claim> {
 
 /// The label a PROVEN author's slot shows at `now_wall` (the harness's or the
 /// person's), never a `ctl` client's or another author's: what a person's
-/// tooltip may show (phase 3B ruling S11).
+/// tooltip may show.
 #[must_use]
 pub fn shown_proven_label(st: &SessionState, now_wall: u64) -> Option<&Claim> {
     st.label_proven
@@ -1757,7 +1757,7 @@ pub fn clause_of(st: &SessionState, now_wall: u64) -> Option<Clause> {
 }
 
 /// [`clause_of`] with only a PROVEN author's label admitted
-/// ([`shown_proven_label`]; phase 3B rulings S11 and A5): a `ctl` label
+/// ([`shown_proven_label`]): a `ctl` label
 /// neither shows nor hides the step or turn row beneath it. The tooltip's
 /// clause; `brief` and [`Fold::clause`] keep [`clause_of`].
 #[must_use]
@@ -1770,8 +1770,8 @@ pub fn clause_of_proven(st: &SessionState, now_wall: u64) -> Option<Clause> {
 /// `approval · bash`, `limit · 3pm`, `failed · exit 2` — or `None` for a
 /// word the clause gives no row (it reads on to the label and the open
 /// path). The clause's own need row, and what a bus reader shows of a
-/// remote session's need (the Overview's "On the fabric" group, session log
-/// Phase 6 step 6E-7): one rendering for both.
+/// remote session's need (the Overview's "On the fabric" group):
+/// one rendering for both.
 #[must_use]
 pub fn need_words(word: &str, detail: Option<&str>) -> Option<(Words, Tone)> {
     match word {

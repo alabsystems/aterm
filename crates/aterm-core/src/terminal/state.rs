@@ -258,7 +258,7 @@ pub struct Terminal {
     /// Monotonic count of desktop notifications the program asked for (OSC 9,
     /// a final OSC 99 chunk, OSC 777 `notify`), counted before the
     /// `allow_notifications` gate, so a session with notifications off still
-    /// says it asked (session log Phase 3B, `mark - notify n=`, ruling S19).
+    /// says it asked (`mark - notify n=`).
     /// Never their text. Not checkpointed.
     pub(super) notify_total: u64,
     /// Host-preferred default cursor style, used before any DECSCUSR and restored on

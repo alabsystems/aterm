@@ -4,44 +4,9 @@
 // Derived from winit 0.30.13 src/event.rs,
 // modified by the aterm project in 2026 (see the repository NOTICE).
 
-//! Modified by the aterm project in 2026; see the repository NOTICE.
+//! The [`Event`] enum and supporting types for [`EventLoop::run_app`].
 //!
-//! The [`Event`] enum and assorted supporting types.
-//!
-//! These are sent to the closure given to [`EventLoop::run_app(...)`], where they get
-//! processed and used to modify the program state. For more details, see the root-level
-//! documentation.
-//!
-//! Some of these events represent different "parts" of a traditional event-handling loop. You could
-//! approximate the basic ordering loop of [`EventLoop::run_app(...)`] with this pseudocode:
-//!
-//! ```text
-//! let mut start_cause = StartCause::Init;
-//!
-//! while !elwt.exiting() {
-//!     app.new_events(event_loop, start_cause);
-//!
-//!     for event in (window events, user events, device events) {
-//!         // This will pick the right method on the application based on the event.
-//!         app.handle_event(event_loop, event);
-//!     }
-//!
-//!     for window_id in (redraw windows) {
-//!         app.window_event(event_loop, window_id, RedrawRequested);
-//!     }
-//!
-//!     app.about_to_wait(event_loop);
-//!     start_cause = wait_if_necessary();
-//! }
-//!
-//! app.exiting(event_loop);
-//! ```
-//!
-//! This leaves out timing details like [`ControlFlow::WaitUntil`] but hopefully
-//! describes what happens in what order.
-//!
-//! [`EventLoop::run_app(...)`]: crate::event_loop::EventLoop::run_app
-//! [`ControlFlow::WaitUntil`]: crate::event_loop::ControlFlow::WaitUntil
+//! [`EventLoop::run_app`]: crate::event_loop::EventLoop::run_app
 use std::path::PathBuf;
 use std::sync::{Mutex, Weak};
 use std::time::Instant;
@@ -57,52 +22,35 @@ use crate::window::Window;
 use crate::window::{Theme, WindowId};
 
 /// Describes a generic event.
-///
-/// See the module-level docs for more information on the event loop manages each event.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Event<T: 'static> {
-    /// See [`ApplicationHandler::new_events`] for details.
-    ///
-    /// [`ApplicationHandler::new_events`]: crate::application::ApplicationHandler::new_events
+    /// See [`ApplicationHandler::new_events`](crate::application::ApplicationHandler::new_events).
     NewEvents(StartCause),
 
-    /// See [`ApplicationHandler::window_event`] for details.
-    ///
-    /// [`ApplicationHandler::window_event`]: crate::application::ApplicationHandler::window_event
+    /// See [`ApplicationHandler::window_event`](crate::application::ApplicationHandler::window_event).
     WindowEvent { window_id: WindowId, event: WindowEvent },
 
-    /// See [`ApplicationHandler::device_event`] for details.
-    ///
-    /// [`ApplicationHandler::device_event`]: crate::application::ApplicationHandler::device_event
+    /// See [`ApplicationHandler::device_event`](crate::application::ApplicationHandler::device_event).
     DeviceEvent { device_id: DeviceId, event: DeviceEvent },
 
-    /// See [`ApplicationHandler::user_event`] for details.
-    ///
-    /// [`ApplicationHandler::user_event`]: crate::application::ApplicationHandler::user_event
+    /// See [`ApplicationHandler::user_event`](crate::application::ApplicationHandler::user_event).
     UserEvent(T),
 
-    /// See [`ApplicationHandler::suspended`] for details.
-    ///
-    /// [`ApplicationHandler::suspended`]: crate::application::ApplicationHandler::suspended
+    /// See [`ApplicationHandler::suspended`](crate::application::ApplicationHandler::suspended).
     Suspended,
 
-    /// See [`ApplicationHandler::resumed`] for details.
-    ///
-    /// [`ApplicationHandler::resumed`]: crate::application::ApplicationHandler::resumed
+    /// See [`ApplicationHandler::resumed`](crate::application::ApplicationHandler::resumed).
     Resumed,
 
-    /// See [`ApplicationHandler::about_to_wait`] for details.
-    ///
-    /// [`ApplicationHandler::about_to_wait`]: crate::application::ApplicationHandler::about_to_wait
+    /// See [`ApplicationHandler::about_to_wait`](crate::application::ApplicationHandler::about_to_wait).
     AboutToWait,
 
-    /// See [`ApplicationHandler::exiting`] for details.
-    ///
-    /// [`ApplicationHandler::exiting`]: crate::application::ApplicationHandler::exiting
+    /// See [`ApplicationHandler::exiting`](crate::application::ApplicationHandler::exiting).
     LoopExiting,
 }
 
 impl<T> Event<T> {
+    /// Maps the user event type when `self` is not [`Event::UserEvent`].
     #[allow(clippy::result_large_err)]
     pub fn map_nonuser_event<U>(self) -> Result<Event<U>, Event<T>> {
         use self::Event::*;
@@ -122,306 +70,131 @@ impl<T> Event<T> {
 /// Describes the reason the event loop is resuming.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StartCause {
-    /// Sent if the time specified by [`ControlFlow::WaitUntil`] has been reached. Contains the
-    /// moment the timeout was requested and the requested resume time. The actual resume time is
-    /// guaranteed to be equal to or after the requested resume time.
-    ///
-    /// [`ControlFlow::WaitUntil`]: crate::event_loop::ControlFlow::WaitUntil
+    /// Sent when the time specified by [`ControlFlow::WaitUntil`](crate::event_loop::ControlFlow::WaitUntil) has been reached.
     ResumeTimeReached { start: Instant, requested_resume: Instant },
 
-    /// Sent if the OS has new events to send to the window, after a wait was requested. Contains
-    /// the moment the wait was requested and the resume time, if requested.
+    /// Sent when new OS events arrive while waiting.
     WaitCancelled { start: Instant, requested_resume: Option<Instant> },
 
-    /// Sent if the event loop is being resumed after the loop's control flow was set to
-    /// [`ControlFlow::Poll`].
-    ///
-    /// [`ControlFlow::Poll`]: crate::event_loop::ControlFlow::Poll
+    /// Sent when the event loop resumes under [`ControlFlow::Poll`](crate::event_loop::ControlFlow::Poll).
     Poll,
 
-    /// Sent once, immediately after `run` is called. Indicates that the loop was just initialized.
+    /// Sent once immediately after `run` is called.
     Init,
 }
 
 /// Describes an event from a [`Window`].
-// LOCAL PATCH (aterm), 2026-10-15 (docs/AUDIT-third-party-2026-10-15.md, winit-core step 5):
-// `PinchGesture`, `DoubleTapGesture`, `RotationGesture` and `TouchpadPressure` are cut with the
-// macOS view rows that alone sent them (nothing in aterm handled one), and `PanGesture` and
-// `ActivationTokenDone`, which no remaining backend sends, with `ActivationToken` and
-// `event_loop::AsyncRequestSerial`. `Event::MemoryWarning` (iOS/Android only) went the same way.
 #[derive(Debug, Clone, PartialEq)]
 pub enum WindowEvent {
-    /// The size of the window has changed. Contains the client area's new dimensions.
+    /// The client area size of the window changed.
     Resized(PhysicalSize<u32>),
 
-    /// The position of the window has changed. Contains the window's new position.
-    ///
-    /// ## Platform-specific
-    ///
-    /// - **iOS / Android / Web / Wayland:** Unsupported.
+    /// The position of the window changed.
     Moved(PhysicalPosition<i32>),
 
-    /// The window has been requested to close.
+    /// The window was requested to close.
     CloseRequested,
 
-    /// The window has been destroyed.
+    /// The window was destroyed.
     Destroyed,
 
-    /// A file has been dropped into the window.
-    ///
-    /// When the user drops multiple files at once, this event will be emitted for each file
-    /// separately.
+    /// A file was dropped into the window.
     DroppedFile(PathBuf),
 
     /// A file is being hovered over the window.
-    ///
-    /// When the user hovers multiple files at once, this event will be emitted for each file
-    /// separately.
     HoveredFile(PathBuf),
 
-    /// A file was hovered, but has exited the window.
-    ///
-    /// There will be a single `HoveredFileCancelled` event triggered even if multiple files were
-    /// hovered.
+    /// A hovered file exited the window.
     HoveredFileCancelled,
 
-    /// The window gained or lost focus.
-    ///
-    /// The parameter is true if the window has gained focus, and false if it has lost focus.
+    /// The window gained (`true`) or lost (`false`) focus.
     Focused(bool),
 
-    /// An event from the keyboard has been received.
-    ///
-    /// ## Platform-specific
-    /// - **Windows:** The shift key overrides NumLock. In other words, while shift is held down,
-    ///   numpad keys act as if NumLock wasn't active. When this is used, the OS sends fake key
-    ///   events which are not marked as `is_synthetic`.
+    /// A keyboard event occurred.
     KeyboardInput {
         device_id: DeviceId,
         event: KeyEvent,
-
-        /// If `true`, the event was generated synthetically by winit
-        /// in one of the following circumstances:
-        ///
-        /// * Synthetic key press events are generated for all keys pressed when a window gains
-        ///   focus. Likewise, synthetic key release events are generated for all keys pressed when
-        ///   a window goes out of focus. ***Currently, this is only functional on X11 and
-        ///   Windows***
-        ///
-        /// Otherwise, this value is always `false`.
+        /// `true` if generated synthetically on focus change.
         is_synthetic: bool,
     },
 
-    /// The keyboard modifiers have changed.
+    /// The keyboard modifiers changed.
     ModifiersChanged(Modifiers),
 
-    /// An event from an input method.
-    ///
-    /// **Note:** You have to explicitly enable this event using [`Window::set_ime_allowed`].
-    ///
-    /// ## Platform-specific
-    ///
-    /// - **iOS / Android / Web / Orbital:** Unsupported.
+    /// An input method event (enabled via [`Window::set_ime_allowed`]).
     Ime(Ime),
 
-    /// The cursor has moved on the window.
-    ///
-    /// ## Platform-specific
-    ///
-    /// - **Web:** Doesn't take into account CSS [`border`], [`padding`], or [`transform`].
-    ///
-    /// [`border`]: https://developer.mozilla.org/en-US/docs/Web/CSS/border
-    /// [`padding`]: https://developer.mozilla.org/en-US/docs/Web/CSS/padding
-    /// [`transform`]: https://developer.mozilla.org/en-US/docs/Web/CSS/transform
+    /// The cursor moved on the window.
     CursorMoved {
         device_id: DeviceId,
-
-        /// (x,y) coords in pixels relative to the top-left corner of the window. Because the range
-        /// of this data is limited by the display area and it may have been transformed by
-        /// the OS to implement effects such as cursor acceleration, it should not be used
-        /// to implement non-cursor-like interactions such as 3D camera control.
+        /// Pixel coordinates relative to the top-left corner of the window.
         position: PhysicalPosition<f64>,
     },
 
-    /// The cursor has entered the window.
-    ///
-    /// ## Platform-specific
-    ///
-    /// - **Web:** Doesn't take into account CSS [`border`], [`padding`], or [`transform`].
-    ///
-    /// [`border`]: https://developer.mozilla.org/en-US/docs/Web/CSS/border
-    /// [`padding`]: https://developer.mozilla.org/en-US/docs/Web/CSS/padding
-    /// [`transform`]: https://developer.mozilla.org/en-US/docs/Web/CSS/transform
+    /// The cursor entered the window.
     CursorEntered { device_id: DeviceId },
 
-    /// The cursor has left the window.
-    ///
-    /// ## Platform-specific
-    ///
-    /// - **Web:** Doesn't take into account CSS [`border`], [`padding`], or [`transform`].
-    ///
-    /// [`border`]: https://developer.mozilla.org/en-US/docs/Web/CSS/border
-    /// [`padding`]: https://developer.mozilla.org/en-US/docs/Web/CSS/padding
-    /// [`transform`]: https://developer.mozilla.org/en-US/docs/Web/CSS/transform
+    /// The cursor left the window.
     CursorLeft { device_id: DeviceId },
 
-    /// A mouse wheel movement or touchpad scroll occurred.
+    /// A mouse wheel or touchpad scroll occurred.
     MouseWheel { device_id: DeviceId, delta: MouseScrollDelta, phase: TouchPhase },
 
-    /// An mouse button press has been received.
+    /// A mouse button was pressed or released.
     MouseInput { device_id: DeviceId, state: ElementState, button: MouseButton },
 
-    /// Motion on some analog axis. May report data redundant to other, more specific events.
+    /// Motion on an analog axis.
     AxisMotion { device_id: DeviceId, axis: AxisId, value: f64 },
 
-    /// Touch event has been received
-    ///
-    /// ## Platform-specific
-    ///
-    /// - **Web:** Doesn't take into account CSS [`border`], [`padding`], or [`transform`].
-    /// - **macOS:** Unsupported.
-    ///
-    /// [`border`]: https://developer.mozilla.org/en-US/docs/Web/CSS/border
-    /// [`padding`]: https://developer.mozilla.org/en-US/docs/Web/CSS/padding
-    /// [`transform`]: https://developer.mozilla.org/en-US/docs/Web/CSS/transform
+    /// A touch event occurred.
     Touch(Touch),
 
-    /// The window's scale factor has changed.
-    ///
-    /// The following user actions can cause DPI changes:
-    ///
-    /// * Changing the display's resolution.
-    /// * Changing the display's scale factor (e.g. in Control Panel on Windows).
-    /// * Moving the window to a display with a different scale factor.
-    ///
-    /// To update the window size, use the provided [`InnerSizeWriter`] handle. By default, the
-    /// window is resized to the value suggested by the OS, but it can be changed to any value.
-    ///
-    /// For more information about DPI in general, see the [`dpi`](crate::dpi) module.
+    /// The window's DPI scale factor changed.
     ScaleFactorChanged {
         scale_factor: f64,
-        /// Handle to update inner size during scale changes.
-        ///
-        /// See [`InnerSizeWriter`] docs for more details.
+        /// Handle to update the inner size during scale changes.
         inner_size_writer: InnerSizeWriter,
     },
 
-    /// The system window theme has changed.
-    ///
-    /// Applications might wish to react to this to change the theme of the content of the window
-    /// when the system changes the window theme.
-    ///
-    /// This only reports a change if the window theme was not overridden by [`Window::set_theme`].
-    ///
-    /// ## Platform-specific
-    ///
-    /// - **iOS / Android / X11 / Wayland / Orbital:** Unsupported.
+    /// The system window theme changed.
     ThemeChanged(Theme),
 
-    /// The window has been occluded (completely hidden from view).
-    ///
-    /// This is different to window visibility as it depends on whether the window is closed,
-    /// minimised, set invisible, or fully occluded by another window.
-    ///
-    /// ## Platform-specific
-    ///
-    /// ### iOS
-    ///
-    /// On iOS, the `Occluded(false)` event is emitted in response to an
-    /// [`applicationWillEnterForeground`] callback which means the application should start
-    /// preparing its data. The `Occluded(true)` event is emitted in response to an
-    /// [`applicationDidEnterBackground`] callback which means the application should free
-    /// resources (according to the [iOS application lifecycle]).
-    ///
-    /// [`applicationWillEnterForeground`]: https://developer.apple.com/documentation/uikit/uiapplicationdelegate/1623076-applicationwillenterforeground
-    /// [`applicationDidEnterBackground`]: https://developer.apple.com/documentation/uikit/uiapplicationdelegate/1622997-applicationdidenterbackground
-    /// [iOS application lifecycle]: https://developer.apple.com/documentation/uikit/app_and_environment/managing_your_app_s_life_cycle
-    ///
-    /// ### X11
-    ///
-    /// Occluded while the window is unmapped after a map (the window manager iconified it or
-    /// moved it off the current workspace, or the application hid it), while its
-    /// `_NET_WM_STATE` holds `_NET_WM_STATE_HIDDEN`, or while `VisibilityNotify` says it is
-    /// fully obscured; reported when that changes. A compositing window manager redirects the
-    /// window, so a window merely covered by others is not reported there.
-    ///
-    /// ### Others
-    ///
-    /// - **Web:** Doesn't take into account CSS [`border`], [`padding`], or [`transform`].
-    /// - **Android / Wayland / Windows / Orbital:** Unsupported.
-    ///
-    /// [`border`]: https://developer.mozilla.org/en-US/docs/Web/CSS/border
-    /// [`padding`]: https://developer.mozilla.org/en-US/docs/Web/CSS/padding
-    /// [`transform`]: https://developer.mozilla.org/en-US/docs/Web/CSS/transform
+    /// The window's occlusion state changed.
     Occluded(bool),
 
-    /// Emitted when a window should be redrawn.
-    ///
-    /// This gets triggered in two scenarios:
-    /// - The OS has performed an operation that's invalidated the window's contents (such as
-    ///   resizing the window).
-    /// - The application has explicitly requested a redraw via [`Window::request_redraw`].
-    ///
-    /// Winit will aggregate duplicate redraw requests into a single event, to
-    /// help avoid duplicating rendering work. On X11, `platform::x11::redraw_is_exposure` says
-    /// during the dispatch whether the server's `Expose` is among them.
+    /// The window should be redrawn (invalidated by the OS or requested via [`Window::request_redraw`]).
     RedrawRequested,
 }
 
 /// Identifier of an input device.
-///
-/// Whenever you receive an event arising from a particular input device, this event contains a
-/// `DeviceId` which identifies its origin. Note that devices may be virtual (representing an
-/// on-screen cursor and keyboard focus) or physical. Virtual devices typically aggregate inputs
-/// from multiple physical devices.
 #[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct DeviceId(pub(crate) platform_impl::DeviceId);
 
 impl DeviceId {
-    /// Returns a dummy id, useful for unit testing.
-    ///
-    /// # Notes
-    ///
-    /// The only guarantee made about the return value of this function is that
-    /// it will always be equal to itself and to future values returned by this function.
-    /// No other guarantees are made. This may be equal to a real `DeviceId`.
+    /// Returns a dummy id for unit testing.
     pub const fn dummy() -> Self {
         DeviceId(platform_impl::DeviceId::dummy())
     }
 }
 
-/// Represents raw hardware events that are not associated with any particular window.
-///
-/// Useful for interactions that diverge significantly from a conventional 2D GUI, such as 3D camera
-/// or first-person game controls. Many physical actions, such as mouse movement, can produce both
-/// device and window events. Because window events typically arise from virtual devices
-/// (corresponding to GUI cursors and keyboard focus) the device IDs may not match.
-///
-/// Note that these events are delivered regardless of input focus.
+/// Raw hardware events not associated with any particular window.
 #[derive(Clone, Debug, PartialEq)]
 pub enum DeviceEvent {
     Added,
     Removed,
 
-    /// Change in physical position of a pointing device.
-    ///
-    /// This represents raw, unfiltered physical motion. Not to be confused with
-    /// [`WindowEvent::CursorMoved`].
+    /// Raw, unfiltered physical motion of a pointing device.
     MouseMotion {
-        /// (x, y) change in position in unspecified units.
-        ///
-        /// Different devices may use different units.
+        /// `(x, y)` change in position in device-specific units.
         delta: (f64, f64),
     },
 
-    /// Physical scroll event
+    /// Physical scroll event.
     MouseWheel {
         delta: MouseScrollDelta,
     },
 
-    /// Motion on some analog axis. This event will be reported for all arbitrary input devices
-    /// that winit supports on this platform, including mouse devices.  If the device is a mouse
-    /// device then this will be reported alongside the MouseMotion event.
+    /// Motion on an analog axis.
     Motion {
         axis: AxisId,
         value: f64,
@@ -435,124 +208,40 @@ pub enum DeviceEvent {
     Key(RawKeyEvent),
 }
 
-/// Describes a keyboard input as a raw device event.
-///
-/// Note that holding down a key may produce repeated `RawKeyEvent`s. The
-/// operating system doesn't provide information whether such an event is a
-/// repeat or the initial keypress. An application may emulate this by, for
-/// example keeping a Map/Set of pressed keys and determining whether a keypress
-/// corresponds to an already pressed key.
+/// A keyboard input as a raw device event.
 #[derive(Debug, Clone, Eq, PartialEq, Hash)]
 pub struct RawKeyEvent {
+    /// Physical key identifier.
     pub physical_key: keyboard::PhysicalKey,
+    /// Press or release state.
     pub state: ElementState,
 }
 
-/// Describes a keyboard input targeting a window.
+/// A keyboard input targeting a window.
 #[derive(Debug, Clone, Eq, PartialEq, Hash)]
 pub struct KeyEvent {
-    /// Represents the position of a key independent of the currently active layout.
-    ///
-    /// It also uniquely identifies the physical key (i.e. it's mostly synonymous with a scancode).
-    /// The most prevalent use case for this is games. For example the default keys for the player
-    /// to move around might be the W, A, S, and D keys on a US layout. The position of these keys
-    /// is more important than their label, so they should map to Z, Q, S, and D on an "AZERTY"
-    /// layout. (This value is `KeyCode::KeyW` for the Z key on an AZERTY layout.)
-    ///
-    /// ## Caveats
-    ///
-    /// - Certain niche hardware will shuffle around physical key positions, e.g. a keyboard that
-    ///   implements DVORAK in hardware (or firmware)
-    /// - Your application will likely have to handle keyboards which are missing keys that your
-    ///   own keyboard has.
-    /// - Certain `KeyCode`s will move between a couple of different positions depending on what
-    ///   layout the keyboard was manufactured to support.
-    ///
-    ///  **Because of these caveats, it is important that you provide users with a way to configure
-    ///  most (if not all) keybinds in your application.**
-    ///
-    /// ## `Fn` and `FnLock`
-    ///
-    /// `Fn` and `FnLock` key events are *exceedingly unlikely* to be emitted by Winit. These keys
-    /// are usually handled at the hardware or OS level, and aren't surfaced to applications. If
-    /// you somehow see this in the wild, we'd like to know :)
+    /// Position of the key independent of the active layout.
     pub physical_key: keyboard::PhysicalKey,
 
-    // Allowing `broken_intra_doc_links` for `logical_key`, because
-    // `key_without_modifiers` is not available on all platforms
     #[cfg_attr(
         not(any(windows_platform, macos_platform, x11_platform, wayland_platform)),
         allow(rustdoc::broken_intra_doc_links)
     )]
-    /// This value is affected by all modifiers except <kbd>Ctrl</kbd>.
-    ///
-    /// This has two use cases:
-    /// - Allows querying whether the current input is a Dead key.
-    /// - Allows handling key-bindings on platforms which don't support [`key_without_modifiers`].
-    ///
-    /// If you use this field (or [`key_without_modifiers`] for that matter) for keyboard
-    /// shortcuts, **it is important that you provide users with a way to configure your
-    /// application's shortcuts so you don't render your application unusable for users with an
-    /// incompatible keyboard layout.**
-    ///
-    /// ## Platform-specific
-    /// - **Web:** Dead keys might be reported as the real key instead of `Dead` depending on the
-    ///   browser/OS.
+    /// Logical key value affected by all modifiers except Ctrl (see [`key_without_modifiers`]).
     ///
     /// [`key_without_modifiers`]: crate::platform::modifier_supplement::KeyEventExtModifierSupplement::key_without_modifiers
     pub logical_key: keyboard::Key,
 
-    /// Contains the text produced by this keypress.
-    ///
-    /// In most cases this is identical to the content
-    /// of the `Character` variant of `logical_key`.
-    /// However, on Windows when a dead key was pressed earlier
-    /// but cannot be combined with the character from this
-    /// keypress, the produced text will consist of two characters:
-    /// the dead-key-character followed by the character resulting
-    /// from this keypress.
-    ///
-    /// An additional difference from `logical_key` is that
-    /// this field stores the text representation of any key
-    /// that has such a representation. For example when
-    /// `logical_key` is `Key::Named(NamedKey::Enter)`, this field is `Some("\r")`.
-    ///
-    /// This is `None` if the current keypress cannot
-    /// be interpreted as text.
-    ///
-    /// See also: `text_with_all_modifiers()`
+    /// Text produced by this keypress, or `None` if non-printable.
     pub text: Option<SmolStr>,
 
-    /// Contains the location of this key on the keyboard.
-    ///
-    /// Certain keys on the keyboard may appear in more than once place. For example, the "Shift"
-    /// key appears on the left side of the QWERTY keyboard as well as the right side. However,
-    /// both keys have the same symbolic value. Another example of this phenomenon is the "1"
-    /// key, which appears both above the "Q" key and as the "Keypad 1" key.
-    ///
-    /// This field allows the user to differentiate between keys like this that have the same
-    /// symbolic value but different locations on the keyboard.
-    ///
-    /// See the [`KeyLocation`] type for more details.
-    ///
-    /// [`KeyLocation`]: crate::keyboard::KeyLocation
+    /// Physical location of this key on the keyboard (see [`KeyLocation`](crate::keyboard::KeyLocation)).
     pub location: keyboard::KeyLocation,
 
     /// Whether the key is being pressed or released.
-    ///
-    /// See the [`ElementState`] type for more details.
     pub state: ElementState,
 
-    /// Whether or not this key is a key repeat event.
-    ///
-    /// On some systems, holding down a key for some period of time causes that key to be repeated
-    /// as though it were being pressed and released repeatedly. This field is `true` if and only
-    /// if this event is the result of one of those repeats.
-    ///
-    /// # Example
-    ///
-    /// In games, you often want to ignore repeated key events - this can be
-    /// done by ignoring events where this property is set.
+    /// `true` if this event is a key repeat.
     ///
     /// ```
     /// use aterm_window::event::{ElementState, KeyEvent, WindowEvent};
@@ -576,29 +265,13 @@ pub struct KeyEvent {
     /// ```
     pub repeat: bool,
 
-    /// Platform-specific key event information.
-    ///
-    /// On Windows, Linux and macOS, this type contains the key without modifiers and the text with
-    /// all modifiers applied.
-    ///
-    /// On Android, iOS, Redox and Web, this type is a no-op.
+    /// Platform-specific key event fields.
     pub(crate) platform_specific: platform_impl::KeyEventExtra,
 }
 
-// A test or debug build only: a release build has no way to mint a key event
-// the platform did not deliver. Gated on the profile, not a feature, so the
-// downstream test build and the shipped build compile one winit. The cost:
-// aterm-gui's tests build only under a profile with debug assertions on, never
-// `--release` or an optimized test profile that turns them off.
 #[cfg(any(test, debug_assertions))]
 impl KeyEvent {
-    /// Construct a synthetic event for downstream conformance tests.
-    ///
-    /// Test and debug builds only, because real events normally come only from
-    /// the platform event loop. The constructor also initializes winit's private
-    /// modifier-supplement payload, letting a downstream test exercise the same
-    /// `key_without_modifiers()` path as a native event without unsafe layout
-    /// fabrication.
+    /// Constructs a synthetic key event for conformance tests.
     #[doc(hidden)]
     #[must_use]
     pub fn synthetic_for_test(
@@ -621,19 +294,7 @@ impl KeyEvent {
         )
     }
 
-    /// [`synthetic_for_test`](Self::synthetic_for_test) with the modifier
-    /// supplement's BASE key — what `key_without_modifiers()` answers — passed
-    /// explicitly instead of copied from `logical_key`.
-    ///
-    /// The plain constructor sets the two equal, which no real X11/Wayland
-    /// KEYPAD event does: those backends compute `key_without_modifiers()` from
-    /// xkb's LEVEL-0 keysym, and the KEYPAD key type holds the NumLock-OFF
-    /// symbol at level 0 (`types/numpad`: `map[None] = Level1`;
-    /// `symbols/keypad(x11)`: `<KP1> { [ KP_End, KP_1 ] }`). A NumLock-ON
-    /// keypad 1 therefore arrives with `logical_key = Character("1")` and
-    /// `key_without_modifiers() = Named(End)` — two different keys. A
-    /// downstream test of code that reads the base key cannot see that
-    /// divergence through the plain constructor, so it gets this one.
+    /// Like [`synthetic_for_test`](Self::synthetic_for_test), with an explicit `key_without_modifiers` base key.
     #[doc(hidden)]
     #[must_use]
     pub fn synthetic_for_test_with_base(
@@ -655,10 +316,7 @@ impl KeyEvent {
         Self { physical_key, logical_key, text, location, state, repeat, platform_specific }
     }
 
-    /// This synthetic press with [`text_ignoring_lock`] answering `text`: what xkb reads for
-    /// a press under Caps Lock (X11 and Wayland), where it can differ from
-    /// [`KeyEvent::text`]. Elsewhere the press is returned unchanged, as the method answers
-    /// [`KeyEvent::text`] there.
+    /// Sets [`text_ignoring_lock`] on X11 and Wayland; a no-op elsewhere.
     ///
     /// [`text_ignoring_lock`]: crate::platform::modifier_supplement::KeyEventExtModifierSupplement::text_ignoring_lock
     #[doc(hidden)]
@@ -678,14 +336,10 @@ impl KeyEvent {
     }
 }
 
-/// Describes keyboard modifiers event.
+/// Describes a keyboard modifiers event.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct Modifiers {
     pub(crate) state: ModifiersState,
-
-    // NOTE: Currently pressed modifiers keys.
-    //
-    // The field providing a metadata, it shouldn't be used as a source of truth.
     pub(crate) pressed_mods: ModifiersKeys,
 }
 
@@ -750,19 +404,7 @@ impl From<ModifiersState> for Modifiers {
     }
 }
 
-/// Describes [input method](https://en.wikipedia.org/wiki/Input_method) events.
-///
-/// This is also called a "composition event".
-///
-/// Most keypresses using a latin-like keyboard layout simply generate a
-/// [`WindowEvent::KeyboardInput`]. However, one couldn't possibly have a key for every single
-/// unicode character that the user might want to type
-/// - so the solution operating systems employ is to allow the user to type these using _a sequence
-///   of keypresses_ instead.
-///
-/// A prominent example of this is accents - many keyboard layouts allow you to first click the
-/// "accent key", and then the character you want to apply the accent to. In this case, some
-/// platforms will generate the following event sequence:
+/// Input method (composition) events; see [`Window::set_ime_cursor_area`].
 ///
 /// ```
 /// use aterm_window::event::Ime;
@@ -776,13 +418,6 @@ impl From<ModifiersState> for Modifiers {
 /// ];
 /// assert_eq!(events.last(), Some(&Ime::Commit("é".into())));
 /// ```
-///
-/// Additionally, certain input devices are configured to display a candidate box that allow the
-/// user to select the desired character interactively. (To properly position this box, you must use
-/// [`Window::set_ime_cursor_area`].)
-///
-/// An example of a keyboard layout which uses candidate boxes is pinyin. On a latin keyboard the
-/// following event sequence could be obtained:
 ///
 /// ```
 /// use aterm_window::event::Ime;
@@ -804,33 +439,16 @@ impl From<ModifiersState> for Modifiers {
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Ime {
-    /// Notifies when the IME was enabled.
-    ///
-    /// After getting this event you could receive [`Preedit`][Self::Preedit] and
-    /// [`Commit`][Self::Commit] events. You should also start performing IME related requests
-    /// like [`Window::set_ime_cursor_area`].
+    /// The IME was enabled.
     Enabled,
 
-    /// Notifies when a new composing text should be set at the cursor position.
-    ///
-    /// The value represents a pair of the preedit string and the cursor begin position and end
-    /// position. When it's `None`, the cursor should be hidden. When `String` is an empty string
-    /// this indicates that preedit was cleared.
-    ///
-    /// The cursor position is byte-wise indexed.
+    /// Composing preedit string and optional byte-indexed `(start, end)` cursor range.
     Preedit(String, Option<(usize, usize)>),
 
-    /// Notifies when text should be inserted into the editor widget.
-    ///
-    /// Right before this event winit will send empty [`Self::Preedit`] event.
+    /// Committed text to insert (preceded by an empty [`Self::Preedit`]).
     Commit(String),
 
-    /// Notifies when the IME was disabled.
-    ///
-    /// After receiving this event you won't get any more [`Preedit`][Self::Preedit] or
-    /// [`Commit`][Self::Commit] events until the next [`Enabled`][Self::Enabled] event. You should
-    /// also stop issuing IME related requests like [`Window::set_ime_cursor_area`] and clear
-    /// pending preedit text.
+    /// The IME was disabled.
     Disabled,
 }
 
@@ -843,89 +461,39 @@ pub enum TouchPhase {
     Cancelled,
 }
 
-/// Represents a touch event
-///
-/// Every time the user touches the screen, a new [`TouchPhase::Started`] event with an unique
-/// identifier for the finger is generated. When the finger is lifted, an [`TouchPhase::Ended`]
-/// event is generated with the same finger id.
-///
-/// After a `Started` event has been emitted, there may be zero or more `Move`
-/// events when the finger is moved or the touch pressure changes.
-///
-/// The finger id may be reused by the system after an `Ended` event. The user
-/// should assume that a new `Started` event received with the same id has nothing
-/// to do with the old finger and is a new finger.
-///
-/// A [`TouchPhase::Cancelled`] event is emitted when the system has canceled tracking this
-/// touch, such as when the window loses focus, or on iOS if the user moves the
-/// device against their face.
-///
-/// ## Platform-specific
-///
-/// - **Web:** Doesn't take into account CSS [`border`], [`padding`], or [`transform`].
-/// - **macOS:** Unsupported.
-///
-/// [`border`]: https://developer.mozilla.org/en-US/docs/Web/CSS/border
-/// [`padding`]: https://developer.mozilla.org/en-US/docs/Web/CSS/padding
-/// [`transform`]: https://developer.mozilla.org/en-US/docs/Web/CSS/transform
+/// Represents a touch event.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Touch {
+    /// Input device identifier.
     pub device_id: DeviceId,
+    /// Touch phase.
     pub phase: TouchPhase,
+    /// Touch position in the window.
     pub location: PhysicalPosition<f64>,
-    /// Describes how hard the screen was pressed. May be `None` if the platform
-    /// does not support pressure sensitivity.
-    ///
-    /// ## Platform-specific
-    ///
-    /// - Only available on **iOS** 9.0+, **Windows** 8+, **Web**, and **Android**.
-    /// - **Android**: This will never be [None]. If the device doesn't support pressure
-    ///   sensitivity, force will either be 0.0 or 1.0. Also see the
-    ///   [android documentation](https://developer.android.com/reference/android/view/MotionEvent#AXIS_PRESSURE).
+    /// Touch pressure, if supported by the platform.
     pub force: Option<Force>,
     /// Unique identifier of a finger.
     pub id: u64,
 }
 
-/// Describes the force of a touch event
+/// Describes the force of a touch event.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Force {
-    /// On iOS, the force is calibrated so that the same number corresponds to
-    /// roughly the same amount of pressure on the screen regardless of the
-    /// device.
+    /// Calibrated force where `1.0` represents an average touch.
     Calibrated {
-        /// The force of the touch, where a value of 1.0 represents the force of
-        /// an average touch (predetermined by the system, not user-specific).
-        ///
-        /// The force reported by Apple Pencil is measured along the axis of the
-        /// pencil. If you want a force perpendicular to the device, you need to
-        /// calculate this value using the `altitude_angle` value.
+        /// Force of the touch along the stylus axis.
         force: f64,
-        /// The maximum possible force for a touch.
-        ///
-        /// The value of this field is sufficiently high to provide a wide
-        /// dynamic range for values of the `force` field.
+        /// Maximum possible force for a touch.
         max_possible_force: f64,
-        /// The altitude (in radians) of the stylus.
-        ///
-        /// A value of 0 radians indicates that the stylus is parallel to the
-        /// surface. The value of this property is Pi/2 when the stylus is
-        /// perpendicular to the surface.
+        /// Altitude angle (in radians) of the stylus, if available.
         altitude_angle: Option<f64>,
     },
-    /// If the platform reports the force as normalized, we have no way of
-    /// knowing how much pressure 1.0 corresponds to – we know it's the maximum
-    /// amount of force, but as to how much force, you might either have to
-    /// press really really hard, or not hard at all, depending on the device.
+    /// Force normalized to `0.0..=1.0` by the platform.
     Normalized(f64),
 }
 
 impl Force {
-    /// Returns the force normalized to the range between 0.0 and 1.0 inclusive.
-    ///
-    /// Instead of normalizing the force, you should prefer to handle
-    /// [`Force::Calibrated`] so that the amount of force the user has to apply is
-    /// consistent across devices.
+    /// Returns the force normalized to `0.0..=1.0`.
     #[inline]
     pub fn normalized(&self) -> f64 {
         match self {
@@ -963,11 +531,6 @@ impl ElementState {
 }
 
 /// Describes a button of a mouse controller.
-///
-/// ## Platform-specific
-///
-/// **macOS:** `Back` and `Forward` might not work with all hardware.
-/// **Orbital:** `Back` and `Forward` are unsupported due to orbital not supporting them.
 #[derive(Debug, Hash, PartialEq, Eq, PartialOrd, Ord, Clone, Copy)]
 pub enum MouseButton {
     Left,
@@ -981,31 +544,14 @@ pub enum MouseButton {
 /// Describes a difference in the mouse scroll wheel state.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum MouseScrollDelta {
-    /// Amount in lines or rows to scroll in the horizontal
-    /// and vertical directions.
-    ///
-    /// Positive values indicate that the content that is being scrolled should move
-    /// right and down (revealing more content left and up).
+    /// Horizontal and vertical scroll amount in lines or rows.
     LineDelta(f32, f32),
 
-    /// Amount in pixels to scroll in the horizontal and
-    /// vertical direction.
-    ///
-    /// Scroll events are expressed as a `PixelDelta` if
-    /// supported by the device (eg. a touchpad) and
-    /// platform.
-    ///
-    /// Positive values indicate that the content being scrolled should
-    /// move right/down.
-    ///
-    /// For a 'natural scrolling' touch pad (that acts like a touch screen)
-    /// this means moving your fingers right and down should give positive values,
-    /// and move the content right and down (to reveal more things left and up).
+    /// Horizontal and vertical scroll amount in pixels.
     PixelDelta(PhysicalPosition<f64>),
 }
 
-/// Handle to synchronously change the size of the window from the
-/// [`WindowEvent`].
+/// Handle to synchronously change the size of the window from [`WindowEvent::ScaleFactorChanged`].
 #[derive(Debug, Clone)]
 pub struct InnerSizeWriter {
     pub(crate) new_inner_size: Weak<Mutex<PhysicalSize<u32>>>,
@@ -1017,7 +563,7 @@ impl InnerSizeWriter {
         Self { new_inner_size }
     }
 
-    /// Try to request inner size which will be set synchronously on the window.
+    /// Requests a new inner size to be set synchronously on the window.
     #[inline]
     pub fn request_inner_size(
         &mut self,
@@ -1056,7 +602,6 @@ mod tests {
                 use crate::event::WindowEvent::*;
                 use crate::window::WindowId;
 
-                // Mainline events.
                 let wid = WindowId::dummy();
                 x(UserEvent(()));
                 x(NewEvents(event::StartCause::Init));
@@ -1065,7 +610,6 @@ mod tests {
                 x(Suspended);
                 x(Resumed);
 
-                // Window events.
                 let with_window_event = |wev| x(WindowEvent { window_id: wid, event: wev });
 
                 with_window_event(CloseRequested);

@@ -22,8 +22,8 @@ pub(crate) struct InputMark {
     verb: InputVerb,
     cause: Option<aterm_slog::ShortId>,
     turn: bool,
-    /// What the input says it means for the box it dismisses (`act=`,
-    /// ruling T1), and what the agent's tracker held when it was admitted.
+    /// What the input says it means for the box it dismisses (`act=`),
+    /// and what the agent's tracker held when it was admitted.
     act: Option<aterm_slog::ActWord>,
     admission: Option<aterm_slog::Admission>,
     accepted: Arc<AtomicBool>,
@@ -58,7 +58,7 @@ impl InputMark {
         cause: Option<aterm_slog::ShortId>,
         turn: bool,
     ) -> Self {
-        // THE ADMISSION (ruling T1): the step the input may dismiss is the
+        // THE ADMISSION: the step the input may dismiss is the
         // one open now, under the lock taken before a byte is written.
         let (epoch, admission) = {
             let timeline = ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
@@ -80,7 +80,7 @@ impl InputMark {
         }
     }
 
-    /// The input's `act=` (ruling T1): what it means for the box it
+    /// The input's `act=`: what it means for the box it
     /// dismisses, read only from a proven author.
     pub(crate) fn acting(mut self, act: Option<aterm_slog::ActWord>) -> Self {
         self.act = act;

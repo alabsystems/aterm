@@ -9597,7 +9597,7 @@ mod registry_conformance_tests {
         }
     }
 
-    /// THE SESSION LOG'S TWO SWITCHES (session log Phase 6, step 6B-3; D3 and
+    /// THE SESSION LOG'S TWO SWITCHES (D3 and
     /// D6, ruled 2026-10-19) are Bool rows in the group and section of
     /// "Restore session at launch", seeded on from the resolved getters, and
     /// the writer types them as TOML booleans, like the `[packages]` switches:

@@ -826,7 +826,7 @@ pub(crate) struct GraphemeUnit {
 /// `Line` built from text alone, with no stored bits, lays VS16 out narrow;
 /// every line the grid stores comes from its cells.
 #[inline]
-pub(crate) fn stored_unit_is_wide(unit: GraphemeUnit, attrs: CellAttrs) -> bool {
+pub(crate) const fn stored_unit_is_wide(unit: GraphemeUnit, attrs: CellAttrs) -> bool {
     let stored_wide = CellFlags::from_bits(attrs.flags).contains(CellFlags::WIDE);
     !unit.force_narrow && (stored_wide || (unit.wide && !unit.vs16_widened))
 }
@@ -926,7 +926,7 @@ pub(crate) fn char_at(text: &str, byte_idx: usize) -> char {
 /// `char_width(c) == 0`, answered without the table for printable ASCII
 /// (always width 1; `ascii_fast_path_matches_the_scan` pins it).
 #[inline]
-pub(crate) fn is_zero_width(c: char) -> bool {
+pub(crate) const fn is_zero_width(c: char) -> bool {
     !matches!(c, ' '..='~') && aterm_grapheme::char_width(c) == 0
 }
 
@@ -1150,7 +1150,7 @@ impl SpacerValues {
 
     /// Fill the spacer's empty slots only: a span-shaped extra (a hyperlink) may
     /// already cover it, which keeps the pass idempotent.
-    pub(super) fn fill(self, spacer: &mut CellExtra) {
+    pub(super) const fn fill(self, spacer: &mut CellExtra) {
         if self.fg.is_some() && spacer.fg_rgb().is_none() {
             spacer.set_fg_rgb(self.fg);
         }

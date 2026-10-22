@@ -511,10 +511,10 @@ impl App {
             });
             let resume = tl.claude_footer().and_then(|facts| facts.resume.clone());
             let admit = (crate::harness_host::agent_of(a), a.program_pgid);
-            // The worker's NEEDS YOU sets as its loop told the host (§12.2.3,
-            // slice 2c): two `Arc`s, copied under this lock; a set is read
+            // The worker's NEEDS YOU sets as its loop told the host (§12.2.3):
+            // two `Arc`s, copied under this lock; a set is read
             // only beside its own entry (`NeedFacts::told_needs`), where the
-            // verdict says every need in it whole (slice 2d).
+            // verdict says every need in it whole.
             let told = tl.harness_needs();
             (agent, admit, stall, task, resume, a.age_ms(), told)
         };
@@ -943,8 +943,8 @@ impl App {
                 }
                 self.harness_screen_moved();
             }
-            // THE WORKER'S NEEDS YOU, WHOLE (§12.2.3 item 3, §12.2.11, slice
-            // 2c): the window's host already wrote the set on the session's
+            // THE WORKER'S NEEDS YOU, WHOLE (§12.2.3 item 3, §12.2.11):
+            // the window's host already wrote the set on the session's
             // timeline, on the loop's thread, before the entry's `meta set`
             // went out, so the publication that first sees the entry has its
             // words. The host wakes the window only where what a reader reads
@@ -954,7 +954,7 @@ impl App {
             // one place the words are read (its herald, chrome and menu; the
             // herald republishes Settings ▸ Harness where the verdict moved,
             // so the page is published once). No face, footer or chip moves.
-            // The tab's hover says every need (slice 2d) and is composed only
+            // The tab's hover says every need and is composed only
             // where a strip is stamped, which the refresh does only where the
             // pill's words moved: a set moving under one entry (`[a, b]` to
             // `[a, c]`) or a first tell beside a standing entry leaves them,
@@ -974,7 +974,7 @@ impl App {
                     self.restamp_for_hover(session);
                 }
             }
-            // WHY LAND STILL HOLDS (§12.3.3 item 3, slice 3c): the window's
+            // WHY LAND STILL HOLDS (§12.3.3 item 3): the window's
             // host already wrote the hold on the session's timeline, on the
             // loop's thread, where `status` reads it; it is read back here
             // under that leaf lock alone and kept on the glass. Beside a
@@ -1536,7 +1536,7 @@ impl App {
     /// `session` (§12.3.3 item 3, §12.4.3 item 1): its chip's face (`driven
     /// by aterm (land)` to `(land, landed)`) or its timer — or its harness's
     /// needs, a line each, where they moved and the pill's words did not
-    /// (§12.2.1, slice 2d: `HarnessFact::Needs`). The hover is
+    /// (§12.2.1, `HarnessFact::Needs`). The hover is
     /// composed only at a strip's refresh (`App::tab_tooltips`), so the
     /// windows whose tabs show the session are stamped again — those alone —
     /// and the menu bar's glance, which reads the same face, is dirtied. At
@@ -2005,8 +2005,7 @@ impl App {
     /// [`Self::tell_story`] told by `by` (the wire's `log_actor`, carried in
     /// `Wake::Story`): once the point is noted, the session log's `mark -
     /// story word=<verb>` (never a text) under the timeline alone, every
-    /// other lock let go, and then the log's watchers (session log phase 3B,
-    /// addendum A15).
+    /// other lock let go, and then the log's watchers.
     pub(crate) fn tell_story_by(
         &mut self,
         session: u64,
@@ -2445,7 +2444,7 @@ impl Desk for App {
     }
 }
 
-/// A HARNESS'S NEED ON THE TAB'S HOVER (§12.2.1, slice 2d): one `Needs
+/// A HARNESS'S NEED ON THE TAB'S HOVER (§12.2.1): one `Needs
 /// you: <the need in the worker's words>` line for every need the window
 /// holds the words of, each whole (up to the policy's 160 characters), the
 /// first need first — then `Claude Code carries on meanwhile` in the

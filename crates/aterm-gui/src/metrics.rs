@@ -563,7 +563,7 @@ window_ledger! {
         // the session, and the worst one.
         pub(crate) need_publish: Histogram,
         pub(crate) need_publish_max: Max,
-        // THE TRANSCRIPT APPLY'S HOLD (session log, ruling T31): how long one
+        // THE TRANSCRIPT APPLY'S HOLD (session log): how long one
         // chunk of a transcript batch holds a session's timeline lock on the
         // footer resolver's thread (`session_log::transcript::apply_batch`), the
         // lock the composer and the sweep take. `tx_chunk` books a full chunk
@@ -1230,7 +1230,7 @@ label_enum! {
         /// panel's turn every `PANEL_TICK` while it is up (placement, System
         /// Settings still running, one list read); and a worker's slot re-read
         /// while one is out. The folder warm-up's launch look and the once-per-Mac
-        /// debugger-access launch ask's next look (owner ruling O29) fold under it
+        /// debugger-access launch ask's next look fold under it
         /// too, each only while an aterm window is focused. Nothing waiting and no
         /// panel arm nothing.
         DevToolsHandOver => "devtools_hand_over",
@@ -1245,8 +1245,8 @@ label_enum! {
         /// `crate::control_theme`): one wake at the instant the preview reverts to
         /// the configured theme by itself. No preview arms nothing.
         ThemePreview => "theme_preview",
-        /// THE OVERVIEW'S FABRIC READ (`crate::overview_fabric`, session log
-        /// Phase 6 step 6E-7): one wake a minute after the last read of the
+        /// THE OVERVIEW'S FABRIC READ (`crate::overview_fabric`):
+        /// one wake a minute after the last read of the
         /// fabric's log began, while an Overview is open and no read is out.
         /// No card open, or no fabric, arms nothing.
         OverviewFabric => "overview_fabric",

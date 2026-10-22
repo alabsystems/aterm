@@ -258,6 +258,11 @@ struct Replayer {
     shadow: Option<SupervisorConfig>,
     pending_shadow: Option<Decided>,
     shadowed: Vec<(u64, Decided)>,
+    /// The host's doors the recording build had, as the tape's header names
+    /// them (`Header::host_doors`; none named on a tape from before):
+    /// [`ReplayCore::lacks_door`]. `None`, a core no header set (a test's),
+    /// lacks no door.
+    host_doors: Option<Vec<String>>,
 }
 
 impl ReplayCore {
@@ -330,6 +335,7 @@ impl ReplayCore {
                 shadow: None,
                 pending_shadow: None,
                 shadowed: Vec::new(),
+                host_doors: None,
             }),
             origin: now.checked_add(ORIGIN_AHEAD).unwrap_or(now),
             roots,
@@ -944,6 +950,24 @@ impl ReplayCore {
         self.lock().trace_at = Some(n);
     }
 
+    /// The host's doors the recording build had (`Header::host_doors`; an
+    /// empty set for a tape from before headers named them).
+    pub(crate) fn recorded_doors(&self, doors: Vec<String>) {
+        self.lock().host_doors = Some(doors);
+    }
+
+    /// Whether the recording build had no host door `door`, as its header
+    /// names its doors ([`Self::recorded_doors`]): where the answer's type
+    /// has one for that case (`TapeValue::absent`), the replay gives it and
+    /// takes no record (`Fx::host_exchange`). A core no header set lacks
+    /// none.
+    pub(crate) fn lacks_door(&self, door: &str) -> bool {
+        self.lock()
+            .host_doors
+            .as_ref()
+            .is_some_and(|doors| !doors.iter().any(|d| d == door))
+    }
+
     /// The candidate policy this SHADOW replay decides each turn end again
     /// under, if it is one (`Fx::shadow_policy`).
     pub(crate) fn shadow_policy(&self) -> Option<SupervisorConfig> {
@@ -1362,6 +1386,7 @@ fn run_replay(
         core.trace_at(n);
     }
     core.lock().shadow = shadow;
+    core.recorded_doors(header.host_doors.clone().unwrap_or_default());
     let fx = Fx::replay(Arc::clone(&core));
     let run = run_entry(&header, &fx);
     if let Some(door) = capped {

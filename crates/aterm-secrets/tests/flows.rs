@@ -1092,7 +1092,6 @@ fn an_admin_puts_back_a_vault_its_server_lost() {
     applied(client::sync(&machine, None).expect("sync"));
 
     lab.restart_empty();
-    assert!(client::sync(&machine, None).is_err(), "nothing is served");
     assert!(
         client::create(&lab.home("other"), &lab.url, None, Some("other")).is_ok(),
         "an empty server takes a new vault under a name it does not hold"

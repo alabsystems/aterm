@@ -184,7 +184,7 @@ fn only_a_removal_that_would_remove_something_disqualifies_the_launch() {
     );
 }
 
-/// ROUND EIGHT'S LEAD U42: the successor's control directory is the launcher's
+/// the successor's control directory is the launcher's
 /// by construction. The variables it is computed from travel explicitly from the
 /// launcher's own environment, whatever LaunchServices merges them over; one the
 /// `Command` sets wins, and one the launcher lacks is not invented.

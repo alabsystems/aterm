@@ -251,9 +251,11 @@ Run aterm's checks in place, alone or in any combination.
                                   machine's recovery ledger, not the tree
   verify glue <in.wasm> <out-dir> --flavor web|nodejs
                                   a wasm module's JS glue (`verify glue --help`)
-  verify fetch-browser            the pinned chrome-headless-shell, Firefox
-                                  and WebKit the browser check drives, into
-                                  this machine's cache
+  verify provision [--linux] [--record] [--check] [ROW...]
+                                  the tools this checkout pins (fish, pwsh,
+                                  binaryen, the browsers, rustup's stock
+                                  exceptions; lima, wasm-bindgen), fetched or
+                                  built into this user's cache
   verify browser-site DIR         the browser check's first half: both web
                                   modules built and the site laid in DIR
   verify browser-drive SITE OUT [--engine metal|swiftshader|firefox|webkit]...

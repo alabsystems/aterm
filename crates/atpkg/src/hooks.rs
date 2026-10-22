@@ -3904,8 +3904,8 @@ mod tests {
             };
             let want = spelled(want.clone());
             // The inherited PATH, then the hook's own answer sourced again (a nested shell),
-            // then the edges: a sole EMPTY entry beside the agents dir survives (review
-            // finding 2026-09-10), and a PATH of only the managed dirs stays exactly those.
+            // then the edges: a sole EMPTY entry beside the agents dir survives,
+            // and a PATH of only the managed dirs stays exactly those.
             let mut cases = vec![
                 (
                     inherited.clone(),

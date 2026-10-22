@@ -25,8 +25,8 @@
 //! (a bare-name `open` or `BROWSER` lands on the recorder). For codex-alab,
 //! `--no-daemon` keeps Codex's app server inside the process the tab (or
 //! `codex-run`) started, in the tree the witness watches and `down` ends; a
-//! vendor `codex` has no such flag and is launched without it
-//! ([`takes_no_daemon`]).
+//! vendor `codex` gets it where its bytes name it (0.163.0 does, 0.151.0 has
+//! no such flag and is launched without it) ([`takes_no_daemon`]).
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -283,39 +283,37 @@ pub fn safe_args(tab: bool, args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-/// Whether the Codex at `bin` takes `--no-daemon`, by what it is: codex-alab
-/// does, and its default starts the app server as a background daemon that
-/// leaves the tree and outlives it, from a copy of the package it installs
-/// into `CODEX_HOME`. A vendor `codex` has no such flag: 0.151.0 refuses it
-/// (`unexpected argument '--no-daemon'`). Files only, never a run, and the
-/// package says it where there is one (the one whose manifest names `bin`,
-/// as the host's readers find it):
+/// Whether the Codex at `bin` takes `--no-daemon`: codex-alab does, and its
+/// default starts the app server as a background daemon that leaves the tree
+/// and outlives it, from a copy of the package it installs into `CODEX_HOME`;
+/// so does vendor `codex` from some release after 0.151.0 (0.163.0 lists
+/// `--no-daemon  Run without the shared background server` and by default
+/// starts the same shared daemon), while 0.151.0 refuses it (`unexpected
+/// argument '--no-daemon'`). Files only, never a run:
 ///
-/// * its root carries ALab's build mark
-///   (`aterm_agent::harness::codex_alab::alab_bytes`): codex-alab;
-/// * its manifest's version is a release
-///   (`aterm_agent::harness::codex_alab::package_version`, which no ALab
-///   build's pre-release answers): a vendor `codex`, as 0.151.0's cask lays
-///   it;
-/// * else — a binary in no package (a `target/…/codex` dev build, a copy),
-///   or a package that says neither — its own bytes decide
-///   ([`names_no_daemon`]): a codex-alab outside a marked package takes the
-///   flag as surely, and a daemon left out of the jail is silent where a
-///   refused flag is loud. Vendor 0.151.0's bytes hold no `no-daemon`.
+/// * the package whose manifest names `bin` (as the host's readers find it)
+///   carries ALab's build mark
+///   (`aterm_agent::harness::codex_alab::alab_bytes`): codex-alab, read no
+///   further;
+/// * else the binary's own bytes decide ([`names_no_daemon`]), whatever its
+///   package's version says: a release version names no flag set (0.151.0
+///   and 0.163.0 are both releases), and a daemon left out of the jail is
+///   silent where a refused flag is loud. Measured on this machine: vendor
+///   0.163.0 and the store's codex-alab hold `no-daemon`, vendor 0.151.0
+///   holds none.
 #[must_use]
 pub fn takes_no_daemon(bin: &str) -> bool {
-    use aterm_agent::harness::codex_alab::{alab_bytes, package_version};
     let bin = Path::new(bin);
-    alab_bytes(bin) || (package_version(bin).is_none() && names_no_daemon(bin))
+    aterm_agent::harness::codex_alab::alab_bytes(bin) || names_no_daemon(bin)
 }
 
 /// Whether the regular file at `bin` holds the bytes `no-daemon` (clap keeps
 /// a long flag's name as a literal, so a binary that takes `--no-daemon`
 /// holds it), read in 4 MiB blocks with the needle's length less one carried
 /// across each seam. `false` for a file that cannot be read and for anything
-/// not a regular file (a FIFO would park the launch). Read only for a binary
-/// no package speaks for ([`takes_no_daemon`]): a debug lab reads a 250 MB
-/// build in a second or two.
+/// not a regular file (a FIFO would park the launch). Read for every binary
+/// but codex-alab's marked package ([`takes_no_daemon`]): a debug lab reads a
+/// 250 MB build in a second or two.
 #[must_use]
 pub fn names_no_daemon(bin: &Path) -> bool {
     use std::io::Read as _;
@@ -871,6 +869,10 @@ mod tests {
     /// flag among other text, as the store's build holds it.
     const NAMES_IT: &[u8] = b"\x00\xcf\xfa\xed\xfeno-daemon cannot be used with --remote\x00";
 
+    /// The bytes of a stand-in binary that takes no `--no-daemon`: the
+    /// literal's pieces, never the literal (vendor 0.151.0's case).
+    const NAMES_NONE: &[u8] = b"\x00\xcf\xfa\xed\xfeno-daemo\x00n-daemon\x00no-daemoN\x00";
+
     /// A Codex package at `root` (layout 1, `bin/codex` its entrypoint,
     /// holding `exe`), its manifest's version `version`, ALab's when `alab`
     /// (its `alab-build.json` beside the manifest): the binary's path.
@@ -894,18 +896,19 @@ mod tests {
     /// THE LAUNCHER EXECS CODEX BY PATH, `--no-daemon` ONLY WHERE IT IS
     /// TAKEN: codex-alab's package (its ALab build mark beside the manifest)
     /// is launched with `--no-daemon` before the caller's arguments, in the
-    /// tab and in `codex-run`; vendor `codex`'s — a release's package without
-    /// the mark, as 0.151.0's cask lays it, whatever its bytes — and a path
-    /// that is no file are launched without it, the arguments straight after
-    /// the binary. A binary in NO package (`LAB_CODEX` at a `target/…/codex`
-    /// dev build or a copy) is read: codex-alab's bytes name the flag and it
-    /// gets it, a binary whose bytes do not is launched without; and so is
-    /// one in a package that says neither (an unmarked pre-release).
-    /// NEGATIVE CONTROL: the mark written back into the vendor's package
-    /// brings `--no-daemon` back, and the dev build's bytes without the
+    /// tab and in `codex-run`, its bytes unread. Any other binary is read: a
+    /// vendor release's package whose bytes name the flag (0.163.0, which
+    /// takes it and by default runs a shared daemon) gets it; one whose bytes
+    /// do not (0.151.0, which refuses it) and a path that is no file are
+    /// launched without it, the arguments straight after the binary. So is a
+    /// binary in NO package (`LAB_CODEX` at a `target/…/codex` dev build or a
+    /// copy) and one in a package that says neither (an unmarked
+    /// pre-release): codex-alab's bytes name the flag and get it.
+    /// NEGATIVE CONTROL: the mark written into 0.151.0's package brings
+    /// `--no-daemon` in, and 0.163.0's and the dev build's bytes without the
     /// literal take it away.
     #[test]
-    fn the_launcher_execs_codex_by_path_with_no_daemon_only_for_codex_alab() {
+    fn the_launcher_execs_codex_by_path_with_no_daemon_where_it_is_taken() {
         let scratch = aterm_tempfile::tempdir().expect("exclusive package fixture");
         let alab = package_at(
             &scratch.path().join("alab b"),
@@ -913,14 +916,20 @@ mod tests {
             true,
             b"",
         );
-        let vendor = package_at(&scratch.path().join("vendor"), "0.151.0", false, NAMES_IT);
+        let vendor = package_at(&scratch.path().join("vendor"), "0.151.0", false, NAMES_NONE);
+        let vendor_163 = package_at(
+            &scratch.path().join("vendor 163"),
+            "0.163.0",
+            false,
+            NAMES_IT,
+        );
         let dev = scratch.path().join("codex-rs/target/release/codex");
         fs::create_dir_all(dev.parent().unwrap()).unwrap();
         fs::write(&dev, NAMES_IT).unwrap();
         let dev = dev.to_string_lossy().into_owned();
         let other = scratch.path().join("other/codex");
         fs::create_dir_all(other.parent().unwrap()).unwrap();
-        fs::write(&other, b"\x00\xcf\xfa\xed\xfeno-daemo\x00n-daemon\x00").unwrap();
+        fs::write(&other, NAMES_NONE).unwrap();
         let other = other.to_string_lossy().into_owned();
         let neither = package_at(
             &scratch.path().join("neither"),
@@ -970,7 +979,12 @@ mod tests {
         assert_eq!(
             takes(&vendor),
             [Some(false); 2],
-            "a vendor release's package"
+            "vendor 0.151.0: its bytes name no flag"
+        );
+        assert_eq!(
+            takes(&vendor_163),
+            [Some(true); 2],
+            "vendor 0.163.0: a release whose bytes name the flag"
         );
         assert_eq!(takes("/a b/codex"), [Some(false); 2], "no file");
         assert_eq!(takes(&dev), [Some(true); 2], "a codex-alab dev build");
@@ -980,12 +994,18 @@ mod tests {
             [Some(true); 2],
             "a package that says neither"
         );
-        // CONTROL: the mark brings it back to the vendor's package, and the
-        // dev build loses it with the literal.
-        let marked = package_at(&scratch.path().join("vendor"), "0.151.0", true, NAMES_IT);
+        // CONTROL: the mark brings it to 0.151.0's package, and 0.163.0's
+        // package and the dev build lose it with the literal.
+        let marked = package_at(&scratch.path().join("vendor"), "0.151.0", true, NAMES_NONE);
         assert_eq!(marked, vendor);
         assert_eq!(takes(&marked), [Some(true); 2], "CONTROL: the mark");
-        fs::write(&dev, b"\x00\xcf\xfa\xed\xfeno-daemoN\x00").unwrap();
+        fs::write(&vendor_163, NAMES_NONE).unwrap();
+        assert_eq!(
+            takes(&vendor_163),
+            [Some(false); 2],
+            "CONTROL: 0.163.0's literal"
+        );
+        fs::write(&dev, NAMES_NONE).unwrap();
         assert_eq!(takes(&dev), [Some(false); 2], "CONTROL: the literal");
     }
 

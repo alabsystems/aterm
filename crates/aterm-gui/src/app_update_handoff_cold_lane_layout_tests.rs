@@ -136,7 +136,7 @@ fn a_layout_the_disk_will_not_take_refuses_only_while_its_cause_passes() {
 /// The record a settled layout write leaves: why the new version opens
 /// without those tabs, in Messages, written before the switch.
 ///
-/// ROUND EIGHT, U48's REVIEW: ONCE PER TARGET BUILD AND CAUSE. A record is
+/// ONCE PER TARGET BUILD AND CAUSE. A record is
 /// never folded, so an `exec` that fails and is retried must not write it
 /// again.
 #[test]

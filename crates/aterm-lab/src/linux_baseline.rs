@@ -1,82 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The Linux lane's baseline (`linux baseline`; step LW.4 of
-//! `docs/AUDIT-third-party-2026-10-15.md`): what today's Linux stack (the
-//! winit fork's X11 and Wayland backends, softbuffer, x11rb, sctk, the AT-SPI
-//! publisher) does for one scripted aterm-gui session, recorded
-//! per architecture and screen ([`guest::Screen::BASELINE`]), and replayed
-//! against that record. The steps that replace the stack (LW.5-7, A11Y.2-5,
-//! GW.2-4) run the replay, and their commits diff the recordings.
-//!
-//! One session, in order, each item recording what happened (an item that
-//! fails records its failure, and the session goes on):
-//!
-//! 1. an AT-SPI listener (`lane-bus atspi-listen`, crates/aterm-dbus) on
-//!    at-spi2-core's bus, with `org.a11y.Status.IsEnabled` on for the
-//!    session, so aterm's AT-SPI publisher publishes from its first frame;
-//!    aterm-gui starts once the listener's match is in place;
-//! 2. aterm-gui in a scratch world (a prompt of its own, `lane$ `), `ready`;
-//!    `dims` (grid, scale, cell, font, frame, surface, padding, bands and
-//!    crop);
-//! 3. a typed `echo` whose output must appear; the AT-SPI tree walked
-//!    (`lane-bus atspi-walk`);
-//! 4. resizes from the control socket (30x100, 24x80, and a one-row flap),
-//!    and on X11 one from the window system (xdotool's `windowsize`), each
-//!    with `dims`; then `status` (`render=`, `resizes=`), the `resizes`
-//!    ledger and `cast drift`;
-//! 5. CLIPBOARD and PRIMARY, both ways, through a second client: on X11
-//!    xclip, with PRIMARY made by a real mouse drag and pasted by a real
-//!    middle click (xdotool's XTEST); under Mutter wl-clipboard, with the
-//!    keys, and PRIMARY's drag and middle click (since LW.7), from Mutter's
-//!    RemoteDesktop virtual keyboard and pointer (`lane-bus seat`), the only
-//!    input a headless compositor can be given here;
-//! 6. key repeat: a key held 1.5 s (XTEST on X11, the virtual keyboard
-//!    under Mutter), and how many characters it typed, with the server's
-//!    repeat settings as a stack line;
-//! 7. on X11, compose (a dead key through XTEST) and a file dropped by XDND
-//!    (`lane-bus xdnd`, a second X client as the drag source: dragged over
-//!    the window and away, then dropped), with the drop highlight read from
-//!    frames; after the session, XIM through ibus: the dead key again, and
-//!    a pinyin composition (ibus-libpinyin), its preedit and the spot aterm
-//!    gave it read from `chrome`'s `ime` line, then committed; then the X11
-//!    wire (X11-TRACE): a second aterm-gui through an `xtrace` proxy display,
-//!    started, typed at, resized and quit, its requests summed up as the
-//!    `x11.wire.*` lines ([`crate::linux_xwire`]);
-//! 8. the AT-SPI tree again, then the event stream the listener recorded,
-//!    its kinds and whether its text changes rebuild the end walk's text;
-//! 9. the present and input percentiles (`metrics percentiles`, reset after
-//!    `ready`), on llvmpipe: software rendering, never a GPU's figure;
-//! 10. the stack: the guest's packages, the crates the lock resolves for the
-//!     windowing and accessibility stack, the server's globals or
-//!     extensions, the GPU.
-//!
-//! Every wait for something that must happen is a one-minute hang detector:
-//! a paste is awaited on the typed line before the rest of the line is
-//! sent, a selection before it is read, a seat's keys before it lets go of
-//! the keyboard, and the AT-SPI listener's match before aterm starts.
-//!
-//! A recording is lines `<class> <key> <value>`:
-//!
-//! * `=` behaviour: the replay compares it exactly, and a line that moved,
-//!   came or went is a FAIL;
-//! * `~` measured (counts and latencies that move from run to run, and the
-//!   raw AT-SPI event stream, whose batching follows frame timing): shown
-//!   when it moves, never a verdict;
-//! * `@` the stack: shown as the stack's diff, never a verdict;
-//! * `#` a comment.
-//!
-//! The recordings live in `crates/aterm-lab/linux-baseline/<arch>-<screen>.txt`.
-//! `linux baseline` records afresh and compares (exit 0 the same behaviour,
-//! 1 it moved, 3 NOT RUN); `--record` writes the fresh ones there. An item
-//! this session does not drive is a line `= not-driven.<item> <token>`, the
-//! token a short word for why (`no-seat`, `no-keycode`, …), and the reason in
-//! prose a `#` comment, which the replay never compares: the line moves (and
-//! the replay says so) the day the item is driven, never when its
-//! explanation is reworded.
-//!
-//! STOCK EXCEPTION: the guest builds with rustup's stock toolchain, as the
-//! proof does ([`crate::linux_proof`]).
+//! Scripted Linux baseline session (`linux baseline`): records and replays `<class> <key> <value>` lines (`=` behaviour, `~` measured, `@` stack, `#` comment) per architecture and [`guest::Screen::BASELINE`].
+//! STOCK EXCEPTION: the guest builds with rustup's stock toolchain, as [`crate::linux_proof`] does.
 
 use std::collections::BTreeSet;
 use std::fmt::Write as _;
@@ -93,77 +19,57 @@ mod deck;
 
 pub(crate) use deck::{row as deck_row, row_name as deck_row_name};
 
-/// Where the recordings are committed, under the checkout.
+/// Committed recordings directory under the checkout.
 pub const DIR: &str = "crates/aterm-lab/linux-baseline";
 
-/// The application name aterm-gui's AT-SPI root carries (aterm-a11y's
-/// publisher names it after the executable, as accesskit_unix did).
+/// AT-SPI root application name for `aterm-gui`.
 pub const APP: &str = "aterm-gui";
 
-/// The compose check: `echo X-` sent, `x` typed and seen (the typed line
-/// shows `echo X-x`, its output never does: the shell has not run it yet),
-/// `dead_acute` then `e` typed, `-Y` sent.
+/// Prefix sent before the compose check.
 pub const COMPOSE_BEFORE: &str = "echo X-";
 pub const COMPOSE_LIVE: &str = "echo X-x";
 pub const COMPOSE_AFTER: &str = "-Y";
 pub const COMPOSED: &str = "X-x\u{e9}-Y";
 
-/// The input-method check (Mutter, under GNOME Shell): after `echo X-` and a
-/// plain `x`, one burst of BackSpace, `dead_acute` and `e`, aterm-gui stopped
-/// across it. The input method passes the BackSpace back as a key and commits
-/// the `é` through text-input-v3, both read in one dispatch once aterm-gui
-/// continues; applied in the order they came (fb676e9b67), the BackSpace takes
-/// the `x` and the shell prints `X-é-Y`. Applied commit first, it would take
-/// the `é`, and the shell would print `X-x-Y`.
+/// Expected shell output for the Mutter input-method compose check.
 pub const IME_COMPOSED: &str = "X-\u{e9}-Y";
 
-/// ibus's engine for the XIM check: its simple engine, which composes dead
-/// keys (an engine must be set, or ibus passes every key through untouched).
+/// IBus engine for dead-key XIM composition.
 pub const XIM_ENGINE: &str = "xkb:us::eng";
 
-/// ibus's CJK engine for the XIM item's second half (L-HEADER-LW7,
-/// linux-xim-cjk-preedit): libpinyin, which holds the pinyin typed as a
-/// composition and commits its first candidate on space.
+/// IBus CJK engine for pinyin XIM composition.
 pub const XIM_CJK_ENGINE: &str = "libpinyin";
 
-/// The pinyin typed to it, one key at a time.
+/// Pinyin keys typed to [`XIM_CJK_ENGINE`].
 pub const XIM_CJK_KEYS: [&str; 5] = ["n", "i", "h", "a", "o"];
 
-/// The pinyin's first candidate, committed between `echo X-` and `-Y`.
+/// Committed first candidate for [`XIM_CJK_KEYS`].
 pub const XIM_CJK_TEXT: &str = "\u{4f60}\u{597d}";
 
-/// How long a key is held for the repeat measurement.
+/// Key-hold duration in milliseconds for the repeat measurement.
 pub const HOLD_MS: u64 = 1500;
 
-/// The XDND check's file: created in the guest before the drag (the target
-/// resolves the path it is given), with a space in its name, which the uri
-/// carries percent-encoded, the target decodes, and aterm types
-/// shell-escaped.
+/// Guest directory for the XDND drop test file.
 pub const DND_DIR: &str = "/tmp/aterm-lane-dnd";
 pub const DND_FILE: &str = "dropped file.txt";
 pub const DND_URI: &str = "file:///tmp/aterm-lane-dnd/dropped%20file.txt";
 
-/// Why weston's outside resize is not driven: Mutter's is, through a binding
-/// its RemoteDesktop keyboard presses.
+/// Reason weston headless outside resize is not driven.
 pub const RESIZE_OS_WESTON: &str = "weston's headless backend has no seat, so no binding of its own reaches the window, and no tool here resizes a Wayland client from outside (Mutter's is driven, resize.os.tiled-left, and weston-x11's, resize.os.maximized from its seat)";
 
-/// The Wayland global a compositor offers PRIMARY through.
+/// Wayland global name for primary selection.
 pub const PRIMARY_GLOBAL: &str = "zwp_primary_selection_device_manager_v1";
 
-/// What the CPU item types on the seat's keyboard and enters, and the row
-/// only the shell's answer makes: every key on its key's first level, as
-/// `lane-bus xseat` presses keys.
+/// Command typed on the seat keyboard for the CPU presenter check.
 pub const CPU_TYPED: &str = "echo lane-seat";
 pub const CPU_ECHO: &str = "lane-seat";
 
-/// Why touch is not driven under weston's x11 backend, headless weston and
-/// the X11 screens: Mutter's is, through a RemoteDesktop finger.
+/// Reason touch input is not driven on X11 and weston backends.
 pub const TOUCH_WESTON_X11: &str = "weston's x11 backend gives its seat a pointer and a keyboard, no touch, and XTEST fakes no touchscreen (lane-bus xseat refuses a finger step); Mutter's is driven, through a RemoteDesktop finger";
 pub const TOUCH_WESTON: &str = "weston's headless backend advertises no wl_seat, so no touch reaches a client; Mutter's is driven, through a RemoteDesktop finger";
 pub const TOUCH_X11: &str = "the lane's X servers have no touch device, which XInput 2's touch events come from, and XTEST fakes no touchscreen; Mutter's is driven, through a RemoteDesktop finger";
 
-/// The seat's steps that type `text`, a key each: a space is `space`, any
-/// other character its own keysym.
+/// Seat key steps that type `text` one character at a time.
 #[must_use]
 pub fn seat_taps(text: &str) -> Vec<String> {
     text.chars()
@@ -174,31 +80,23 @@ pub fn seat_taps(text: &str) -> Vec<String> {
         .collect()
 }
 
-/// What the drop types that no earlier row shows: awaited on the typed line.
+/// Filename stem awaited on the typed line after a drop.
 pub const DND_STEM: &str = "aterm-lane-dnd";
 
-/// A window pixel, `(x, y)`.
 type Px = (i32, i32);
 
-/// How a check types through the window system: XTEST on an X display (to
-/// an XIM `server` or not), or the RemoteDesktop keyboard (Mutter).
 #[derive(Clone, Copy)]
 enum Typist<'a> {
     X { display: &'a str, server: bool },
     Seat,
 }
 
-/// A decoded frame: RGBA pixels, row-major.
 struct Frame {
     rgba: Vec<u8>,
     w: usize,
     h: usize,
 }
 
-/// How much of frame `b` differs from `a`, as a class a replay compares:
-/// `at most a cell` (at most 1% of the pixels: no change, or a cursor's
-/// blink), `most pixels` (over half: a wash over the window), or `part`;
-/// and the count, which is measured.
 fn frame_change(a: &Frame, b: &Frame) -> (String, String) {
     if (a.w, a.h) != (b.w, b.h) {
         let size = format!("{}x{} against {}x{}", b.w, b.h, a.w, a.h);
@@ -218,13 +116,7 @@ fn frame_change(a: &Frame, b: &Frame) -> (String, String) {
     (class.into(), format!("{differ} of {pixels} pixels"))
 }
 
-/// The text-input-v3 part of a client's Wayland wire log
-/// (`WAYLAND_DEBUG=client`): the manager's version as bound, then each
-/// request (`->`) and event the client logged on a `zwp_text_input*`
-/// object, by interface and name, once each, in the order they first came.
-/// Object ids and arguments are left out (a cursor rectangle follows where
-/// the prompt was when focus came, which is timing), except a content
-/// type's, which says what the client declares itself.
+/// Extract the deduplicated `zwp_text_input*` request/event sequence from a Wayland client wire log.
 #[must_use]
 pub fn text_input_wire(log: &str) -> String {
     let mut bound = Vec::new();
@@ -291,10 +183,7 @@ pub fn text_input_wire(log: &str) -> String {
     )
 }
 
-/// The touch part of a client's Wayland wire log (`WAYLAND_DEBUG=client`):
-/// each request (`->`) it made for or on a touch (`wl_seat.get_touch`,
-/// `wl_touch.*`) and each `wl_touch` event, by interface and name, once
-/// each, in the order they first came.
+/// Extract the deduplicated `wl_touch` request/event sequence from a Wayland client wire log.
 #[must_use]
 pub fn touch_wire(log: &str) -> String {
     let mut requests: Vec<String> = Vec::new();
@@ -335,9 +224,7 @@ pub fn touch_wire(log: &str) -> String {
     format!("requests {}; events {}", show(&requests), show(&events))
 }
 
-/// The arguments of the first `wl_touch.down` in a client's Wayland wire log
-/// past its serial, time and surface: the touch's id and its surface-local
-/// position, as logged.
+/// Extract the touch id and surface-local position of the first `wl_touch.down` in `log`.
 #[must_use]
 pub fn touch_down_at(log: &str) -> Option<String> {
     let line = log
@@ -352,19 +239,7 @@ pub fn touch_down_at(log: &str) -> Option<String> {
     (parts.len() == 6).then(|| format!("id {} at {},{}", parts[3], parts[4], parts[5]))
 }
 
-/// What a Wayland drag source's report `lines` (`lane-wl drag`'s) says past
-/// its first `seen` lines, once it says what `want` waits for; `None` until
-/// then. `want` is a target type (its last `target` line past `seen`) with
-/// the action `want.1` (its last `action` line anywhere), when one is wanted:
-/// the target, and the action when one came past `seen` (how many `target
-/// none` came on the way, while Mutter moved the drag's focus, follows the
-/// motions: the whole stream is measured). A `want.0` of `none` is the
-/// window's leave: `target none` past `seen` (Mutter tells the source so),
-/// else an `action none` there, the offer weston makes the client under the
-/// pointer next (weston 13 tells the source nothing at a leave, and its
-/// desktop-shell's panel and background take a drag's offer, as every
-/// client of its toolkit does, without accepting it: measured 2026-10-19,
-/// the source heard `action none` then `action copy` and no target).
+/// Match `want` (`(target, action)`) in `lane-wl drag` report lines after `seen`.
 #[must_use]
 pub fn source_heard(lines: &[&str], seen: usize, want: (&str, Option<&str>)) -> Option<String> {
     let new = lines.get(seen..).unwrap_or_default();
@@ -382,11 +257,7 @@ pub fn source_heard(lines: &[&str], seen: usize, want: (&str, Option<&str>)) -> 
         .then(|| "action none".to_string())
 }
 
-/// The window's own frame as aterm-gui's `chrome` verb reports it (its
-/// `strip-caption` line, LW.5): whether the window draws its own frame
-/// (`frame=client`, a Wayland compositor that leaves the client undecorated)
-/// or the window system decorates it (`frame=system`), and the header's
-/// buttons as the strip laid them out, by name and strip columns.
+/// Window frame mode (`client` or `system`) and header button spans from `chrome`'s `strip-caption` line.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Caption {
     pub client: bool,
@@ -397,7 +268,7 @@ pub struct Caption {
 }
 
 impl Caption {
-    /// The middle strip column of the button named `name`.
+    /// Middle strip column of the button named `name`.
     #[must_use]
     pub fn middle(&self, name: &str) -> Option<u16> {
         self.buttons
@@ -406,10 +277,7 @@ impl Caption {
             .map(|&(_, s, e)| s + (e - s) / 2)
     }
 
-    /// The first strip column of the right end's buttons on a `cols`-wide
-    /// strip, or `cols` where none is there: the buttons in one run from
-    /// column 0 are the left end's (GNOME's `button-layout` can put buttons
-    /// at either end, aterm-gui's `client_frame::ButtonLayout`).
+    /// First strip column of the right-aligned header buttons on a `cols`-wide strip, or `cols`.
     #[must_use]
     pub fn right_end(&self, cols: u16) -> u16 {
         let mut slots: Vec<(u16, u16)> = self.buttons.iter().map(|&(_, s, e)| (s, e)).collect();
@@ -428,7 +296,7 @@ impl Caption {
             .map_or(cols, |(s, _)| s)
     }
 
-    /// The buttons' names, in strip order, `none` without any.
+    /// Comma-separated button names in strip order, or `none`.
     #[must_use]
     pub fn names(&self) -> String {
         if self.buttons.is_empty() {
@@ -442,7 +310,7 @@ impl Caption {
     }
 }
 
-/// The `strip-caption` line of a `chrome` reply, read; `None` without one.
+/// Parse the `strip-caption` line of a `chrome` reply.
 #[must_use]
 pub fn parse_caption(chrome: &str) -> Option<Caption> {
     let line = chrome
@@ -474,11 +342,7 @@ pub fn parse_caption(chrome: &str) -> Option<Caption> {
     Some(c)
 }
 
-/// The `xdg_toplevel` requests a client's wire log (`WAYLAND_DEBUG=client`)
-/// shows for the frame's gestures, by name, once each, in the order they
-/// first came: `move`, `resize(<edge>)` (xdg-shell's edge, by name),
-/// `show_window_menu`, `set_maximized`, `unset_maximized`, `set_minimized`.
-/// Serials and positions are left out: they follow the seat and the timing.
+/// Extract the deduplicated `xdg_toplevel` frame-gesture requests from a Wayland client wire log.
 #[must_use]
 pub fn frame_requests(log: &str) -> String {
     const EDGES: [(&str, &str); 8] = [
@@ -533,10 +397,7 @@ pub fn frame_requests(log: &str) -> String {
     }
 }
 
-/// The cells one header button's slot takes at `scale` on `cell_w`-px cells:
-/// aterm-gui's rule (`client_frame::CaptionSlot::measure`), 34 logical px
-/// rounded up to whole cells; the lab reads a window the system decorates
-/// through the same slots, so its negative control is the same pixels.
+/// Width in cells of one 34-logical-px header button slot at `scale` on `cell_w`-px cells.
 #[must_use]
 pub fn caption_slot_cols(cell_w: u32, scale: f64) -> u16 {
     if cell_w == 0 {
@@ -551,11 +412,6 @@ pub fn caption_slot_cols(cell_w: u32, scale: f64) -> u16 {
     }
 }
 
-/// How a header slot `[x0, x1)` × `[y0, y1)` of frame `f` reads: `drawn`
-/// when more than a tenth of its pixels differ from the slot's top-left one
-/// (the bare band above the button row), else `bare`; and the count. `y0` is
-/// where the band starts: the frame's top, or the foot of a stats Deck over
-/// it.
 fn slot_class(f: &Frame, x0: usize, x1: usize, y0: usize, y1: usize) -> (&'static str, usize) {
     let (x1, y1) = (x1.min(f.w), y1.min(f.h));
     if x0 >= x1 || y0 >= y1 {
@@ -582,7 +438,7 @@ fn slot_class(f: &Frame, x0: usize, x1: usize, y0: usize, y1: usize) -> (&'stati
     (class, differ)
 }
 
-/// The `chrome` verb's `ime` line: `ime preedit="<text>" caret=<n|-> spot=<x>,<y>,<w>x<h>|-`.
+/// Extract the `ime` line from a `chrome` reply.
 #[must_use]
 pub fn ime_line(chrome: &str) -> Option<&str> {
     chrome
@@ -591,14 +447,14 @@ pub fn ime_line(chrome: &str) -> Option<&str> {
         .find(|l| l.starts_with("ime preedit="))
 }
 
-/// An `ime` line's composition, its text and caret, without the spot.
+/// Strip the `spot=` suffix from an `ime` line, keeping preedit text and caret.
 #[must_use]
 pub fn ime_composition(line: &str) -> &str {
     line.rsplit_once(" spot=")
         .map_or(line, |(composition, _spot)| composition)
 }
 
-/// What is typed after the screen's last prompt (`lane$ `).
+/// Text typed after the last `lane$ ` prompt on `screen`.
 #[must_use]
 pub fn typed_line(screen: &str) -> String {
     screen
@@ -611,14 +467,14 @@ pub fn typed_line(screen: &str) -> String {
         .unwrap_or_default()
 }
 
-/// A line's class.
+/// Recording line class.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Class {
-    /// `=`: compared exactly.
+    /// `=`: behaviour compared exactly on replay.
     Behaviour,
-    /// `~`: shown when it moves.
+    /// `~`: measured figure shown when it moves.
     Measured,
-    /// `@`: the stack.
+    /// `@`: stack metadata.
     Stack,
 }
 
@@ -642,7 +498,7 @@ impl Class {
     }
 }
 
-/// One line of a recording.
+/// One `<class> <key> <value>` line of a recording.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Line {
     pub class: Class,
@@ -650,7 +506,7 @@ pub struct Line {
     pub value: String,
 }
 
-/// A recording: a title, comments, and lines with unique keys, in order.
+/// Ordered recording lines with unique keys and header comments.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Recording {
     pub comments: Vec<String>,
@@ -658,8 +514,7 @@ pub struct Recording {
 }
 
 impl Recording {
-    /// Add a line. A key already present gets `.<n>` appended, so every key
-    /// stays unique and the order of repeats is kept.
+    /// Append a line, disambiguating duplicate keys with `.<n>`.
     pub fn push(&mut self, class: Class, key: &str, value: impl Into<String>) {
         let mut k = key.to_string();
         let mut n = 2;
@@ -687,15 +542,14 @@ impl Recording {
         self.push(Class::Stack, key, value);
     }
 
-    /// An item this session does not drive: `= not-driven.<item> <token>`,
-    /// and `why` in a comment, which no replay compares.
+    /// Record `= not-driven.<item> <token>` with `why` as a `#` comment.
     pub fn not_driven(&mut self, item: &str, token: &str, why: &str) {
         self.behaviour(&format!("not-driven.{item}"), token);
         self.comments
             .push(format!("not-driven.{item} {token}: {}", one_line(why)));
     }
 
-    /// The text committed: the comments, then one line each.
+    /// Format comments and lines as committed recording text.
     #[must_use]
     pub fn render(&self) -> String {
         let mut s = String::new();
@@ -708,11 +562,7 @@ impl Recording {
         s
     }
 
-    /// Read a committed recording. A line that is neither a comment nor
-    /// `<class> <key> <value>` is an error, never skipped.
-    ///
-    /// # Errors
-    /// The line, numbered from 1.
+    /// Parse committed recording text.
     pub fn parse(text: &str) -> Result<Recording, String> {
         let mut r = Recording::default();
         for (i, raw) in text.lines().enumerate() {
@@ -751,15 +601,11 @@ impl Recording {
     }
 }
 
-/// A value on one line: its newlines and carriage returns shown as `\n` and
-/// `\r`. Nothing else is escaped, so a value lane-bus already escaped reads
-/// as it printed it.
 fn one_line(s: &str) -> String {
     s.trim_end().replace('\n', "\\n").replace('\r', "\\r")
 }
 
-/// What moved between a committed recording and a fresh one, by class: each
-/// entry the key, the committed value and the fresh one (`None`: absent).
+/// Per-class differences between a committed and a fresh [`Recording`].
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct Diff {
     pub behaviour: Vec<(String, Option<String>, Option<String>)>,
@@ -774,9 +620,7 @@ impl Diff {
     }
 }
 
-/// Compare a fresh recording with the committed one. A key's class is the
-/// committed line's when both have it; a line only one side has is judged
-/// by its own class, so a behaviour line that appears or vanishes fails.
+/// Diff `new` against `old`, classifying keys by `old` when present in both.
 #[must_use]
 pub fn compare(old: &Recording, new: &Recording) -> Diff {
     let mut d = Diff::default();
@@ -803,8 +647,7 @@ pub fn compare(old: &Recording, new: &Recording) -> Diff {
     d
 }
 
-/// The diff, as the report prints it: behaviour first, every line; the
-/// stack's and the measured lines' after, the measured ones capped.
+/// Format `d` for the report, capping measured diffs at `measured_cap`.
 #[must_use]
 pub fn render_diff(d: &Diff, measured_cap: usize) -> String {
     let mut s = String::new();
@@ -824,26 +667,19 @@ pub fn render_diff(d: &Diff, measured_cap: usize) -> String {
     s
 }
 
-/// What `baseline` was asked.
+/// Parsed CLI arguments for `linux baseline`.
 #[derive(Debug, PartialEq, Eq)]
 pub struct BaselineArgs {
     pub arches: Vec<Arch>,
     pub screens: Vec<Screen>,
     pub record: bool,
-    /// aterm-gui built with aterm-gpu's `wgpu-oracle`, so its windows draw
-    /// on wgpu (Vulkan on the lane's lavapipe), the Linux renderer before
-    /// the GL arm: GW.2's other arm, replayed against the shipped
-    /// renderer's recordings and never recorded.
+    /// Build `aterm-gui` with `wgpu-oracle` and replay against the default recordings.
     pub wgpu_oracle: bool,
     pub keep_build: bool,
     pub keep_up: bool,
 }
 
-/// `baseline [--arch A]... [--screen S]... [--record | --wgpu-oracle]
-/// [--keep-build] [--keep-up]`: every arch and screen when none is named.
-///
-/// # Errors
-/// A usage error.
+/// Parse `linux baseline` CLI arguments.
 pub fn parse_baseline(args: &[String]) -> Result<BaselineArgs, Fail> {
     let mut b = BaselineArgs {
         arches: Vec::new(),
@@ -905,16 +741,12 @@ pub fn parse_baseline(args: &[String]) -> Result<BaselineArgs, Fail> {
     Ok(b)
 }
 
-/// The committed recording's file name.
+/// Committed recording filename for `arch` and `screen`.
 #[must_use]
 pub fn file_name(arch: Arch, screen: Screen) -> String {
     format!("{}-{}.txt", arch.name(), screen.name())
 }
 
-/// The `dims` fields a recording keeps, in this order: every one that says
-/// how the grid sits in the window (the head and padding a Wayland CSD
-/// header moves, the bands and crop a resize leaves), none that is a count
-/// of viewers or a present retry.
 const DIMS_FIELDS: [&str; 27] = [
     "scale",
     "cell_w",
@@ -945,8 +777,7 @@ const DIMS_FIELDS: [&str; 27] = [
     "tab_rows",
 ];
 
-/// A `dims` reply as a recording keeps it: `<rows>x<cols>` and the fields
-/// that say how the grid sits in the window.
+/// Keep the grid dimensions and layout fields from a `dims` reply.
 #[must_use]
 pub fn dims_summary(reply: &str) -> String {
     let mut w = reply.split_whitespace();
@@ -961,18 +792,9 @@ pub fn dims_summary(reply: &str) -> String {
     s
 }
 
-/// The fields of a `resizes` ledger line that are behaviour: which resize,
-/// from what grid to what, from where (`site=`), on which screen, and the
-/// window's grid. How its rows moved (`trimmed=`, `appended=`, `restored=`,
-/// `shift=`, …) and which run it joined (`run=`) follow what the shell had
-/// drawn when it landed: the flap's halves straddle bash's SIGWINCH redraw or
-/// not, which decides whether they join one run and whether the undo
-/// restores the quiet flap (aterm-gui's resize_ledger.rs, `joins_run`).
 const RESIZE_BEHAVIOUR: [&str; 8] = ["ord", "from", "to", "alt", "sync", "site", "win", "chrome"];
 
-/// A `resizes` ledger line as a recording keeps it: its behaviour fields,
-/// and everything but the time (`t=`) and the source line that booked it
-/// (`at=`, which moves with every edit of the file) as a measured line.
+/// Split a `resizes` ledger line into its behaviour fields and timing-sensitive measured fields.
 #[must_use]
 pub fn resize_line(line: &str) -> (String, String) {
     let words: Vec<&str> = line.split_whitespace().collect();
@@ -995,12 +817,8 @@ pub fn resize_line(line: &str) -> (String, String) {
     (behaviour, measured)
 }
 
-/// The fields of the `resizes` summary that are behaviour: how many resizes,
-/// risks and lost or unledgered ones, and the render verdict. How they fell
-/// into runs and flaps is timing, as for each resize.
 const SUMMARY_BEHAVIOUR: [&str; 5] = ["total", "risks", "render", "unledgered", "lost"];
 
-/// Keep the `key=value` words of `line` whose key is in `keys`, in order.
 fn keep_fields(line: &str, keys: &[&str]) -> String {
     line.split_whitespace()
         .filter(|w| w.split_once('=').is_some_and(|(k, _)| keys.contains(&k)))
@@ -1008,10 +826,7 @@ fn keep_fields(line: &str, keys: &[&str]) -> String {
         .join(" ")
 }
 
-/// `text` as an `await match` pattern that matches it literally: the regex
-/// metacharacters escaped, and each space as `\s`, since aterm-gui splits
-/// the verb's words on whitespace (a space would end the pattern there, and
-/// `echo X-x` would wait for `echo`, which an earlier row already shows).
+/// Escape `text` as a single-word `await match` regex literal.
 #[must_use]
 pub fn regex_literal(text: &str) -> String {
     let mut out = String::with_capacity(text.len() + 8);
@@ -1028,10 +843,6 @@ pub fn regex_literal(text: &str) -> String {
     out
 }
 
-/// The fields of a `cast drift` reply that are its verdict: what it found
-/// and against what. How many runs and candidates it replayed follows how
-/// the resizes fell into runs, which is timing (measured: two runs of the
-/// same script gave `runs=1` and `runs=2`).
 const DRIFT_VERDICT: [&str; 6] = [
     "verdict",
     "fidelity",
@@ -1041,8 +852,7 @@ const DRIFT_VERDICT: [&str; 6] = [
     "geom",
 ];
 
-/// A `cast drift` reply's verdict, and the rest of its first line without
-/// the fields that move with timing (`anchor=`, `ms=`).
+/// Split a `cast drift` reply into its behaviour verdict and measured fields.
 #[must_use]
 pub fn drift_line(reply: &str) -> (String, String) {
     let first = reply.lines().next().unwrap_or_default();
@@ -1059,24 +869,20 @@ pub fn drift_line(reply: &str) -> (String, String) {
     (verdict, rest)
 }
 
-/// One AT-SPI event as `lane-bus atspi-listen` writes it
-/// (`<ms> <pid> <Iface.Member> <path> <body>`): the process that emitted it,
-/// and the event without its time.
+/// Split a `lane-bus atspi-listen` line into `(pid, event_without_timestamp)`.
 #[must_use]
 pub fn event_parts(line: &str) -> Option<(&str, &str)> {
     let (_, rest) = line.split_once(' ')?;
     rest.split_once(' ')
 }
 
-/// The event without its time and process.
+/// Strip the timestamp and PID from an `atspi-listen` line.
 #[must_use]
 pub fn event_body(line: &str) -> &str {
     event_parts(line).map_or(line, |(_, body)| body)
 }
 
-/// The kind of an event, by the role its path has in the walks
-/// (`roles`: path → role): `<Iface.Member>:<detail>@<role>`, and for a
-/// state change the new value too.
+/// Classify an AT-SPI event line as `<Iface.Member>:<detail>@<role>` using `roles`.
 #[must_use]
 pub fn event_kind(line: &str, roles: &[(String, String)]) -> String {
     let body = event_body(line);
@@ -1101,8 +907,7 @@ pub fn event_kind(line: &str, roles: &[(String, String)]) -> String {
     kind
 }
 
-/// A walk's node line split into its path and the rest (the path is
-/// the publisher's numbering, not behaviour a reader sees).
+/// Split an `atspi-walk` node line into `(path, rest)`.
 #[must_use]
 pub fn node_parts(line: &str) -> Option<(&str, String)> {
     let rest = line.strip_prefix("node ")?;
@@ -1115,13 +920,11 @@ pub fn node_parts(line: &str) -> Option<(&str, String)> {
     Some((path, without))
 }
 
-/// The role a node line names.
 fn node_role(line: &str) -> Option<&str> {
     proof::field(line, "role")
 }
 
-/// The value of ` key="…"` in `line`, unescaped as lane-bus quotes a string
-/// (`\"`, `\\`, `\n`, `\t`, `\r`, `\u{…}`).
+/// Extract and unescape `key="…"` from `line`.
 #[must_use]
 pub fn quoted_field(line: &str, key: &str) -> Option<String> {
     let open = format!(" {key}=\"");
@@ -1150,12 +953,7 @@ pub fn quoted_field(line: &str, key: &str) -> Option<String> {
     None
 }
 
-/// Whether the event stream's text changes rebuild the end walk's text, and
-/// whether its last caret event names the end walk's caret. Undone in
-/// reverse from the end walk's text, each insert must find its own text at
-/// its offset and each delete must fit; that holds however the changes were
-/// batched, so the line is behaviour, where the stream itself is measured.
-/// `events` are this aterm's, in order; `roles` maps paths to roles.
+/// Verify that undoing `events` in reverse from `end_text` matches every insert/delete and the final caret.
 #[must_use]
 pub fn text_replay(
     events: &[&str],
@@ -1214,10 +1012,6 @@ pub fn text_replay(
     } else {
         "the text changes undo cleanly from the end walk's text".to_string()
     };
-    // A caret event comes only while the terminal has focus (none at all
-    // under weston, none after Mutter's keyboard goes), so a caret moved
-    // since is behaviour too; where it moved to follows the key repeat's
-    // count, which is timing.
     let caret = match (last_caret.as_deref(), end_caret) {
         (None, _) => "no caret event",
         (Some(a), Some(b)) if a == b => "the last caret event names the end walk's caret",
@@ -1226,8 +1020,7 @@ pub fn text_replay(
     format!("{rebuilt}; {caret}")
 }
 
-/// How many times `ch` follows the prompt on the screen's last prompt row:
-/// the characters a held key typed.
+/// Count consecutive `ch` characters after the last `lane$ ` prompt on `screen`.
 #[must_use]
 pub fn typed_after_prompt(screen: &str, ch: char) -> usize {
     screen
@@ -1237,7 +1030,7 @@ pub fn typed_after_prompt(screen: &str, ch: char) -> usize {
         .map_or(0, |typed| typed.chars().filter(|c| *c == ch).count())
 }
 
-/// `xset q`'s repeat settings: `delay=<ms> rate=<hz>`.
+/// Parse `delay=<ms> rate=<hz>` from `xset q` output.
 #[must_use]
 pub fn xset_repeat(text: &str) -> Option<String> {
     let line = text.lines().find(|l| l.contains("auto repeat delay:"))?;
@@ -1251,8 +1044,7 @@ pub fn xset_repeat(text: &str) -> Option<String> {
     }
 }
 
-/// wayland-info's keyboard repeat settings (`wl_keyboard.repeat_info`, which
-/// it prints under a seat that has a keyboard): `delay=<ms> rate=<hz>`.
+/// Parse `delay=<ms> rate=<hz>` from `wayland-info` output.
 #[must_use]
 pub fn wayland_repeat(text: &str) -> Option<String> {
     let number = |key: &str| {
@@ -1270,7 +1062,7 @@ pub fn wayland_repeat(text: &str) -> Option<String> {
     ))
 }
 
-/// wayland-info's globals: `name@version`, sorted.
+/// Parse sorted `interface@version` globals from `wayland-info` output.
 #[must_use]
 pub fn wayland_globals(text: &str) -> String {
     let mut g: Vec<String> = text
@@ -1287,7 +1079,7 @@ pub fn wayland_globals(text: &str) -> String {
     g.join(",")
 }
 
-/// `setxkbmap -query`'s layout and variant: `us intl`.
+/// Parse layout and variant from `setxkbmap -query` output.
 #[must_use]
 pub fn keymap_summary(text: &str) -> String {
     let get = |k: &str| {
@@ -1300,7 +1092,7 @@ pub fn keymap_summary(text: &str) -> String {
         .to_string()
 }
 
-/// xdpyinfo's extension names, sorted.
+/// Parse sorted X extension names from `xdpyinfo -queryExtensions` output.
 #[must_use]
 pub fn x_extensions(text: &str) -> String {
     let mut out = Vec::new();
@@ -1312,7 +1104,6 @@ pub fn x_extensions(text: &str) -> String {
         }
         if inside {
             if l.starts_with("    ") {
-                // `NAME  (opcode: N, …)` with -queryExtensions: the name.
                 let name = l.trim().split("  (").next().unwrap_or_default();
                 out.push(name.to_string());
             } else {
@@ -1324,11 +1115,7 @@ pub fn x_extensions(text: &str) -> String {
     out.join(",")
 }
 
-/// The crates the lock resolves for the windowing and accessibility stack,
-/// `name version` (with `(path)` for a first-party path crate), one per
-/// version, sorted. Read from the checkout's `Cargo.lock`. The first-party
-/// crates that replaced the registry stack (LW.6, LW.7) are named too, so a
-/// recording's stack says what took the registry crates' place.
+/// Extract sorted `(crate, version)` pairs for the Linux windowing and accessibility stack from `Cargo.lock`.
 #[must_use]
 pub fn lock_stack(lock: &str) -> Vec<(String, String)> {
     const NAMES: [&str; 31] = [
@@ -1388,8 +1175,7 @@ pub fn lock_stack(lock: &str) -> Vec<(String, String)> {
     out
 }
 
-/// The guest packages a recording names for `arch`: the servers and the
-/// session's own, then the libraries aterm-gui loads, in `arch`'s build.
+/// Guest package names recorded for `arch`.
 #[must_use]
 pub fn guest_packages(arch: Arch) -> Vec<String> {
     let dpkg_arch = match arch {
@@ -1425,35 +1211,23 @@ pub fn guest_packages(arch: Arch) -> Vec<String> {
         .collect()
 }
 
-/// One session's driver: an aterm-gui under `screen`, its probes, and the
-/// recording it fills.
+/// Driver state for one scripted baseline session.
 struct Session<'a> {
     gui: Gui<'a>,
     arch: Arch,
     screen: Screen,
-    /// lane-bus in the guest.
     bus: String,
-    /// aterm-wayland's `lane-wl` example in the guest: the Wayland drag
-    /// source.
     wl: String,
-    /// Where the run's report and fresh recordings go on this Mac (frames
-    /// too).
     results: PathBuf,
     rec: Recording,
-    /// path → role, from the walks.
     roles: Vec<(String, String)>,
-    /// The terminal's text and caret in the end walk.
     end_terminal: Option<(String, Option<String>)>,
-    /// Where each scripted item began on aterm's metrics clock
-    /// (`metrics_now_ms`), for naming the item the slowest present ended in.
     marks: Vec<(&'static str, f64)>,
 }
 
-/// A wait that must end: a one-minute hang detector, never a budget.
+/// Hang-detector timeout for conditions that must complete.
 const HANG: Duration = Duration::from_secs(60);
 
-/// A `lane-bus seat` running as a lane unit ([`Session::seat_unit`]), and
-/// its markers in the guest.
 struct SeatUnit {
     name: String,
     ready: String,
@@ -1462,7 +1236,6 @@ struct SeatUnit {
 }
 
 impl SeatUnit {
-    /// Wait (a hang detector) until the seat's steps have gone.
     fn done(&self, s: &Session<'_>) -> Result<(), String> {
         if s.sh(&guest::wait_file(&self.done, 60)).ok() {
             Ok(())
@@ -1474,8 +1247,6 @@ impl SeatUnit {
         }
     }
 
-    /// Let the seat go: its stop marker, then the unit's end (a hang
-    /// detector), then a stop in case it never came.
     fn stop(&self, s: &Session<'_>) {
         let _ = s.sh(&["touch".into(), self.stop.clone()]);
         let _ = s.sh(&guest::wait_unit_gone(&self.name, 60));
@@ -1498,12 +1269,10 @@ impl Session<'_> {
             .then(|| self.screen.display.client_env(&self.up().runtime).1)
     }
 
-    /// A control verb's reply (trailing whitespace dropped), or why not.
     fn ctl(&self, verb: &[&str]) -> Result<String, String> {
         self.gui.expect(verb, &|_| true)
     }
 
-    /// Run `argv` in the guest.
     fn sh(&self, argv: &[String]) -> Out {
         self.up().sh(argv)
     }
@@ -1520,7 +1289,6 @@ impl Session<'_> {
         self.sh(&argv)
     }
 
-    /// A lane unit's main pid.
     fn unit_pid(&self, unit: &str) -> Option<String> {
         let out = self.sh(&[
             "systemctl".into(),
@@ -1534,17 +1302,10 @@ impl Session<'_> {
         (out.ok() && !pid.is_empty() && pid != "0").then_some(pid)
     }
 
-    /// aterm-gui's main pid: the AT-SPI application to read, the X window.
     fn pid(&self) -> Option<String> {
         self.unit_pid(&Gui::unit_name())
     }
 
-    /// aterm-gui's X window, by its pid, once it is viewable (a hang
-    /// detector). `ready` reads the shell, not the window, and X refuses the
-    /// focus to a window not yet mapped (`BadMatch` from `SetInputFocus`):
-    /// with the guest's CPUs busy, a fresh aterm-gui's window was found and
-    /// focused before it was mapped, the focus failed, and the keys typed
-    /// next reached no window (measured, FLAKES).
     fn x_window(&self, display: &str) -> Option<String> {
         let pid = self.pid()?;
         let out = self.x(
@@ -1568,8 +1329,6 @@ impl Session<'_> {
             .map(str::to_string)
     }
 
-    /// Give the X window `win` the keyboard focus, or say why not: a key
-    /// typed without it reaches no window.
     fn focus_x(&self, display: &str, win: &str) -> Result<(), String> {
         let out = self.x(display, &["xdotool", "windowfocus", "--sync", win]);
         if out.ok() {
@@ -1582,8 +1341,6 @@ impl Session<'_> {
         }
     }
 
-    /// Wait for the screen to stop changing: two equal `text` reads 300 ms
-    /// apart, within the hang detector.
     fn settled_text(&self) -> Result<String, String> {
         let t0 = Instant::now();
         let mut last = self.ctl(&["text"])?;
@@ -1600,8 +1357,6 @@ impl Session<'_> {
         }
     }
 
-    /// `dims` once it stops moving: the same reply twice, 600 ms apart,
-    /// within the hang detector.
     fn settled_dims(&self) -> Result<String, String> {
         let t0 = Instant::now();
         let mut last = self.ctl(&["dims"])?;
@@ -1618,7 +1373,6 @@ impl Session<'_> {
         }
     }
 
-    /// Poll `dims` until `done` holds, within the hang detector.
     fn dims_until(&self, done: &dyn Fn(&str) -> bool) -> Result<String, String> {
         let t0 = Instant::now();
         loop {
@@ -1633,7 +1387,6 @@ impl Session<'_> {
         }
     }
 
-    /// Type a line through the control socket and wait for `want`.
     fn run_line(&self, typed: &str, want: &str) -> Result<(), String> {
         self.ctl(&["send", typed])?;
         self.ctl(&["key", "enter"])?;
@@ -1645,7 +1398,6 @@ impl Session<'_> {
         }
     }
 
-    /// The AT-SPI tree, as `atspi.walk.<phase>.<n>` lines.
     fn walk(&mut self, phase: &str) {
         let argv = vec![
             "env".to_string(),
@@ -1695,10 +1447,6 @@ impl Session<'_> {
         self.ctl(&["resize", "24", "80"])?;
         let d = self.dims_until(&|r| proof::dims_are(r, 24, 80))?;
         self.rec.behaviour("resize.input.24x80", dims_summary(&d));
-        // A one-row flap, its halves back to back in one guest command (two
-        // round trips from this Mac would land a variable 100-300 ms apart,
-        // either side of the ledger's run gap): the case the resize undo
-        // exists for.
         let one = self.gui.ctl_argv(&["resize", "23", "80"]);
         let two = self.gui.ctl_argv(&["resize", "24", "80"]);
         let mut argv = vec![
@@ -1719,9 +1467,6 @@ impl Session<'_> {
         Ok(())
     }
 
-    /// A resize the window system makes (X11: the window's size set from
-    /// outside, as a window manager would; Mutter: [`Self::mutter_os_resize`]),
-    /// then the size put back.
     fn os_resize(&mut self) {
         let Some(display) = self.x_display() else {
             match self.screen.display.seat() {
@@ -1781,31 +1526,14 @@ impl Session<'_> {
         }
     }
 
-    /// A resize the compositor makes under Mutter: its `toggle-tiled-left`
-    /// binding (Super+Left, through the RemoteDesktop keyboard while the
-    /// window has its focus) tiles the window to the screen's left half, at
-    /// a size the client never asked for, and the same binding again puts it
-    /// back. Mutter 46's keyboard resize (Alt+F8 and arrows) moved nothing a
-    /// RemoteDesktop keyboard drove (measured), so the tiling is the outside
-    /// resize here.
     fn mutter_os_resize(&mut self) {
         self.binding_os_resize("Super_L+Left", "Super+Left", "resize.os.tiled-left");
     }
 
-    /// A resize the compositor makes under weston's x11 backend: desktop-shell's
-    /// maximize binding (Super+Shift+M, through XTEST while the window has
-    /// weston's keyboard focus) gives the window the output's work area, at a
-    /// size the client never asked for, and the same binding puts it back.
-    /// weston has no tiling, and its interactive resize binding (Super and a
-    /// right drag) is a gesture's, which the header item drives from the
-    /// window's own edge.
     fn weston_os_resize(&mut self) {
         self.binding_os_resize("Super_L+Shift_L+m", "Super+Shift+M", "resize.os.maximized");
     }
 
-    /// The compositor's binding `chord` (`shown` in an error) pressed on the
-    /// seat's keyboard, the grid it moved to recorded as `key`, then pressed
-    /// again and the grid it went back to as `resize.os.restored`.
     fn binding_os_resize(&mut self, chord: &str, shown: &str, key: &str) {
         let grid = |r: &str| {
             let mut it = r.split_whitespace().skip(1);
@@ -1854,13 +1582,11 @@ impl Session<'_> {
                         proof::field(&s, "resizes").unwrap_or("?"),
                     ),
                 );
-                // A flap is two resizes in one run: timing, as below.
                 self.rec
                     .measured("status.flaps", proof::field(&s, "flaps").unwrap_or("?"));
             }
             Err(e) => self.rec.behaviour("status", format!("failed: {e}")),
         }
-        // The ledger: aterm-ctl prints its summary line on stderr, after.
         let out = self.gui.ctl(&["resizes"]);
         for line in out.text.lines() {
             let line = line.trim();
@@ -1870,7 +1596,6 @@ impl Session<'_> {
                 self.rec.behaviour(&format!("resizes.{n}"), behaviour);
                 self.rec.measured(&format!("resizes.{n}.rows"), measured);
             } else if let Some(rest) = line.strip_prefix("run ") {
-                // How resizes group into runs is timing; each resize is kept above.
                 let n = rest.split_whitespace().next().unwrap_or("?").to_string();
                 self.rec.measured(&format!("runs.{n}"), resize_line(rest).1);
             } else if let Some(rest) = line.strip_prefix("aterm-ctl: OK ") {
@@ -1891,8 +1616,6 @@ impl Session<'_> {
         }
     }
 
-    /// The echo row's pixel centre in X window coordinates, and the x where a
-    /// drag across its text ends.
     fn x_echo_cell(
         &self,
         display: &str,
@@ -1925,7 +1648,6 @@ impl Session<'_> {
             );
             return;
         };
-        // CLIPBOARD out: the echo row selected and copied, read by xclip.
         let out = (|| -> Result<String, String> {
             let screen = self.ctl(&["text"])?;
             let row = proof::echo_row(&screen).ok_or("no echo row on screen")?;
@@ -1941,12 +1663,10 @@ impl Session<'_> {
             "clipboard.out",
             out.unwrap_or_else(|e| format!("failed: {e}")),
         );
-        // CLIPBOARD in: xclip owns it; aterm's Paste.
         let r = self.paste_from_x(display, Selection::Clipboard, "XCLIP-42", &|s| {
             s.ctl(&["invoke", "unread=ok", "Paste"]).map(drop)
         });
         self.rec.behaviour("clipboard.in", r);
-        // PRIMARY out: a real drag across the echo row (copy-on-select).
         let out = (|| -> Result<String, String> {
             let screen = self.ctl(&["text"])?;
             let row = proof::echo_row(&screen).ok_or("no echo row on screen")?;
@@ -1977,9 +1697,6 @@ impl Session<'_> {
             if !drag.ok() {
                 return Err(format!("xdotool drag: {}", drag.tail(2)));
             }
-            // aterm takes PRIMARY once it has handled the button release: wait
-            // for the echo there (a hang detector), then read what is there,
-            // which a drag that set nothing leaves as before.
             let _ = self.sh(&guest::wait_clipboard(
                 display,
                 Selection::Primary,
@@ -1996,7 +1713,6 @@ impl Session<'_> {
             "primary.out",
             out.unwrap_or_else(|e| format!("failed: {e}")),
         );
-        // PRIMARY in: xclip owns it; a real middle click over the grid.
         let r = self.paste_from_x(display, Selection::Primary, "XPRIMARY-42", &|s| {
             let click = s.x(
                 display,
@@ -2020,17 +1736,11 @@ impl Session<'_> {
         self.rec.behaviour("primary.in", r);
     }
 
-    /// Wait (a hang detector) until a row matches the regex `pattern`.
-    /// aterm-ctl exits non-zero on `OK timeout`, so the reply decides.
     fn matched(&self, pattern: &str) -> bool {
         let r = self.gui.ctl(&["await", "match", pattern, "timeout=60000"]);
         r.text.trim_start().starts_with("OK match")
     }
 
-    /// Clear what is typed at the prompt, if anything, and wait (a hang
-    /// detector) for the bare prompt. An empty line is left alone: readline
-    /// rings the bell for Ctrl+U on one, and aterm's visual bell inverts the
-    /// frames that follow.
     fn clear_line(&self) {
         let typed = self
             .ctl(&["text"])
@@ -2042,8 +1752,6 @@ impl Session<'_> {
         }
     }
 
-    /// Wait (a hang detector) for `typed` on the screen: the line being
-    /// typed shows what a paste or a key put there, before the rest is sent.
     fn typed(&self, typed: &str) -> Result<(), String> {
         if self.matched(&regex_literal(typed)) {
             Ok(())
@@ -2052,7 +1760,6 @@ impl Session<'_> {
         }
     }
 
-    /// Wait (a hang detector) for `want` on the screen.
     fn appeared(&self, want: &str) -> Result<(), String> {
         if self.matched(&regex_literal(want)) {
             Ok(())
@@ -2061,9 +1768,6 @@ impl Session<'_> {
         }
     }
 
-    /// xclip owns `sel` with `text`; `paste` pastes it after `echo X-`, and
-    /// once the typed line shows it, ` | tr A-Z a-z` follows; the lowered
-    /// echo must appear.
     fn paste_from_x(
         &self,
         display: &str,
@@ -2099,8 +1803,6 @@ impl Session<'_> {
         }
     }
 
-    /// `wl-paste` (of PRIMARY with `primary`) until it reads `text` (a hang
-    /// detector), then once more: what it read, or why not.
     fn wl_paste_until(&self, wayland: &str, text: &str, primary: bool) -> Result<String, String> {
         let flags = if primary {
             "--primary --no-newline"
@@ -2127,12 +1829,7 @@ impl Session<'_> {
         }
     }
 
-    /// CLIPBOARD and PRIMARY through wl-clipboard and the screen's seat
-    /// (Mutter's RemoteDesktop session, or XTEST into weston's x11 backend).
     fn wl_selections(&mut self, wayland: &str) {
-        // CLIPBOARD out: the echo row selected, copied by Ctrl+Shift+C on the
-        // seat's keyboard, read by wl-paste while the keyboard lives (a
-        // client without a keyboard cannot read a selection on Mutter).
         let out = (|| -> Result<String, String> {
             let screen = self.ctl(&["text"])?;
             let row = proof::echo_row(&screen).ok_or("no echo row on screen")?;
@@ -2148,9 +1845,6 @@ impl Session<'_> {
             "clipboard.out",
             out.unwrap_or_else(|e| format!("failed: {e}")),
         );
-        // CLIPBOARD in: wl-copy (a lane unit, serving in the foreground) takes
-        // it while a keyboard lives; then a second keyboard, once it has the
-        // window's focus again, pastes with Ctrl+Shift+V.
         let text = "WLCOPY-42";
         let want = "x-wlcopy-42";
         let r = (|| -> Result<(), String> {
@@ -2190,14 +1884,6 @@ impl Session<'_> {
         self.wl_primary(wayland);
     }
 
-    /// PRIMARY from the seat's pointer (under Mutter, LW.7 recorded it on the
-    /// sctk backend before switching): out, a real drag across the echo row
-    /// (copy-on-select) read by `wl-paste --primary`; in, `wl-copy
-    /// --primary`'s text pasted by a real middle click over the grid. The
-    /// seat moves only relatively, so each aim is made from where the window
-    /// reads its pointer (`pointer status`), as the header gestures aim. A
-    /// compositor that offers no primary selection (weston 13: wl-copy said
-    /// so, measured) has none to carry, and the line says so.
     fn wl_primary(&mut self, wayland: &str) {
         let info = self.wl(wayland, &["wayland-info"]);
         let globals = wayland_globals(&info.text);
@@ -2231,8 +1917,6 @@ impl Session<'_> {
         );
     }
 
-    /// The window pixels of the echo row's first and last cells (their
-    /// left and right edges, 2 px in, at mid-row), from `dims`.
     fn echo_span(&self) -> Result<(Px, Px), String> {
         let screen = self.ctl(&["text"])?;
         let row = proof::echo_row(&screen).ok_or("no echo row on screen")?;
@@ -2250,7 +1934,6 @@ impl Session<'_> {
         Ok(((pad + 2, y), (pad + len * cell_w - 2, y)))
     }
 
-    /// The window's scale (`dims`), 1 when it says none.
     fn dims_scale(&self) -> f64 {
         self.ctl(&["dims"])
             .ok()
@@ -2279,8 +1962,6 @@ impl Session<'_> {
         let slack = scale.ceil() as i32;
         let (start, end) = self.echo_span()?;
         let steps = [
-            // From the top-left corner, where `lane-bus seat` parked its
-            // pointer before the window took the keyboard, onto the window.
             "move:640,400".to_string(),
             format!("touch:{}", mark("centred")),
             format!("wait:{}", mark("aim-start")),
@@ -2312,9 +1993,6 @@ impl Session<'_> {
             self.put_file(&mark("to-end"), &format!("{} 0", logical(end.0 - start.0)))?;
             go("drag");
             self.seat_reached(&seat, &marks, "dragged")?;
-            // aterm takes PRIMARY once it has handled the release: read it
-            // while the seat's keyboard lives (a client without a keyboard
-            // cannot read a selection on Mutter).
             let read = self.wl_paste_until(wayland, proof::ECHO, true)?;
             Ok(format!("drag; wl-paste --primary read {read:?}"))
         })();
@@ -2326,7 +2004,6 @@ impl Session<'_> {
     }
 
     fn wl_primary_in(&mut self, wayland: &str, text: &str, want: &str) -> Result<(), String> {
-        // wl-copy takes PRIMARY while a keyboard lives.
         let holder = self.seat_unit(&[])?;
         let copier = guest::Unit {
             name: format!("{}wlcopy", guest::UNIT_PREFIX),
@@ -2347,8 +2024,6 @@ impl Session<'_> {
         holder.stop(self);
         owned.map_err(|_| "wl-copy never owned PRIMARY (60 s)".to_string())?;
         self.ctl(&["send", proof::PASTE_BEFORE])?;
-        // A middle click over the grid: the pointer centred, then aimed at
-        // the grid's middle from where the window reads it.
         let marks = format!("{}/primary-in", self.gui.dir);
         let mark = |name: &str| format!("{marks}/{name}");
         let fresh = self.sh(&[
@@ -2399,21 +2074,10 @@ impl Session<'_> {
         self.appeared(want)
     }
 
-    /// The screen's seat driving `steps` as a lane unit, so a keyboard lives
-    /// while another client acts: under Mutter `lane-bus seat` (a
-    /// RemoteDesktop session), under weston's x11 backend `lane-bus xseat`
-    /// (XTEST on the X display weston is nested in). It touches `ready` once
-    /// its keyboard has the window's focus, runs `steps`, touches `done`, and
-    /// lets go when [`SeatUnit::stop`] says so. Returned once `ready` is there
-    /// (a hang detector).
     fn seat_unit(&self, steps: &[&str]) -> Result<SeatUnit, String> {
         self.seat_unit_of(&format!("{}mutter", guest::UNIT_PREFIX), APP, steps)
     }
 
-    /// [`Self::seat_unit`] of the compositor that is lane unit `compositor`
-    /// (a Mutter's; weston's x11 backend needs none named), for application
-    /// `app` (`-`: one whose focus is not awaited, and the steps then take it
-    /// themselves).
     fn seat_unit_of(
         &self,
         compositor: &str,
@@ -2480,7 +2144,6 @@ impl Session<'_> {
         Ok(seat)
     }
 
-    /// The last lines a lane unit logged, on one line.
     fn unit_journal(&self, name: &str) -> String {
         let out = self.sh(&[
             "journalctl".into(),
@@ -2505,11 +2168,6 @@ impl Session<'_> {
         ]);
     }
 
-    /// X11-TRACE: what aterm-gui says on the X11 wire
-    /// ([`crate::linux_xwire`]). A second aterm-gui reaches the screen through
-    /// an `xtrace` proxy display ([`xwire::PROXY`]) and is driven through its
-    /// start, a typed echo, a resize to 30x100 and the person's quit; its log
-    /// is kept beside the report and summed up into the `x11.wire.*` lines.
     fn x11_wire(&mut self) {
         let Some(display) = self.x_display() else {
             return;
@@ -2527,7 +2185,6 @@ impl Session<'_> {
         }
     }
 
-    /// [`Self::x11_wire`]'s run: its lines, or why it could not run.
     fn x11_wire_run(&self, display: &str) -> Result<Vec<(&'static str, String)>, String> {
         let log = format!("{}/xtrace.txt", self.gui.dir);
         let stderr = format!("{}/xtrace-gui.stderr", self.gui.dir);
@@ -2538,7 +2195,6 @@ impl Session<'_> {
             argv: xwire::proxy_argv(display, &log),
             socket: guest::x_socket(xwire::PROXY),
         };
-        // A socket an earlier proxy left would keep the new one from listening.
         let _ = self.sh(&["rm".into(), "-f".into(), proxy.socket.clone()]);
         let started = self.sh(&guest::run_unit(&proxy, None));
         if !started.ok() {
@@ -2585,8 +2241,6 @@ impl Session<'_> {
             return Err("aterm-gui still ran 60 s after its Quit".into());
         }
         self.stop_unit(&proxy.name);
-        // The log is kept beside the report whatever it says: it is what
-        // says which request a line came from.
         let wire = self.sh(&["cat".into(), log]);
         let _ = std::fs::write(
             self.results.join(format!(
@@ -2659,8 +2313,6 @@ impl Session<'_> {
                 return;
             }
         };
-        // Under Mutter the keyboard's repeat settings exist only while a
-        // keyboard does: read them now, before it goes.
         if let (Some(w), Some(_)) = (self.wayland_display(), &seat) {
             let info = self.wl(&w, &["wayland-info"]);
             if let Some(r) = wayland_repeat(&info.text) {
@@ -2693,16 +2345,12 @@ impl Session<'_> {
         self.clear_line();
     }
 
-    /// The IME events aterm has counted (`metrics percentiles`' `n_ime`).
     fn ime_events(&self) -> Option<u64> {
         self.ctl(&["metrics", "percentiles"])
             .ok()
             .and_then(|m| proof::field(&m, "n_ime").and_then(|v| v.parse().ok()))
     }
 
-    /// `steps` driven on the screen's seat in one session
-    /// ([`Self::seat_unit`]: Mutter's RemoteDesktop keyboard and pointer, or
-    /// XTEST into weston's x11 backend), which ends once they have gone.
     fn seat_keys(&self, steps: &[&str]) -> Result<(), String> {
         let seat = self.seat_unit(steps)?;
         let done = seat.done(self);
@@ -2710,14 +2358,6 @@ impl Session<'_> {
         done
     }
 
-    /// A plain key, then a dead key and a letter, typed through the window
-    /// system (`typist`) between `echo X-` and `-Y`: what the shell printed,
-    /// and whether aterm counted IME events for it. The plain key must reach
-    /// the screen before the dead key goes, so the whole input path (an XIM
-    /// server's input context included) is live when it does: typed at once
-    /// after the window took focus, the dead key was sometimes lost under
-    /// ibus (measured). Through an XIM server the letter is held down until
-    /// the composed letter is on the line ([`Self::held_letter`]).
     fn composed(&self, typist: Typist<'_>) -> String {
         let before = self.ime_events();
         let r = (|| -> Result<String, String> {
@@ -2734,10 +2374,6 @@ impl Session<'_> {
             }
             self.typed(COMPOSE_LIVE)
                 .map_err(|_| format!("a plain key never reached the screen ({COMPOSE_LIVE})"))?;
-            // The keys go through the window system; the typed suffix must
-            // follow them, so the composed letter is awaited on the typed
-            // line first. Keys that compose nothing pass the hang detector,
-            // and the line then shows what they did.
             let composed = format!("{COMPOSE_LIVE}\u{e9}");
             match typist {
                 Typist::X {
@@ -2784,26 +2420,6 @@ impl Session<'_> {
         }
     }
 
-    /// `dead_acute`, then `e` pressed through the XIM-served X `display` and
-    /// let go only once `composed` is on the typed line (a hang detector),
-    /// with the server's autorepeat off while it is held, so how long that
-    /// takes changes nothing.
-    ///
-    /// libX11 hands its client each event the input method sends back (a key
-    /// the method did not use, or a commit's carrier: a KeyPress with keycode
-    /// 0) with `XPutBackEvent`, at the head of the queue, and marks it with
-    /// one flag per input method, which the next key the client filters
-    /// takes (`MARK_FABRICATED`, libX11 1.8.7's `modules/im/ximcp`). A
-    /// synchronous XIM request dispatches whatever else it reads while it
-    /// waits for its reply (`_XimRead`; aterm makes them, `XSetICValues` for
-    /// the spot among them), so a second such event can be put back before
-    /// aterm has read the first, and ahead of it. Typed as one burst, the
-    /// letter's release came back right behind the commit and took the
-    /// flag; aterm filtered the carrier as a new key, ibus swallowed it, and
-    /// the shell printed `X-x-Y` (measured with aterm-gui stopped across the
-    /// keys, and with the guest's CPUs busy). Held, the carrier has been read
-    /// before anything can come back after it; what came back before the
-    /// commit (the dead key's release) is put back behind it.
     fn held_letter(&self, display: &str, composed: &str) -> Result<(), String> {
         let off = self.x(display, &["xset", "r", "off"]);
         if !off.ok() {
@@ -2824,12 +2440,6 @@ impl Session<'_> {
         Ok(())
     }
 
-    /// Compose: `dead_acute` then `e` through the window system, with no
-    /// input-method server: Xlib's own compose on X11; under Mutter, through
-    /// the RemoteDesktop keyboard on the baseline's `us intl` keymap
-    /// ([`guest::MUTTER_XKB_US`]), aterm-window's own compose over
-    /// libxkbcommon's table (aterm-xkb, LW.6-7). A bare Mutter runs no input
-    /// method, though the window enables text-input-v3: the keys reach it.
     fn compose(&mut self) {
         let r = match (self.x_display(), self.screen.display.seat()) {
             (Some(display), _) => {
@@ -2860,11 +2470,7 @@ impl Session<'_> {
         self.rec.behaviour("compose", r);
     }
 
-    /// A frame of the window (`image`), copied to this Mac beside the report
-    /// and decoded: its pixels, or why not.
     fn frame(&self, name: &str) -> Result<Frame, String> {
-        // `plain`: without the Scene's animated sprites and the cursor's
-        // trail, which move from frame to frame.
         let reply = self.ctl(&["image", "plain", name])?;
         let guest_path = reply
             .split_whitespace()
@@ -2882,12 +2488,6 @@ impl Session<'_> {
             .ok_or_else(|| format!("{}: not a PNG this lab decodes", to.display()))
     }
 
-    /// XDND (X11): `lane-bus xdnd`, a second X client acting as the drag
-    /// source, drags a file over aterm's window and away, then over it and
-    /// drops it. What the target answered (`XdndAware`, each `XdndStatus`,
-    /// the data it asked for, `XdndFinished`), the drop highlight read from
-    /// frames taken at rest, while hovered and after the leave, and what the
-    /// drop typed at the prompt.
     fn dnd(&mut self, display: &str) {
         let marks = format!("{}/dnd", self.gui.dir);
         let report = format!("{marks}/report");
@@ -2907,7 +2507,6 @@ impl Session<'_> {
             if !made.ok() {
                 return Err(format!("the dropped file: {}", made.tail(2)));
             }
-            // A clean prompt, at rest.
             self.clear_line();
             let rest = self.frame("dnd-rest.png")?;
             let source = guest::Unit {
@@ -2984,19 +2583,6 @@ impl Session<'_> {
         self.clear_line();
     }
 
-    /// A Wayland drag from the screen's seat (Mutter's RemoteDesktop pointer,
-    /// or XTEST into weston's x11 backend): a second client, `lane-wl drag`,
-    /// drags [`DND_URI`] from a window of its own with the seat's pointer,
-    /// over aterm's window, away past its top-left corner and back, and drops
-    /// it. The source's window is maximized, so the pointer, at the screen's
-    /// centre (on aterm's window), presses on it wherever it is; it unmaps
-    /// once the drag has begun, and a motion then finds aterm's window under
-    /// the pointer. Recorded as XDND is on X11: what the source heard at each
-    /// point (`dnd.source.*`; the whole stream measured), the drop highlight
-    /// from three frames, and what the drop typed at the prompt. Each point
-    /// waits (a hang detector) for the source to have heard what the window
-    /// answered: aterm accepts `text/uri-list` and the copy action as the drag
-    /// enters, and the compositor tells the source.
     fn wl_dnd(&mut self, wayland: &str) {
         let marks = format!("{}/dnd", self.gui.dir);
         let report = format!("{marks}/report");
@@ -3028,19 +2614,13 @@ impl Session<'_> {
             self.clear_line();
             let rest = self.frame("dnd-rest.png")?;
             let steps = [
-                // From the top-left corner, where `lane-bus seat` parked its
-                // pointer, to the screen's centre, on aterm's window.
                 "move:640,400".to_string(),
                 format!("touch:{}", mark("centred")),
-                // The source's window, mapped over it: two motions make
-                // Mutter find the window under the pointer.
                 format!("wait:{}", mark("mapped")),
                 "move:1,0".to_string(),
                 "move:-1,0".to_string(),
                 format!("wait:{}", mark("pointed")),
                 "press:left".to_string(),
-                // The drag began and the source's window went: a motion
-                // finds aterm's window under the pointer again.
                 format!("wait:{}", mark("dragging")),
                 "move:1,1".to_string(),
                 format!("touch:{}", mark("over")),
@@ -3064,9 +2644,6 @@ impl Session<'_> {
             let dragged = (|| -> Result<(), String> {
                 self.seat_reached(&seat, &marks, "centred")?;
                 let (x, y) = self.settled_px().map_err(|e| format!("centred: {e}"))?;
-                // Away: 20 seat pixels past the window's top-left corner,
-                // from where the pointer will be (one pixel right of and
-                // below the centre); back: the same way back.
                 let scale = self.dims_scale();
                 let logical = |px: i32| (f64::from(px) / scale).round() as i32;
                 let (ax, ay) = (-logical(x) - 21, -logical(y) - 21);
@@ -3075,9 +2652,6 @@ impl Session<'_> {
                 if !self.sh(&guest::run_unit(&source, None)).ok() {
                     return Err("lane-wl drag did not start".into());
                 }
-                // At each point, what the source heard since the last one; the
-                // window's answer is awaited by its target (and, entering, the
-                // copy action: Mutter 46 sends no action at a leave).
                 let mut seen = 0;
                 for (point, answer, want, frame) in [
                     (
@@ -3124,8 +2698,6 @@ impl Session<'_> {
             }
             dragged?;
             done?;
-            // What the source heard once the drop came: the lines after the
-            // last `action` (the drag's return), repeats in a row folded.
             let tail: Vec<&str> = events
                 .lines()
                 .rev()
@@ -3182,9 +2754,6 @@ impl Session<'_> {
         self.clear_line();
     }
 
-    /// Wait (a hang detector) until the Wayland drag source's report, past
-    /// its first `seen` lines, says what `want` waits for ([`source_heard`]):
-    /// what the source then holds, and how many lines the report then had.
     fn source_heard_until(
         &self,
         report: &str,
@@ -3210,7 +2779,6 @@ impl Session<'_> {
         }
     }
 
-    /// The drag source's report, a behaviour line per answer.
     fn record_dnd_report(&mut self, report: &str) {
         let out = self.sh(&["cat".into(), report.into()]);
         for line in out.text.lines() {
@@ -3220,18 +2788,6 @@ impl Session<'_> {
         }
     }
 
-    /// XIM (X11): a second aterm-gui started with `XMODIFIERS=@im=ibus` while
-    /// ibus-daemon serves XIM with its `xkb:us::eng` engine (ibus's simple
-    /// engine, which composes dead keys), then the same dead key and letter,
-    /// the letter held down until it composed ([`Self::held_letter`]).
-    /// The session's own aterm has stopped by now. ibus reads its settings
-    /// from a scratch keyfile ([`guest::IBUS_KEYFILE`]) that keeps it off the
-    /// X keymap: picking the engine would otherwise set the keymap to plain
-    /// `us`, where xdotool types `dead_acute` by binding a spare keycode
-    /// around each half of the key, and ibus, which reads the key's symbol
-    /// when its XIM server handles it, read keyval 0 once the binding had gone
-    /// and swallowed the key (measured: `X-xe-Y`, seen on x86_64 under
-    /// Rosetta, where aterm hands the key on later).
     fn xim(&mut self) {
         let Some(display) = self.x_display() else {
             return;
@@ -3280,10 +2836,6 @@ impl Session<'_> {
             if !self.sh(&guest::run_unit(&ibus, None)).ok() {
                 return Err("ibus-daemon did not start".into());
             }
-            // The engine can be set once the daemon answers; XIM serves once
-            // the root window names it. Hang detectors, both.
-            // ibus finds its daemon by a file named after the display, under
-            // the daemon's XDG_CONFIG_HOME.
             let engine = self.x(
                 &display,
                 &[
@@ -3360,16 +2912,6 @@ impl Session<'_> {
         }
     }
 
-    /// The XIM item's CJK half (L-HEADER-LW7, linux-xim-cjk-preedit), on the
-    /// XIM aterm-gui [`Self::xim`] started: ibus switched to
-    /// [`XIM_CJK_ENGINE`], `echo X-` sent, the pinyin [`XIM_CJK_KEYS`] typed
-    /// through the X `display` one key at a time, each awaited (a hang
-    /// detector) as a change of the composition the `chrome` verb's `ime` line
-    /// shows, since a composition is painted and never typed; then space, held until the committed text is
-    /// on the typed line ([`Self::held_letter`] says why), and `-Y`. Returns
-    /// the `ime` line after the last key (the composition, its caret and the
-    /// spot aterm gave ibus for it) with what the typed line read meanwhile,
-    /// `None` where no key composed; and what the shell printed.
     fn cjk(&self, display: &str, config: &str) -> (Option<String>, String) {
         let mut preedit = None;
         let before = self.ime_events();
@@ -3405,8 +2947,6 @@ impl Session<'_> {
                 let t0 = Instant::now();
                 loop {
                     let now = self.ime()?;
-                    // The composition, not the spot: a key that composes
-                    // nothing is typed, and the caret's spot moves all the same.
                     if ime_composition(&now) != ime_composition(&last) {
                         last = now;
                         break;
@@ -3466,8 +3006,6 @@ impl Session<'_> {
         (preedit, committed)
     }
 
-    /// The front window's `ime` line (the composition and its spot), or why
-    /// not.
     fn ime(&self) -> Result<String, String> {
         let chrome = self.ctl(&["chrome"])?;
         ime_line(&chrome).map(str::to_string).ok_or_else(|| {
@@ -3478,12 +3016,6 @@ impl Session<'_> {
         })
     }
 
-    /// text-input-v3 (Mutter): a second aterm-gui, its Wayland wire logged
-    /// (`WAYLAND_DEBUG=client`, stderr to a file), given a keyboard's focus
-    /// and then out of it by `lane-bus seat`. No input method composes under
-    /// a bare Mutter, so this is the client's half: what it binds, and what
-    /// it asks and hears of text-input-v3 as focus comes and goes. The
-    /// session's own aterm has stopped by now.
     fn text_input_v3(&mut self) {
         if self.screen.display != Display::Mutter {
             return;
@@ -3508,10 +3040,6 @@ impl Session<'_> {
             }
             let seat = self.seat_unit(&[])?;
             let done = seat.done(self);
-            // The client places the input method's cursor rectangle once it
-            // has redrawn with focus, a few ms after `enable`: the keyboard
-            // stays until the log shows it (a hang detector; a client that
-            // never sends one leaves after it, and its line says so).
             let _ = self.sh(&[
                 "timeout".into(),
                 "60".into(),
@@ -3522,7 +3050,6 @@ impl Session<'_> {
                 "wait-cursor-rectangle".into(),
                 log.clone(),
             ]);
-            // The seat ends once the window has lost its focus again.
             seat.stop(self);
             done?;
             self.gui.stop();
@@ -3544,8 +3071,6 @@ impl Session<'_> {
         );
     }
 
-    /// Wait (a hang detector) until the client's Wayland wire log `log` has
-    /// a line `pattern` (an extended regular expression) matches.
     fn wire_until(&self, log: &str, pattern: &str) -> Result<(), String> {
         let seen = self.sh(&[
             "timeout".into(),
@@ -3564,9 +3089,6 @@ impl Session<'_> {
         }
     }
 
-    /// A fresh aterm-gui under `display` (its socket in `extra`, if it is
-    /// not the screen's own), its Wayland wire written to `log`
-    /// (`WAYLAND_DEBUG=client`), started and `ready`.
     fn logged_gui(&self, log: &str, extra: &[(String, String)]) -> Result<(), String> {
         self.gui.prepare()?;
         let mut env = vec![("WAYLAND_DEBUG".to_string(), "client".to_string())];
@@ -3588,7 +3110,6 @@ impl Session<'_> {
         }
     }
 
-    /// Keep a client's wire log beside the report, and return it.
     fn keep_wire(&self, log: &str, what: &str) -> String {
         let wire = self.sh(&["cat".into(), log.into()]).text;
         let _ = std::fs::write(
@@ -3602,17 +3123,6 @@ impl Session<'_> {
         wire
     }
 
-    /// Touch under Mutter: a finger through the RemoteDesktop session's
-    /// touchscreen, which Mutter places in a screencast stream's space, in
-    /// the monitor's pixels (`lane-bus seat` records the monitor, and taps
-    /// once first: Mutter makes the touchscreen with that tap, which no
-    /// client hears). The finger goes down where the pointer sits on aterm's
-    /// window, moves and lifts, once aterm-gui has asked for the touch
-    /// (`wl_seat.get_touch`, a hang detector). aterm-gui does nothing with a
-    /// touch (its `WindowEvent::Touch` only ends an update hand-off), so what
-    /// is recorded is what the window heard (the wire), that the screen
-    /// stayed as it was, and, measured, where the touch landed against the
-    /// pointer (surface-local, logical pixels both).
     fn touch(&mut self) {
         if self.screen.display != Display::Mutter {
             return;
@@ -3706,24 +3216,6 @@ impl Session<'_> {
         }
     }
 
-    /// An input method composing through text-input-v3, under GNOME Shell
-    /// (Mutter and its IBus bridge: the one input method that reaches
-    /// Mutter's `zwp_text_input_manager_v3`), in place of the screen's bare
-    /// Mutter, on the same monitor and settings ([`Screen::gnome_shell`]).
-    /// GNOME Shell starts IBus and gives it the engine of its `us+intl`
-    /// source, `xkb:us::eng`, whose engine process is awaited (a hang
-    /// detector). A fresh aterm-gui comes up on it; GNOME Shell gives a new
-    /// window no focus until it is clicked, so the RemoteDesktop pointer
-    /// clicks it, once aterm-gui has its pointer, and the keys wait for its
-    /// text input's `enable`. Then [`IME_COMPOSED`]: a plain `x` seen on the
-    /// typed line, and a burst of BackSpace, `dead_acute` and `e` with
-    /// aterm-gui stopped (`SIGSTOP`) across it, continued once GNOME Shell's
-    /// own wire log (`WAYLAND_DEBUG=server`) shows the commit and the `e`'s
-    /// release posted to it (hang detectors), so the BackSpace and the commit
-    /// reach aterm-gui in one read and one dispatch (fb676e9b67). Unstopped,
-    /// the BackSpace reached it 3 to 39 ms before the commit, a dispatch of
-    /// its own (measured), and nothing held the order. The wire says the
-    /// letter came as an input method's commit, not a key.
     fn text_input_v3_ime(&mut self) {
         if self.screen.display != Display::Mutter {
             return;
@@ -3739,7 +3231,6 @@ impl Session<'_> {
         let Some(mut shell) = self.screen.gnome_shell(&self.up().runtime, config) else {
             return;
         };
-        // Outside the session's directory, which `logged_gui` empties.
         let shell_log = format!("{}/{}-wire.txt", self.up().runtime, shell.name);
         shell.env.push(("WAYLAND_DEBUG".into(), "server".into()));
         shell
@@ -3767,7 +3258,6 @@ impl Session<'_> {
                 self.rec.stack(key, v.text.trim());
             }
         }
-        // What GNOME Shell said on its stderr, its wire lines left out.
         let shell_said = || {
             let said = self.sh(&[
                 "sh".into(),
@@ -3780,8 +3270,6 @@ impl Session<'_> {
         };
         let before = std::cell::Cell::new(None);
         let r = (|| -> Result<String, String> {
-            // The screen's own Mutter goes first: one compositor answers
-            // for RemoteDesktop and the screen's monitor.
             self.stop_unit(&format!("{}mutter", guest::UNIT_PREFIX));
             if !self.sh(&guest::run_unit(&shell, None)).ok() {
                 return Err("gnome-shell did not start".into());
@@ -3823,8 +3311,6 @@ impl Session<'_> {
                 return Err(format!("{marks}: {}", fresh.tail(2)));
             }
             let steps = [
-                // The pointer, made and parked in the top-left corner; a
-                // motion waits until the window has it.
                 "move:-4000,-4000".to_string(),
                 format!("touch:{}", mark("parked")),
                 format!("wait:{}", mark("bound")),
@@ -3863,8 +3349,6 @@ impl Session<'_> {
                 self.typed(COMPOSE_LIVE).map_err(|_| {
                     format!("a plain key never reached the screen ({COMPOSE_LIVE})")
                 })?;
-                // Stopped across the burst, so all of it waits in the
-                // socket and one read takes it.
                 if !self.gui.signal("SIGSTOP") {
                     return Err("aterm-gui would not stop".into());
                 }
@@ -3895,9 +3379,6 @@ impl Session<'_> {
                 return Err("aterm-gui would not continue".into());
             }
             done?;
-            // The composed letter on the typed line first (a hang detector;
-            // keys that compose nothing pass it, and the line shows what
-            // they did), then the suffix.
             let _ = self.typed(&format!("{COMPOSE_BEFORE}\u{e9}"));
             self.ctl(&["send", COMPOSE_AFTER])?;
             self.ctl(&["key", "enter"])?;
@@ -3923,8 +3404,6 @@ impl Session<'_> {
         };
         self.gui.stop();
         self.stop_unit(&shell.name);
-        // GNOME Shell's side of the keyboard and the text input, beside the
-        // report; the whole log goes.
         let posted = self.sh(&[
             "sh".into(),
             "-c".into(),
@@ -3956,7 +3435,6 @@ impl Session<'_> {
         }
     }
 
-    /// The front window's `strip-caption` (LW.5), or why not.
     fn caption(&self) -> Result<Caption, String> {
         let chrome = self.ctl(&["chrome"])?;
         parse_caption(&chrome).ok_or_else(|| {
@@ -3967,7 +3445,6 @@ impl Session<'_> {
         })
     }
 
-    /// Poll `chrome` until the frame says `done`, within the hang detector.
     fn caption_until(&self, done: &dyn Fn(&Caption) -> bool) -> Result<Caption, String> {
         let t0 = Instant::now();
         loop {
@@ -3986,10 +3463,6 @@ impl Session<'_> {
         }
     }
 
-    /// Click the header button `name` over the control socket: the pointer on
-    /// its middle column of the strip (the chrome row that IS the strip: a
-    /// message band may sit between it and the grid), then
-    /// `pointer click`, which runs what a press and release run.
     fn click_button(&self, caption: &Caption, name: &str) -> Result<(), String> {
         let col = caption
             .middle(name)
@@ -3997,8 +3470,6 @@ impl Session<'_> {
         self.click_strip(col)
     }
 
-    /// Click the strip at column `col`: the pointer on the chrome row that
-    /// is the strip ([`Self::click_button`]), then `pointer click`.
     fn click_strip(&self, col: u16) -> Result<(), String> {
         let col = col.to_string();
         let d = self.ctl(&["dims"])?;
@@ -4020,14 +3491,6 @@ impl Session<'_> {
         Err(format!("no chrome row above the grid is the strip ({d})"))
     }
 
-    /// LW.5: the window's own frame, where the band is the header. On X11 (the
-    /// window manager's frame: this lane runs none) and under a compositor that
-    /// grants server-side decorations, `frame=system` and no buttons; under
-    /// weston and Mutter, which leave a Wayland client to decorate itself, the
-    /// band's buttons, their pixels (each slot holds a drawn button; read
-    /// through the same slots, a system-framed window's band is bare there,
-    /// which is the negative control), and maximize and restore driven
-    /// through those buttons over the control socket.
     fn header(&mut self) {
         let caption = match self.caption() {
             Ok(c) => c,
@@ -4064,9 +3527,6 @@ impl Session<'_> {
         }
     }
 
-    /// The header's three rightmost button slots, from one `image plain`: each
-    /// `drawn` (a button) or `bare` (band), read the same way whatever frame
-    /// the window has.
     fn header_pixels(&mut self, caption: &Caption) {
         let r = (|| -> Result<(String, String), String> {
             let d = self.ctl(&["dims"])?;
@@ -4112,9 +3572,6 @@ impl Session<'_> {
         }
     }
 
-    /// Maximize through the header's maximize button, then restore through
-    /// the button that takes its place: the grid each settles at, and the
-    /// buttons the header shows while maximized.
     fn header_maximize(&mut self, caption: &Caption) {
         let maximized = (|| -> Result<(Caption, String), String> {
             self.click_button(caption, "maximize")?;
@@ -4151,7 +3608,6 @@ impl Session<'_> {
         }
     }
 
-    /// Write `text` to `path` in the guest.
     fn put_file(&self, path: &str, text: &str) -> Result<(), String> {
         let out = self.sh(&[
             "sh".into(),
@@ -4168,7 +3624,6 @@ impl Session<'_> {
         }
     }
 
-    /// The window pixel `pointer status` reads back, or why not.
     fn pointer_px(&self) -> Result<(i32, i32), String> {
         let at = self.ctl(&["pointer", "status"])?;
         proof::field(&at, "px")
@@ -4177,9 +3632,6 @@ impl Session<'_> {
             .ok_or_else(|| format!("the window holds no pointer ({at})"))
     }
 
-    /// The pointer's window pixel once it stops moving: the same reading
-    /// twice, 300 ms apart, within the hang detector (while a compositor grab
-    /// holds the pointer the window holds none).
     fn settled_px(&self) -> Result<(i32, i32), String> {
         let t0 = Instant::now();
         let mut last = self.pointer_px().ok();
@@ -4199,8 +3651,6 @@ impl Session<'_> {
         }
     }
 
-    /// Wait (a hang detector) until the window reads its pointer at `want`,
-    /// give or take `slack` pixels; the reading, or where it was instead.
     fn px_at(&self, want: (i32, i32), slack: i32) -> Result<(i32, i32), String> {
         let t0 = Instant::now();
         loop {
@@ -4226,17 +3676,6 @@ impl Session<'_> {
         }
     }
 
-    /// LW.5 under a seat (Mutter's RemoteDesktop, or XTEST into weston's x11
-    /// backend): the frame's gestures, which the control socket cannot make
-    /// (a compositor move, resize or window menu takes a press's serial): a
-    /// second aterm-gui with `WAYLAND_DEBUG=client` and the seat's pointer,
-    /// aimed from what the window reads back (`pointer status`'s `px=`). A
-    /// press on the bare band dragged 40,30 (40 left where the screen's right
-    /// would leave no room for the edge's drag) after the move starts (the
-    /// window follows the pointer, so the pointer ends where it started on the
-    /// window), a press on the right edge dragged 60 px right (the window
-    /// widens), and a right press on the band (the window menu); with the
-    /// `xdg_toplevel` requests the wire log shows.
     fn header_gestures(&mut self) {
         if self.screen.display.seat().is_none() {
             return;
@@ -4259,7 +3698,6 @@ impl Session<'_> {
         }
     }
 
-    /// Wait (a hang detector) until the seat touches `<marks>/<name>`.
     fn seat_reached(&self, seat: &SeatUnit, marks: &str, name: &str) -> Result<(), String> {
         if self
             .sh(&guest::wait_file(&format!("{marks}/{name}"), 60))
@@ -4274,14 +3712,10 @@ impl Session<'_> {
         }
     }
 
-    /// [`Self::header_gestures`]'s session: its lines (`true` for behaviour),
-    /// or why it could not run.
     fn header_gestures_run(&self) -> Result<Vec<(bool, String, String)>, String> {
         let log = format!("{}/wayland-debug-frame.txt", self.gui.dir);
         let marks = format!("{}/frame", self.gui.dir);
         let mark = |name: &str| format!("{marks}/{name}");
-        // After the scratch world is made afresh (`prepare` empties the
-        // session's directory), so the seat's markers have a place.
         self.gui.prepare()?;
         let fresh = self.sh(&[
             "sh".into(),
@@ -4317,21 +3751,15 @@ impl Session<'_> {
         let (w, h) = (num("frame_w").unwrap_or(0), num("frame_h").unwrap_or(0));
         let band_y =
             num("pad_top").unwrap_or(0) + num("head").unwrap_or(0) + num("cell_h").unwrap_or(0) / 2;
-        // Bare band: four cells left of the first button, right of a lone
-        // tab and its `+`.
         let caption = self.caption()?;
         let (cw, pad) = (num("cell_w").unwrap_or(0), num("pad").unwrap_or(0));
         let cols = u16::try_from(num("window_cols").unwrap_or(0)).unwrap_or(0);
         let first = i32::from(caption.right_end(cols));
         let band_x = pad + (first - 4).max(0) * cw;
-        // The seat moves in logical pixels and the window reads back device
-        // pixels: one seat pixel is `scale` window pixels.
         let logical = |px: i32| (f64::from(px) / scale).round() as i32;
         let device = |lp: i32| (f64::from(lp) * scale).round() as i32;
         let slack = scale.ceil() as i32;
         let steps = [
-            // From the top-left corner, where `lane-bus seat` parked its
-            // pointer before the window took the keyboard, onto the window.
             "move:640,400".to_string(),
             format!("touch:{}", mark("centred")),
             format!("wait:{}", mark("aim-band")),
@@ -4370,8 +3798,6 @@ impl Session<'_> {
         let go = |name: &str| {
             let _ = self.sh(&["touch".into(), mark(name)]);
         };
-        // Aim the seat from `from` to `to` (window pixels): the motion in
-        // seat pixels, and the window pixel it lands on.
         let aim = |name: &str, from: (i32, i32), to: (i32, i32)| -> Result<(i32, i32), String> {
             let (dx, dy) = (logical(to.0 - from.0), logical(to.1 - from.1));
             self.put_file(&mark(name), &format!("{dx} {dy}"))?;
@@ -4385,20 +3811,12 @@ impl Session<'_> {
                 "header.gesture.centred".into(),
                 format!("px={x},{y}"),
             ));
-            // Each aim is checked where the window reads it back before the
-            // seat presses there: a motion reaches the window a moment after
-            // RemoteDesktop takes it.
             let band = aim("to-band", (x, y), (band_x, band_y))?;
             go("aim-band");
             self.seat_reached(&seat, &marks, "at-band")?;
             let (bx, by) = self
                 .px_at(band, slack)
                 .map_err(|e| format!("on the band: {e}"))?;
-            // The move: 40 seat pixels right and 30 down, or left when the
-            // right edge would then leave too little of the screen for the
-            // edge's 60 px drag. The pointer sits at the screen's centre, so the
-            // window's left edge is that far left of it: Mutter centres a new
-            // window, and weston's desktop-shell places one at random.
             let left = guest::SCREEN.0 / 2 - logical(x);
             let room = guest::SCREEN.0 - (left + 46 + logical(w));
             let dx = if room > 60 + 2 * slack { 40 } else { -40 };
@@ -4408,9 +3826,6 @@ impl Session<'_> {
             let (mx, my) = self
                 .settled_px()
                 .map_err(|e| format!("after the move: {e}"))?;
-            // The window followed: the pointer ends on the window where the
-            // press was (Mutter anchors the move at the press), give or take
-            // the 6 px that started it; had the window stayed, 46,30 off.
             let near = device(8);
             let followed = (mx - bx).abs() <= near && (my - by).abs() <= near;
             lines.push((
@@ -4423,7 +3838,6 @@ impl Session<'_> {
                 "header.gesture.moved".into(),
                 format!("px={mx},{my}"),
             ));
-            // The right edge's handle: 2 px in, at mid-height.
             let edge = aim("to-edge", (mx, my), (w - 2, h / 2))?;
             go("aim-edge");
             self.seat_reached(&seat, &marks, "at-edge")?;
@@ -4441,10 +3855,6 @@ impl Session<'_> {
                 if wider { "wider" } else { "unchanged" }.into(),
             ));
             lines.push((false, "header.resize.dims".into(), dims_summary(&d)));
-            // Where the pointer is now, in window pixels: the right edge's
-            // handle plus the 60 seat pixels it was dragged (the window's left
-            // edge did not move). The window snaps its width to whole cells, so
-            // the pointer may be just outside it, and the window then reads none.
             let dragged = (edge.0 + device(60), edge.1);
             let menu = aim("to-menu", dragged, (band_x, band_y))?;
             go("aim-menu");
@@ -4461,8 +3871,6 @@ impl Session<'_> {
         };
         seat.stop(self);
         self.gui.stop();
-        // The wire log is kept beside the report whatever happened: it is
-        // what says where a gesture went.
         let wire = self.sh(&["cat".into(), log]);
         let _ = std::fs::write(
             self.results.join(format!(
@@ -4478,22 +3886,6 @@ impl Session<'_> {
         Ok(lines)
     }
 
-    /// LW.6's Wayland CPU presenter (`wl_shm`) driven by a seat: under weston's
-    /// x11 backend, the one weston here whose seat has a keyboard and a pointer
-    /// (XTEST, [`Seat::Xtest`]). A second aterm-gui with `--cpu`, typed at and
-    /// resized only through that seat: [`CPU_TYPED`] and Return on its
-    /// keyboard, desktop-shell's maximize binding (Super+Shift+M), the proof's
-    /// [`proof::MORE`] typed and not entered (a frame that changes one row),
-    /// and the binding again. After each change the frame aterm presented is
-    /// held to weston's own output pixels where its scene graph puts the
-    /// window, exactly, as the proof's headless CPU row holds it
-    /// ([`Gui::held_to_server`]; weston-x11 runs with `--debug`). Maximized,
-    /// the window's surface is not whole cells: the frame sits at `dims`'
-    /// offset in it, and the remainder bands around it must each be the
-    /// frame's nearest pixel ([`proof::bands_held`]).
-    /// The seat's first session parks the pointer in the top-left corner, on
-    /// desktop-shell's panel, so no cursor is drawn over the window and no
-    /// button of its header is hovered.
     fn cpu_seat(&mut self) {
         if self.screen.display.seat() != Some(Seat::Xtest) {
             return;
@@ -4516,8 +3908,6 @@ impl Session<'_> {
         }
     }
 
-    /// [`Self::cpu_seat`]'s session: its lines (`true` for behaviour), or why
-    /// it could not run.
     fn cpu_seat_run(&self) -> Result<Vec<(bool, String, String)>, String> {
         self.gui.prepare()?;
         let invocation = self.gui.start(Some(self.screen.display), &[])?;
@@ -4532,7 +3922,6 @@ impl Session<'_> {
             }
             let start = self.settled_dims()?;
             lines.push((true, "cpu.start.dims".into(), dims_summary(&start)));
-            // `move:0,0` makes xseat park the pointer before the keys.
             let mut typed = vec!["move:0,0".to_string()];
             typed.extend(seat_taps(CPU_TYPED));
             typed.push("tap:Return".into());
@@ -4582,10 +3971,6 @@ impl Session<'_> {
         Ok(lines)
     }
 
-    /// The CPU item's lines after its `phase`: what drew the frame
-    /// (`status`'s `render=`, `metrics`' `backend=`), and whether weston's
-    /// output shows that frame exactly, with the pixel hold's detail as a
-    /// measured line (where weston placed the window moves run to run).
     fn cpu_held(&self, phase: &str) -> Vec<(bool, String, String)> {
         let render = self
             .ctl(&["status"])
@@ -4620,7 +4005,6 @@ impl Session<'_> {
         lines
     }
 
-    /// What a later step can compare against for input it could not drive.
     fn not_driven(&mut self) {
         match self.screen.display {
             Display::Mutter => {}
@@ -4695,9 +4079,6 @@ impl Session<'_> {
         }
     }
 
-    /// Note where `item` begins on aterm's metrics clock; a reply without the
-    /// clock leaves no mark, and the slowest present is then named against
-    /// the marks there are.
     fn mark(&mut self, item: &'static str) {
         if let Some(now) = self
             .ctl(&["metrics"])
@@ -4736,7 +4117,7 @@ impl Session<'_> {
     }
 }
 
-/// Record one session: the recording, or why the session could not run.
+/// Run and record one baseline session for `arch` and `screen`.
 fn record_session(
     up: &Up,
     arch: Arch,
@@ -4794,7 +4175,6 @@ fn record_session(
     for (name, version) in lock_stack(lock) {
         s.rec.stack(&format!("crate.{name}"), version);
     }
-    // The listener first, so it hears aterm's adapter from its first event.
     let events = format!("{dir}/atspi-events.txt");
     let stop = format!("{dir}/atspi-stop");
     let listener = guest::Unit {
@@ -4819,8 +4199,6 @@ fn record_session(
             listening.tail(3)
         ));
     }
-    // lane-bus creates its output once its match rule is in place: from then
-    // on the bus routes it every event, aterm's first included.
     if !up.sh(&guest::wait_file(&events, 60)).ok() {
         let why = s.unit_journal(&listener.name);
         up.stop_units();
@@ -4829,8 +4207,6 @@ fn record_session(
         ));
     }
     let invocation = s.gui.start(Some(screen.display), &[])?;
-    // A session that never got going decided nothing: NOT RUN, with aterm's
-    // journal tail and any crash report it wrote kept beside the report.
     let started = (|| -> Result<String, String> {
         if !up.sh(&guest::wait_socket(&s.gui.sock(), 60)).ok() {
             return Err("aterm-gui's control socket never listened (60 s)".into());
@@ -4841,11 +4217,6 @@ fn record_session(
         }
         let _ = s.ctl(&["metrics", "reset"]);
         s.mark("settle");
-        // The window's first configures can still be landing at `ready` (an
-        // output's scale arrives with the surface's enter): the grid it
-        // settles at. Both startup re-grids the lane once booked, a scaled
-        // weston's and Mutter's, are traced in
-        // docs/measured/linux-gpu-rows-2026-10-19.md.
         s.settled_dims()
     })();
     let d = match started {
@@ -4917,20 +4288,14 @@ fn record_session(
     let journal = s.gui.journal(&invocation);
     s.percentiles(&journal);
     let pid = s.pid().unwrap_or_default();
-    // The event stream: the listener stopped, its file read.
     let _ = up.sh(&["touch".into(), stop]);
     let _ = up.sh(&guest::wait_unit_gone(&listener.name, 60));
     let stream = up.sh(&["cat".into(), events]);
-    // This aterm's events only: the guest's bus may carry another lane's.
     let lines: Vec<&str> = stream
         .text
         .lines()
         .filter(|l| event_parts(l).is_some_and(|(p, _)| p == pid))
         .collect();
-    // The frame's name follows the window title, which the shell sets to the
-    // running command and back; whether a short command's title is ever
-    // published follows frame timing (measured: present on x86_64, absent on
-    // aarch64, for the same script). The end walk keeps the name it settles at.
     let kinds: BTreeSet<String> = lines
         .iter()
         .map(|l| event_kind(l, &s.roles))
@@ -4969,17 +4334,12 @@ fn record_session(
     s.header_gestures();
     s.cpu_seat();
     s.touch();
-    // Last: it puts GNOME Shell in place of the screen's Mutter.
     s.text_input_v3_ime();
     up.stop_units();
     Ok(s.rec)
 }
 
-/// The session's slowest present, from a `metrics` summary: its
-/// output-to-present latency, the scripted item it ended in (the last of
-/// `marks` that began before it) and how far in, the gap since the present
-/// before it, and the frame and main-loop maxima beside it, which say
-/// whether the frame's own work or a wait made it slow.
+/// Summarize the slowest present in `metrics` against the item start timestamps in `marks`.
 #[must_use]
 pub fn slowest_present(metrics: &str, marks: &[(&str, f64)]) -> String {
     let get = |k: &str| proof::field(metrics, k).unwrap_or("?");
@@ -5005,11 +4365,7 @@ pub fn slowest_present(metrics: &str, marks: &[(&str, f64)]) -> String {
     )
 }
 
-/// What every baseline session of one lane run shares: lane-bus and
-/// `lane-wl`, built once natively (probes, not under test) while
-/// accessibility is on; the
-/// checkout's lock, for the stack lines; where the recordings are committed;
-/// where the fresh ones go; and whether this run records or replays.
+/// Shared state across all baseline sessions in one lane run.
 pub struct Baseline {
     bus: String,
     wl: String,
@@ -5017,12 +4373,11 @@ pub struct Baseline {
     committed: PathBuf,
     results: PathBuf,
     record: bool,
-    /// The sessions' aterm-gui draws on the wgpu oracle (`--wgpu-oracle`).
+    /// Whether sessions run `aterm-gui` with `--wgpu-oracle`.
     pub wgpu_oracle: bool,
 }
 
-/// Set at-spi2-core's `org.a11y.Status.IsEnabled`: aterm's AT-SPI
-/// publisher (aterm-a11y) publishes only while it is on.
+/// Set `org.a11y.Status.IsEnabled` on the guest AT-SPI bus.
 pub(crate) fn accessibility(up: &Up, on: bool) -> Out {
     up.sh(&[
         "busctl".into(),
@@ -5038,12 +4393,7 @@ pub(crate) fn accessibility(up: &Up, on: bool) -> Out {
 }
 
 impl Baseline {
-    /// Build lane-bus and `lane-wl`, and see that at-spi2-core can turn accessibility on
-    /// (it is off again until a session starts: the proof's own rows and the
-    /// guest's other aterms run without it).
-    ///
-    /// # Errors
-    /// The NOT RUN row that says which of the two failed.
+    /// Build guest probes (`lane-bus`, `lane-wl`) and verify `org.a11y.Status.IsEnabled`.
     pub fn begin(up: &Up, results: &Path, record: bool) -> Result<Baseline, proof::Row> {
         let repo = linux::repo();
         let t0 = Instant::now();
@@ -5063,8 +4413,6 @@ impl Baseline {
         }
         let lane = up.lane_dir();
         let env = guest::cargo_env(Arch::Aarch64, &format!("{lane}/target"), false);
-        // lane-bus, and the Wayland drag source (aterm-wayland's `lane-wl`
-        // example): probes, built natively, not under test.
         for (what, package, target) in [
             ("lane-bus", "aterm-dbus", ["--bin", "lane-bus"]),
             ("lane-wl", "aterm-wayland", ["--example", "lane-wl"]),
@@ -5107,14 +4455,12 @@ impl Baseline {
         })
     }
 
-    /// Turn accessibility off, whatever a session left.
+    /// Disable `org.a11y.Status.IsEnabled` in the guest.
     pub fn end(&self, up: &Up) {
         let _ = accessibility(up, false);
     }
 
-    /// One session of `arch` under `screen`, from the aterm-gui and
-    /// aterm-ctl built in `bin`: recorded, then replayed against the
-    /// committed recording, or (`--record`) written over it. Its row.
+    /// Record one session for `arch` and `screen` and compare or write the baseline file.
     pub fn session(&self, up: &Up, arch: Arch, screen: Screen, bin: &str) -> proof::Row {
         let name = format!(
             "{} ({}) baseline {}{}",
@@ -5129,8 +4475,6 @@ impl Baseline {
         );
         println!("\n=== {name} ===");
         let started = Instant::now();
-        // Accessibility is on for the session alone: aterm's AT-SPI
-        // publisher publishes only while it is.
         let enabled = accessibility(up, true);
         let recorded = if enabled.ok() {
             record_session(
@@ -5166,8 +4510,6 @@ impl Baseline {
         row
     }
 
-    /// Keep the fresh recording beside the report, then compare it with the
-    /// committed one, or (`record`) write it over the committed one.
     fn judge(
         &self,
         rec: &Recording,
@@ -5247,10 +4589,7 @@ impl Baseline {
     }
 }
 
-/// `linux baseline …`.
-///
-/// # Errors
-/// A usage error, or the lane could not be brought up (NOT RUN).
+/// Entry point for `linux baseline`.
 pub fn cmd_baseline(args: &[String]) -> Res {
     let ask = parse_baseline(args)?;
     crate::stop::install();
@@ -5422,8 +4761,6 @@ mod tests {
         assert!(Recording::parse("==key v\n").is_err());
     }
 
-    /// The replay's negative control: a behaviour line that moves, appears or
-    /// vanishes fails it; a measured or stack line that moves never does.
     #[test]
     fn only_behaviour_decides_the_replay() {
         let old = rec(&[
@@ -5518,8 +4855,6 @@ mod tests {
         );
     }
 
-    /// The drag source's reports as Mutter 46 and weston 13 sent them over
-    /// aterm's window, away past its corner and back (measured 2026-10-19).
     #[test]
     fn a_drag_source_hears_the_window_take_and_leave_the_drag() {
         let over = ("text/uri-list", Some("copy"));
@@ -5574,8 +4909,6 @@ mod tests {
         assert_eq!(source_heard(&["action copy"], 0, away), None);
     }
 
-    /// The slowest present is named by the item it ended in: the last mark
-    /// that began before it, however late in that item it came.
     #[test]
     fn the_slowest_present_is_named_by_the_item_it_ended_in() {
         let metrics = "OK backend=gpu max_present_latency_ms=301.40 max_frame_render_ms=297.10 \
@@ -5597,7 +4930,6 @@ mod tests {
         assert!(slowest_present("OK", &marks).starts_with("? ms, ending in before the first mark"));
     }
 
-    /// Shapes measured in the guest on 2026-10-16.
     #[test]
     fn the_replies_are_kept_without_what_moves_with_time_or_edits() {
         let dims = "OK 24 80 1120 720 session=0 cell_w=14 cell_h=30 font_px=23.00 scale=1.50 window=0 window_rows=24 window_cols=80 composed_rows=24 grid_w=1120 grid_h=720 frame_w=1156 frame_h=792 surface_w=1157 surface_h=792 offset_x=18 offset_y=54 band_left=0 band_right=0 band_top=0 band_bottom=0 crop_left=0 crop_right=0 crop_top=0 crop_bottom=0 pad=18 pad_top=2 pad_bottom=18 head=34 tab_rows=1 viewers=1 visible_viewers=1 geometry=settled present_retry_state=idle";
@@ -5651,8 +4983,6 @@ mod tests {
         assert_eq!(typed_line("lane$ echo x\nx\nlane$\n"), "");
     }
 
-    /// `await match` takes one word, a regex: text with a space or a
-    /// metacharacter still matches only itself.
     #[test]
     fn a_literal_becomes_one_word_of_regex() {
         assert_eq!(regex_literal("echo X-x"), r"echo\sX-x");
@@ -5664,7 +4994,6 @@ mod tests {
         assert!(!regex_literal("a b c").contains(' '));
     }
 
-    /// The CPU item's typing: a key per character, the space by name.
     #[test]
     fn text_is_typed_on_the_seat_a_key_each() {
         assert_eq!(
@@ -5683,14 +5012,9 @@ mod tests {
         assert!(seat_taps("").is_empty());
     }
 
-    /// The stream's text changes, undone from the end walk's text, and its
-    /// last caret event; the negative controls: an insert whose text is not
-    /// where it says, and a caret that moved after its last event.
     #[test]
     fn the_text_changes_rebuild_the_end_walks_text() {
         let roles = vec![("/t".to_string(), "terminal".to_string())];
-        // From "lane$ \n": the echo typed, the blank row taken, its output
-        // and the next prompt put in its place.
         let events = [
             r#"1 7 Object.TextChanged /t detail="insert" d1=6 d2=6 any="echo x""#,
             r#"2 7 Object.TextChanged /t detail="delete" d1=12 d2=1 any="\n""#,
@@ -5726,8 +5050,6 @@ mod tests {
         );
     }
 
-    /// A wire log's lines as libwayland prints them (measured under Mutter
-    /// 46, 2026-10-16).
     #[test]
     fn the_text_input_wire_keeps_names_and_the_content_type() {
         let log = r#"[1545378.526] wl_registry@2.global(24, "zwp_text_input_manager_v3", 1)
@@ -5752,8 +5074,6 @@ mod tests {
         );
     }
 
-    /// A wire log's touch lines as libwayland prints them (measured under
-    /// Mutter 46 through a RemoteDesktop touchscreen, 2026-10-19).
     #[test]
     fn the_touch_wire_keeps_names_and_the_first_down() {
         let log = "[1166175.811]  -> wl_seat@7.get_touch(new id wl_touch@33)
@@ -5777,7 +5097,6 @@ mod tests {
         assert_eq!(touch_down_at(none), None);
     }
 
-    /// The `strip-caption` line as aterm-gui's `chrome` prints it (LW.5).
     #[test]
     fn the_caption_line_reads_back_the_frame_and_its_buttons() {
         let chrome = "toolbar (none)\nstrip-caption frame=client buttons=minimize:68..72,maximize:72..76,close:76..80 hovered=none maximized=false edges=true menu=true\nmenu \"File\": New Tab";
@@ -5816,7 +5135,6 @@ mod tests {
         assert!(none.buttons.is_empty() && none.maximized);
     }
 
-    /// The `ime` line as aterm-gui's `chrome` prints it (L-HEADER-LW7).
     #[test]
     fn the_ime_line_is_found_among_the_chrome_lines() {
         let chrome = "toolbar (none)\nstrip-caption frame=system\nime preedit=\"ni hao\" caret=6 spot=66,36,9x20\nmenu \"File\": New Tab";
@@ -5836,7 +5154,6 @@ mod tests {
         );
     }
 
-    /// A wire log's `xdg_toplevel` requests as libwayland prints them.
     #[test]
     fn the_frame_requests_keep_names_and_the_resize_edge() {
         let log = "[1.0]  -> xdg_toplevel@17.set_title(\"~\")
@@ -5854,7 +5171,6 @@ mod tests {
         assert_eq!(frame_requests("[1.0] xdg_toplevel@17.close()\n"), "none");
     }
 
-    /// The slot rule is aterm-gui's: 34 logical px in whole cells.
     #[test]
     fn a_caption_slot_is_34_logical_px_in_whole_cells() {
         assert_eq!(caption_slot_cols(9, 1.0), 4);
@@ -5866,7 +5182,6 @@ mod tests {
 
     #[test]
     fn a_slot_with_a_button_reads_drawn_and_bare_band_reads_bare() {
-        // 8x4 frame: band grey, a 3x3 block of ink in the right half.
         let band = [48u8, 48, 48, 255];
         let ink = [200u8, 200, 200, 255];
         let mut rgba = Vec::new();
@@ -5880,8 +5195,6 @@ mod tests {
         assert_eq!(slot_class(&f, 4, 8, 0, 4), ("drawn", 9));
         assert_eq!(slot_class(&f, 0, 4, 0, 4), ("bare", 0));
         assert_eq!(slot_class(&f, 8, 9, 0, 4), ("bare", 0), "past the frame");
-        // Read from under a band on top (a stats Deck's): the ground is the
-        // slot's top-left pixel there, and the rows above it are not read.
         assert_eq!(slot_class(&f, 4, 8, 1, 4), ("drawn", 9));
         assert_eq!(slot_class(&f, 4, 8, 2, 4), ("drawn", 6));
         assert_eq!(slot_class(&f, 4, 8, 4, 4), ("bare", 0), "no rows");

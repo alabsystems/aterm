@@ -1,177 +1,39 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `aterm fabric`: the fabric's state on one screen, and `tail`, its traffic live. [`USAGE`]
-//! is the command line; `on`, `off` and `doctor` are [`crate::enable`], `mint-for` and `join`
-//! [`crate::join`].
+//! `aterm fabric`: fabric status, live traffic (`tail`), session-log brief (`brief`), lifecycle
+//! (`on`, `off`, `doctor` in [`crate::enable`]), and person commands (`mint-for`, `halt`, `inbox`,
+//! `post` in [`crate::person`]). [`USAGE`] lists all subcommands and flags.
 //!
-//! ```text
-//! aterm fabric [status] [--json]
-//! aterm fabric tail [--bodies] [--from <offset>]
-//! aterm fabric brief [@<sid>[@<node>]] [--window <records>] [--budget <tokens>]
-//! aterm fabric on [--dry-run] [--fleet <F>] [--service launchd|systemd|none] [--durability <tier>]
-//! aterm fabric off [--dry-run] [--service launchd|systemd|none]
-//! aterm fabric doctor
-//! aterm fabric mint-for h-<name>|a-<name> [--out <cap>] [--fleet <F>] [--expires <N>d|<N>h]
-//! aterm fabric halt  --cap-file <person-cap> <reason>|off
-//! aterm fabric inbox --cap-file <person-cap> [--peek]
-//! aterm fabric post  --cap-file <person-cap> to=@<sid>@<node> kind=<k> [re=<off>] <text>
-//! aterm fabric help
-//! ```
+//! ## Command resolution
 //!
-//! `on`, `off` and `doctor` are [`crate::enable`]: turning the fabric on in
-//! one command, proving it, and naming the fix for each warning below.
-//! `mint-for`, `halt`, `inbox` and `post` are [`crate::person`]: a person
-//! gets a cap of their own, and halts the fleet, reads their mail and answers
-//! it under that cap.
+//! `status` takes no positional arguments. It resolves the bridge command (`aterm link serve …`)
+//! in order from:
+//! 1. `$ATERM_FABRIC_COMMAND` (development builds only),
+//! 2. `[fabric] command` in `aterm.toml` (string split on whitespace or TOML string array),
+//! 3. the rendezvous file (`fabric.toml`) written by `aterm fabric on`,
+//! 4. a running local instance's supervised bridge (recorded as a warning when config is absent).
 //!
-//! THE OWNER'S COMMAND, AND IT TAKES NO ARGUMENTS. Everything it needs is in the
-//! `[fabric] command` aterm launches its bridge from: the fleet, the broker, the
-//! cap files and the state dir are that command's own flags, parsed by the
-//! bridge's own parser ([`crate::cli::parse`]). The command is read in either
-//! spelling the app reads ([`command_in_toml`]): a line split on whitespace,
-//! or an argv array whose elements are one word each, so the dev app's
-//! `…/aterm (dev).app/…` path is one word. In a development build the
-//! `ATERM_FABRIC_COMMAND` seam overrides the file exactly as it does for the app
-//! (`aterm-gui`'s `fabric_launch::configured_command`: the seam first, then the
-//! file, blank means absent — a shipped build reads the file alone). With
-//! neither, the rendezvous file `aterm fabric on` wrote beside the
-//! instance control sockets ([`crate::enable::Rendezvous`]) is read for the
-//! command it mirrors; with none of the three, the report says the fabric is
-//! off and where it looked. One more source is read when all are empty: a
-//! running instance's bridge — armed with a command its aterm.toml named then
-//! and no longer does, or launched from a development build's
-//! `$ATERM_FABRIC_COMMAND` seam —
-//! is carrying mail all the same, so its command is used and the missing config
-//! is a WARNING.
+//! ## `status` sections
 //!
-//! A message body prints only under `tail --bodies`. Every string from the bus or another
-//! process goes through [`crate::render::safe`] before it reaches the terminal. The report
-//! writes no file. Exit status: `0` healthy; `1` a warning was printed; `2` the fabric is off,
-//! its config cannot be read, or the command line is wrong.
-//! ## What `status` reads, and from where
+//! * **CONFIG**: command source, program, fleet, node id, cap-file grant counts, state dir,
+//!   `presence` and `receipts` settings.
+//! * **BROKER**: live connect + `Hello` + cap attach + head query (`Fetch max=0`), guard probe
+//!   ([`BrokerView::guarded`]), serving PID and launchd job, `subjects` spent of [`SUBJECT_BUDGET`],
+//!   served durability tier (`acks`), in-band `health` (entry 0x04: poison and flush counts), and
+//!   sidecar `holds` (`<log>.health`). On a guarded broker whose caps do not grant `/f/<F>/>`,
+//!   reads run over the granted faces ([`BrokerView::faces`]).
+//! * **NODES**: every node presence row on the bus (`this`, `local`, or `remote` for an unhosted
+//!   or ghost node on this machine).
+//! * **BRIDGES**: every local `aterm` instance and its supervised `link serve` child.
+//! * **SESSIONS**: bus presence roster joined by `<sid>` with local instance `meta`, `inbox --peek
+//!   --meta`, `timeline` (for hold reason/origin) and `topic ls`.
+//! * **TRAFFIC**: the newest [`TRAFFIC_ROWS`] records (metadata only; `tail --bodies` prints text).
+//! * **WARNINGS**: conditions that break delivery or make `connected` misleading (`aterm fabric
+//!   doctor` prints the remedy for each).
 //!
-//! * CONFIG — the command and where it came from, its fleet, the node id in its
-//!   state dir, and how many grants each cap file holds.
-//! * BROKER — a REAL reachability check: a connect, the broker's `Hello`, every
-//!   cap attached, and the head query (`Fetch max=0`). A socket FILE is not a
-//!   broker. The endpoint's `fabric=connected` means the bridge's link had its
-//!   last exchange acked, `stalled` that a bridge is attached but its link is
-//!   down — but that is the BRIDGE's last observation, as old as
-//!   `link_age_ms=` says; this probe is the report's own, made now.
-//!   `stale` is the case the other two cannot see: the endpoint gave the
-//!   bridge a post and has had nothing back since — no ack, no landing, no
-//!   `link` record. A dead helper closes its fds (`disconnected`) and a dead
-//!   BROKER is reported within the bridge's own 5 s ack deadline (`stalled`);
-//!   a WEDGED helper does neither. It is not read off the ack's age alone: a
-//!   quiet link's age grows without bound by design, so the clock runs only
-//!   while an answer is owed.
-//!   The pid is the process serving `link broker <socket>` in the process table,
-//!   and on macOS the launchd job whose pid that is. THE HEAD QUERY IS PART OF
-//!   THE CHECK ([`BrokerView::read_ok`]): a broker that acknowledges the `Hello`
-//!   and every `Attach` and then errors the `Fetch` — a cap file whose grants do
-//!   not cover `/f/<fleet>/>`, or a broker that dies between the two — is `yes,
-//!   but the bus cannot be read: <its own reason>`, a WARNING, and exit 1. It is
-//!   not `reachable yes`: with no head there is no roster, no traffic and no
-//!   standing halt to report. THE GUARD IS MEASURED TOO ([`BrokerView::guarded`]):
-//!   one more attach, of a grant minted under a secret no broker holds, which a
-//!   guarded broker refuses — a broker that acknowledges it checks no
-//!   capability, whatever its job says, and that is a WARNING.
-//! * BRIDGES — one row per aterm instance on this machine, found by the same
-//!   rendezvous walk `aterm ctl instances` makes ([`aterm_ctl::local_instances`])
-//!   and asked `fabric status` under the Owner token beside its socket: its
-//!   `state=`, and for a `stalled` link the bridge's `reason=`, for a
-//!   `connected` one the last acked round trip and its age. The bridge pid is
-//!   that instance's child running `link serve`.
-//! * SESSIONS — the bus's presence roster (the rows `aterm link ls` prints)
-//!   joined by sid with what each local instance says about its own sessions:
-//!   `meta` for the title and role, and `inbox --peek --meta` for the inbox
-//!   numbers — `--peek` so no row becomes listed, `--meta` so no text is read.
-//!   The row's own `detail=` and `phase=` (the running program, and busy |
-//!   idle | prompt | question | limited | survey — the server's agent verdict
-//!   the bridge relays) are the bridge's, so a remote session shows them too;
-//!   a local instance's `meta` wins for the title and role, the bus row fills
-//!   them in for a remote one.
-//!   A HELD session's `timeline` is read for the hold's reason and origin, which
-//!   no other read verb reports; an unhandled task's or ask's age is the `t=` of
-//!   its record on the bus. A row still `live` under a node whose will fired
-//!   reads `away` (mail to it queues); a session that ended, or that its
-//!   instance withdrew as it quit (`bye quit`), reads `exited`.
-//! * NODES — every node row on the presence roster, as the node published it
-//!   (`host=`, `state=`, `fabric=`, and `proto=`/`aterm=`: the astream
-//!   protocol it speaks and the aterm release it runs; a will reads `away`,
-//!   whether its bridge wrote that or the older `gone`), with the sessions it
-//!   advertises, `this` for the node the command's state dir names, `local`
-//!   for another instance on this machine, and `remote` for one no instance
-//!   here answers as. THE BUS IS ONE MACHINE'S (a Unix socket in a 0700
-//!   directory: no other host reaches it), so a `remote` node is never
-//!   another host: it is an UNHOSTED or GHOST node of this machine — an aterm
-//!   that quit or crashed under another state dir, a lab or scratch
-//!   instance's node, the node a state dir answered as before its node id
-//!   was minted again, or an instance that did not answer this report (a
-//!   WARNING names it). A node publishes only as itself, and only its own
-//!   cap grants its faces, so its rows clear only AS it: an aterm that runs
-//!   with its state dir again retires what its bridge can prove unhosted, and
-//!   `aterm fabric doctor --retire-ghosts` under a `[fabric] command` naming
-//!   that state dir AND that node's cap retires the rest — beside this
-//!   machine's running aterm too, since each node's rows go to a bridge of
-//!   that node or to the command itself, never to another node's bridge
-//!   (`enable.rs`'s `publisher_for`). A node whose state dir or cap is gone —
-//!   under `aterm fabric on`, whose root keeps one state dir, the old node of
-//!   a node id minted again — has nothing left on this machine that can speak
-//!   as it: its rows stay, its will reads `away`, and mail to it queues. A
-//!   remote node is never a BRIDGES row: that table is this machine's running
-//!   instances. The roster read stops at
-//!   [`crate::glance::MAX_ROWS`]; a cut one says `rows=4096+ truncated` under
-//!   SESSIONS and is a WARNING.
-//! * THE SUBJECT BUDGET — BROKER's `subjects` line: how many of the 4096
-//!   distinct subjects one node may ever mint this node has spent
-//!   ([`subjects_of`]), a WARNING from three quarters. Only a closed
-//!   session's own `ev` face is ever reclaimed, and only while the session-log
-//!   mirror runs (`[fabric] log`; `bridge.rs` module docs): every `presence`, `say` and mail
-//!   lane subject stays spent.
-//! * THE LOG'S HEALTH — BROKER's `health` line is the broker's own word, its
-//!   `Hello`'s entry 0x04: whether its log is POISONED (it refuses every write
-//!   until it is reopened — a WARNING, which a broker of this build cures by
-//!   exiting for its supervisor) and the flushes it has issued since it
-//!   opened, a failed one a WARNING too. Its `holds` line is astream's
-//!   snapshot beside the log, `<log>.health`: what the log holds and who is
-//!   attached, said as the serving broker's own only when astream's reader
-//!   says the process serving the socket wrote it ([`crate::broker_health`]).
-//! * TRAFFIC — the last ten records under `/f/<F>/>`, metadata only.
-//!
-//! A GUARDED BROKER is read through the caps' own faces. A node's ring never
-//! grants `/f/<F>/>`, and every broker `aterm fabric on` runs is guarded, so
-//! on one the whole-fleet reads above are refused `unauthorized`. The head
-//! query then asks the first granted face (the head is global), and TRAFFIC,
-//! the deadline scan and the task ages read each granted face and merge by
-//! offset ([`BrokerView::faces`]) — the report reads what this node may read,
-//! and BROKER's `reads` line says so.
-//! * WARNINGS — every condition found above that makes `connected` a lie or
-//!   loses mail. A `stalled` bridge is one: its instance's mail queues and none
-//!   arrives until the link is back. Another is a node the bus's OWN roster
-//!   calls `state=away` while the instance whose node it is says
-//!   `fabric=connected` — a second bridge sharing the node id exited and
-//!   fired its will (measured with one state dir, before its lock; still
-//!   possible with a copy of the dir), so every peer reading the fleet's
-//!   directory saw a live node as dead. A third is an instance whose bridge
-//!   STANDS BY because another holds its state dir (`reason=state-locked`).
-//!
-//! ## Privacy
-//!
-//! A message body is never printed unless `tail --bodies` asks for it, and
-//! `status` never prints one: its ctl reads are `--meta`, and of a bus record's
-//! body it shows only the `t=` and the length. The report writes no file.
-//!
-//! Every string that came off the bus or out of another process — a subject
-//! segment, a title, a principal — goes through [`crate::render::safe`] before it
-//! reaches the terminal, so nothing a sender chose can move the cursor, reorder
-//! a line or forge a column.
-//!
-//! ## Exit status
-//!
-//! `0` healthy; `1` at least one WARNING was printed; `2` the fabric is off, its
-//! config cannot be read, or the command line is wrong.
+//! All bus and process strings pass through [`crate::render::safe`]. Exit status: `0` healthy,
+//! `1` at least one warning, `2` fabric off, unreadable config, or usage error.
 
 use aterm_uds::spawnfd::Stdio;
 use std::collections::{BTreeMap, BTreeSet};
@@ -204,179 +66,81 @@ usage: aterm fabric [status] [--json]
                           [--] <text>
        aterm fabric help
 
-The fabric's state on one screen, and the one command that turns it on. `status`
-takes no arguments: the fleet, broker, cap file and state dir are read from the
-`[fabric] command` in aterm.toml — a line split on whitespace, or an argv array of
-one string per word — and the rendezvous file `on` writes beside the instance
-control sockets (fabric.toml) is read when the file has no command.
+Inspect and manage the local aterm fabric. `status` reads the fleet, broker, cap
+file and state dir from `[fabric] command` in aterm.toml, falling back to the
+rendezvous file (`fabric.toml`) written by `aterm fabric on`.
 
-  status           the default. Seven sections: CONFIG (where the command came from,
-                   its fleet, node id and cap-file grants), BROKER (a real connect,
-                   attach and head query, whether it checks capabilities, the
-                   broker's pid and launchd job, `subjects`: how many of the
-                   4096 distinct subjects a node may ever mint this one has spent —
-                   only a closed session's `ev` face is ever given back, while
-                   the session-log mirror runs, so three quarters is a WARNING —
-                   `health`: the broker's own word on whether its log is
-                   POISONED, refusing every write until it is reopened (a
-                   WARNING), and its flushes, and `holds`: astream's snapshot
-                   beside the log of what it holds and who is attached),
-                   NODES (every node on the bus's presence roster: host=, state=,
-                   fabric=, proto= and aterm= — the astream protocol it speaks and
-                   the aterm release it runs — and its sessions, `this` marking
-                   this one and `remote` a node no instance here answers as: the
-                   bus is this machine's, so that is an unhosted or ghost node
-                   here — an aterm that quit under another state dir, a scratch
-                   instance, one that did not answer — whose rows only that node
-                   can retire: `aterm fabric doctor --retire-ghosts` under a
-                   [fabric] command naming its state dir and its cap (with those
-                   gone, nothing here can, and its rows stay); a
-                   node whose bridge went silent reads state=away, and so do the
-                   sessions it left: mail to them queues),
-                   BRIDGES (every aterm instance on this machine and its bridge),
-                   SESSIONS (each session's phase, running program, hold and inbox
-                   numbers and the broadcast topics it has opted into — a session
-                   no instance here hosts too, from its presence row, and each
-                   session's node while the bus carries more than one; BUS live,
-                   away, or gone for one that exited or that its quitting
-                   instance withdrew — a post to that is refused unroutable; a
-                   roster read cut at 4096 rows says `rows=4096+ truncated`),
-                   TRAFFIC (the last 10 bus records) and
-                   WARNINGS (what makes `connected` a lie or loses mail). On a
-                   GUARDED broker whose grants do not cover /f/<F>/> (every one
-                   `on` runs) every read is made over the faces the cap files
-                   grant, and BROKER says which
-  --json           status and brief: the same data as one JSON object (brief's
-                   holds one object per session, ids, closed words and counts:
-                   node, sid, this, ep, need, detail, open, mail_in, mail_out,
-                   last_seq, age_s, partial)
-  tail             follow the bus live, one line per record, until Ctrl-C
-  --from <offset>  tail only: replay from that bus offset first (default: new
-                   records only)
-  --bodies         tail only: also print each record's text, after its trust label
-  --filter <f>     tail only: follow ONE subject pattern instead of the whole fleet
-                   — `*` is one segment and `>` the rest, so
-                   `/f/<F>/pub/*/*/say/>` is every broadcast in the fleet. It must
-                   name this fleet; what it may READ is still what the cap files
-                   grant, and a broker that refuses it says so rather than quietly
-                   following the granted faces instead
-  on               turn the fabric on, idempotently, and PROVE it: the binary is
-                   checked, the root (~/.local/share/aterm-fabric) made 0700 (an
-                   aterm path with a space in it is run through a link there,
-                   bin/aterm), a node
-                   id provisioned once, a mint secret and the node's 8 grants minted
-                   (as one transaction), the broker installed and started under launchd
-                   (macOS) or systemd --user (Linux) — the login's supervisors, so it
-                   stops at logout — and probed for real, `[fabric] command` written
-                   to aterm.toml (atomically, previous file kept as .bak), the
-                   rendezvous file written 0600, every running aterm instance armed
-                   with `fabric attach <argv>`, then a note posted from a session to
-                   itself and awaited back through the broker within 5 s; `aterm
-                   fabric` status prints last. A second `on` changes nothing and says
-                   so per step
-  --dry-run        on/off only: print every step and touch nothing
-  --fleet <F>      on and mint-for only: the bus's fleet name, `/f/<F>/` (on: the
-                   fleet this root is configured for, else local — another is
-                   refused until `off`; mint-for: this machine's fleet). Not
-                   `aterm fleet`, the aterms of a LAN that read each other's
-                   sessions
-  --service <s>    on/off only: launchd | systemd | none — `none` means the
-                   broker is kept alive by something else (it must already answer)
+  status           default view with seven sections:
+                   - CONFIG: command source, fleet, node id, cap grants, state dir
+                   - BROKER: live connect/attach/head probe, capability guard check,
+                     PID/service job, `subjects` spent of 4096, `acks` durability,
+                     `health` (poison status and flush counts), and `holds`
+                     (`<log>.health` snapshot)
+                   - NODES: bus presence rows (`this`, `local`, or `remote` for an
+                     unhosted/ghost node on this machine; retire via `aterm fabric
+                     doctor --retire-ghosts`)
+                   - BRIDGES: local aterm instances and their bridge processes
+                   - SESSIONS: per-session bus state (`live`, `away`, `gone`), hold,
+                     inbox counts, topics, role, detail, phase, context and title
+                     (`rows=4096+ truncated` when cut at 4096 rows)
+                   - TRAFFIC: last 10 bus records (metadata only)
+                   - WARNINGS: issues that block mail or make `connected` misleading
+  --json           status and brief: emit one JSON object (`brief --json` emits one
+                   object per session with node, sid, this, ep, need, detail, open,
+                   mail_in, mail_out, last_seq, age_s, partial)
+  tail             stream bus records live until Ctrl-C
+  --from <offset>  tail only: replay from bus offset `<offset>` first
+  --bodies         tail only: print each record's text after its trust label
+  --filter <f>     tail only: subscribe to one subject pattern (`/f/<F>/…`, `*` for
+                   one segment, `>` for the rest) instead of the whole fleet
+  on               idempotently provision the fabric root (`~/.local/share/aterm-fabric`,
+                   0700), node id, mint secret and 8 node grants; install and start
+                   the broker under launchd (macOS) or systemd --user (Linux); write
+                   `[fabric] command` to aterm.toml (keeping `.bak`) and `fabric.toml`
+                   (0600); attach running aterm instances; verify end-to-end delivery
+                   with a self-test note; and print `status`
+  --dry-run        on/off only: print planned steps without modifying anything
+  --fleet <F>      on and mint-for: fleet name (`/f/<F>/`; default `local`)
+  --service <s>    on/off only: `launchd`, `systemd` or `none` (`none` uses an
+                   already-running externally managed broker)
   --durability strict|ordered|relaxed
-                   on only: what the broker's ack promises. Unnamed it is the
-                   build's default, ordered. ordered acks once the record is
-                   in ORDER on the disk, and the broker flushes in full a
-                   tenth of a second after the first ack no full flush covers,
-                   once the batch in hand is written: a panic or forced
-                   power-off can lose the last 100 ms of machine records, plus
-                   a batch and a full flush (up to 145 ms of them measured on
-                   a loaded Mac), never a halt, a person's own words, mail to
-                   a person or a person's read mark, which are flushed in full
-                   before their ack. astream serves it strict where the disk
-                   cannot keep the order (off macOS, a log off the boot
-                   volume), and status says so and why. strict acks once the
-                   record is flushed in full: a power loss loses nothing
-                   acked. relaxed acks once it is in the page cache, without
-                   waiting for a disk flush, and survives a crash or restart
-                   of the broker but NOT a power loss, kernel panic or hard
-                   reset, which can take the machine records it acked since
-                   it last started or stopped cleanly (the same records as
-                   ordered are flushed first). A clean
-                   stop (logout, shutdown, `off`, an update) flushes the log and
-                   costs nothing, and so does a kill -9 in the same boot while
-                   the log is on the boot volume (off it, a kill -9 counts as
-                   the restart below). After a machine restart WITHOUT one, the
-                   log's GENERATION moves at its first open, with the point
-                   where the two generations agree: every bridge and notifier
-                   resumes there, so nothing posted after the restart is
-                   skipped, and only the records the power loss took are gone
-                   from the log. A machine restart stops aterm too, and what
-                   its sessions had queued goes with it. When aterm outlives
-                   a move (a kill -9 of a relaxed broker whose log is off the
-                   boot volume, the reopen after a failed flush), a session's
-                   endpoint is told that point too and keeps a reply it had
-                   queued, and a verdict on a row shown before the move, that
-                   name a record below it (an older aterm retires both, as on
-                   any change of log). The
-                   tier is written into the job when named (strict too); a
-                   bare `on` keeps the tier the installed job names (under
-                   --service none, the one the running broker runs), and a
-                   job that names none runs the build's default. Status and
-                   doctor say which tier is in force, as the broker itself
-                   reports it. A build older than the one that first took the
-                   word refuses --durability ordered: before going back to
-                   one, run `off`, then its own `on`
-  off              stop and remove the broker job, remove the `[fabric]` table
-                   (previous file kept as .bak) and the rendezvous file — and keep
-                   the node id, secret and cap: identity is provisioned, never
-                   discarded. The bus log stays; the line says where
-  doctor           `status`'s WARNINGS, each with the fix for it, plus whether the
-                   rendezvous file is there
-                   --retire-ghosts lists every presence row this node advertises LIVE
-                   that no local instance hosts and, after a y/N (or --yes), publishes
-                   `exited` for each. DRY by default. Each row goes to a bridge of
-                   ITS node when one is UP (`aterm ctl fabric retire`, then the bus
-                   is read back), never to another node's; with none, this command
-                   publishes the rows of the node its state dir names itself, and
-                   names any other node's as not retirable from here.
-  mint-for h-<name>
-                   on this machine (its fabric root holds the mint secret): a
-                   PERSON's cap (a-<name> for an agent with a cap of its own) —
-                   the grants inbox and post below use: a send lane to any
-                   session in their name (trust=human for h-), their mail lane
-                   and its cursor, and the presence roster; a human also gets
-                   their own halt row. The secret never leaves the root and is
-                   never printed
-  --out <cap>      mint-for only: write the cap there, 0600, never over a different
-                   file and never through a symlink; an identical one already there
-                   is made 0600 (default: the cap's lines on stdout, the guidance
-                   on stderr). The last lines are the commands that use it
+                   on only: broker ack durability tier (default `ordered`).
+                   - `ordered`: acks after a disk ordering barrier and flushes in
+                     full within 100 ms (served `strict` where the disk cannot
+                     guarantee ordering).
+                   - `strict`: acks after a full drive-cache flush; loses nothing
+                     acked on power loss.
+                   - `relaxed`: acks after the page-cache write; survives broker
+                     restarts, not power loss or kernel panic.
+                   Halts, a person's words, mail to a person and read marks always
+                   flush in full before ack. Clean stops flush and close the log; an
+                   unclean reboot advances the log generation at the agreement offset
+                   so bridges and notifiers resume without skipping post-restart mail
+  off              stop and remove the broker job, `[fabric]` in aterm.toml (keeping
+                   `.bak`), and `fabric.toml`, while preserving the node id, secret,
+                   cap and bus log
+  doctor           print `status` warnings with their remedies (`--retire-ghosts`
+                   lists unhosted live presence rows on this node and, after y/N or
+                   `--yes`, publishes `exited` for each; dry by default)
+  mint-for <id>    mint a capability ring for human `h-<name>` or agent `a-<name>`
+                   under this machine's mint secret (human rings include `halt`)
+  --out <cap>      mint-for only: write cap to `<cap>` (0600, refusing symlinks or
+                   different existing caps; default prints cap to stdout and guidance
+                   to stderr)
   --expires <N>d|<N>h
-                   mint-for only: stamp every grant `exp=` that far from now; the
-                   broker refuses the ring from that instant on, so a copied cap
-                   stops working by itself. Renew it by minting again. Without it
-                   the ring never expires
-  halt <reason>    as the human a --cap-file names: hold EVERY session on the
-                   fleet (hold=1 origin=fleet, ERR halted to every PTY-reaching
-                   verb), as each node reads the row. `halt off` withdraws that
-                   person's halt; nothing else lifts it (the Owner's `hold off` is
-                   ERR denied, and `fabric off` leaves the row for the next `on`)
-  inbox            as that person: the mail agents posted `to=<person>` (asks,
-                   reports, receipts, undeliverable/expired notices) since the last
-                   inbox, then everything it read is marked read, mail or none (one
-                   commit record) — the cursor is the broker's, so every reader
-                   agrees. --peek marks nothing. Each ask prints its answer
-  post             as that person, to ONE session: to=@<sid>@<node> (what inbox
-                   prints), kind= ask|answer|task|report|note (default note),
-                   re=<off> to answer one; the rest of the line is the text. A
-                   human's task always arrives as a task; an a-<name>'s only where
-                   --accept-from lists it
-  --cap-file <c>   halt/inbox/post: the person's cap (`mint-for h-<name> --out`)
+                   mint-for only: stamp grants with `exp=` so the broker refuses the
+                   ring after `<N>d` or `<N>h`
+  halt <reason>    as human `--cap-file`: hold every session on the fleet (`hold=1
+                   origin=fleet`); `halt off` withdraws this human's halt
+  inbox            as `--cap-file`: print unread mail to `<person>` and commit the
+                   consumer group cursor (`--peek` leaves mail unread)
+  post             as `--cap-file`: send `to=@<sid>@<node>` with `kind=ask|answer|
+                   task|report|note` (default `note`) and optional `re=<off>`
+  --cap-file <c>   halt/inbox/post/brief: capability file (`mint-for h-<name> --out`)
 
-A message body never prints without `tail --bodies`; `status`, `tail` and `doctor`
-write nothing to disk. Exit status: 0 healthy, 1 a warning was printed (or the
-proof failed), 2 the fabric is off, its config cannot be read, or the command line
-is wrong. `tail` exits 1 when the broker cannot be reached or closes the stream.
+Message bodies are never printed without `tail --bodies`. `status`, `tail` and
+`doctor` write nothing to disk. Exit status: 0 healthy, 1 warning (or failed proof),
+2 fabric off, unreadable config, or usage error.
 ";
 
 /// A development build's override for `[fabric] command` (`aterm_types::dev_seam!`).
@@ -430,7 +194,7 @@ pub enum Cmd {
         /// `--filter <subject-filter>`; `None` is the whole fleet.
         filter: Option<String>,
     },
-    /// `aterm fabric brief …` ([`crate::fabric_brief`], session log phase 4).
+    /// `aterm fabric brief …` ([`crate::fabric_brief`]).
     Brief(crate::fabric_brief::BriefOpts),
     /// `aterm fabric on …` ([`crate::enable::on`]).
     On(crate::enable::OnOpts),
@@ -471,7 +235,6 @@ pub fn parse_args(args: &[String]) -> Result<Cmd, String> {
             });
         }
         Some("help" | "-h" | "--help") => return Ok(Cmd::Help),
-        // The session logs' bus fold (phase 4): its own words.
         Some("brief") => return crate::fabric_brief::BriefOpts::parse(&args[1..]).map(Cmd::Brief),
         Some(flag) if flag.starts_with('-') => ("status", args),
         Some(other) => {
@@ -934,8 +697,7 @@ pub fn receipts_from_config() -> bool {
     key_from_config(receipts_in_toml, true, "receipts default to on")
 }
 
-/// `[fabric] log` in `text` (session log phase 4; `auto` since Phase 6 step
-/// 6E-3): `"auto"`, `"off"` or `"turns"`.
+/// `[fabric] log` in `text`: `"auto"`, `"off"` or `"turns"`.
 ///
 /// # Errors
 ///
@@ -949,13 +711,8 @@ pub fn log_in_toml(text: &str) -> Result<Option<crate::mirror::LogMode>, String>
     })
 }
 
-/// `[fabric] log` from the aterm.toml [`config_path`] resolves, for a `serve`
-/// whose command line did not say: the bus mirror of the session logs. AUTO
-/// when the file has no such key (owner decision D4, session log Phase 6 step
-/// 6E-3: the turn class mirrored over a broker that retains it,
-/// [`crate::mirror::LogMode::Auto`]), and OFF — said on stderr, not fatal —
-/// when the file cannot be read or the value is wrong, the side that
-/// publishes nothing. `"off"` is the opt-out.
+/// `[fabric] log` from `aterm.toml` (`auto` when absent; `off` with a stderr warning when
+/// unreadable or invalid).
 #[must_use]
 pub fn log_from_config() -> crate::mirror::LogMode {
     key_from_config_or(
@@ -1035,20 +792,9 @@ pub fn serve_flags<S: AsRef<str>>(argv: &[S]) -> Option<Vec<String>> {
     )
 }
 
-/// The PROGRAM a bridge command runs — what [`serve_flags`] leaves out: its
-/// first word RESOLVED to the file it names (a bare word looked up on this
-/// process's `$PATH`, then every symlink followed), so `aterm` on PATH, the
-/// bundle it links into and an `aterm-link` link to the same file are one
-/// program; and any further words before the `link serve` verb, as written
-/// (`sh -c /tmp/x link serve …` is `/bin/sh -c /tmp/x`). A word that names no
-/// file is kept as written. `None` when the command is not a bridge.
-///
-/// Two commands with the same flags and different programs are two bridges:
-/// a substituted program holds the instance's `Scope::Bridge` lane, so it is
-/// named, never reported as this one (audit r4-17).
-///
-/// The words are SHOWN ([`shown_argv`]), so a program path with a space in it
-/// reads as the one word it is.
+/// The program prefix of a bridge command (`argv` before `link serve` / `serve`), with `argv[0]`
+/// resolved on `$PATH` and canonicalized, formatted with [`shown_argv`]. `None` when `argv` is
+/// not a bridge command.
 #[must_use]
 pub fn bridge_program<S: AsRef<str>>(argv: &[S]) -> Option<String> {
     let at = (0..argv.len()).find(|&i| is_link_verb(argv, i, "serve"))?;
@@ -1785,24 +1531,8 @@ pub struct DoctorSummary {
     pub unmeasured: bool,
 }
 
-/// THE TOP-LEVEL DOCTOR'S FABRIC ROW: whether the broker the `[fabric]
-/// command` names answers, the tier it SAYS it serves, and whether it says its
-/// log is poisoned — read by the same probe `aterm fabric` makes
-/// ([`probe_broker`]: connect, `Hello`, the ring attached, the head query),
-/// for the command the CONFIGURED places name, in `aterm fabric`'s order (the
-/// development seam, aterm.toml, then the rendezvous file `on` wrote).
-/// Nothing more: no instance is asked and no roster is read, so `aterm doctor`
-/// stays a quick look, and `aterm fabric doctor` is the fabric's whole report
-/// with a fix for each warning.
-///
-/// WHERE THE TWO DOCTORS CAN DIFFER, said rather than hidden: when none of
-/// those names a command, `aterm fabric` ([`gather`]) also takes the one a
-/// running instance's supervised bridge still runs — after `aterm fabric
-/// off`, an instance keeps the bridge it had until it is relaunched — and
-/// reports that bridge's broker. Finding it means asking every instance over
-/// its control socket, a round trip per window this quick look does not pay;
-/// so this row says `off` for the configuration, and its words name where the
-/// lingering bridge is reported.
+/// Top-level `aterm doctor` `fabric:` row: probes the broker named by `$ATERM_FABRIC_COMMAND`,
+/// `aterm.toml`, or `fabric.toml` without querying local instances or scanning the roster.
 #[must_use]
 pub fn doctor_summary() -> DoctorSummary {
     let config = config_path();
@@ -1994,12 +1724,7 @@ pub fn traffic_of(fleet: &str, off: u64, subject: &str, raw: &[u8]) -> Traffic {
     traffic_of_body(fleet, off, subject, Body::decode(raw).0)
 }
 
-/// A SESSION LOG RECORD the bus mirror put on a session's `ev` face (a `v=2`
-/// body, session log phase 4): its wire fields are its text (`tail --bodies`
-/// prints them, made safe there), its length the body's, and its label who
-/// said it — the record's `src=` (`shell`, `mark`, `aterm`, …), never
-/// `screen`, which is quoted screen content. `None` for anything else: a
-/// `v=2` body on another face, or one that does not read.
+/// Decode a `v=2` session-log record mirrored onto a session's `ev` face into a [`Traffic`] row.
 fn mirrored_traffic(fleet: &str, off: u64, subject: &str, raw: &[u8]) -> Option<Traffic> {
     let text = std::str::from_utf8(raw).ok()?;
     let b = aterm_slog::decode_bus(text).ok()?;
@@ -3032,24 +2757,8 @@ fn in_cargo_target_dir(program: &Path) -> bool {
             .any(|d| d.join("CACHEDIR.TAG").is_file())
 }
 
-/// How many distinct subjects `node`'s producer holds in the broker's
-/// last-value index — what [`SUBJECT_BUDGET`] counts — read off the two trees
-/// a node writes: its own `pub/<node>/` faces (its presence and `ev`, each
-/// session's two, every `say/<topic>` a session shouted on, the halt ack) and
-/// every `in` lane it posted, answered or noticed on, whose `<src>` segment is
-/// cap-forced to be the node. Both are readable through the node's own ring
-/// (`ro:/f/<F>/pub/>`, `rw,p=<node>:/f/<F>/in/*/*/<node>/*`).
-///
-/// THE WALK IS BOUNDED BY THE BUDGET ITSELF. astream has no metadata-only
-/// read, so each subject costs its newest record, body included — a presence
-/// or `ev` row is a few hundred bytes, an `in` lane's newest post up to the
-/// post cap — and the walk stops at [`SUBJECT_BUDGET`] rows, the most the
-/// broker lets one producer hold. A count that reached it is the budget spent,
-/// so the cut loses nothing. Only `aterm fabric status` pays this, once per run.
-///
-/// # Errors
-///
-/// A walk the broker did not finish or the caps do not cover.
+/// Count distinct subjects `node`'s producer holds in the broker's last-value index across
+/// `/f/<fleet>/pub/<node>/>` and `/f/<fleet>/in/*/*/<node>/*`, bounded by [`SUBJECT_BUDGET`].
 pub(crate) fn subjects_of(conn: &mut Conn, fleet: &str, node: &str) -> io::Result<usize> {
     let mut n = 0usize;
     for filter in [
@@ -3296,22 +3005,8 @@ fn warnings(
              fleet halt"
         ));
     }
-    // THE BROKER SAYS ITS LOG IS POISONED ([`BrokerView::poisoned`]: its
-    // `Hello`'s entry 0x04, or the current snapshot of a broker whose `Hello`
-    // carries none). A poisoned log answers every read and refuses every
-    // write, so the probe's own attach and head query both succeed over it.
-    // A bridge sees it only once one of its writes is refused (its `broker
-    // link is down … reason=poisoned`, a WARNING of its own), and one that
-    // has written nothing since says nothing: this is the word that does not
-    // wait for a write.
-    //
-    // A FAILED FLUSH WITH NO POISON IS ONLY THAT. astream counts the failure
-    // BEFORE its disk work — the rollback, the `Lossy` record in `<log>.id`,
-    // on the very device that failed — and publishes a poison only AFTER it,
-    // so a probe that lands between the two reads a failed flush and no poison
-    // over a log astream is about to poison. The count says the disk failed a
-    // flush; it never says nothing acked was lost. The next report says
-    // whether the log was poisoned.
+    // Report in-band or snapshot log poison (`BrokerView::poisoned`), or failed flushes when
+    // the log is not yet poisoned.
     if let Some(why) = r.broker.poisoned() {
         w.push(format!(
             "the broker at {broker} {POISONED_WARNING} ({}): it refuses every write until the \
@@ -3467,9 +3162,7 @@ fn warnings(
                  the mail they carried is held back on the bus, not lost"
             ));
         }
-        // THE PROGRAM IS COMPARED TOO, not only the flags: a substituted
-        // program armed with this command's flags holds the instance's bridge
-        // lane, and is named rather than reported as this bridge (r4-17).
+        // Compare both the resolved program and the flags against the configured command.
         let program_differs = inst.program.is_some() && inst.program != r.program;
         if inst.supervised == Some(true)
             && (inst.command.as_deref().and_then(serve_flags) != config_flags || program_differs)
@@ -3513,12 +3206,8 @@ fn warnings(
                 r.source.describe()
             ));
         }
-        // What the FLEET'S OWN DIRECTORY says about this instance's node: a
-        // `connected` bridge whose node the bus retains as `state=away` is
-        // invisible to every peer (measured 2026-09-14: a second bridge on the
-        // same state dir exited and its will fired over the survivor, which
-        // never republishes presence unprompted — the case the state dir's
-        // lock now refuses, kept for a copy of the dir on another machine).
+        // Warn if a `connected` bridge's node is retained on the bus as `state=away` (e.g., a
+        // second bridge sharing the state dir exited and fired its will).
         if inst.fabric.as_deref() == Some("connected") {
             if let Some(row) = inst
                 .node
@@ -3857,28 +3546,9 @@ fn connect_attached(cfg: &Config) -> io::Result<Conn> {
     Ok(conn)
 }
 
-/// Publish `state=exited` for each `(sid, node)` by rewriting the row already there.
-///
-/// Only `state=` and `t=` change. `inc=`, `epoch=` and `gen=` are carried
-/// through from the live row, because those are the bridge's facts and a
-/// retirement is not the place to invent them — a row whose `inc=` this command
-/// guessed would be a row the next bridge cannot reason about
-/// ([`crate::bridge::adoptable`]).
-///
-/// The sequence comes from the state dir, in the CURRENT incarnation's range,
-/// reserved before the publish by the bridge's own reservation
-/// ([`crate::state::StateDir::reserve_next_sequence`]; an atomic write, which a
-/// power loss can undo, fenced then by the durable incarnation above it) — and under the
-/// bridge's own lock ([`crate::state::StateDir::lock_bridge`]), held for the
-/// whole run, so a bridge that starts meanwhile stands by rather than
-/// reserving from the same counter. `enable::retire_ghosts_action` asks a
-/// running bridge instead; the lock is what makes "no bridge is running" a
-/// fact here rather than that caller's reading of the instance list.
-///
-/// # Errors
-///
-/// The broker, the caps, the state dir (held by a bridge included), or a row
-/// that is no longer on the bus.
+/// Publish `state=exited` for each `(sid, node)` by rewriting its existing presence row (keeping
+/// `inc=`, `epoch=`, `gen=` intact) under [`crate::state::StateDir::lock_bridge`] and reserving
+/// sequences from the current incarnation.
 pub fn publish_exited(report: &Report, ghosts: &[(String, String)]) -> io::Result<usize> {
     let cfg = &report.cfg;
     // The state dir before the broker: a retirement reserves its sequences

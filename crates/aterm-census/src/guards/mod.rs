@@ -41,7 +41,7 @@
 //! | `store-current`     | a store `current` path run unresolved |
 //! | `key-material`      | a master phrase on the key surface, a key file in the checkout |
 //! | `capture-privacy`   | in an encoded test capture's decoded bytes (a pty log's hex, a `.reads` file's escapes), what the export forbids in text, a home path, a banner's plan or a session id |
-//! | `export-content`    | in a file the export publishes, as its transforms leave it, a line or a path the publication engine's content guard refuses |
+//! | `export-content`    | in a file the export publishes, as its transforms leave it, a line, a binary file's bytes or a path the publication engine's content guard refuses |
 //! | `devtools-door`     | a developer-mode change outside the owner's gesture; an admin-rights API |
 //! | `machines-root-door`| a root tool (`installer`, `pmset`, `/etc/sudoers.d`, …) or the machines agent outside aterm-machines |
 //! | `ffi-door`          | a WindowServer or process-creation `extern` declared outside its one file |

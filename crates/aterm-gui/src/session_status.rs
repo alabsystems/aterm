@@ -453,9 +453,10 @@ impl StatusFsm {
     /// and costs the event loop nothing.
     ///
     /// Each arm is the earliest instant [`StatusFsm::classify`] could change its verdict.
-    /// `Running` lives on movement or output, so it retires off the fresher clock: a client
-    /// that repaints identical frames (a Claude Code TUI) keeps output fresh while movement goes
-    /// stale, and arming off movement alone would put every wake in the past and spin.
+    /// `Running` lives on movement or output (output alone sustains a published `Running`, never
+    /// starts one), so it retires off the fresher clock: a client that repaints identical frames
+    /// (a Claude Code TUI) keeps output fresh while movement goes stale, and arming off movement
+    /// alone would put every wake in the past and spin.
     fn owed_wake(&self) -> Option<Instant> {
         if let Some((_, first_seen)) = &self.pending {
             return Some(*first_seen + self.policy.dwell);
@@ -543,7 +544,16 @@ impl StatusFsm {
             };
         }
 
-        let moved = self.moved_recently(now) || self.output_recently(&evidence.activity, now);
+        // Output that moved no cell SUSTAINS a published `Running` (a TUI
+        // that repaints identical frames while it works) but never STARTS
+        // one: an idle program's colour reset or colour query at rest (Muse
+        // Code's SGR reset every ~9 s, Gemini CLI's OSC 11 once a minute)
+        // read `quiet -> running -> quiet` and cost three timed sweeps a
+        // write (dwell, retire, its dwell) with nothing new to read
+        // (docs/measured/vitals-multi-tab-2026-10-22.md).
+        let moved = self.moved_recently(now)
+            || (self.published.phase == Phase::Running
+                && self.output_recently(&evidence.activity, now));
 
         // 2. Shell integration, the strongest routine evidence, outranks screen movement: a
         //    background job printing at a prompt stays Idle.
@@ -1735,7 +1745,7 @@ pub(crate) fn needs_fields(verdict: &crate::needs::Verdict) -> String {
 }
 
 /// THE WORKER'S NEEDS YOU AS ITS LOOP TOLD THE WINDOW (development builds,
-/// `docs/DESIGN-harness-autopilot-2026-10-15.md` §12.2.3 item 3, slice 2c):
+/// `docs/DESIGN-harness-autopilot-2026-10-15.md` §12.2.3 item 3):
 /// ` needs_told=<n>` where a reader reads a set of `n` needs beside the
 /// needs owner's entry that stands (`entry`): the set told last, or the
 /// outgoing one while its own entry still stands; ` needs_told=stale` where
@@ -2069,7 +2079,7 @@ impl StatusObserver {
         }
     }
 
-    /// THE CODEX ROLLOUT TAP (session log 5G-3; ruling T15): ask for
+    /// THE CODEX ROLLOUT TAP: ask for
     /// `session`'s rollout to be read on into its log, at most every
     /// [`crate::codex_rollout_tap::RECHECK`], while `program` in front is the
     /// one a proven self-claim speaks for and that claim's copy names a
@@ -2949,7 +2959,7 @@ impl crate::App {
         // Autopilot Land), after the loop.
         let mut turns_moved = Vec::new();
         // What a footer read the sweep starts wakes when it moves a session's
-        // log (session log Phase 3B, `claude_footer::LogWake`).
+        // log (`claude_footer::LogWake`).
         let footer_wake = self.footer_log_wake();
         self.session_status.set_log_wake(&footer_wake);
         // The sweep never changes pool membership, so it borrows each session directly.
@@ -3659,7 +3669,7 @@ impl crate::App {
             carried.is_some_and(|carried| carried.seen) && self.session_status.note_seen(session);
         if quieted {
             // THE SESSION LOG: the failure the carry says was seen is seen here,
-            // and its readers woken in the same hold (ruling R9).
+            // and its readers woken in the same hold.
             let mut timeline = timeline.lock().unwrap_or_else(|p| p.into_inner());
             let at = timeline.slog().now();
             timeline.slog_mut().failure_seen(at);
@@ -4210,7 +4220,7 @@ impl crate::App {
         // short turns ends, as it last told this window's host.
         let pause = crate::autopilot::pause_field(pause, claimed_here, supervised_agent);
         // `land_held=<legs|-> land_nudges=<n|-> land_since=<unix s|->`
-        // (Autopilot v5 §12.3.1, slice 3c), right after `pause=` and under
+        // (Autopilot v5 §12.3.1), right after `pause=` and under
         // its rule: why Land still holds, as its loop last told this
         // window's host, only while the session runs under Land with its
         // task open ([`land_fields`]).
@@ -4277,7 +4287,7 @@ impl crate::App {
         // where none is the published need.
         //
         // `needs_told=<n|stale|->` (development builds only, Autopilot v5
-        // §12.2.3 item 3, slice 2c) rides it too: the worker's NEEDS YOU set
+        // §12.2.3 item 3) rides it too: the worker's NEEDS YOU set
         // as its loop told this window's host, whole ([`needs_told_field`]).
         // The needs owner's entry is copied under the meta's leaf lock first,
         // released before the timeline's; a release build reads neither.
@@ -4454,7 +4464,7 @@ impl crate::App {
 }
 
 /// WHY LAND STILL HOLDS AS `status` PRINTS IT
-/// (`docs/DESIGN-harness-autopilot-2026-10-15.md` §12.3.1, slice 3c): `
+/// (`docs/DESIGN-harness-autopilot-2026-10-15.md` §12.3.1): `
 /// land_held=<legs> land_nudges=<n> land_since=<unix s>` for `held`, the
 /// hold the session's loop last told this window's host — its legs in the
 /// owner's order (`needs,repo,open,defense,cut`, `-` before a land act's

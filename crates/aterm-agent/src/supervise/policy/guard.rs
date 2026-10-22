@@ -105,8 +105,8 @@ pub fn server_fences_send(help: &str) -> bool {
     entry_names_gen(help, "send")
 }
 
-/// Whether the server's `help` text says `key` takes `act=` (session log
-/// phase 5, ruling T1): what a press means for the box it dismisses. An
+/// Whether the server's `help` text says `key` takes `act=`:
+/// what a press means for the box it dismisses. An
 /// older `key` refuses the option as a key name, so a press carries it only
 /// where this is true. Read off the same `help key` reply as
 /// [`server_fences_gen`], so it costs no request of its own.
@@ -114,8 +114,8 @@ pub fn server_takes_act(help: &str) -> bool {
     entry_names(help, "key", "act=approve")
 }
 
-/// What a dismissing key means for the box it dismisses (session log phase
-/// 5, ruling T1): the leading `act=<word>` the server's `key` takes. Only the
+/// What a dismissing key means for the box it dismisses:
+/// the leading `act=<word>` the server's `key` takes. Only the
 /// key that dismisses carries one (the digit, the focused Enter, the
 /// decline's Enter, a question's answering Enter), never an arrow, a Tab or
 /// a text.
@@ -280,7 +280,7 @@ mod tests {
         ));
     }
 
-    /// `act=` (session log phase 5, ruling T1) is read off the `help key`
+    /// `act=` is read off the `help key`
     /// reply the fence probe already asks for: the shipped `key` entry and
     /// catalog name it; an older entry, or `act=` under another verb, does
     /// not.

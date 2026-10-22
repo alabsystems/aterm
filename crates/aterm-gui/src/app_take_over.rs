@@ -116,7 +116,7 @@ pub(crate) struct AgentsState {
     /// reads its coarse ages again a minute after).
     pub(crate) overview_read_at: Option<Instant>,
     /// The Overview's "On the fabric" group's reads of the fabric's log
-    /// (`crate::overview_fabric`, session log Phase 6 step 6E-7).
+    /// (`crate::overview_fabric`).
     pub(crate) overview_fabric: crate::overview_fabric::FabricGlance,
     /// When the Agents menu's live bits were last published
     /// (`App::publish_agents_live`).

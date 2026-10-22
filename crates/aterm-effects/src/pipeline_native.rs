@@ -1231,7 +1231,7 @@ impl EffectsPipeline {
     /// The shell's Execute rising edge for `session` — noted every frame,
     /// with or without an engine.
     #[inline]
-    pub fn note_rain_shell(&mut self, session: u64, executing: bool) -> bool {
+    pub const fn note_rain_shell(&mut self, session: u64, executing: bool) -> bool {
         self.rain_latches.note_shell_executing(session, executing)
     }
 
@@ -1284,7 +1284,7 @@ impl EffectsPipeline {
     /// The frame's rain channels are empty.
     #[inline]
     #[must_use]
-    pub fn rain_empty(&self) -> bool {
+    pub const fn rain_empty(&self) -> bool {
         self.rain_scratch.is_empty() && self.rain_add_scratch.is_empty()
     }
 

@@ -169,7 +169,7 @@ impl CursorComet {
     /// comet is charged (typing, or a jump flare cooling).
     #[must_use]
     #[inline]
-    pub fn is_active(&self) -> bool {
+    pub const fn is_active(&self) -> bool {
         self.blaze > SETTLED_BLAZE
     }
 
@@ -527,7 +527,7 @@ fn ring_row(
 /// the config colour, so an explicit `cursor_trail_color` re-tints the nucleus
 /// with the tail.
 #[inline]
-fn ice_ramp(color: u32, t: f32) -> u32 {
+const fn ice_ramp(color: u32, t: f32) -> u32 {
     let t = t.clamp(0.0, 1.0);
     if t < 0.45 {
         lerp_rgb(lerp_rgb(color, 0x0000_0000, 0.50), color, t / 0.45)

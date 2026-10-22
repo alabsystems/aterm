@@ -2809,7 +2809,7 @@ mod persistent_notice_tests {
         }
     }
 
-    /// ROUND-SEVEN UPDATE AUDIT, FINDING 206 — A SUCCESSOR SENDS THE RECOVERY OF
+    /// A SUCCESSOR SENDS THE RECOVERY OF
     /// WHAT ITS PARENT ANNOUNCED. The parent announced "Couldn't check for
     /// updates" and the window latched it; a build landed and the successor's
     /// first check came back up to date, which clears the streak in the ledger.
@@ -2937,7 +2937,7 @@ mod persistent_notice_tests {
         assert_eq!(process.class(), Some("pipeline"));
     }
 
-    /// ROUND-EIGHT UPDATE AUDIT, FINDING 301 — A TAKEN-UP DOWNLOAD WARNING IS NOT SAID
+    /// A TAKEN-UP DOWNLOAD WARNING IS NOT SAID
     /// AGAIN FOR ITS SIBLING CLASS. The parent said "Couldn't download updates", which
     /// both `stage` and `pipeline` speak; the window reads it back as `pipeline` and
     /// the successor takes that up. Its own streak is `stage`: keyed by the ledger's

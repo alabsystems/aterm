@@ -293,6 +293,7 @@ impl Log {
                 bytes,
                 ms: 0,
                 mono: 0,
+                row: super::rows::RowTag::NONE,
             });
             log.bytes = log.bytes.saturating_add(bytes);
         }

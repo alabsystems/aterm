@@ -7,8 +7,8 @@
 
 use aterm_spec::derive::*;
 
-/// THE OWNER'S DEBUGGER-ACCESS CHANGE (design §5.1; owner rulings O7 and O8,
-/// 2026-09-29). The owner presses *Allow debugger access…* (or *Turn off…*) on
+/// THE OWNER'S DEBUGGER-ACCESS CHANGE (design §5.1).
+/// The owner presses *Allow debugger access…* (or *Turn off…*) on
 /// Settings ▸ Security; aterm's own `confirm_owner` alert states the whole-Mac
 /// scope and defaults to Cancel; a detached worker takes the Mac-wide change
 /// lock, re-reads `DevToolsSecurity -status` and, only if it still reads the
@@ -18,7 +18,7 @@ use aterm_spec::derive::*;
 /// spike D2's to measure; the model only lets the child take as long as it
 /// likes.
 ///
-/// THE LAUNCH ASK (owner ruling O29, 2026-10-19). Once per Mac aterm asks by
+/// THE LAUNCH ASK. Once per Mac aterm asks by
 /// itself, at a quiet moment after the first-launch hand-overs, whether to
 /// turn debugger access on. It raises the press's alert, in its launch
 /// wording, and takes the answer exactly as a press's: `Offer` lands in phase

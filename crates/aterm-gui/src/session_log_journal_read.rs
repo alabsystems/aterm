@@ -9,10 +9,10 @@
 //! - OWNER ONLY. No read grant survives its process, so an edge gets `ERR no
 //!   such session`, byte for byte what an unknown sid gets
 //!   (`control::closed_session_reply`).
-//! - OFF WITH THE JOURNAL (ruling R10): the reader exists only when this
+//! - OFF WITH THE JOURNAL: the reader exists only when this
 //!   launch keeps a journal ([`install`]); it only opens an existing
 //!   directory and never creates one.
-//! - BOUNDED (ruling R11), in two steps. THE INDEX REFRESH reads, without
+//! - BOUNDED, in two steps. THE INDEX REFRESH reads, without
 //!   decoding, what segments it has not indexed (or the tail a segment grew
 //!   by), at most `journal::INDEX_BUDGET` bytes, so which segments hold the
 //!   session is known for a journal within its budgets, never guessed from a

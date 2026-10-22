@@ -2414,7 +2414,7 @@ impl<C: Ctl> Session<'_, C> {
     /// the archive the same (`origin=`) and on. `None` otherwise, or with no
     /// owner among the newest [`OWNER_ROWS`]. Before, the alternate screen
     /// counted as under a call: a real wall under a long prompt there was
-    /// left to the person with no transcript (the review of 87faa9bf23).
+    /// left to the person with no transcript.
     fn archived_up_to(
         &mut self,
         rows: &[String],

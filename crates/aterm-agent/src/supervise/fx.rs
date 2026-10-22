@@ -496,7 +496,27 @@ impl Fx {
         request: impl FnOnce() -> Vec<u8>,
         live: impl FnOnce() -> A,
     ) -> A {
+        // A DOOR NEWER THAN THE TAPE: the recording build had none here, so
+        // its loop asked nothing; where the answer has a form for that
+        // (`HostReply::absent`), the replay gives it and takes no record.
+        // Any other door the tape lacks diverges, as it always did.
+        if self.replay_lacks_host_door(door)
+            && let Some(absent) = A::absent()
+        {
+            return absent;
+        }
         self.exchange_as(door, request, live, A::put, A::take)
+    }
+
+    /// Whether this replay's recording build lacked a host door, as its
+    /// header says. Live and recording runs lack none. A caller whose whole
+    /// observer arrived with that door can leave its new outputs out too,
+    /// rather than only substituting the door's absent answer.
+    pub(crate) fn replay_lacks_host_door(&self, door: &str) -> bool {
+        match &self.mode {
+            Mode::Replay(core) => core.lacks_door(door),
+            Mode::Live | Mode::Record(_) => false,
+        }
     }
 
     /// A NOTIFICATION TO THE WINDOW'S HOST at `door` (`host.<name>`): an

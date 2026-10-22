@@ -78,7 +78,7 @@ impl Rec {
         }
     }
 
-    /// THE BUS CLASS (§5.5, phase 4 ruling Q5): what the bus mirror carries.
+    /// THE BUS CLASS (§5.5): what the bus mirror carries.
     /// The turn class ([`Rec::is_turn_class`], unchanged, which `log
     /// class=turn` and `subscribe … log:class=turn` still mean), and beside
     /// it what a remote fold needs to hold the needs a local one holds: the

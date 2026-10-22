@@ -10462,8 +10462,8 @@ fn the_canarys_words_on_agy_or_muse_must_stand_still() {
     assert_eq!(s.stuck_still, None);
 }
 
-/// THE CANARY'S WORDS MOVING AFTER ITS EXCEPTION END IT (the review of
-/// 6b820169e8: nothing tested a move once a rung was reached). On a virtual
+/// THE CANARY'S WORDS MOVING AFTER ITS EXCEPTION END IT (nothing tested a move once a rung was reached).
+/// On a virtual
 /// clock, Muse Code's turn ends over its backgrounded shell and the screen
 /// is read a unit, three and six units on: `STUCK`, then `STALLED` in the
 /// work's words with the host's record of the work (no wait unclassified,
@@ -19573,8 +19573,8 @@ fn bucket_notice_transcript(prompt: &str, notice: &str, at: i64) -> String {
 /// redraw with nothing between: a successor decides the short turn's
 /// back-off and `continue@v1`, as the first loop does, though its host reads
 /// no transcript: the bucket its own relaunch left holds no point for an
-/// unread conversation (`TurnEndState::relaunched_off`). Measured before (the
-/// review of ddf58eaf8b): that loop looked again every
+/// unread conversation (`TurnEndState::relaunched_off`). Measured before:
+/// that loop looked again every
 /// `LIMIT_CONVERSATION_LOOK`, nothing decided, for good — the reset passed,
 /// the session on opus never continued. Every loop's clock stands between
 /// its steps, so each second compared is the policy's, not the machine's.
@@ -25552,8 +25552,8 @@ fn sent(requests: &[String], verb: &str) -> bool {
     requests.iter().any(|r| verb_of(r) == verb)
 }
 
-/// AN OFF SESSION'S PANEL GETS ONE PLAIN CLOSE, NEVER A STALL'S HOLD (the
-/// review of c1d193998). The panel a stopped loop left owed, on a session
+/// AN OFF SESSION'S PANEL GETS ONE PLAIN CLOSE, NEVER A STALL'S HOLD.
+/// The panel a stopped loop left owed, on a session
 /// whose word is `off`, with a stall suspected and the worker published
 /// stalled, is not looked into: the loop parks at once — no `FROZEN`, no
 /// restart, no Escape — and the panel stays owed for the word's turn.

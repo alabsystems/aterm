@@ -662,7 +662,7 @@ fn standing_rows(
 /// whole from the state's row on, a Land episode held under Autopilot Land
 /// (no act of another mode is typed to end it) kept every row after its
 /// instruction, 3.2 MB past 9000 approvals, and a switch whose return is
-/// never due 1.9 MB past 4000 continuations (the review of 3af6c3da7d,
+/// never due 1.9 MB past 4000 continuations (
 /// KRF-2).
 fn standing_path(
     rows: &[String],
@@ -6132,7 +6132,7 @@ mod tests {
     /// switch the model back at the reset, and typed the land instruction
     /// anew. Past the states' rows the cut keeps its newest rows as before.
     /// And the cut still BOUNDS THE FILE while such a state stands for as long
-    /// as the session runs so (the review of 3af6c3da7d, KRF-2): a Land
+    /// as the session runs so (KRF-2): a Land
     /// episode under Autopilot Land, where no act of another mode is typed to
     /// end it, then 9000 approvals; a switch at a bucket whose notice named no
     /// reset, whose return is never due, then 4000 continuations each with its
@@ -6665,7 +6665,7 @@ mod tests {
     }
 
     /// A SECOND COLD RESTORE (A, then B, then C) READS NO STATE THE TAB
-    /// BETWEEN ENDED BEFORE ITS CUT (the review of 3af6c3da7d, KRF-3): B's
+    /// BETWEEN ENDED BEFORE ITS CUT (KRF-3): B's
     /// loop took A's books up and switched A's model back, then B's ledger
     /// passed its bound and its cut dropped the take-up's row and that switch
     /// back, as a continuous ledger's cut drops them. C's books are B's own

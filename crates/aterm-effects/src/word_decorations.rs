@@ -2503,7 +2503,7 @@ impl WordDecorations {
     /// reads as zero and the flash falls back to a bounded upward search. Spent
     /// by the next rescan in its scope.
     #[inline]
-    pub fn set_scan_base_y(&mut self, base_y: Option<i64>) {
+    pub const fn set_scan_base_y(&mut self, base_y: Option<i64>) {
         let scope = self.scan_scope();
         self.trick_flash.declare_base_y(scope, base_y);
     }

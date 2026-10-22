@@ -58,7 +58,7 @@ impl PetRect {
 
     #[inline]
     #[must_use]
-    pub fn valid(self) -> bool {
+    pub const fn valid(self) -> bool {
         self.row.is_finite()
             && self.col.is_finite()
             && self.rows.is_finite()
@@ -70,7 +70,7 @@ impl PetRect {
     /// Do these two rectangles share any area at all?
     #[inline]
     #[must_use]
-    pub fn overlaps(self, other: Self) -> bool {
+    pub const fn overlaps(self, other: Self) -> bool {
         self.valid()
             && other.valid()
             && self.row < other.row + other.rows
@@ -80,7 +80,7 @@ impl PetRect {
     }
 
     #[inline]
-    fn union(self, other: Self) -> Self {
+    const fn union(self, other: Self) -> Self {
         let row = self.row.min(other.row);
         let col = self.col.min(other.col);
         Self::new(
@@ -174,6 +174,13 @@ pub struct PetPane {
 }
 
 impl PetPane {
+    pub const EMPTY: Self = Self {
+        row: 0,
+        col: 0,
+        rows: 0,
+        cols: 0,
+    };
+
     #[inline]
     #[must_use]
     pub const fn full(input: &RenderInput) -> Self {
@@ -451,9 +458,9 @@ impl Default for PetWorld {
 impl PetWorld {
     /// Retire all geometry without reallocating the bounded buffer.
     #[inline]
-    pub fn retire(&mut self) {
+    pub const fn retire(&mut self) {
         self.stamp = None;
-        self.coverage = PetPane::default();
+        self.coverage = PetPane::EMPTY;
         self.ground_split = false;
         self.caret_cells_len = 0;
         self.ground_caret_cells_len = 0;
@@ -992,7 +999,7 @@ impl PetWorld {
 
     #[inline]
     #[must_use]
-    pub fn cell(&self, row: usize, col: usize) -> PetCell {
+    pub const fn cell(&self, row: usize, col: usize) -> PetCell {
         if self.stamp.is_none() {
             return PetCell::Unknown;
         }
@@ -1005,16 +1012,18 @@ impl PetWorld {
         if r >= self.coverage.rows || c >= self.coverage.cols {
             return PetCell::Unknown;
         }
-        self.cells[r * MAX_WORLD_COLS + c]
+        self.cells.as_slice()[r * MAX_WORLD_COLS + c]
     }
 
     /// Actual glyph/decorated-cell occupancy, independent of caret/selection
     /// protection. None means unobserved or unsupported geometry, never blank.
     #[inline]
     #[must_use]
-    pub fn ink_at(&self, row: usize, col: usize) -> Option<bool> {
-        self.glyph_at(row, col)
-            .map(|glyph| glyph != PetGlyph::Blank)
+    pub const fn ink_at(&self, row: usize, col: usize) -> Option<bool> {
+        let Some(glyph) = self.glyph_at(row, col) else {
+            return None;
+        };
+        Some(!matches!(glyph, PetGlyph::Blank))
     }
 
     /// Ink substantial enough to displace a pet drawn beneath the glyphs.
@@ -1022,20 +1031,28 @@ impl PetWorld {
     /// glyph occupancy, protected surfaces and unknown coverage are unchanged.
     #[inline]
     #[must_use]
-    pub fn locomotion_ink_at(&self, row: usize, col: usize) -> Option<bool> {
-        self.glyph_at(row, col)
-            .map(|glyph| glyph == PetGlyph::Substantive)
+    pub const fn locomotion_ink_at(&self, row: usize, col: usize) -> Option<bool> {
+        let Some(glyph) = self.glyph_at(row, col) else {
+            return None;
+        };
+        Some(matches!(glyph, PetGlyph::Substantive))
     }
 
     #[inline]
-    fn glyph_at(&self, row: usize, col: usize) -> Option<PetGlyph> {
-        self.stamp?;
-        let r = row.checked_sub(self.coverage.row)?;
-        let c = col.checked_sub(self.coverage.col)?;
+    const fn glyph_at(&self, row: usize, col: usize) -> Option<PetGlyph> {
+        if self.stamp.is_none() {
+            return None;
+        }
+        let Some(r) = row.checked_sub(self.coverage.row) else {
+            return None;
+        };
+        let Some(c) = col.checked_sub(self.coverage.col) else {
+            return None;
+        };
         if r >= self.coverage.rows || c >= self.coverage.cols {
             return None;
         }
-        self.glyphs[r * MAX_WORLD_COLS + c]
+        self.glyphs.as_slice()[r * MAX_WORLD_COLS + c]
     }
 
     /// Certify all cells touched by the rectangle and a margin on every side.
@@ -1176,10 +1193,10 @@ impl PetWorld {
     }
 
     #[inline]
-    fn carets_len(&self, ground: bool) -> usize {
-        usize::from(self.caret_cells_len)
+    const fn carets_len(&self, ground: bool) -> usize {
+        (self.caret_cells_len as usize)
             + if ground && self.ground_split {
-                usize::from(self.ground_caret_cells_len)
+                self.ground_caret_cells_len as usize
             } else {
                 0
             }
@@ -1267,7 +1284,7 @@ impl PetWorld {
     /// Cells the supplied prefix table counts in a map-local window: four
     /// reads, whatever the sprite's size.
     #[inline]
-    fn blocked(&self, prefix: &[u16], r0: usize, c0: usize, r1: usize, c1: usize) -> u16 {
+    const fn blocked(&self, prefix: &[u16], r0: usize, c0: usize, r1: usize, c1: usize) -> u16 {
         let r0_base = r0 * (MAX_WORLD_COLS + 1);
         let r1_base = r1 * (MAX_WORLD_COLS + 1);
         prefix[r1_base + c1] + prefix[r0_base + c0] - prefix[r1_base + c0] - prefix[r0_base + c1]
@@ -1293,11 +1310,17 @@ impl PetWorld {
     /// The ground plane's `(blocked, protected)` prefix tables
     /// (`ground_cells`): the live ones where no transient cell was observed.
     #[inline]
-    fn ground_prefixes(&self) -> (&[u16], &[u16]) {
+    const fn ground_prefixes(&self) -> (&[u16], &[u16]) {
         if self.ground_split {
-            (&self.ground_blocked_prefix, &self.ground_protected_prefix)
+            (
+                self.ground_blocked_prefix.as_slice(),
+                self.ground_protected_prefix.as_slice(),
+            )
         } else {
-            (&self.blocked_prefix, &self.protected_prefix)
+            (
+                self.blocked_prefix.as_slice(),
+                self.protected_prefix.as_slice(),
+            )
         }
     }
 
@@ -1796,7 +1819,7 @@ impl PetWorld {
     /// unknown.
     #[inline]
     #[must_use]
-    pub fn margin_in_map(&self, rect: PetRect, margin: f32) -> f32 {
+    pub const fn margin_in_map(&self, rect: PetRect, margin: f32) -> f32 {
         let cov = self.coverage;
         let (top, left) = (cov.row as f32, cov.col as f32);
         let (bottom, right) = ((cov.row + cov.rows) as f32, (cov.col + cov.cols) as f32);
@@ -1814,7 +1837,7 @@ impl PetWorld {
     /// give or take half a row.
     #[inline]
     #[must_use]
-    pub fn same_ground(from: PetRect, to: PetRect) -> bool {
+    pub const fn same_ground(from: PetRect, to: PetRect) -> bool {
         (from.foot_row() - to.foot_row()).abs() < 0.5
     }
 
@@ -2167,9 +2190,9 @@ impl<'a> RowScan<'a> {
 }
 
 #[inline]
-fn is_single_braille_dot(ch: char) -> bool {
-    let code = u32::from(ch);
-    (0x2800..=0x28ff).contains(&code) && (code - 0x2800).count_ones() == 1
+const fn is_single_braille_dot(ch: char) -> bool {
+    let code = ch as u32;
+    code >= 0x2800 && code <= 0x28ff && (code - 0x2800).count_ones() == 1
 }
 
 /// The pane-local columns `[lo, hi)` of row `row` whose cells overlap
@@ -2180,20 +2203,18 @@ fn is_single_braille_dot(ch: char) -> bool {
 /// predicate however the rect's edges round
 /// (`exclusion_spans_agree_with_the_cell_test`).
 #[inline]
-fn exclusion_span(rect: PetRect, row: usize, limit: usize) -> Option<(usize, usize)> {
+const fn exclusion_span(rect: PetRect, row: usize, limit: usize) -> Option<(usize, usize)> {
     let row_f = row as f32;
     if !(rect.row < row_f + 1.0 && rect.row + rect.rows > row_f) {
         return None;
     }
     let rect_right = rect.col + rect.cols;
-    let starts_before = |col: usize| rect.col < col as f32 + 1.0;
-    let ends_after = |col: usize| rect_right > col as f32;
     // The predicates are monotone, but f32 plateaus can cover many integer
     // columns. Bisect the whole domain instead of repairing one column at a time.
     let (mut a, mut b) = (0, limit);
     while a < b {
         let mid = a + (b - a) / 2;
-        if starts_before(mid) {
+        if rect.col < mid as f32 + 1.0 {
             b = mid;
         } else {
             a = mid + 1;
@@ -2203,14 +2224,14 @@ fn exclusion_span(rect: PetRect, row: usize, limit: usize) -> Option<(usize, usi
     let (mut a, mut b) = (0, limit);
     while a < b {
         let mid = a + (b - a) / 2;
-        if ends_after(mid) {
+        if rect_right > mid as f32 {
             a = mid + 1;
         } else {
             b = mid;
         }
     }
     let hi = a;
-    (lo < hi).then_some((lo, hi))
+    if lo < hi { Some((lo, hi)) } else { None }
 }
 
 #[cfg(test)]

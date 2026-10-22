@@ -198,7 +198,7 @@ impl Row {
     #[cfg(test)]
     #[must_use]
     #[inline]
-    pub(crate) fn page_id(&self) -> super::page::PageId {
+    pub(crate) const fn page_id(&self) -> super::page::PageId {
         self.cells.page_id()
     }
 

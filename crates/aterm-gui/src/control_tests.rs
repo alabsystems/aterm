@@ -6355,7 +6355,7 @@ fn escalated_op_fences_argument_dependent_seams() {
         // `brief` reads its target, and `brief all` the whole roster, Owner-only,
         // wherever `all` stands among its arguments (its parser takes it there).
         ("log", "tier=content --json", None),
-        // `log n` is the INSTANCE's node log (session log 5J-3): Owner-only like
+        // `log n` is the INSTANCE's node log: Owner-only like
         // `brief all`, wherever the bare `n` stands; `n=<count>` is a count.
         ("log", "n", owner),
         ("log", "since=1 ep=2 n --json", owner),
@@ -15510,7 +15510,7 @@ fn a_bridges_hello_and_its_unparsed_lines_body() {
     assert!(fabric_status_line().ends_with(&tail("-", "-", 0)));
 }
 
-/// THE STORE HEARS AN `auto` BRIDGE (session log Phase 6 step 6E-3): a
+/// THE STORE HEARS AN `auto` BRIDGE: a
 /// recorded `hello … log=turns` serves the mirror; an `auto` hello (a
 /// bridge's restart, before its attach has judged the broker) leaves that as
 /// it was, so no session goes unengaged across the restart; the bridge's
@@ -15541,8 +15541,8 @@ fn an_auto_hello_leaves_the_served_word_and_unretained_clears_it() {
     });
 }
 
-/// THE BUS MIRROR OFF TAKES NO LOCK OF ITS OWN (session log phase 4, ruling
-/// Q5): on a default instance — its bridge attached and its hello recorded
+/// THE BUS MIRROR OFF TAKES NO LOCK OF ITS OWN:
+/// on a default instance — its bridge attached and its hello recorded
 /// without `log=turns`, so nothing is engaged or retained — `fabric status`,
 /// the recorded `hello`, a replaced bus log (`link log` `forgot=1`), an
 /// update's draw, its Commit's reading and its stand-down each answer while
@@ -18326,7 +18326,7 @@ fn active_for_handle(h: &crate::session_store::SessionHandle) -> ActiveHandle {
     })))
 }
 
-// ---- the closed-session index (session log phase 2A) -------------------------
+// ---- the closed-session index -------------------------
 
 /// A headless app with a second session (a stub tab) that wrote a few records,
 /// granted `grants` to session 0 as an edge's source. The caller closes it
@@ -18496,7 +18496,7 @@ fn a_close_wakes_its_watchers_only_once_its_log_is_kept() {
     );
 }
 
-/// `LOG N` IS THE OWNER'S (session log 5J-3): the instance's node log answers an
+/// `LOG N` IS THE OWNER'S: the instance's node log answers an
 /// Owner-class connection with no terminal; an edge, granted or not, is
 /// refused (`ERR denied`, audited), and so is a selector (node `n` is no
 /// session's). NEGATIVE CONTROL: the same edge's session `log` is no
@@ -19216,7 +19216,7 @@ fn a_wrong_token_is_still_err_auth() {
     assert!(first_line_scope(&format!("AUTH {near}"), &instance, || Some(ctx.clone())).is_err());
 }
 
-/// `cause=` (phase 3A, ruling R6): taken among `send`'s and `turn`'s leading
+/// `cause=`: taken among `send`'s and `turn`'s leading
 /// options in any order, once; a malformed or repeated one is a carried usage
 /// refusal; no other verb takes it.
 #[test]
@@ -19251,7 +19251,7 @@ fn cause_is_taken_among_the_leading_options_once() {
     assert_eq!((o.cause, tail), (None, "cause=7 enter"), "key takes none");
 }
 
-/// `act=` (phase 5, ruling T1): taken among `key`'s and `send`'s leading
+/// `act=`: taken among `key`'s and `send`'s leading
 /// options in any order, once, a closed word; a malformed or repeated one is
 /// a carried usage refusal (answered before a byte); `paste` and `turn` take
 /// none (their bodies keep it).
@@ -19652,7 +19652,7 @@ fn edge_to(h: &SessionHandle, op: aterm_session::Op) -> (Scope, SessionId) {
     (Scope::Edge(tok), src)
 }
 
-/// THE FUNCTIONAL NEGATIVE CONTROL (design §7.4; ruling R5's proof): `mark p<n>
+/// THE FUNCTIONAL NEGATIVE CONTROL (design §7.4; proof): `mark p<n>
 /// act word=approve` on an open approval, from the owner, the harness and a
 /// `WriteInput` edge, through the `mark` arm's own function, answers `OK` and
 /// puts NO byte on the PTY: the positive control's `Z`, written after them, is
@@ -20083,7 +20083,7 @@ fn mark_is_status_framed() {
     );
 }
 
-// ---- `await log` (phase 3A; ruling R2) ---------------------------------------
+// ---- `await log` (phase 3A) ---------------------------------------
 
 /// `await log <args>` on `h`, in process (no hangup slicing: a missing wake
 /// parks it to its deadline).
@@ -20272,8 +20272,8 @@ fn await_log_predicates_match_exactly_their_records() {
     assert!(!reply.contains("gap="), "{reply}");
 }
 
-/// `await log kind=program` SEES THE PROGRAM'S OWN REPORT (phase 6, 6F-4;
-/// ruling U17, T24's reversal): a waiter parked for the next program mark is
+/// `await log kind=program` SEES THE PROGRAM'S OWN REPORT (T24's reversal):
+/// a waiter parked for the next program mark is
 /// answered by the move the status sweep's gate shows (one-minute hang
 /// detector). NEGATIVE CONTROL: before the move, the same wait times out at
 /// once, and a `bell` wait over the move times out.

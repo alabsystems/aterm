@@ -348,8 +348,7 @@ mod close_confirm;
 /// A window's start asks for the executable's code in one read (macOS).
 #[cfg(target_os = "macos")]
 mod code_readahead;
-/// A codex-alab session's rollout steps into its session log
-/// (session log 5G-3; ruling T15).
+/// A codex-alab session's rollout steps into its session log.
 mod codex_rollout_tap;
 mod command_registry;
 /// Config-directory marker files (`privacy-access-card-answered`, the
@@ -403,7 +402,7 @@ mod control_input_ack;
 /// The owner's DEBUGGER-ACCESS change (`docs/DESIGN-macos-debugger-access-2026-09-29.md`
 /// §3.4, §3.5): the pure reducer and its Tier-1 bind, the shared result slot
 /// its detached `consent-devtools` worker publishes into, the change and
-/// observed markers, drift, and the once-per-Mac launch ask (owner ruling O29).
+/// observed markers, drift, and the once-per-Mac launch ask.
 /// Started ONLY by the owner's yes in aterm's alert — the Security page's
 /// confirmed press, or the launch ask aterm raises by itself once per Mac — and
 /// no control verb, config key, environment variable or band capsule starts it
@@ -690,8 +689,8 @@ mod message_inbox;
 mod message_reporters;
 mod messages_host;
 mod messages_store;
-/// The occupancy facts board (`docs/DESIGN-harness-occupancy-2026-10-20.md`
-/// slice 0): cores, load, memory, the home volume and the build slots at each
+/// The occupancy facts board (`docs/DESIGN-harness-occupancy-2026-10-20.md`):
+/// cores, load, memory, the home volume and the build slots at each
 /// disk look, stored and logged; nothing decided, nothing typed.
 mod occupancy_host;
 /// The control socket, token and `latest` alias this instance published, and
@@ -1017,6 +1016,9 @@ mod session_status;
 mod session_store;
 /// Per-session user metadata and event timeline.
 mod session_timeline;
+/// The timeline as a view of the session log: its grammar (the log's row
+/// rule) and its rows (phase 6, 6G-2).
+mod session_timeline_view;
 /// Each session's watcher list, and the wake its producers ring.
 mod session_watch;
 mod settings;
@@ -3903,8 +3905,8 @@ pub(crate) enum HarnessFact {
     /// [`aterm_agent::supervise::WaitKind::BackOff`]), or none standing.
     Pause(Option<PausePlan>),
     /// THE WORKER'S NEEDS YOU, WHOLE, MOVED
-    /// (`docs/DESIGN-harness-autopilot-2026-10-15.md` §12.2.3 item 3, slice
-    /// 2c): the window's host stored the set its loop told
+    /// (`docs/DESIGN-harness-autopilot-2026-10-15.md` §12.2.3 item 3):
+    /// the window's host stored the set its loop told
     /// ([`aterm_agent::supervise::IdleHost::needs_standing`]) on the
     /// session's timeline, on the loop's thread, before the entry's `meta
     /// set` went out (`SessionTimeline::harness_needs`). It carries nothing —
@@ -3912,7 +3914,7 @@ pub(crate) enum HarnessFact {
     /// grows; the window republishes what reads them.
     Needs,
     /// WHY LAND STILL HOLDS, MOVED (`docs/DESIGN-harness-autopilot-2026-10-15.md`
-    /// §12.3.3 item 3, slice 3c): the window's host stored the hold its loop
+    /// §12.3.3 item 3): the window's host stored the hold its loop
     /// told ([`aterm_agent::supervise::IdleHost::land_held`]) on the
     /// session's timeline, on the loop's thread
     /// (`SessionTimeline::land_held`). It carries nothing — the hold is read
@@ -3989,8 +3991,8 @@ enum Wake {
     ClaudeFooter {
         session: u64,
     },
-    /// A session's log moved off the loop in a way the loop follows (session
-    /// log Phase 3B, `claude_footer::LogWake`): the footer thread applied a
+    /// A session's log moved off the loop in a way the loop follows (`claude_footer::LogWake`):
+    /// the footer thread applied a
     /// transcript's steps that armed the turn tracker's settle, whose tick
     /// the loop keeps, or moved the log while `[session_log] clause` is on,
     /// so the tab's chrome may follow the clause; or the render path moved it
@@ -9007,6 +9009,11 @@ pub(crate) struct FindBarHit {
     /// Window terminal columns the panel covers: every column, or in a split the
     /// focused pane's, so a press on the sibling beside it is not the panel's.
     pub cols: std::ops::Range<usize>,
+    /// The grid `splice_find_bar` laid the panel on ([`app_mouse::GlassGrid`]):
+    /// under any other — a re-grid since, its frame not yet painted — the band
+    /// answers no pointer (`App::laid_cell_at`), and the next frame lays it
+    /// again from the window's grid.
+    pub laid: Option<app_mouse::GlassGrid>,
 }
 
 #[derive(Clone)]
@@ -13408,7 +13415,7 @@ struct App {
     /// The node log this App writes its config facts to (the instance's;
     /// a test's own), and the semantic values it last compared: a published
     /// snapshot whose values moved writes `config key=` marks for the schema
-    /// keys that moved, never a value (session log 5J-2,
+    /// keys that moved, never a value (
     /// [`session_log_node::changed_config_keys`]).
     node_log: &'static session_log_node::NodeLogHost,
     node_log_values: Arc<std::collections::BTreeMap<String, String>>,
@@ -13865,8 +13872,8 @@ struct App {
     /// restore placed every handed-off shell (fresh tokens under fresh nonces), never
     /// resurrected.
     pending_conn_carry: Vec<crate::session_store::ConnectionCarry>,
-    /// THE BUS MIRROR's adoption latch is on (session log phase 4, ruling
-    /// Q1): a seamless successor's store answers `log-landed` for a sid it
+    /// THE BUS MIRROR's adoption latch is on:
+    /// a seamless successor's store answers `log-landed` for a sid it
     /// does not hold yet `adopting`, until the restore has registered every
     /// handed-off session, when the loop turns it off once.
     slog_mirror_adopting: bool,
@@ -13978,7 +13985,7 @@ struct App {
     /// A seamless successor's: the agents the outgoing instance's cold-restore
     /// queue still owed at its park, by the outgoing id of the adopted shell
     /// each is owed to, until this process's Commit hands them to its host
-    /// (`App::hand_carried_restored_agents`, round four plan item 7).
+    /// (`App::hand_carried_restored_agents`).
     handoff_restored_agents: Vec<(u64, restore::AgentRestore)>,
     /// The agents the outgoing instance's host supervised, by the id each handoff leaf
     /// names (`restore::TerminalLeafRestore::supervised`): watched by this process's
@@ -14094,7 +14101,7 @@ struct App {
     /// yes to a press (`begin_debugger_access_change`) or to the launch ask; a
     /// headless instance's lane never has a child to ask about.
     debugger_change: debugger_access::DebuggerChangeLane,
-    /// The once-per-Mac debugger-access launch ask (owner ruling O29): queued
+    /// The once-per-Mac debugger-access launch ask: queued
     /// on a windowed macOS instance until it asks, settles or drops, and its
     /// next look ([`App::look_for_debugger_moment`]). Never queued headless.
     debugger_launch: debugger_access::LaunchAskQueue,
@@ -14560,7 +14567,7 @@ struct App {
     /// Commit (`App::seed_carried_messages`): a healing that parent put on
     /// record after the capture is a record it wrote under an id of its band and
     /// stamped at or after the capture, which the file read again at Commit
-    /// shows (`App::reload_messages_log_at_commit`; round eight, lead U62, as
+    /// shows (`App::reload_messages_log_at_commit`; as
     /// reviewed three times). Taken at Commit; `None` with no parked parent, or
     /// one too old to carry its next id or the capture's stamp.
     #[cfg(unix)]
@@ -15233,7 +15240,7 @@ impl App {
     /// [`MAX_COMMITTED_DEFERRED_WAKES`] a wake is handled as before this hold.
     ///
     /// THE UPDATE FACTS THIS SUCCESSOR ASKED FOR wait from its first wake, not
-    /// only once it has committed (round eight of the update audit, U14). The
+    /// only once it has committed. The
     /// facts worker answers the boot's Startup read, or the Refresh a restored
     /// Settings tab asks for, well inside the overlap, and nothing asks again
     /// after the Commit: swallowed, the answer left a restored Software Update
@@ -15622,7 +15629,7 @@ impl App {
     /// THE OWNER'S DEBUGGER-ACCESS CHANGE, after aterm's alert (design §3.4
     /// step 2). Reachable from the Security page's drain — the press was
     /// recorded on the view after the owner answered `confirm_owner`. The
-    /// once-per-Mac launch ask (owner ruling O29) takes its own yes through
+    /// once-per-Mac launch ask takes its own yes through
     /// the same lane and the same start ([`Self::look_for_debugger_moment`]).
     ///
     /// Refuses unless every check holds again: a window, macOS, `[privacy] enabled && check`,
@@ -16465,7 +16472,7 @@ impl App {
         }
     }
 
-    // DEBUGGER ACCESS ON A NEW MAC (owner ruling O29, 2026-10-19)
+    // DEBUGGER ACCESS ON A NEW MAC
 
     /// THE DEBUGGER-ACCESS LAUNCH ASK: once per Mac, aterm raises the Security
     /// page's own debugger-access alert by itself — after this process's Full
@@ -17477,8 +17484,8 @@ impl App {
             }
             WarmupStep::Start => {}
         }
-        // The debugger-access launch ask goes before the folders (owner ruling
-        // O29), and no folder dialog stacks on macOS's administrator dialog
+        // The debugger-access launch ask goes before the folders,
+        // and no folder dialog stacks on macOS's administrator dialog
         // while a debugger change is under way. The trade: a password dialog
         // left unanswered holds the warm-up for this process.
         if self.devtools_helper.panel().is_some()
@@ -21292,9 +21299,12 @@ impl App {
     fn on_output_wake(&mut self, session: u64, now: Instant) {
         // A spare booking waiting for this session's first prompt (`spare`).
         self.spares.note_output(session, now);
-        // Output may be a job starting: the stuck engine looks (job demand),
-        // in this wake when the edge is due now.
-        self.vitals_output_edge(now);
+        #[cfg(test)]
+        crate::vitals_host::BEFORE_LATCH_CLEAR.with_borrow(|seam| {
+            if let Some(seam) = seam {
+                seam(self, session);
+            }
+        });
         // Clear the session's coalescing flag before any work, so output processed from
         // here on posts a fresh wake — or, for a streaming session, hold it for the
         // cadence, so that output marks the hold dirty and its release runs the next
@@ -21311,6 +21321,12 @@ impl App {
                 Ordering::Relaxed,
             );
         }
+        // Output that moved the screen may be a job starting or ending: the
+        // stuck engine looks (job demand), in this wake when the edge is due
+        // now. After the clear, as the screen's generation decides it: a chunk
+        // fed before the clear (which posted no wake) is in the screen read
+        // here, and one fed after it posts its own wake.
+        self.vitals_output_edge(session, now);
         // The burst is owed a look: this sweep's, or one once the output pauses.
         self.session_status.note_output(session, now);
         // Queue every visible viewer's frame first; the same scan gates the work below.
@@ -23146,8 +23162,8 @@ impl App {
             let before = timeline.high_id();
             timeline.record_cwd_change(live_cwd.as_deref());
             let cwd_moved = timeline.high_id() != before;
-            // The session log's `title` mark (phase 3B) and, since phase 6
-            // (6F-8, ruling U13), the `title-change` row it keeps, in the
+            // The session log's `title` mark (phase 3B) and, since phase 6,
+            // the `title-change` row it keeps, in the
             // same hold: the informative title as the tab shows it (Git
             // Bash's home read `~`), a spinner frame's move aside. An owed
             // wake rings the session's watchers under this lock
@@ -24625,7 +24641,7 @@ impl ApplicationHandler<Wake> for App {
         // One `Option` check when none stands.
         self.expire_theme_preview(Instant::now());
         // An open Overview reads the fabric's log again a minute after the
-        // last read began (`overview_fabric`, step 6E-7). One `Option` check
+        // last read began (`overview_fabric`). One `Option` check
         // where no read was ever kicked or the fabric is off.
         self.tick_overview_fabric(Instant::now());
         // Autopilot's timer: one whose instant came lands its session. Nothing
@@ -24977,7 +24993,7 @@ impl ApplicationHandler<Wake> for App {
         // Overlap handoff: the window was created hidden. `aterm-window` queues
         // `RedrawRequested` for a hidden window as for any other (`queue_redraw`), so
         // every window the restore pass rebuilds presents on its redraw request
-        // (measured, round eight's U22); window 0's first present is driven directly
+        // (measured); window 0's first present is driven directly
         // only so it does not wait a run-loop turn for its request. The post-present
         // hook reveals it, or the retry/fallback path takes over.
         if self.handoff_ready.is_some()
@@ -25867,12 +25883,12 @@ impl App {
                 // A restored Settings ▸ Harness reads now, as it could not
                 // before the Commit.
                 self.settle_harness_reading_at_commit();
-                // THE PARENT'S LAYOUT IS THIS RUN'S (round seven of the update
-                // audit, findings 5 and 27): the parent is gone through a clean
+                // THE PARENT'S LAYOUT IS THIS RUN'S:
+                // the parent is gone through a clean
                 // `_exit` that left its crash journal, and this process had
                 // written none — a death before the first capture used to lose
                 // the whole desk. The Commit waiter took it over before it
-                // released the readers (round eight, finding 45); installed
+                // released the readers; installed
                 // here, or taken here when no waiter ran the take-over.
                 if let Some(parent) = self
                     .crash_journal
@@ -33136,7 +33152,7 @@ fn build_event_loop(headless: bool, successor: bool) -> BuiltLoop {
         Ok(el) => {
             crate::metrics::stamp_claim(crate::metrics::ClaimStamp::EventLoopBuilt);
             // The display opened: a Linux window start the boot apply could not
-            // vouch for is counted now (round eight of the update audit, #82).
+            // vouch for is counted now (#82).
             count_linux_window_start_once_open();
             el
         }
@@ -33273,7 +33289,7 @@ pub fn main_entry_with_first_run(argv: Vec<std::ffi::OsString>, first_run: Optio
         ready_fd,
         launch,
     } = parse_cli(argv);
-    // The instance's node log (session log 5J-2): its `start` written now, and
+    // The instance's node log: its `start` written now, and
     // the fabric link heard from here on, before any bridge can attach.
     session_log_node::install();
     // Windows lifecycle: opt into OS-driven relaunch (update reboot / "restart
@@ -33407,8 +33423,8 @@ pub fn main_entry_with_first_run(argv: Vec<std::ffi::OsString>, first_run: Optio
             &incoming_exec_fds.final_exec_env_with(&handoff_env),
             target_names_this_build,
             image,
-            // What this launch can prove about a boot trial (round eight of the
-            // update audit, #8): a headless one proves nothing about the windows.
+            // What this launch can prove about a boot trial (#8):
+            // a headless one proves nothing about the windows.
             boot_trial_witness(headless_flag),
         )
     };
@@ -33464,7 +33480,7 @@ pub fn main_entry_with_first_run(argv: Vec<std::ffi::OsString>, first_run: Optio
         );
         crate::crash_signal::clean_exit_now(0)
     }
-    // THE RELAUNCH THAT WAS REFUSED, AS A VERDICT AND ITS BUDGET (round eight, #1
+    // THE RELAUNCH THAT WAS REFUSED, AS A VERDICT AND ITS BUDGET (#1
     // and its review): this process is the old build again on the desk that took
     // the cold lane, and its first automatic attempt reads this before it
     // relaunches into the same refusal — and books it where the lane's schedule
@@ -33516,8 +33532,8 @@ pub fn main_entry_with_first_run(argv: Vec<std::ffi::OsString>, first_run: Optio
     let launch_record_renewed_from = aterm_log::env::take(launch_record_renewal::RENEWED_FROM_ENV)
         .and_then(|value| value.to_str()?.parse::<u32>().ok());
     // …and what a cold-lane parent's update-health warnings had said, for the
-    // landing to record their healing (round eight of the update audit, finding
-    // 79) — taken here for the same reasons, kept only for a real landing.
+    // landing to record their healing
+    // — taken here for the same reasons, kept only for a real landing.
     let cold_lane_health_said = app_update_handoff::take_cold_lane_health_said(just_updated);
     let _ = JUST_UPDATED.set(just_updated);
     // The containment mode, once, before any subsystem queries it (default `User`); an
@@ -33530,8 +33546,7 @@ pub fn main_entry_with_first_run(argv: Vec<std::ffi::OsString>, first_run: Optio
         // The session's words (aterm-cli `session_main`): the accepted values.
         if matches!(e, aterm_containment::InitModeFromFlagError::Parse(_)) {
             crate::logging::stderr_line!(
-                "aterm-gui: --containment takes user, safety or containment; \
-                 using containment"
+                "aterm-gui: --containment takes user, safety or containment; using containment"
             );
         } else {
             crate::logging::stderr_line!("aterm-gui: {e}; using containment");
@@ -33810,8 +33825,8 @@ pub fn main_entry_with_first_run(argv: Vec<std::ffi::OsString>, first_run: Optio
     // Tokenless carried connection triples, re-minted once every handed-off session is
     // registered (`remint_carried_connections`).
     let seamless_conn_carry = incoming_handoff.connections;
-    // The bus mirror's tombstones the outgoing process carried (session log
-    // phase 4, ruling Q4), adopted into the store before its first session.
+    // The bus mirror's tombstones the outgoing process carried,
+    // adopted into the store before its first session.
     let seamless_mirror_dropped = incoming_handoff.mirror_dropped;
     let seamless_mirror_served = incoming_handoff.mirror_served;
     // The exit ledger's count, which the store goes on above; applied where the store is
@@ -34545,8 +34560,8 @@ pub fn main_entry_with_first_run(argv: Vec<std::ffi::OsString>, first_run: Optio
         ),
         _ => (rows, cols),
     };
-    // THE EPOCHS THE LAYOUT'S LEAVES RECORDED (session log phase 6, 6A-2,
-    // ruling U1), noted before any session starts: every log this process
+    // THE EPOCHS THE LAYOUT'S LEAVES RECORDED,
+    // noted before any session starts: every log this process
     // starts, fresh or uncarried, takes an epoch above the one its sid's
     // predecessor was at when the layout was saved.
     if let Some(layout) = restore_manifest.as_ref() {
@@ -35024,9 +35039,9 @@ pub fn main_entry_with_first_run(argv: Vec<std::ffi::OsString>, first_run: Optio
             .unwrap_or_else(|p| p.into_inner())
             .continue_roster_seq(carried);
     }
-    // THE BUS MIRROR (session log phase 4): the predecessor's tombstones, and
+    // THE BUS MIRROR: the predecessor's tombstones, and
     // the adoption latch while handed-off sessions are still to register
-    // (ruling Q1: a bridge's landing for one is `adopting`, never `gone`).
+    // (a bridge's landing for one is `adopting`, never `gone`).
     let slog_mirror_adopting = !seamless_adopt.is_empty();
     {
         let g = store.read().unwrap_or_else(|p| p.into_inner());
@@ -35453,7 +35468,7 @@ pub fn main_entry_with_first_run(argv: Vec<std::ffi::OsString>, first_run: Optio
             ));
         }
     }
-    // A lab desk's own kill scan (session log 6C-4): the dead `lab` marker its previous run
+    // A lab desk's own kill scan: the dead `lab` marker its previous run
     // left in the private root's log directory, consumed for the census below; a headless
     // desk posts no row.
     #[cfg(unix)]
@@ -35810,7 +35825,7 @@ pub fn main_entry_with_first_run(argv: Vec<std::ffi::OsString>, first_run: Optio
             lane
         },
         debugger_change: debugger_access::DebuggerChangeLane::new(headless),
-        // Asked once per Mac, by a windowed macOS instance only (owner ruling O29).
+        // Asked once per Mac, by a windowed macOS instance only.
         debugger_launch: debugger_access::LaunchAskQueue::new(
             !headless && cfg!(target_os = "macos"),
         ),
@@ -36085,7 +36100,7 @@ pub fn main_entry_with_first_run(argv: Vec<std::ffi::OsString>, first_run: Optio
         });
     }
     // A refused cold relaunch reaches the automatic lane before anything can arm it
-    // (the startup reconcile below; round eight, #1's review).
+    // (the startup reconcile below; #1's review).
     #[cfg(unix)]
     if let Some(seed) = cold_relaunch_seed {
         app.seed_refused_cold_relaunch(seed, Instant::now());
@@ -36459,8 +36474,8 @@ fn stub_session(id: u64) -> Session {
 fn stub_session_with_sink(id: u64, sink: Arc<SinkWriter>) -> Session {
     prime_test_timing();
     let session = ptyless_session(id, SessionId::generate(), Terminal::new(24, 80), sink);
-    // A unit test's stub reads `ep=1`: its log is the test constructor's
-    // (ruling U46), never a build-wide pin.
+    // A unit test's stub reads `ep=1`: its log is the test constructor's,
+    // never a build-wide pin.
     #[cfg(test)]
     {
         *session
@@ -36718,8 +36733,8 @@ mod session_chrome_expiry_conformance_tests {
         );
     }
 
-    /// A QUIET DESKTOP'S TABS ARM NO WAKE, ON SCREEN OR NOT (D5, the
-    /// Together run's idle windows, and the review of ba16cabbe5: the ages
+    /// A QUIET DESKTOP'S TABS ARM NO WAKE, ON SCREEN OR NOT (the
+    /// Together run's idle windows: the ages
     /// are the context menu's, and a visible window still woke once a minute
     /// per young tab to recompose a closed menu): a fresh tab's composition
     /// carries its `started` row's stamp, the clock moves none of it, and the
@@ -38285,14 +38300,12 @@ pub fn run_ship(rest: &[String]) -> i32 {
         }
     }
     let Some(tool) = candidates.into_iter().find(|p| p.is_file()) else {
-        crate::logging::stderr_line!("aterm ship: this machine is not set up to publish aterm.");
         crate::logging::stderr_line!(
-            "aterm ship:   the release tool (`aterm-release`) ships with the SOURCE, not the \
-             app — it is not something every install carries."
+            "aterm ship: this machine is not set up to publish aterm (`aterm-release` ships with \
+             source, not the app)."
         );
         crate::logging::stderr_line!(
-            "aterm ship:   from a checkout, build it once:  targo --unverified build --release \
-             -p aterm-release"
+            "aterm ship:   from a checkout: targo --unverified build --release -p aterm-release"
         );
         return 1;
     };

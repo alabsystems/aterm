@@ -2,8 +2,8 @@
 // Copyright 2026 Andrew Yates
 
 //! THE CODEX STEP FOLD: turns, tool calls, turn ends and the usage wall from
-//! a Codex rollout, for the session log, with no text kept (session log 5G-2;
-//! rulings T9, T33, S6). It folds into the Claude step fold's own types
+//! a Codex rollout, for the session log, with no text kept.
+//! It folds into the Claude step fold's own types
 //! ([`Step`], [`StepEvent`], [`StepBatch`]), so the log takes a Codex
 //! rollout's steps as it takes a transcript's. One reader feeds it: 5G-3's
 //! rollout tap ([`super::codex_tap`]), which binds only a codex-alab
@@ -75,7 +75,7 @@
 //! ([`StepEvent::Off`]) until the next bind. A call id that is no log id is
 //! counted lost; a row of a kind it does not read is skipped.
 //!
-//! NO TEXT (ruling S6). A step holds ids, a tool's bounded name, class words
+//! NO TEXT. A step holds ids, a tool's bounded name, class words
 //! and numbers. A row is opened only when its raw bytes hold a key it reads
 //! (or a `\u` escape, which could spell one), and read through
 //! `super::transcript`'s `codex_steps` projection, which keeps only those
@@ -85,7 +85,7 @@
 //!
 //! MEASURED BUILDS. [`CODEX_MEASURED_BUILDS`] names each codex-alab build
 //! whose rollouts the lab measured: 0.164.0-dev.12521 and 0.164.0-dev.12479
-//! (session log 6D-3a, `lab codex-alab-proof` on the package built from its
+//! (`lab codex-alab-proof` on the package built from its
 //! source and on the owner's managed one), and 0.164.0-dev.12672 (B5c, the
 //! forever-port package under the twelve-leg proof), each leg's rollout
 //! committed reduced as `codex-alab-<release>-<leg>.jsonl`.
@@ -94,7 +94,7 @@
 //! by the tap that read it), and, where its reader knows the build writing
 //! the rollout now ([`CodexStepFold::set_writer`]: a resumed or re-exec'd
 //! thread never restates its `session_meta`), only while that one is named
-//! there too; else [`StepState::Partial`] (ruling T8's rule): the 5G lab
+//! there too; else [`StepState::Partial`] (rule): the 5G lab
 //! run's 0.163.0 was a vendor Codex, which is never bound. An
 //! ALab build's version carries its commit as build metadata
 //! (`0.164.0-dev.12521+g3d3eb12d8`), whose `+` no log id holds, so the
@@ -121,12 +121,12 @@ use super::transcript;
 /// The codex-alab builds whose rollouts the lab measured, each with its
 /// key-only reductions committed (`harness/testdata/steps/<stem>-<leg>.jsonl`,
 /// `aterm_phase::anchors::rollout_reduction_stem`'s stem): exact one by one
-/// (ruling T8's rule), the whole build string matched: 0.164.0-dev.12521,
+/// (rule), the whole build string matched: 0.164.0-dev.12521,
 /// built from its source for the run, 0.164.0-dev.12479, the owner's
 /// managed codex-alab, read from its store, and 0.164.0-dev.12672, the
 /// forever-port build (codex-alab `089291d37`) the Autopilot Cruise / LAND
 /// proof runs (B5c). `lab codex-alab-proof`'s legs
-/// on each (session log 6D-3a: a turn, a continued turn, an approved
+/// on each (a turn, a continued turn, an approved
 /// `exec_command`, a `request_user_input` answered, the usage wall waited
 /// out, a crash relaunched and a turn carried on), each step the fold makes
 /// exact against what the leg did and the rollout's own per-turn token
@@ -343,7 +343,7 @@ impl CodexStepFold {
         self.floor_ms = self.floor_ms.max(floor_ms);
     }
 
-    /// THE WRITER (session log 5G-3): `build` is what the process writing
+    /// THE WRITER: `build` is what the process writing
     /// the rollout runs now (the rollout tap reads it off the claimant's
     /// image, `super::codex_alab::alab_build`). A thread's `session_meta`
     /// names the build that STARTED it, and a thread resumed or re-exec'd
@@ -655,7 +655,7 @@ impl CodexStepFold {
         );
     }
 
-    /// The state of the rows now (ruling T8's rule): the thread's build's,
+    /// The state of the rows now (rule): the thread's build's,
     /// and never `On` while its writer runs a build nobody measured
     /// ([`Self::set_writer`]).
     const fn state(&self) -> StepState {

@@ -93,7 +93,7 @@ fn session(log: &mut Log) {
     .expect("the session opens");
 }
 
-/// RULING Q5: the bus class is its own predicate. The turn class is what it
+/// the bus class is its own predicate. The turn class is what it
 /// was; the bus class holds it, the need-bearing steps and `mark seen`, and
 /// nothing else.
 #[test]
@@ -153,18 +153,19 @@ fn the_bus_class_is_its_own_predicate_and_holds_the_turn_class() {
     assert_eq!(bus_only, want, "the bus class past the turn class");
 }
 
-/// RULING Q5: `ms` costs exactly its 8 bytes a record in heap, mirror on or
+/// `ms` costs exactly its 8 bytes a record in heap, mirror on or
 /// off, and numbers the bus class densely; a local record has none. Phase 6
 /// (6F-1) adds the record's process-clock reading, another 8 bytes an entry,
-/// which the footprint counts with the rest.
+/// and 6G-1 its row tag (its row ids and span), 8 more, which
+/// the footprint counts with the rest.
 #[test]
 fn ms_costs_eight_bytes_a_record_and_numbers_the_bus_class_densely() {
     assert_eq!(
         ENTRY_BYTES,
         std::mem::size_of::<std::sync::Arc<Rec>>()
             + std::mem::size_of::<usize>()
-            + 2 * std::mem::size_of::<u64>(),
-        "an entry is its shared record, its bytes, its ms and its mono"
+            + 3 * std::mem::size_of::<u64>(),
+        "an entry is its shared record, its bytes, its ms, its mono and its row tag"
     );
     let mut log = Log::new(1);
     session(&mut log);
@@ -190,7 +191,7 @@ fn ms_costs_eight_bytes_a_record_and_numbers_the_bus_class_densely() {
     assert_eq!(log.mirror_landed(), None, "nothing mirrors until a take");
 }
 
-/// RULING Q5 (the carry golden): a log no bridge ever took from carries the
+/// a log no bridge ever took from carries the
 /// bytes a build without phase 4 wrote, its `ms` included in nothing.
 #[test]
 fn an_unmirrored_carry_is_the_bytes_it_was() {
@@ -267,7 +268,7 @@ fn adopt(log: &Log, ms: u64) -> CarryAdopt {
     }
 }
 
-/// RULING Q7: a phase-4 successor adopts the carry a 2A writer made and the
+/// a phase-4 successor adopts the carry a 2A writer made and the
 /// carry a 2B writer made — no `ms=`, `r` lines only, an update's overlap
 /// hole, and (2B) the journal's host line: accepted, its bus class numbered
 /// densely from 1 in seq order over the carried records, `ms`'s head their
@@ -376,7 +377,7 @@ fn the_landed_cursor_and_ms_cross_the_carry() {
     assert_eq!(view.dup, 0);
 }
 
-/// RULINGS Q2 and Q15: a take derives every loss from `ms` alone. One cover
+/// a take derives every loss from `ms` alone. One cover
 /// per hole, each exact, the covers' counts summing to the bus-class
 /// records evicted; a loss of local-class records only is no cover at all.
 #[test]
@@ -426,7 +427,7 @@ fn a_take_says_each_hole_once_with_its_exact_count() {
     assert_eq!(view.max_ms(), log.ms_head());
 }
 
-/// RULINGS Q2 and Q12: under an update's fence a take stops at the fence's
+/// under an update's fence a take stops at the fence's
 /// seq and its tail cover at the fence's `ms` head, and no landing moves the
 /// cursor the export drew; once the fence lifts, the take goes on.
 #[test]
@@ -485,7 +486,7 @@ fn a_landing_is_monotone_and_never_ahead() {
     assert_eq!(log.mirror_landed(), Some(c));
 }
 
-/// RULING S17: a snapshot's `open=` and `needs=` carry only bus-class nodes.
+/// a snapshot's `open=` and `needs=` carry only bus-class nodes.
 /// Taken while a tool step is open beneath the turn (and beneath an open
 /// approval), the snap names the run, the turn and the approval; a bus fold
 /// seeded from it holds the open path and needs the local fold's bus facts
@@ -559,7 +560,7 @@ fn a_bus_fold_seeds_from_a_snap_taken_while_a_local_step_is_open() {
     assert!(late.state().needs.iter().all(Option::is_none));
 }
 
-/// RULING Q6: an edge's actor crosses as its stable alias, never its sid,
+/// an edge's actor crosses as its stable alias, never its sid,
 /// so two edges' needs and clears leave the same needs on the bus as here.
 #[test]
 fn two_edges_needs_and_clears_agree_locally_and_on_the_bus() {
@@ -616,7 +617,7 @@ fn two_edges_needs_and_clears_agree_locally_and_on_the_bus() {
     );
 }
 
-/// RULING Q5: `mark seen` is bus class, so a remote fold lifts
+/// `mark seen` is bus class, so a remote fold lifts
 /// `need=failure` as the local one does.
 #[test]
 fn seen_lifts_failure_on_the_bus() {
@@ -662,8 +663,7 @@ fn drain_without(log: &mut Log, view: &mut BusSpace, ms: u64, k: Kind) {
     panic!("the take never settled");
 }
 
-/// THE HARNESS'S RELAUNCH LIFT IS THE BUS'S TOO (Phase 6 step 6C-1, ruling
-/// U3): the old run failed, the relaunched run is open, and the harness's
+/// THE HARNESS'S RELAUNCH LIFT IS THE BUS'S TOO: the old run failed, the relaunched run is open, and the harness's
 /// act is followed by `mark - seen by=harness src=aterm conf=strong`. The
 /// `act` stays local, but the `seen` is bus class, so the mirror's fold
 /// lifts the need as the local one does and their facts agree. NEGATIVE
@@ -788,7 +788,7 @@ fn encode_mirror_refuses_local_class_and_no_host_key_crosses() {
     }
 }
 
-/// RULING Q7, the uncarried path: the successor's first take says the old
+/// the successor's first take says the old
 /// space's tail as one exact `why=reset` cover in that space, then takes its
 /// own from its first record; a landing in the old space moves only the
 /// old space's owed tail.
@@ -840,7 +840,7 @@ fn an_uncarried_update_says_the_old_spaces_tail_as_one_reset_cover() {
     );
 }
 
-/// RULING Q4's engine half: a closed session's bus tail is its bus-class
+/// engine half: a closed session's bus tail is its bus-class
 /// records past the cursor, its close among them, and a take of it settles
 /// once its close has landed.
 #[test]
@@ -872,7 +872,7 @@ fn a_closed_sessions_bus_tail_holds_its_close() {
     assert!(view.holes().is_empty());
 }
 
-/// RULING Q0: the reader's view is the law. A seeded session mirrored with
+/// the reader's view is the law. A seeded session mirrored with
 /// planted duplicates, whole batches offered twice and a batch offered in
 /// reverse (a re-pinned slot landing late) shows each record once, `ms`
 /// dense, and folds to the local fold's bus facts and totals.
@@ -1010,7 +1010,7 @@ fn bus_fold_equals_local_bus_view() {
     }
 }
 
-/// RULING Q4 UNDER A FENCE (fixer F1): a session that closes while an
+/// a session that closes while an
 /// update's export holds its readers' fence is judged against its LIVE `ms`
 /// head, not the fence's: its tail is owed even when the cursor stands at
 /// the fence. The tail carries the fence (no landing passes the export's
@@ -1464,10 +1464,10 @@ fn a_mirrored_carry_is_read_whatever_the_writers_bus_class() {
     assert!(view.holes().is_empty(), "{:?}", view.holes());
 }
 
-/// WHICH SIDS CROSS (fixer F18, for D4): a restored session's open and its
+/// WHICH SIDS CROSS (D4): a restored session's open and its
 /// `amend - restore` carry `prev=` and `lineage=` as sids, unaliased; no
 /// other key of theirs carries one. A spawned one's open `parent=` stays
-/// local (HOST since session log Phase 6 step 6E-4, ruling U23(c)).
+/// local (HOST).
 #[test]
 fn a_restored_sessions_lineage_sids_reach_the_bus() {
     let a = "s-aaaaaaaaaaaaaaaaaaaa";
@@ -1731,8 +1731,7 @@ fn an_out_refining_amend_and_a_confirmation_agree_on_host_and_bus() {
     agree(&log, &view, "after the confirmation");
 }
 
-/// AN EDGE'S RAW SID NEVER CROSSES BY `op_by=` (Phase 6 step 6C-2, ruling
-/// U6): a turn an edge opened and `ctl` closed restates its opener on the
+/// AN EDGE'S RAW SID NEVER CROSSES BY `op_by=`: a turn an edge opened and `ctl` closed restates its opener on the
 /// close as the host id `op_by=<sid>`; at `Tier::Wire` the close carries
 /// none, and no body the mirror takes holds the raw sid (the open's own
 /// `by=` crosses as the edge's alias). NEGATIVE CONTROL (scratch revert):
@@ -1781,7 +1780,7 @@ fn an_edges_raw_sid_never_crosses_by_the_restated_opener() {
     );
 }
 
-/// THE BUS NEVER GUESSES A MAIL LINK (Phase 6 step 6C-3, ruling U5): the
+/// THE BUS NEVER GUESSES A MAIL LINK: the
 /// local log links a `ctl` turn to the one `kind=task` mail before it and
 /// its brief prints ` mail=@9~`; the mail mark is local class and its
 /// `off=` host tier, so a bus fold holds no link and the brief a peer folds

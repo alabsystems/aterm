@@ -416,7 +416,7 @@ pub(crate) struct SessionGlass {
     end: Option<EndGlass>,
     /// How many ends this session told: the next end's [`EndGlass::serial`].
     ends: u32,
-    /// WHY LAND STILL HOLDS (§12.3.3 item 3, slice 3c), as the session's
+    /// WHY LAND STILL HOLDS (§12.3.3 item 3), as the session's
     /// loop last told it ([`on_land_held`]), with its `since` stamped once:
     /// what the SESSIONS state line, the tab's hover and the Overview, the
     /// menu bar's worker row and the chip's title (the W4 title slice) say
@@ -873,7 +873,7 @@ pub(crate) fn on_need_words(app: &mut App, session: u64) {
 }
 
 /// LAND'S HOLD of session `session` moved to `held` (`None`: none stands;
-/// `HarnessFact::LandHeld`, §12.3.3 item 3, slice 3c): kept on the
+/// `HarnessFact::LandHeld`, §12.3.3 item 3): kept on the
 /// session's glass with its `since` stamped ONCE — its local clock and day,
 /// read here where the hold's `since` is new and kept as it was where only
 /// the legs or the nudges moved ([`HeldGlass::of`]). The hold moves nothing
@@ -1320,7 +1320,7 @@ impl App {
 }
 
 impl SessionGlass {
-    /// A SEAMLESS UPDATE'S CARRIED END (§11.2.3, item 8; slice 2b,
+    /// A SEAMLESS UPDATE'S CARRIED END (§11.2.3, item 8;
     /// `App::adopt_end_carry`): the end the outgoing process held, `face` at
     /// its own clock `at`, put back as it stood — the session's first end in
     /// this process, seen where it was seen — where none stands (an end told

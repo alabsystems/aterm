@@ -25,6 +25,9 @@
 //!   solved in OkLab from the ground they sit on.
 //! * [`events`]: what changed between snapshots (pressure, throttle, swap,
 //!   free space, load, tabs, readers).
+//! * [`explain`]: who uses the CPU, per resource coalition: the split over
+//!   one matched window, each coalition's lead, and the machine's timeline,
+//!   the facts `sys why` and the cause engine read.
 //! * [`sys`]: the `sys` verb's grammar, its text and JSON views, deltas
 //!   against an earlier reply, and the `await sys` predicates.
 //! * [`jobs`]: stuck processes and jobs (§11): job units, progress, classes
@@ -38,6 +41,7 @@
 
 pub mod delegated;
 pub mod events;
+pub mod explain;
 pub mod history;
 pub mod ink;
 pub mod jobs;

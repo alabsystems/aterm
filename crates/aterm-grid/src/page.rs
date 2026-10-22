@@ -41,9 +41,9 @@ unsafe impl Send for Page {}
 // accesses, whose callers guarantee exclusivity; no byte range is mutated concurrently.
 unsafe impl Sync for Page {}
 
-fn _assert_send<T: Send>() {}
-fn _assert_sync<T: Sync>() {}
-fn _guard_page() {
+const fn _assert_send<T: Send>() {}
+const fn _assert_sync<T: Sync>() {}
+const fn _guard_page() {
     _assert_send::<Page>();
     _assert_sync::<Page>();
 }
@@ -67,7 +67,7 @@ impl Page {
     ///
     /// Writing through it requires that no other reference to the bytes exists.
     #[inline]
-    pub(crate) fn data_ptr(&self) -> *mut u8 {
+    pub(crate) const fn data_ptr(&self) -> *mut u8 {
         self.data.get().cast()
     }
 }

@@ -230,8 +230,8 @@ impl Parser {
     /// so the caller decides when to take it: `aterm-core`'s checkpoint takes
     /// it when the handler keeps nothing (a string it only consumes, such as
     /// tmux control mode) or holds a picture a stream's next frame
-    /// replaces (a sixel), and never for a query whose reply would be lost
-    /// (round eight of the update audit, finding 57). A pure read.
+    /// replaces (a sixel), and never for a query whose reply would be lost.
+    /// A pure read.
     ///
     /// The carried state is [`HOOKED_STRING_CARRY`] with no APC consumer: every
     /// byte stays in the string (DEL, C1 and UTF-8 bytes included) except CAN

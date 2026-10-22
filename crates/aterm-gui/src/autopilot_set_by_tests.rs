@@ -97,8 +97,8 @@ fn field(reply: &str, key: &str) -> Option<String> {
 }
 
 /// THE CONTROL LANE (§11.7.5): `meta set autopilot off` over an Owner
-/// connection leaves the session's keyed record — none was left before
-/// slice 7 — with the title a window write has and its last line `set over
+/// connection leaves the session's keyed record — none was left in an older format
+/// — with the title a window write has and its last line `set over
 /// aterm ctl`; `meta unset autopilot` records the hand back to the default
 /// with the same line; aterm's harness and the fabric name themselves. A
 /// session's edge connection is refused the write (the Owner rule, §11.7.6),
@@ -223,7 +223,7 @@ fn a_write_over_the_wire_is_recorded_with_its_writer() {
 /// armed over the wire, then `meta set autopilot land` over the wire — the
 /// record says the timer it dropped is cancelled, as a window write's does,
 /// and who set it. NEGATIVE CONTROL: indexing before the read (the order
-/// before slice 7) loses the cancel line.
+/// in an older format) loses the cancel line.
 #[test]
 fn a_wire_write_says_the_timer_it_dropped() {
     let (mut app, host) = hosted();
@@ -437,7 +437,7 @@ fn meta_says_who_set_the_word_and_when() {
         )),
         "{reply}"
     );
-    // A word with no setter: carried by a leaf from before slice 7.
+    // A word with no setter: carried by a leaf from an older format.
     {
         let ctx = app.pool.get(0).unwrap().ctx.clone();
         let mut meta = ctx.meta.lock().unwrap();
@@ -619,8 +619,8 @@ fn a_sessions_row_says_who_set_its_word_and_when() {
     host.shutdown_and_join();
 }
 
-/// A LATER WAKE NEVER REPLACES THE FIRE'S RECORD (§11.7.7, the review of
-/// slice 7): a timer armed from the menu fires — its record says what the
+/// A LATER WAKE NEVER REPLACES THE FIRE'S RECORD (§11.7.7):
+/// a timer armed from the menu fires — its record says what the
 /// fire found and `set at the 13:00 timer` — and the session's next wake
 /// for another field (`meta set title x` over the wire) records nothing,
 /// since the fire noted its revision as recorded. NEGATIVE CONTROL: the fire

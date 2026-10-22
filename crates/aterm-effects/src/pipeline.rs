@@ -171,7 +171,7 @@ struct CursorCoordinateSpace {
 /// `cursor_scroll_signal_model`. The table lives in `aterm-core`
 /// ([`ContentScrollState::delta_since`]).
 #[inline]
-fn content_scroll_decision(
+const fn content_scroll_decision(
     previous: Option<ContentScrollState>,
     current: ContentScrollState,
 ) -> ContentScrollDelta {
@@ -859,7 +859,7 @@ impl EffectsPipeline {
     /// The typed line turned into prose, or was aborted, before a tentative
     /// kitty command was performed: take it back. Idempotent.
     #[cfg(test)]
-    pub fn revoke_trick(&mut self) {
+    pub const fn revoke_trick(&mut self) {
         self.companion.revoke_trick();
     }
 
@@ -898,7 +898,7 @@ impl EffectsPipeline {
     /// go before the all-off arm retires it.
     #[inline]
     #[must_use]
-    pub fn enabled_any(&self) -> bool {
+    pub const fn enabled_any(&self) -> bool {
         self.glow_cfg.enabled
             || self.trail_cfg.enabled
             || self.sparkle.is_some()
@@ -1076,7 +1076,7 @@ impl EffectsPipeline {
     /// retire the pet's frozen contrast sample so its next appearance
     /// re-samples the glass; behaviour, position and breed handoff continue.
     #[inline]
-    pub fn invalidate_companion_colors(&mut self) {
+    pub const fn invalidate_companion_colors(&mut self) {
         self.companion.invalidate_colors();
     }
 
@@ -1085,13 +1085,13 @@ impl EffectsPipeline {
     /// pointer changed, so an idle hover costs no render. Non-finite samples
     /// are dropped.
     #[inline]
-    pub fn note_pointer_px(&mut self, x: f32, y: f32) -> bool {
+    pub const fn note_pointer_px(&mut self, x: f32, y: f32) -> bool {
         self.companion.set_pointer(Some((x, y)))
     }
 
     /// The pointer left the surface. Returns `true` iff there was one.
     #[inline]
-    pub fn note_pointer_leave(&mut self) -> bool {
+    pub const fn note_pointer_leave(&mut self) -> bool {
         self.companion.set_pointer(None)
     }
 
@@ -1314,7 +1314,7 @@ impl EffectsPipeline {
     /// The emphasis resolve, as in the native resolver: `enabled && (ink_enabled ||
     /// has_custom_specs)`.
     #[inline]
-    fn recompute_emphasis(&mut self) {
+    const fn recompute_emphasis(&mut self) {
         self.deco_cfg.emphasis = self.emphasis_enabled
             && (self.deco_cfg.ink_enabled || self.deco_cfg.spec_table.has_custom());
     }

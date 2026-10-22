@@ -873,7 +873,10 @@ pub struct ChromeIcon {
 /// The band's icon set: one drawn icon for every status glyph a message row can carry, so
 /// the glyph cell reads as one family whatever font holds `⚠` or `ℹ`. Each stands in for one
 /// character ([`Self::for_char`]), drawn from the cell's geometry and the face's stroke weight
-/// in the cell's ink.
+/// in the cell's ink. The set also draws the harness switch's three marks (`● ○ ◐`,
+/// [`Self::switch_mark`]), which no message carries: the default macOS face (SF Mono) has
+/// `●` and `○` but no half disc, and the fallback face's `◐` drew at about half their size at
+/// 1×, so the switch draws all three, one family.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum BandIcon {
     /// `ℹ` — an `i` cut out of a disc.
@@ -902,11 +905,17 @@ pub enum BandIcon {
     More,
     /// `⊖`: a bar cut out of a disc, a removal in flight.
     Remove,
+    /// `●` — a disc: the harness switch on.
+    Disc,
+    /// `○` — a ring: the harness switch off.
+    Ring,
+    /// `◐` — the ring with its left half filled: the harness switch turning on.
+    HalfDisc,
 }
 
 impl BandIcon {
     /// Every icon, in its index order ([`Self::index`]).
-    pub const ALL: [BandIcon; 13] = [
+    pub const ALL: [BandIcon; 16] = [
         Self::Info,
         Self::Success,
         Self::Warn,
@@ -920,7 +929,23 @@ impl BandIcon {
         Self::Dot,
         Self::More,
         Self::Remove,
+        Self::Disc,
+        Self::Ring,
+        Self::HalfDisc,
     ];
+
+    /// The harness switch's mark drawn for `ch` (`●` on, `○` off, `◐` turning on); `None`
+    /// for any other character. Not a band glyph: [`Self::for_char`] never names one.
+    #[must_use]
+    #[inline]
+    pub const fn switch_mark(ch: char) -> Option<Self> {
+        Some(match ch {
+            '\u{25cf}' => Self::Disc,
+            '\u{25cb}' => Self::Ring,
+            '\u{25d0}' => Self::HalfDisc,
+            _ => return None,
+        })
+    }
 
     /// The icon that stands in for `ch`, the band's glyph; `None` for any
     /// character outside the set (it keeps its font glyph).
@@ -963,6 +988,9 @@ impl BandIcon {
             Self::Dot => '\u{00b7}',
             Self::More => '\u{2026}',
             Self::Remove => '\u{2296}',
+            Self::Disc => '\u{25cf}',
+            Self::Ring => '\u{25cb}',
+            Self::HalfDisc => '\u{25d0}',
         }
     }
 

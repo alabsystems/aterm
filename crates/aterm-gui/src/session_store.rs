@@ -349,8 +349,8 @@ pub(crate) struct SessionRecord {
     )]
     pub status_seen: Option<String>,
     /// THE AUTOPILOT'S END AND THE TASK'S WORK (additive, absent ⇒ none;
-    /// `docs/DESIGN-harness-autopilot-2026-10-15.md` §11.2.3, item 8, slice
-    /// 2b): the end of the session's supervised task standing on the glass —
+    /// `docs/DESIGN-harness-autopilot-2026-10-15.md` §11.2.3):
+    /// the end of the session's supervised task standing on the glass —
     /// a landing, the wall time its face moved there, whether anyone looked
     /// at it — and the agent's busy time since the task opened, as one row
     /// (`harness_end_carry::EndCarry::row`: `end=landed@<unix ms>
@@ -1108,8 +1108,8 @@ pub(crate) struct SessionHandoff {
         deserialize_with = "lenient_rows"
     )]
     pub fleet_told: Vec<String>,
-    /// THE BUS MIRROR's closed sessions (additive, absent tolerated; session
-    /// log phase 4, ruling Q4): one `<sid> <ep>:<seq>:<ms>:<head>` row per
+    /// THE BUS MIRROR's closed sessions (additive, absent tolerated):
+    /// one `<sid> <ep>:<seq>:<ms>:<head>` row per
     /// closed session whose mirrored records the bus does not hold yet, which
     /// the successor says as one exact `gap why=dropped n=<k>` each
     /// (`session_log_mirror::Tombstone`). Empty, so not written, while no
@@ -1120,7 +1120,7 @@ pub(crate) struct SessionHandoff {
         deserialize_with = "lenient_rows"
     )]
     pub mirror_dropped: Vec<String>,
-    /// THE BUS MIRROR was served here (additive; session log phase 4): the
+    /// THE BUS MIRROR was served here (additive): the
     /// owning bridge's recorded `hello` said `log=turns`. The successor
     /// takes it as its own until its bridge's hello says (a session that
     /// opens and closes before then is still kept for the bus). `false`, so
@@ -1182,8 +1182,8 @@ pub(crate) struct HeldPaneCarry {
     /// outgoing process retires once the proof checks out.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub history: Option<String>,
-    /// CONTROL CARRY (additive, absent tolerated; round eight of the update
-    /// audit, finding 730): `"<len> <sha256hex>"` of this pane's
+    /// CONTROL CARRY (additive, absent tolerated):
+    /// `"<len> <sha256hex>"` of this pane's
     /// `seamless-<pid>-<nonce>.h<id>.ctl` sidecar — its turn ledger and archive
     /// tail, exactly as a handed session's `SessionRecord::control` carries them
     /// (`crate::handoff_carry`), so `history` and the harness's report reader still read
@@ -1251,8 +1251,8 @@ impl Drawn {
 }
 
 /// What a handoff record carries of a session that a control verb can move
-/// after the park drew it, and that no other Commit fact compares (round eight
-/// of the update audit, finding 751): its broadcast opt-ins (`topic add` /
+/// after the park drew it, and that no other Commit fact compares:
+/// its broadcast opt-ins (`topic add` /
 /// `drop`), its keyed escalations (`meta set attention owner=…`), its
 /// supervisor claim (`meta set supervisor …`) — the holder and whether the
 /// producer vouches for the claim, never a lease's remaining time, which moves
@@ -1403,8 +1403,8 @@ impl SessionHandoff {
                         task,
                     } = Drawn::of(&h.ctx, now_us, &own_holder);
                     // The id the successor's timeline counts on from (the
-                    // newest one plus the overlap's reserve: round seven,
-                    // finding 50, and its review's item 2), and the session
+                    // newest one plus the overlap's reserve),
+                    // and the session
                     // log's epoch, node-id counters and seq count with theirs, under ONE
                     // hold of the timeline's leaf lock. Taken here, not in the
                     // literal: a guard made in a field's initializer lives
@@ -1811,7 +1811,7 @@ pub(crate) struct SessionStore {
     /// Not carried.
     input_replies: crate::control::InputReplies,
     /// THE BUS MIRROR's closed-session tails, tombstones and adoption latch
-    /// (`session_log_mirror`, session log phase 4). Empty, holding no heap,
+    /// (`session_log_mirror`). Empty, holding no heap,
     /// while no bridge mirrors.
     mirror: crate::session_log_mirror::StoreMirror,
 }
@@ -1848,7 +1848,7 @@ impl SessionStore {
             // log (`session_log_mirror::Shared`): nothing is engaged by it
             // while the node does not mirror.
             tl.slog_mut().bind_mirror(self.mirror.shared());
-            // THE PERSON'S COUNT the log reconciles against (ruling T2).
+            // THE PERSON'S COUNT the log reconciles against.
             tl.slog_mut()
                 .bind_person(std::sync::Arc::clone(&handle.ctx.human_input));
             tl.record("spawned", format!("state={}", handle.state.as_str()));
@@ -2163,7 +2163,7 @@ impl SessionStore {
             }
             tl.record("state-change", "state=closed".to_string());
             // The session log's `close - out=<reason> by=<actor> code=<n> closer=<raw>`
-            // (the raw actor at the content tier, ruling U12); everything still open
+            // (the raw actor at the content tier); everything still open
             // closes under it.
             let at = tl.slog().now();
             tl.slog_mut().close_session(
@@ -2176,8 +2176,8 @@ impl SessionStore {
             if let Some(retirements) = retirements.as_mut() {
                 retirements.retire(&sid, &h.ctx.timeline, tl.slog());
             }
-            // A mirrored log's tail the bus does not hold yet stays for it
-            // (ruling Q4); a log nothing mirrored keeps nothing.
+            // A mirrored log's tail the bus does not hold yet stays for it;
+            // a log nothing mirrored keeps nothing.
             mirror.retire(sid.as_str(), tl.slog_mut());
             reason
         });
@@ -2226,7 +2226,7 @@ impl SessionStore {
     }
 
     /// Update the live title (on relabel); a no-op if unknown or unchanged.
-    /// It records nothing: since phase 6 (6F-8, ruling U13) the timeline's
+    /// It records nothing: since phase 6 the timeline's
     /// `title-change` rows follow the session log's content-tier title
     /// marks, every session's, from the drift flush
     /// ([`crate::session_timeline::SessionTimeline::record_title`]), not
@@ -2630,7 +2630,7 @@ fn handle_over(
     let master = sink.master();
     let observed = crate::session_watch::Observed::default();
     observed.watchers.bind_frame(&term);
-    // The test constructor's log (`ep=1`, ruling U46), in the timeline that
+    // The test constructor's log (`ep=1`), in the timeline that
     // rings this context's watchers.
     *observed
         .timeline
@@ -2685,7 +2685,7 @@ fn handle_over(
 mod tests {
     use super::*;
 
-    /// THE LOG'S STATE WORDS MIRROR THE GUI'S (Phase 6 step 6F-2): every
+    /// THE LOG'S STATE WORDS MIRROR THE GUI'S: every
     /// session state `state-change` names (`SessionState::as_str`, and the
     /// close's `closed`), every state an OSC 7501 report names and every kind
     /// a `blocked` one waits on are words of the log's closed lists, so a
@@ -4070,8 +4070,8 @@ title = \"zsh\"
         store.register(h);
         assert!(store.mark_alive(4));
         assert!(!store.mark_alive(4), "no-op re-mark records nothing");
-        // The store's title records nothing; since phase 6 (6F-8, ruling
-        // U13) the `title-change` row is the drift flush's, its title mark's.
+        // The store's title records nothing; since phase 6
+        // the `title-change` row is the drift flush's, its title mark's.
         store.set_title(4, "vim main.rs");
         assert!(timeline.lock().unwrap().record_title("vim main.rs"));
         assert!(

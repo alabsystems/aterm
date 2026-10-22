@@ -22,8 +22,9 @@ aterm secrets: one credentials file for every machine (aterm help secrets).
   aterm secrets get <name>               print one value to stdout
 admin (a machine in [admins]):
   aterm secrets create <url>|<path> [--import <dir>] [--name <host>]
-        [--no-agent]                     (installs the subscriber too: its approver lets
-                                         in a machine that types the join password)
+        [--no-agent]                     (for a <url>, installs the subscriber too: its
+                                         approver lets in a machine that types the join
+                                         password)
   aterm secrets edit                     the vault text in $EDITOR; saving publishes it
   aterm secrets set <name> [--for <host|code>...] [--file <path>]
         [--if-absent [--with <name> | --no-with]] [--fleet-reads-anchors]
@@ -34,8 +35,9 @@ admin (a machine in [admins]):
   aterm secrets password [show|set|new|open|off] [--no-agent]
                                                    the join password a joining machine
                                          types, or open: every machine that asks is let in
-                                         (by this Mac's subscriber, which set, new and
-                                         open install where it does not run)
+                                         (for a <url>, by this Mac's subscriber, which set,
+                                         new and open install where it does not run; a
+                                         <path> has no join queue: approve each key)
   aterm secrets requests                 machines asking to join
   aterm secrets approve <code>... | --all | <age1...> --name <host>
   aterm secrets revoke <host|code> [--drop-sections]
@@ -632,6 +634,10 @@ mod unix {
     /// What an open vault means, said where one is made or shown.
     const OPEN_VAULT: &str = "this vault is open: every machine that reaches its server and asks to join is let in within seconds, with no password and no code, and reads [everyone]'s entries, except a machine you let go (aterm secrets password set closes it)";
 
+    /// What a vault at a path says where one served at a URL says whom its `[join]` lets in: a
+    /// path has no join queue, so nothing lets a machine in by itself there.
+    const PATH_JOINS: &str = "a vault at a path has no join queue: a machine joins it only when an admin approves its key: aterm secrets approve <age1…> --name <host>";
+
     /// What a publish that let a machine go from an open vault says.
     const KEPT_OUT: &str = "the vault stays open, but not to a machine you let go: its key is a `code-only` line in [join], so whatever it asks, it is let back in only by its code (aterm secrets approve)";
 
@@ -1136,6 +1142,34 @@ mod unix {
         }
     }
 
+    /// This Mac's approver for a command that needs one: put in where it does not run
+    /// ([`put_in_approver`]), or with `--no-agent` (`agent` false) only read, so a subscriber
+    /// already running (installed by an earlier join or command) is said to run, and nothing
+    /// is installed.
+    pub(super) fn approver_here(agent: bool, subscriber: &Subscriber<'_>) -> Approver {
+        if agent {
+            put_in_approver(subscriber)
+        } else if matches!(
+            (subscriber.state)(),
+            Ok(service::State::Installed { pid: Some(_), .. })
+        ) {
+            Approver::Running
+        } else {
+            Approver::Skipped
+        }
+    }
+
+    /// What `password` says of whom a vault whose `[join]` is `doc`'s lets in by itself: for
+    /// one with a join queue (`queued`, a URL's), that an open one lets in every machine that
+    /// asks (a password is the approver's line to say); for one at a path, which has none,
+    /// that a machine joins it only by an admin's approval of its key, whatever `[join]` says.
+    pub(super) fn lets_in_words(queued: bool, doc: &text::Document) -> Option<&'static str> {
+        if !queued {
+            return Approval::of(doc).map(|_| PATH_JOINS);
+        }
+        doc.open().then_some(OPEN_VAULT)
+    }
+
     /// Who an approver for `approval` lets in.
     fn joiner(approval: Approval) -> &'static str {
         match approval {
@@ -1454,6 +1488,15 @@ mod unix {
                 println!("up to date at seq {seq}");
                 Ok(ExitCode::SUCCESS)
             }
+            SyncOutcome::PutBack { seq, served } => {
+                let held = served.map_or("no vault".to_string(), |served| {
+                    format!("seq {served}, older than this Mac's")
+                });
+                println!(
+                    "the source held {held}: put this Mac's copy back; up to date at seq {seq}"
+                );
+                Ok(ExitCode::SUCCESS)
+            }
             SyncOutcome::NotIn => {
                 println!("this machine is not in the vault (yet): aterm secrets status");
                 Ok(ExitCode::FAILURE)
@@ -1484,7 +1527,9 @@ mod unix {
     /// `create`, then this Mac's subscriber put in as `join` puts it in (unless `agent` is
     /// false, `--no-agent`): a new vault has a join password, and only an admin's subscriber
     /// approves a machine that types it. A failed install is a warning, not a failure: the
-    /// vault is out, and `aterm secrets agent on` starts the approver later.
+    /// vault is out, and `aterm secrets agent on` starts the approver later. So is a failure
+    /// of this Mac's own sync after the publish, said after the approver step, which still
+    /// runs: the subscriber it puts in syncs the vault.
     pub(super) fn create(
         paths: &Paths,
         source: &str,
@@ -1506,6 +1551,7 @@ mod unix {
         );
         // A vault at a path has no join queue: a machine joins it by key (`approve <age1…>
         // --name`), so no approver has anything to do there.
+        let mut syncs = false;
         if !matches!(
             client::config(paths)?.map(|config| config.source),
             Some(Source::Url(_))
@@ -1514,11 +1560,7 @@ mod unix {
                 "a machine joins it when an admin Mac approves its key: aterm secrets approve <age1…> --name <host>"
             );
         } else {
-            let approver = if agent {
-                put_in_approver(subscriber)
-            } else {
-                Approver::Skipped
-            };
+            let approver = approver_here(agent, subscriber);
             if let Some(words) = approver_words(&approver, Approval::Password) {
                 eprintln!("{words}");
             }
@@ -1529,9 +1571,20 @@ mod unix {
             } else {
                 println!("aterm secrets password shows the join password a joining machine types");
             }
+            syncs = approver.runs();
         }
         if !created.imported.is_empty() {
             println!("imported into [everyone]: {}", created.imported.join(", "));
+        }
+        if let Some(why) = &created.local {
+            let then = if syncs {
+                "this Mac's subscriber syncs it"
+            } else {
+                "aterm secrets sync retries"
+            };
+            eprintln!(
+                "warning: the vault is published, but this Mac's copy is not synced yet ({why}): {then}"
+            );
         }
         Ok(ExitCode::SUCCESS)
     }
@@ -1845,7 +1898,9 @@ mod unix {
     /// itself (`open`, `set`, `new`) also puts this Mac's approver in where none runs
     /// ([`put_in_approver`]), so the promise it prints holds: only an admin's subscriber lets
     /// a machine in without a person. `--no-agent` (`agent` false) installs nothing, for an
-    /// admin whose subscriber was turned off on purpose, and says so where none runs.
+    /// admin whose subscriber was turned off on purpose, and says so where none runs. A vault
+    /// at a path has no queue: nothing is put in, and what it prints says a machine joins it
+    /// by key ([`lets_in_words`]).
     pub(super) fn password(
         paths: &Paths,
         action: Password,
@@ -1859,16 +1914,7 @@ mod unix {
             let Some(approval) = Approval::of(doc).filter(|_| queued) else {
                 return;
             };
-            let approver = if agent {
-                put_in_approver(subscriber)
-            } else if matches!(
-                (subscriber.state)(),
-                Ok(service::State::Installed { pid: Some(_), .. })
-            ) {
-                Approver::Running
-            } else {
-                Approver::Skipped
-            };
+            let approver = approver_here(agent, subscriber);
             if let Some(words) = approver_words(&approver, approval) {
                 eprintln!("{words}");
             }
@@ -1883,7 +1929,9 @@ mod unix {
                     Ok(ExitCode::SUCCESS)
                 }
                 None if admin.doc.open() => {
-                    eprintln!("{OPEN_VAULT}");
+                    if let Some(words) = lets_in_words(queued, &admin.doc) {
+                        eprintln!("{words}");
+                    }
                     Ok(ExitCode::FAILURE)
                 }
                 None => {
@@ -1895,7 +1943,9 @@ mod unix {
             },
             Password::Open => {
                 if admin.doc.open() {
-                    println!("{OPEN_VAULT}");
+                    if let Some(words) = lets_in_words(queued, &admin.doc) {
+                        println!("{words}");
+                    }
                     approver(&admin.doc);
                     return Ok(ExitCode::SUCCESS);
                 }
@@ -1914,7 +1964,9 @@ mod unix {
                 doc.set_open(true).map_err(text_error)?;
                 let done = client::admin_publish(paths, &admin, &doc)?;
                 let code = published("opened the vault", &done);
-                println!("{OPEN_VAULT}");
+                if let Some(words) = lets_in_words(queued, &doc) {
+                    println!("{words}");
+                }
                 approver(&doc);
                 eprintln!("note: {OLDER_ADMINS}");
                 Ok(code)
@@ -1925,6 +1977,9 @@ mod unix {
                     .map_err(text_error)?;
                 let done = client::admin_publish(paths, &admin, &doc)?;
                 let code = published("set a new join password", &done);
+                if let Some(words) = lets_in_words(queued, &doc) {
+                    println!("{words}");
+                }
                 approver(&doc);
                 let mut out = std::io::stdout().lock();
                 out.write_all(b"join password: ")?;
@@ -1951,6 +2006,9 @@ mod unix {
                     .map_err(text_error)?;
                 let done = client::admin_publish(paths, &admin, &doc)?;
                 let code = published("set the join password", &done);
+                if let Some(words) = lets_in_words(queued, &doc) {
+                    println!("{words}");
+                }
                 approver(&doc);
                 Ok(code)
             }
@@ -3351,6 +3409,30 @@ mod tests {
             Approver::Unknown("played: launchctl hung".into())
         );
         assert_eq!(installs.get(), 3, "an unreadable state installs nothing");
+        // `--no-agent` installs nothing, but a subscriber already running still approves.
+        assert_eq!(
+            unix::approver_here(false, &played(&running, &install)),
+            Approver::Running
+        );
+        for state in [
+            &stopped as &dyn Fn() -> crate::Result<State>,
+            &absent,
+            &unreadable,
+        ] {
+            assert_eq!(
+                unix::approver_here(false, &played(state, &install)),
+                Approver::Skipped
+            );
+        }
+        assert_eq!(
+            unix::approver_here(true, &played(&absent, &install)),
+            Approver::Installed("played: installed".into())
+        );
+        assert_eq!(
+            installs.get(),
+            4,
+            "only the one asked to put it in installs"
+        );
     }
 
     /// Where no approver runs on this Mac, a command that needs one says so, and that `aterm
@@ -3399,10 +3481,45 @@ mod tests {
         assert!(!Approver::Skipped.runs() && !Approver::Failed(String::new()).runs());
     }
 
+    /// A vault at a path has no join queue, so nothing lets a machine in there by itself:
+    /// where `password` would say an open vault lets in every machine that asks, or a join
+    /// password lets in whoever types it, it says a machine joins only by an admin's approval
+    /// of its key. A vault served at a URL says what an open one lets in, and leaves a
+    /// password to the approver's line; a closed one says nothing either way.
+    #[cfg(unix)]
+    #[test]
+    fn a_vault_at_a_path_says_a_machine_joins_it_by_key() {
+        let mut open = crate::text::Document::new_vault("ma", &crate::transport::test_recipient(1));
+        let mut password = open.clone();
+        let closed = open.clone();
+        open.set_open(true).expect("open");
+        password
+            .set_join_password(Some(b"a-long-enough-join-password"))
+            .expect("password");
+        for doc in [&open, &password] {
+            let words = unix::lets_in_words(false, doc).expect("said");
+            assert!(words.contains("no join queue"), "{words}");
+            assert!(
+                words.contains("aterm secrets approve <age1…> --name <host>"),
+                "{words}"
+            );
+            assert!(!words.contains("let in"), "{words}");
+        }
+        assert_eq!(unix::lets_in_words(false, &closed), None);
+        let words = unix::lets_in_words(true, &open).expect("said");
+        assert!(
+            words.contains("every machine that reaches its server"),
+            "{words}"
+        );
+        assert_eq!(unix::lets_in_words(true, &password), None);
+        assert_eq!(unix::lets_in_words(true, &closed), None);
+    }
+
     /// `create` puts this Mac's approver in, as `join` puts the subscriber in, so a machine
-    /// that types the new vault's join password is let in; `--no-agent` installs nothing, and
-    /// a failed install leaves the vault made (exit 0) with a warning. A vault at a path has no
-    /// join queue, so nothing to approve: no subscriber is read or installed for one.
+    /// that types the new vault's join password is let in; `--no-agent` installs nothing, but
+    /// reads the subscriber, which, already running, approves for the new vault too; a failed
+    /// install leaves the vault made (exit 0) with a warning. A vault at a path has no join
+    /// queue, so nothing to approve: no subscriber is read or installed for one.
     #[cfg(unix)]
     #[test]
     fn create_puts_in_the_approver_unless_told_not_to() {
@@ -3432,6 +3549,11 @@ mod tests {
         let unread = || -> crate::Result<crate::service::State> {
             panic!("this create reads no subscriber")
         };
+        let reads = std::cell::Cell::new(0);
+        let running = || {
+            reads.set(reads.get() + 1);
+            Ok(installed(Some(42)))
+        };
         let create = |dir: &str, agent: bool, subscriber: &unix::Subscriber<'_>| {
             let source = if dir == "path" {
                 let shared = root.path().join(dir).join("team.vault");
@@ -3448,8 +3570,11 @@ mod tests {
         };
         create("a", true, &played(&absent, &install));
         assert_eq!(installs.get(), 1, "create installs the subscriber");
-        create("b", false, &played(&unread, &install));
+        create("b", false, &played(&absent, &install));
         assert_eq!(installs.get(), 1, "--no-agent installs nothing");
+        create("d", false, &played(&running, &install));
+        assert_eq!(reads.get(), 1, "--no-agent reads whether the approver runs");
+        assert_eq!(installs.get(), 1, "a running subscriber is left be");
         create("c", true, &played(&absent, &refused));
         assert_eq!(installs.get(), 2, "a failed install still makes the vault");
         create("path", true, &played(&unread, &install));
@@ -3459,6 +3584,142 @@ mod tests {
             "a vault at a path has nothing to approve"
         );
         server.stop();
+    }
+
+    /// A vault server that takes a vault's first version and then fails every read, as one that
+    /// goes away between `create`'s publish and its own sync: a GET before the PUT is 404, the
+    /// PUT 204, a GET after it 503. It answers until [`LostAfterThePut::end`].
+    #[cfg(unix)]
+    struct LostAfterThePut {
+        url: String,
+        stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        addr: std::net::SocketAddr,
+        server: std::thread::JoinHandle<()>,
+    }
+
+    #[cfg(unix)]
+    impl LostAfterThePut {
+        fn start() -> LostAfterThePut {
+            use std::io::{Read, Write};
+            use std::sync::atomic::Ordering;
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+            let addr = listener.local_addr().expect("address");
+            let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let seen = std::sync::Arc::clone(&stop);
+            let server = std::thread::spawn(move || {
+                let mut put = false;
+                for stream in listener.incoming() {
+                    if seen.load(Ordering::SeqCst) {
+                        return;
+                    }
+                    let Ok(mut stream) = stream else {
+                        continue;
+                    };
+                    // A hang detector, not a latency budget.
+                    let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(60)));
+                    let mut head = Vec::new();
+                    let mut byte = [0u8; 1];
+                    while !head.ends_with(b"\r\n\r\n") {
+                        match stream.read(&mut byte) {
+                            Ok(1) => head.push(byte[0]),
+                            _ => break,
+                        }
+                    }
+                    let head = String::from_utf8_lossy(&head).into_owned();
+                    let length = head
+                        .lines()
+                        .find_map(|line| {
+                            let (name, value) = line.split_once(':')?;
+                            name.eq_ignore_ascii_case("content-length")
+                                .then(|| value.trim().parse::<usize>().ok())
+                                .flatten()
+                        })
+                        .unwrap_or(0);
+                    let mut body = vec![0u8; length];
+                    let _ = stream.read_exact(&mut body);
+                    let status = if head.starts_with("PUT ") {
+                        put = true;
+                        "204 No Content"
+                    } else if put {
+                        "503 Service Unavailable"
+                    } else {
+                        "404 Not Found"
+                    };
+                    let _ = stream.write_all(
+                        format!(
+                            "HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                        )
+                        .as_bytes(),
+                    );
+                }
+            });
+            LostAfterThePut {
+                url: format!("http://{addr}/v1/team"),
+                stop,
+                addr,
+                server,
+            }
+        }
+
+        /// Answer no more: the connection this makes wakes the server to see it.
+        fn end(self) {
+            self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+            std::net::TcpStream::connect(self.addr).expect("the server is woken");
+            self.server.join().expect("the server ends");
+        }
+    }
+
+    /// A create whose own sync fails once the vault is published (its server gone between the
+    /// two) is no failure: the vault is out and source.toml names it, and a create run again
+    /// would be refused ("already exists there"). The approver still goes in, and its
+    /// subscriber syncs the vault; client::create says why this Mac's copy is not synced.
+    #[cfg(unix)]
+    #[test]
+    fn a_create_whose_own_sync_fails_still_puts_the_approver_in() {
+        let root = aterm_tempfile::tempdir().expect("tempdir");
+        let installs = std::cell::Cell::new(0);
+        let install = || {
+            installs.set(installs.get() + 1);
+            Ok("played: installed".to_string())
+        };
+        let absent = || Ok(crate::service::State::Absent);
+        let lost = LostAfterThePut::start();
+        let admin = crate::client::Paths::for_home(&root.path().join("ma"));
+        let code = unix::create(
+            &admin,
+            &lost.url,
+            None,
+            Some("ma".into()),
+            true,
+            &played(&absent, &install),
+        )
+        .expect("created");
+        assert_eq!(code, ExitCode::SUCCESS);
+        assert_eq!(installs.get(), 1, "the approver goes in");
+        let status = crate::client::status(&admin).expect("status");
+        assert_eq!(
+            status.config.map(|config| config.source),
+            Some(crate::transport::Source::Url(lost.url.clone()))
+        );
+        assert_eq!(
+            status.membership,
+            crate::client::Membership::Pending,
+            "not synced yet"
+        );
+        lost.end();
+
+        let lost = LostAfterThePut::start();
+        let other = crate::client::Paths::for_home(&root.path().join("mb"));
+        let created = crate::client::create(&other, &lost.url, None, Some("mb")).expect("created");
+        assert!(
+            created
+                .local
+                .as_ref()
+                .is_some_and(|why| why.contains("503")),
+            "{:?}",
+            created.local
+        );
+        lost.end();
     }
 
     /// What leaves a vault letting machines in by itself (`password open`, as `set` and `new`)

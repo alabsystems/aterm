@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE DEFAULT BROKER'S RETENTION (session log Phase 6 step 6E-2; rulings
-//! U23(a), U24; `docs/DESIGN-session-log-2026-10-15.md` §5.5): the one place
+//! THE DEFAULT BROKER'S RETENTION (`docs/DESIGN-session-log-2026-10-15.md` §5.5): the one place
 //! the rules every broker aterm opens retains its log by are written, so
 //! `aterm link broker` and the world harness's in-process broker open alike
 //! ([`retain`]), and the World default is the production default.
@@ -16,7 +15,7 @@
 //! - `/f/*/pub/*/*/ev`, the bulk stream (the session-log mirror and every
 //!   node's and session's `ev` records): PREFIX, 7 days or 256 MiB, which is
 //!   four nodes at §5.5's 64 MiB share each, the share each node's mirror
-//!   holds itself to ([`crate::mirror::NODE_WINDOW_BYTES`], ruling U41).
+//!   holds itself to ([`crate::mirror::NODE_WINDOW_BYTES`]).
 //! - `/f/*/pub/*/*/presence`: HOLD, the last value only (each subject's `Last`
 //!   row, which every compaction carries whatever the rules).
 //! - `/f/*/in/>`, the mail lanes: HOLD within 64 MiB. A hold rule never moves
@@ -97,8 +96,8 @@ fn rules() -> io::Result<Retention> {
 /// node's `ev` faces: a prefix rule whose filter holds every
 /// `/f/<fleet>/pub/<node>/<sid>/ev`, so the broker gives the bulk stream up
 /// from its oldest end and says where (`oldest=`, `retained-from=`). The mirror
-/// is on by default only over such a broker (step 6E-3) and keeps to its
-/// window budget there ([`crate::mirror::NODE_WINDOW_BYTES`], ruling U41); a
+/// is on by default only over such a broker and keeps to its
+/// window budget there ([`crate::mirror::NODE_WINDOW_BYTES`]); a
 /// hold rule or the default rule alone is no such broker.
 #[must_use]
 pub fn retains_ev(rules: &Retention, fleet: &str, node: &str) -> bool {

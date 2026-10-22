@@ -347,7 +347,7 @@ fn the_card_hangs_above_the_chip_and_opens_down_only_where_fewer_rows_are_above(
 }
 
 /// THE CARD STAYS IN ITS PANE, UP AND DOWN AND ACROSS (the review of
-/// v3/polish-page, findings 2 and 4): within the pane's rows it hangs above
+/// v3/polish-page): within the pane's rows it hangs above
 /// the chip, opens downward only where it is not whole above, and covers
 /// the chip's row to stay whole where neither side of the pane holds it —
 /// never reaching into a pane above or below; a pane shorter than the card
@@ -1379,7 +1379,7 @@ fn row_of(app: &App, key: &str) -> Option<usize> {
 }
 
 /// AN OPEN MENU NEVER GOES STALE, AND ITS CANCEL NEVER WRITES OVER A HAND
-/// (review of slice B, finding 1). The menu's rows are built again whenever
+/// (review of slice B). The menu's rows are built again whenever
 /// its session's pair moves under it — a wire `meta set autopilot off` once
 /// its wake lands, the timer's own fire — so its `●` and its cancel row say
 /// what is stored; a lit row whose words went dark is unlit, and Return then
@@ -1778,8 +1778,8 @@ fn reader(
     );
 }
 
-/// A READER'S CLICK HEARD FROM ROWS THAT MOVED CHOOSES NOTHING (review of
-/// fix/autopilot-menu-wiring, findings 1 and 4). Each item's id carries the
+/// A READER'S CLICK HEARD FROM ROWS THAT MOVED CHOOSES NOTHING.
+/// Each item's id carries the
 /// epoch of the rows it was published from, so a click from a tree built
 /// before a timer was armed over the wire under the open menu — which puts
 /// its cancel where `Harness settings` stood — is refused before the frame
@@ -1890,8 +1890,8 @@ fn a_readers_click_heard_from_rows_that_moved_chooses_nothing() {
     );
 }
 
-/// A READER OPENS THE MENU FROM THE CHIP (review of
-/// fix/autopilot-menu-wiring, finding 3; design §9.3.3): the Autopilot
+/// A READER OPENS THE MENU FROM THE CHIP (design §9.3.3):
+/// the Autopilot
 /// chip's node says it has a menu (`HasPopup::Menu`) and offers
 /// `ShowContextMenu`, which opens it as the keyboard does — its first
 /// choice lit — so once a frame has painted it the tree's focus is Cruise.
@@ -2386,8 +2386,8 @@ fn claude_split(
     (app, wid, first, second, host)
 }
 
-/// THE MENU KEEPS ITS SESSION'S NAME WHOLE AND STAYS IN ITS PANE (the
-/// post-check of wave 1, behaviour-3 and owner-eye-5, and its review): in a
+/// THE MENU KEEPS ITS SESSION'S NAME WHOLE AND STAYS IN ITS PANE (behaviour-3 and owner-eye-5):
+/// in a
 /// Claude Code | Claude Code split, side by side or one above the other,
 /// each pane's menu names its pane — `tab 1, right pane` whole, broken at
 /// its comma where the pane cannot hold it on one row — and `“✳ Claude
@@ -2404,7 +2404,7 @@ fn claude_split(
 /// (`…tab 1, right pane “✳ Claude Cod…`), the right pane's card at a narrow
 /// window was shifted left over the left pane, a stacked pane's card opened
 /// over the other pane, a 31-column pane cut `right p…` and `then la…`, and
-/// (the review of v3/polish-page's fixes, finding 3) a pane under 26 columns
+/// (the review of v3/polish-page's fixes) a pane under 26 columns
 /// lent its card the frame: 26 columns over the divider and the next pane,
 /// its choices cut all the same.
 #[test]
@@ -2555,7 +2555,7 @@ fn the_menu_keeps_its_name_whole_and_stays_in_its_pane() {
 }
 
 /// THE MENU'S `Harness settings…` LANDS THE PAGE ON ITS SESSION'S ROW
-/// (§10.3.3 item 8; the review of v3/stats-fold, finding 2): chosen with a
+/// (§10.3.3 item 8; the review of v3/stats-fold): chosen with a
 /// click on the menu of Claude Code's tab, it opens Settings ▸ Harness
 /// landed on that session — its row's Show drawn selected, and no other
 /// row's. NEGATIVE CONTROL: before the choice, the page opened at its top
@@ -3123,7 +3123,7 @@ fn a_row_never_moves_under_a_still_pointer_to_another_choice() {
 }
 
 /// A CARD PAINTED UNDER A RESTING POINTER TAKES NO PRESS IT DID NOT SEE (the
-/// review of v3/polish-page's fixes, finding 1), for every way a press
+/// review of v3/polish-page's fixes), for every way a press
 /// arrives ([`Press`]). In a 24 × 80 Claude Code over Claude Code split the
 /// bottom pane's card is whole only over its own chip's row, so `Cruise 2
 /// hours, then land` comes up under the pointer that right-clicked the chip.

@@ -33,8 +33,8 @@
 //!   is a human's, and the bus row it stands in for may be gone; a rewound identity
 //!   stays refused even if its head grows again, and releasing it first flushes the
 //!   replacement log's witness; the bus mirror's alias key is every edge's alias for
-//!   the node's life (ruling Q6), and the floor of its lifetime total is what a
-//!   total resumes at when its pin cannot say (ruling Q13, raised once per
+//!   the node's life, and the floor of its lifetime total is what a
+//!   total resumes at when its pin cannot say (raised once per
 //!   [`crate::mirror::FLOOR_LEASE_BYTES`] of bodies). Each is written once, or when
 //!   its set changes, never per message.
 //! - Atomic only: everything else (`logpin`, the bus mirror's one batch in
@@ -175,8 +175,8 @@
 //! as absent. But the readers of the in-flight journal, the reservations and
 //! the refill floors ([`TornKind`]) REFUSE damage, fail-closed, because within
 //! one boot damage is a bug: refused at every attach of every later boot, a torn
-//! one wedged the bridge until a person repaired the dir (the simulation's
-//! finding F1) — while every one of them serves only sessions, which a reboot
+//! one wedged the bridge until a person repaired the dir
+//! — while every one of them serves only sessions, which a reboot
 //! ends, so the table calls losing it, after one, harmless (the rows marked
 //! TORN). And a cut can READ: an in-flight entry cut just before its `log=`
 //! line, or inside its hex body at an even length, is an entry with no witness
@@ -204,7 +204,7 @@
 //! lease (the attach leases afresh), `seq` as a lower one the durable `inc`
 //! fences, `acked`'s torn tail as no offset ([`AckedLog`]) — save `logpin`,
 //! the mirror's pin, which holds what no reboot ends: the node's alias key
-//! (ruling Q6) and its lifetime mirrored total (ruling Q13). Each has a DURABLE
+//! and its lifetime mirrored total. Each has a DURABLE
 //! COPY a bridge of this build writes before it is needed: `logkey` before the
 //! first take that names the key, `logfloor` — at or above every byte the
 //! mirror sent — before any byte of a batch is sent. The copies hold only while
@@ -228,8 +228,8 @@
 //! deduped where the log still holds the record — but where the log, on
 //! another volume or after a lossy flush, lost the record on its own (the law
 //! lets it lose an unescalated one) and the sender's later posts landed after,
-//! it lands again BEHIND them: the sender's posts out of order (the
-//! simulation's finding F2). Nothing in the dir or on the log tells that entry
+//! it lands again BEHIND them: the sender's posts out of order.
+//! Nothing in the dir or on the log tells that entry
 //! from one whose record never landed (a read carries no producer sequence;
 //! the same cut rolls the later post's reservation back), and nothing needs
 //! either: the sessions they serve ended with the boot. So the same first
@@ -281,9 +281,9 @@
 //! | `deadlines` | atomic | each `ask`/`task` published with `dl=` and not yet answered, newest [`DEADLINES_KEEP`] | no `expired` for those asks; the bus is checked before any verdict, so never a false one |
 //! | `topics/<sid>` | atomic | `<topic> <next>` per broadcast opt-in ([`StateDir::topics`]) | the topic restarts from the session's `since=`, and `head` skips what was published meanwhile, so it is written every step |
 //! | `unhandled/<sid>` | atomic | `<topic> <off>`: per topic, the lowest offset of a broadcast the endpoint took as new and `inbox seen` has not passed, written before the cursor moves past it ([`StateDir::topic_floors`]) | a successor that keeps the sid (a seamless update, a PTY keeper's recovery) is not offered those broadcasts again, though they are gone from its inbox; no successor keeps a sid across a reboot. TORN, set aside |
-//! | `logpin` | atomic, flushed at a clean stop; durable where it replaces none of this build's | the bus mirror's one batch in flight, the node's total of mirrored bytes and its alias key ([`StateDir::logpin`]), `v=2`, which an older build refuses ([`crate::mirror::Pin`]); only while the session-log mirror runs (`[fabric] log`) | an older whole version: one batch taken again at fresh sequences, a second copy each reader dedupes; after an unclean stop in an earlier boot, its total raised to `logfloor` ([`StateDir::reconcile_logpin`]), which counts the floor's lease as mirrored. TORN there, with `logfloor` and `logkey` on the media: set aside, a whole pin written from them in its place, and the mirror resumes (rulings Q6, Q13). Torn with no floor or no key (an older build's pin, the only copy), torn as an older build's `v=1`, within one boot or after a clean stop: the mirror stops, keeps it as it is, and says what a person does |
-//! | `logkey` | durable | the bus mirror's alias key (ruling Q6), 32 hex digits, written once, before the first take that names it ([`StateDir::logkey`]); only while the session-log mirror runs (`[fabric] log`) | load-bearing: a fresh key is a second alias for every edge on the bus, so a torn pin is never set aside without it. Missing in a dir only an older build mirrored in, whose pin's `key=` is copied here before the next take |
-//! | `logfloor` | durable | the floor of the bus mirror's lifetime total (ruling Q13): at or above every body byte it sent, raised by [`crate::mirror::FLOOR_LEASE_BYTES`] past a batch before any byte of it is sent ([`StateDir::logfloor`]); only while the session-log mirror runs (`[fabric] log`) | the total a mirror resumes at when its pin is gone or may be rolled back: the lease's unused rest and the batch in flight are counted as mirrored, never a byte less. Missing: no bridge of this build sent a batch, and a torn pin stops the mirror |
+//! | `logpin` | atomic, flushed at a clean stop; durable where it replaces none of this build's | the bus mirror's one batch in flight, the node's total of mirrored bytes and its alias key ([`StateDir::logpin`]), `v=2`, which an older build refuses ([`crate::mirror::Pin`]); only while the session-log mirror runs (`[fabric] log`) | an older whole version: one batch taken again at fresh sequences, a second copy each reader dedupes; after an unclean stop in an earlier boot, its total raised to `logfloor` ([`StateDir::reconcile_logpin`]), which counts the floor's lease as mirrored. TORN there, with `logfloor` and `logkey` on the media: set aside, a whole pin written from them in its place, and the mirror resumes. Torn with no floor or no key (an older build's pin, the only copy), torn as an older build's `v=1`, within one boot or after a clean stop: the mirror stops, keeps it as it is, and says what a person does |
+//! | `logkey` | durable | the bus mirror's alias key, 32 hex digits, written once, before the first take that names it ([`StateDir::logkey`]); only while the session-log mirror runs (`[fabric] log`) | load-bearing: a fresh key is a second alias for every edge on the bus, so a torn pin is never set aside without it. Missing in a dir only an older build mirrored in, whose pin's `key=` is copied here before the next take |
+//! | `logfloor` | durable | the floor of the bus mirror's lifetime total: at or above every body byte it sent, raised by [`crate::mirror::FLOOR_LEASE_BYTES`] past a batch before any byte of it is sent ([`StateDir::logfloor`]); only while the session-log mirror runs (`[fabric] log`) | the total a mirror resumes at when its pin is gone or may be rolled back: the lease's unused rest and the batch in flight are counted as mirrored, never a byte less. Missing: no bridge of this build sent a batch, and a torn pin stops the mirror |
 //! | `run` | ordered (OPEN), durable (CLEAN) | the boot the last bridge ran in and whether it stopped cleanly, every file of a [`TornKind`] it wrote flushed first ([`LastRun`]): OPEN admitted once per StateDir open after its sweep, by two barriers ahead of every later write on the device (two full flushes over either record of this boot, over no record, or with a torn kind's directory on another device: [`StateDir::begin_run`]), and CLEAN at a clean stop (a quit: a handoff leaves it open and its successor re-establishes the publication fence) | a dir without one is judged by its lease's boot, as a build before it was; a torn file found after a stop it cannot call unclean is refused where it is read |
 //! | `quarantine/` | durable | the exact bytes of each file found torn after an unclean stop in an earlier boot, moved aside by the first bridge after it ([`StateDir::set_aside_torn`], [`QUARANTINE`]) — the mirror's pin among them, as `logpin`, once its copies are on the media ([`StateDir::reconcile_logpin`]) — and of each whole in-flight entry it retired then, as `retired.inflight.<seq>` ([`StateDir::retire_in_flight_of_an_earlier_boot`]) | nothing reads it: it is the owner's, to read or remove. Only its count is read: how many torn files it still holds ([`StateDir::quarantined_torn`]), which at none ends aterm's entry for the owner's look |
 
@@ -1627,7 +1627,7 @@ impl PinRules {
 }
 
 /// What a whole in-flight entry retired after an unclean stop in an earlier
-/// boot ([`StateDir::retire_in_flight_of_an_earlier_boot`], finding F2) is
+/// boot ([`StateDir::retire_in_flight_of_an_earlier_boot`]) is
 /// named with in [`QUARANTINE`], before its path: `retired.inflight.<seq>`.
 /// A torn file's name there starts with its kind's directory, never this.
 pub const RETIRED_PREFIX: &str = "retired.";
@@ -1857,7 +1857,7 @@ impl StateDir {
         }
     }
 
-    /// THE BUS MIRROR'S PIN (`logpin`, session log phase 4,
+    /// THE BUS MIRROR'S PIN (`logpin`,
     /// [`crate::mirror::Pin`]): the one batch in flight and the node's total
     /// of mirrored bytes. Absent on a node that never mirrored; a bridge with
     /// `[fabric] log = "off"` never reads or writes it (save the first bridge
@@ -1985,7 +1985,7 @@ impl StateDir {
         Some(head)
     }
 
-    /// THE BUS MIRROR'S ALIAS KEY, its durable copy (`logkey`, ruling Q6):
+    /// THE BUS MIRROR'S ALIAS KEY, its durable copy (`logkey`):
     /// 32 hex digits and a newline, written once ([`StateDir::set_logkey`])
     /// before the first take that names the key, so no alias derived from it
     /// is on the bus before the key is on the media. `None` where no bridge
@@ -2029,7 +2029,7 @@ impl StateDir {
         self.replace(LOGKEY, &aterm_codec::hex::encode_lower(key), true, 0o600)
     }
 
-    /// THE FLOOR OF THE MIRROR'S LIFETIME TOTAL (`logfloor`, ruling Q13): at
+    /// THE FLOOR OF THE MIRROR'S LIFETIME TOTAL (`logfloor`): at
     /// or above every body byte this node's mirror ever sent, because it is
     /// raised past a batch's bytes before any byte of the batch is sent
     /// ([`StateDir::raise_logfloor`]). The total a bridge resumes at when the
@@ -2068,7 +2068,7 @@ impl StateDir {
     /// hold it and the media not (a durable replace whose rename was made and
     /// whose directory flush failed, here or in a killed predecessor), and a
     /// batch sent past it would be lost from the count with the next power
-    /// cut (ruling Q13; sim item S7). Answers the floor the media now holds.
+    /// cut (sim item S7). Answers the floor the media now holds.
     ///
     /// # Errors
     ///
@@ -2119,7 +2119,7 @@ impl StateDir {
             && self.on_the_media(LOGFLOOR)
     }
 
-    /// RULING Q6 AND Q13 ACROSS A POWER CUT: AFTER AN UNCLEAN STOP IN AN
+    /// AFTER AN UNCLEAN STOP IN AN
     /// EARLIER BOOT ([`StateDir::torn_files_possible`]), THE MIRROR'S PIN IS
     /// RECONCILED WITH ITS DURABLE COPIES — its floor on the media
     /// (`logfloor`) and its key (`logkey`), which a bridge of this build
@@ -3166,7 +3166,7 @@ impl StateDir {
     /// of the next boot retires it unpublished
     /// ([`StateDir::retire_in_flight_of_an_earlier_boot`]) — published again, it
     /// landed behind its sender's later posts wherever the log had lost the
-    /// record on its own (finding F2). A record that did NOT land is dropped
+    /// record on its own. A record that did NOT land is dropped
     /// durably ([`StateDir::drop_in_flight`]).
     ///
     /// # Errors
@@ -3484,7 +3484,7 @@ impl StateDir {
     }
 
     /// TEST-ONLY: [`StateDir::set_aside_torn`] with each file judged by its
-    /// reader alone ([`TornKind::reads`]), as finding F1's first fix judged it:
+    /// reader alone ([`TornKind::reads`]), as the first fix judged it:
     /// a cut that still reads stays. The simulation's negative control
     /// (`Mutant::SweepByTheReaderAlone`).
     #[cfg(test)]
@@ -3518,7 +3518,7 @@ impl StateDir {
         self.move_into_quarantine(&torn, "")
     }
 
-    /// FINDING F2, DECIDED: AFTER AN UNCLEAN STOP IN AN EARLIER BOOT
+    /// AFTER AN UNCLEAN STOP IN AN EARLIER BOOT
     /// ([`StateDir::torn_files_possible`]), EVERY WHOLE IN-FLIGHT ENTRY IS
     /// RETIRED — moved aside, never published again.
     ///
@@ -3946,7 +3946,7 @@ impl StateDir {
     ///   record vouching for the clean stop's in-flight entries, which the
     ///   next boot republishes behind the later posts of their senders that a
     ///   broker on another volume kept while losing the entries' own
-    ///   republish — finding F2's disorder, which the open record's
+    ///   republish disorder, which the open record's
     ///   retirement prevents. A visible OPEN of this boot can be a failed
     ///   attempt to replace that CLEAN: a kill after the rename and before
     ///   the root flush, or a failed root flush, leaves the same bytes as a
@@ -6758,7 +6758,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&c);
     }
 
-    /// **A STATE DIR'S MARK IS ITS OWN, AND A COPY HAS ANOTHER** (finding F4,
+    /// **A STATE DIR'S MARK IS ITS OWN, AND A COPY HAS ANOTHER** (
     /// the module doc's "Whose row it is"): the same dir, opened again or
     /// renamed within its volume, answers the same mark — so a later bridge
     /// of it reads the rows an earlier one wrote as the dir's — while a copy
@@ -7329,8 +7329,8 @@ mod tests {
     }
 
     /// **A TORN FILE AFTER AN UNCLEAN STOP IN AN EARLIER BOOT IS SET ASIDE, AND
-    /// THE SAME DAMAGE WITHIN ONE BOOT IS REFUSED** — finding F1 on the real
-    /// filesystem ([`StateDir::set_aside_torn`]).
+    /// THE SAME DAMAGE WITHIN ONE BOOT IS REFUSED**
+    /// ([`StateDir::set_aside_torn`]).
     ///
     /// The last bridge ran in boot 1 and did not stop cleanly (`run` says so, and
     /// its lease names boot 1). Beside a whole in-flight entry and a whole
@@ -8109,7 +8109,7 @@ mod tests {
     }
 
     /// **AFTER A CLEAN STOP, DAMAGE IS A BUG'S, AND A REBOOT DOES NOT CHANGE
-    /// THAT** — the review of finding F1's fix, against astream's clean close.
+    /// THAT** — against astream's clean close.
     /// A bridge in boot 1 writes a reservation and an in-flight entry and is
     /// killed; its successor in the same boot inherits them unflushed, writes a
     /// receipt pin, and stops cleanly: every one of the three is flushed where
@@ -8359,7 +8359,7 @@ mod tests {
         );
     }
 
-    /// **FINDING F2, DECIDED: A WHOLE IN-FLIGHT ENTRY OF AN EARLIER BOOT IS
+    /// **A WHOLE IN-FLIGHT ENTRY OF AN EARLIER BOOT IS
     /// RETIRED, NEVER PUBLISHED AGAIN** — on the real filesystem
     /// ([`StateDir::retire_in_flight_of_an_earlier_boot`]).
     ///
@@ -8466,8 +8466,8 @@ mod tests {
         }
     }
 
-    /// **AN ATTACH OF THIS BOOT ON RECORD STOPS THE RETIREMENT** — the review
-    /// of finding F2's fix ([`StateDir::attached_in_this_boot`]). The last
+    /// **AN ATTACH OF THIS BOOT ON RECORD STOPS THE RETIREMENT** —
+    /// ([`StateDir::attached_in_this_boot`]). The last
     /// bridge of boot 1 attached and did not stop cleanly, leaving a whole
     /// entry. In boot 2 the disk refuses `begin_run`, so `run` still says
     /// "open, boot 1" — and then an attach of boot 2 takes an incarnation
@@ -8532,13 +8532,13 @@ mod tests {
         }
     }
 
-    /// **A CUT IN-FLIGHT ENTRY THAT STILL READS IS SET ASIDE TOO** — the review
-    /// of finding F1's fix. A real file is cut part-way, not only to nothing,
+    /// **A CUT IN-FLIGHT ENTRY THAT STILL READS IS SET ASIDE TOO** —.
+    /// A real file is cut part-way, not only to nothing,
     /// and three cuts of a witnessed reply's entry read whole: just before its
     /// `log=` line (no witness), inside its hex body at an even length (a
     /// shorter body, no witness), and inside the witness's generation (a lower
     /// one). Kept, the first two are unwitnessed references that
-    /// `Bridge::settle_in_flight` refuses at every attach — finding F1's wedge
+    /// `Bridge::settle_in_flight` refuses at every attach
     /// again. After an unclean stop in an earlier boot each is moved aside,
     /// with its exact bytes, and the whole entry beside them stays.
     #[test]
@@ -8589,8 +8589,8 @@ mod tests {
         assert_eq!(st.in_flight().expect("reads"), vec![(7, whole)]);
     }
 
-    /// **WITHIN ONE BOOT NOTHING IS SET ASIDE, ON ANY VOLUME** — the review of
-    /// finding F1's fix: a boot nobody can name (and a dir off the boot volume)
+    /// **WITHIN ONE BOOT NOTHING IS SET ASIDE, ON ANY VOLUME** —:
+    /// a boot nobody can name (and a dir off the boot volume)
     /// gives the page cache no voucher, but no reboot either. Damage there is
     /// a bug, and a reservation a sweep set aside would publish its post again
     /// at a fresh sequence — a second copy — so the reader refuses it, as it
@@ -8614,9 +8614,9 @@ mod tests {
         assert!(st.post_pin("s-a", 1).is_err(), "refused, fail-closed");
     }
 
-    /// **THE SWEEP OF THE TORN KINDS NEVER MOVES `logpin`** — the review of
-    /// finding F1's fix: the pin holds the node's lifetime total of mirrored
-    /// bytes (ruling Q13's cap) and its alias key (ruling Q6), which no reboot
+    /// **THE SWEEP OF THE TORN KINDS NEVER MOVES `logpin`** —:
+    /// the pin holds the node's lifetime total of mirrored
+    /// bytes (cap) and its alias key, which no reboot
     /// ends, so it is judged with its durable copies, by its own step
     /// ([`StateDir::reconcile_logpin`]), and with no copies on the media (a dir
     /// only an older build mirrored in) it stays where the mirror refuses it.
@@ -8658,7 +8658,7 @@ mod tests {
         }
     }
 
-    /// **RULINGS Q6 AND Q13 ACROSS A POWER CUT, ON THE REAL FILESYSTEM: A TORN
+    /// **A TORN
     /// PIN WITH ITS DURABLE COPIES IS SET ASIDE AFTER AN UNCLEAN STOP IN AN
     /// EARLIER BOOT, A WHOLE ONE WRITTEN FROM THEM IN ITS PLACE, AND A WHOLE
     /// ONE IS RAISED TO THE FLOOR** ([`StateDir::reconcile_logpin`]).

@@ -502,8 +502,8 @@ fn a_use_in_the_kernels_spelling_is_placed_on_its_version() {
     );
 }
 
-/// A VERSION USED THROUGH AN 8.3 SPELLING KEEPS THAT VERSION ALONE (Windows;
-/// wave 5's live finding F1, its second site): a `cmd.exe` of this test's
+/// A VERSION USED THROUGH AN 8.3 SPELLING KEEPS THAT VERSION ALONE (Windows; its second site):
+/// a `cmd.exe` of this test's
 /// started in `versions\1.0.0` spelled with 8.3 short names (a process keeps
 /// the spelling it was started in as its working directory) keeps 1.0.0,
 /// and 1.0.1 beside it stays free. The scan reports the use in the spelling

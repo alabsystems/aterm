@@ -356,9 +356,17 @@ const PROBE_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 // Skip: spawns a child and waits on the wall clock.
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn serves_caffeine(origin: &Path) -> Option<bool> {
+    serves_caffeine_within(origin, PROBE_WAIT)
+}
+
+/// [`serves_caffeine`] waiting `wait` for the answer.
+#[cfg(unix)]
+// Skip: spawns a child and waits on the wall clock.
+#[cfg_attr(trust_verify, trust::skip)]
+fn serves_caffeine_within(origin: &Path, wait: std::time::Duration) -> Option<bool> {
     let out = aterm_uds::deadline::output_until(
         aterm_uds::spawnfd::command(origin).args(["help", "caffeine"]),
-        std::time::Instant::now() + PROBE_WAIT,
+        std::time::Instant::now() + wait,
     )
     .ok()?;
     // A signal (no code) says nothing about the verb.
@@ -899,10 +907,21 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn the_probe_reads_the_verb_from_the_exit_status() {
-        assert_eq!(serves_caffeine(Path::new("/usr/bin/true")), Some(true));
-        assert_eq!(serves_caffeine(Path::new("/usr/bin/false")), Some(false));
+        // Each answers at once: the wait is only the hang detector.
+        let hang = std::time::Duration::from_secs(60);
+        assert_eq!(
+            serves_caffeine_within(Path::new("/usr/bin/true"), hang),
+            Some(true)
+        );
+        assert_eq!(
+            serves_caffeine_within(Path::new("/usr/bin/false"), hang),
+            Some(false)
+        );
         let root = aterm_tempfile::tempdir().expect("tempdir");
-        assert_eq!(serves_caffeine(&root.path().join("missing")), None);
+        assert_eq!(
+            serves_caffeine_within(&root.path().join("missing"), hang),
+            None
+        );
     }
 
     /// An ended mug's copy goes whole once it said it ran from it, the directory with it;

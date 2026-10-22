@@ -261,7 +261,7 @@ impl MotionPolicy {
     ///   whatever the config.
     #[inline]
     #[must_use]
-    pub fn resolve(mode: MotionMode, system_reduce: bool, focused: bool) -> Self {
+    pub const fn resolve(mode: MotionMode, system_reduce: bool, focused: bool) -> Self {
         let animate = focused
             && match mode {
                 MotionMode::Full => true,
@@ -277,7 +277,7 @@ impl MotionPolicy {
     /// rejects anything nonzero.
     #[inline]
     #[must_use]
-    pub fn amplitude(self, effect: MotionEffect) -> f32 {
+    pub const fn amplitude(self, effect: MotionEffect) -> f32 {
         match self {
             Self::Full => 1.0,
             Self::Reduced => match effect {
@@ -298,7 +298,7 @@ impl MotionPolicy {
     /// convenience for consumers that gate rather than scale.
     #[inline]
     #[must_use]
-    pub fn animate(self, effect: MotionEffect) -> bool {
+    pub const fn animate(self, effect: MotionEffect) -> bool {
         self.amplitude(effect) > 0.0
     }
 }

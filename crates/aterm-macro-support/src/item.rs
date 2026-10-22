@@ -178,7 +178,7 @@ impl Generics {
     /// Whether there are no parameters.
     #[inline]
     #[must_use]
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.params.is_empty()
     }
 

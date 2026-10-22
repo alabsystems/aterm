@@ -269,9 +269,16 @@ impl Word {
     /// Only whole characters go in and out, so the prefix is valid UTF-8; the
     /// checked conversion runs at boundaries only.
     #[inline]
-    fn as_str(&self) -> &str {
-        let bytes = self.bytes.get(..usize::from(self.len)).unwrap_or(&[]);
-        std::str::from_utf8(bytes).unwrap_or("")
+    const fn as_str(&self) -> &str {
+        let len = self.len as usize;
+        if len > self.bytes.len() {
+            return "";
+        }
+        let (bytes, _) = self.bytes.split_at(len);
+        match std::str::from_utf8(bytes) {
+            Ok(s) => s,
+            Err(_) => "",
+        }
     }
 
     /// `false` (and nothing written) when the character does not fit — which
@@ -360,7 +367,7 @@ fn kind_of(c: char) -> Kind {
 /// vocabulary's no-space set minus Hangul, which is in that set only to be
 /// looked up raw (Korean writes its spaces).
 #[inline]
-fn is_unspaced_script(c: char) -> bool {
+const fn is_unspaced_script(c: char) -> bool {
     is_no_space_script(c) && !matches!(c as u32, 0x1100..=0x11FF | 0xAC00..=0xD7AF)
 }
 
@@ -1203,7 +1210,7 @@ impl TrickListener {
     /// Snapshot the line, then take the open token off it. The snapshot is the
     /// one level of undo Backspace has (module docs).
     #[inline]
-    fn end_token(&mut self) -> (Word, u32) {
+    const fn end_token(&mut self) -> (Word, u32) {
         let token = (self.line.token, self.line.token_chars);
         if self.line.token_chars > 0 {
             self.snapshot = Some(self.line);
@@ -1489,11 +1496,11 @@ impl TrickListener {
     }
 
     #[inline]
-    fn fresh_line(&mut self) -> Option<Outcome> {
+    const fn fresh_line(&mut self) -> Option<Outcome> {
         let revoked = self.line.tentative.is_some();
         self.line = Line::FRESH;
         self.snapshot = None;
-        revoked.then_some(Outcome::Revoke)
+        if revoked { Some(Outcome::Revoke) } else { None }
     }
 
     /// Take one cluster off the open token, as an editor's Backspace does:
@@ -1521,15 +1528,15 @@ impl TrickListener {
     }
 
     #[inline]
-    fn feed(&self, out: Option<Outcome>, submit_pet_only: bool) -> TrickFeed<'_> {
-        let event = out.map(|out| match out {
-            Outcome::Fire {
+    const fn feed(&self, out: Option<Outcome>, submit_pet_only: bool) -> TrickFeed<'_> {
+        let event = match out {
+            Some(Outcome::Fire {
                 trick,
                 back_chars,
                 addressed,
-            } => {
+            }) => {
                 let word = self.word.as_str();
-                TrickEvent::Fire {
+                Some(TrickEvent::Fire {
                     trick,
                     word,
                     commands: Commands {
@@ -1538,11 +1545,12 @@ impl TrickListener {
                     },
                     back_chars,
                     addressed,
-                }
+                })
             }
-            Outcome::Confirm { trick } => TrickEvent::Confirm { trick },
-            Outcome::Revoke => TrickEvent::Revoke,
-        });
+            Some(Outcome::Confirm { trick }) => Some(TrickEvent::Confirm { trick }),
+            Some(Outcome::Revoke) => Some(TrickEvent::Revoke),
+            None => None,
+        };
         TrickFeed {
             event,
             submit_pet_only,

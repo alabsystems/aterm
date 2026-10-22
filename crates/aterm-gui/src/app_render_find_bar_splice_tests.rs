@@ -1722,16 +1722,17 @@ fn find_bar_toggle_fires_through_on_mouse_input() {
     app.search_enter();
     seed_query(&mut app, wid, "target");
     app.search_recompute();
-    fill_scratch(&mut app, wid);
-    app.splice_find_bar(wid);
     // An attached native window: 12 px on every edge but a 4 px top inset
-    // with a 3 px chrome band above it (asymmetric padding).
+    // with a 3 px chrome band above it (asymmetric padding), the geometry the
+    // frame lays the bar on.
     {
         let metrics = &mut app.windows.get_mut(&wid).unwrap().metrics;
         metrics.pad = 12;
         metrics.pad_top = 4;
         metrics.head = 3;
     }
+    fill_scratch(&mut app, wid);
+    app.splice_find_bar(wid);
     let hit = app
         .windows
         .get(&wid)
@@ -2643,4 +2644,198 @@ fn the_fluent_box_owns_the_composition_underline() {
     if crate::find_bar::FIND_TOOLBAR && crate::tray_raster::strip_band_ui_ready() {
         assert!(!underlined(&app), "the raster draws it, no cell does");
     }
+}
+
+/// The control of the find bar `hit` records at terminal cell `(row, col)`:
+/// one of its toolbar's buttons or toggles, on its field row.
+fn control_at(hit: &crate::FindBarHit, (row, col): (usize, usize)) -> Option<&'static str> {
+    if row != hit.row {
+        return None;
+    }
+    [
+        ("Aa", &hit.case_cols),
+        (".*", &hit.regex_cols),
+        ("prev", &hit.prev_cols),
+        ("next", &hit.next_cols),
+        ("close", &hit.close_cols),
+    ]
+    .into_iter()
+    .find_map(|(name, span)| {
+        span.as_ref()
+            .is_some_and(|s| s.contains(&col))
+            .then_some(name)
+    })
+}
+
+/// What a press on the find bar can change: the toggles, the current match,
+/// whether find is open.
+fn find_state(app: &App, wid: WindowId) -> Option<(bool, bool, usize)> {
+    let s = app.windows[&wid].search.as_ref()?;
+    Some((s.case_sensitive, s.is_regex, s.current))
+}
+
+/// A RE-GRID LEAVES THE FIND BAR'S LAST BAND ANSWERING NOTHING: the bar
+/// painted, the pointer resting on its field row. A font zoom re-grids the
+/// window — its cells grow — and puts, under that pixel, a control's cell of
+/// the band the last frame recorded, one the glass does not show there.
+/// Before the next frame the band answers nothing there, and a press fires
+/// no control of it. The re-grid closes nothing: the next frame lays the bar
+/// again on the zoomed grid, and the band answers with the cell the bar is
+/// painted at now.
+///
+/// NEGATIVE CONTROLS: the zoom undone, the grid is the one the bar was laid on
+/// and the band answers the resting pointer with what it painted there; and
+/// the last frame's band stamped as the zoomed grid's (no stamp, as before),
+/// the same pixel is the control's, which a press fires.
+#[test]
+fn a_regrid_leaves_the_find_bars_last_band_answering_nothing() {
+    use aterm_window::event::{ElementState, MouseButton};
+    let mut app = App::headless_for_test();
+    let wid = WindowId(0);
+    app.tab_strip_rows = 1;
+    let term = app.pool.get(0).expect("session 0").term.clone();
+    // The matches below the bar's top band, so it rides the top rows.
+    let mut out = Vec::new();
+    for i in 0..8 {
+        out.extend_from_slice(format!("filler {i}\r\n").as_bytes());
+    }
+    out.extend_from_slice(b"target one\r\ntarget two\r\n");
+    term_lock(&term).process(&out);
+    app.search_enter();
+    seed_query(&mut app, wid, "target");
+    app.search_recompute();
+    let frame = |app: &mut App| {
+        fill_scratch(app, wid);
+        app.splice_find_bar(wid);
+        app.windows[&wid]
+            .find_bar_hit
+            .clone()
+            .expect("bar geometry")
+    };
+    let hit = frame(&mut app);
+    assert_eq!(hit.band.start, 0, "fixture: the bar rides the top rows");
+    let laid = hit.laid;
+    assert_eq!(laid, app.glass_grid(wid), "stamped with its grid");
+    let chrome = usize::from(app.chrome_rows(wid));
+    let term_cell = |app: &App, x: f64, y: f64| {
+        let (row, col) = app.frame_cell_at(wid, x, y)?;
+        Some((row.checked_sub(chrome)?, col))
+    };
+    // Every field-row cell's pixel on the grid the bar was laid on.
+    let (cw, ch) = app.win_cell_size(wid);
+    let (ox, oy) = app.frame_origin(wid);
+    let (pad, top) = (app.win_pad(wid), app.win_pad_top(wid) + app.win_head(wid));
+    let cells: Vec<((usize, usize), (f64, f64))> = hit
+        .cols
+        .clone()
+        .map(|col| {
+            let x = ox as f64 + (pad + col * cw + cw / 2) as f64;
+            let y = oy as f64 + (top + (chrome + hit.row) * ch + ch / 2) as f64;
+            assert_eq!(
+                term_cell(&app, x, y),
+                Some((hit.row, col)),
+                "the pixel names the cell"
+            );
+            ((hit.row, col), (x, y))
+        })
+        .collect();
+    assert!(
+        cells
+            .iter()
+            .any(|&(cell, _)| control_at(&hit, cell).is_some()),
+        "the bar drew a control"
+    );
+    // The first zoom step that puts, under one pixel of the field row, a
+    // control's cell of the recorded band that is not the one painted there.
+    let base = app.font_size;
+    let zoom = |app: &mut App, size: f32| assert!(app.set_font_size_with(size, |_| true));
+    let (size, was, now, (x, y)) = (1..=16u8)
+        .find_map(|step| {
+            let size = base + f32::from(step);
+            zoom(&mut app, size);
+            let found = cells.iter().find_map(|&(cell, (x, y))| {
+                let was = control_at(&hit, cell);
+                let now = control_at(&hit, term_cell(&app, x, y)?)?;
+                (Some(now) != was).then_some((size, was, now, (x, y)))
+            });
+            zoom(&mut app, base);
+            found
+        })
+        .expect("a zoom puts a control the glass does not show under a pixel");
+    let on = |app: &App| {
+        app.find_bar_cell_at(wid, x, y)
+            .map(|(row, col)| control_at(&hit, (usize::from(row), usize::from(col))))
+    };
+
+    // CONTROL: on the grid the bar was laid on, the band answers with what
+    // it painted under the pointer.
+    assert_eq!(app.glass_grid(wid), laid, "the zoom undone");
+    assert_eq!(
+        on(&app),
+        Some(was),
+        "CONTROL: the painted cell under the pointer"
+    );
+
+    // The zoom: no frame painted yet.
+    zoom(&mut app, size);
+    let zoomed = app.glass_grid(wid);
+    assert_ne!(zoomed, laid, "the zoom re-grids the window");
+    let set_laid = |app: &mut App, laid| {
+        app.windows
+            .get_mut(&wid)
+            .and_then(|ws| ws.find_bar_hit.as_mut())
+            .expect("bar")
+            .laid = laid;
+    };
+    let press = |app: &mut App| {
+        app.windows.get_mut(&wid).expect("window").last_cursor_px = (x, y);
+        app.on_mouse_input(wid, ElementState::Pressed, MouseButton::Left);
+        app.on_mouse_input(wid, ElementState::Released, MouseButton::Left);
+    };
+    let before = find_state(&app, wid);
+    assert!(before.is_some(), "find is open");
+    // CONTROL: the last band stamped as the zoomed grid's, the same pixel is
+    // a control no frame lays under the pointer, and a press fires it.
+    set_laid(&mut app, zoomed);
+    assert_eq!(
+        on(&app),
+        Some(Some(now)),
+        "CONTROL: unstamped, the stale band puts a control under the press"
+    );
+    press(&mut app);
+    let fired = find_state(&app, wid);
+    assert_ne!(fired, before, "CONTROL: and the press fires it");
+    // Undo what it fired: the same press again (a toggle toggles back).
+    press(&mut app);
+    assert_eq!(find_state(&app, wid), before, "fixture: the toggle undone");
+
+    set_laid(&mut app, laid);
+    assert_eq!(
+        app.find_bar_cell_at(wid, x, y),
+        None,
+        "a band laid on another grid answers nothing"
+    );
+    press(&mut app);
+    assert_eq!(
+        find_state(&app, wid),
+        before,
+        "the press fired no control of the stale band"
+    );
+
+    // The next frame lays the bar again on the zoomed grid: the band answers
+    // with the cell it is painted at now.
+    let relaid = frame(&mut app);
+    assert_eq!(relaid.laid, zoomed, "laid again on the zoomed grid");
+    let cell = term_cell(&app, x, y).expect("on the grid");
+    assert_eq!(
+        app.find_bar_cell_at(wid, x, y)
+            .map(|(row, col)| (usize::from(row), usize::from(col))),
+        Some(cell),
+        "the bar laid again answers"
+    );
+    assert_eq!(
+        control_at(&relaid, cell),
+        Some(now),
+        "with the control it paints there"
+    );
 }

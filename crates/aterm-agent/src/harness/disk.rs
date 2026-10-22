@@ -3058,6 +3058,12 @@ pub fn sweep_words(why: atpkg::build_cache::Unused) -> String {
         Unused::Unfinished => {
             "an earlier sweep renamed it aside and did not finish removing it".to_owned()
         }
+        Unused::Tooling { idle, after } => format!(
+            "a pinned tool of the tooling cache nothing ran for {} (the sweep takes \
+             one unused {}); `targo --unverified verify provision` lays it again",
+            span(idle),
+            span(after)
+        ),
         Unused::Stale {
             incremental,
             units,
@@ -3082,6 +3088,7 @@ pub fn sweep_reason(why: atpkg::build_cache::Unused) -> String {
         Unused::Gone { .. } => "its workspace is gone".to_owned(),
         Unused::Idle { idle } => format!("unwritten {}", sweep_span(idle)),
         Unused::Unfinished => "left half-removed by an earlier sweep".to_owned(),
+        Unused::Tooling { idle, .. } => format!("a tool unused {}", sweep_span(idle)),
         Unused::Stale {
             incremental,
             units,
@@ -3131,10 +3138,10 @@ pub fn sweep_row(
     o.insert("action".to_owned(), Value::from(action.to_owned()));
     o.insert("path".to_owned(), Value::from(path_text(path)));
     o.insert("bytes".to_owned(), Value::from(bytes));
-    let what = if matches!(why, atpkg::build_cache::Unused::Stale { .. }) {
-        "part of a build cache"
-    } else {
-        "a build cache, whole"
+    let what = match why {
+        atpkg::build_cache::Unused::Stale { .. } => "part of a build cache",
+        atpkg::build_cache::Unused::Tooling { .. } => "a pinned tool, whole",
+        _ => "a build cache, whole",
     };
     o.insert(
         "text".to_owned(),

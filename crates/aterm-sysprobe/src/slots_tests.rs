@@ -1363,3 +1363,24 @@ mod live {
         assert_eq!(holder(writer, file, Some(true)), Sight::Unproven);
     }
 }
+
+/// A HOLDER IS RUNNING WHILE ITS PID IS STILL THE PROCESS IT WAS PROVEN AS:
+/// this test's own process, by the birth the kernel records for it.
+/// NEGATIVE CONTROL: the same pid under another birth (taken again by a
+/// process born since) is not.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_holder_is_running_only_as_the_process_born_when_it_was_proven() {
+    let pid = std::process::id();
+    let me = crate::kproc::record(pid).expect("this process's record");
+    let holder = Holder {
+        pid,
+        birth_us: birth_us(&me),
+    };
+    assert!(holder.running());
+    let reborn = Holder {
+        birth_us: holder.birth_us + 1,
+        ..holder
+    };
+    assert!(!reborn.running());
+}

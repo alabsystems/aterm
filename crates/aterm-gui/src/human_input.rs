@@ -109,8 +109,8 @@ use crate::input::InputEvent;
 pub(crate) struct HumanInputStamp {
     at: AtomicU64,
     count: AtomicU64,
-    /// THE NUMBER OF THE LAST GESTURE THAT REACHED THE PROGRAM (session log
-    /// phase 5, rulings T1, T2, T39), `0` for none: a key that encodes to
+    /// THE NUMBER OF THE LAST GESTURE THAT REACHED THE PROGRAM,
+    /// `0` for none: a key that encodes to
     /// bytes, text, a paste, a wheel the program is sent (a report or
     /// alternate scroll), a mouse press under tracking, a drag the tracking
     /// mode reports ([`reaches_program`]). Only these can dismiss a box or
@@ -119,8 +119,8 @@ pub(crate) struct HumanInputStamp {
     /// that sees it sees which gesture it is, so no order of two loads can
     /// pair a gesture's class with a count from before it ([`Self::counts`]).
     reached: AtomicU64,
-    /// THE NUMBER OF THE LAST GESTURE THAT OPENED A BURST (session log phase
-    /// 6, 6F-8, ruling U13), `0` for none: published after the count and
+    /// THE NUMBER OF THE LAST GESTURE THAT OPENED A BURST,
+    /// `0` for none: published after the count and
     /// before [`Self::reached`], so a reading that holds a reaching
     /// gesture's number holds whether it opened a burst. A reconciling
     /// delivery that writes the mail latch's `human` mark over a burst
@@ -309,7 +309,7 @@ impl HumanInputStamp {
         Noted { burst, seq: n }
     }
 
-    /// THE PERSON'S COUNTS AS ONE READING (rulings T2, T39): how many
+    /// THE PERSON'S COUNTS AS ONE READING: how many
     /// gestures are counted and the number of the last that reached the
     /// program, the count never below that number. The number names its
     /// gesture, so a reading that holds it covers it: a log that delivers
@@ -1069,7 +1069,7 @@ mod tests {
         }));
     }
 
-    /// THE COUNTS ARE ONE READING (rulings T2, T39): at the one point a note
+    /// THE COUNTS ARE ONE READING: at the one point a note
     /// can be read apart (counted, its class not yet published) the reading
     /// holds the gesture's count and not its class; after the note, both.
     /// A reading never names a program-bound gesture its count does not

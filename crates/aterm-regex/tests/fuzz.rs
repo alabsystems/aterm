@@ -14,7 +14,7 @@
 struct Lcg(u64);
 
 impl Lcg {
-    fn next_u32(&mut self) -> u32 {
+    const fn next_u32(&mut self) -> u32 {
         self.0 = self
             .0
             .wrapping_mul(6_364_136_223_846_793_005)
@@ -22,11 +22,11 @@ impl Lcg {
         (self.0 >> 33) as u32
     }
 
-    fn below(&mut self, n: u32) -> u32 {
+    const fn below(&mut self, n: u32) -> u32 {
         self.next_u32() % n
     }
 
-    fn pick<T: Copy>(&mut self, xs: &[T]) -> T {
+    const fn pick<T: Copy>(&mut self, xs: &[T]) -> T {
         let i = self.below(xs.len() as u32) as usize;
         xs[i]
     }

@@ -4003,7 +4003,7 @@ fn the_launch_card_is_read_only_under_a_live_repl() {
     }
 }
 
-/// THE CONTEXT INDICATOR HAS GONE only from an empty slot (`context_gone`, slice 4e's review),
+/// THE CONTEXT INDICATOR HAS GONE only from an empty slot (`context_gone`),
 /// on the rows 2.1.306 drew in the real-Claude lab (2026-10-21, 120 columns, a 100 000-token
 /// window compacting at 15%): once its effort notice has gone after `/compact` its mode row
 /// stands with nothing at its end, and an older build's footer rows with no indicator above
@@ -4650,7 +4650,7 @@ fn a_title_stands_beside_the_facts_as_they_fit_without_it() {
     );
 }
 
-/// THE STEP TAP'S SIDE OF ONE REGISTRY READ (session log Phase 3B, S1 as
+/// THE STEP TAP'S SIDE OF ONE REGISTRY READ (S1 as
 /// built): the lookup says whether the transcript's path is CERTAIN — the
 /// project's own file, or the one file a scan finds — and a read that found
 /// none tells an armed tap so, so the file Claude Code writes next is bound

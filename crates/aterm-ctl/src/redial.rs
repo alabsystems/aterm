@@ -650,7 +650,7 @@ pub(crate) fn retries_across_replacement(request_parts: &[String]) -> bool {
 /// from on its own: a `since=` cursor, which means the same on a successor
 /// (the log's seq space continues across an update), or the `need` form,
 /// which latches on the needs the carried fold holds open. A predicate list
-/// (session log 5F-1) latches only as far as its members do: every member
+/// latches only as far as its members do: every member
 /// `need` (`need,need`) resumes as `need` does, but one other member
 /// (`need,close=turn`) is anchored at the moment it was armed — a resting
 /// turn's settle close the successor wrote before a retry armed at its head

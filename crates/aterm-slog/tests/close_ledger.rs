@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! A turn's close restates its `ledger=` (plan 5F-4a, ruling T12): the log
+//! A turn's close restates its `ledger=`: the log
 //! copies it from the turn's open record, pinned while the turn is open, so
 //! a close that outlives its evicted open still names the exchange that
 //! opened the turn, and `drive ledger --source=log` joins it with no clock.
@@ -146,7 +146,7 @@ fn turn_by(log: &mut Log, run: Node, by: Actor, ms: u64) -> Node {
     .expect("a turn")
 }
 
-/// A TURN'S CLOSE RESTATES WHO OPENED IT (Phase 6 step 6C-2, ruling U6):
+/// A TURN'S CLOSE RESTATES WHO OPENED IT:
 /// `op_by=<opener>` on the close of a turn the person, `ctl`, the harness
 /// or an edge opened, whoever closes it (the screen `by=-`, the transcript
 /// `by=vendor`, a cascade), as a host-tier id. NEGATIVE CONTROLS, each

@@ -2,9 +2,9 @@
 // Copyright 2026 Andrew Yates
 
 //! The session log's clause in a tab's tooltip and context menu (phase 3B,
-//! plan §5; addendum A12, A30; rulings S10, S11, S16), behind
-//! `[session_log] clause`, on by default since D6 (Phase 6 step 6B-2, ruling
-//! U22): `clause = false`, the chrome is as it was before the clause, byte
+//! plan §5; addendum A12, A30), behind
+//! `[session_log] clause`, on by default since D6:
+//! `clause = false`, the chrome is as it was before the clause, byte
 //! for byte, and no lock is taken for it; on, a move of the clause
 //! recomposes the tab once, a shown label leaves at its `until` and names
 //! its author, a `ctl` label neither shows nor hides the step beneath it,
@@ -119,7 +119,7 @@ fn tooltip(ext: &crate::session_chrome::TabChromeExt) -> &str {
     ext.tooltip.as_deref().unwrap_or_default()
 }
 
-/// OFF IS TODAY'S CHROME (addendum A30, ruling S10): with the switch off a
+/// OFF IS TODAY'S CHROME: with the switch off a
 /// log that moves (a turn, a step, a person's label) leaves the tooltip, the
 /// menu and the expiry exactly what they were, even recomposed from
 /// nothing, and the timeline is not acquired for a clause: a held timeline
@@ -195,7 +195,7 @@ fn a_log_move_recomposes_the_tabs_clause_with_the_switch_on() {
     assert!(tooltip(&edit).contains("\nnow: editing"), "{edit:?}");
 }
 
-/// D6 ON (Phase 6 step 6B-2, ruling U22): an app on the default config,
+/// D6 ON: an app on the default config,
 /// with no `[session_log]` table, shows the clause in the tooltip and the
 /// menu; the tab's label stays its identity title.
 ///
@@ -225,10 +225,10 @@ fn the_default_config_shows_the_clause() {
     );
 }
 
-/// RULING S10: a shown label leaves at its `until`, and the composition's
+/// a shown label leaves at its `until`, and the composition's
 /// expiry is that instant (no upgrade on the tab), so the scheduler's due
 /// batch recomposes the tab there and the step beneath shows again. The
-/// label names its author while it shows (D6, ruling U22): the harness's
+/// label names its author while it shows: the harness's
 /// says `by the harness`.
 ///
 /// NEGATIVE CONTROL: a `ClauseLine` without its author fails the author
@@ -274,7 +274,7 @@ fn a_shown_label_leaves_the_chrome_at_its_until() {
     );
 }
 
-/// RULING S11: a `ctl` client's label is absent from the tooltip and the
+/// a `ctl` client's label is absent from the tooltip and the
 /// menu, present in `log`, and the step beneath it shows; the harness's
 /// label shows, attributed by being shown at all.
 ///
@@ -309,7 +309,7 @@ fn a_ctl_label_is_absent_from_the_chrome_and_present_in_the_log() {
     );
 }
 
-/// §7.3'S ORDER STANDS (D6, ruling U22): a harness label written while a
+/// §7.3'S ORDER STANDS: a harness label written while a
 /// usage wall is open is the log's and not the chrome's: the wall's need
 /// row comes first, `now: limit · <its detail>`, and a need row names no
 /// author. Once the wall closes, the label shows, attributed.
@@ -367,7 +367,7 @@ fn a_harness_label_under_an_open_usage_wall_shows_the_wall() {
     );
 }
 
-/// ONLY A LABEL NAMES ITS AUTHOR (D6, ruling U22): a turn a person prompted
+/// ONLY A LABEL NAMES ITS AUTHOR: a turn a person prompted
 /// (`by=human`), a step a person's turn ran and a wall the harness raised
 /// each show in the tooltip and the menu with no `· by` suffix, though each
 /// record has an author a label row would print.

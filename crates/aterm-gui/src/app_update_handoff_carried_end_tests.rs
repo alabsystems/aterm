@@ -2,7 +2,7 @@
 // Copyright 2026 Andrew Yates
 
 //! THE CARRIED END ACROSS A SEAMLESS UPDATE (`docs/DESIGN-harness-autopilot-
-//! 2026-10-15.md` §11.2.3, item 8; §11.2.5 "The carry"; slice 2b): the park
+//! 2026-10-15.md` §11.2.3, item 8; §11.2.5 "The carry"): the park
 //! stamps each supervised session's end and its task's work on its manifest
 //! record (`SessionRecord::autopilot_end`, `App::end_carry_rows`); the
 //! successor seeds the end's face and time onto the timeline before the
@@ -220,7 +220,7 @@ fn uncheered(app: &App, session: u64) -> Option<u32> {
         .and_then(crate::harness_glass::SessionGlass::landed)
 }
 
-/// The kitty as slice 3's cheer tests keep it (§11.3): the resident pet the
+/// The kitty as cheer tests keep it (§11.3): the resident pet the
 /// trail, Full motion, window 0 presenting through a scripted CPU surface
 /// (the real redraw path) and focused; drawn for a moment on its front tab.
 fn with_the_pet(app: &mut App, t: &mut Instant) {

@@ -46,7 +46,7 @@ const FIXTURES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/src/supervise/fixtu
 const MEASURED: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/src/harness/testdata/steps");
 
 /// The file a slice's `<file>` names: a measured build's committed
-/// reduction (`harness/testdata/steps/<build>.jsonl`, ruling T8) when it is
+/// reduction (`harness/testdata/steps/<build>.jsonl`) when it is
 /// a build [`MEASURED_BUILDS`] names, so the corpus replays the exact path
 /// on the rows the lab read; else a `supervise/fixtures` transcript.
 fn fixture_path(file: &str) -> String {

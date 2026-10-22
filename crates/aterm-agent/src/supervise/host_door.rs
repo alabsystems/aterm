@@ -177,6 +177,12 @@ macro_rules! idle_host_trait {
         /// hold the door's names to.
         #[cfg(test)]
         pub(crate) const HOST_METHODS: &[&str] = &[$(stringify!($name)),*];
+
+        /// Every method's door, in the trait's order: what a tape's header
+        /// names as the doors its recording build had (`[opts] host_doors`),
+        /// so a replay knows a door that build lacked from one it never
+        /// asked ([`crate::supervise::tape::TapeValue::absent`]).
+        pub(crate) const HOST_DOORS: &[&str] = &[$(concat!("host.", stringify!($name))),*];
     };
     // Whether a method's mark makes it an act.
     (@act act) => { true };
@@ -861,6 +867,21 @@ pub trait IdleHost: Send + Sync + std::fmt::Debug {
     /// default reads nothing: today's ladder, in today's words.
     fn background_jobs(&self) -> crate::supervise::background::BackgroundEvidence {
         crate::supervise::background::BackgroundEvidence::Unknown
+    }
+
+    /// THE MACHINE'S OCCUPANCY AS THE WINDOW'S FACTS BOARD READS IT FOR THIS
+    /// SESSION ([`crate::supervise::occupancy::OccupancyReading`]; the
+    /// occupancy design §2, §4.2): memory, disk, build slots, and the board's
+    /// own judgements across its looks (`hold-room`'s slot latch, its machine
+    /// terms, when a slot holder last lay in this session's tree). A query,
+    /// asked at a settled break only where `hold-room` could be due by
+    /// everything but the machine, and at most once a board look
+    /// (`run::occupancy_loop`): it changes nothing. The default reads
+    /// nothing: the empty reading, never fresh, on which no rule that needs
+    /// the machine fires — and what a replay of a tape whose recording build
+    /// had no such door answers ([`crate::supervise::tape::TapeValue::absent`]).
+    fn occupancy(&self) -> crate::supervise::occupancy::OccupancyReading {
+        crate::supervise::occupancy::OccupancyReading::default()
     }
 
     /// WHAT THE AGENT'S OWN SCREEN SAYS OF ITS ACCOUNT'S USAGE ([`UsageSeen`]:

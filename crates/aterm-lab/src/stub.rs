@@ -807,6 +807,10 @@ pub enum ToolTurn {
     Call(String, J, usize),
     /// Reply with this text and end the turn; the step it is.
     Say(String, usize),
+    /// Call these tools, in this order, in ONE assistant message (a step
+    /// `{"calls": [{"name", "input"}, …]}`: parallel tool calls, each input's
+    /// `@SID:<k>@` filled); the step it is.
+    Calls(Vec<(String, J)>, usize),
     /// Every step is answered.
     Done,
 }
@@ -902,7 +906,9 @@ fn call_input(c: &J) -> J {
 }
 
 /// [`ToolTurn`] of a request body against a Claude Code script (one step or a
-/// list): a step is a call (an object with a name) or a reply that ends the
+/// list): a step is a call (an object with a name), several calls made in one
+/// message (an object with `calls`, a list of named calls; Claude Code answers
+/// them all in one request, so they are one step) or a reply that ends the
 /// turn (an object with a `text`).
 #[must_use]
 pub fn tool_turn(body: &[u8], script: &J) -> Option<ToolTurn> {
@@ -915,13 +921,24 @@ pub fn tool_turn(body: &[u8], script: &J) -> Option<ToolTurn> {
     .into_iter()
     .filter(|c| {
         matches!(c, J::Obj(_))
-            && (c.get("name").is_some_and(J::truthy) || c.get("text").and_then(J::as_str).is_some())
+            && (c.get("name").is_some_and(J::truthy)
+                || c.get("text").and_then(J::as_str).is_some()
+                || c.get("calls")
+                    .is_some_and(|calls| !script_calls(calls).is_empty()))
     })
     .collect();
     let results = tool_results(msgs);
     let answer = |c: &J, step: usize| {
         if c.get("name").is_some_and(J::truthy) {
             ToolTurn::Call(call_name(c), fill_sids(&call_input(c), &results), step)
+        } else if let Some(calls) = c.get("calls").filter(|_| c.get("text").is_none()) {
+            ToolTurn::Calls(
+                script_calls(calls)
+                    .into_iter()
+                    .map(|k| (call_name(k), fill_sids(&call_input(k), &results)))
+                    .collect(),
+                step,
+            )
         } else {
             ToolTurn::Say(
                 c.get("text").and_then(J::as_str).unwrap_or("").to_string(),
@@ -2150,6 +2167,11 @@ impl Stub {
                     let s = format!("{summary} tool:{name} step {step}");
                     return self.stream_tool(&base.in_mode(&mode), &s, &name, &input, out);
                 }
+                Some(ToolTurn::Calls(calls, step)) => {
+                    let names: Vec<&str> = calls.iter().map(|(n, _)| n.as_str()).collect();
+                    let s = format!("{summary} tool:{} step {step}", names.join("+"));
+                    return self.stream_tools(&base.in_mode(&mode), &s, &calls, out);
+                }
                 Some(ToolTurn::Say(text, step)) => {
                     let s = format!("{summary} tool:text step {step}");
                     let deltas = split_deltas(&text);
@@ -2353,8 +2375,9 @@ impl Stub {
                     return self.muse_text(facts, &info, &s, &done, 0.0, in_tok, &[], out);
                 }
                 // Its script holds named calls only (`script_calls`): a text
-                // step is a Claude Code script's (`tool_turn`).
-                Some(ToolTurn::Say(..)) | None => {}
+                // step, or calls made in one message, is a Claude Code
+                // script's (`tool_turn`).
+                Some(ToolTurn::Say(..) | ToolTurn::Calls(..)) | None => {}
             }
         }
         if let Some(spec) = self
@@ -3113,52 +3136,69 @@ impl Stub {
         input: &J,
         out: &mut Out<'_>,
     ) -> io::Result<()> {
+        self.stream_tools(t, summary, &[(name.to_string(), input.clone())], out)
+    }
+
+    /// Tool uses in ONE assistant message as SSE, one content block each in
+    /// order, each input split across two `input_json_delta`s.
+    fn stream_tools(
+        &self,
+        t: &Turn<'_>,
+        summary: &str,
+        calls: &[(String, J)],
+        out: &mut Out<'_>,
+    ) -> io::Result<()> {
         out.stream_head(&[])?;
         let sent = (|| -> io::Result<()> {
             out.sse(
                 "message_start",
                 &Self::message_start(t.info, est_tokens(t.blen)),
             )?;
-            out.sse(
-                "content_block_start",
-                &J::obj([
-                    ("type", J::s("content_block_start")),
-                    ("index", J::Int(0)),
-                    (
-                        "content_block",
-                        J::obj([
-                            ("type", J::s("tool_use")),
-                            ("id", J::s(format!("toolu_lab{}", rand_hex()))),
-                            ("name", J::s(name)),
-                            ("input", J::Obj(Vec::new())),
-                        ]),
-                    ),
-                ]),
-            )?;
-            out.sse("ping", &J::obj([("type", J::s("ping"))]))?;
-            let js = input.dump(COMPACT);
-            let chars: Vec<char> = js.chars().collect();
-            let half = chars.len() / 2;
-            for part in [&chars[..half], &chars[half..]] {
+            for (index, (name, input)) in (0_i64..).zip(calls) {
                 out.sse(
-                    "content_block_delta",
+                    "content_block_start",
                     &J::obj([
-                        ("type", J::s("content_block_delta")),
-                        ("index", J::Int(0)),
+                        ("type", J::s("content_block_start")),
+                        ("index", J::Int(index)),
                         (
-                            "delta",
+                            "content_block",
                             J::obj([
-                                ("type", J::s("input_json_delta")),
-                                ("partial_json", J::s(part.iter().collect::<String>())),
+                                ("type", J::s("tool_use")),
+                                ("id", J::s(format!("toolu_lab{}", rand_hex()))),
+                                ("name", J::s(name.as_str())),
+                                ("input", J::Obj(Vec::new())),
                             ]),
                         ),
                     ]),
                 )?;
+                out.sse("ping", &J::obj([("type", J::s("ping"))]))?;
+                let js = input.dump(COMPACT);
+                let chars: Vec<char> = js.chars().collect();
+                let half = chars.len() / 2;
+                for part in [&chars[..half], &chars[half..]] {
+                    out.sse(
+                        "content_block_delta",
+                        &J::obj([
+                            ("type", J::s("content_block_delta")),
+                            ("index", J::Int(index)),
+                            (
+                                "delta",
+                                J::obj([
+                                    ("type", J::s("input_json_delta")),
+                                    ("partial_json", J::s(part.iter().collect::<String>())),
+                                ]),
+                            ),
+                        ]),
+                    )?;
+                }
+                out.sse(
+                    "content_block_stop",
+                    &J::obj([
+                        ("type", J::s("content_block_stop")),
+                        ("index", J::Int(index)),
+                    ]),
+                )?;
             }
-            out.sse(
-                "content_block_stop",
-                &J::obj([("type", J::s("content_block_stop")), ("index", J::Int(0))]),
-            )?;
             out.sse(
                 "message_delta",
                 &J::obj([

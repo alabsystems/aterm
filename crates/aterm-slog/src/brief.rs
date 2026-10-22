@@ -17,7 +17,7 @@
 //!
 //! Tokens are estimated as bytes ÷ 4 ([`tokens`]). When the whole does not
 //! fit, it sheds in this order: first what a Claude Code transcript added
-//! (phase 3B, ruling S15) — the closed transcript steps' lines, and the open
+//! — the closed transcript steps' lines, and the open
 //! turn's open transcript steps down to the newest and a count (`· +3
 //! open`), then every transcript record (the brief as it read without
 //! them: no transcript step, no transcript amend's numbers, a turn's step
@@ -118,7 +118,7 @@ impl StepInfo<'_> {
     }
 }
 
-/// How much of what a transcript added a rendering keeps (ruling S15): it
+/// How much of what a transcript added a rendering keeps: it
 /// is shed before any line the brief held without it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum TxShed {
@@ -211,8 +211,8 @@ impl TurnInfo<'_> {
 }
 
 /// The window, sorted into turns, their steps and the marks worth a line;
-/// and the `act` and `story` marks, counted (ruling S15), and the `shown`
-/// marks (phase 6, 6F-9, ruling U26).
+/// and the `act` and `story` marks, counted, and the `shown`
+/// marks.
 struct Scan<'a> {
     turns: BTreeMap<u32, TurnInfo<'a>>,
     marks: Vec<&'a Rec>,
@@ -232,14 +232,14 @@ impl Scan<'_> {
 /// Marks a brief never gives a line: the raw signals the tree is built from,
 /// the content tier, and needs and claims (shown elsewhere). A source's state
 /// and a post's landing (phase 3B) are bookkeeping: the turns they explain
-/// are the lines. PHASE 3B's signals (ruling S15, addendum A23) give none
+/// are the lines. PHASE 3B's signals give none
 /// either, so a brief reads with them as it read without: the engine's,
 /// the status classifier's, the screen's context and goal, the fabric's
 /// (mail is the `mail in · out` line), the usage tap's; `act` and `story`
 /// are one count line ([`Scan::acts`]), the first line shed. A worker's
 /// `task` mark (phase 5, 5C-1) is bookkeeping too: `task` is its reader. So
 /// are Phase 6's ring facts (6F-2): a session's state, a policy's
-/// generation, a topic, an advisory, the program's own report (ruling U17),
+/// generation, a topic, an advisory, the program's own report,
 /// a mail fetch and what the person was shown (6F-9: `shown`, one count
 /// line, [`Scan::shown`], shed with the others).
 fn mark_worth_a_line(k: Kind) -> bool {
@@ -314,8 +314,8 @@ fn open_path_seeds(st: &SessionState, window: &[&Rec]) -> Vec<Rec> {
         .collect()
 }
 
-/// [`scan`] of the window as it would be without the transcript's records
-/// (ruling S15): no transcript step and no transcript amend of a step or a
+/// [`scan`] of the window as it would be without the transcript's records:
+/// no transcript step and no transcript amend of a step or a
 /// turn, each turn's transcript steps counted so its rollup reads without
 /// them; and whether the window held any.
 fn scan_stripped<'a>(window: &[&'a Rec], seeds: &'a [Rec]) -> (Scan<'a>, bool) {
@@ -531,7 +531,7 @@ fn turn_line(n: u32, t: &TurnInfo<'_>, link: Option<MailLink>, shed: TxShed, now
     } else if t.open.is_none()
         && let Some(Val::Id(opener)) = t.close.and_then(|c| c.f.get(Key::OpBy))
     {
-        // THE OPEN WAS EVICTED (Phase 6 step 6C-2, ruling U6): the close's
+        // THE OPEN WAS EVICTED: the close's
         // restated opener, printed as the text it is, never read back into
         // an actor.
         let _ = write!(line, " by={opener}");
@@ -556,7 +556,7 @@ fn turn_line(n: u32, t: &TurnInfo<'_>, link: Option<MailLink>, shed: TxShed, now
             }
         }
     }
-    // THE MAIL IT PROBABLY ANSWERED (Phase 6 step 6C-3, ruling U5): the
+    // THE MAIL IT PROBABLY ANSWERED: the
     // fold's heuristic link, printed with its confidence's suffix, so it
     // never reads without the `~` that says it is a guess. A turn that
     // names its cause has none (the fold never links one).
@@ -718,7 +718,7 @@ fn trailer(st: &SessionState, now: u64) -> (Vec<String>, Vec<String>) {
     // (the owner class, `ctl` among it) when it is another, then the newest
     // of any author when that is yet another: no `ctl` client — the agent
     // the harness judges is one — and no other author displaces the
-    // harness's verdict here (phase 3A ruling R13; `fold::shown_verdicts`).
+    // harness's verdict here (`fold::shown_verdicts`).
     for v in crate::fold::shown_verdicts(st) {
         if let Some(w) = v.word {
             claims.push(format!(
@@ -984,7 +984,7 @@ impl<'a> BriefInput<'a> {
     ///
     /// `links` are the fold's heuristic mail links
     /// ([`crate::Fold::mail_links`]): a linked turn's line ends its fields
-    /// with ` mail=@<off>~` (Phase 6 step 6C-3, ruling U5). The fold holds
+    /// with ` mail=@<off>~`. The fold holds
     /// links for the open turns and the newest closed one only, so an older
     /// closed turn's line has none. The local brief passes its fold's; a
     /// brief of the bus passes none.

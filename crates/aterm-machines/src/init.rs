@@ -662,6 +662,9 @@ impl Item for Guard {
     fn stood_aside(&self) -> Option<aterm_converge::StoodAside> {
         self.inner.stood_aside()
     }
+    fn stands_aside(&self, sys: &dyn System, ctx: &Ctx) -> Option<aterm_converge::StoodAside> {
+        self.inner.stands_aside(sys, ctx)
+    }
 }
 
 fn same_snapshot_read(a: &Read<PValue>, b: &Read<PValue>) -> bool {
@@ -772,6 +775,56 @@ pub fn run_initial_spotlight(
         held: Vec::new(),
     }
     .run(sys, mode)
+}
+
+/// Apply System State's Secrets stage: the vault item `aterm init` converges
+/// ([`crate::init_secrets`]), for the vault the plan names (`source`), through the same
+/// probe/apply/read-back engine, every change journaled in the journal of the account
+/// `sys` acts as before it is made. Nobody is asked anything; the join waits up to `wait`
+/// for an approval. `password` is the join password the person typed in System State: it
+/// is given to the one join that needs it and comes back `None` once that join has queued
+/// its proof (or let this Mac in), and as it was when no join took it or the join failed,
+/// so an unattended retry neither loses it to the network nor sends it again.
+///
+/// # Errors
+/// The context names no one user, or the journal cannot be resolved; nothing was changed.
+pub fn run_initial_secrets(
+    sys: &dyn System,
+    ctx: &Ctx,
+    ops: Arc<dyn crate::init_secrets::SecretsOps>,
+    source: &str,
+    password: &mut Option<aterm_secrets::SecretBytes>,
+    wait: std::time::Duration,
+) -> Result<Vec<ItemReport>, String> {
+    let mut journal = sys.journal()?;
+    run_initial_secrets_with(sys, ctx, ops, source, password, wait, journal.as_mut())
+}
+
+/// [`run_initial_secrets`], journaling in `journal`.
+///
+/// # Errors
+/// As [`run_initial_secrets`].
+pub fn run_initial_secrets_with(
+    sys: &dyn System,
+    ctx: &Ctx,
+    ops: Arc<dyn crate::init_secrets::SecretsOps>,
+    source: &str,
+    password: &mut Option<aterm_secrets::SecretBytes>,
+    wait: std::time::Duration,
+    journal: &mut dyn Journal,
+) -> Result<Vec<ItemReport>, String> {
+    let vault = crate::init_secrets::selected(ctx, ops, source, wait)?;
+    vault.hold_password(password.take());
+    let bound = crate::engine::bind(
+        [(&vault as &dyn Item, workstation_place(Class::Install))],
+        sys,
+        ctx,
+    );
+    let rows =
+        aterm_converge::run(&bound, Mode::Apply, journal).map_err(|refused| refused.to_string());
+    drop(bound);
+    *password = vault.unspent_password();
+    rows
 }
 
 fn workstation_items_selected(

@@ -45,9 +45,9 @@
 //! a colon, or a dash (`—`, `–`, ` - `) — inside or outside the emphasis; a
 //! heading that is the head alone needs none (`## Nothing left`), and it may
 //! say `to do` or `to land` before it (`Nothing left to do:`). A NEEDS YOU
-//! head is read louder ([`need_rest`]), FAILING TOWARD A KEPT NEED (the
-//! integration review of 12449ff581: every spelling below was lost, and a
-//! lost need is a false landing): a quote's gutter (`>`, `▎`, `│`, the
+//! head is read louder ([`need_rest`]), FAILING TOWARD A KEPT NEED (every spelling below was lost, and a
+//! lost need is a false landing):
+//! a quote's gutter (`>`, `▎`, `│`, the
 //! worker's own call-out or a GitHub alert), leading emoji (`🚨`, `⚠️`) and
 //! a checkbox (`- [ ]`) are passed over too, the token's two words may be
 //! joined any way (`NEEDS-YOU`, `NEEDS_YOU`, two spaces, a no-break space)

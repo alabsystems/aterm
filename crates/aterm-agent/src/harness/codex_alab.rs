@@ -64,7 +64,7 @@ pub(crate) fn alab_marker(exe: &Path) -> Option<std::io::Result<std::fs::Metadat
 /// (`0.164.0-dev.12521+g3d3eb12d8`), when `exe` runs ALab bytes
 /// ([`alab_bytes`]: the package root whose manifest names `exe` carries
 /// [`ALAB_BUILD_JSON`]); `None` for any other exe. What the Codex rollout tap
-/// holds a thread's rows to (session log 5G-3, `super::codex_tap`): the
+/// holds a thread's rows to (`super::codex_tap`): the
 /// build writing them now, which a thread resumed or re-exec'd onto another
 /// build never restates in its `session_meta`. Files only, never a run.
 #[must_use]

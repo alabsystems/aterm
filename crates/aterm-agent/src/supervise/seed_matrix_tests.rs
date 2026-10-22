@@ -5483,7 +5483,7 @@ fn a_land_episode_a_reading_in_another_mode_ended_is_over_for_a_loop_that_follow
 }
 
 /// THE HOLD'S `since` IS THE INSTRUCTION'S ROW, FOR THIS LOOP AND THE NEXT
-/// (the Autopilot design's §12.3.3, slice 3a): the loop that types Land's
+/// (the Autopilot design's §12.3.3): the loop that types Land's
 /// instruction holds it from the stamp its ledger row carries
 /// (`ledger_row` → `TurnEndState::ledgered`), and a loop that follows on
 /// the same books (a restart, a seamless update) seeds that very stamp

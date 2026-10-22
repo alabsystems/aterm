@@ -1,0 +1,965 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Andrew Yates
+
+//! `targo --unverified verify provision [ROW...] [--linux] [--record] [--check]`: the
+//! one verb that puts the tools this checkout pins on this machine
+//! (docs/DESIGN-init-system-2026-10-20.md §4.4, §6.2–§6.4). It is how every
+//! [`aterm_uds::host::Provider::Workspace`] row of `aterm_uds::host::TOOLS` is provided,
+//! and the only route by which one reaches a Mac: never Homebrew, never a hand install.
+//!
+//! A bare run provides every row wanted always ([`ROWS`]): rustup's stock exceptions,
+//! fish (built here from upstream's source), pwsh, binaryen and the browser lane's
+//! browsers. `--linux` adds lima, `--record` adds wasm-bindgen, and naming rows provides
+//! just those. `--check` reads and changes nothing.
+//!
+//! Each row installs into `<user cache>/tooling.noindex/<package>-<version>/` (the
+//! browsers into the browser lane's cache, where the lane looks) beside a `stamp.json`
+//! recording its URL, sha256, version, the host it was placed for and, for a build, its
+//! features. A download (rustup-init's too) goes into an empty directory of its own and
+//! is held to its size and sha256 before anything reads it. A copied executable whose
+//! first run is unproven retains its scratch image on failure ([`place`]). A row already
+//! in place, its stamp the pin's for this host, is left alone; anything else at its path
+//! (no stamp, another pin's, another host's) is replaced, never adopted: nothing ties
+//! bytes found in place to their pin.
+//!
+//! The host is the Mac's own (`macos-aarch64` on Apple silicon, from an x86_64 build
+//! under Rosetta too), so a translated run never swaps a tree the native one placed.
+//!
+//! This verb reads the network: `verify` is offline but for it, `export` and `linux`'s
+//! first provision. Exit: 0 every wanted row is in place, 1 a row failed (or, under
+//! `--check`, is missing), 2 usage, 3 none of the rows asked for is pinned for this host.
+
+mod fish;
+mod place;
+mod rows;
+pub mod stable;
+#[cfg(test)]
+mod tests;
+
+use std::ffi::OsString;
+use std::path::{Path, PathBuf};
+
+use aterm_uds::host::When;
+
+pub use place::SCRATCH_PREFIX;
+pub use rows::{Anchor, Archive, Engine, Install, MICROSOFT_TEAM, ROWS, Row, row};
+pub use stable::{FOREIGN_CELL_TARGETS, WasmClause, wasm_clause};
+
+/// The OS's curl, by absolute path (§6.1 row 10).
+pub(crate) const CURL: &str = "/usr/bin/curl";
+
+/// The name of a row's stamp in its directory, the one the resolver requires beside a
+/// pinned program ([`aterm_uds::host::PIN_STAMP`]).
+pub const STAMP: &str = aterm_uds::host::PIN_STAMP;
+
+/// What a placed row's `stamp.json` records.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Stamp {
+    /// The row.
+    pub row: String,
+    /// The version placed.
+    pub version: String,
+    /// Where it came from.
+    #[serde(default)]
+    pub url: Option<String>,
+    /// The archive's sha256 it was held to.
+    #[serde(default)]
+    pub sha256: Option<String>,
+    /// What the tree was held to besides: `sha256`, `developer-id <team>`, `crates.io`.
+    pub anchor: String,
+    /// A build's features (fish: none past `--no-default-features`).
+    #[serde(default)]
+    pub features: Option<Vec<String>>,
+    /// What the placed program answered (`fish --version`).
+    #[serde(default)]
+    pub reports: Option<String>,
+    /// The host it was placed for (`macos-aarch64`): a tree another host's run placed is
+    /// not this one's.
+    #[serde(default)]
+    pub platform: Option<String>,
+    /// When it was placed (Unix seconds).
+    pub placed: u64,
+    /// Set by the retired adoption, which stamped a copy found in place without holding
+    /// its bytes to the pin: such a stamp is never this pin's placement, and a run
+    /// replaces the copy.
+    #[serde(default)]
+    pub adopted: bool,
+}
+
+/// The current Unix time in seconds (`0` where the clock says nothing).
+pub(crate) fn now() -> u64 {
+    aterm_time::unix_secs().unwrap_or(0)
+}
+
+/// One child a row runs: the whole of what it is handed, so a test reads the argv and
+/// the environment of a build from the record ([`Host::run`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Spawn {
+    /// The program, by absolute path.
+    pub program: PathBuf,
+    /// Its arguments.
+    pub args: Vec<OsString>,
+    /// Where it runs.
+    pub cwd: PathBuf,
+    /// Variables set for it.
+    pub set: Vec<(String, OsString)>,
+    /// Variables removed from what it inherits; a name ending in `*` is a prefix.
+    pub remove: Vec<String>,
+}
+
+impl Spawn {
+    /// The command this spawn is, over the parent environment's variable names `parent`
+    /// (each removal by prefix reads them).
+    #[must_use]
+    pub fn command(&self, parent: &[OsString]) -> aterm_uds::spawnfd::Command {
+        let mut cmd = aterm_uds::spawnfd::command(&self.program);
+        cmd.args(&self.args).current_dir(&self.cwd);
+        for key in &self.remove {
+            if let Some(prefix) = key.strip_suffix('*') {
+                for name in parent {
+                    if name.to_string_lossy().starts_with(prefix) {
+                        cmd.env_remove(name);
+                    }
+                }
+            } else {
+                cmd.env_remove(key);
+            }
+        }
+        for (key, value) in &self.set {
+            cmd.env(key, value);
+        }
+        cmd
+    }
+}
+
+/// What the rows do to the outside world, injected so a test stands up any host and
+/// reads what was run.
+pub trait Host {
+    /// Download `url` into `dest`, a new path in an empty directory of its own, giving up
+    /// once the body passes `bytes` (the pin's size), so no server fills the volume.
+    ///
+    /// # Errors
+    /// The download failed.
+    fn fetch(&self, url: &str, dest: &Path, bytes: u64) -> Result<(), String>;
+
+    /// Whether the Mach-O at `path` verifies as signed by a Developer ID of `team`.
+    ///
+    /// # Errors
+    /// It does not, or codesign could not say.
+    fn developer_id(&self, path: &Path, team: &str) -> Result<(), String>;
+
+    /// Run `spawn` to completion: its stdout.
+    ///
+    /// # Errors
+    /// It could not start, its output/read or wait failed, or it exited unsuccessfully
+    /// (with its stderr's tail). An error need not prove the child's exit or first exec.
+    fn run(&self, spawn: &Spawn) -> Result<String, String>;
+
+    /// The Trust toolchain's `targo`.
+    ///
+    /// # Errors
+    /// None is installed: what provides it.
+    fn targo(&self) -> Result<PathBuf, String>;
+
+    /// The rustup the rustup row drives.
+    fn rustup(&self) -> &dyn stable::Rustup;
+}
+
+/// Where a run puts things on this machine, and for which host.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Machine {
+    /// `<os>-<arch>` as Rust names them (`macos-aarch64`): the machine's own
+    /// ([`platform_of`]).
+    pub platform: String,
+    /// The tooling cache ([`aterm_uds::host::tooling_dir`]).
+    pub tooling: PathBuf,
+    /// The browser lane's cache.
+    pub browser: PathBuf,
+    /// The checkout, whose `publish/config.sh` names the wasm32 pin.
+    pub repo: PathBuf,
+    /// rustup's homes.
+    pub homes: stable::Homes,
+}
+
+impl Machine {
+    fn os_arch(&self) -> (&str, &str) {
+        self.platform
+            .split_once('-')
+            .unwrap_or((&self.platform, ""))
+    }
+}
+
+/// Where a row stands after a run.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum State {
+    /// In place already, its stamp the pin's: nothing was fetched.
+    Present(PathBuf),
+    /// Fetched or built, checked and placed by this run.
+    Placed(PathBuf),
+    /// Nothing is pinned for this host: no failure, and nothing to provide.
+    NotPinned(String),
+    /// `--check`: not in place, and what a run would do.
+    Missing(String),
+    /// Refused or failed, with nothing left behind.
+    Failed(String),
+}
+
+impl State {
+    /// Whether the row is where the tests look for it.
+    #[must_use]
+    pub fn in_place(&self) -> bool {
+        matches!(self, Self::Present(_) | Self::Placed(_))
+    }
+}
+
+/// What a run was asked for.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Options {
+    /// Rows named on the command line; empty: every wanted row.
+    pub rows: Vec<String>,
+    /// `--linux`: add the Linux lane's rows.
+    pub linux: bool,
+    /// `--record`: add the rows that re-record goldens.
+    pub record: bool,
+    /// `--check`: read only.
+    pub check: bool,
+    /// `-h`/`--help`.
+    pub help: bool,
+}
+
+/// The usage text.
+#[must_use]
+pub fn usage() -> String {
+    let names: Vec<&str> = ROWS.iter().map(|r| r.name).collect();
+    format!(
+        "targo --unverified verify provision [ROW...] [--linux] [--record] [--check]
+
+Fetch or build the tools this checkout pins into this user's cache: each held to its
+sha256 (pwsh also to Microsoft's Developer ID), placed whole or not at all, beside a
+stamp.json. It reads the network.
+
+  (no ROW)    every row wanted always
+  --linux     and lima, the Linux lane's VM
+  --record    and wasm-bindgen, to re-record the wasm-glue goldens
+  --check     say what is missing; fetch and change nothing
+  ROW...      just these: {}
+
+Exit: 0 in place, 1 a row failed (--check: is missing), 2 usage, 3 nothing pinned here.
+",
+        names.join(" ")
+    )
+}
+
+/// Parse what follows `verify provision`.
+///
+/// # Errors
+/// An unknown flag or row: the usage error's words.
+pub fn parse(args: &[String]) -> Result<Options, String> {
+    let mut opts = Options::default();
+    for arg in args {
+        match arg.as_str() {
+            "--linux" => opts.linux = true,
+            "--record" => opts.record = true,
+            "--check" => opts.check = true,
+            "-h" | "--help" => opts.help = true,
+            flag if flag.starts_with('-') => {
+                return Err(format!("verify provision: unknown flag `{flag}`"));
+            }
+            name if row(name).is_some() => {
+                if !opts.rows.iter().any(|r| r == name) {
+                    opts.rows.push(name.to_string());
+                }
+            }
+            name => {
+                let names: Vec<&str> = ROWS.iter().map(|r| r.name).collect();
+                return Err(format!(
+                    "verify provision: no row `{name}` (the rows: {})",
+                    names.join(", ")
+                ));
+            }
+        }
+    }
+    Ok(opts)
+}
+
+/// The rows `opts` asks for, in [`ROWS`] order: those named, else each row wanted
+/// always, with `--linux`'s and `--record`'s when their flag is given.
+#[must_use]
+pub fn select(opts: &Options) -> Vec<&'static Row> {
+    ROWS.iter()
+        .filter(|r| {
+            if opts.rows.is_empty() {
+                match r.when() {
+                    When::Always => true,
+                    When::Linux => opts.linux,
+                    When::Record => opts.record,
+                }
+            } else {
+                opts.rows.iter().any(|n| n == r.name)
+            }
+        })
+        .collect()
+}
+
+/// Whether `t.dir` holds a complete placement of its pin: the program in it, and a stamp
+/// that [`Target::admits`].
+pub(crate) fn complete(t: &Target) -> bool {
+    t.dir.join(&t.exe).is_file() && place::read_stamp(&t.dir).is_some_and(|s| t.admits(&s))
+}
+
+/// Where `row` would be placed on `machine`, with what its stamp must say; `None` for
+/// rows not placed in a directory (rustup) or not pinned here.
+fn target(row: &Row, machine: &Machine) -> Option<Target> {
+    let (os, arch) = machine.os_arch();
+    match row.install {
+        Install::Unpack { .. } | Install::Build { .. } | Install::Cargo => {
+            let tool = row.tool_row()?;
+            let pin = tool.pin?;
+            if !pin.pinned_for(&machine.platform) {
+                return None;
+            }
+            let sha256 = match row.install {
+                Install::Cargo => None,
+                _ => Some(row.archive_for(&machine.platform)?.sha256),
+            };
+            let features = match row.install {
+                Install::Build { features, .. } => {
+                    Some(features.iter().map(|f| (*f).to_string()).collect())
+                }
+                _ => None,
+            };
+            Some(Target {
+                dir: tool.pinned_root(&machine.tooling)?,
+                exe: pin.exe.to_string(),
+                version: pin.version.to_string(),
+                sha256,
+                platform: machine.platform.clone(),
+                features,
+            })
+        }
+        Install::Browser(engine) => {
+            let pin = crate::browser::pin_for(engine, os, arch, &machine.browser)?;
+            Some(Target {
+                dir: pin.dir,
+                exe: pin.binary.to_string_lossy().into_owned(),
+                version: pin.version,
+                sha256: Some(pin.sha256),
+                platform: machine.platform.clone(),
+                features: None,
+            })
+        }
+        Install::Rustup { .. } => None,
+    }
+}
+
+/// A row's directory and program, and what its stamp must say: the version, the pinned
+/// sha256 (none for a crate targo builds), the host, and a build's features.
+pub(crate) struct Target {
+    dir: PathBuf,
+    exe: String,
+    version: String,
+    sha256: Option<&'static str>,
+    platform: String,
+    features: Option<Vec<String>>,
+}
+
+impl Target {
+    /// Whether `stamp` records this pin placed for this host: its version, its sha256
+    /// where the pin names one, this host, a build's features exactly, and never a stamp
+    /// the retired adoption wrote.
+    fn admits(&self, stamp: &Stamp) -> bool {
+        !stamp.adopted
+            && stamp.version == self.version
+            && stamp.platform.as_deref() == Some(self.platform.as_str())
+            && self
+                .sha256
+                .is_none_or(|h| stamp.sha256.as_deref() == Some(h))
+            && self
+                .features
+                .as_ref()
+                .is_none_or(|f| stamp.features.as_ref() == Some(f))
+    }
+
+    /// The stamp of this pin placed now from `url`, held to `anchor`.
+    fn stamp(
+        &self,
+        row: &str,
+        url: Option<String>,
+        anchor: &str,
+        reports: Option<String>,
+    ) -> Stamp {
+        Stamp {
+            row: row.into(),
+            version: self.version.clone(),
+            url,
+            sha256: self.sha256.map(str::to_string),
+            anchor: anchor.into(),
+            features: self.features.clone(),
+            reports,
+            platform: Some(self.platform.clone()),
+            placed: now(),
+            adopted: false,
+        }
+    }
+}
+
+/// Why `row` has nothing to provide on `machine`.
+fn not_pinned(row: &Row, machine: &Machine) -> String {
+    format!("{}: nothing is pinned for {}", row.name, machine.platform)
+}
+
+/// Where `row` stands on `machine`, read only: in place, missing (with what a run would
+/// do), or not pinned here.
+pub fn check(row: &Row, machine: &Machine, host: &dyn Host) -> State {
+    if matches!(row.install, Install::Rustup { .. }) {
+        let pin = match stable::wasm_pin_wanted(&machine.repo) {
+            Ok(pin) => pin,
+            Err(why) => return State::Missing(format!("rustup: the wasm32 pin — {why}")),
+        };
+        let lacks = stable::missing(&machine.homes, host.rustup(), pin.as_deref());
+        return if lacks.is_empty() {
+            State::Present(machine.homes.rustup_home.clone())
+        } else {
+            State::Missing(format!("rustup: a run would {}", lacks.join("; ")))
+        };
+    }
+    let Some(t) = target(row, machine) else {
+        return State::NotPinned(not_pinned(row, machine));
+    };
+    if complete(&t) {
+        State::Present(t.dir.join(&t.exe))
+    } else if t.dir.join(&t.exe).is_file() {
+        State::Missing(format!(
+            "{} {}: {} holds a copy without this pin's stamp for {}, which a run replaces",
+            row.name,
+            t.version,
+            t.dir.display(),
+            t.platform
+        ))
+    } else {
+        State::Missing(format!(
+            "{} {}: not in {}",
+            row.name,
+            t.version,
+            t.dir.display()
+        ))
+    }
+}
+
+/// Provide `row` on `machine`: leave it where it is complete, else fetch or build it.
+pub fn provide(row: &Row, machine: &Machine, host: &dyn Host, say: &mut dyn FnMut(&str)) -> State {
+    if let Install::Rustup { version, .. } = row.install {
+        return rustup_row(row, version, machine, host, say);
+    }
+    let Some(t) = target(row, machine) else {
+        return State::NotPinned(not_pinned(row, machine));
+    };
+    let exe = t.dir.join(&t.exe);
+    if complete(&t) {
+        place::touch_stamp(&t.dir);
+        return State::Present(exe);
+    }
+    let done = match row.install {
+        Install::Unpack {
+            strip,
+            anchor,
+            keep,
+            ..
+        } => {
+            let archive = row
+                .archive_for(&machine.platform)
+                .expect("target() found it");
+            unpack_row(row, &archive, &t, strip, anchor, keep, machine, host, say)
+        }
+        Install::Build { .. } => {
+            let archive = row
+                .archive_for(&machine.platform)
+                .expect("target() found it");
+            fish::build(&archive, &t, machine, host, say)
+        }
+        Install::Cargo => return cargo_row(row, &t, machine, host, say),
+        Install::Browser(engine) => return browser_row(engine, &t, machine, host, say),
+        Install::Rustup { .. } => unreachable!("handled above"),
+    };
+    match done {
+        Ok(exe) => State::Placed(exe),
+        Err(why) => State::Failed(format!("{} {}: {why}", row.name, t.version)),
+    }
+}
+
+/// The rustup row: [`stable::run`], handed rustup-init at the pin where no rustup is
+/// installed. The installer is fetched into a scratch of its own under the tooling cache
+/// and held to its size and sha256 there before it runs; the scratch goes with the run.
+fn rustup_row(
+    row: &Row,
+    version: &str,
+    machine: &Machine,
+    host: &dyn Host,
+    say: &mut dyn FnMut(&str),
+) -> State {
+    let fetched = if stable::lacks_rustup(&machine.homes) {
+        let fetched = (|| -> Result<(place::Scratch, PathBuf), String> {
+            let archive = row.archive_for(&machine.platform).ok_or_else(|| {
+                format!(
+                    "no rustup-init {version} is pinned for {}",
+                    machine.platform
+                )
+            })?;
+            let scratch = place::Scratch::new(&machine.tooling, row.name)?;
+            let url = archive.url_at(version);
+            let init =
+                place::fetch_checked(host, &scratch, &url, archive.sha256, archive.bytes, say)?;
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                std::fs::set_permissions(&init, std::fs::Permissions::from_mode(0o755))
+                    .map_err(|e| format!("chmod {}: {e}", init.display()))?;
+            }
+            Ok((scratch, init))
+        })();
+        match fetched {
+            Ok(fetched) => Some(fetched),
+            Err(why) => return State::Failed(format!("rustup: rustup was not installed — {why}")),
+        }
+    } else {
+        None
+    };
+    let init = fetched.as_ref().map(|(_, init)| init.as_path());
+    match stable::run(&machine.repo, &machine.homes, host.rustup(), init, say) {
+        Ok(acquired) if acquired.is_empty() => State::Present(machine.homes.rustup_home.clone()),
+        Ok(_) => State::Placed(machine.homes.rustup_home.clone()),
+        Err(why) => State::Failed(format!("rustup: {why}")),
+    }
+}
+
+/// An unpacked row: fetch, check, unpack, hold the tree to `anchor`, keep `keep`, stamp,
+/// place.
+#[expect(clippy::too_many_arguments, reason = "one row's whole description")]
+fn unpack_row(
+    row: &Row,
+    archive: &Archive,
+    t: &Target,
+    strip: u32,
+    anchor: Anchor,
+    keep: &[&str],
+    machine: &Machine,
+    host: &dyn Host,
+    say: &mut dyn FnMut(&str),
+) -> Result<PathBuf, String> {
+    let url = archive.url_at(&t.version);
+    let scratch = place::Scratch::new(&machine.tooling, row.name)?;
+    let file = place::fetch_checked(host, &scratch, &url, archive.sha256, archive.bytes, say)?;
+    let tree = place::unpack(&scratch, &file, place::container_of(&url)?, strip, "tree")?;
+    place::links_within(&tree)?;
+    if !place::is_executable(&tree.join(&t.exe)) {
+        return Err(format!("{url} holds no executable {}", t.exe));
+    }
+    for name in keep {
+        if !tree.join(name).is_file() {
+            return Err(format!("{url} holds no {name}, which the tree keeps"));
+        }
+    }
+    let anchor_words = match anchor {
+        Anchor::Sha256 => "sha256".to_string(),
+        Anchor::DeveloperId { team } => {
+            let machos = atpkg::macho::find_macho(&tree).map_err(|e| e.to_string())?;
+            if machos.is_empty() {
+                return Err(format!("{url} holds no Mach-O to hold to team {team}"));
+            }
+            for macho in &machos {
+                let shown = macho
+                    .strip_prefix(&tree)
+                    .unwrap_or(macho)
+                    .display()
+                    .to_string();
+                host.developer_id(macho, team)
+                    .map_err(|e| format!("{shown} is not signed by team {team}: {e}"))?;
+            }
+            say(&format!(
+                "{} {}: all {} Mach-O files verify as Developer ID team {team}",
+                row.name,
+                t.version,
+                machos.len()
+            ));
+            format!("developer-id {team}")
+        }
+    };
+    place::write_stamp(&tree, &t.stamp(row.name, Some(url), &anchor_words, None))?;
+    place::place(&scratch, &tree, &t.dir, &|| complete(t))?;
+    Ok(t.dir.join(&t.exe))
+}
+
+/// wasm-bindgen's `--version` words at `pin`, read from `exe`.
+fn bindgen_answers(host: &dyn Host, exe: &Path, cwd: &Path) -> Option<String> {
+    let out = host
+        .run(&Spawn {
+            program: exe.to_path_buf(),
+            args: vec!["--version".into()],
+            cwd: cwd.to_path_buf(),
+            set: Vec::new(),
+            remove: Vec::new(),
+        })
+        .ok()?;
+    crate::wasm_glue::reports_pin(&out).then(|| out.trim().to_string())
+}
+
+/// The `--record` row: targo builds the CLI at the pin, `--locked`, from crates.io into a
+/// scratch root that is placed whole. A copy already at the pin with no stamp (the retired
+/// `ship provision` laid one) is replaced, not adopted: nothing ties its bytes to
+/// crates.io, and only the build in the scratch is run before it is stamped.
+fn cargo_row(
+    row: &Row,
+    t: &Target,
+    machine: &Machine,
+    host: &dyn Host,
+    say: &mut dyn FnMut(&str),
+) -> State {
+    let exe = t.dir.join(&t.exe);
+    let built = (|| -> Result<(), String> {
+        let scratch = place::Scratch::new(&machine.tooling, row.name)?;
+        let root = scratch.path().join("tree");
+        let targo = host.targo()?;
+        let mut args: Vec<OsString> = vec!["--unverified".into()];
+        args.extend(crate::wasm_glue::BINDGEN_INSTALL.iter().map(OsString::from));
+        args.extend([
+            "--root".into(),
+            root.clone().into_os_string(),
+            "--target-dir".into(),
+            scratch.path().join("target.noindex").into_os_string(),
+        ]);
+        say(&format!(
+            "building wasm-bindgen-cli {}: targo --unverified install --locked",
+            t.version
+        ));
+        host.run(&Spawn {
+            program: targo,
+            args,
+            cwd: scratch.path().to_path_buf(),
+            set: Vec::new(),
+            remove: fish::removed(),
+        })?;
+        let built = root.join(&t.exe);
+        let reports = bindgen_answers(host, &built, scratch.path())
+            .ok_or_else(|| format!("{} does not answer {}", built.display(), t.version))?;
+        let url = format!("https://crates.io/crates/wasm-bindgen-cli/{}", t.version);
+        place::write_stamp(
+            &root,
+            &t.stamp(row.name, Some(url), "crates.io", Some(reports)),
+        )?;
+        place::place(&scratch, &root, &t.dir, &|| complete(t))
+    })();
+    match built {
+        Ok(()) => State::Placed(exe),
+        Err(why) => State::Failed(format!("{} {}: {why}", row.name, t.version)),
+    }
+}
+
+/// A browser row: fetched, checked, unpacked by the OS's own zip reader as the lane always
+/// has (`ditto`, `unzip` off macOS) in a scratch under the tooling cache, held to links
+/// that stay in the tree, stamped and renamed into the browser lane's cache. A copy
+/// already there without this pin's stamp is replaced.
+fn browser_row(
+    engine: Engine,
+    t: &Target,
+    machine: &Machine,
+    host: &dyn Host,
+    say: &mut dyn FnMut(&str),
+) -> State {
+    let (os, arch) = machine.os_arch();
+    let Some(pin) = crate::browser::pin_for(engine, os, arch, &machine.browser) else {
+        return State::NotPinned(format!("nothing is pinned for {}", machine.platform));
+    };
+    match place_browser(engine_name(engine), &pin, t, machine, host, say) {
+        Ok(()) => State::Placed(t.dir.join(&t.exe)),
+        Err(why) => State::Failed(format!("{}: {why}", pin.what)),
+    }
+}
+
+/// [`browser_row`]'s fetch, unzip, check, stamp and placement of `pin` as row `name`.
+fn place_browser(
+    name: &str,
+    pin: &crate::browser::Pin,
+    t: &Target,
+    machine: &Machine,
+    host: &dyn Host,
+    say: &mut dyn FnMut(&str),
+) -> Result<(), String> {
+    let (os, _) = machine.os_arch();
+    // Under the tooling cache, where the reclaim finds a scratch a killed run left; the
+    // two caches share a volume (`aterm_uds::host::user_cache`), so the rename holds.
+    let scratch = place::Scratch::new(&machine.tooling, name)?;
+    let zip = place::fetch_checked(host, &scratch, &pin.url, pin.sha256, pin.bytes, say)?;
+    let tree = scratch.path().join("tree");
+    let unzip = if os == "macos" {
+        Spawn {
+            program: PathBuf::from("/usr/bin/ditto"),
+            args: vec![
+                "-x".into(),
+                "-k".into(),
+                zip.into_os_string(),
+                tree.clone().into_os_string(),
+            ],
+            cwd: scratch.path().to_path_buf(),
+            set: Vec::new(),
+            remove: Vec::new(),
+        }
+    } else {
+        let unzip = aterm_uds::host::find_tool("unzip")
+            .ok_or_else(|| aterm_uds::host::tool("unzip").refusal())?;
+        Spawn {
+            program: unzip,
+            args: vec![
+                "-q".into(),
+                zip.into_os_string(),
+                "-d".into(),
+                tree.clone().into_os_string(),
+            ],
+            cwd: scratch.path().to_path_buf(),
+            set: Vec::new(),
+            remove: Vec::new(),
+        }
+    };
+    host.run(&unzip)?;
+    place::links_within(&tree)?;
+    if !tree.join(&pin.binary).is_file() {
+        return Err(format!("the archive holds no {}", pin.binary.display()));
+    }
+    place::write_stamp(&tree, &t.stamp(name, Some(pin.url.clone()), "sha256", None))?;
+    place::place(&scratch, &tree, &t.dir, &|| complete(t))
+}
+
+fn engine_name(engine: Engine) -> &'static str {
+    match engine {
+        Engine::Chromium => "chrome-headless-shell",
+        Engine::Firefox => "firefox",
+        Engine::Webkit => "webkit",
+    }
+}
+
+/// One row's line, as a run prints it.
+#[must_use]
+pub fn line(row: &Row, state: &State) -> String {
+    match state {
+        State::Present(p) => format!("{} — in place: {}", row.name, p.display()),
+        State::Placed(p) => format!("{} — placed: {}", row.name, p.display()),
+        State::NotPinned(why) => format!("{} — not provided: {why}", row.name),
+        State::Missing(why) => format!("MISSING — {why}"),
+        State::Failed(why) => format!("FAIL — {why}"),
+    }
+}
+
+/// A whole run: each selected row checked or provided in order, a line each, then the
+/// exit code ([`crate::exit`]).
+pub fn run(opts: &Options, machine: &Machine, host: &dyn Host, say: &mut dyn FnMut(&str)) -> i32 {
+    let rows = select(opts);
+    let mut states = Vec::new();
+    for row in &rows {
+        let state = if opts.check {
+            check(row, machine, host)
+        } else {
+            provide(row, machine, host, &mut |l: &str| {
+                say(&format!("{}: {l}", row.name))
+            })
+        };
+        say(&line(row, &state));
+        states.push(state);
+    }
+    let failed = states
+        .iter()
+        .filter(|s| matches!(s, State::Failed(_) | State::Missing(_)))
+        .count();
+    let placed = states.iter().filter(|s| s.in_place()).count();
+    if failed > 0 {
+        say(&format!(
+            "FAIL — {failed} of {} rows not in place",
+            rows.len()
+        ));
+        crate::exit::FAILED
+    } else if placed == 0 {
+        say(&format!(
+            "COULD NOT RUN — none of the rows asked for is pinned for {}",
+            machine.platform
+        ));
+        crate::exit::COULD_NOT_RUN
+    } else {
+        let rows = if placed == 1 { "row" } else { "rows" };
+        say(&format!("PASS — {placed} {rows} in place"));
+        crate::exit::PASS
+    }
+}
+
+/// This machine.
+pub struct System {
+    repo: PathBuf,
+    rustup: stable::System,
+}
+
+impl System {
+    /// This machine, for the checkout at `repo`.
+    #[must_use]
+    pub fn new(repo: &Path) -> Self {
+        Self {
+            repo: repo.to_path_buf(),
+            rustup: stable::System,
+        }
+    }
+}
+
+/// The last `n` lines of `text`.
+fn tail(text: &[u8], n: usize) -> String {
+    let text = String::from_utf8_lossy(text);
+    let lines: Vec<&str> = text.trim_end().lines().collect();
+    lines[lines.len().saturating_sub(n)..].join("\n")
+}
+
+/// The download of `url` into `dest`: the OS's curl reading no `~/.curlrc` (`-q`, first),
+/// https only through every redirect (GitHub's release assets redirect to its CDN),
+/// stopped once the body passes the pin's `bytes`, and giving up on a stalled transfer
+/// rather than hanging.
+pub(crate) fn fetch_spawn(url: &str, dest: &Path, bytes: u64) -> Spawn {
+    let bytes = bytes.to_string();
+    Spawn {
+        program: PathBuf::from(CURL),
+        args: [
+            "-q",
+            "--proto",
+            "=https",
+            "--proto-redir",
+            "=https",
+            "--tlsv1.2",
+            "-sSfL",
+            "--max-filesize",
+            &bytes,
+            "--retry",
+            "0",
+            "--connect-timeout",
+            "30",
+            "--speed-limit",
+            "1024",
+            "--speed-time",
+            "60",
+            "-o",
+        ]
+        .into_iter()
+        .map(OsString::from)
+        .chain([dest.as_os_str().to_owned(), url.into()])
+        .collect(),
+        cwd: dest.parent().unwrap_or(Path::new("/")).to_path_buf(),
+        set: Vec::new(),
+        remove: Vec::new(),
+    }
+}
+
+impl Host for System {
+    fn fetch(&self, url: &str, dest: &Path, bytes: u64) -> Result<(), String> {
+        self.run(&fetch_spawn(url, dest, bytes)).map(|_| ())
+    }
+
+    fn developer_id(&self, path: &Path, team: &str) -> Result<(), String> {
+        let len = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+        let deadline =
+            std::time::Instant::now() + aterm_update_core::codesign::verify_timeout_for(len);
+        aterm_update_core::codesign::verify_developer_id_until(path, team, false, deadline)
+            .map_err(|e| e.to_string())
+    }
+
+    fn run(&self, spawn: &Spawn) -> Result<String, String> {
+        use aterm_uds::output::CommandOutput as _;
+        let parent: Vec<OsString> = std::env::vars_os().map(|(k, _)| k).collect();
+        let out = spawn
+            .command(&parent)
+            .output_owned()
+            .map_err(|e| format!("could not run {}: {e}", spawn.program.display()))?;
+        if out.status.success() {
+            Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+        } else {
+            Err(format!(
+                "{} exited {:?}: {}",
+                spawn.program.display(),
+                out.status.code(),
+                tail(&out.stderr, 30)
+            ))
+        }
+    }
+
+    fn targo(&self) -> Result<PathBuf, String> {
+        let toolchain = crate::run_toolchain(&crate::EnvSnapshot::capture(), &self.repo);
+        if toolchain.targo.is_file() {
+            Ok(toolchain.targo)
+        } else {
+            Err(format!(
+                "no Trust targo at {}: {}",
+                toolchain.targo.display(),
+                aterm_uds::host::tool("targo").remedy()
+            ))
+        }
+    }
+
+    fn rustup(&self) -> &dyn stable::Rustup {
+        &self.rustup
+    }
+}
+
+/// The host a run provisions for: `<os>-<arch>` as Rust names them, the Mac's own arm64
+/// where this process is an x86_64 build `translated` by Rosetta. A Mac's tools are the
+/// machine's, not one build's: a translated run that asked for Intel trees would replace
+/// the arm64 ones every native run placed (and back), under any program running from them.
+#[must_use]
+pub fn platform_of(os: &str, arch: &str, translated: bool) -> String {
+    if os == "macos" && arch == "x86_64" && translated {
+        "macos-aarch64".into()
+    } else {
+        format!("{os}-{arch}")
+    }
+}
+
+/// Whether this process runs translated by Rosetta (`sysctl.proc_translated`).
+fn translated() -> bool {
+    #[cfg(target_vendor = "apple")]
+    {
+        aterm_uds::process::translation() == aterm_uds::process::Translation::Translated
+    }
+    #[cfg(not(target_vendor = "apple"))]
+    {
+        false
+    }
+}
+
+/// This machine's [`Machine`] for the checkout at `repo`; `None` where no `$HOME` names
+/// the caches.
+#[must_use]
+pub fn this_machine(repo: &Path) -> Option<Machine> {
+    let home = std::env::var_os("HOME")
+        .filter(|h| !h.is_empty())
+        .map(PathBuf::from)?;
+    Some(Machine {
+        platform: platform_of(std::env::consts::OS, std::env::consts::ARCH, translated()),
+        tooling: aterm_uds::host::tooling_dir()?,
+        browser: crate::browser::chromium::host_cache_root()?,
+        repo: repo.to_path_buf(),
+        homes: stable::Homes::from_env(&home),
+    })
+}
+
+/// `verify provision`'s whole CLI, from `cwd`.
+#[must_use]
+pub fn main(args: &[String], cwd: &Path) -> i32 {
+    let opts = match parse(args) {
+        Ok(o) => o,
+        Err(e) => {
+            eprintln!("{e}\n\n{}", usage());
+            return crate::exit::USAGE;
+        }
+    };
+    if opts.help {
+        print!("{}", usage());
+        return crate::exit::PASS;
+    }
+    let repo = crate::checkout_root(cwd).unwrap_or_else(|| cwd.to_path_buf());
+    let Some(machine) = this_machine(&repo) else {
+        eprintln!("verify provision: COULD NOT RUN — no $HOME names this user's cache");
+        return crate::exit::COULD_NOT_RUN;
+    };
+    run(&opts, &machine, &System::new(&repo), &mut |l| {
+        eprintln!("verify provision: {l}");
+    })
+}

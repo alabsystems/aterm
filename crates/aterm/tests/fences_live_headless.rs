@@ -309,7 +309,7 @@ fn a_fenced_key_skips_a_swapped_box_and_the_worker_receives_nothing() {
     assert_eq!(std::fs::read(&keylog).unwrap(), b"1");
 }
 
-/// `act=` (session log phase 5, ruling T1) is checked with the key's other
+/// `act=` is checked with the key's other
 /// leading options before a byte moves: a malformed or repeated one answers
 /// `ERR usage` and the worker receives nothing. POSITIVE CONTROL:
 /// `key act=approve 1` delivers exactly the key's byte (the option is not

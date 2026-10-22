@@ -540,8 +540,8 @@ fn eviction_takes_classes_in_policy_order() {
     );
 }
 
-/// Front eviction alone (marks on the session, nothing else open) reads as
-/// slice 1 did: one gap, `resync_to` the oldest live less one, `oldest=` the
+/// Front eviction alone (marks on the session, nothing else open) reads as before:
+/// one gap, `resync_to` the oldest live less one, `oldest=` the
 /// oldest live.
 #[test]
 fn a_contiguous_loss_reads_as_slice_one_did() {
@@ -1071,7 +1071,7 @@ fn an_amend_of_a_closed_node_reindexes_its_closed_ancestors_too() {
 
 /// AN OPEN UNDER A CLOSED NODE HANGS THE SAME WHATEVER WAS EVICTED: `under=`
 /// a turn closed long ago (its run closed too) resolves its nearest open
-/// ancestor from the open path and the last closes alone (slice 1's rule),
+/// ancestor from the open path and the last closes alone (rule),
 /// never from the node index, which keeps the old turn only while a record
 /// of it lives. Two logs driven alike, one evicting and one not, write the
 /// same open. NEGATIVE CONTROL: their indexes differ about the old turn

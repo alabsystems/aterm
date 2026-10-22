@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! MAIL DIR=IN END TO END THROUGH A BRIDGE (plan 5B-7; ruling T13; 3B wrote
+//! MAIL DIR=IN END TO END THROUGH A BRIDGE (3B wrote
 //! the fabric's marks, `SessionLog::observe_fabric`, and no world test read
 //! them back): a guarded broker, a headless aterm and the bridge it launches,
 //! the bridge

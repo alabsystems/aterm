@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `aterm fabric mint-for|halt|inbox|post` — the PERSON side of the fabric.
+//! `aterm fabric mint-for|halt|inbox|post` — the person side of the fabric.
 //!
 //! ```text
 //! aterm fabric mint-for h-<name>|a-<name> [--out <cap>] [--fleet <F>] [--expires <N>d|<N>h]
@@ -10,69 +10,20 @@
 //! aterm fabric post  --cap-file <cap> to=@<sid>@<node> kind=<k> [re=<off>] [--] <text>
 //! ```
 //!
-//! A session speaks through its node's bridge, and its node's cap-forced
-//! `<src>` says so: what a person types in an aterm session arrives
-//! `trust=agent`, attested by that node. A PERSON speaks for themself, under a
-//! cap of their own — §8.2's human ring, [`crate::enable::person_grants`],
-//! minted by `aterm fabric mint-for h-<name>` on this machine, whose fabric
-//! root holds the mint secret — and the broker binds every publish to the
-//! principal the cap names. That is what these four verbs are:
-//!
-//! * `mint-for` mints that ring under `<root>/mint.secret`
-//!   ([`mint_for`]): the cap these verbs take, and the one `aterm link notify
-//!   --on ask:<person>` reads its mail with. It refuses anything but an `h-`
-//!   or `a-` id, and a secret that is missing, short or readable by another
-//!   user (the one reader, [`crate::transport::read_mint_secret`]). It never
-//!   prints the secret; `--out` writes the cap 0600, atomically, never over a
-//!   DIFFERENT file and never through a symlink, and makes an IDENTICAL file
-//!   already there 0600 before it says so; without `--out` the lines go to
-//!   stdout (like `aterm link mint`) and the guidance to stderr. `--expires
-//!   30d` stamps `exp=` into every grant, and the broker refuses the ring from
-//!   that instant on; without it the ring lasts until the secret is rotated.
-//!
-//! * A HUMAN's `halt` publishes the retained row `/f/<F>/fleet/<person>/halt`
-//!   (`v=1 t= state=on reason=<pct>`, or `state=off`). Every bridge applies it to every
-//!   session it hosts — `hold=1 origin=fleet`, `ERR halted` to every
-//!   PTY-reaching verb — re-reads it at every attach, and answers it on its
-//!   node's `ack` face. `off` withdraws THIS person's halt; another person's
-//!   still holds. Only an `h-` human halts: a bridge applies no other
-//!   principal's row, so an `a-` service's cap carries no halt grant and this
-//!   verb refuses one by name. Nothing else lifts a fleet hold: the Owner's
-//!   `hold <sid> off` is `ERR denied` for one, and `aterm fabric off` leaves
-//!   the row on the bus for the next `on` to re-apply.
-//! * `inbox` reads the person's mail lane `/f/<F>/in/p/<person>/>` — every
-//!   node's `post to=<person>`, the receipts of what the person sent, and the
-//!   bridges' `undeliverable`/`expired` notices — as a durable consumer group,
-//!   `/f/<F>/cur/p/<person>/inbox`: from where the last `inbox` left off to the
-//!   broker's head as it starts, then the group is COMMITTED past everything
-//!   it read, mail or none (never before it is printed; one commit record per
-//!   run; `--peek` commits nothing). The cursor lives in the broker, so any
-//!   host the person reads from agrees on what is unread.
-//! * `post` publishes `/f/<F>/in/<node>/<sid>/<person>/<kind>` — an answer to
-//!   an ask (`re=<off>`, which settles the asker's deadline: the reply is from
-//!   the principal the ask went to), a note, a report or a task. The address is
-//!   always the explicit `@<sid>@<node>` that `inbox` prints: a person has no
-//!   bridge, so no roster pins a bare sid.
-//!
-//! ## The sequence
-//!
-//! A person has no state dir, so a publish is keyed the way astream's own `asb
-//! pub` keys one: the producer sequence is the wall clock in nanoseconds, fresh
-//! per invocation and below astream's reserved ack half. One invocation
-//! publishes once and never retries, so it never re-uses a sequence; a broker
-//! that answers `deduped` (a clock that stepped back onto an earlier run's
-//! sequence) appended NOTHING, and that is reported as the failure it is, never
-//! as a success. A run whose answer was lost (the broker died after the append)
-//! may have landed: `halt` and `halt off` are retained rows, so re-running one
-//! is harmless; a re-run `post` is a second message.
-//!
-//! ## What it does not do
-//!
-//! It does not count who held a halt: every bridge answers on its node's `ack`
-//! face (`re=<off> state=held`), asynchronously, and a count read the instant
-//! after the publish would be a race. `aterm fabric` shows each session's
-//! `hold=`. And it holds no deadline for an ask a person sends: that sweep is
-//! a bridge's, and a person has none.
+//! * **`mint-for`** ([`mint_for`]): mints [`crate::enable::person_grants`] for an `h-` human or
+//!   `a-` service under `<root>/mint.secret` (optional `--expires <N>d|<N>h` stamps `exp=`).
+//!   `--out` writes mode 0600 atomically, refusing symlinks or different existing caps; without
+//!   `--out`, cap lines go to stdout and guidance to stderr.
+//! * **`halt`**: publishes the retained row `/f/<F>/fleet/<person>/halt` (`state=on` or
+//!   `state=off`). Only an `h-` human may halt the fleet; every bridge holds its sessions
+//!   (`hold=1 origin=fleet`) while any human's halt is `on`.
+//! * **`inbox`**: reads `/f/<F>/in/p/<person>/>` through consumer group `/f/<F>/cur/p/<person>/inbox`
+//!   up to the broker head captured at start, then commits once past everything printed (`--peek`
+//!   commits nothing; an unprinted message leaves the cursor uncommitted).
+//! * **`post`**: publishes `/f/<F>/in/<node>/<sid>/<person>/<kind>` (`to=@<sid>@<node>`, since a
+//!   person has no bridge roster to resolve a bare `<sid>`).
+//! * **Sequence**: publishes use the wall-clock nanosecond timestamp below `ACK_SEQ_BASE` as the
+//!   producer sequence and fail if the broker reports `deduped`.
 
 use std::collections::BTreeSet;
 use std::io;
@@ -501,27 +452,9 @@ fn post(
     Ok(())
 }
 
-/// `inbox [--peek]`: the person's unread mail, then the group committed past
-/// everything it read — mail or none. Printed as it arrives, so a deep backlog
-/// costs one record of memory.
-///
-/// * WHERE IT ENDS: the broker's head as the inbox starts. A mark or delivery
-///   at or past that head ends the read; that delivery belongs to the next
-///   inbox and is not printed. A progress mark below the captured head is
-///   never taken for "that was all", and a busy matching tail needs no mark.
-/// * HOW LONG IT MAY WAIT: a catch-up over a long log can scan for longer than
-///   a request's bound before its first matching record, so the subscription
-///   is held to its own (`bounds`; [`LIVE`] for the operator) — a liveness
-///   bound, which a broker that marks (checked first) keeps while it scans;
-///   past it the link is gone, and nothing is marked read.
-/// * WHAT IT MARKS READ: everything below the captured head, not only up to the
-///   last message printed. One commit record per run, so the next inbox scans
-///   only what arrived since; an inbox that committed only after mail would
-///   re-scan the whole bus since the person's last message, every run.
-///   `--peek` commits nothing. A new commit connection must identify exactly
-///   the log, including its generation, on which the snapshot was read.
-/// * WHEN IT MARKS NOTHING: mail `out` refused ([`Unprinted`]) was not read,
-///   whether its reader went away (`| head -1`) or the disk filled.
+/// `inbox [--peek]`: print unread mail up to the broker head captured at start, then commit
+/// the consumer group through `head - 1` (`--peek` and failed stdout writes commit nothing;
+/// the commit connection verifies the same `LogIdentity` before committing).
 fn inbox(
     cfg: &Config,
     cmd: &PersonCmd,
@@ -914,11 +847,7 @@ pub(crate) fn write_capability_to(out: &mut dyn io::Write, text: &str) -> io::Re
     out.write_all(text.as_bytes()).and_then(|()| out.flush())
 }
 
-/// Whether the cap `mint-for` wrote to stdout reached its reader whole, as `written` says: any
-/// write error refuses, a reader that went away included. A verb's answer into `| head -1` is no
-/// failure ([`aterm_uds::stdout::answer_status`]), but a cap cut short (`| ssh host 'cat > cap'`
-/// whose ssh died, `> cap` on a full disk) is no cap a person can present, and "minted … to
-/// stdout" would say it was.
+/// Map a failed stdout write of a minted capability into an error message.
 fn cap_on_stdout(written: io::Result<()>) -> Result<(), String> {
     written.map_err(|e| {
         format!(
@@ -928,13 +857,9 @@ fn cap_on_stdout(written: io::Result<()>) -> Result<(), String> {
     })
 }
 
-/// Write the cap `lines` to `path`, 0600 — never through a symlink, never over
-/// a DIFFERENT file; an IDENTICAL file already there is made 0600, and a wider
-/// mode it had is reported with what voids a copy (`secret`, the mint secret
-/// the cap was minted under). The path written.
+/// Write `lines` to `path` with mode 0600, refusing symlinks or different existing files; if an
+/// identical file already exists, tighten its mode to 0600 and warn if it was wider.
 fn write_cap(path: &Path, lines: &str, secret: &Path) -> Result<PathBuf, String> {
-    // NEVER THROUGH A SYMLINK: `read` and the write below would both follow
-    // one at `--out`, into a file somebody else chose.
     if std::fs::symlink_metadata(path).is_ok_and(|m| !m.file_type().is_file()) {
         return Err(format!(
             "{} exists and is not a regular file; remove it or choose another --out",
@@ -942,8 +867,6 @@ fn write_cap(path: &Path, lines: &str, secret: &Path) -> Result<PathBuf, String>
         ));
     }
     match std::fs::read(path) {
-        // THE SAME CAP IS ALREADY THERE: made 0600 first, since the line
-        // after says so, and a wider mode is reported.
         Ok(old) if old == lines.as_bytes() => match private_mode(path) {
             Ok(None) => {}
             Ok(Some(was)) => eprintln!(

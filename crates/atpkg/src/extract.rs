@@ -1427,6 +1427,45 @@ pub(crate) fn extract_zip_tree(
     zipread::extract(archive, dest_root, max_total_bytes, max_entries, opts)
 }
 
+/// Which container a vetted [`extract_tree`] reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Container {
+    /// A gzip-compressed tar (`.tar.gz`, `.tgz`).
+    TarGz,
+    /// An uncompressed tar.
+    Tar,
+    /// A zip archive.
+    Zip,
+}
+
+/// Lay `archive` into `dest_root`, an existing empty directory, through the lanes a
+/// package install lays a vendor archive with: every member's path vetted beneath the
+/// root, modes from [`safe_mode`], links only as `opts.symlinks` admits, at most
+/// `max_total_bytes` of content in at most `install::MAX_ENTRIES` entries. For a caller
+/// outside atpkg that unpacks an upstream archive it pinned by sha256 and checked before
+/// this call (`targo --unverified verify provision`). On an error the caller removes the
+/// partial `dest_root`.
+///
+/// # Errors
+/// Any [`ExtractError`]; a `dest_root` that is not empty is refused before anything is
+/// laid.
+pub fn extract_tree(
+    archive: &Path,
+    dest_root: &Path,
+    container: Container,
+    max_total_bytes: u64,
+    opts: ExtractOptions,
+) -> Result<(), ExtractError> {
+    require_empty_destination(dest_root)?;
+    let entries = crate::install::MAX_ENTRIES;
+    match container {
+        Container::TarGz => extract_tar_gz_tree(archive, dest_root, max_total_bytes, entries, opts),
+        Container::Tar => extract_tar_tree(archive, dest_root, max_total_bytes, entries, opts),
+        Container::Zip => extract_zip_tree(archive, dest_root, max_total_bytes, entries, opts),
+    }
+    .map(|_| ())
+}
+
 /// The fold a `fold = true` extraction always produces; its absence fails closed.
 fn folded(tree: Option<TreeAccumulator>) -> Result<TreeAccumulator, ExtractError> {
     tree.ok_or_else(|| io::Error::other("extraction produced no tree_root").into())

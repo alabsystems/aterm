@@ -81,7 +81,7 @@ pub struct VoiceTerms {
 /// [`Voice::motion_twin`].
 #[inline]
 #[must_use]
-pub fn voice_gain(voice: Voice, terms: &VoiceTerms) -> Option<f32> {
+pub const fn voice_gain(voice: Voice, terms: &VoiceTerms) -> Option<f32> {
     if terms.reduced_motion && voice.motion_twin().is_some() {
         return None;
     }
@@ -92,8 +92,12 @@ pub fn voice_gain(voice: Voice, terms: &VoiceTerms) -> Option<f32> {
 /// `motion_focus` bit that recordings use to keep visual effects moving. A
 /// background recording may animate; it must never make the Mac speak.
 #[inline]
-pub fn trail_sound_gain(raw_focused: bool, configured: bool, volume: f32) -> Option<f32> {
-    (raw_focused && configured && volume > 0.0).then_some(volume)
+pub const fn trail_sound_gain(raw_focused: bool, configured: bool, volume: f32) -> Option<f32> {
+    if raw_focused && configured && volume > 0.0 {
+        Some(volume)
+    } else {
+        None
+    }
 }
 
 /// Resolve sing-along riff audio: [`trail_sound_gain`] plus the riff's own
@@ -101,7 +105,7 @@ pub fn trail_sound_gain(raw_focused: bool, configured: bool, volume: f32) -> Opt
 /// without muting the keystroke palette. It gates sound only; the celebration's
 /// visuals keep running. The single-pane and split-pane riff seams both use it.
 #[inline]
-pub fn sing_riff_gain(
+pub const fn sing_riff_gain(
     raw_focused: bool,
     trail_sounds: bool,
     riff: bool,
@@ -124,7 +128,7 @@ pub fn sing_riff_gain(
 /// read before any policy fold. Zero is their explicit off: it silences the
 /// key seam, and the verb calls it `trail-off` rather than `engine-silent`.
 #[inline]
-pub fn user_lit(resolved: &crate::cursor_glow::GlowConfig) -> bool {
+pub const fn user_lit(resolved: &crate::cursor_glow::GlowConfig) -> bool {
     resolved.intensity > 0.0
 }
 
@@ -137,7 +141,7 @@ pub fn user_lit(resolved: &crate::cursor_glow::GlowConfig) -> bool {
 /// aurora at all, so a shed frame or Reduce Motion never silences keystrokes.
 /// The `TrailSoundSeam` conformance drives this function directly.
 #[inline]
-pub fn fold_window_audibility(
+pub const fn fold_window_audibility(
     cfg: &mut crate::cursor_glow::GlowConfig,
     motion_amplitude: f32,
     shed_env: f32,
@@ -245,7 +249,7 @@ pub struct TrailSoundPolicy {
 /// (`app_input`) and the frame drain both build events here, so the same
 /// keystroke sounds the same whichever seam carries it.
 #[inline]
-pub fn trail_sound_event(
+pub const fn trail_sound_event(
     cue: &crate::cursor_glow::SoundCue,
     style: crate::cursor_glow::GlowStyle,
     cols: u16,
@@ -310,7 +314,7 @@ pub fn drain_trail_sound_cues(
 /// is the one stated exception. The focus, master and volume terms delegate
 /// to [`trail_sound_gain`], as [`sing_riff_gain`] does.
 #[inline]
-pub fn bonk_sound_gain(
+pub const fn bonk_sound_gain(
     raw_focused: bool,
     trail_sounds: bool,
     enabled: bool,

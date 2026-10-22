@@ -155,9 +155,11 @@ pub(crate) const JOBS_FRESH: Duration = Duration::from_secs(60);
 /// WHETHER A JOBS VIEW `age` OLD SPEAKS FOR NOW: one at most [`JOBS_FRESH`]
 /// old does; so does a PARKED one (its demand idle: every live job waits only
 /// for the person, or none is live) of any age while its reader runs
-/// (`reader`), because a parked engine is read again only on an edge (output,
-/// a session's fork, `exec` or exit, the disk watch's look; design §6.1), so
-/// no reading since says nothing changed. An idle Claude Code, vim, less or a
+/// (`reader`), because a parked engine is read again only on an edge (output
+/// that moves a screen, a parked screen's redraw at most once a floor, a
+/// session's fork, `exec` or exit the kernel watch hears, the disk watch's
+/// look; design §6.1), so no reading since says nothing changed that drew or
+/// that the kernel told of. An idle Claude Code, vim, less or a
 /// password prompt keeps its `job=` and its brief line for as long as it
 /// waits. A view that is not parked, or whose reader stopped, says nothing of
 /// now past the minute.

@@ -4347,9 +4347,7 @@ fn pid_for_completion(pid: i32) -> u32 {
 ///
 /// So a successor computes the same `control_socket_dir` (`XDG_RUNTIME_DIR`, else `HOME`)
 /// as the process that launched it, and the manifest, layout and rendezvous paths in that
-/// directory are inside its own. Round eight's lead U42, a refusal of every handoff from a
-/// parent whose `XDG_RUNTIME_DIR` or `HOME` differs from launchd's, rested on the
-/// opposite assumption, and cannot happen. The two are carried explicitly as well
+/// directory are inside its own. The two are carried explicitly as well
 /// ([`CONTROL_DIR_KEYS`]), so that holds whatever environment a later macOS merges over.
 #[cfg(target_os = "macos")]
 fn launch_environment(
@@ -10713,7 +10711,7 @@ mod admission_refusal_detail_tests {
 
     /// A live-session refusal keeps WHY the handoff is unavailable and what
     /// changes it, within the 400 characters durable health keeps — whatever
-    /// the foreground probe answered (ROUND EIGHT, U26: an unreadable
+    /// the foreground probe answered (U26: an unreadable
     /// foreground used to swap in the probe's words and drop both, and the
     /// recorded reason flipped between the two across retries). The
     /// admission block's own sentence carries neither. So does the refusal of a
@@ -11818,8 +11816,8 @@ enum UndialledStandDown {
     Unnamed,
 }
 
-/// Stands down the launched successor of an attempt that ended before its dial (round
-/// eight's lead U41): the dial budget ran out, or the cancel came, and the successor may
+/// Stands down the launched successor of an attempt that ended before its dial:
+/// the dial budget ran out, or the cancel came, and the successor may
 /// still run — inside its boot on a loaded desk, or wedged. An attempt retires only over a
 /// successor proven gone (`NativeUpdateOverlapHandoff`'s `UngrantedRetireRequiresReap`), or
 /// a retry launches beside it and a wedged one lives on, window-less. The successor is named
@@ -11872,8 +11870,8 @@ struct UndialledRetire {
     give_back: Option<HandoffCandidate>,
 }
 
-/// Files the end of a dial wait that came before any dial, the cancel or the dial deadline
-/// (round eight's lead U41): the successor is stood down first
+/// Files the end of a dial wait that came before any dial, the cancel or the dial deadline:
+/// the successor is stood down first
 /// ([`stand_down_undialled_successor`]), and only then is the rollback made
 /// (`NeverTransferred`: nothing was accepted), so it cannot be published over a successor
 /// still running. A successor nothing names within `patience` (no LaunchServices answer and

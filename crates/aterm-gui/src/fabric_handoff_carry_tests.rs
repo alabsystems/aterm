@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! ROUND SEVEN OF THE UPDATE AUDIT, FINDINGS 6, 8 AND 28: what a seamless
+//! what a seamless
 //! update carries of a session's mailbox beside its topics and hold
 //! ([`FabricCarry`]), driven through the real manifest — `from_store`, TOML
 //! out and back, and the spawn's own seed.
@@ -281,9 +281,9 @@ fn a_broadcast_its_refilling_bridge_let_go_of_is_counted_lost() {
     });
 }
 
-/// FINDING 6: a post still queued and a receipt still owed at the park are
+/// a post still queued and a receipt still owed at the park are
 /// on the SUCCESSOR's `outbox` peek — its bridge drains them — under the
-/// ids the old process gave them. FINDINGS 8 AND 28: every id the
+/// ids the old process gave them. every id the
 /// successor hands out after that is above the old process's, so a
 /// pre-update anchor or sequence pin never names a new row, post or
 /// receipt. NEGATIVE CONTROL: a post the bridge already retired is not
@@ -487,7 +487,7 @@ fn unknown_carried_receipts_stay_fenced_before_the_first_log_report() {
 }
 
 /// A PTY KEEPER RECOVERY IS NOT A FRESH MAILBOX (the fabric audit's fourth
-/// round, findings 2-5). A session the keeper kept through a crash keeps
+/// round). A session the keeper kept through a crash keeps
 /// its sid and its agent, and comes back from its META's fabric: HELD
 /// again before it answers a verb, its broadcast opt-in listed (so the new
 /// bridge keeps the topic's cursor), every id above the dead window's (an
@@ -826,7 +826,6 @@ fn the_commit_sees_the_outbox_move_and_a_post_waits_on_its_fence() {
     });
 }
 
-/// FINDING 8's GUARD, for a successor whose producer predates the id carry:
 /// an `await inbox since=` above every id this session has handed out
 /// names no row of this process's, and is refused at once — never parked
 /// over unread mail until `OK timeout`.
@@ -858,7 +857,7 @@ fn an_inbox_anchor_this_process_never_minted_is_refused() {
     });
 }
 
-/// ROUND SEVEN'S REVIEW, ITEM 1: THE MAIL BUDGET CHARGES WHAT TOML WRITES,
+/// THE MAIL BUDGET CHARGES WHAT TOML WRITES,
 /// AND IT HOLDS THE RECEIPTS TOO. A post of ANSI colour codes escapes to up
 /// to six bytes per byte in the manifest, so it is charged that — a budget
 /// its RAW length fits leaves it uncarried, said — and owed receipts are
@@ -941,7 +940,7 @@ fn the_mail_budget_charges_what_toml_writes_and_holds_the_receipts() {
     });
 }
 
-/// ROUND SEVEN'S REVIEW, ITEM 1: SHEDDING THE CARRY keeps the counters and
+/// SHEDDING THE CARRY keeps the counters and
 /// retires every post dead in the successor, `not-carried`, said; the
 /// receipts are counted. What the manifest writer does before it would
 /// refuse an update over its cap.
@@ -991,7 +990,7 @@ fn a_shed_carry_keeps_its_counters_and_says_what_it_dropped() {
     });
 }
 
-/// ROUND SEVEN'S REVIEW OF GROUP J, ITEM 2: INBOUND MAIL IN THE OVERLAP
+/// INBOUND MAIL IN THE OVERLAP
 /// NEVER VETOES THE UPDATE. A row delivered after the park's draw moves no
 /// serial the Commit compares, and one delivered under the Commit's fence
 /// is answered at once: the manifest carried the last id plus
@@ -1062,7 +1061,7 @@ fn notice_every() -> std::time::Duration {
 /// [`SessionFabric::fence_wait`], the longest any fenced path on them waits
 /// before a `hold`, a post and a retirement answer [`HOLD_BUSY`] — failing
 /// the moment one answers. A watch that ended inside the bound would pass a
-/// wait that times out into `ERR busy` (round seven's review of group J,
+/// wait that times out into `ERR busy` (
 /// open problem 202). The minute is a hang detector, never a budget.
 #[cfg(unix)] // the update fence (`lift_hold_fence`) is unix-only
 fn still_waiting_past_every_fenced_bound(
@@ -1105,7 +1104,7 @@ fn still_waiting_past_every_fenced_bound(
     }
 }
 
-/// ROUND SEVEN'S REVIEW OF GROUP J, ITEM 1, AND OPEN PROBLEMS 201-203: A
+/// A
 /// DELIVERY THAT MUST NOT BE ANSWERED UNDER THE COMMIT'S FENCE WAITS FOR
 /// THE ATTEMPT, for as long as the fence stands, and is never answered an
 /// `ERR`: the bridge books any non-`OK` reply as a verdict (the
@@ -1194,7 +1193,7 @@ fn a_fenced_delivery_waits_past_every_bound_and_is_never_refused() {
     assert_eq!(broadcast(&store, &bsid, 11, "news", "shout"), "OK 2\n");
 }
 
-/// ROUND SEVEN'S REVIEW, ITEM 5: THE FENCE HOLDS A RETIREMENT BACK ONLY FOR
+/// THE FENCE HOLDS A RETIREMENT BACK ONLY FOR
 /// A SUCCESSOR THAT READS THE CARRY. An older one restarts the post ids
 /// under the same sid, so a retirement left unanswered keeps a sequence
 /// pin its own post would be deduplicated into; for it the retirement is

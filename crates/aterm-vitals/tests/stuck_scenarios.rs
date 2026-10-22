@@ -885,6 +885,82 @@ fn a_program_at_the_persons_raw_read_parks_demand_even_while_it_writes_files() {
     );
 }
 
+/// THE PARKED TABS (`JobsView::parked_tabs`, design §6.1): a tab is parked
+/// exactly while every live job of it holds the foreground at the person's
+/// own raw read and adds no demand, whatever its class: an idle full-screen
+/// program at its prompt, or one at the prompt that writes its own files.
+/// NEGATIVE CONTROLS, each leaving its tab unparked: the same program in a
+/// canonical terminal (no read is named), one that drew past its mode word,
+/// one spinning a core at the raw read (still watched fast), the raw program
+/// beside a background job of the same tab, and an exited job alone (no live
+/// job: nothing to park). Another tab's park never parks this one.
+#[test]
+fn a_tab_is_parked_only_while_every_live_job_waits_at_the_persons_read() {
+    let parked = |w: &mut World| run_to(w, 20_000, |_, _| {}).parked_tabs;
+
+    let mut w = World::new();
+    w.run_fg(1, 51, "./muse", sleeper(1000, "muse"));
+    w.tty_mode(1, false, false);
+    w.shell_tab(2, 2, 2000);
+    assert_eq!(parked(&mut w), vec![1], "at its prompt: parked");
+
+    let mut w = World::new();
+    let mut writer = sleeper(1000, "agy");
+    writer.cpu_per_s = 18_000_000;
+    writer.writes_per_s = 256 * 1024;
+    w.run_fg(1, 51, "./agy", writer);
+    w.tty_mode(1, false, false);
+    let v = run_to(&mut w, 60_000, |_, _| {});
+    assert_eq!(v.row("b51").map(|r| r.class), Some(Class::Running));
+    assert_eq!(v.parked_tabs, vec![1], "writing its own files at the read");
+
+    let mut w = World::new();
+    w.run_fg(1, 51, "./muse", sleeper(1000, "muse"));
+    assert!(
+        parked(&mut w).is_empty(),
+        "a canonical terminal names no read"
+    );
+
+    let mut w = World::new();
+    w.run_fg(1, 51, "./muse", sleeper(1000, "muse"));
+    w.tty_mode(1, false, false);
+    let v = run_to(&mut w, 20_000, |w, rel| {
+        if rel > 0 {
+            w.cr(1);
+        }
+    });
+    assert!(
+        v.parked_tabs.is_empty(),
+        "drawn past its word: no read named"
+    );
+
+    let mut w = World::new();
+    w.run_fg(1, 51, "./muse", spinner(1000, "muse"));
+    w.tty_mode(1, false, false);
+    let v = run_to(&mut w, 60_000, |_, _| {});
+    assert_eq!(v.demand, Demand::Fast);
+    assert!(v.parked_tabs.is_empty(), "spinning at the read: watched");
+
+    let mut w = World::new();
+    w.run_fg(1, 51, "./muse", sleeper(1000, "muse"));
+    w.tty_mode(1, false, false);
+    w.run_bg(1, sleeper(1100, "sleep"));
+    assert!(parked(&mut w).is_empty(), "a background job beside it");
+
+    let mut w = World::new();
+    w.run_fg(1, 51, "./muse", sleeper(1000, "muse"));
+    w.tty_mode(1, false, false);
+    let _ = run_to(&mut w, 4_000, |_, _| {});
+    w.exit(1000, false);
+    w.close_block(1, 0);
+    let v = run_to(&mut w, 4_000, |_, _| {});
+    assert_eq!(v.row("b51").map(|r| r.verdict), Some(Verdict::Exited));
+    assert!(
+        v.parked_tabs.is_empty(),
+        "an exited job alone parks nothing"
+    );
+}
+
 /// A full-screen program at its prompt whose fds 1 and 2 are its own log
 /// (agy 1.4.5 in the real-Claude lab, 2026-10-21: the terminal raw, a log
 /// line every 5 s while its telemetry post is refused), playing tab `key`'s

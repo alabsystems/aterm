@@ -33,35 +33,31 @@ use super::store::Store;
 
 /// The usage text.
 pub const USAGE: &str = "\
-aterm ai — this machine's AI CLIs (claude, codex, agy, muse): one working login each,
-a doctor that signs in what needs it, and reviews one AI asks of another.
+aterm ai — AI CLIs on this machine (claude, codex, agy, muse): logins, doctor, and cross-AI reviews.
 
-  aterm ai                      the doctor, read-only (exit 0)
-  aterm ai doctor [--read-only] [--json] [--on <host>,… | --fleet]
-                                look, then on your terminal sign in each CLI that needs it,
-                                through its vendor's own flow; --on and --fleet do the same
-                                on other machines over ssh ([harness] hosts)
-  aterm ai login <cli>          one CLI's sign-in
-  aterm ai review [--with <cli>,… | --all] [--from <cli>] [--base <ref> | --uncommitted]
+  aterm ai [status] [--json]    read-only status and health (exit 0)
+  aterm ai doctor [--read-only] [--json] [--on <host>,\u{2026} | --fleet]
+                                inspect CLIs and, in an interactive terminal, sign in any
+                                that need it (--on / --fleet also run over ssh via [harness] hosts)
+  aterm ai login <cli>          run one CLI's vendor sign-in flow
+  aterm ai review [--with <cli>,\u{2026} | --all] [--from <cli>] [--base <ref> | --uncommitted]
                   [--permissions <inherit|yolo|edits|ask|plan>] [--timeout <s>] [--json]
                   [--] [<what to look for> | -]
-                                hand this directory's change to every AI CLI used here but
-                                the asker, each with all its tools, in this repository, at
-                                the asking agent's own permission level; print the answers
+                                ask other configured AI CLIs to review this directory's change
+                                at the asking agent's permission level
   aterm ai review --show <id> [--json]
-                                a review's answers again (kept a day)
-  aterm ai fleet [status]       the fleet document: where it comes from, what is held
-  aterm ai fleet fetch          fetch the fleet document from its URL now, and verify it
+                                reprint a saved review (kept 24h)
+  aterm ai fleet [status]       show fleet document source, signer, and cached state
+  aterm ai fleet fetch          fetch and verify the fleet document from its https:// URL
   aterm ai fleet keygen <secret-key-file>
-                                make the key that signs a fleet document (owner, once)
+                                generate an Ed25519 signing keypair (0600, never overwritten)
   aterm ai fleet sign <doc> --key <secret-key-file>
-                                sign a fleet document: writes <doc>.sig beside it
+                                sign <doc> and write <doc>.sig beside it
   aterm ai fleet verify <doc> [--key <public-key>]
-                                check <doc> against <doc>.sig
+                                verify <doc> against <doc>.sig
 
-Settings ▸ Harness ▸ AI CLIs, and `aterm help ai`, say more. Configuration: [ai] in
-aterm.toml, and the fleet document ([ai] fleet: a file or an https:// URL, else
-ai-fleet.toml beside aterm.toml).";
+Config: `[ai]` in `aterm.toml` and `ai-fleet.toml` (or `[ai] fleet` path / https:// URL).
+See `aterm help ai`.";
 
 /// Everything the verbs read of the process, once.
 #[derive(Debug, Clone)]
@@ -1037,7 +1033,7 @@ fn login_verb(
     if !env.stdin_tty {
         let _ = writeln!(
             err,
-            "aterm ai login: not run: stdin is not a terminal (a sign-in opens a browser and waits); run `aterm ai login {id}` in a terminal"
+            "aterm ai login: stdin is not a terminal; run `aterm ai login {id}` in a terminal"
         );
         return ExitCode::from(2);
     }
@@ -1187,7 +1183,7 @@ fn review_verb(
     if env.var("CODEX_SANDBOX").is_some_and(|v| !v.is_empty()) {
         return refuse(
             err,
-            "it needs the network, which Codex's sandbox blocks: run `aterm ai review …` outside your sandbox",
+            "blocked by Codex's sandbox (needs network): run `aterm ai review …` outside the sandbox",
         );
     }
     let l = look(env);
@@ -1405,7 +1401,7 @@ fn fleet_status(env: &Env, out: &mut dyn Write) -> ExitCode {
         pad("source:", LABEL_W),
         s.fleet_source
             .as_deref()
-            .unwrap_or("none ([ai] fleet names none, and no ai-fleet.toml lies beside aterm.toml)")
+            .unwrap_or("none (no [ai] fleet or ai-fleet.toml beside aterm.toml)")
     );
     let _ = writeln!(
         out,
@@ -1489,13 +1485,10 @@ fn fleet_keygen(path: &Path, out: &mut dyn Write) -> Result<(), String> {
         .map_err(|e| crate::harness::one_line(&e.to_string(), 120))?;
     let _ = writeln!(
         out,
-        "secret key: {} (keep it private, and out of the fleet document's repository)\n\
+        "secret key: {} (keep private)\n\
          public key: {public}\n\n\
-         Sign a document with `aterm ai fleet sign <doc> --key {}`, serve <doc> and <doc>.sig\n\
-         side by side over HTTPS, and on each machine set, in aterm.toml:\n\n\
-         [ai]\n\
-         fleet = \"https://…/ai-fleet.toml\"\n\
-         fleet_key = \"{public}\"",
+         Sign with `aterm ai fleet sign <doc> --key {}`, serve <doc> and <doc>.sig over HTTPS,\n\
+         and set `[ai] fleet = \"https://\u{2026}/ai-fleet.toml\"` and `fleet_key = \"{public}\"` in aterm.toml.",
         path.display(),
         path.display()
     );
@@ -1535,11 +1528,7 @@ fn fleet_sign(doc: &Path, key: &Path, out: &mut dyn Write) -> Result<(), String>
             let _ = writeln!(out, "seq {n}: a machine takes it only over a lower seq");
         }
         None => {
-            let _ = writeln!(
-                out,
-                "warning: no `seq`: a machine fetching it from a URL refuses it (add `seq = 1`, \
-                 raised at every edit)"
-            );
+            let _ = writeln!(out, "warning: no `seq`; URL fetches require `seq = <n>`");
         }
     }
     for n in notes {

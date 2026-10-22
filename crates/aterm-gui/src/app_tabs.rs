@@ -1778,7 +1778,7 @@ impl App {
     }
 
     /// THE SESSION LOG'S CLAUSE as `session`'s chrome is composed with it
-    /// (phase 3B; addendum A12, ruling S16), only with `[session_log] clause`
+    /// (phase 3B), only with `[session_log] clause`
     /// on: a `try_lock` on `timeline`, taken after the blocking `high_id` read
     /// as a separate acquisition. Contended, the cached clause is served and
     /// the session enlisted in the retry lane, as a contended terminal is
@@ -2922,7 +2922,7 @@ impl App {
             .get(&h.local_id)
             .and_then(crate::harness_glass::SessionGlass::end);
         let landed = self.chip_face_landed(h.local_id);
-        // LANDING (§12.4.3 item 1, slice 3c): Land's instruction typed to it
+        // LANDING (§12.4.3 item 1): Land's instruction typed to it
         // and a hold standing, under `⤓ land` ([`Self::shown_hold`]); its
         // tip what holds it, with no clock.
         let hold = self.shown_hold(h.local_id);
@@ -3117,8 +3117,8 @@ impl App {
     }
 
     /// A SEAMLESS UPDATE'S CARRIED END, at `session`'s first publication
-    /// here (`docs/DESIGN-harness-autopilot-2026-10-15.md` §11.2.3, item 8;
-    /// slice 2b): what the outgoing process held of its Autopilot task
+    /// here (`docs/DESIGN-harness-autopilot-2026-10-15.md` §11.2.3, item 8):
+    /// what the outgoing process held of its Autopilot task
     /// (`SessionRecord::autopilot_end`, by sid `sid`). Beside
     /// [`Self::adopt_status_carry`], and spent at once as it is:
     ///

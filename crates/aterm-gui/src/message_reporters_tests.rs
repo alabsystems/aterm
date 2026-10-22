@@ -438,14 +438,14 @@ fn who_set_it_is_the_records_last_line_never_its_title() {
 
 /// ONLY AN INTERRUPT STANDS ON THE BAND (the owner, 2026-09-28: "there needs
 /// to be some clear reason why the user must be engaged and what the user
-/// should do ... don't continue to persist alerts to the user that are not
+/// should do... don't continue to persist alerts to the user that are not
 /// actionable"; the second reviews of 2026-09-29: this claim was type-checked
 /// and never observed). For a roster of rows that covers every class the
 /// classifier has, the reporter's entry is a standing warn row exactly where
 /// [`Row::interrupt`] names a need and says that need's words; every other
 /// row — a wait before or after its notice, a usage limit, a rest, a
-/// refusal, a give-up after the owner's own press three days behind (round
-/// six, F7: it stood as a warn row for days) — is a record (`LogOnly`).
+/// refusal, a give-up after the owner's own press three days behind (F7: it stood as a warn row for days)
+/// — is a record (`LogOnly`).
 /// The pure half of the pre-landing drive (`plan-upgrade` 12.0): the host's
 /// half is driven against a private instance.
 #[test]
@@ -686,7 +686,7 @@ fn a_resting_round_that_gave_up_is_a_record_that_offers_upgrade_now() {
 /// A TAB NO WORKER OF ATERM'S RUNS IN, BY SOMEONE ELSE'S HAND, IS NEVER
 /// SAID AS ATERM'S OWN FAULT (the review of 2026-09-30, of C10): its agent
 /// suspended with `^Z` (not in front), its tab under another supervisor's
-/// claim, or its Autopilot turned off by the owner (the review of a295792e4)
+/// claim, or its Autopilot turned off by the owner
 /// (`Row::aside`, which the owner's view sets). The record nothing has
 /// stamped for three hours is told by what holds it — "it is not in front in
 /// its tab", "another supervisor holds its tab", "its autopilot is off" —
@@ -1695,7 +1695,7 @@ fn a_folder_row_reads_back_as_the_folders_it_names() {
     assert_eq!(folder_row_named(&restored_tab_failed("x")), None);
 }
 
-/// AUDIT #7 FINDING 48 — the reopened layout's restored line claimed every
+/// the reopened layout's restored line claimed every
 /// tab came back in its folder; it COUNTS the panes that could not open
 /// theirs instead, and claims folders only when none failed. A pane a
 /// program held whose folder is not here (audit #8) is not counted, and
@@ -2982,7 +2982,7 @@ fn r44_overdue_tabs(
         .collect()
 }
 
-/// `UPGRADE NOW` ONLY WHERE IT MOVES (round eight, #4's review and its
+/// `UPGRADE NOW` ONLY WHERE IT MOVES (#4's review and its
 /// review). A quiet round its agent's own work gave up on — the work seen
 /// since its notice, or running under the agent at the last look — is a
 /// wait on that work: `Upgrade now` re-arms a round the quiet restart's

@@ -2,7 +2,7 @@
 // Copyright 2026 Andrew Yates
 
 // WHY LAND STILL HOLDS, TOLD BY THE LOOP (`docs/DESIGN-harness-autopilot-2026-10-15.md`
-// §12.3.3 item 2, slice 3b): what a recording host is told through
+// §12.3.3 item 2): what a recording host is told through
 // `IdleHost::land_held` — by the loop's one teller (`Session::tell_hold`),
 // where the face is told (each start, each point folded in, each live read
 // of someone else's turn), at each act's ledger row, at an Off park, and

@@ -227,10 +227,13 @@ pub const MESA: &[&str] = &["libgl1-mesa-dri", "libegl-mesa0", "mesa-vulkan-driv
 /// aterm-render's script and emoji tests need, and without them those answer
 /// COULD NOT RUN), the x86_64 cross toolchain with its libc, zsh and fish,
 /// the shells aterm integrates beside bash, whose integration tests run each
-/// one and cannot run without it (pwsh, the fourth, is [`PWSH`]), the two
+/// one and cannot run without it (apt's fish, 3.7 on noble, is the fish floor
+/// lane, docs/DESIGN-init-system-2026-10-20.md §6.2: the guest never takes the
+/// pinned 4.9.3 `verify provision` builds on macOS; pwsh, the fourth, is
+/// [`PWSH`], Microsoft's release archive held to its sha256), the two
 /// build tools [`BASH_3_2_INSTALL`] needs (autotools-dev's `config.guess` and
 /// `config.sub`, which know aarch64, and bison), unzip,
-/// which `verify fetch-browser` unpacks the browser lane's pinned browsers
+/// which `verify provision` unpacks the browser lane's pinned browsers
 /// with, sway (headless wlroots: the one lane compositor that grants
 /// server-side decorations and offers cursor-shape-v1 and a virtual pointer,
 /// for `linux edges`), grim (its screenshot, for the shadow margin's

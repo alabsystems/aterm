@@ -17,7 +17,7 @@
 //! Rosetta 2 is Apple's x86_64 translator. On an Apple-silicon Mac the apply installs it
 //! when it is missing ([`apply_rosetta`]), so every ALab Mac has it the way it has the
 //! toolset: `softwareupdate --install-rosetta --agree-to-license`, run as the user, which
-//! needs no administrator (owner ruling R1, docs/DESIGN-machines-2026-10-16.md; measured
+//! needs no administrator (docs/DESIGN-machines-2026-10-16.md; measured
 //! 2026-10-18 and 2026-10-21). `[machine] rosetta = false` turns it off; elsewhere it is
 //! inert ([`ROSETTA_APPLIES`]).
 

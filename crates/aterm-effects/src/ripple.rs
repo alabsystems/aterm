@@ -128,7 +128,7 @@ fn profile(x: f32) -> f32 {
 /// The current ring's distance from the origin at `ms`, in cells: `0` at
 /// each cycle's start, under [`GLINT_LAP`].
 #[inline]
-fn front(ms: u64) -> f32 {
+const fn front(ms: u64) -> f32 {
     GLINT_CELLS_PER_S * (ms % GLINT_PERIOD_MS) as f32 / 1000.0
 }
 

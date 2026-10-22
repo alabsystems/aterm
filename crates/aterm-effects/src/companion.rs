@@ -263,7 +263,7 @@ pub fn prepare_resident_pet_tick(
 ///     A pet never yet dressed (`worn` `None`) keeps its ceremony.
 #[must_use]
 #[inline]
-pub fn pet_arrival_for_sync(
+pub const fn pet_arrival_for_sync(
     rung: CompanionRung,
     authorised: PetArrival,
     worn: Option<(u8, u8)>,
@@ -851,7 +851,7 @@ impl CompanionOwner {
     /// a drain's fresh brain wears it) and written to the brain now. Switching
     /// swaps the sprite without resetting the companion.
     #[inline]
-    pub fn set_species(&mut self, s: PetSpecies) {
+    pub const fn set_species(&mut self, s: PetSpecies) {
         self.species = s;
         self.pet.set_species(s);
     }
@@ -860,12 +860,19 @@ impl CompanionOwner {
     /// so an idle hover costs no render. A non-finite sample is dropped; a sample
     /// fed with the frame ([`HostFrameInput::pointer_px`]) wins.
     #[inline]
-    pub fn set_pointer(&mut self, px: Option<(f32, f32)>) -> bool {
-        let next = px.filter(|(x, y)| x.is_finite() && y.is_finite());
+    pub const fn set_pointer(&mut self, px: Option<(f32, f32)>) -> bool {
+        let next = match px {
+            Some((x, y)) if x.is_finite() && y.is_finite() => Some((x, y)),
+            _ => None,
+        };
         if px.is_some() && next.is_none() {
             return false;
         }
-        let changed = self.pointer_px != next;
+        let changed = match (self.pointer_px, next) {
+            (Some((x0, y0)), Some((x1, y1))) => x0 != x1 || y0 != y1,
+            (None, None) => false,
+            _ => true,
+        };
         self.pointer_px = next;
         changed
     }
@@ -1512,14 +1519,14 @@ impl CompanionOwner {
 
     /// The terminal BEL rang in the pane this pet is chasing.
     #[inline]
-    pub fn note_bell(&mut self, now: Instant) {
+    pub const fn note_bell(&mut self, now: Instant) {
         self.pet.note_bell(now);
     }
 
     /// The hand found its flow (`CursorGlow::take_flow_entry`), forwarded between
     /// [`Self::prepare`] and [`Self::tick`].
     #[inline]
-    pub fn note_flow(&mut self, now: Instant) {
+    pub const fn note_flow(&mut self, now: Instant) {
         self.pet.note_flow(now);
     }
 
@@ -1545,14 +1552,14 @@ impl CompanionOwner {
     /// The typed line turned into prose, or was aborted: take back a tentative
     /// kitty command not yet performed. Idempotent.
     #[inline]
-    pub fn revoke_trick(&mut self) {
+    pub const fn revoke_trick(&mut self) {
         self.pet.revoke_trick();
     }
 
     /// The whole submitted line was pet talk (`sit` + Enter at a shell): the
     /// brain does not grieve the fast `command not found` that follows.
     #[inline]
-    pub fn note_trick_submit(&mut self, now: Instant) {
+    pub const fn note_trick_submit(&mut self, now: Instant) {
         self.pet.note_trick_submit(now);
     }
 
@@ -1700,7 +1707,7 @@ impl CompanionOwner {
     /// Retire the pet's frozen contrast samples, its ghosts' included (a theme or
     /// palette change). Behaviour, position and breed handoff continue.
     #[inline]
-    pub fn invalidate_colors(&mut self) {
+    pub const fn invalidate_colors(&mut self) {
         self.pet.invalidate_colors();
     }
 
@@ -1709,7 +1716,7 @@ impl CompanionOwner {
     /// latch leaves the frame train to [`Self::next_change_deadline`].
     #[inline]
     #[must_use]
-    pub fn needs_frames(&self) -> bool {
+    pub const fn needs_frames(&self) -> bool {
         !self.last_static && self.last_shed_tick.is_none() && self.pet.needs_frames()
     }
 

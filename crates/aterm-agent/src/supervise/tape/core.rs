@@ -117,6 +117,19 @@ pub(crate) trait TapeValue: Sized {
     ///
     /// Bytes [`Self::to_tape`] did not write.
     fn from_tape(bytes: &[u8]) -> Result<Self, CodecError>;
+
+    /// THE ANSWER AT A DOOR NEWER THAN THE TAPE (the occupancy red-team's
+    /// F8): what a replay answers at a host door the tape's recording build
+    /// did not have, as its header's `host_doors` names them
+    /// (`header::Header::host_doors`), without taking a record. `None`, the
+    /// default: such a door diverges like any other the tape does not hold.
+    /// Only a value whose door was added after headers named their doors may
+    /// say `Some` — an older header names none, so every door it was asked
+    /// at reads as lacked — and only one whose loop judged nothing where
+    /// the old build asked nothing (the empty reading).
+    fn absent() -> Option<Self> {
+        None
+    }
 }
 
 /// A round trip with nothing to say back: a sleep, a bound.

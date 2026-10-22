@@ -548,6 +548,7 @@ mod tests {
             findings: Findings::default(),
             demand: crate::jobs::Demand::Fast,
             lanes_off: Vec::new(),
+            parked_tabs: Vec::new(),
         }
     }
 

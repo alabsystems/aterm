@@ -83,12 +83,20 @@
 //! prompt reads `tty-raw`), and such a parked view keeps speaking for now
 //! while the thread runs ([`crate::vitals_jobs::speaks_for_now`]). EDGES (what
 //! brings job demand back, [`VitalsHost::note_edge`]): output from a session
-//! (a tab just opened prints its prompt, a job that ends lets its shell print
-//! one), and a fork, `exec` or exit its process watch heard ([`ProcEdge`]: a
-//! command forks after its echo, and a shell can start one silently), each ask
-//! one whole reading, at most every [`JOBS_FLOOR`], because a job may have
-//! started or ended; the engine looks at every such reading, even one that
-//! lands inside its own 2 s ([`Request::jobs_now`]). A job's verdict that
+//! that moved its screen (a tab just opened prints its prompt, a job that
+//! ends lets its shell print one), and a fork, `exec` or exit its process
+//! watch heard ([`ProcEdge`]: a command forks after its echo, and a shell can
+//! start one silently), each ask one whole reading, at most every
+//! [`JOBS_FLOOR`], because a job may have started or ended; the engine looks
+//! at every such reading, even one that lands inside its own 2 s
+//! ([`Request::jobs_now`]). A write that moved no cell (an idle program's
+//! colour reset, a colour query) is no edge, and neither is a redraw of a
+//! screen the held view parks on the person's read while the terminal still
+//! says so: the same group in front, the same mode, no input driven since
+//! ([`crate::App::vitals_output_kind`], [`Parked`]); such a screen's write
+//! asks one reading once [`PARKED_RECHECK`] (the floor) passed since a
+//! reading looked at it, and only in its own wake, never on a deadline. A
+//! job's verdict that
 //! moved, in any reading, reaches the loop in the hand-over
 //! ([`Handover::job_events`]), which records it on the session's timeline
 //! (`subscribe … events` pushes `EVENT <local> job …`, `status job=`, the
@@ -267,6 +275,9 @@ pub(crate) static PROC_EDGE: ProcEdge = ProcEdge::new();
 pub(crate) struct Handover {
     /// The newest snapshot (taken by [`VitalsHost::adopt`]).
     snap: Option<Arc<Snapshot>>,
+    /// The terminal words of the request that snapshot was read with
+    /// ([`TtyWord::seen`]): what its jobs view named each park from.
+    words: Vec<WordSeen>,
     /// Job verdicts that moved, oldest first, at most [`JOB_EVENTS_CAP`].
     job_events: Vec<aterm_vitals::events::Event>,
 }
@@ -456,6 +467,19 @@ impl TtyWord {
         })
     }
 
+    /// What the loop keeps of the word once a reading made with it lands
+    /// ([`Handover::words`]): the session, its mode, and the input driven
+    /// into it before it was read, which a parked screen is judged against
+    /// ([`Parked`]).
+    pub(crate) fn seen(&self) -> WordSeen {
+        WordSeen {
+            key: self.key,
+            canonical: self.canonical,
+            echo: self.echo,
+            input: self.input_seen,
+        }
+    }
+
     /// The engine's word for the tick at `at_ms`, stamped then: it still
     /// holds there while no output came and no input was driven since it was
     /// read. `None` once either has.
@@ -471,6 +495,134 @@ impl TtyWord {
                 },
             ))
     }
+}
+
+/// A [`TtyWord`] as a reading's request carried it ([`TtyWord::seen`]):
+/// handed back to the loop beside the snapshot that reading made
+/// ([`Handover::words`]), so a park is judged against the very word the
+/// engine named it from, never a later request's.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct WordSeen {
+    /// The session's key ([`TabRoot::key`]).
+    pub(crate) key: u64,
+    /// `ICANON` when the word was read.
+    pub(crate) canonical: bool,
+    /// `ECHO` when the word was read.
+    pub(crate) echo: bool,
+    /// The sink's driven input just before the word was read.
+    pub(crate) input: aterm_session::sink::DrivenInput,
+}
+
+/// A parked session's own write asks one reading once this long passed since
+/// a reading looked at the session, in its own output wake and only when no
+/// edge's floor stands ([`OutputEdge::Recheck`]); a write inside it asks
+/// nothing and arms nothing, and the program's next write past it reads. The
+/// floor's own length: a program at the person's read that starts work by
+/// itself (an agent's tool call: a detached child, `setsid`, no tty), with
+/// no key and no change of the foreground, forks where the kernel edge does
+/// not hear (it hears the shell's forks and its children's `exec` and exit,
+/// [`ProcEdge`]), so its redraws are what bring the engine back, as an
+/// unparked screen's would, only never on a deadline. A 30 s recheck left
+/// such a child unseen for its whole 20 s life (review 2026-10-22,
+/// docs/measured/vitals-multi-tab-2026-10-22.md). What it still misses: a
+/// child started before writes that all land inside the floor of the last
+/// reading, with nothing written after them, waits for the session's next
+/// edge (main read it at the floor, on a deadline).
+pub(crate) const PARKED_RECHECK: Duration = JOBS_FLOOR;
+
+/// A test's stand-in for a PTY reader's feed of session `u64`.
+#[cfg(test)]
+pub(crate) type ReaderFeed = Box<dyn Fn(&crate::App, u64)>;
+
+#[cfg(test)]
+thread_local! {
+    /// Run by [`crate::App::on_output_wake`] just before the pass clears the
+    /// session's output latch: where a test stands a PTY reader's feed that
+    /// posts no wake of its own, since the latch is still set.
+    pub(crate) static BEFORE_LATCH_CLEAR: std::cell::RefCell<Option<ReaderFeed>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// A SESSION PARKED ON THE PERSON'S READ (design §6.1, "What brings job
+/// demand back"): the held jobs view parks its tab
+/// ([`aterm_vitals::jobs::JobsView::parked_tabs`]: every live job of it
+/// holds the foreground at the person's own raw or password read), and what
+/// the engine named that from: the job's process group, and the word's mode
+/// and driven-input count ([`WordSeen`]). The park holds while the terminal
+/// still says so ([`Parked::holds`]): the same group in front, the same
+/// mode, and no key, paste, report or control verb's bytes driven since.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Parked {
+    /// The parked job's process group.
+    pub(crate) pgid: u32,
+    /// The word the engine named the read from.
+    pub(crate) word: WordSeen,
+    /// When a reading last looked at the session: the view that parked it,
+    /// or its own write's [`OutputEdge::Recheck`].
+    pub(crate) read_at: Instant,
+}
+
+impl Parked {
+    /// What `view` parks, as the request `words` named it, at `now`: one
+    /// park per tab the view parks whose word the request carried and whose
+    /// live jobs share one process group.
+    pub(crate) fn of(
+        view: &aterm_vitals::jobs::JobsView,
+        words: &[WordSeen],
+        now: Instant,
+    ) -> std::collections::HashMap<u64, Self> {
+        view.parked_tabs
+            .iter()
+            .filter_map(|tab| {
+                let word = *words.iter().find(|w| w.key == *tab)?;
+                let mut groups = view
+                    .rows
+                    .iter()
+                    .filter(|r| r.tab == *tab && r.verdict != aterm_vitals::jobs::Verdict::Exited)
+                    .map(|r| r.pgid);
+                let pgid = groups.next()?;
+                groups.all(|g| g == pgid).then_some((
+                    *tab,
+                    Self {
+                        pgid,
+                        word,
+                        read_at: now,
+                    },
+                ))
+            })
+            .collect()
+    }
+
+    /// Whether the park still holds on the terminal now: `fg` the group in
+    /// front, `mode` its `(ICANON, ECHO)` (`None`: no terminal to ask), and
+    /// `input` the driven input so far.
+    pub(crate) fn holds(
+        &self,
+        fg: i32,
+        mode: Option<(bool, bool)>,
+        input: aterm_session::sink::DrivenInput,
+    ) -> bool {
+        i64::from(fg) == i64::from(self.pgid)
+            && mode == Some((self.word.canonical, self.word.echo))
+            && input == self.word.input
+    }
+}
+
+/// What one write of a session is to the stuck engine with no window
+/// showing the bars ([`crate::App::vitals_output_kind`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum OutputEdge {
+    /// A job may have started or ended: a reading at once, or at the floor.
+    Edge,
+    /// Nothing new for the engine: the write moved no cell of the screen
+    /// (an idle program's colour reset, a colour query), or it redrew a
+    /// screen parked on the person's read inside [`PARKED_RECHECK`] of the
+    /// reading that last looked at it.
+    Quiet,
+    /// A parked screen's redraw whose session no reading looked at for
+    /// [`PARKED_RECHECK`]: one reading if one is due at once, never a
+    /// deadline.
+    Recheck,
 }
 
 /// What the thread is sent. The requests are boxed: a slot of the channel,
@@ -544,6 +696,14 @@ pub(crate) struct VitalsHost {
     edge: bool,
     /// When the loop last asked an edge's reading ([`JOBS_FLOOR`]).
     last_edge_read: Option<Instant>,
+    /// Each session's screen generation at its last output wake with no
+    /// window showing the bars: a write that leaves it where it was moved no
+    /// cell, and is no edge ([`crate::App::vitals_output_kind`]).
+    screens: std::collections::HashMap<u64, crate::control::ScreenGen>,
+    /// The sessions the held jobs view parks on the person's read
+    /// ([`Parked::of`], named again with each new view): their redraws are
+    /// no edge while the park holds ([`Parked::holds`]).
+    parked: std::collections::HashMap<u64, Parked>,
     /// Job events taken from the hand-over, for the timelines.
     job_events: Vec<aterm_vitals::events::Event>,
     /// Each session's count of job events recorded (`EVENT … job rev=`).
@@ -589,6 +749,8 @@ impl Default for VitalsHost {
             disk_pull: false,
             edge: false,
             last_edge_read: None,
+            screens: std::collections::HashMap::new(),
+            parked: std::collections::HashMap::new(),
             job_events: Vec::new(),
             job_revs: std::collections::HashMap::new(),
             delegated_active: false,
@@ -614,12 +776,17 @@ impl VitalsHost {
     }
 
     /// Take the thread's newest snapshot if it is newer than the one held,
-    /// at `now`, and the job events it raised. True when the Deck has
-    /// something new to draw.
+    /// at `now`, and the job events it raised. A new jobs view names the
+    /// parked sessions again from the words its reading carried
+    /// ([`Parked::of`]). True when the Deck has something new to draw.
     pub(crate) fn adopt(&mut self, now: Instant) -> bool {
-        let (fresh, events) = {
+        let (fresh, words, events) = {
             let mut h = self.latest.lock().unwrap_or_else(PoisonError::into_inner);
-            (h.snap.take(), std::mem::take(&mut h.job_events))
+            (
+                h.snap.take(),
+                std::mem::take(&mut h.words),
+                std::mem::take(&mut h.job_events),
+            )
         };
         self.job_events.extend(events);
         if self.job_events.len() > JOB_EVENTS_CAP {
@@ -635,6 +802,11 @@ impl VitalsHost {
                 };
                 if !same {
                     self.adopted_at = Some(now);
+                    self.parked = snap
+                        .jobs
+                        .as_deref()
+                        .map(|view| Parked::of(view, &words, now))
+                        .unwrap_or_default();
                 }
                 if !snap.machine_only {
                     self.full_adopted_at = Some(now);
@@ -981,7 +1153,8 @@ fn run(
             last_whole = Some(Instant::now());
         }
         peaks.keep(source.model().peaks(), Instant::now(), false);
-        let jobs_moved = hand_over(latest, &snap);
+        let words = req.ttys.iter().map(TtyWord::seen).collect();
+        let jobs_moved = hand_over(latest, &snap, words);
         if let Some(sys) = sys {
             sys.publish(snap, source.machine().unwrap_or(&no_machine));
         }
@@ -1008,9 +1181,10 @@ fn keep_warm_events(warm: Snapshot, snap: &mut Snapshot) {
     snap.events = events;
 }
 
-/// Leave `snap` for the loop, with its job events. True when a job's verdict
-/// moved: the loop records it even when it asked no reading (a pull's).
-fn hand_over(latest: &Mutex<Handover>, snap: &Arc<Snapshot>) -> bool {
+/// Leave `snap` for the loop, with its job events and the terminal `words`
+/// of the request it was read with. True when a job's verdict moved: the
+/// loop records it even when it asked no reading (a pull's).
+fn hand_over(latest: &Mutex<Handover>, snap: &Arc<Snapshot>, words: Vec<WordSeen>) -> bool {
     let events: Vec<_> = snap
         .events
         .iter()
@@ -1019,6 +1193,7 @@ fn hand_over(latest: &Mutex<Handover>, snap: &Arc<Snapshot>) -> bool {
         .collect();
     let mut h = latest.lock().unwrap_or_else(PoisonError::into_inner);
     h.snap = Some(Arc::clone(snap));
+    h.words = words;
     let moved = !events.is_empty();
     h.job_events.extend(events);
     if h.job_events.len() > JOB_EVENTS_CAP {
@@ -1249,8 +1424,9 @@ impl Reader {
     /// ([`crate::occupancy_host::SLOTS_ARMED`]), else every
     /// [`aterm_sysprobe::slots::IDLE_PERIOD`]; between, the last reading
     /// rides on with its age, which a wait judges by. The memory figure is
-    /// one host statistics call, read each time.
-    fn set_occupancy_facts(&mut self, snap: &mut Snapshot) {
+    /// one host statistics call, read each time. Returns the slots reading,
+    /// whose holders a full reading attributes to tabs.
+    fn set_occupancy_facts(&mut self, snap: &mut Snapshot) -> aterm_sysprobe::slots::SlotsRead {
         snap.avail =
             aterm_sysprobe::machine_memory().map(|m| m.available_mib.saturating_mul(1 << 20));
         let machine = aterm_sysprobe::slots::Machine {
@@ -1267,6 +1443,7 @@ impl Reader {
         snap.slots_age_ms = self.slots.read_at().map(|at| {
             u64::try_from(now.saturating_duration_since(at).as_millis()).unwrap_or(u64::MAX)
         });
+        read
     }
 
     /// One full reading folded into the trends: the machine counters and the
@@ -1283,7 +1460,18 @@ impl Reader {
         sample.procs = observed.procs;
         sample.delegated = observed.delegated;
         let mut snap = self.vitals.absorb(&sample);
-        self.set_occupancy_facts(&mut snap);
+        let slots = self.set_occupancy_facts(&mut snap);
+        snap.slot_tabs = crate::occupancy_host::slot_tabs(
+            &slots,
+            sample.procs.as_deref(),
+            req.self_pid,
+            &req.tabs,
+            &mut |pid| {
+                i32::try_from(pid)
+                    .ok()
+                    .and_then(aterm_uds::process::read_process_start)
+            },
+        );
         crate::resource_jobs::publish(
             sample
                 .procs
@@ -1314,6 +1502,8 @@ impl Reader {
         let mut sample = self.machine_sample(req);
         sample.machine_only = true;
         let mut snap = self.vitals.absorb(&sample);
+        // No sweep, so no holder is attributed to a tab (`slot_tabs` stays
+        // `None`).
         self.set_occupancy_facts(&mut snap);
         snap.jobs = self.jobs.tick(
             sample.at_ns / 1_000_000,
@@ -1397,6 +1587,11 @@ impl Reader {
                 .collect(),
             plan: req.plan.clone(),
             procs_truncated: false,
+            // The coalitions' lane is not read yet.
+            coalitions: None,
+            leads: Vec::new(),
+            timeline: None,
+            coal_lane: aterm_vitals::explain::CoalLane::Unsupported,
         }
     }
 }
@@ -1436,6 +1631,8 @@ pub(crate) fn proc_sample(p: &aterm_sysprobe::ProcessReading, epoch: Instant) ->
         at_ns: p.read_at.map(|t| {
             u64::try_from(t.saturating_duration_since(epoch).as_nanos()).unwrap_or(u64::MAX)
         }),
+        coalition: None,
+        birth_ms: None,
     }
 }
 
@@ -2049,17 +2246,101 @@ impl crate::App {
             .windowless_deadline(hidden.map(|(period, _)| period), now);
     }
 
-    /// OUTPUT FROM A SESSION (the `Wake::Output` arm, at its clock `now`): an
-    /// edge ([`VitalsHost::note_edge`]), and one due now is asked in this
-    /// wake. Left to the next turn it would be the loop's deadline, armed at
-    /// now and fired at once: a `system_vitals` timer wake for every write a
-    /// program makes at rest (Muse Code's SGR reset every 10 s), which
-    /// Autopilot Land's END counts against the instance. Within the floor the
-    /// edge waits for its deadline as before.
-    pub(crate) fn vitals_output_edge(&mut self, now: Instant) {
-        self.vitals.note_edge();
-        if self.vitals.edge_at(now).is_some_and(|at| at <= now) {
-            self.service_vitals(now);
+    /// OUTPUT FROM `session` (the `Wake::Output` arm, at its clock `now`,
+    /// after the pass cleared the session's output latch: a chunk fed after
+    /// the screen is read here posts a wake of its own): with no window
+    /// showing the bars, what the write is to the stuck engine
+    /// ([`Self::vitals_output_kind`]). An edge
+    /// ([`VitalsHost::note_edge`]) due now is asked in this wake. Left to the
+    /// next turn it would be the loop's deadline, armed at now and fired at
+    /// once: a `system_vitals` timer wake for every write a program makes at
+    /// rest, which Autopilot Land's END counts against the instance. Within
+    /// the floor the edge waits for its deadline as before. A write that is
+    /// no edge asks nothing and arms nothing: with several tabs at rest,
+    /// each idle program's colour reset landing within the floor of another
+    /// tab's reading was put off to the floor on a timer
+    /// (docs/measured/vitals-multi-tab-2026-10-22.md). A parked screen's
+    /// [`OutputEdge::Recheck`] reads only when that reading is due at once.
+    pub(crate) fn vitals_output_edge(&mut self, session: u64, now: Instant) {
+        match self.vitals_output_kind(session, now) {
+            OutputEdge::Edge => {
+                self.vitals.note_edge();
+                if self.vitals.edge_at(now).is_some_and(|at| at <= now) {
+                    self.service_vitals(now);
+                }
+            }
+            OutputEdge::Recheck => {
+                // Due once the floor of the last edge's reading passed (an
+                // edge owed then is this same reading, asked in this wake
+                // rather than on its deadline).
+                let due = self
+                    .vitals
+                    .last_edge_read
+                    .is_none_or(|t| t + JOBS_FLOOR <= now);
+                if due {
+                    if let Some(park) = self.vitals.parked.get_mut(&session) {
+                        park.read_at = now;
+                    }
+                    self.vitals.note_edge();
+                    self.service_vitals(now);
+                }
+            }
+            OutputEdge::Quiet => {}
+        }
+    }
+
+    /// What a write of `session` is to the stuck engine at `now` (design
+    /// §6.1, "What brings job demand back"). With a window showing the bars,
+    /// or no thread to read, an [`OutputEdge::Edge`] that notes nothing. A
+    /// write that moved no cell (the session's [`crate::control::ScreenGen`]
+    /// where its last output wake left it) is [`OutputEdge::Quiet`]: no job
+    /// started or ended by it, as a shell's prompt or a command's echo moves
+    /// the screen, and the kernel edge hears the shell's forks and its
+    /// children's `exec` and exit where it runs ([`ProcEdge`]). A screen the
+    /// held view parks on the person's read is quiet while the park holds
+    /// ([`Parked::holds`]), and an [`OutputEdge::Recheck`] once
+    /// [`PARKED_RECHECK`] passed since a reading looked at it, so a job the
+    /// parked program started itself is read within the floor of its next
+    /// redraw. A contended terminal lock, or no generation seen yet,
+    /// counts as moved; a park that no longer holds is dropped, and the write
+    /// is an edge.
+    pub(crate) fn vitals_output_kind(&mut self, session: u64, now: Instant) -> OutputEdge {
+        if self.vitals.windowed || self.vitals.tx.is_none() {
+            return OutputEdge::Edge;
+        }
+        let Some(s) = self.pool.get(session) else {
+            return OutputEdge::Edge;
+        };
+        let moved = match crate::term_try_lock(&s.term).map(|t| crate::control::screen_gen(&t)) {
+            None => true,
+            Some(screen) => match self.vitals.screens.insert(session, screen) {
+                Some(before) => before != screen,
+                None => {
+                    let pool = &self.pool;
+                    self.vitals
+                        .screens
+                        .retain(|key, _| pool.get(*key).is_some());
+                    true
+                }
+            },
+        };
+        if !moved {
+            return OutputEdge::Quiet;
+        }
+        let Some(park) = self.vitals.parked.get(&session).copied() else {
+            return OutputEdge::Edge;
+        };
+        let sink = &s.ctx.sink;
+        let fg = crate::quit_safety::foreground_pgrp(sink.master());
+        let mode = sink.tty_echo().map(|e| (e.canonical, e.echo));
+        if !park.holds(fg, mode, sink.driven_input()) {
+            self.vitals.parked.remove(&session);
+            return OutputEdge::Edge;
+        }
+        if now.saturating_duration_since(park.read_at) >= PARKED_RECHECK {
+            OutputEdge::Recheck
+        } else {
+            OutputEdge::Quiet
         }
     }
 

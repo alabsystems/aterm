@@ -354,8 +354,8 @@ pub(crate) fn export(sources: &[CarrySource], turn_id_ceiling: u64) -> Vec<(u64,
 /// `turn_id_ceiling` is the turn-id count the manifest carries, the most this process mints
 /// before it exits.
 ///
-/// THE AGGREGATE IS SPENT BY PRIORITY, not first come, first served (round
-/// seven, finding 37): every session's CORE — its ledger and the archive's
+/// THE AGGREGATE IS SPENT BY PRIORITY, not first come, first served:
+/// every session's CORE — its ledger and the archive's
 /// counters, what `history`, `offscreen since=` and a resumed `since-turn=`
 /// stand on — is set aside first, then each session's differ state (all or
 /// none), and the archive's rows share what is left alike, each session's
@@ -365,7 +365,7 @@ pub(crate) fn export(sources: &[CarrySource], turn_id_ceiling: u64) -> Vec<(u64,
 /// their whole ledger, the same sessions on every update. When the cores ALONE
 /// overflow it, they share it ([`core_shares`]): every session keeps its
 /// newest records, the longest ledgers are cut alike, and each carry names
-/// the turn ids it shed (round eight, finding 41).
+/// the turn ids it shed.
 ///
 /// No session log: what a successor older than the log's carry is handed
 /// ([`export_for_target`]).
@@ -576,8 +576,8 @@ pub(crate) fn export_noting(
     // fenced from here on) is the only thing done under its lock.
     let log_patience = Instant::now() + LOG_LOCK_PATIENCE;
     let mut log_takes: Vec<Option<LogTake>> = Vec::with_capacity(sources.len());
-    // THE BUS MIRROR's cursor and head under each fence just set (phase 4,
-    // ruling Q7): what a successor says of the old space's tail when this
+    // THE BUS MIRROR's cursor and head under each fence just set:
+    // what a successor says of the old space's tail when this
     // session's log does not cross, or crosses and its carry does not read
     // there. `None` for an unmirrored log.
     let mut log_priors: Vec<Option<aterm_slog::Prior>> = Vec::with_capacity(sources.len());
@@ -767,7 +767,7 @@ pub(crate) fn export_noting(
                 pick.bytes
             });
         // A MIRRORED log's cursor and head cross whether or not its log does,
-        // a few dozen bytes (ruling Q7): a successor whose `Log::from_carry`
+        // a few dozen bytes: a successor whose `Log::from_carry`
         // refuses the carry still says the old space's tail as one exact
         // `gap why=reset`. An unmirrored one adds none.
         let bytes = match prior {
@@ -1278,7 +1278,7 @@ pub(crate) struct Wire {
     )]
     log: Vec<String>,
     /// THE BUS MIRROR's cursor and head in the old seq space, for a mirrored
-    /// log that did not cross (phase 4, ruling Q7): `<ep>:<seq>:<ms>:<head>`.
+    /// log that did not cross: `<ep>:<seq>:<ms>:<head>`.
     /// Absent for every other sidecar, so an unmirrored instance's sidecars
     /// are the bytes they were.
     #[serde(default, skip_serializing_if = "Option::is_none")]

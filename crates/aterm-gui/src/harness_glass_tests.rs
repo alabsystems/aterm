@@ -598,7 +598,7 @@ fn a_task_face_is_stamped_with_the_wall_clock() {
 }
 
 /// A STAMP NAMES ITS DAY SO IT CANNOT BE READ AS ANOTHER (§10.2.3, item 3;
-/// the honest chip's review, finding 3): read against its own day, or with
+/// the honest chip's review): read against its own day, or with
 /// no day read, the bare clock; within the six days before `today` its
 /// weekday (`Sat 17:58` on a Friday, six days back); a week or more back its
 /// date (`11 Oct 17:58` on the Friday after, where the weekday would be

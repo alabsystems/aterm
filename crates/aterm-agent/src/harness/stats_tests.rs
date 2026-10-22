@@ -529,7 +529,7 @@ fn the_folds_words_are_the_writers_consts() {
     let adopted = format!("attention=OK again={AGAIN_ADOPTED}");
     assert_eq!(escalation_of(&adopted), Escalation::Again);
     // The turn-end policy's badge an Off park took down, set again as it
-    // ends: no second escalation (the review of b512d03d8).
+    // ends: no second escalation.
     let unparked = format!("attention=OK again={AGAIN_UNPARKED}");
     assert_eq!(escalation_of(&unparked), Escalation::Again);
     // A journal an earlier build wrote, which still mailed a manager, says
@@ -590,7 +590,7 @@ const ENDS: &str = "
 ";
 
 /// A STALL'S HOLD, AN OFF PARK'S START AND A LOOP'S LAST CLEAR END A
-/// PERSON'S WAIT ([`ENDS`]; the review of c1d193998): a `FROZEN` line whose
+/// PERSON'S WAIT ([`ENDS`]): a `FROZEN` line whose
 /// `attention=` reply took the loop's entry down closes the wait the badge
 /// opened, with no `CLEARED` line after it; one whose reply is `kept` (a
 /// limit's badge stands) or `skipped: …` (behind another supervisor) closes

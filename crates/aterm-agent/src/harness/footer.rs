@@ -676,7 +676,7 @@ pub fn transcript_path(claude_dir: &Path, entry: &SessionEntry) -> Option<PathBu
     transcript_lookup(claude_dir, entry).map(|(path, _)| path)
 }
 
-/// [`transcript_path`] and whether it is CERTAIN (session log Phase 3B, plan
+/// [`transcript_path`] and whether it is CERTAIN (plan
 /// §2.1): the project's own `<claude dir>/projects/<slug>/<id>.jsonl`, or
 /// the one project directory holding the id ([`sole_transcript_path`]'s
 /// rule), in the same walk. The footer reads the same path either way; the
@@ -1788,7 +1788,7 @@ impl FooterCache {
         UsageFacts::of(models, wall, Some(&refresh)).map(|facts| facts.with_runtime(busy_ms))
     }
 
-    /// ARM the step tap (session log Phase 3B, rulings S1, S23): rows of
+    /// ARM the step tap: rows of
     /// the main transcript older than `floor_ms` (wall ms: the process's
     /// start, `floor_of` × 1000) or at or below the log's watermark `given`
     /// for their file are history, folded into the end and never queued.
@@ -1813,7 +1813,7 @@ impl FooterCache {
     /// first rows read before its prompt row wait one take at most for it
     /// (the fold's opening hold, [`super::steps::StepFold::take`]). A transcript whose
     /// path was not certain ([`transcript_lookup`]) gives partial steps
-    /// only: they add facts and overrule nothing (ruling S9).
+    /// only: they add facts and overrule nothing.
     pub fn take_steps(&mut self) -> super::steps::StepBatch {
         let mut batch = self
             .steps
@@ -1838,7 +1838,7 @@ impl FooterCache {
     /// does so when the log holds no run its steps could go to (none in
     /// front, or a new run that bound no file), so the next
     /// [`Self::set_floor`] arms a fresh one, bound at once — what the file
-    /// held then is history (ruling S1).
+    /// held then is history.
     pub fn disarm_steps(&mut self) {
         self.steps = None;
     }
@@ -3129,7 +3129,7 @@ pub fn read_pid(
     // One lookup of the transcript for the facts and the fold alike.
     let found = transcript_lookup(claude_dir, &entry);
     // The step tap's floor is this process's start (ms), and its steps are
-    // partial where the path is not certain (session log Phase 3B).
+    // partial where the path is not certain.
     fold.note_entry(
         floor_of(started, &entry).map(|s| s.saturating_mul(1000)),
         &entry.session_id,

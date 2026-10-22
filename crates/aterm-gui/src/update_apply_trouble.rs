@@ -1056,7 +1056,7 @@ mod tests {
         );
     }
 
-    /// Round seven, #3: an install whose folder cannot be written is refused before
+    /// an install whose folder cannot be written is refused before
     /// the park, as a person's to clear — and the remedy is to move the app or ask an
     /// administrator, never to reinstall the signed release (which would land in the
     /// same folder and be refused again).

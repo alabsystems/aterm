@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The bus mirror's GUI half (session log phase 4): the two verbs over a
-//! real store and real session logs, the adoption latch (ruling Q1), closed
+//! The bus mirror's GUI half: the two verbs over a
+//! real store and real session logs, the adoption latch, closed
 //! sessions' tails across an update (Q4), the fence (Q12), the alias (Q6),
 //! the old space an uncarried update ends (Q7), and the default that engages
 //! nothing (Q5).
@@ -59,7 +59,7 @@ fn commands(h: &crate::session_store::SessionHandle, n: usize) {
 }
 
 /// A take's slots: `(sid, cursor, body)`, the header's byte count checked
-/// against the body (the Bytes framing a bridge reads, ruling Q11).
+/// against the body (the Bytes framing a bridge reads).
 fn slots(reply: &str) -> (Vec<(String, BusCursor, String)>, bool) {
     let (header, body) = reply.split_once('\n').expect("a header line");
     let mut it = header.split(' ');
@@ -184,7 +184,7 @@ fn a_take_hands_out_slots_and_a_landing_moves_the_cursor() {
     });
 }
 
-/// RULING Q1: until a seamless successor has registered every handed-off
+/// until a seamless successor has registered every handed-off
 /// session, a landing for a sid it does not hold is `adopting` (the bridge
 /// keeps its pin) and a take is refused; once the session is registered the
 /// same landing moves its carried cursor; once adoption has drained, an
@@ -243,7 +243,7 @@ fn a_landing_before_adoption_keeps_the_pin_and_lands_after_adoption() {
     });
 }
 
-/// RULING Q4: a session that closes with an unlanded tail keeps it for the
+/// a session that closes with an unlanded tail keeps it for the
 /// bus; an update's manifest carries it as a tombstone; the successor's take
 /// says it as one exact `gap why=dropped n=<k>`, which lands `done`. A
 /// landing past the draw stands the Commit down, and once the Commit has
@@ -327,7 +327,7 @@ fn a_closed_sessions_unlanded_tail_crosses_an_update_as_one_dropped_cover() {
     });
 }
 
-/// RULINGS Q12 and Q2: a landing under an update's fence moves nothing and
+/// a landing under an update's fence moves nothing and
 /// says `fenced`; once the update stands down it lands.
 #[test]
 fn a_landing_is_refused_under_the_commit_fence() {
@@ -418,7 +418,7 @@ fn a_landing_racing_the_commits_reading_is_fenced() {
     });
 }
 
-/// RULING Q6: an edge's actor crosses as `by=e<8 hex>`, the bridge key's
+/// an edge's actor crosses as `by=e<8 hex>`, the bridge key's
 /// hash of its sid, never the sid; one edge is one alias. Without a key the
 /// actor is `-`.
 #[test]
@@ -473,7 +473,7 @@ fn an_edges_actor_crosses_as_its_alias_never_its_sid() {
     });
 }
 
-/// RULING Q7, the host's half: an adoption whose update did not carry the
+/// an adoption whose update did not carry the
 /// log but carried the mirror's fence-time cursor owes the old space's tail
 /// as one `why=reset` cover in that space.
 #[test]
@@ -521,7 +521,7 @@ fn an_uncarried_adoption_owes_the_old_spaces_tail() {
     assert_eq!(crashed.log().mirror_prior(), None);
 }
 
-/// RULING Q5: with the mirror off nothing engages. A session that runs and
+/// with the mirror off nothing engages. A session that runs and
 /// closes leaves no tail, no tombstone, no manifest row, and its log no
 /// cursor; its carry holds no `ms=`.
 #[test]
@@ -827,7 +827,7 @@ fn a_replaced_bus_log_starts_every_cursor_over_and_locks_no_timeline() {
     });
 }
 
-/// FIXER F13's drawn generation, OFF (ruling Q5): on a store that never
+/// FIXER F13's drawn generation, OFF: on a store that never
 /// mirrored — no hello asked, nothing taken, nothing engaged — a bus log
 /// replaced between an update's draw and its Commit stands nothing down.
 /// The export's own syncs (each session's carry source) engage nothing.
@@ -950,7 +950,7 @@ fn a_replaced_bus_log_stands_down_an_update_whose_only_cursors_are_adopted() {
 /// definitely, never engages a log — and retained state no bridge serves is
 /// said in `fabric status` (`mirror=unserved tails=<k> tombstones=<j>`;
 /// under an `auto` hello, whose line already says `mirror=`, the counts
-/// alone, session log Phase 6 step 6E-3).
+/// alone).
 #[test]
 fn the_verbs_are_refused_unless_the_recorded_hello_asked_and_retained_state_is_said() {
     crate::fabric::with_link_reset(|| {
@@ -1480,7 +1480,7 @@ fn a_closed_sessions_tail_conforms_to_the_model() {
     });
 }
 
-/// THE ADOPTION LATCH AGAINST THE MODEL (ruling Q1): a slot published under
+/// THE ADOPTION LATCH AGAINST THE MODEL: a slot published under
 /// the export's fence is refused its landing; the successor answers
 /// `adopting` until it registers the session, then lands on the carried
 /// cursor.

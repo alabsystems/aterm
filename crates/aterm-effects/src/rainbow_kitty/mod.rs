@@ -776,9 +776,10 @@ impl EchoLedger {
     /// precedes every `None`, oldest first, so a hole in the middle cannot
     /// hide the presses behind it.
     #[inline]
-    fn repack(&mut self) {
+    const fn repack(&mut self) {
         let mut write = 0;
-        for read in 0..ECHO_LEDGER_DEPTH {
+        let mut read = 0;
+        while read < ECHO_LEDGER_DEPTH {
             if let Some(entry) = self.slots[read] {
                 if write != read {
                     self.slots[write] = Some(entry);
@@ -786,6 +787,7 @@ impl EchoLedger {
                 }
                 write += 1;
             }
+            read += 1;
         }
     }
 
@@ -1109,7 +1111,7 @@ impl Engine {
     /// every seam point (D14).
     #[inline]
     #[must_use]
-    pub fn engaged(&self) -> bool {
+    pub const fn engaged(&self) -> bool {
         self.engaged
     }
 
@@ -1210,7 +1212,7 @@ impl Engine {
     /// `Typed` events pressed after it. The host sets it around the flush
     /// and clears it after; `None` is the ordinary append.
     #[inline]
-    pub fn set_flush_clock(&mut self, at: Option<Instant>) {
+    pub const fn set_flush_clock(&mut self, at: Option<Instant>) {
         self.flush_clock = at;
     }
 
@@ -1221,7 +1223,7 @@ impl Engine {
     /// lays the key's `Typed` at the origin when it is in the same frame, and
     /// the ribbon keeps the word for the next key, which reflows it down.
     #[inline]
-    pub fn note_soft_wrap(&mut self, sw: ribbon::SoftWrap, key_at: Option<Instant>) {
+    pub const fn note_soft_wrap(&mut self, sw: ribbon::SoftWrap, key_at: Option<Instant>) {
         if self.engaged {
             self.soft_wrap = Some((sw, key_at));
         }
@@ -1235,7 +1237,7 @@ impl Engine {
     /// holds a same-frame key with no cell (its glyph is the blank the wrap ate
     /// at the end of the row above).
     #[inline]
-    pub fn note_lift(&mut self, lift: ribbon::Lift, key_at: Option<Instant>) {
+    pub const fn note_lift(&mut self, lift: ribbon::Lift, key_at: Option<Instant>) {
         if self.engaged {
             self.lift = Some((lift, key_at));
         }
@@ -1246,7 +1248,7 @@ impl Engine {
     /// before it names a reflow ([`Engine::note_reflow`]).
     #[inline]
     #[must_use]
-    pub fn soft_wrap_carry(&self) -> Option<ribbon::SoftWrap> {
+    pub const fn soft_wrap_carry(&self) -> Option<ribbon::SoftWrap> {
         self.ribbon.carry()
     }
 
@@ -1256,7 +1258,7 @@ impl Engine {
     /// Without it the ribbon relays nothing, since a hop past a word also looks
     /// like a burst after a short word.
     #[inline]
-    pub fn note_reflow(&mut self, sw: ribbon::SoftWrap, to: (u16, u16)) {
+    pub const fn note_reflow(&mut self, sw: ribbon::SoftWrap, to: (u16, u16)) {
         if self.engaged {
             self.reflow = Some((sw, to));
         }
@@ -1267,7 +1269,7 @@ impl Engine {
     /// typed run's unchanged text, with that run's walk. The replay hands the
     /// walk to the ribbon with that `Sweep`.
     #[inline]
-    pub fn note_revive(&mut self, rv: ribbon::Revive) {
+    pub const fn note_revive(&mut self, rv: ribbon::Revive) {
         if self.engaged {
             self.revive = Some(rv);
         }
@@ -1637,13 +1639,13 @@ impl Engine {
     /// The clock of the host's sweep for the last observed move, when it
     /// sent one — the licensing key the ledger partitioned by.
     #[cfg(test)]
-    fn last_host_sweep_at(&self) -> Option<Instant> {
+    const fn last_host_sweep_at(&self) -> Option<Instant> {
         self.last_host_sweep_at
     }
 
     /// Every [`Event::Kill`] this engine has received (test-only).
     #[cfg(test)]
-    pub(crate) fn kills(&self) -> u32 {
+    pub(crate) const fn kills(&self) -> u32 {
         self.kills
     }
 
@@ -1651,7 +1653,7 @@ impl Engine {
     /// grid: the edges a typed fold wraps at, so a split pane's wrap never
     /// lights a cell in the neighbouring pane. Stored whether or not engaged.
     #[inline]
-    pub fn set_pane(&mut self, pane: Option<(u16, u16)>) {
+    pub const fn set_pane(&mut self, pane: Option<(u16, u16)>) {
         self.pane = pane;
     }
 
@@ -1659,7 +1661,7 @@ impl Engine {
     /// the floor the band's lower lobe and vivid rail may reach to, so neither
     /// crosses a split's divider.
     #[inline]
-    pub fn set_pane_rows(&mut self, pane_rows: Option<(u16, u16)>) {
+    pub const fn set_pane_rows(&mut self, pane_rows: Option<(u16, u16)>) {
         self.pane_rows = pane_rows;
     }
 
@@ -1672,7 +1674,7 @@ impl Engine {
     /// `Typed` already buffered lays at the caret it was typed at. Inert until
     /// a licensed move has seeded the mirror.
     #[inline]
-    pub fn observe_caret(&mut self, to: (u16, u16)) {
+    pub const fn observe_caret(&mut self, to: (u16, u16)) {
         if !self.engaged || !self.caret_known || to.0 == self.caret.0 {
             return;
         }
@@ -1746,7 +1748,7 @@ impl Engine {
     /// paint-conformance bind read the resident cells from.
     #[inline]
     #[must_use]
-    pub fn ribbon(&self) -> &Ribbon {
+    pub const fn ribbon(&self) -> &Ribbon {
         &self.ribbon
     }
 
@@ -2154,7 +2156,7 @@ impl Engine {
     /// before [`Engine::follow_rows`], which searches that far too and ends
     /// it. Inert while disengaged.
     #[inline]
-    pub(crate) fn carry_caret(&mut self, dr: i16) {
+    pub(crate) const fn carry_caret(&mut self, dr: i16) {
         if self.engaged {
             self.witness.carry_caret(dr);
         }
@@ -2235,7 +2237,7 @@ impl Engine {
     /// The hand's line the last follow pass lifted with the hand
     /// ([`Engine::hand_rides`]), `(from row, to row)`, taken once.
     #[inline]
-    pub(crate) fn take_hand_lift(&mut self) -> Option<(u16, u16)> {
+    pub(crate) const fn take_hand_lift(&mut self) -> Option<(u16, u16)> {
         self.hand_lift.take()
     }
 
@@ -2243,7 +2245,12 @@ impl Engine {
     /// The ribbon consumes the exact pair during the next replay and clears
     /// any unused proof when that frame ends.
     #[inline]
-    pub(crate) fn prove_short_reanchor(&mut self, from: (u16, u16), to: (u16, u16), at: Instant) {
+    pub(crate) const fn prove_short_reanchor(
+        &mut self,
+        from: (u16, u16),
+        to: (u16, u16),
+        at: Instant,
+    ) {
         self.ribbon.prove_short_reanchor(from, to, at);
     }
 
@@ -2320,7 +2327,7 @@ impl Engine {
     /// [`spine::Spine::note_verdict`]'s door, so the first key typed inside
     /// [`spine::VERDICT_WINDOW_S`] is born at full momentum.
     #[inline]
-    pub fn note_verdict(&mut self, now: Instant) {
+    pub const fn note_verdict(&mut self, now: Instant) {
         if !self.engaged {
             return;
         }
@@ -2373,7 +2380,7 @@ impl Engine {
     /// burst `ring` on every fourth bar, minted at the caret on the next tick
     /// ([`meteor::Meteors::party`]). One per frame (a later call wins).
     #[inline]
-    pub fn party(&mut self, now: Instant, n: u8, ring: bool) {
+    pub const fn party(&mut self, now: Instant, n: u8, ring: bool) {
         if !self.engaged {
             return;
         }
@@ -2385,7 +2392,7 @@ impl Engine {
     /// it: those carry the arrival edge the body must not lose, while a pose
     /// is an edge the animator can take next frame.
     #[inline]
-    fn offer(&mut self, impulse: CompanionImpulse) {
+    const fn offer(&mut self, impulse: CompanionImpulse) {
         if !matches!(
             self.companion,
             Some(CompanionImpulse::Meteor { .. } | CompanionImpulse::Land)
@@ -2775,7 +2782,7 @@ impl Engine {
     /// Seam point 6 (`momentum_display`): the eased spine.
     #[inline]
     #[must_use]
-    pub fn momentum_display(&self) -> f32 {
+    pub const fn momentum_display(&self) -> f32 {
         self.spine.disp()
     }
 
@@ -2795,7 +2802,7 @@ impl Engine {
     /// [`Engine::ribbon_segments`]'s modelled claim.
     #[inline]
     #[must_use]
-    pub fn ribbon_drawn(&self) -> usize {
+    pub const fn ribbon_drawn(&self) -> usize {
         self.ribbon.ink_quad_count()
     }
 
@@ -2810,22 +2817,22 @@ impl Engine {
     /// The ribbon's laid cells, live or retracting — the count a test reads
     /// to pin "laid once".
     #[cfg(test)]
-    pub(crate) fn laid_cells(&self) -> usize {
+    pub(crate) const fn laid_cells(&self) -> usize {
         self.ribbon.live_cells()
     }
 
     /// The caret mirror (the last licensed move's landing), the cell a `Typed`
     /// key lays against.
     #[cfg(test)]
-    pub(crate) fn caret_mirror(&self) -> (u16, u16) {
+    pub(crate) const fn caret_mirror(&self) -> (u16, u16) {
         self.caret
     }
 
     /// The events buffered for the next frame, in the order the host handed
     /// them over — read before the tick that drains them.
     #[cfg(test)]
-    pub(crate) fn pending_events(&self) -> &[(Event, Instant)] {
-        &self.events
+    pub(crate) const fn pending_events(&self) -> &[(Event, Instant)] {
+        self.events.as_slice()
     }
 
     /// `trail status`'s `ribbon_hue_bands=` while v2 owns the frame: distinct
@@ -2848,7 +2855,7 @@ impl Engine {
     /// halo and the ribbon under that cell resolve one spectrum position.
     #[inline]
     #[must_use]
-    pub fn phase(&self) -> f32 {
+    pub const fn phase(&self) -> f32 {
         self.spine.phase()
     }
 
@@ -2856,7 +2863,7 @@ impl Engine {
     /// metric beside its display twin.
     #[inline]
     #[must_use]
-    pub fn spine(&self) -> &Spine {
+    pub const fn spine(&self) -> &Spine {
         &self.spine
     }
 
@@ -2864,7 +2871,7 @@ impl Engine {
     /// only stardust spends it.
     #[must_use]
     #[cfg(test)]
-    pub fn budget(&self) -> &StarBudget {
+    pub const fn budget(&self) -> &StarBudget {
         &self.stardust.budget
     }
 
@@ -2873,14 +2880,14 @@ impl Engine {
     /// row is unknown and no sky star is born over it. Free transients (fan,
     /// shed, mini-fan) are only kept off a cell the probe says is inked.
     #[inline]
-    pub fn probe_mut(&mut self) -> &mut GlyphProbe {
+    pub const fn probe_mut(&mut self) -> &mut GlyphProbe {
         self.stardust.probe_mut()
     }
 
     /// Read-only view of the frame's glyph truth.
     #[must_use]
     #[cfg(test)]
-    pub fn probe(&self) -> &GlyphProbe {
+    pub const fn probe(&self) -> &GlyphProbe {
         self.stardust.probe()
     }
 
@@ -2912,7 +2919,7 @@ impl Engine {
     /// [`Engine::next_change_deadline`]. `false` lets the host idle (T6).
     #[inline]
     #[must_use]
-    pub fn needs_frame_cadence(&self) -> bool {
+    pub const fn needs_frame_cadence(&self) -> bool {
         self.engaged && self.brisk
     }
 
@@ -2947,7 +2954,7 @@ impl Engine {
     /// [`liveness`]); compare the streams themselves to compare frames.
     #[inline]
     #[must_use]
-    pub fn fingerprint(&self) -> u64 {
+    pub const fn fingerprint(&self) -> u64 {
         self.fp
     }
 
@@ -2957,7 +2964,7 @@ impl Engine {
     /// pending companion impulse (§7.2). [`Frame::companion`] is a
     /// non-consuming report of the same slot.
     #[inline]
-    pub fn take_companion_impulse(&mut self) -> Option<CompanionImpulse> {
+    pub const fn take_companion_impulse(&mut self) -> Option<CompanionImpulse> {
         self.companion.take()
     }
 
@@ -3081,7 +3088,7 @@ impl Engine {
     /// to whatever tick comes next. [`Engine::reset`] and [`Engine::curtain`]
     /// drop an un-taken arm.
     #[inline]
-    pub fn hide_next_frame(&mut self) {
+    pub const fn hide_next_frame(&mut self) {
         if self.engaged {
             self.hidden = true;
         }
@@ -3090,7 +3097,7 @@ impl Engine {
     /// Whether a hide is armed and not yet taken.
     #[inline]
     #[must_use]
-    pub fn hide_armed(&self) -> bool {
+    pub const fn hide_armed(&self) -> bool {
         self.hidden
     }
 
@@ -3308,7 +3315,7 @@ impl Engine {
     /// Seam point 12 (`v2_status`): the frame's `trail status` counters.
     #[inline]
     #[must_use]
-    pub fn status(&self) -> Status {
+    pub const fn status(&self) -> Status {
         self.status
     }
 }

@@ -913,8 +913,9 @@ impl Stub {
                     return self.gemini_answer(t, &s, text_steps("Tool call done."), &[], out);
                 }
                 // Its script holds named calls only (`script_calls`): a text
-                // step is a Claude Code script's (`stub::tool_turn`).
-                Some(ToolTurn::Say(..)) | None => {}
+                // step, or calls made in one message, is a Claude Code
+                // script's (`stub::tool_turn`).
+                Some(ToolTurn::Say(..) | ToolTurn::Calls(..)) | None => {}
             }
         }
         let mut mode = mode.to_string();

@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The step fold's prompt classifier against this module's own (addendum
-//! A10, ruling S3): the marker prefixes are one set of consts both read,
+//! The step fold's prompt classifier against this module's own:
+//! the marker prefixes are one set of consts both read,
 //! and on every shape the step fold leaves out — a task notification, a
 //! shell-mode command and its output, Esc's row, a meta row, a local
 //! command — `asked_by` names no person's prompt either. NEGATIVE

@@ -26,14 +26,14 @@
 //! ```
 //!
 //! THE MIRROR (phase 4) adds nothing to a log no bridge ever took from: its
-//! carry is the bytes it was (ruling Q5). A mirrored log's header ends
+//! carry is the bytes it was. A mirrored log's header ends
 //! ` ms=<head> mirror=<ep>:<seq>:<ms> snap=<ms>[ prior=<ep>:<seq>:<ms>:<head>]`
 //! and each of its bus-class records crosses as `R <ms> <record>`, so the
 //! successor goes on numbering the bus class where the predecessor stopped
 //! and takes from the cursor the export drew. A carry without `ms=` (a 2A or
 //! 2B writer's, or an unmirrored log's) is read as it always was: its
 //! bus-class records are numbered densely from 1 in seq order, `ms`'s head
-//! is their count, and no cursor crosses (ruling Q7).
+//! is their count, and no cursor crosses.
 //!
 //! THE CUT. The open records of open nodes, the session's own open and the
 //! record appended last (with the closes above it) always cross; the rest
@@ -242,7 +242,7 @@ pub struct CarrySnapshot {
     ms_of: BTreeMap<u64, u64>,
 }
 
-/// One `hole <lo> <hi>` line: an update's overlap as slice 2A wrote it, any
+/// One `hole <lo> <hi>` line: an update's overlap as before, any
 /// other range (a journal read's, `Log::from_journal`) with its ` why=<w>`,
 /// which a reader that predates it skips as an unknown token.
 pub(super) fn hole_line(lo: u64, hi: u64, why: GapWhy) -> String {
@@ -524,7 +524,7 @@ impl Log {
     }
 
     /// [`Log::from_carry`], its handoff mark naming the predecessor's build
-    /// (`mark - handoff … build=<n>`, Phase 6 step 6F-7) when the update
+    /// (`mark - handoff … build=<n>`) when the update
     /// said it.
     ///
     /// # Errors
@@ -571,8 +571,8 @@ impl Log {
         let ep = u32::try_from(ep).map_err(|_| CarryError::Line("an epoch"))?;
         let base = u32::try_from(base).map_err(|_| CarryError::Line("an epoch"))?;
         // THE MIRROR'S KEYS (phase 4): present only in a mirrored log's
-        // carry. Without them the carried bus class is numbered afresh
-        // (ruling Q7); with them each bus-class record crosses as an `R` line.
+        // carry. Without them the carried bus class is numbered afresh;
+        // with them each bus-class record crosses as an `R` line.
         let ms_head: Option<u64> = match kv_of(head, 2, "ms") {
             Some(v) => Some(
                 v.parse()
@@ -930,8 +930,8 @@ impl Log {
         }
         log.nodes = index;
         log.open = open;
-        // The bus class's numbering: carried, or (a carry without it, ruling
-        // Q7) densely from 1 in seq order over the carried bus-class records.
+        // The bus class's numbering: carried, or (a carry without it)
+        // densely from 1 in seq order over the carried bus-class records.
         let mut dense = 0u64;
         for (rec, ms) in recs.into_iter().zip(rec_ms) {
             let bytes = encoded_size(&rec, Tier::Content)
@@ -955,6 +955,7 @@ impl Log {
                 bytes,
                 ms,
                 mono,
+                row: super::rows::RowTag::NONE,
             });
             log.bytes = log.bytes.saturating_add(bytes);
         }
@@ -1161,7 +1162,7 @@ impl CarrySnapshot {
             self.issued[1],
             self.issued[2],
         );
-        // Only a mirrored log's header says more (ruling Q5): an older
+        // Only a mirrored log's header says more: an older
         // reader reads the keys it knows and skips these.
         if let Some(m) = &self.mirror {
             let _ = write!(
@@ -1541,7 +1542,7 @@ impl PreparedCarry {
         self.snap.last_seq
     }
 
-    /// THE MIRROR UNDER THE FENCE (phase 4, ruling Q7): the landed cursor and
+    /// THE MIRROR UNDER THE FENCE: the landed cursor and
     /// the `ms` head as the snapshot (and the readers' fence beside it) drew
     /// them, for a mirrored log; `None` for one nothing ever mirrored. What a
     /// successor that does not get this carry says of the old space's tail:

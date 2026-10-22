@@ -201,7 +201,7 @@ impl WarmBlock {
     /// Get the compressed size in bytes.
     #[must_use]
     #[inline]
-    pub(crate) fn compressed_size(&self) -> usize {
+    pub(crate) const fn compressed_size(&self) -> usize {
         self.compressed.len()
     }
 
@@ -644,7 +644,7 @@ impl WarmTier {
     }
 
     #[inline]
-    fn index_bytes(&self) -> usize {
+    const fn index_bytes(&self) -> usize {
         // Saturating: a real Vec's capacity in bytes fits (see push_compressed).
         self.cumulative_lines
             .capacity()

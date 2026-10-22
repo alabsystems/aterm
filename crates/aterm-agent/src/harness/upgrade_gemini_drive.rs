@@ -816,7 +816,7 @@ pub(super) fn after_exit_onto(
         // after its line. Never a restart on a guess: any `--session-id`
         // launch's `42` would be its own restart ([`own_restart`]), every
         // worker's included, and a crash read so went with no continuation
-        // (the review of 3a4586a01e, R2; the model's
+        // (the model's
         // `ACrashRelaunchedIsContinued`).
         ExitRecord::Crashed if !relaunched_before && cause == ExitCause::Exit => {
             match shell_word(opts, snap, k) {

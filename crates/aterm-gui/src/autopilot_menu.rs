@@ -1,15 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE AUTOPILOT MENU, set from the chip
-//! (`docs/DESIGN-harness-autopilot-2026-10-15.md` §9.3.3): Cruise, Land now,
-//! Off, the timed Cruises, the cancel and `⚙ Harness settings…` (the glass's
-//! one door to Settings ▸ Harness at the session's row, since the owner's
-//! 2026-10-19 "remove the settings button in the harness"), as cells
-//! over the pane — a popup, never a chrome row, so no program is re-gridded
-//! — opened by a right-click on the Autopilot chip (a ctrl-click on macOS),
-//! or `↓`, shift+F10 or the Menu key while `ctrl+shift+tab` has the chip
-//! selected.
+//! In-grid popup menu for the Autopilot chip and composer-rule facts (`crate::fact_menu`).
 //!
 //! ```text
 //!  Autopilot · tab 3 “fix the footer”
@@ -27,92 +19,10 @@
 //!  ⚙  Harness settings…
 //! ```
 //!
-//! **Shape.** The model ([`rows`]), its geometry ([`place`]), hit test
-//! ([`item_at`]), keyboard steps ([`step`]) and paint ([`paint`]) are pure
-//! functions over the rows, generalized from the in-grid tab menu
-//! (`crate::tab_menu`, whose rect, ink and text cutting they share). Not an
-//! NSMenu on macOS: the chip is no NSView, and a menu's nested tracking loop
-//! would stop frames while the agent's output keeps coming. Its
-//! accessibility node is the grid tree's `a11y_tree::GridMenu`
-//! ([`App::autopilot_grid_menu`]: a `Role::Menu` the window publishes where
-//! the tree is built, its items in words, the highlighted row the focus).
-//!
-//! **Where.** It hangs above the chip, its left edge at the chip's column,
-//! and opens downward only where fewer rows are above — inside the chip's
-//! own pane, across and up and down: shifted left only to stay in it, as
-//! narrow as the pane where the pane is narrower than the card (its side
-//! margins given up first, then the ends of its rows: never over the next
-//! pane), over the chip's row where neither side of the pane holds it
-//! whole, and its first rows only where the pane is shorter than it
-//! ([`place`]). Its name goes on two rows where one would cut it: the
-//! place, then the session's name in quotes; and the place breaks at its
-//! comma where a narrow pane cannot hold it whole ([`rows`]).
-//!
-//! **Who set it** (design §11.7.1): under the name, where the session runs
-//! under its own word, a note says who set it and when (`set 14:05 over
-//! aterm ctl`, `set Fri 09:12 from the chip`; clock times, never ages) —
-//! whole on one row, or broken at its comma onto two, or absent where the
-//! card's room cannot hold it whole. It is the first row to give way: where
-//! the pane's rows cannot hold the card whole with it, or would move the
-//! card to the chip's other side, the card is laid out without it
-//! ([`fit_rows`]).
-//!
-//! **On top.** It is painted after the frame published its overlays, so its
-//! splice takes its cells back from them (`app_render::scrub_overlay_card`):
-//! a caret under it is hidden and a sprite across its edge (the resident
-//! pet) is cut there; and its paint is a host write (`snapshot_seq`), so the
-//! card is drawn whole, never only over the rows the program redrew.
-//!
-//! **Keys.** `↑`/`↓`/Return/Esc. Any other key closes it and passes through,
-//! as the chip selection does. A click outside closes it, and is spent on
-//! that, as the tab menu's is.
-//!
-//! **It closes by itself** on the rule a stale chip selection has: at the
-//! first painted frame whose glass no longer shows its session's Autopilot
-//! chip at the menu's anchor (a box covered the composer, the pane narrowed,
-//! the chip did not fit), and on a focus or tab change — so a box that
-//! replaces Claude's composer under an open menu is answered by whoever
-//! answers boxes, never by the menu's Return. A re-grid (a window resize, a
-//! font zoom) closes nothing of itself: the next frame lays the card again
-//! where the chip still stands at the anchor, or closes it by that rule;
-//! until then the card the last frame laid on the old grid answers no
-//! pointer (`App::laid_cell_at`), and the card laid again counts as rows
-//! that moved under a resting pointer.
-//!
-//! **Under the master switch (or no host)** the mode and timer rows are
-//! shown disabled under the line `harness off in Settings`, and only `⚙
-//! Harness settings…` acts. Under the session's agent's own switch they are
-//! disabled under that switch by name, `Supervise Claude Code sessions is off`, as
-//! the chip's title says it (§10.2.1).
-//!
-//! **It follows its session.** Where the session's word or timer moves under
-//! an open menu (a wire `meta set`, the timer's fire, Settings), its rows are
-//! built again from the store, so its `●` and its cancel never stand stale;
-//! and the cancel is a compare-and-set that drops only the timer its row
-//! named, never writing `cruise` over what someone else stored. The rows
-//! built again keep the places the shown rows hold ([`keep_places`]: a row
-//! that left leaves a blank [`MenuRow::Gap`]), so no row moves under a still
-//! pointer; where a row arrives and the rest must move, a press on a choice
-//! the rows moved under since the pointer last moved chooses nothing
-//! ([`AutopilotMenu::press_lands`]) — and a card painted under a pointer
-//! that rests there (the right press that opened a card over its own chip,
-//! a keyboard open beside a resting pointer) is rows that moved under it.
-//!
-//! **Cost.** Nothing at rest: closed, the menu is one `Option` the frame's
-//! repaint key and the key path test. Opening and closing it are one frame
-//! each; the rows are built at the open, and again only when the session's
-//! pair moves under it.
-//!
-//! **Its owners.** The same card is each of the composer rule's facts' menu
-//! too (`crate::fact_menu`, owner 2026-10-19: "I need to also be able to
-//! click the other text on that line"): [`AutopilotMenu::owner`] names whose
-//! it is — the Autopilot chip's, or a fact's ([`MenuOwner`]) — and with it
-//! what keeps it open (the chip at its anchor, or the fact anywhere along
-//! the anchor's row), what its rows do ([`MenuAct::Fact`]) and which
-//! `controls` target reads it. One is open at a time. The usage's card is a
-//! graph of the session's traffic over time: its [`MenuRow::Plot`] rows are
-//! inert cells the card paints as given, and a card with them may be wider
-//! ([`TRAFFIC_MAX_CONTENT`]).
+//! [`rows`], [`place`], [`item_at`], [`step`] and [`paint`] are pure functions
+//! over [`MenuRow`]; [`fit_rows`] drops the `set …` row first when space is
+//! tight, and [`keep_places`] holds row positions with [`MenuRow::Gap`] when
+//! rows rebuild under an open menu ([`AutopilotMenu::press_lands`]).
 
 use aterm_agent::supervise::Autopilot;
 use aterm_core::terminal::RenderCell;
@@ -125,41 +35,28 @@ use crate::fact_menu::FactAct;
 use crate::tab_menu::{MenuRect, display_cells, ellipsize};
 use crate::{App, WindowId};
 
-/// The timed Cruises the menu and Settings offer, in minutes (§9.3.3).
+/// Timed Cruise durations in minutes.
 pub(crate) const LAND_IN_MINUTES: [u32; 3] = [60, 120, 240];
 
-/// Cells of breathing room inside each vertical border, where the pane
-/// holds them ([`side_pad`]).
 const H_PAD: usize = 1;
-/// The narrowest and widest the card's content may be, in cells.
 const MIN_CONTENT: usize = 24;
+/// Default maximum content width in cells.
 pub(crate) const MAX_CONTENT: usize = 44;
-/// The widest a card with a graph ([`MenuRow::Plot`]) may be: its columns
-/// are time, and more of them say more.
+/// Maximum content width for cards containing a [`MenuRow::Plot`].
 pub(crate) const TRAFFIC_MAX_CONTENT: usize = 60;
-/// The glyph column: `∞⤓` and a space.
 const GLYPH_CELLS: usize = 3;
-/// The checked mark (`●`) and the space before it.
 const CHECK_CELLS: usize = 2;
 
-/// What a row does when chosen.
+/// Action performed when a menu row is chosen.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum MenuAct {
-    /// Write the session's own word (the chip's write; a hand write drops a
-    /// timer).
     Mode(Autopilot),
-    /// A timed Cruise, or its cancel.
     Timer(TimerChoice),
-    /// Open Settings ▸ Harness.
     Settings,
-    /// A row of a fact's menu (`crate::fact_menu`): the fact, and what the
-    /// row does to it. None types into any program.
     Fact(Fact, FactAct),
 }
 
-/// Whose the open card is: the Autopilot chip's, or a fact's of the composer
-/// rule (`crate::fact_menu`). It decides what keeps the card open, what its
-/// rows do and which `controls` target reads it.
+/// Owner of the open card (Autopilot chip or composer-rule fact).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum MenuOwner {
     Autopilot,
@@ -167,7 +64,7 @@ pub(crate) enum MenuOwner {
 }
 
 impl MenuAct {
-    /// The row's stable key (`controls autopilot-menu`, §9.3.3).
+    /// Stable `controls` key for this action.
     #[must_use]
     pub(crate) fn key(self) -> String {
         match self {
@@ -184,60 +81,35 @@ impl MenuAct {
 /// One row of the menu.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum MenuRow {
-    /// The menu's name: `Autopilot · tab 3 “fix the footer”` — or, where
-    /// that is wider than the card's room, its place alone
-    /// (`Autopilot · tab 1, right pane`), the name on the row under it; and
-    /// where the place too is wider, the place broken at its comma onto two
-    /// such rows (`Autopilot · tab 1,` then `right pane`).
     Header(String),
-    /// The session's name under a header that names its place alone
-    /// (`✳ Claude Code`, drawn in quotes, cut inside them).
     Name(String),
-    /// Why the rows below are off: `harness off in Settings`, or the agent's
-    /// own switch by name (`Supervise Claude Code sessions is off`).
     Note(String),
-    /// Who set the session's own word, and when (§11.7.1): `set 14:05 over
-    /// aterm ctl` — one row, or two where it breaks at its comma; inert, in
-    /// the note's ink, and the first row to give way ([`fit_rows`]). `floor`:
-    /// the cells it asks of the card at the least — 0 at a build, and the
-    /// cells the shown note asked where one built again takes its place
-    /// ([`keep_places`]), so a note that says less (the timer's fire under
-    /// an open menu) never narrows the card under a still pointer.
-    SetBy { text: String, floor: usize },
-    /// A rule between groups.
+    /// Provenance note (`set 14:05 …`), with `floor` width preserved across rebuilds.
+    SetBy {
+        text: String,
+        floor: usize,
+    },
     Rule,
-    /// The place of a choice that left while the menu was open (the timer
-    /// fired, or was cancelled elsewhere): blank, inert, and as wide as the
-    /// row it held (`.0`, its cells in [`content_width`]), so every row that
-    /// remains stays on the frame row it was on ([`keep_places`]). Never in
-    /// a menu built at the open.
+    /// Blank placeholder preserving row positions after a choice disappears.
     Gap(usize),
-    /// A row of a graph (the traffic card's, `crate::fact_menu`): its cells
-    /// painted as given — glyph, ink, and a shaded ground where Claude was
-    /// working — inert, never a choice.
     Plot(Box<[PlotCell]>),
-    /// A choice.
     Item {
         glyph: &'static str,
         label: String,
-        /// What a screen reader says: words, never a glyph.
         spoken: String,
         act: MenuAct,
         enabled: bool,
-        /// The mode the session runs under (`●`).
         checked: bool,
     },
 }
 
 impl MenuRow {
-    /// Whether a click or Return can choose it.
+    /// Whether a click or Return can choose this row.
     #[must_use]
     pub(crate) fn selectable(&self) -> bool {
         matches!(self, Self::Item { enabled: true, .. })
     }
 
-    /// Its text as drawn, the glyph column padded (the check mark is drawn
-    /// apart, flush right).
     fn text(&self) -> String {
         match self {
             Self::Header(text) | Self::Note(text) | Self::SetBy { text, .. } => text.clone(),
@@ -252,8 +124,7 @@ impl MenuRow {
     }
 }
 
-/// One cell of a [`MenuRow::Plot`]: its glyph, its ink, and whether its
-/// column fell in a span Claude was working (a shaded ground).
+/// One cell of a [`MenuRow::Plot`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct PlotCell {
     pub(crate) ch: char,
@@ -261,8 +132,7 @@ pub(crate) struct PlotCell {
     pub(crate) busy: bool,
 }
 
-/// A graph cell's ink: the tokens in (the card's accent), the tokens out (its
-/// words' ink), or the axis and labels (its secondary ink).
+/// Ink role for a [`PlotCell`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum PlotInk {
     In,
@@ -270,13 +140,10 @@ pub(crate) enum PlotInk {
     Axis,
 }
 
-/// `name` in the menu's quotes: `“✳ Claude Code”`.
 fn quoted(name: &str) -> String {
     format!("\u{201c}{name}\u{201d}")
 }
 
-/// `name` in quotes cut to `room` cells inside them, the closing quote kept
-/// (`“✳ Claude Co…”`).
 fn quoted_in(name: &str, room: usize) -> String {
     if display_cells(&quoted(name)) <= room {
         return quoted(name);
@@ -284,43 +151,22 @@ fn quoted_in(name: &str, room: usize) -> String {
     quoted(&ellipsize(name, room.saturating_sub(2)))
 }
 
-/// What the menu is built from, read once at the open.
+/// Snapshot of session state used to build the menu rows.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct MenuFacts {
-    /// The menu's name: `Autopilot` and the session's place
-    /// (`Autopilot · tab 1, right pane`).
     pub(crate) title: String,
-    /// The session's own name (`✳ Claude Code`), where it has one: after the
-    /// place in quotes, on the header's row where both fit `room`, else on
-    /// the row under it.
     pub(crate) name: Option<String>,
-    /// The content cells the card has in its pane ([`content_room`]).
     pub(crate) room: usize,
-    /// Its name as a screen reader says it, in words
-    /// (`Autopilot, tab 3, fix the footer`).
     pub(crate) spoken: String,
-    /// The session's effective Autopilot (the checked row).
     pub(crate) view: AutopilotView,
-    /// Whether the harness carries a mode here: off under the master
-    /// switch, an agent's own switch, or with no host.
     pub(crate) carries: bool,
-    /// `[harness] land_at` as it arms if chosen now
-    /// ([`crate::autopilot_timers::offer_glass`]), offered as "Cruise until
-    /// 18:00, then land" — "Cruise until Sat 18:00, then land" once today's
-    /// 18:00 has passed.
     pub(crate) land_at: Option<LandAtGlass>,
-    /// The session's armed instant, whether or not a local face is available.
     pub(crate) armed_at_ms: Option<i64>,
-    /// Its optional local face, used only to name the cancel row.
     pub(crate) armed: Option<LandAtGlass>,
-    /// Who set the session's own word, and when (§11.7.1: `set 14:05 over
-    /// aterm ctl`), composed at the build; `None` where it runs under the
-    /// default.
     pub(crate) set_by: Option<String>,
 }
 
-/// A clock time as the title and the page write it: `18:00`, or `Sat 16:00`
-/// on another day.
+/// Format a landing time (`18:00` or `Sat 16:00`).
 pub(crate) fn when(at: LandAtGlass) -> String {
     match at.other_day {
         Some(day) => format!("{} {}", day.short(), at.clock.as_str()),
@@ -328,7 +174,7 @@ pub(crate) fn when(at: LandAtGlass) -> String {
     }
 }
 
-/// [`when`] as a screen reader says it: `18:00`, or `Saturday 16:00`.
+/// Format [`when`] for screen readers (`18:00` or `Saturday 16:00`).
 pub(crate) fn spoken_when(at: LandAtGlass) -> String {
     match at.other_day {
         Some(day) => format!("{} {}", day.long(), at.clock.as_str()),
@@ -336,22 +182,15 @@ pub(crate) fn spoken_when(at: LandAtGlass) -> String {
     }
 }
 
-/// THE MODEL (§9.3.3): the header, the three modes (the effective one
-/// checked), the timed Cruises (1 h, 2 h, 4 h; until `[harness] land_at`
-/// where it is set; the cancel while a timer is armed) and Settings. Where
-/// the harness carries no mode here, the mode and timer rows are disabled
-/// under `harness off in Settings` (or, under the agent's own switch, that
-/// switch by name), and only Settings acts. Pure.
+/// Build the Autopilot menu rows from `facts`.
 #[must_use]
 pub(crate) fn rows(facts: &MenuFacts) -> Vec<MenuRow> {
     let on = facts.carries;
     let mut out = header_rows(&facts.title, facts.name.as_deref(), facts.room);
-    // Who set it, under the name: whole, or not at all (§11.7.1).
     if let Some(set_by) = &facts.set_by {
         out.extend(set_by_rows(set_by, facts.room));
     }
     if !on {
-        // Why, as the chip's title says it: an agent's own switch by name.
         let why = match facts.view {
             AutopilotView::AgentOff(agent) => crate::autopilot::agent_switch_off(agent),
             _ => "harness off in Settings",
@@ -427,11 +266,7 @@ pub(crate) fn rows(facts: &MenuFacts) -> Vec<MenuRow> {
     out
 }
 
-/// A card's name as its first rows: `title` (`Autopilot · tab 3`) and the
-/// session's `name` in quotes. THE NAME HAS ITS OWN ROOM: the place and the
-/// name on one row where a card of `room` content cells holds them whole,
-/// else on two — so the pane word never cuts the name, and the choices keep
-/// their width. Pure; every owner's card is named so.
+/// Build header rows for `title` and optional `name` within `room` cells.
 #[must_use]
 pub(crate) fn header_rows(title: &str, name: Option<&str>, room: usize) -> Vec<MenuRow> {
     match name {
@@ -449,10 +284,6 @@ pub(crate) fn header_rows(title: &str, name: Option<&str>, room: usize) -> Vec<M
     }
 }
 
-/// The menu's place as header rows: one where it is whole in `room` cells,
-/// else broken after its last comma (`Autopilot · tab 1,` then `right
-/// pane`), so the pane word — what tells two panes' menus apart — is never
-/// the part cut.
 fn place_rows(title: &str, room: usize) -> Vec<MenuRow> {
     match title.rsplit_once(", ") {
         Some((head, pane)) if display_cells(title) > room => vec![
@@ -463,10 +294,6 @@ fn place_rows(title: &str, room: usize) -> Vec<MenuRow> {
     }
 }
 
-/// The setter's note as rows in `room` cells (§11.7.1): one where it is
-/// whole, else broken after its last comma where both halves are whole
-/// (`set 14:05 from Settings ▸ Harness,` then `every session`), else none —
-/// it is never cut.
 fn set_by_rows(note: &str, room: usize) -> Vec<MenuRow> {
     let row = |text: String| MenuRow::SetBy { text, floor: 0 };
     if display_cells(note) <= room {
@@ -480,13 +307,7 @@ fn set_by_rows(note: &str, room: usize) -> Vec<MenuRow> {
     }
 }
 
-/// THE NOTE GIVES WAY FIRST (§11.7.3, item 6): `rows` as the card shows
-/// them over the chip at `anchor` in `pane` of the frame `frame` under `top`
-/// chrome rows ([`place`]'s inputs) — with the setter's note where the card
-/// holds every row with it, on the side of the chip it would take without
-/// it; else without the note, so a tight pane loses the note before any
-/// choice, and the note never moves the card over its chip or into the
-/// frame's rows. Pure.
+/// Drop [`MenuRow::SetBy`] rows when keeping them would truncate the card or flip its side.
 #[must_use]
 pub(crate) fn fit_rows(
     rows: Vec<MenuRow>,
@@ -520,8 +341,6 @@ pub(crate) fn fit_rows(
     }
 }
 
-/// Whether `a` offers the choice `b` offered, in the same words: a lit row
-/// stays lit across a rebuild only where Return would still do what it said.
 fn same_choice(a: &MenuRow, b: &MenuRow) -> bool {
     match (a, b) {
         (
@@ -542,8 +361,6 @@ fn same_choice(a: &MenuRow, b: &MenuRow) -> bool {
     }
 }
 
-/// The cells one row asks of the card: its text, and room for the check
-/// mark on a choice; a gap keeps what its row asked.
 fn row_width(row: &MenuRow) -> usize {
     match row {
         MenuRow::Gap(cells) => *cells,
@@ -554,8 +371,6 @@ fn row_width(row: &MenuRow) -> usize {
     }
 }
 
-/// The card's content width: the widest row with room for the check mark,
-/// floored and capped — at [`TRAFFIC_MAX_CONTENT`] for a card with a graph.
 fn content_width(rows: &[MenuRow]) -> usize {
     rows.iter()
         .map(row_width)
@@ -564,8 +379,6 @@ fn content_width(rows: &[MenuRow]) -> usize {
         .clamp(MIN_CONTENT, max_content(rows))
 }
 
-/// The widest `rows`' card may be: [`TRAFFIC_MAX_CONTENT`] with a graph,
-/// else [`MAX_CONTENT`].
 fn max_content(rows: &[MenuRow]) -> usize {
     if rows.iter().any(|row| matches!(row, MenuRow::Plot(_))) {
         TRAFFIC_MAX_CONTENT
@@ -574,35 +387,22 @@ fn max_content(rows: &[MenuRow]) -> usize {
     }
 }
 
-/// The cells of the card's border and its padding, both sides.
 const CHROME_W: usize = 2 + 2 * H_PAD;
 
-/// The cells of the card's two borders alone: a card in a pane narrower
-/// than its rows ask gives up its padding first ([`side_pad`]).
 const BORDER_W: usize = 2;
 
-/// The content cells a card has in a pane `pane_cols` wide ([`place`]): the
-/// widest card's, or the pane's inside its borders where it is narrower
-/// (its padding given up, [`side_pad`]): the card never leaves its pane, so
-/// its header is broken for the room it has there.
+/// Available content cells in a pane `pane_cols` wide.
 #[must_use]
 pub(crate) fn content_room(pane_cols: usize) -> usize {
     content_room_up_to(pane_cols, MAX_CONTENT)
 }
 
-/// [`content_room`] for a card that may be `widest` content cells wide (a
-/// graph's, [`TRAFFIC_MAX_CONTENT`]): the pane's own room up to that, the
-/// card never leaving its pane.
+/// Available content cells in `pane_cols`, capped at `widest`.
 #[must_use]
 pub(crate) fn content_room_up_to(pane_cols: usize, widest: usize) -> usize {
     pane_cols.saturating_sub(BORDER_W).min(widest)
 }
 
-/// The padding inside each border of a card `w` cells wide that shows
-/// `rows`: [`H_PAD`] where the card holds its rows with it, none where it is
-/// narrower than they ask — a pane's two cells go to the words first, so in
-/// a narrow pane `Cruise 4 hours, then land` and `tab 1, right pane` stay
-/// whole. Pure, so the paint and the place agree.
 fn side_pad(w: usize, rows: &[MenuRow]) -> usize {
     if w >= content_width(rows) + CHROME_W {
         H_PAD
@@ -611,10 +411,6 @@ fn side_pad(w: usize, rows: &[MenuRow]) -> usize {
     }
 }
 
-/// The rows a card must show to be worth opening in a pane: its header and
-/// the three modes (every row before the first rule, but the setter's note,
-/// which gives way first: [`fit_rows`]), and its borders. A pane with fewer
-/// rows lends it the frame's.
 fn least_rows(rows: &[MenuRow]) -> usize {
     rows.iter()
         .take_while(|row| !matches!(row, MenuRow::Rule))
@@ -623,8 +419,6 @@ fn least_rows(rows: &[MenuRow]) -> usize {
         + 2
 }
 
-/// Whether `fresh` may stand where `shown` stood: the same kind of row, and
-/// for a choice the same act (its words, check and state may have moved).
 fn same_place(shown: &MenuRow, fresh: &MenuRow) -> bool {
     match (shown, fresh) {
         (MenuRow::Header(_), MenuRow::Header(_))
@@ -638,12 +432,7 @@ fn same_place(shown: &MenuRow, fresh: &MenuRow) -> bool {
     }
 }
 
-/// THE ROWS STAY WHERE THEY WERE (lifecycle-1): `fresh`, the rows built again
-/// under an open menu, laid into the places the `shown` rows hold — a row that
-/// left leaves a [`MenuRow::Gap`] as wide as it was — so a choice that remains
-/// stays on the frame row the pointer found it on, and the card keeps its
-/// rect. `None` where `fresh` holds a row with no place among `shown` (one
-/// arrived: the card must grow, and is laid out afresh). Pure.
+/// Map `fresh` onto `shown` row positions using [`MenuRow::Gap`] for removed rows.
 #[must_use]
 pub(crate) fn keep_places(shown: &[MenuRow], fresh: &[MenuRow]) -> Option<Vec<MenuRow>> {
     let mut next = fresh.iter().peekable();
@@ -651,7 +440,6 @@ pub(crate) fn keep_places(shown: &[MenuRow], fresh: &[MenuRow]) -> Option<Vec<Me
         .iter()
         .map(
             |old| match next.next_if(|new| same_place(old, new)).cloned() {
-                // A note built again asks at least the cells the shown one did.
                 Some(MenuRow::SetBy { text, floor }) => MenuRow::SetBy {
                     text,
                     floor: floor.max(row_width(old)),
@@ -664,23 +452,7 @@ pub(crate) fn keep_places(shown: &[MenuRow], fresh: &[MenuRow]) -> Option<Vec<Me
     next.peek().is_none().then_some(laid)
 }
 
-/// THE GEOMETRY: the card hangs ABOVE the chip at frame cell `(chip_row,
-/// chip_col)`, its left edge at the chip's column, never over the first
-/// `top` rows (the tab strip); it opens downward only where it is not whole
-/// above. Where neither side holds it whole, it moves over the chip's row,
-/// whole, from the end of the side with more rows (the AppKit rule for a menu
-/// at a screen's edge: the menu stays whole, its origin covered); only
-/// where there are fewer rows than the card has does it show its first
-/// rows, never ending on a rule. IT STAYS IN ITS PANE (the frame rows and
-/// columns `pane`): across, shifted left only to stay in it, and no wider
-/// than it, however narrow — its padding given up first ([`side_pad`]), then
-/// the ends of its rows, never a cell over the next pane (the chip that
-/// opens it leaves a pane before the pane is too narrow for the rows to say
-/// what they choose: `Cruise 4 hours, then…`); up and down, inside the
-/// pane's rows, down to a pane that holds the header and the three modes
-/// ([`least_rows`]). A pane shorter than that lends the card the frame's
-/// rows, placed as in a frame of one pane. `None` where the frame (`(cols,
-/// frame_rows)`) or the pane cannot host a card at all.
+/// Place the menu card relative to `(chip_row, chip_col)` within `pane` and `frame`.
 #[must_use]
 pub(crate) fn place(
     rows: &[MenuRow],
@@ -692,14 +464,12 @@ pub(crate) fn place(
     if rows.is_empty() || cols <= CHROME_W || chip_row >= frame_rows {
         return None;
     }
-    // Across: inside the pane, however narrow.
     let pane = pane_cols.start.min(cols)..pane_cols.end.min(cols);
     if pane.len() <= BORDER_W {
         return None;
     }
     let w = (content_width(rows) + CHROME_W).min(pane.len());
     let col = chip_col.min(pane.end - w).max(pane.start);
-    // Up and down: the rows `lo..hi` it may cover, the pane's or the frame's.
     let (lo, hi) = (pane_rows.start.max(top), pane_rows.end.min(frame_rows));
     let (lo, hi) = if (lo..hi).contains(&chip_row) && hi - lo >= least_rows(rows) {
         (lo, hi)
@@ -713,7 +483,6 @@ pub(crate) fn place(
     } else if below >= want {
         (chip_row + 1, want)
     } else if hi - lo >= want {
-        // Over the chip's row, whole.
         if above >= below {
             (lo, want)
         } else {
@@ -722,15 +491,13 @@ pub(crate) fn place(
     } else {
         (lo, hi - lo)
     };
-    // A prefix never ends on a rule: a line over the bottom border.
     if h < want && h > 3 && matches!(rows.get(h - 3), Some(MenuRow::Rule)) {
         h -= 1;
     }
-    // A border pair and one row, or no card.
     (h >= 3).then_some(MenuRect { row, col, w, h })
 }
 
-/// The row frame `row` shows, or `None` for a border or past a truncation.
+/// Index into `rows` at `frame_row`, or `None` on a border or past truncation.
 #[must_use]
 pub(crate) fn row_at(rect: MenuRect, frame_row: usize) -> Option<usize> {
     if frame_row <= rect.row || frame_row + 1 >= rect.row + rect.h {
@@ -739,7 +506,7 @@ pub(crate) fn row_at(rect: MenuRect, frame_row: usize) -> Option<usize> {
     Some(frame_row - rect.row - 1)
 }
 
-/// The row a click at frame `(row, col)` chooses: a shown, selectable row.
+/// Selectable row index at frame `(row, col)`.
 #[must_use]
 pub(crate) fn item_at(rect: MenuRect, rows: &[MenuRow], row: usize, col: usize) -> Option<usize> {
     if !rect.contains(row, col) {
@@ -749,8 +516,7 @@ pub(crate) fn item_at(rect: MenuRect, rows: &[MenuRow], row: usize, col: usize) 
     rows.get(i).filter(|r| r.selectable()).map(|_| i)
 }
 
-/// Step the highlight one selectable row (`down`, else up), wrapping; from
-/// none, the first (or last). Only rows a truncated card shows (`shown`).
+/// Advance highlight by one selectable row within the first `shown` rows.
 #[must_use]
 pub(crate) fn step(
     rows: &[MenuRow],
@@ -776,21 +542,18 @@ pub(crate) fn step(
     })
 }
 
-/// What a key means to the open menu.
+/// Key action for an open menu.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum MenuKey {
     Up,
     Down,
     Choose,
     Close,
-    /// Any other key: the menu closes and the key goes on.
     PassThrough,
-    /// A bare modifier: nothing.
     Inert,
 }
 
-/// The menu's keys (§9.3.3): `↑`/`↓`/Return/Esc; a bare modifier is
-/// nothing; everything else closes the menu and passes through.
+/// Classify `key` for an open menu.
 #[must_use]
 pub(crate) fn key_of(key: &aterm_types::keyboard::Key) -> MenuKey {
     use aterm_types::keyboard::{Key, NamedKey as Nk};
@@ -806,9 +569,7 @@ pub(crate) fn key_of(key: &aterm_types::keyboard::Key) -> MenuKey {
     }
 }
 
-/// THE PAINT: exactly `rect.h` rows of `rect.w` cells, the tab menu's card
-/// (its ground, rules, ink and selection), a disabled row in the disabled
-/// ink, the checked row's `●` flush right.
+/// Render the menu card into `rect.h` rows of `rect.w` cells.
 #[must_use]
 pub(crate) fn paint(
     rect: MenuRect,
@@ -879,10 +640,6 @@ pub(crate) fn paint(
     out
 }
 
-/// One [`MenuRow::Plot`] of a card `w` cells wide, its cells laid from
-/// `text_start` to before `text_end` as given: In in the card's accent, Out
-/// in its words' ink, the axis in its secondary ink; a column Claude was
-/// working in on a ground a tenth of the way to the accent.
 fn paint_plot(
     w: usize,
     (text_start, text_end): (usize, usize),
@@ -913,8 +670,7 @@ fn paint_plot(
     cells
 }
 
-/// The card a menu choice just closed (`App::spends_menu_follow_up`): its
-/// window, where it was painted, the grid it was laid on, and when.
+/// Recently closed menu card rect used to swallow the second press of a double-click.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct SpentCard {
     pub(crate) wid: WindowId,
@@ -923,58 +679,26 @@ pub(crate) struct SpentCard {
     pub(crate) at: std::time::Instant,
 }
 
-/// One open Autopilot menu (one at a time, in one window).
+/// Open Autopilot or fact popup menu state.
 #[derive(Clone, Debug)]
 pub(crate) struct AutopilotMenu {
-    /// Whose card it is: the Autopilot chip's, or a fact's.
     pub(crate) owner: MenuOwner,
-    /// The window it is open in.
     pub(crate) wid: WindowId,
-    /// The session whose chip opened it: every choice is for it.
     pub(crate) session: u64,
-    /// The window's focused session when it opened: a focus or tab change
-    /// moves it, and the menu closes.
     pub(crate) focus: Option<u64>,
-    /// The chip's first cell, frame coordinates: the anchor, and what each
-    /// painted frame checks is still the session's Autopilot chip.
     pub(crate) anchor: (usize, usize),
-    /// The rows, built at the open and again whenever the session's pair
-    /// moves under the open menu ([`App::refresh_autopilot_menu`]).
     pub(crate) rows: Vec<MenuRow>,
-    /// The menu's name in words, read with the rows ([`MenuFacts::spoken`]):
-    /// what its accessibility node is called.
     pub(crate) spoken: String,
-    /// The instant its cancel row names, unix ms (the index's, read with the
-    /// rows): the cancel drops that timer and no other.
+    /// Armed timer deadline (unix ms) targeted by the cancel row.
     pub(crate) cancels: Option<i64>,
-    /// The highlighted row: the first choice for a keyboard open, none for
-    /// a pointer's.
     pub(crate) highlight: Option<usize>,
-    /// Where the last frame painted it, for the hit test; `None` before the
-    /// first frame.
     pub(crate) rect: Option<MenuRect>,
-    /// The grid that frame laid [`Self::rect`] on
-    /// ([`crate::app_mouse::GlassGrid`]): under any other — a re-grid since,
-    /// its frame not yet painted — the rect answers no pointer
-    /// ([`App::laid_cell_at`]), and the next frame lays the card again where
-    /// its chip still stands at the anchor, or closes it.
     pub(crate) laid: Option<crate::app_mouse::GlassGrid>,
-    /// How many times the rows moved under the open menu (0 at the open).
     pub(crate) generation: u64,
-    /// Where the pointer last moved to while the menu was open, and what it
-    /// rested on there ([`Self::note_pointer`]); at the open, the pixel it
-    /// already held, with nothing read.
     pub(crate) rest: PointerRest,
 }
 
-/// Where the pointer last MOVED to while the menu was open: the window pixel
-/// (`None` where the window held no position), the frame row there and the
-/// choice the card showed on it (`None` for both until the pointer moved
-/// over a painted card; a choice `None` over a border, the header, a rule, a
-/// gap or off the card), and the rows' [`AutopilotMenu::generation`] it was
-/// read against. Keyed on the pixel, not on the event: a motion event at the
-/// pixel the pointer already rests on — AppKit queues one ahead of every
-/// press and every wheel event — is no motion and reads nothing.
+/// Last pointer position and hovered choice recorded while the menu is open.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct PointerRest {
     px: Option<(f64, f64)>,
@@ -984,8 +708,7 @@ pub(crate) struct PointerRest {
 }
 
 impl PointerRest {
-    /// The rest at an open: the pixel the pointer holds, nothing read, the
-    /// rows' first generation.
+    /// Initial pointer state when the menu opens.
     pub(crate) fn at_open(px: Option<(f64, f64)>) -> Self {
         Self {
             px,
@@ -996,12 +719,9 @@ impl PointerRest {
     }
 }
 
-/// A choice as the person saw it: what it does, its words, whether it was on
-/// — [`same_choice`]'s fields.
 type Choice = (MenuAct, String, bool);
 
 impl AutopilotMenu {
-    /// Row `i` as a [`Choice`], where it is one.
     fn choice_at(&self, i: usize) -> Option<Choice> {
         match self.rows.get(i)? {
             MenuRow::Item {
@@ -1014,20 +734,12 @@ impl AutopilotMenu {
         }
     }
 
-    /// The pointer is at window pixel `px`, on frame row `frame_row`
-    /// (`None` off every frame cell), over row `hovered` of the painted card
-    /// where that is a choice. Where it MOVED there — another pixel than the
-    /// one it rested on — what it sees there is noted against the rows'
-    /// generation now; a motion event at the same pixel is no motion and
-    /// reads nothing, whatever the rows did meanwhile.
     fn note_pointer(&mut self, px: (f64, f64), frame_row: Option<usize>, hovered: Option<usize>) {
         if self.rest.px != Some(px) {
             self.rest_on(px, frame_row, hovered);
         }
     }
 
-    /// Note what the pointer at `px` sees now, moved or not: a refused press
-    /// shows the person the row now under it, and the next press may take it.
     fn rest_on(&mut self, px: (f64, f64), frame_row: Option<usize>, hovered: Option<usize>) {
         self.rest = PointerRest {
             px: Some(px),
@@ -1037,18 +749,7 @@ impl AutopilotMenu {
         };
     }
 
-    /// THE PRESS GOES WHERE THE POINTER LOOKED (lifecycle-1): whether a
-    /// press on frame row `frame_row`, over row `i`, chooses it. Yes where
-    /// the rows have not moved since the pointer last moved (or since the
-    /// open); else only where the pointer last moved onto that same frame
-    /// row and the card showed there the very choice it shows now. A press
-    /// the rows moved under is refused, and the row now under it lit
-    /// ([`App::autopilot_menu_press`]), as the reader's click from moved rows
-    /// is refused by its epoch — a pointer still since the open, which read
-    /// nothing, included. A card painted over the pixel a pointer rests on is
-    /// rows that moved under it ([`App::paint_autopilot_menu`]): the right
-    /// press that opened a card over its own chip saw no choice there, so the
-    /// next press at that pixel lights the row and the one after chooses.
+    /// Whether a press at `(frame_row, i)` lands without rows having shifted under the pointer.
     fn press_lands(&self, frame_row: usize, i: usize) -> bool {
         let rest = &self.rest;
         rest.generation == self.generation
@@ -1057,12 +758,7 @@ impl AutopilotMenu {
                 && rest.choice == self.choice_at(i))
     }
 
-    /// Refresh the owned menu snapshot, as the App's meta/timer wake does.
-    /// Whether its visible rows moved and therefore need another painted frame.
-    /// The rows that remain keep their places ([`keep_places`]) — and the
-    /// card its rect, where it asks no other width — so nothing moves under a
-    /// still pointer; only where a row arrived is the card laid out afresh,
-    /// and the hit test waits for the frame that paints it.
+    /// Rebuild menu rows in place, returning whether visible rows changed.
     pub(crate) fn refresh_rows(
         &mut self,
         fresh: Vec<MenuRow>,
@@ -1087,9 +783,7 @@ impl AutopilotMenu {
         true
     }
 
-    /// `controls autopilot-menu` (`controls fact-menu` for a fact's, which
-    /// names its fact): the open card's rows, their stable keys, what each
-    /// shows and whether it is on, checked and highlighted.
+    /// Format `controls autopilot-menu` or `controls fact-menu` lines.
     #[must_use]
     pub(crate) fn controls_lines(&self, sid: &str) -> Vec<String> {
         let (target, fact) = match self.owner {
@@ -1132,14 +826,7 @@ impl AutopilotMenu {
         out
     }
 
-    /// THE ROWS' ACCESSIBILITY EPOCH (`a11y_tree::GridMenu::epoch`): its
-    /// session, its name, the exact instant its cancel names and its rows
-    /// (each row's words, choice, state and check) folded. A timer replacement
-    /// is an identity input even where its visible minute face stays equal.
-    /// This is a compact 22-bit hash, not a collision-free generation.
-    /// The highlight is not in it: `↓` moves the tree's focus
-    /// and keeps every id. Computed where the tree is built and where a
-    /// reader's click arrives, never on the frame's own path.
+    /// Compact 22-bit accessibility epoch over session, spoken title, cancel deadline, and rows.
     #[cfg(a11y_tree)]
     #[must_use]
     fn a11y_epoch(&self) -> u32 {
@@ -1152,7 +839,6 @@ impl AutopilotMenu {
         crate::a11y_tree::menu_epoch_from(h.finish())
     }
 
-    /// Repaint fingerprint: never 0 (closed is 0).
     #[must_use]
     fn fingerprint(&self) -> u64 {
         use std::hash::{Hash, Hasher};
@@ -1186,9 +872,7 @@ impl std::hash::Hash for MenuRow {
     }
 }
 
-/// The open menu's repaint term for window `wid`: 0 with none open there,
-/// so a frame at rest pays one `Option` test. It moves on the open, the
-/// close and every highlight step, none of which dirty a terminal cell.
+/// Repaint fingerprint for `wid` (`0` when no menu is open in `wid`).
 #[must_use]
 pub(crate) fn fingerprint(menu: Option<&AutopilotMenu>, wid: WindowId) -> u64 {
     menu.filter(|menu| menu.wid == wid)
@@ -1196,23 +880,15 @@ pub(crate) fn fingerprint(menu: Option<&AutopilotMenu>, wid: WindowId) -> u64 {
 }
 
 impl App {
-    /// Session `session`'s place as a card names it (`tab 1, left pane`) and
-    /// its own name where it has one (`✳ Claude Code`): read once, at an
-    /// open or a rebuild — every owner's card is named so.
+    /// Session place label and optional title for menu headers.
     pub(crate) fn menu_place_and_name(&self, session: u64) -> (String, Option<String>) {
         let sid = self
             .pool
             .get(session)
             .map(|s| s.ctx.self_id.as_str().to_string())
             .unwrap_or_default();
-        // Its pane named where its tab holds two agents (`tab 1, left pane`),
-        // as its SESSIONS row names it (§10.3.3, item 9).
         let place = self.session_place(&sid);
         let place = place.strip_prefix("in ").unwrap_or(&place).to_string();
-        // The page's own name for the session: the person's title, else the
-        // terminal's live one without its spinner frame (the menu's name is
-        // built once, at the open) — read from the pane's terminal, never the
-        // store's copy, which only the front pane's window title writes.
         let name = self.pool.get(session).and_then(|s| {
             let person = s
                 .ctx
@@ -1234,7 +910,6 @@ impl App {
         (place, name)
     }
 
-    /// The facts session `session`'s menu is built from, read once.
     fn autopilot_menu_facts(&self, session: u64) -> MenuFacts {
         let (_, view, _) = self.session_autopilot(session);
         let (place, name) = self.menu_place_and_name(session);
@@ -1242,9 +917,6 @@ impl App {
             Some(name) => format!("Autopilot, {place}, {name}"),
             None => format!("Autopilot, {place}"),
         };
-        // Who set its own word, and when (§11.7.1): one wall read, at the
-        // build, for the day the clock is named against; none where it runs
-        // under the default.
         let set_by = self
             .pool
             .get(session)
@@ -1271,7 +943,6 @@ impl App {
             spoken,
             view,
             carries: view.mode().is_some(),
-            // One wall read at the open, only with `land_at` set.
             land_at: self.harness_policy.get().policy.land_at.map(|at| {
                 crate::autopilot_timers::offer_glass(
                     at,
@@ -1285,9 +956,6 @@ impl App {
         }
     }
 
-    /// `rows` as the card over `session`'s chip at `anchor` in window `wid`
-    /// shows them: the setter's note given way where the pane cannot hold
-    /// the card whole with it ([`fit_rows`]).
     fn autopilot_menu_fit(
         &self,
         wid: WindowId,
@@ -1308,10 +976,7 @@ impl App {
         )
     }
 
-    /// OPEN session `session`'s menu in window `wid`, hung from its
-    /// Autopilot chip's first cell `anchor` (frame row, column). A keyboard
-    /// open lights the first choice; a pointer's lights none. Any menu open
-    /// elsewhere closes. One frame.
+    /// Open `session`'s Autopilot menu in `wid` anchored at `anchor`.
     pub(crate) fn open_autopilot_menu(
         &mut self,
         wid: WindowId,
@@ -1320,10 +985,7 @@ impl App {
         keyboard: bool,
     ) {
         self.close_autopilot_menu();
-        // A card up again: a double-click's second half is no longer the
-        // next press (`Self::spends_menu_follow_up`).
         self.autopilot_menu_spent = None;
-        // When the `land_at` row's words turn, noted before they are read.
         self.note_land_at_offer();
         let facts = MenuFacts {
             room: content_room(self.autopilot_menu_pane(wid, session).1.len()),
@@ -1357,16 +1019,7 @@ impl App {
         self.request_menu_frame(wid);
     }
 
-    /// THE OPEN MENU FOLLOWS ITS SESSION'S PAIR: session `local_id`'s word or
-    /// timer moved under it (a wire `meta set`, the timer's fire, Settings,
-    /// a re-derived face), so its rows are built again from what is stored
-    /// now — the checked mode, the cancel row and the instant it names — and
-    /// never offer what no longer is. The highlight stays on a choice still
-    /// offered in the same words; otherwise none is lit, and Return closes
-    /// the menu without acting. The hit test waits for the frame that paints
-    /// the new rows. Nothing (one `Option` test) unless a menu is open on
-    /// `local_id`; nothing more where its rows did not move. A fact's menu
-    /// on the session is not this one's (`App::refresh_fact_menu`).
+    /// Rebuild the open Autopilot menu if it belongs to `local_id`.
     pub(crate) fn refresh_autopilot_menu(&mut self, local_id: u64) {
         if !self
             .autopilot_menu
@@ -1399,8 +1052,7 @@ impl App {
         self.request_menu_frame(wid);
     }
 
-    /// Close the open menu, wherever it is. Whether one was open (its
-    /// window owes the frame that erases it).
+    /// Close any open menu and request a redraw.
     pub(crate) fn close_autopilot_menu(&mut self) -> bool {
         let Some(menu) = self.autopilot_menu.take() else {
             return false;
@@ -1409,10 +1061,7 @@ impl App {
         true
     }
 
-    /// The frame rows and columns of the pane that shows `session` in window
-    /// `wid`: the card's room ([`place`]); the frame's where no visible pane
-    /// shows it. A pane's rows are counted under the window's chrome rows
-    /// (the tab strip, the message band), which the frame's rows include.
+    /// Frame row and column ranges of `session`'s visible pane in `wid`.
     pub(crate) fn autopilot_menu_pane(
         &self,
         wid: WindowId,
@@ -1437,15 +1086,13 @@ impl App {
         )
     }
 
-    /// Ask `wid`'s window, where it has one, for a frame.
+    /// Request a redraw on `wid`.
     pub(crate) fn request_menu_frame(&self, wid: WindowId) {
         if let Some(window) = self.windows.get(&wid).and_then(|ws| ws.os_window.as_ref()) {
             window.request_redraw();
         }
     }
 
-    /// The frame cell `(row, col)`'s centre, window pixels: the inverse of
-    /// `App::frame_cell_at`.
     fn frame_cell_centre(&self, wid: WindowId, (row, col): (usize, usize)) -> (f64, f64) {
         let (cw, ch) = self.win_cell_size(wid);
         let (cw, ch) = (cw.max(1), ch.max(1));
@@ -1458,17 +1105,13 @@ impl App {
         )
     }
 
-    /// Whether the frame cell shows `session`'s Autopilot chip on this frame's
-    /// glass (`App::claude_chips_at`, which a band claiming the row hides).
     fn shows_autopilot_chip(&self, wid: WindowId, session: u64, cell: (usize, usize)) -> bool {
         let (x, y) = self.frame_cell_centre(wid, cell);
         self.claude_chips_at(wid, x, y)
             == Some((session, Some(crate::claude_lights::Chip::Autopilot)))
     }
 
-    /// A press on `session`'s Autopilot chip at window pixel `(x, y)` that
-    /// asks for the menu (a right-click, a ctrl-click on macOS): opened,
-    /// hung from the chip's first cell. Whether it opened.
+    /// Open the Autopilot menu if `(x, y)` hits an Autopilot chip in `wid`.
     pub(crate) fn open_autopilot_menu_at(&mut self, wid: WindowId, x: f64, y: f64) -> bool {
         let Some((session, Some(crate::claude_lights::Chip::Autopilot))) =
             self.claude_chips_at(wid, x, y)
@@ -1485,10 +1128,7 @@ impl App {
         true
     }
 
-    /// `open autopilot-menu`: the front window's focused session's menu, hung
-    /// from its Autopilot chip as this frame's glass shows it (the first
-    /// cell, scanned once — a wire call, never a frame's), its first choice
-    /// lit as for a keyboard open.
+    /// Open the Autopilot menu for the front window's focused session (`open autopilot-menu`).
     pub(crate) fn open_front_autopilot_menu(&mut self) -> Result<(), String> {
         let wid = self
             .frontmost_window
@@ -1507,20 +1147,7 @@ impl App {
         Ok(())
     }
 
-    /// THE SPLICE, once a frame after the footer's (whose hits it reads):
-    /// paint the open menu of window `wid` over its frame cells and record
-    /// where, for the hit test — or CLOSE it where this frame's glass no
-    /// longer shows its session's Autopilot chip at the anchor (a fact's
-    /// menu: its fact anywhere on the anchor's row, so the card stays while
-    /// the fact slides), the window's focus moved (a pane or a tab change)
-    /// since it opened, or no card fits. Nothing with no menu open.
-    ///
-    /// The menu's card is the last of the host's chrome over the grid the
-    /// resident pet must not sit on, after the footer's write: its cells are
-    /// noted, as a transient overlay (it protects its cells from the pet but
-    /// never moves its rest seat), and the pass ends here (`crate::pet_chrome`) — a
-    /// pass whose cells moved under a pet that read the old ones asks for the
-    /// frame that shows them to it.
+    /// Paint the open menu into `wid`'s frame scratch, or close it if its anchor or focus moved.
     pub(crate) fn splice_autopilot_menu(&mut self, wid: WindowId) {
         let rect = self.paint_autopilot_menu(wid);
         let Some(ws) = self.windows.get_mut(&wid) else {
@@ -1537,8 +1164,6 @@ impl App {
         }
     }
 
-    /// [`Self::splice_autopilot_menu`]'s paint: the card's frame rect where
-    /// one was painted.
     fn paint_autopilot_menu(&mut self, wid: WindowId) -> Option<crate::tab_menu::MenuRect> {
         let menu = self.autopilot_menu.as_ref().filter(|m| m.wid == wid)?;
         let (session, anchor, focus, owner) = (menu.session, menu.anchor, menu.focus, menu.owner);
@@ -1568,17 +1193,7 @@ impl App {
             self.close_autopilot_menu();
             return None;
         };
-        // The grid this paint lays the card on: its rect answers the pointer
-        // on it alone (`App::laid_cell_at`).
         let laid = self.glass_grid(wid);
-        // A CARD THAT ARRIVES UNDER A RESTING POINTER (the first paint, a
-        // card laid out anew, or laid again on a grid a re-grid moved — a
-        // font zoom puts other rows under the same pixel): the pointer saw
-        // none of the rows now under it — the right press that opened a card
-        // over its own chip, a keyboard open beside a resting pointer — so
-        // they moved under it, as rows built again do, and its next press
-        // chooses nothing ([`AutopilotMenu::press_lands`]). Only where the
-        // rect or its grid changed: once a paint, never a frame's at rest.
         let arrived = (menu.rect != Some(rect) || menu.laid != laid)
             && menu
                 .rest
@@ -1614,20 +1229,12 @@ impl App {
             }
         }
         crate::claude_card::cut_out(&mut ws.claude_card, &mut ws.input_scratch, rect, cw, pad);
-        // THE CARD IS ON TOP: the caret under it, the resident pet and every
-        // other overlay yield its cells (`scrub_overlay_card`) — the pet's
-        // seat avoids them from the next frame (`crate::pet_chrome`), this
-        // cut covers the frames before it moves.
         crate::app_render::scrub_overlay_card(
             &mut ws.input_scratch,
             rect,
             (cw, ch),
             (pad, grid_top),
         );
-        // A host write, as the tab menu's is: every reuse lane refills, and
-        // the renderer compares every row — not only the rows whose engine
-        // revision moved, which painted the card in strips over rows the
-        // program left alone.
         ws.input_scratch.snapshot_seq = ws.input_scratch.snapshot_seq.wrapping_add(1);
         if let Some(menu) = self.autopilot_menu.as_mut() {
             menu.rect = Some(rect);
@@ -1639,8 +1246,7 @@ impl App {
         Some(rect)
     }
 
-    /// Choose row `i` of the open menu: close it, then act for its session
-    /// — a cancel for the very timer its row named.
+    /// Execute selectable row `i` and close the menu.
     pub(crate) fn choose_autopilot_menu_row(&mut self, i: usize) {
         let Some(menu) = self.autopilot_menu.as_ref() else {
             return;
@@ -1652,8 +1258,6 @@ impl App {
         else {
             return;
         };
-        // A typed row is decided with its menu open: a refusal keeps it
-        // open under a note (`fact_menu`).
         if let MenuAct::Fact(fact, crate::fact_menu::FactAct::Type(slash)) = act {
             let (anchor, keyboard) = (menu.anchor, menu.highlight.is_some());
             self.choose_fact_type(wid, session, fact, slash, anchor, keyboard);
@@ -1662,8 +1266,6 @@ impl App {
         self.close_autopilot_menu();
         match act {
             MenuAct::Mode(mode) => {
-                // A menu's enabled row is a snapshot. Pointer, keyboard and
-                // controller choices all recheck the policy in force now.
                 if self
                     .session_harness_posture(session)
                     .default_mode()
@@ -1694,10 +1296,7 @@ impl App {
         }
     }
 
-    /// A key while the menu is open in window `wid` (§9.3.3): `↑`/`↓` move
-    /// the highlight, Return chooses it, Esc closes; a bare modifier is
-    /// nothing; any other key closes the menu and goes on. Whether the key
-    /// was the menu's.
+    /// Handle a window key event while the menu is open in `wid`.
     pub(crate) fn autopilot_menu_key(
         &mut self,
         wid: WindowId,
@@ -1713,8 +1312,7 @@ impl App {
         self.autopilot_menu_nav(wid, meaning)
     }
 
-    /// One [`MenuKey`] for the menu open in window `wid`: the sole mutator
-    /// behind the key path. Whether the key was the menu's.
+    /// Apply `meaning` to the open menu in `wid`.
     pub(crate) fn autopilot_menu_nav(&mut self, wid: WindowId, meaning: MenuKey) -> bool {
         let Some(menu) = self.autopilot_menu.as_mut().filter(|m| m.wid == wid) else {
             return false;
@@ -1748,10 +1346,7 @@ impl App {
         }
     }
 
-    /// An engine-neutral input event (a controller's `aterm ctl key …`, `App::input`)
-    /// while the menu is open in window `wid`: its keys as [`Self::autopilot_menu_nav`]
-    /// reads them; a key release is not the menu's; any other input closes it and
-    /// goes on. Whether the menu took it.
+    /// Handle a controller input event while the menu is open in `wid`.
     pub(crate) fn autopilot_menu_input_event(
         &mut self,
         wid: WindowId,
@@ -1775,19 +1370,7 @@ impl App {
         }
     }
 
-    /// A mouse press while the menu is open in window `wid`, at window pixel
-    /// `(x, y)`: a left press on a choice chooses it; a press on the card
-    /// elsewhere is swallowed and the card stays; a press anywhere else
-    /// closes it and is spent on that (the tab menu's rule: the gesture that
-    /// closes a menu never also acts on what is underneath). A press on a
-    /// choice the rows moved under since the pointer last moved — the timer
-    /// fired, or was armed or cancelled elsewhere, and another choice now
-    /// stands where the pointer rests — chooses nothing: the choice under it
-    /// is lit, and the next press takes it ([`AutopilotMenu::press_lands`]).
-    /// Between a re-grid and the frame that lays the card again the card
-    /// answers nothing ([`App::laid_cell_at`]): the press closes it, as one
-    /// before its first paint does. Whether the menu took the press — always,
-    /// while one is open there.
+    /// Handle a mouse press in `wid` while the menu is open.
     pub(crate) fn autopilot_menu_press(
         &mut self,
         wid: WindowId,
@@ -1808,9 +1391,6 @@ impl App {
                 if left && let Some(i) = item_at(rect, &menu.rows, row, col) {
                     if menu.press_lands(row, i) {
                         self.choose_autopilot_menu_row(i);
-                        // Chosen and closed: the press a double-click puts
-                        // after it on the same card is that gesture's, not
-                        // a press on what the card covered (`Self::spends_menu_follow_up`).
                         if self.autopilot_menu.as_ref().is_none_or(|m| m.wid != wid) {
                             self.autopilot_menu_spent = Some(SpentCard {
                                 wid,
@@ -1833,20 +1413,7 @@ impl App {
         true
     }
 
-    /// THE SECOND HALF OF A DOUBLE-CLICK on a menu choice: whether a press
-    /// now in window `wid` falls on the card a choice just closed, within
-    /// the system's multi-click interval of that choice ([`crate::multi_click_ms`])
-    /// — spent there, as the press that chose was. Without this it would
-    /// land on what the card covered: a press of Claude's grid, a person's
-    /// gesture that stops the very press a typed row began
-    /// (`crate::claude_slash`). Any other press lets the mark go, and so
-    /// does a menu opened since (whose own presses are its card's).
-    ///
-    /// The press is judged on the grid the card was laid on
-    /// ([`crate::app_mouse::GlassGrid::cell_at`]), not the window's now: the
-    /// card is gone, and what is asked is whether the second press fell where
-    /// the first one's card was — a re-grid between the two (a font zoom, a
-    /// window resize) moves no pixel of the gesture.
+    /// Swallow the second press of a double-click on the rect a menu choice just closed.
     pub(crate) fn spends_menu_follow_up(&mut self, wid: WindowId) -> bool {
         let Some(spent) = self.autopilot_menu_spent.take() else {
             return false;
@@ -1863,15 +1430,7 @@ impl App {
                 .is_some_and(|(row, col)| spent.rect.contains(row, col))
     }
 
-    /// The pointer moved over window `wid` while the menu is open there: the
-    /// highlight follows a choice under it (and stays where the pointer is off
-    /// every choice). Where it is on the painted card or off it is noted
-    /// ([`AutopilotMenu::note_pointer`]), before the first paint too: a card
-    /// that then comes up or grows under a pointer resting beside it takes no
-    /// press it did not see. Between a re-grid and the frame that lays the
-    /// card again it answers nothing ([`App::laid_cell_at`]): the pointer is
-    /// noted on no frame cell, and nothing is lit from it. Whether the menu
-    /// took the motion — over the card.
+    /// Update hover highlight and pointer rest state on mouse motion in `wid`.
     pub(crate) fn autopilot_menu_motion(&mut self, wid: WindowId, x: f64, y: f64) -> bool {
         let Some((rect, laid)) = self
             .autopilot_menu
@@ -1901,9 +1460,7 @@ impl App {
         true
     }
 
-    /// `controls autopilot-menu`: the open Autopilot menu of the front
-    /// window, or `autopilot-menu open=false` (a fact's menu open there is
-    /// `controls fact-menu`'s).
+    /// `controls autopilot-menu` output for the frontmost window.
     #[must_use]
     pub(crate) fn autopilot_menu_controls(&self) -> Vec<String> {
         match self
@@ -1923,16 +1480,7 @@ impl App {
         }
     }
 
-    /// THE ACCESSIBILITY NODE of the menu open in window `wid` (§9.2.1,
-    /// §9.3.3), once a frame has painted it: the grid tree's
-    /// [`crate::a11y_tree::GridMenu`] over its cells, named in words
-    /// (`Autopilot, tab 3, fix the footer`, and `harness off in Settings`
-    /// where that line stands), one item per choice the card shows — a mode
-    /// row a radio with its `●` as its checked state, a timer or Settings row
-    /// a plain item, a disabled row disabled — and the highlighted row the
-    /// tree's focus, since the keys are the menu's while it is open. Rows in
-    /// the grid's own numbering (below the tab strip), as the chips' nodes
-    /// are. `None` with no menu painted there: the tree publishes none.
+    /// Build the accessibility [`crate::a11y_tree::GridMenu`] for `wid`.
     #[cfg(a11y_tree)]
     #[must_use]
     pub(crate) fn autopilot_grid_menu(&self, wid: WindowId) -> Option<crate::a11y_tree::GridMenu> {
@@ -1972,8 +1520,6 @@ impl App {
                 | MenuRow::Plot(_) => {}
             }
         }
-        // In the card's order: its name, who set it (§11.7.1: its two rows
-        // read as the one line they are), then why its rows are off.
         let mut label = menu.spoken.clone();
         if !set_by.is_empty() {
             label.push_str(", ");
@@ -1995,18 +1541,7 @@ impl App {
         })
     }
 
-    /// A SCREEN READER CLICKED item `item` of the menu the tree published for
-    /// window `wid` at `epoch` ([`Self::autopilot_grid_menu`]'s numbering: the
-    /// card's shown choices, top down): what a click on that row does
-    /// ([`Self::choose_autopilot_menu_row`]) — a disabled row does nothing.
-    /// Only while the open menu's rows are the ones that tree was built from
-    /// (its epoch, [`AutopilotMenu::a11y_epoch`]) and a frame has painted
-    /// them. Rebuilt rows and the exact cancel instant feed the compact
-    /// identity ([`AutopilotMenu::a11y_epoch`]); a request with a different
-    /// epoch is refused rather than matched by position against the current
-    /// rows. The 22-bit hash can collide; it is not a unique generation.
-    /// A request for a menu that is shut, or open in another window, is
-    /// nothing.
+    /// Activate `item` from a screen reader if `epoch` matches the painted menu.
     #[cfg(a11y_tree)]
     pub(crate) fn choose_autopilot_menu_item_for_reader(
         &mut self,
@@ -2035,8 +1570,6 @@ impl App {
     }
 }
 
-/// How many of the menu's rows a card painted at `rect` shows: its rows
-/// between the borders (a card too tall for the frame shows a prefix).
 #[cfg(a11y_tree)]
 fn shown_rows(rect: MenuRect) -> usize {
     rect.h.saturating_sub(2)

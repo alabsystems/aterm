@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The window's readers over lines a headless instance printed (slice 5c's
-//! exploration lab, 2026-10-21), each beside a line it must not read the
+//! The window's readers over lines a headless instance printed (
+//! exploration lab), each beside a line it must not read the
 //! same way.
 
 use super::*;

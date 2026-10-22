@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Who dismissed a box (session log phase 5, rulings T1 and T2), host side:
+//! Who dismissed a box, host side:
 //! the admission an input mark takes under the timeline lock before a byte,
 //! the acceptance its completion makes after the write, and the person's
 //! count the log reconciles against before it reaches the tracker.
@@ -335,7 +335,7 @@ fn a_persons_first_key_after_mail_is_marked_though_the_timeline_was_held() {
     assert_eq!(after_mail(false), 0);
 }
 
-/// T2's second case (deferred to 5D-5; rulings T10, T39): delivered mail,
+/// T2's second case (deferred to 5D-5): delivered mail,
 /// then the person's key that found the timeline held, then a later `ctl
 /// turn`: the turn is not the mail's. The held key is the `human` mark
 /// between the two, written by the `ctl turn`'s own reconcile before the
@@ -406,8 +406,8 @@ fn a_held_persons_key_after_mail_links_no_later_ctl_turn() {
     assert_eq!(link_after(false), Some(9), "the unbound log lost the key");
 }
 
-/// THE MAIL A TURN PROBABLY ANSWERED, IN THE VERBS' BRIEFS (Phase 6 step
-/// 6C-3, ruling U5): delivered `kind=task` mail, then a `ctl turn` that
+/// THE MAIL A TURN PROBABLY ANSWERED, IN THE VERBS' BRIEFS:
+/// delivered `kind=task` mail, then a `ctl turn` that
 /// names no cause. The `brief` verb and `brief all` (what `survey --brief`
 /// prints) end the turn's fields with ` mail=@9~`, the `~` saying it is a
 /// guess, and `log` names no link at either tier.
@@ -594,8 +594,8 @@ fn a_gesture_that_reaches_no_program_answers_no_mail() {
     assert_eq!(after_mail(), 1, "the key after the mail");
 }
 
-/// THE MAIL LATCH CROSSES A SEAMLESS UPDATE (Phase 6 step 6C-5, ruling
-/// U19): mail delivered, then an update before the person touched the
+/// THE MAIL LATCH CROSSES A SEAMLESS UPDATE:
+/// mail delivered, then an update before the person touched the
 /// session. On the successor, inside a burst already running (so no burst
 /// opens), the person's first input that reaches the program writes `mark -
 /// human` after the handoff, as it would have before the update; the latch
@@ -674,7 +674,7 @@ fn assert_the_view_is_the_ring(g: &crate::session_timeline::SessionTimeline) {
     assert_eq!(view, ring, "the view's order is the ring's");
 }
 
-/// THE VIEW'S `human` ROWS AGAINST THE RING'S (phase 6, 6F-8, ruling U13):
+/// THE VIEW'S `human` ROWS AGAINST THE RING'S:
 /// the ring's `human` rows and the burst marks (every `human` mark but the
 /// mail latch's own, `why=mail`), as counts.
 fn human_rows_and_burst_marks(g: &crate::session_timeline::SessionTimeline) -> (usize, usize) {
@@ -1158,7 +1158,7 @@ const MIRROR_STATES: [(&str, &[u8]); 29] = [
     ("kitty-all", b"\x1b[>31u"),
 ];
 
-/// 6A-4 (F10's remainder; ruling U20), WHAT REACHES THE PROGRAM IS WHAT THE
+/// 6A-4 (F10's remainder), WHAT REACHES THE PROGRAM IS WHAT THE
 /// SEAM SENDS, ON EVERY PLATFORM: every person gesture of every
 /// [`crate::input::InputEvent`] class ([`every_event`]), on a fresh terminal
 /// in every mode-mirror state ([`MIRROR_STATES`]), under every platform's

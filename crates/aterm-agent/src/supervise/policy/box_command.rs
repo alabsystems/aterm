@@ -50,6 +50,26 @@
 //! that gap. The call's provenance, its pending state and shape agreement
 //! therefore never authorize narrowing the screen's alternatives.
 //!
+//! WHY NO PROOF TIES A BOX TO ITS CALL (MEASURED 2026-10-22 on 2.1.308, the
+//! measured note's breaker-4 section): which of the box and its call's row
+//! comes first is a race, not an order. The writer queues the row and
+//! flushes it on a 100 ms timer the box does not wait for, armed by whatever
+//! row was queued first, and a failed write drops it and goes on. Against
+//! the lab's stub, which replies at once, the box stood 42 to 79 ms before
+//! the row in each of the 24 runs (a session's turns, its first turn, a
+//! resumed session, parallel calls, under load); with the reply held 60 to
+//! 85 ms the row rode the request rows' timer and reached the file within
+//! a few ms of the box, before it in some runs, and held 88 ms or more it
+//! came about 100 ms after. A real reply's latency lands in either regime,
+//! so neither order can be relied on. A lost write left an
+//! older call waiting under a newer box that both draw alike for 7 s, past
+//! the settle and after the file was writable again
+//! (`fixtures/claude-2.1.308-transcript-stale-pending.jsonl`); a killed and
+//! resumed session's call is the one waiting at its next box. Parallel calls
+//! put the newest call's row right above the first call's box. Nothing on
+//! the screen names the call: the description is the model's, no call id
+//! is drawn.
+//!
 //! WHAT THE SCREEN CANNOT SHOW: two commands can draw the same rows and the
 //! same call's row and still be read otherwise by the shell. The screen
 //! draws a tab as the blanks to its stop and shows no blank at a row's end,

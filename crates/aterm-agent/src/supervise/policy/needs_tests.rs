@@ -144,7 +144,7 @@ fn a_needs_token_a_lines_start_names_is_no_need() {
 }
 
 /// A NEEDS YOU line in a quote, in ticks, inside a sentence or spelled
-/// `NEED YOU` is a need (the integration review of 12449ff581: each was
+/// `NEED YOU` is a need (each was
 /// lost, and a lost need lands with the need off the screen). NEGATIVE
 /// CONTROLS: the mentions in `a_needs_line_in_a_fence_or_named_as_a_thing_is_no_need`.
 #[test]

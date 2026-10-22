@@ -42,7 +42,7 @@ impl TerminalHandler<'_> {
             }
             return;
         }
-        // Asked for, whatever the gate says (ruling S19).
+        // Asked for, whatever the gate says.
         *self.notify_total = self.notify_total.saturating_add(1);
         if !self.modes.allow_notifications {
             return;
@@ -72,7 +72,7 @@ impl TerminalHandler<'_> {
             .and_then(|p| std::str::from_utf8(p).ok())
             .unwrap_or("");
         // A final chunk is one notification asked for, counted before the
-        // gate (ruling S19): `d=` absent or not `0`, the last `d=` winning as
+        // gate: `d=` absent or not `0`, the last `d=` winning as
         // in the parse below. Only the metadata is read.
         if metadata
             .split(':')
@@ -163,7 +163,7 @@ impl TerminalHandler<'_> {
         if subcmd != Some("notify") {
             return;
         }
-        // Asked for, whatever the gate says (ruling S19).
+        // Asked for, whatever the gate says.
         *self.notify_total = self.notify_total.saturating_add(1);
         if !self.modes.allow_notifications {
             return;
@@ -544,7 +544,7 @@ mod tests {
         );
     }
 
-    /// THE NOTIFY COUNT (session log Phase 3B, ruling S19): every desktop
+    /// THE NOTIFY COUNT: every desktop
     /// notification a program asks for is counted, with notifications off
     /// and on alike — OSC 9 past its `9;4` branch, OSC 99 at its final
     /// chunk, OSC 777 `notify`. NEGATIVE CONTROLS: a `9;4` progress, a

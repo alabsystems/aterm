@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE HEURISTIC MAIL → TURN LINK (design §2.6, DESIGN:203-207; session log
-//! phase 5, plan 5D-5; rulings T10, T36, T39): which delivered mail a turn
+//! THE HEURISTIC MAIL → TURN LINK (design §2.6, DESIGN:203-207):
+//! which delivered mail a turn
 //! that named no cause most likely acted on, as the fold reads it from the
 //! records alone.
 //!
@@ -30,12 +30,12 @@
 //! seamless update in the local carry only, as `ml`-prefixed tokens on the
 //! turn's own `fold open` / `fold last` line (`mloff=<off> mlconf=<conf>`),
 //! which a reader that does not know them skips (the R13 skip rule). Since
-//! Phase 6 (step 6C-5, ruling U19) the waiting mails and the mail latch cross
+//! Phase 6 the waiting mails and the mail latch cross
 //! with it, on the totals line (`mlw=`, `mlh=`), so a task mail delivered
 //! before an update still links the successor's next turn. One reader prints
 //! the link: the local `brief`, as ` mail=@<off>~` on the turn's line, never
-//! without the `~` (Phase 6 step
-//! 6C-3, ruling U5). `log`, the bus and the ledger do not print it, and a
+//! without the `~`.
+//! `log`, the bus and the ledger do not print it, and a
 //! bus fold has none to print.
 
 use crate::field::{Key, Val};

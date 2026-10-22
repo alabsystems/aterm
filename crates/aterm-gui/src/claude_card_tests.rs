@@ -1699,7 +1699,7 @@ fn capture_resplice(tab_strip: u16) {
 /// nothing due. Held (the window unfocused), its key is constant and no wake
 /// is armed, over a thousand idle frames. Focus regained plays the intro
 /// again, the kitty in the seat the glass showed and the trail whole
-/// (`harness_card`'s `Ride`, review of slice 5b): no snap back to the
+/// (`harness_card`'s `Ride`): no snap back to the
 /// trail's start.
 /// NEGATIVE CONTROL: the first intro's first frame rides (the kitty left of
 /// its seat, no trail yet).

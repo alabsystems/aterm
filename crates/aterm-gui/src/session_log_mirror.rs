@@ -1,12 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE BUS MIRROR, GUI HALF (`docs/DESIGN-session-log-2026-10-15.md` §5.5,
-//! session log phase 4): the two bridge-only verbs a bridge mirrors the
+//! THE BUS MIRROR, GUI HALF (`docs/DESIGN-session-log-2026-10-15.md` §5.5):
+//! the two bridge-only verbs a bridge mirrors the
 //! session logs with, and what this process keeps for them. A bridge sends
 //! `log-take` only when its `hello … log=turns` was acknowledged (`[fabric]
 //! log = "turns"`, or the default `"auto"` once it has attached to a broker
-//! that retains its node's `ev` faces, session log Phase 6 step 6E-3), and
+//! that retains its node's `ev` faces), and
 //! both verbs are refused unless the owning bridge's RECORDED hello said so;
 //! while no bridge has asked no log is engaged (`aterm_slog::Log::mirror_landed` stays `None`), no record, carry
 //! byte or reply changes, and no lock of the mirror's own is taken: each
@@ -38,19 +38,19 @@
 //!   lock with `try_lock` (a busy timeline is skipped, `more=1`: the bridge's
 //!   lane never waits on the UI's lock) and encodes them after the lock is
 //!   released (`aterm_slog::BusCopy::encode`), at the bus tier the bridge
-//!   names, an edge's sid as its alias under the bridge's key (ruling Q6).
+//!   names, an edge's sid as its alias under the bridge's key.
 //!   Sessions are served round robin, then the closed sessions' tails, then
 //!   the tombstones' covers.
 //! - **`log-landed`** moves each named session's cursor
 //!   (`aterm_slog::Log::land`), refused while an update's export holds the
-//!   readers' fence (`fenced`, ruling Q12). Until a seamless successor has
+//!   readers' fence (`fenced`). Until a seamless successor has
 //!   adopted every handed-off session, a sid it does not hold is
-//!   `adopting`, never `gone` (ruling Q1): the bridge keeps its pin, and the
+//!   `adopting`, never `gone`: the bridge keeps its pin, and the
 //!   carried cursor moves when the session is registered.
-//! - **A closed session's tail** is kept whenever its log was ever mirrored
-//!   (ruling Q4), as a bus-only copy (`aterm_slog::Log::bus_tail`), until
+//! - **A closed session's tail** is kept whenever its log was ever mirrored,
+//!   as a bus-only copy (`aterm_slog::Log::bus_tail`), until
 //!   its close has landed (`done`: the bridge may then retire the session's
-//!   `ev` face, ruling Q8), judged against its LIVE `ms` head — a session
+//!   `ev` face), judged against its LIVE `ms` head — a session
 //!   that closes while an update's export holds its readers' fence owes what
 //!   it appended past the fence too, and the tail keeps that fence until the
 //!   update stands down ([`StoreMirror::lift_commit_fence`] lifts it); at
@@ -77,7 +77,7 @@ use aterm_slog::{
     cover_body,
 };
 
-/// The most closed sessions whose bus tails are kept (ruling Q4).
+/// The most closed sessions whose bus tails are kept.
 pub(crate) const RETIRED_MAX: usize = 512;
 /// The most estimated heap the kept tails take together.
 pub(crate) const RETIRED_BYTES: usize = 16 * 1024 * 1024;
@@ -290,8 +290,8 @@ pub(crate) struct StoreMirror {
     /// log of the store holds it ([`crate::session_log::SessionLog::bind_mirror`]).
     shared: Arc<Shared>,
     retired: Mutex<Retired>,
-    /// A seamless successor has not yet registered every handed-off session
-    /// (ruling Q1): a sid this store does not hold may still arrive.
+    /// A seamless successor has not yet registered every handed-off session:
+    /// a sid this store does not hold may still arrive.
     adopting: AtomicBool,
     /// An update's Commit is reading the draw ([`Self::past_draw`]): no
     /// closed session's tail lands from then on, as no live one does under
@@ -347,7 +347,7 @@ impl StoreMirror {
     /// A session closed with its log: kept for the bus when its log was ever
     /// mirrored, or the node mirrors (it is then engaged from its first
     /// record, [`sync`]), and the bus does not hold all of it — judged
-    /// against its live `ms` head (ruling Q4). A log nothing mirrors keeps
+    /// against its live `ms` head. A log nothing mirrors keeps
     /// nothing.
     pub(crate) fn retire(&self, sid: &str, slog: &mut crate::session_log::SessionLog) {
         #[cfg(test)]
@@ -464,7 +464,7 @@ impl StoreMirror {
     /// held a cursor — read now, after the export's syncs, which may have
     /// drawn one after the manifest — since every cursor the update drew is
     /// then another log's. With the mirror off no log ever held one: a
-    /// replaced bus log stands nothing down (ruling Q5: off is nothing), and
+    /// replaced bus log stands nothing down (off is nothing), and
     /// no lock is taken.
     #[cfg(any(unix, test))]
     pub(crate) fn past_draw(&self) -> bool {
@@ -534,8 +534,8 @@ impl StoreMirror {
     /// hello does not ask for the mirror (` mirror=unserved tails=<k>
     /// tombstones=<j>`), and nothing otherwise — with no lock, the link's
     /// included, while nothing is retained. Under an `auto` hello the line
-    /// already says `mirror=` (`bridge_log=auto mirror=<state>`, session log
-    /// Phase 6 step 6E-3), so it says ` tails=<k> tombstones=<j>` alone.
+    /// already says `mirror=` (`bridge_log=auto mirror=<state>`),
+    /// so it says ` tails=<k> tombstones=<j>` alone.
     pub(crate) fn unserved_facts(&self) -> String {
         if !self.shared.cursors() || crate::fabric::bridge_mirrors_logs() {
             return String::new();
@@ -624,7 +624,7 @@ impl TakeRequest {
     }
 }
 
-/// THE ALIAS OF AN EDGE (ruling Q6): `e` and the first 8 hex digits of
+/// THE ALIAS OF AN EDGE: `e` and the first 8 hex digits of
 /// HMAC-SHA256(`key`, sid) — stable for a node's key, so one edge is one
 /// actor on the bus, and no reader without the key can tell which session it
 /// is. The bridge's key is the node's, minted once and kept durably in its

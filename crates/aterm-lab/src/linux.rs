@@ -401,13 +401,15 @@ pub fn create_args() -> Vec<String> {
 }
 
 /// The `limactl` to run: `named` (`$LAB_LIMACTL`) alone when it is given,
+/// else `pinned` (the copy `verify provision --linux` places in the tooling cache),
 /// else the first of the `limactl` row's usual paths (`aterm_uds::host::TOOLS`) that
-/// `executable` accepts.
+/// `executable` accepts: the resolver's order.
 ///
 /// # Errors
 /// A relative `named` (usage), or none that runs (NOT RUN).
 pub fn pick_limactl(
     named: Option<&str>,
+    pinned: Option<&str>,
     executable: impl Fn(&str) -> bool,
 ) -> Result<String, Fail> {
     match named {
@@ -418,13 +420,13 @@ pub fn pick_limactl(
         Some(p) => Err(not_run(format!(
             "LAB_LIMACTL={p} is not an executable limactl"
         ))),
-        // Where `limactl` is usually installed, after `$LAB_LIMACTL`: its TOOLS row's
-        // paths, and its provider's remedy when none holds it.
+        // After `$LAB_LIMACTL`: the pinned copy, then its TOOLS row's paths, and its
+        // provider's remedy when none holds it.
         None => {
             let lima = aterm_uds::host::tool("limactl");
-            lima.at
-                .iter()
-                .copied()
+            pinned
+                .into_iter()
+                .chain(lima.at.iter().copied())
                 .find(|p| executable(p))
                 .map(str::to_string)
                 .ok_or_else(|| {
@@ -443,7 +445,8 @@ pub struct Lima {
 }
 
 impl Lima {
-    /// `$LAB_LIMACTL` (an absolute path), else the `limactl` row's usual paths.
+    /// `$LAB_LIMACTL` (an absolute path), else the copy `verify provision --linux` placed
+    /// (stamped) in the tooling cache, else the `limactl` row's usual paths.
     ///
     /// # Errors
     /// No `limactl`: the lane cannot run here.
@@ -459,7 +462,10 @@ impl Lima {
             ));
         }
         let named = std::env::var("LAB_LIMACTL").ok().filter(|p| !p.is_empty());
-        pick_limactl(named.as_deref(), crate::sys::executable).map(|bin| Lima {
+        let pinned = aterm_uds::host::tooling_dir()
+            .and_then(|t| aterm_uds::host::tool("limactl").placed_in(&t))
+            .map(|p| p.to_string_lossy().into_owned());
+        pick_limactl(named.as_deref(), pinned.as_deref(), crate::sys::executable).map(|bin| Lima {
             bin: PathBuf::from(bin),
         })
     }
@@ -1819,21 +1825,27 @@ mod tests {
         let code = |r: Result<String, Fail>| r.map_err(|f| f.code);
         let none = |_: &str| false;
         let brew = |p: &str| p == "/opt/homebrew/bin/limactl";
+        let cache = "/c/tooling.noindex/lima-2.2.1/bin/limactl";
         assert_eq!(
-            code(pick_limactl(None, brew)),
+            code(pick_limactl(None, Some(cache), brew)),
             Ok("/opt/homebrew/bin/limactl".into())
         );
-        assert_eq!(code(pick_limactl(None, none)), Err(NOT_RUN));
+        // The pinned copy comes before the usual paths, as the resolver orders them.
         assert_eq!(
-            code(pick_limactl(Some("/x/limactl"), brew)),
+            code(pick_limactl(None, Some(cache), |_| true)),
+            Ok(cache.into())
+        );
+        assert_eq!(code(pick_limactl(None, Some(cache), none)), Err(NOT_RUN));
+        assert_eq!(
+            code(pick_limactl(Some("/x/limactl"), Some(cache), brew)),
             Err(NOT_RUN),
             "no fallback"
         );
         assert_eq!(
-            code(pick_limactl(Some("/x/limactl"), |_| true)),
+            code(pick_limactl(Some("/x/limactl"), None, |_| true)),
             Ok("/x/limactl".into())
         );
-        assert_eq!(code(pick_limactl(Some("limactl"), |_| true)), Err(2));
+        assert_eq!(code(pick_limactl(Some("limactl"), None, |_| true)), Err(2));
     }
 
     #[test]

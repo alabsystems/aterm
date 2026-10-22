@@ -401,8 +401,8 @@ impl Ctl for crate::CtlClient {
     }
 }
 
-/// THE SESSION LOG'S `act` MARKS a loop owes (session log phase 3B; addendum
-/// A17, ruling S28): each one `ledger_row` queued, as the words after
+/// THE SESSION LOG'S `act` MARKS a loop owes:
+/// each one `ledger_row` queued, as the words after
 /// `mark -` ([`crate::harness::acts::log_mark`]), sent by
 /// [`Session::send_act_marks`]. Best effort, never retried: a server that
 /// refuses the verb or a mark's fields latches the producer off for the
@@ -432,8 +432,8 @@ impl ActMarks {
     }
 }
 
-/// Whether a `mark` reply latches the act marks off for the loop (ruling
-/// S28): an older server's `ERR unknown verb`, and a refusal of the mark
+/// Whether a `mark` reply latches the act marks off for the loop:
+/// an older server's `ERR unknown verb`, and a refusal of the mark
 /// itself (`ERR usage: mark …`, `ERR mark: …`). `ERR busy` and anything
 /// else drop the one mark.
 pub(super) fn act_mark_latches(reply: &CtlReply) -> bool {
@@ -448,7 +448,7 @@ pub struct Caps {
     /// the first approval).
     pub gen_fence: Option<bool>,
     /// `key act=approve|deny|answer …` — the press says what it means for
-    /// the box it dismisses (session log phase 5, ruling T1), so the box's
+    /// the box it dismisses, so the box's
     /// close reads `out=approved|declined|answered by=harness`. Read off the
     /// same `help key` reply as [`Caps::gen_fence`]; unknown is not sent.
     pub act_word: Option<bool>,
@@ -528,7 +528,9 @@ pub struct IdlePoint {
 /// order; `NotIdle`, `NotAuthoritative`, `Prompt`, `ActInFlight` and again
 /// `Wall` and `LimitEpisode` are those of an idle point
 /// ([`Session::host_steps_here`]); `WakeSettle` and `Credits` are both's,
-/// asked last. Reporting only.
+/// asked last. Reporting only. The last eight are the occupancy door's own
+/// (`supervise::occupancy::rules`, its `OCCUPANCY … held:<guard>` lines),
+/// never told to a host as a withheld point.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Guard {
     /// A break is offered only on a busy read.
@@ -567,11 +569,37 @@ pub enum Guard {
     /// turn the host types would be billed to them. Offered once the window
     /// they carry past resets, or the screen no longer says so.
     Credits,
+    /// A person's: someone typed into the session within `[harness]
+    /// human_grace_s`, or another driver's hand is on it, as the last
+    /// `status` said.
+    Person,
+    /// The session is halted (`hold=1`), as the last `status` said.
+    Halted,
+    /// The task is done and left to the person's own exchange
+    /// ([`crate::supervise::policy::turn_end::TurnEndState::left_to_person`]).
+    Exchange,
+    /// The session's autopilot word is not one the line is for (the nudges
+    /// are Cruise's).
+    Autopilot,
+    /// The memory wall acts: the agent's memory past its ceiling with the Mac
+    /// in trouble ([`crate::supervise::memory::MemoryOver::acts`]).
+    Memory,
+    /// The agent's route to its API was measured down
+    /// ([`crate::supervise::policy::turn_end::Reach`]).
+    Reach,
+    /// A draft stands in the composer, as the break's own read showed it
+    /// (the draft every read clocks): a line typed now would land in it.
+    Draft,
+    /// Nobody has asked the session anything: the break's own screen is the
+    /// launch card with no message under it
+    /// ([`crate::supervise::policy::turn_end::TurnEndReading::taskless`]'s
+    /// screen arm), a person's own session whatever runs under it.
+    Taskless,
 }
 
 impl Guard {
     /// Every guard, in the order [`Self::code`] numbers them.
-    pub const ALL: [Guard; 13] = [
+    pub const ALL: [Guard; 21] = [
         Guard::NotBusy,
         Guard::NoBackgroundWait,
         Guard::Wall,
@@ -585,9 +613,18 @@ impl Guard {
         Guard::Prompt,
         Guard::WakeSettle,
         Guard::Credits,
+        Guard::Person,
+        Guard::Halted,
+        Guard::Exchange,
+        Guard::Autopilot,
+        Guard::Memory,
+        Guard::Reach,
+        Guard::Draft,
+        Guard::Taskless,
     ];
 
-    /// The word the upgrade's record and `--status` carry (`guard=`).
+    /// The word the upgrade's record and `--status` carry (`guard=`), and an
+    /// `OCCUPANCY` line's `held:<word>`.
     #[must_use]
     pub fn word(self) -> &'static str {
         match self {
@@ -604,10 +641,18 @@ impl Guard {
             Guard::Prompt => "prompt",
             Guard::WakeSettle => "wake-settle",
             Guard::Credits => "credits",
+            Guard::Person => "person",
+            Guard::Halted => "halted",
+            Guard::Exchange => "exchange",
+            Guard::Autopilot => "autopilot",
+            Guard::Memory => "memory",
+            Guard::Reach => "reach",
+            Guard::Draft => "draft",
+            Guard::Taskless => "taskless",
         }
     }
 
-    /// A small number for an atomic (`1..=13`; `0` is left for none), and
+    /// A small number for an atomic (`1..=21`; `0` is left for none), and
     /// back ([`Self::from_code`]).
     #[must_use]
     pub fn code(self) -> u8 {
@@ -4940,7 +4985,7 @@ impl<'a, C: Ctl> Session<'a, C> {
     /// ([`ScreenReader::fold_message`]). A person's message that scrolled up
     /// out of the grid under a long reply is bounded so too: read as text,
     /// its later paragraphs were the reply's top, and their `NEEDS YOU:` the
-    /// worker's need (the review of 3a4586a01e, T1). `rows` as they are
+    /// worker's need. `rows` as they are
     /// where nothing bounds them, as [`Self::message_cells`] says.
     pub(super) fn rows_bounded_by_cells(
         &mut self,

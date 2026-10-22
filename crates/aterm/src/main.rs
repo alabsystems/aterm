@@ -2018,9 +2018,10 @@ impl SetupRetryHost for LiveSetupRetry {
         // A new pass can change what Check observed. Its current outcome
         // replaces that observation, including failures before a report exists.
         clear_initial_setup_rows();
+        // A join that used the password takes it: its proof is with the vault.
         let observed = aterm_cli::macos_doctor::apply_initial_setup_observed(
             self.revision,
-            self.password.as_ref(),
+            &mut self.password,
         );
         if let Some(report) = observed
             .result

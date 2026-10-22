@@ -750,7 +750,7 @@ fn handoff_manifests_answer_as_recorded() {
             "lenient/fabric-attached-int",
             &[("fabric_attached = [\"s-1\"]", "fabric_attached = 5")],
         ),
-        // The Autopilot's carried end (slice 2b, `SessionRecord::autopilot_end`):
+        // The Autopilot's carried end (`SessionRecord::autopilot_end`):
         // a row reads as written and is written back; a value of another type
         // reads as an unreadable row (`""`, which `EndCarry::parse` refuses),
         // never a refused manifest. A record with none writes no key (`base`),

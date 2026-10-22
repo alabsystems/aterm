@@ -313,8 +313,8 @@ pub(crate) fn copy_of_tab(sid: &str) -> Option<Copy> {
         .cloned()
 }
 
-/// What a codex-alab session's ROLLOUT TAP reads (session log 5G-3; ruling
-/// T15; `crate::codex_rollout_tap`): the proven agent's identity, its
+/// What a codex-alab session's ROLLOUT TAP reads (`crate::codex_rollout_tap`):
+/// the proven agent's identity, its
 /// primary thread (its record's `sessionId`) and the `$CODEX_HOME` its
 /// record was read under.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -641,7 +641,7 @@ mod tests {
         })
     }
 
-    /// THE ROLLOUT TAP'S CLAIM GATE (session log 5G-3; ruling T15): only a
+    /// THE ROLLOUT TAP'S CLAIM GATE: only a
     /// proven claim's own copy, standing and naming a thread id, names a
     /// rollout to tap — its thread, under the home the record was read
     /// under. No claim standing (a vendor Codex: no proof), a copy of

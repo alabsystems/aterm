@@ -57,7 +57,7 @@ impl Scrollback {
     /// fits; saturation only discharges the strict L0 gate's unconstrained-input
     /// overflow counterexamples.
     #[inline]
-    pub(crate) fn sync_accounting(&mut self) {
+    pub(crate) const fn sync_accounting(&mut self) {
         self.bytes_used = self
             .hot
             .memory_used()
@@ -73,7 +73,7 @@ impl Scrollback {
 
     /// Recompute watermark level from current `budgeted_bytes` vs thresholds.
     #[inline]
-    pub(crate) fn update_watermark_level(&mut self) {
+    pub(crate) const fn update_watermark_level(&mut self) {
         self.watermark_level = super::recompute_watermark(
             self.watermark_level,
             self.budgeted_bytes,

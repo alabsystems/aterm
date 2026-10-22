@@ -235,7 +235,7 @@ fn acted_on(case: &str, rule: &str, (turns, said, lines): &(usize, Vec<String>, 
 }
 
 /// OFF BACK TO CRUISE: THE POINT THE NEW LOOP FINDS IS ACTED ON, NEVER LEFT
-/// ON A GESTURE (the review of 7c7771267, findings 1 and 2, over the loop).
+/// ON A GESTURE (over the loop).
 /// Under Off the window's host stops the worker; the word turns back and the
 /// host starts a new loop ([`IdleHost::lifted_off`]) that attaches to an idle
 /// point no read of its saw run, the person's last gesture a scroll 10 s
@@ -497,7 +497,7 @@ fn continued(case: &str, (turns, said, lines): &(usize, Vec<String>, Vec<String>
 }
 
 /// A SCROLL OVER A LONG TURN NOBODY SAW RUN IS NO EXCHANGE OF THE PERSON'S
-/// (the review of 85d489954, finding 1, over the loop): the loop attaches to
+/// (over the loop): the loop attaches to
 /// a point the screen draws as 23 minutes of work (`✻ Worked for 23m 2s`),
 /// and the person's last gesture is a wheel scroll 10 s ago. Started as Off
 /// lifted over the stopped loop's act 5 minutes back, or fresh with no act in
@@ -546,8 +546,8 @@ fn a_scroll_over_a_long_turn_nobody_saw_run_is_no_exchange_of_the_persons() {
     }
 }
 
-/// A SCROLL OVER A DAY-LONG TURN NOBODY SAW RUN IS CONTINUED (the review of
-/// 7c7771267, its low finding 3, over the loop): a fresh loop with no act in
+/// A SCROLL OVER A DAY-LONG TURN NOBODY SAW RUN IS CONTINUED (over the loop):
+/// a fresh loop with no act in
 /// the window (a hand-over, a fault restart) or one started as Off lifted
 /// attaches to `❯ run the soak test` drawn above a 26-hour soak's report,
 /// its done row `✻ Sautéed for 1d 2h 3m`, the person's scroll 10 s back.
@@ -596,7 +596,7 @@ fn a_scroll_over_a_day_long_turn_nobody_saw_run_is_continued() {
 }
 
 /// THE POINT OFF STOOD ON, READ AGAIN AS THE WORD TURNS BACK, IS CONTINUED
-/// AS BEFORE THE PARK (the review of 85d489954, finding 2, over the loop):
+/// AS BEFORE THE PARK (over the loop):
 /// a turn seen busy ends at a point the decision there reads Off at; the
 /// person scrolls under Off, and the word turns back to Cruise with the
 /// same point on the screen. Continued — whether its done row says 3
@@ -644,7 +644,7 @@ fn the_point_off_stood_on_read_again_is_continued_as_before_the_park() {
 }
 
 /// A LOOP STARTED AS OFF LIFTED, ATTACHED MID-TURN, CONTINUES THE HARNESS'S
-/// RUN (the review of 85d489954, finding 3, over the loop): the stopped
+/// RUN (over the loop): the stopped
 /// loop typed `keep going` 4 minutes ago and the agent is still on it as the
 /// host starts the new loop (the chip's Land → Off → Cruise); its first read
 /// is the turn live, its end draws no done row, and the person's last
@@ -920,8 +920,8 @@ fn an_autopilot_off_presses_no_box() {
     );
 }
 
-/// OFF TOUCHES NO RATING CARD, not on the wait's busy reads either (the
-/// review of a295792e4): under `dismiss_surveys` a card over a worker that
+/// OFF TOUCHES NO RATING CARD, not on the wait's busy reads either:
+/// under `dismiss_surveys` a card over a worker that
 /// reads busy is dismissed at the first busy read that shows it — a key
 /// pressed before the look reaches its park — so an Off loop is lent no such
 /// duty: no `0`, no `DISMISSED` line, and the loop parks at the turn's
@@ -1394,7 +1394,7 @@ fn badge_of(rows: &[String]) -> String {
     super::super::escalate::attention_text(&aterm_phase::ClaudeReader, &turn, "a restart")
 }
 
-/// OFF TAKES THE LOOP'S BADGES DOWN AS IT PARKS (the review of c1d193998):
+/// OFF TAKES THE LOOP'S BADGES DOWN AS IT PARKS:
 /// the menu bar raises the session's boxes itself while the loop is parked,
 /// so a badge of the loop's left standing would tell the person twice, and
 /// the harness's stats would count the whole park as a person's wait. A
@@ -1560,7 +1560,7 @@ fn an_off_parks_badges_come_down_each_with_its_cleared_line() {
 }
 
 /// THE LOOP'S LAST CLEAR OF THE TURN-END POLICY'S BADGE IS JOURNALED
-/// (`Session::release_attention`, the review of c1d193998): `CLEARED
+/// (`Session::release_attention`): `CLEARED
 /// seq=<n> turn-end attention=OK`, so the harness's stats close the
 /// person's wait on it rather than dropping it at the loop's end — the line
 /// the fold reads back (`harness::stats`, a wait from its escalation to this
@@ -1618,8 +1618,8 @@ fn the_loops_last_clear_of_the_turn_end_badge_is_journaled() {
     assert_eq!(wait(&notes.noted), 0, "the loop's end counts nothing");
 }
 
-/// A PARK'S RETAKE BEHIND THE SAME HOLDER SAYS NOTHING NEW (the review of
-/// c1d193998): the holder the loop watched behind as it parked is kept with
+/// A PARK'S RETAKE BEHIND THE SAME HOLDER SAYS NOTHING NEW:
+/// the holder the loop watched behind as it parked is kept with
 /// the claim given back, so `WATCHING another supervisor holds this
 /// session: <holder>` is said once a holder, not once a park; and a claim
 /// won at the retake is news (`CLAIMED … (after <holder>)`). NEGATIVE
@@ -1679,8 +1679,8 @@ fn a_parks_retake_behind_the_same_holder_says_it_once() {
     );
 }
 
-/// AN OFF PARK'S END SETS THE TURN-END POLICY'S BADGE AGAIN (the review of
-/// b512d03d8). That badge carries no point the rejudge raises it again from
+/// AN OFF PARK'S END SETS THE TURN-END POLICY'S BADGE AGAIN.
+/// That badge carries no point the rejudge raises it again from
 /// — `/login`'s "finish sign-in", a switch's note, a Codex sandbox fall,
 /// each said once — so the park keeps its text as it takes it down and,
 /// with the word turned, sets it again: one `meta set attention`, journaled
@@ -1814,7 +1814,7 @@ fn a_limit_badge_is_a_wait_only_where_the_loop_waits_it_out() {
     }
 }
 
-/// A LIMIT SPANNING AN OFF PARK IS ONE EPISODE (the review of b512d03d8).
+/// A LIMIT SPANNING AN OFF PARK IS ONE EPISODE.
 /// The park takes the episode's badge down and keeps the episode as a
 /// retry, so the notice still up after the park opens the SAME episode —
 /// its seq kept, its badge set again with no second ask (`again=the retry
@@ -1926,8 +1926,8 @@ fn a_limit_spanning_an_off_park_is_one_episode_one_escalation() {
     assert_eq!(folded(&noted).0, 2, "{noted:#?}");
 }
 
-/// WHAT A PARK KEEPS OF A LIMIT ENDS WHERE THE WORKER ANSWERED PAST IT (the
-/// review of a295792e4): the retry a park keeps of a raised episode, and the
+/// WHAT A PARK KEEPS OF A LIMIT ENDS WHERE THE WORKER ANSWERED PAST IT:
+/// the retry a park keeps of a raised episode, and the
 /// marker of a limit's badge adopted from a previous loop, last only while
 /// the notice stands. A read of the park that shows the worker answered —
 /// a point that is not the notice — ends both, so the limit met after the
@@ -1994,7 +1994,7 @@ fn a_limit_the_worker_answered_past_in_a_park_is_a_new_episode() {
 }
 
 /// A LIMIT'S BADGE ADOPTED FROM A PREVIOUS LOOP IS OVER AT THE FIRST POINT
-/// THAT IS NOT ITS NOTICE (the review of a295792e4): a loop that adopts the
+/// THAT IS NOT ITS NOTICE: a loop that adopts the
 /// badge over the notice, then reads the worker answered past it, takes the
 /// badge down (`CLEARED … the worker answered past the adopted limit's
 /// notice`) and forgets the adoption, so the next limit is escalated as its
@@ -2060,7 +2060,7 @@ fn a_limit_after_the_worker_answered_an_adopted_one_is_a_new_ask() {
 }
 
 /// A LOOP BEHIND ANOTHER SUPERVISOR'S CLAIM READS THE SESSION'S WORD AT ITS
-/// START (the review of b512d03d8): its start-up reconcile settles nothing
+/// START: its start-up reconcile settles nothing
 /// behind the holder, but the word its `meta` read names is noted — so a
 /// park on the table's `off` knows the host keeps the word, reads it again
 /// at each step, and ends when the owner turns this session `cruise`.

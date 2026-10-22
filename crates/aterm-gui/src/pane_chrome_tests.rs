@@ -550,6 +550,7 @@ fn inputs() -> OverlayInputs {
         ink: [0xd0, 0xd0, 0xd0],
         ground: INKS.ground,
         animated: true,
+        laid: None,
     }
 }
 
@@ -1240,6 +1241,135 @@ fn the_thumb_drags_its_pane_through_history_and_the_track_pages() {
     let (wx4, wy4) = window_px(&app, wid, 10.0, f64::from(top));
     assert!(!app.scrollbar_pointer_motion(wid, wx4, wy4));
     assert_eq!(app.windows[&wid].pane_overlay.hover, None);
+}
+
+/// A RE-GRID LEAVES THE LAST FRAME'S BARS ANSWERING NOTHING: the bar laid and
+/// the pointer on its thumb. A font zoom re-grids the window — its cells grow,
+/// and the grid's right edge, where the bar is laid, with them — and until the
+/// next frame the pointer is read on the zoomed grid while the lane was laid
+/// with the last one's cell, inset and columns. Before that frame a motion
+/// there lights no bar and a press grabs none; the next frame lays the bar
+/// again at the zoomed grid's edge, where a motion lights it, and the pixel
+/// the old thumb was at is the grid's.
+///
+/// NEGATIVE CONTROLS: the zoom undone, the bar the frame laid answers the
+/// pointer; and the last frame's bar stamped as the zoomed grid's (no stamp,
+/// as before), the same motion lights it and a press grabs a thumb the zoomed
+/// grid lays nowhere under the pointer.
+#[test]
+fn a_regrid_leaves_the_last_frames_bars_answering_nothing() {
+    let mut app = App::headless_for_test();
+    let wid = WindowId(0);
+    app.config.scrollbar = Some(true);
+    app.windows.get_mut(&wid).expect("window").metrics.pad = 12;
+    let session = app.front_terminal(wid).expect("front").session;
+    let term = app.pool.get(session).expect("session").term.clone();
+    {
+        let mut t = crate::term_lock(&term);
+        for i in 0..400 {
+            t.process(format!("line {i}\r\n").as_bytes());
+        }
+    }
+    let now = Instant::now();
+    let refresh = |app: &mut App| {
+        let plan = app.active_visible_leaf_plan(wid).expect("plan");
+        app.refresh_pane_overlay_for_capture(wid, &plan, now);
+    };
+    // The window pixel at the centre of the thumb the last frame laid.
+    let thumb_px = |app: &App| {
+        let inputs = app.windows[&wid].pane_overlay.inputs.expect("laid");
+        let facts = app.windows[&wid].pane_overlay.facts()[0];
+        let (cw, ch) = inputs.cell;
+        let m = Metrics::for_cell(cw as u32, ch as u32);
+        let lane = scrollbar::lane(
+            (0, 0, facts.rect.rows, facts.rect.cols),
+            inputs.win_cols,
+            inputs.cell,
+            inputs.pad,
+            m,
+        )
+        .expect("lane");
+        let (top, len) =
+            scrollbar::thumb(lane, facts.rect.rows as u32, facts.history, 0, m).expect("thumb");
+        window_px(
+            app,
+            wid,
+            f64::from(lane.right) - 3.0,
+            f64::from(top + len / 2),
+        )
+    };
+    let set_laid = |app: &mut App, laid| {
+        app.windows
+            .get_mut(&wid)
+            .and_then(|ws| ws.pane_overlay.inputs.as_mut())
+            .expect("laid")
+            .laid = laid;
+    };
+    let press = |app: &mut App, (x, y): (f64, f64)| {
+        app.windows.get_mut(&wid).expect("window").last_cursor_px = (x, y);
+        let took = app.scrollbar_press(wid);
+        let grabbed = app.windows[&wid].pane_overlay.drag.is_some();
+        app.scrollbar_release(wid);
+        app.scrollbar_pointer_left(wid);
+        took && grabbed
+    };
+    refresh(&mut app);
+    let laid = app.windows[&wid].pane_overlay.inputs.expect("laid").laid;
+    assert_eq!(laid, app.glass_grid(wid), "stamped with its grid");
+    let (x, y) = thumb_px(&app);
+
+    // CONTROL: on the grid the bar was laid on, it answers.
+    assert!(app.scrollbar_pointer_motion(wid, x, y), "CONTROL: lit");
+    app.scrollbar_pointer_left(wid);
+    assert!(press(&mut app, (x, y)), "CONTROL: its thumb grabbed");
+
+    // The zoom: no frame laid yet.
+    let base = app.font_size;
+    assert!(app.set_font_size_with(base + 4.0, |_| true));
+    assert_ne!(app.glass_grid(wid), laid, "the zoom re-grids the window");
+    // CONTROL: the last bar stamped as the zoomed grid's, the stale lane
+    // answers the pointer.
+    let zoomed = app.glass_grid(wid);
+    set_laid(&mut app, zoomed);
+    assert!(
+        app.scrollbar_pointer_motion(wid, x, y),
+        "CONTROL: unstamped, the stale bar lights"
+    );
+    app.scrollbar_pointer_left(wid);
+    assert!(
+        press(&mut app, (x, y)),
+        "CONTROL: and a press grabs its thumb"
+    );
+    set_laid(&mut app, laid);
+    assert!(
+        !app.scrollbar_pointer_motion(wid, x, y),
+        "a bar laid on another grid lights nothing"
+    );
+    assert_eq!(app.windows[&wid].pane_overlay.hover, None);
+    assert!(!press(&mut app, (x, y)), "and a press grabs nothing");
+    assert_eq!(
+        crate::term_lock(&term).grid().display_offset(),
+        0,
+        "nor pages the pane"
+    );
+
+    // The next frame lays the bar again on the zoomed grid.
+    refresh(&mut app);
+    assert_eq!(
+        app.windows[&wid].pane_overlay.inputs.expect("laid").laid,
+        app.glass_grid(wid),
+        "laid again on the zoomed grid"
+    );
+    assert!(
+        !app.scrollbar_pointer_motion(wid, x, y),
+        "the old thumb's pixel is the grid's now"
+    );
+    let moved = thumb_px(&app);
+    assert!(moved.0 > x, "the bar moved right with the grid's edge");
+    assert!(
+        app.scrollbar_pointer_motion(wid, moved.0, moved.1),
+        "the bar laid again answers"
+    );
 }
 
 /// THE ROW LAW (`docs/DESIGN-render-integrity-2026-09-28.md` §3, clause 1): the

@@ -15,6 +15,7 @@ use std::os::unix::net::UnixStream;
 use std::time::{Duration, Instant};
 
 use aterm_agent::supervise::Autopilot;
+use aterm_core::render::{BandIcon, ChromeIcon};
 use aterm_window::event::{ElementState, MouseButton};
 
 use super::gesture_tests::{
@@ -202,8 +203,8 @@ fn an_off_sessions_on_button_turns_it_on() {
     );
 }
 
-/// A DOUBLE CLICK ON `on` LEAVES THE HARNESS ON (review of k2/harnesson,
-/// finding 1): in a real window a frame paints between a double click's
+/// A DOUBLE CLICK ON `on` LEAVES THE HARNESS ON (review of k2/harnesson):
+/// in a real window a frame paints between a double click's
 /// two clicks, so the second lands on the switch the first lit; it is the
 /// same gesture's and does nothing, and the session stays in cruise. The
 /// same holds the other way: a double click on the lit switch leaves it
@@ -440,6 +441,96 @@ fn a_switch_turning_on_says_so_and_takes_no_click() {
     assert_eq!(switch(&app, wid).map(|b| b.face), Some(HarnessSwitch::On));
 }
 
+/// The switch marks (`● ○ ◐`) the frame draws as the chrome's icons on frame
+/// row `row` (`claude_footer::switch_icon`).
+fn drawn_marks(app: &App, wid: WindowId, row: usize) -> Vec<ChromeIcon> {
+    app.windows[&wid]
+        .input_scratch
+        .chrome_rasters
+        .iter()
+        .filter(|raster| usize::from(raster.row) == row)
+        .flat_map(|raster| raster.icons.iter().copied())
+        .filter(|i| BandIcon::switch_mark(i.icon.ch()).is_some())
+        .collect()
+}
+
+/// THE SWITCH'S MARK IS DRAWN, ONE SET (the default macOS face has `●` and
+/// `○` but no `◐`, whose fallback drew half their size at 1×): on, off and
+/// turning on, the frame draws the mark's cell as the chrome's own `●`, `○`
+/// or `◐`, once however often it is painted or spliced, and the footer's
+/// strip takes it back, while the cell keeps its character for the text, a
+/// screen reader and copy. NEGATIVE CONTROL: a pane with no switch draws no
+/// mark on any row.
+#[test]
+fn the_switch_draws_its_mark_as_one_set_in_every_state() {
+    let (mut app, wid, session, _reader, _host) = claude_pane(120);
+    let drawn = |app: &App, want: BandIcon, what: &str| {
+        let b = switch(app, wid).unwrap_or_else(|| panic!("{what}: a switch"));
+        let row = &app.windows[&wid].input_scratch.cells[b.frame_row];
+        let at = b
+            .switch
+            .clone()
+            .find(|&c| row[c].ch == want.ch())
+            .unwrap_or_else(|| panic!("{what}: the cell keeps {:?}", want.ch()));
+        assert_eq!(
+            drawn_marks(app, wid, b.frame_row),
+            [ChromeIcon {
+                col: u16::try_from(at).expect("a frame column"),
+                icon: want,
+            }],
+            "{what}: the mark drawn over its own cell, once"
+        );
+    };
+    drawn(&app, BandIcon::Disc, "on");
+    frame(&mut app, wid);
+    drawn(&app, BandIcon::Disc, "on, painted again");
+    assert!(app.set_session_autopilot(
+        session,
+        Some(Autopilot::Off),
+        crate::autopilot::Surface::Chip
+    ));
+    frame(&mut app, wid);
+    drawn(&app, BandIcon::Ring, "off");
+    policy(&mut app, "[harness]\nenabled = false\n");
+    app.windows
+        .get_mut(&wid)
+        .expect("window")
+        .claude_lights
+        .sessions
+        .entry(session)
+        .or_default()
+        .switch_turning = Some(Instant::now() + Duration::from_secs(60));
+    frame(&mut app, wid);
+    assert_eq!(
+        switch(&app, wid).map(|b| b.face),
+        Some(HarnessSwitch::Turning)
+    );
+    drawn(&app, BandIcon::HalfDisc, "turning on");
+    frame(&mut app, wid);
+    drawn(&app, BandIcon::HalfDisc, "turning on, painted again");
+    // The same scratch spliced again (a capture's re-splice: no strip
+    // clears its rasters first) takes the last mark back before it draws.
+    let (plan, route) = app.active_visible_frame_layout(wid).expect("a layout");
+    for _ in 0..3 {
+        app.splice_claude_footer(wid, &plan, route);
+        drawn(&app, BandIcon::HalfDisc, "turning on, spliced again");
+    }
+    let row = switch(&app, wid).expect("the switch").frame_row;
+    let ws = app.windows.get_mut(&wid).expect("window");
+    crate::claude_card::strip(&mut ws.claude_card, &mut ws.input_scratch);
+    assert_eq!(drawn_marks(&app, wid, row), [], "the strip takes it back");
+    frame(&mut app, wid);
+    // NEGATIVE CONTROL: no agent, no switch, no mark anywhere.
+    set_program(&app, session, None);
+    frame(&mut app, wid);
+    assert_eq!(switch(&app, wid), None, "control: no switch");
+    let rows = app.windows[&wid].input_scratch.cells.len();
+    assert!(
+        (0..rows).all(|r| drawn_marks(&app, wid, r).is_empty()),
+        "control: no switch draws no mark"
+    );
+}
+
 /// THE POINTER OVER `on` (hover): the button is drawn as what a press acts
 /// on (underlined, its fill lifted) and the repaint key moves; off it again, the key
 /// and the glass are what they were. Idle to zero: nothing else moves it.
@@ -663,7 +754,7 @@ fn the_switch_is_a_switch_a_screen_reader_can_press() {
     );
     // A press of `on` while the switch is lit — a stale or repeated request
     // for a button the glass no longer shows — does nothing (review of
-    // k2/harnesson, finding 3: it turned the harness OFF).
+    // k2/harnesson, it turned the harness OFF).
     let before = autopilot(&app, session);
     assert_eq!(before.1, AutopilotView::Cruise);
     app.press_claude_chip_for_reader(wid, session, HarnessChip::SwitchOn);
@@ -1099,5 +1190,109 @@ fn the_facts_and_the_chip_read_on_a_tab_theme_the_instance_did_not_choose() {
         reads(accent, ground) < 1.5,
         "CONTROL: the accent at {:.2}:1 on the tab's paper",
         reads(accent, ground)
+    );
+}
+
+/// THE FACTS' WORDS READ ON A TAB'S OWN THEME, on the real splice (design
+/// §8): on a Claude Code tab in Default Light with its rules drawn in
+/// Claude's panel grey (`#999999`), the composer's bottom rule lays every
+/// value of the facts at 4.5:1 or more on the tab's ground, and with the
+/// branch clicked off its stub (`⎇ main off`) greyed — not bold, at 3:1 or
+/// more and below every value on the line.
+///
+/// NEGATIVE CONTROL: the values as they were laid (the grey lifted a third
+/// toward the tab's ink) read under 4.5:1 there, and the stub, the grey
+/// itself, under 3:1.
+#[test]
+fn the_facts_words_read_on_a_tab_theme_of_its_own() {
+    use aterm_agent::harness::footer::{FactKind, FactMask};
+    use aterm_effects::cli_marks::{ICON_CONTRAST, NAME_CONTRAST};
+    use aterm_effects::color_math::contrast_ratio;
+    let (mut app, wid, session, _reader, _host) = claude_pane(120);
+    app.set_session_theme(
+        session,
+        Some(crate::session_theme::SessionTheme {
+            selector: "Default Light".into(),
+            origin: crate::session_theme::SessionThemeOrigin::Ctl,
+        }),
+    );
+    let grey = "\x1b[38;2;153;153;153m";
+    let rule = "\u{2500}".repeat(120);
+    feed(
+        &app,
+        session,
+        format!(
+            "\x1b[?2004h\x1b[2J\x1b[19;1H\u{25CF} done\x1b[21;1H{grey}{rule}\x1b[39m\
+             \x1b[22;1H\u{276F} \x1b[23;1H{grey}{rule}\x1b[39m\x1b[24;1H{BYPASS}\x1b[22;3H"
+        )
+        .as_bytes(),
+    );
+    app.set_fact_mask(session, FactMask::default().with(FactKind::Branch, true));
+    frame(&mut app, wid);
+    let light = aterm_types::scheme::builtin("Default Light").expect("a built-in");
+    let ground = [light.background.r, light.background.g, light.background.b];
+    let ink = [light.foreground.r, light.foreground.g, light.foreground.b];
+    let pack = |c: [u8; 3]| u32::from_be_bytes([0, c[0], c[1], c[2]]);
+    let reads = |a: [u8; 3], b: [u8; 3]| contrast_ratio(pack(a), pack(b));
+    let at = footer_row(&app, wid);
+    let text = row_text(&app, wid, at);
+    assert!(
+        text.contains("Opus 5.5") && text.contains("\u{2387} main off"),
+        "the facts and the branch's stub are on the rule: {text:?}"
+    );
+    let row = &app.windows[&wid].input_scratch.cells[at];
+    let marks = ['\u{25C6}', '\u{2302}', '\u{2387}'];
+    // The facts are set small and low; the chips are full-size.
+    let words: Vec<_> = row
+        .iter()
+        .filter(|c| {
+            c.ch != ' '
+                && !marks.contains(&c.ch)
+                && matches!(c.script, aterm_core::terminal::Script::Sub { .. })
+        })
+        .collect();
+    let values: Vec<f32> = words
+        .iter()
+        .filter(|c| c.bold)
+        .map(|c| reads(c.fg, ground))
+        .collect();
+    let stubs: Vec<(char, f32)> = words
+        .iter()
+        .filter(|c| !c.bold)
+        .map(|c| (c.ch, reads(c.fg, ground)))
+        .collect();
+    assert!(
+        words.iter().all(|c| c.bg == ground),
+        "the tab's own paper is the facts' ground"
+    );
+    let quietest = values.iter().copied().fold(f32::INFINITY, f32::min);
+    assert!(
+        !values.is_empty() && quietest >= NAME_CONTRAST,
+        "every value at 4.5:1 or more, the quietest at {quietest:.2}:1: {text:?}"
+    );
+    assert_eq!(
+        stubs.iter().map(|&(ch, _)| ch).collect::<String>(),
+        "mainoff",
+        "the stub's letters: {text:?}"
+    );
+    for (ch, k) in stubs {
+        assert!(
+            k >= ICON_CONTRAST && k < quietest,
+            "{ch:?} of the stub at {k:.2}:1, the quietest value at {quietest:.2}:1"
+        );
+    }
+    // CONTROLS: the inks as they were laid.
+    let old_value: [u8; 3] = std::array::from_fn(|i| {
+        (f32::from(0x99_u8) + (f32::from(ink[i]) - f32::from(0x99_u8)) / 3.0).round() as u8
+    });
+    assert!(
+        reads(old_value, ground) < NAME_CONTRAST,
+        "CONTROL: the old value at {:.2}:1",
+        reads(old_value, ground)
+    );
+    assert!(
+        reads([0x99; 3], ground) < ICON_CONTRAST,
+        "CONTROL: the old stub at {:.2}:1",
+        reads([0x99; 3], ground)
     );
 }

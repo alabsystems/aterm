@@ -319,7 +319,7 @@ fn an_edges_dropped_count_rides_only_its_own_mark() {
     assert!(a.contains(&format!(" dropped={dropped} ")), "A's own: {a}");
 }
 
-/// U18'S OVERFLOWED AUTHORS (Phase 6 step 6C-6): sixteen edges hold the
+/// U18'S OVERFLOWED AUTHORS: sixteen edges hold the
 /// named slots, each spent out by its acted keys (in debt for twenty
 /// seconds), so edges A and B, past them, share the overflow's tokens; A's
 /// fifty acted keys spend them, then A and B flood on. What each was short
@@ -507,7 +507,7 @@ fn a_caused_send_names_its_turn() {
     );
 }
 
-// ---- the wake (design §2.2; ruling R9) -------------------------------------
+// ---- the wake (design §2.2) -------------------------------------
 
 /// A registration on `session`'s watcher list, any ring already pending
 /// drained.
@@ -618,7 +618,7 @@ fn a_persons_burst_wakes_the_logs_watchers() {
 }
 
 /// A failure the person comes to look at (`note_session_seen`) and one an
-/// update carried as seen (`note_carried_exit`, ruling R9) wake the watchers.
+/// update carried as seen (`note_carried_exit`) wake the watchers.
 #[test]
 fn a_failure_seen_wakes_the_logs_watchers() {
     use std::time::{Duration, Instant};
@@ -663,7 +663,7 @@ fn a_failure_seen_wakes_the_logs_watchers() {
 }
 
 /// An update that stands down lifts its readers' fence: what was written in
-/// the overlap is theirs to read, and they are woken (ruling R9).
+/// the overlap is theirs to read, and they are woken.
 #[cfg(unix)]
 #[test]
 fn a_lifted_fence_wakes_the_logs_watchers() {
@@ -766,7 +766,7 @@ fn the_await_look_reads_a_close_with_the_flag_it_cleared() {
     );
 }
 
-// ---- a predicate list (session log 5F-1) ------------------------------------
+// ---- a predicate list ------------------------------------
 
 /// `await log` TAKES A LIST: `close=turn,kind=note` is answered by a note
 /// (its second member), and by the first member's record too. NEGATIVE

@@ -301,7 +301,7 @@ impl ScrollbackStorage {
     /// Iterate over all lines (oldest to newest).
     #[must_use]
     #[inline]
-    pub fn iter(&self) -> ScrollbackStorageIter<'_> {
+    pub const fn iter(&self) -> ScrollbackStorageIter<'_> {
         ScrollbackStorageIter {
             storage: self,
             idx: 0,

@@ -217,8 +217,11 @@ impl TrickFlash {
     /// The host's declaration for the one rescan it is about to run in `scope`,
     /// which spends it. `None` withdraws it: every scroll delta then reads zero.
     #[inline]
-    pub(crate) fn declare_base_y(&mut self, scope: Option<u64>, base_y: Option<i64>) {
-        self.declared = base_y.map(|y| (scope, y));
+    pub(crate) const fn declare_base_y(&mut self, scope: Option<u64>, base_y: Option<i64>) {
+        self.declared = match base_y {
+            Some(y) => Some((scope, y)),
+            None => None,
+        };
     }
 
     /// Forget panes the window no longer shows: their memo entries, and a slot

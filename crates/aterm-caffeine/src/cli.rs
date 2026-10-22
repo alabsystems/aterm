@@ -52,7 +52,7 @@ USAGE:
                sets it (a plist in ~/Library/LaunchAgents; `off` also removes
                that of a build that is gone). The running mug stays.
     quit       Turn off and take the mug out of the menu bar. `own`: only this
-               build's mug and its job; another build's keeps running, on.
+               build's mug and its job; another build's is left as it is, on or off.
     serve      Run the mug in this process (what its launchd job runs).
     bridge     Keep the Mac awake while the mug restarts onto an update of
                aterm, until the new mug does (what a restarting mug runs).
@@ -613,8 +613,12 @@ mod mac {
     /// The one stderr line of a `serve` that will not run, and exit 0: launchd's KeepAlive
     /// starts the job again on any other status, and none of these refusals cures itself, so
     /// it would only refuse again every throttle interval (a transient one waits for the next
-    /// start).
-    fn refuse(why: impl std::fmt::Display) -> ExitCode {
+    /// start). No mug runs, so a bridge an update restart left in `paths` lets go now, not at
+    /// its bound; `None` only where the mug's files cannot be found at all.
+    pub(super) fn refuse(paths: Option<&Paths>, why: impl std::fmt::Display) -> ExitCode {
+        if let Some(paths) = paths {
+            crate::macos::release_bridge(paths);
+        }
         eprintln!("{VERB}: serve: {why}");
         ExitCode::SUCCESS
     }
@@ -629,7 +633,7 @@ mod mac {
 
     pub(super) fn serve(version: &str) -> ExitCode {
         let Some(paths) = Paths::from_env() else {
-            return refuse("no home directory");
+            return refuse(None, "no home directory");
         };
         let code_dir = paths.code_dir();
         let lock = paths.lock_file();
@@ -637,11 +641,14 @@ mod mac {
             // First thing from a copy: its exec is over, so it may go once this mug ends.
             code::mark_ran(&code_dir);
             let Some(origin) = code::origin_exe(&code_dir) else {
-                return refuse(format!(
-                    "running from a copy in {}, but {} names no executable it was started as",
-                    code_dir.display(),
-                    code::ORIGIN_ENV
-                ));
+                return refuse(
+                    Some(&paths),
+                    format!(
+                        "running from a copy in {}, but {} names no executable it was started as",
+                        code_dir.display(),
+                        code::ORIGIN_ENV
+                    ),
+                );
             };
             let mut instance = match Instance::adopt(&lock) {
                 Some(instance) => instance,
@@ -655,7 +662,12 @@ mod mac {
         } else {
             let origin = match std::env::current_exe().and_then(std::fs::canonicalize) {
                 Ok(origin) => origin,
-                Err(e) => return refuse(format!("this executable's path cannot be read: {e}")),
+                Err(e) => {
+                    return refuse(
+                        Some(&paths),
+                        format!("this executable's path cannot be read: {e}"),
+                    );
+                }
             };
             let Some(mut instance) = hold(&paths) else {
                 return ExitCode::SUCCESS;
@@ -669,19 +681,22 @@ mod mac {
                 // the bundle, which would take every open of the app.
                 Ok(Some(copy)) => {
                     let e = code::reexec_holding(&copy, &origin, &instance);
-                    return refuse(format!(
-                        "re-running from {}: {e}; not starting",
-                        copy.display()
-                    ));
+                    return refuse(
+                        Some(&paths),
+                        format!("re-running from {}: {e}; not starting", copy.display()),
+                    );
                 }
                 Ok(None) => (origin, instance),
                 Err(e) => {
-                    return refuse(format!(
-                        "cannot make its own copy of {} in {}: {e}; not starting (running \
+                    return refuse(
+                        Some(&paths),
+                        format!(
+                            "cannot make its own copy of {} in {}: {e}; not starting (running \
                          from the bundle would take every open of the app)",
-                        origin.display(),
-                        code_dir.display()
-                    ));
+                            origin.display(),
+                            code_dir.display()
+                        ),
+                    );
                 }
             }
         };
@@ -740,7 +755,10 @@ mod mac {
                 None
             }
             Err(e) => {
-                let _ = refuse(format!("{}: {e}; not starting", lock.display()));
+                let _ = refuse(
+                    Some(paths),
+                    format!("{}: {e}; not starting", lock.display()),
+                );
                 None
             }
         }
@@ -758,6 +776,28 @@ mod tests {
 
     fn parsed(line: &str) -> Result<Command, String> {
         parse(&words(line))
+    }
+
+    /// A `serve` that will not run lets a bridge an update restart left go, and exits 0; one
+    /// that cannot find the mug's files touches none.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_serve_refusal_lets_a_left_bridge_go() {
+        let dir = aterm_tempfile::tempdir().expect("tempdir");
+        let paths = crate::paths::Paths {
+            state_dir: dir.path().join("state"),
+            home: dir.path().join("home"),
+            logs_dir: dir.path().join("logs"),
+        };
+        std::fs::create_dir_all(&paths.state_dir).expect("state dir");
+        std::fs::write(paths.bridge_file(), "4242\n").expect("bridge file");
+        assert_eq!(mac::refuse(None, "a test refusal"), ExitCode::SUCCESS);
+        assert!(paths.bridge_file().exists());
+        assert_eq!(
+            mac::refuse(Some(&paths), "a test refusal"),
+            ExitCode::SUCCESS
+        );
+        assert!(!paths.bridge_file().exists(), "the bridge was left holding");
     }
 
     #[test]

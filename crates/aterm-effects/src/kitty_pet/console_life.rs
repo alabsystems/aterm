@@ -501,14 +501,23 @@ pub(super) struct ConsoleLife {
 /// One pane row's characters as a hash (FNV-1a), for [`ConsoleLife::row_sig`];
 /// 0 for a row with nothing written on it.
 #[inline]
-fn row_signature(row: &[aterm_core::terminal::RenderCell]) -> u64 {
+const fn row_signature(row: &[aterm_core::terminal::RenderCell]) -> u64 {
     let mut blank = true;
     let mut h = 0xcbf2_9ce4_8422_2325u64;
-    for cell in row {
-        blank &= matches!(cell.ch, ' ' | '\0');
-        h = (h ^ u64::from(u32::from(cell.ch))).wrapping_mul(0x0100_0000_01b3);
+    let mut i = 0;
+    while i < row.len() {
+        let ch = row[i].ch;
+        blank &= matches!(ch, ' ' | '\0');
+        h = (h ^ (ch as u32 as u64)).wrapping_mul(0x0100_0000_01b3);
+        i += 1;
     }
-    if blank { 0 } else { h.max(1) }
+    if blank {
+        0
+    } else if h > 1 {
+        h
+    } else {
+        1
+    }
 }
 
 impl ConsoleLife {
@@ -593,8 +602,11 @@ impl PetBrain {
     /// [`crate::pet_world::PetCell::Protected`] here or the pet may sit on it.
     #[inline]
     #[must_use]
-    pub fn console_world(&self) -> Option<&PetWorld> {
-        self.console.world.as_deref()
+    pub const fn console_world(&self) -> Option<&PetWorld> {
+        match &self.console.world {
+            Some(world) => Some(world),
+            None => None,
+        }
     }
 
     #[inline]
@@ -667,11 +679,11 @@ impl PetBrain {
     /// after a refused one ([`PetWorld::retire`] clears the count).
     #[inline]
     #[must_use]
-    pub fn observed_cells(&self) -> usize {
-        self.console
-            .world
-            .as_ref()
-            .map_or(0, |world| world.examined_cells())
+    pub const fn observed_cells(&self) -> usize {
+        match &self.console.world {
+            Some(world) => world.examined_cells(),
+            None => 0,
+        }
     }
 
     #[inline]
@@ -899,13 +911,9 @@ impl PetBrain {
     /// An observed but incoherent surface cannot license new locomotion from
     /// the older ink spans. An unfed legacy host has no such observation.
     #[inline]
-    pub(super) fn console_observation_incoherent(&self) -> bool {
+    pub(super) const fn console_observation_incoherent(&self) -> bool {
         self.console.presentable
-            && self
-                .console
-                .world
-                .as_ref()
-                .is_some_and(|world| world.stamp().is_none())
+            && matches!(&self.console.world, Some(world) if world.stamp().is_none())
     }
 
     /// Ownership/custody is independent of whether a live caret exists.
@@ -925,11 +933,8 @@ impl PetBrain {
 
     #[inline]
     #[must_use]
-    pub fn has_reading_interest(&self) -> bool {
-        self.console
-            .world
-            .as_ref()
-            .is_some_and(|w| w.selection_target().is_some())
+    pub const fn has_reading_interest(&self) -> bool {
+        matches!(&self.console.world, Some(w) if w.selection_target().is_some())
     }
 
     /// Natural, pixel-rounded sprite coverage in fractional grid cells.
@@ -2587,7 +2592,7 @@ impl PetBrain {
     /// nowhere to step it, hid it there until the wrap (2026-10-20, real
     /// Claude Code 2.1.305 with the harness on, windowed).
     #[inline]
-    fn stand_rect(world: &PetWorld, body: PetRect) -> (PetRect, f32) {
+    const fn stand_rect(world: &PetWorld, body: PetRect) -> (PetRect, f32) {
         let feet = Self::on_its_feet(body);
         (feet, world.margin_in_map(feet, CLEARANCE))
     }
@@ -2872,7 +2877,7 @@ impl PetBrain {
     /// while the caret runs ([`Self::console_station`]), so a flight to it
     /// lands on it.
     #[inline]
-    pub(super) fn aims_ahead(&self) -> bool {
+    pub(super) const fn aims_ahead(&self) -> bool {
         self.rhythm_open() && !self.console.rest_seated.get()
     }
 
@@ -3513,7 +3518,7 @@ impl PetBrain {
         self.console.hold.settled()
     }
 
-    pub(super) fn console_frames(&self) -> Option<bool> {
+    pub(super) const fn console_frames(&self) -> Option<bool> {
         if !self.console.presentable || self.console_legacy_motion_pending() {
             return None;
         }
@@ -3525,8 +3530,15 @@ impl PetBrain {
         // So is a look swap in transit (the incoming arrival ramp and the
         // departing ghost's fade). This layer answers the frame-train question
         // first for a resident, so it must count them here or the swap stalls.
-        if self.arrive_t > 0.0 || self.departures.iter().any(Option::is_some) {
+        if self.arrive_t > 0.0 {
             return Some(true);
+        }
+        let mut i = 0;
+        while i < self.departures.len() {
+            if self.departures[i].is_some() {
+                return Some(true);
+            }
+            i += 1;
         }
         if !self.console.resident {
             return None;
@@ -3665,7 +3677,7 @@ fn body_rect(frame: &PetFrame, sense: PetSense) -> Option<PetRect> {
 /// arriving at the cat (as contact it would brace the escort on every burst's
 /// first key); ink anywhere else still touches.
 #[inline]
-fn typed_run(
+const fn typed_run(
     input: &aterm_core::render::RenderInput,
     pane: PetPane,
     last: Option<(u16, u16)>,
@@ -3673,18 +3685,29 @@ fn typed_run(
     if input.display_offset != 0 {
         return None;
     }
-    let row = input.cursor_row.checked_sub(pane.row)?;
-    let col = input.cursor_col.checked_sub(pane.col)?;
+    let Some(row) = input.cursor_row.checked_sub(pane.row) else {
+        return None;
+    };
+    let Some(col) = input.cursor_col.checked_sub(pane.col) else {
+        return None;
+    };
     if !input.cursor_visible {
-        let (_, c) = last.filter(|&(r, c)| {
-            usize::from(r) == row && usize::from(c) < col && col - usize::from(c) <= TYPED_RUN_MAX
-        })?;
-        return Some((row, usize::from(c), col + 1));
+        let Some((r, c)) = last else {
+            return None;
+        };
+        let r = r as usize;
+        let c = c as usize;
+        if r == row && c < col && col - c <= TYPED_RUN_MAX {
+            return Some((row, c, col + 1));
+        }
+        return None;
     }
-    let first = last
-        .filter(|&(r, c)| usize::from(r) == row && usize::from(c) < col)
-        .map_or(col.saturating_sub(1), |(_, c)| usize::from(c));
-    Some((row, first.max(col.saturating_sub(TYPED_RUN_MAX)), col))
+    let first = match last {
+        Some((r, c)) if (r as usize) == row && (c as usize) < col => c as usize,
+        _ => col.saturating_sub(1),
+    };
+    let floor = col.saturating_sub(TYPED_RUN_MAX);
+    Some((row, if first > floor { first } else { floor }, col))
 }
 
 /// Compare occupied ink at the same body rectangle before/after observation.

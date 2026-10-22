@@ -29,7 +29,7 @@ const DEVTOOLS_FLOW: &str = "crates/aterm-gui/src/debugger_access.rs";
 /// That function: the live arm that runs a change for the owner's yes in aterm's
 /// alert. Both ways the yes is given reach it through the App's one start
 /// (`App::run_debugger_change`): the owner's press in Settings ▸ Security, and the
-/// alert aterm raises once per Mac at first launch (owner ruling O29).
+/// alert aterm raises once per Mac at first launch.
 const DEVTOOLS_WORKER: &str = "spawn_devtools_worker";
 /// The runner: public, so aterm-gui can reach it.
 const DEVTOOLS_RUNNER: &str = "run_devtools_change";

@@ -980,7 +980,7 @@ pub(crate) fn asks(said: &str) -> bool {
 /// operation blocked by hook:` over its stderr; `is_hook_verdict`): the
 /// hook's words are no worker's, and the worker never got the prompt, so
 /// there are no last words — never the label's, which a done check's
-/// reader took for an idle report (the review of a00553122d), nor the
+/// reader took for an idle report, nor the
 /// worker's above it, which answered an earlier prompt.
 #[must_use]
 pub fn said_tail(rows: &[String]) -> Option<String> {
@@ -3294,8 +3294,8 @@ mod tests {
     /// hook:` over its stderr and the original prompt. Read as the worker's
     /// answer to the `❯` row over it, a done check a hook stopped was taken
     /// and its stopReason (`No lander is running.`) read as the worker's idle
-    /// report: the task ended on a check the worker never received (the
-    /// review of a00553122d). So too the label with no reason (the bundle's
+    /// report: the task ended on a check the worker never received.
+    /// So too the label with no reason (the bundle's
     /// own `Operation stopped by hook`), a reason wrapped onto a second row,
     /// and a slash command's prompt a UserPromptExpansion hook blocked.
     /// NEGATIVE CONTROLS: the worker's own words in the label's place answer

@@ -2,9 +2,8 @@
 // Copyright 2026 Andrew Yates
 
 //! THE STEP FOLD: tool calls, turn ends and walls from Claude Code's
-//! transcript, for the session log, with no text kept (session log Phase
-//! 3B, plan §2.2-§2.8; addendum A8-A11, A19, A20; rulings S1, S3, S6, S7,
-//! S9, S23).
+//! transcript, for the session log, with no text kept (plan §2.2-§2.8; addendum A8-A11, A19, A20)
+//! .
 //!
 //! The footer's usage fold already reads every byte the main transcript
 //! appends ([`super::session_usage::TranscriptCursor`]); the cursor hands
@@ -15,7 +14,7 @@
 //! transcript` (one `TxEvent` per [`StepEvent`]), and keeps the main
 //! chain's end ([`End`]) for the wall judge ([`judge_wall`]).
 //!
-//! NO TEXT (ruling S6). A [`Step`] holds ids ([`StepId`], the log's id
+//! NO TEXT. A [`Step`] holds ids ([`StepId`], the log's id
 //! alphabet, at most 40 bytes), a tool's name ([`ToolName`], at most 64
 //! bytes), class words and numbers: no field could hold a prompt, a reply,
 //! a tool's input or result, or a notice. The rows are read by
@@ -68,8 +67,8 @@
 //! `/resume`) reads it afresh, and a restart of the same file stays off
 //! and says nothing new. An unknown row is skipped, never an error.
 //!
-//! A TURN WITH NO PROMPT ROW (ruling S3 as `upgrade.rs`'s `TaskScan` reads
-//! it). A prompt command (`/init`, `/review`, a project's command) is a
+//! A TURN WITH NO PROMPT ROW (`upgrade.rs`'s `TaskScan`).
+//! A prompt command (`/init`, `/review`, a project's command) is a
 //! command row and its `isMeta` expansion, a `!` shell command a
 //! `<bash-input>` row (its `<bash-stdout>` output says nothing: 2.1.294 ran
 //! a model turn after one, `supervise/fixtures`), and a background task's
@@ -115,7 +114,7 @@
 //! after rows of an earlier prompt's (a relaunch writing one again) is no
 //! turn of these rows': it starts none.
 //!
-//! MEASURED BUILDS (A19, S9, ruling T8). [`MEASURED_BUILDS`] names each
+//! MEASURED BUILDS. [`MEASURED_BUILDS`] names each
 //! build whose rows the lab read, one by one: a row of a build it names is
 //! [`StepState::On`]; a row of any other build — an older one, a newer one,
 //! or one naming none — is [`StepState::Partial`]: it adds facts and
@@ -138,7 +137,7 @@ use crate::supervise::run::wall_confirm::{self, Class, Entry, Row, TranscriptEnd
 
 /// The Claude Code builds whose transcript rows the lab read, each with its
 /// key-only reduction committed (`harness/testdata/steps/<build>.jsonl`):
-/// exact one by one, never "at or below" (ruling T8, which closed the old
+/// exact one by one, never "at or below" (which closed the old
 /// `MEASURED_THROUGH` that made every older build exact too). 2.1.303: the
 /// lab ran the managed build against its stub (5H-2b), and on a candidate
 /// naming it the limit's wall read `confirmed=1` and a Bash turn closed
@@ -157,7 +156,7 @@ pub const TURN_IDS_MAX: usize = 64;
 const LEAD_BYTES: usize = 63;
 
 /// A background task's wake (`<task-notification>…`): Claude Code's own,
-/// no prompt (ruling S3; `upgrade::asked_by` reads it as nobody's).
+/// no prompt (`upgrade::asked_by` reads it as nobody's).
 pub(crate) const TASK_NOTIFICATION: &str = "<task-notification>";
 /// A shell-mode command (`! cmd`), which asks the model nothing.
 pub(crate) const BASH_INPUT: &str = "<bash-input>";
@@ -186,8 +185,7 @@ pub const COMPACT: &str = "/compact";
 /// background task's wake, a shell-mode command and its output, Esc's row,
 /// a local command's rows and the missed one-shot task's notice (with
 /// [`COMPACT`]). Nothing past them is read. `lab reduce` keeps exactly these
-/// of a user row's text, so a reduction folds as its source (session log
-/// 5H-1, P11 as ruling T7 amends it).
+/// of a user row's text, so a reduction folds as its source.
 pub const USER_MARKERS: [&str; 10] = [
     TASK_NOTIFICATION,
     BASH_INPUT,
@@ -641,7 +639,7 @@ fn notice_of(line: &str) -> (Option<WallKind>, u8) {
 /// it carries, and what the harness makes of them — the wall it is once its
 /// turn is closed, the screen walls it confirms and the limit it names. A
 /// reader of the rows' closed words reads a notice through it
-/// (`aterm-lab reduce`'s readings, session log ruling U7: a reduction keeps
+/// (`aterm-lab reduce`'s readings, a reduction keeps
 /// the words this reads).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NoticeRead {

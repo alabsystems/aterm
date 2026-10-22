@@ -787,7 +787,7 @@ impl App {
                     }
                 }
                 // THE RAW INNER SIZE, for the next process to recreate this
-                // window at: an update's successor (P6 finding 4) and a cold
+                // window at: an update's successor and a cold
                 // restore alike. Never a held window's (maximized, or in the
                 // durable capture tiled or full screen): its row persists the
                 // NORMAL grid, which that size does not hold. Nor, in the
@@ -1076,8 +1076,8 @@ impl App {
                         // handoff's Commit compares layouts, and a program
                         // may start or end in between.
                         held: !carry_drafts && self.restore_session_held(terminal.session),
-                        // THE SESSION IT WAS AND ITS LINEAGE (session log
-                        // phase 2A), and the epoch its log is at (phase 6,
+                        // THE SESSION IT WAS AND ITS LINEAGE,
+                        // and the epoch its log is at (phase 6,
                         // 6A-2), constant for a session, so the Commit's
                         // comparison is unmoved by them.
                         sid,
@@ -1372,10 +1372,10 @@ impl App {
     /// still holds for it ([`Self::unhanded_restored_agent`]), else — an
     /// update's successor, on a shell its parent handed it — what the
     /// parent's image said runs there, until this run knows that tab itself
-    /// ([`crate::crash_journal::Lane::carry_forward`], round eight of the
-    /// update audit, findings 46 and 76; that carry also keeps the parent's
+    /// ([`crate::crash_journal::Lane::carry_forward`]; that carry also keeps the parent's
     /// folder on a leaf whose engine answered none, and names the pairs the
-    /// journal's header keys each handed shell by). A person's own quit
+    /// journal's header keys each handed shell by).
+    /// A person's own quit
     /// keeps none.
     ///
     /// The quit asks after the host's shutdown, which stops the queue but keeps what it owes
@@ -2442,8 +2442,8 @@ impl App {
     /// stopped at its Commit, and this one takes the sessions over (one
     /// supervisor per session), carries on every restart it left in flight,
     /// and relaunches the restored agents its cold-restore queue still owed
-    /// (round four, plan item 7). Before the host resumes, what the
-    /// predecessor carried for it stands here (LC-4 of ): the
+    /// (plan item 7). Before the host resumes, what the
+    /// predecessor carried for it stands here (LC-4 of): the
     /// person's stamps it wrote right before its Commit, taken before its
     /// files are swept ([`Self::take_carried_person_stamps`]) — a relaunch
     /// the host carries through a hand asks whether nobody keyed since — and
@@ -2684,7 +2684,7 @@ impl App {
         // descriptors into an empty logical host before attaching glass, so restore never
         // invents a PTY for it.
         // A native-only window, or one whose bootstrap shell another
-        // window already adopted (a co-view, round six finding 10).
+        // window already adopted (a co-view).
         if self.restores_without_bootstrap(&wl) {
             let previous_front = self.frontmost_window;
             let outer = (wl.outer_x, wl.outer_y);
@@ -2709,11 +2709,11 @@ impl App {
                 self.frontmost_window = previous_front;
                 return std::ops::ControlFlow::Continue(());
             }
-            // No glass: the window goes. A co-view window (round six,
-            // finding 10) may hold shells adopted only in it; each one its
+            // No glass: the window goes. A co-view window
+            // may hold shells adopted only in it; each one its
             // close drops degrades the handoff as a terminal window's
-            // failure does (`App::note_handed_shell_lost`, round eight,
-            // finding 58), rather than leaving a proof over a subset.
+            // failure does (`App::note_handed_shell_lost`),
+            // rather than leaving a proof over a subset.
             if !self.headless && !self.attach_os_window(el, wid) {
                 self.close_window_logical(wid);
                 return std::ops::ControlFlow::Continue(());
@@ -2756,7 +2756,7 @@ impl App {
         let show = wl.show;
         // EVERY WINDOW COMES BACK AT ITS OWN FRAME: its row's grid (an
         // update's adopted shells have it) and the raw size it had (a zoom
-        // back out re-grids it, P6 finding 4), when the row carried that
+        // back out re-grids it), when the row carried that
         // size — an update's layout and a cold restore's alike. Any other
         // row (an older build's, a maximized or cold full-screen window's)
         // inherits the front window's grid, as Cmd-N does.
@@ -2775,7 +2775,7 @@ impl App {
             // its copy with the failed window (its OTHER panes' shells stay in
             // `seamless_adopt` and the orphan net below re-homes them as tabs) — but
             // the shell itself is not signalled: before Commit it is the parked
-            // parent's (`Session::handoff_commit`, round seven, item 20), and the
+            // parent's (`Session::handoff_commit`), and the
             // rollback below resumes it.
             crate::logging::stderr_line!(
                 "aterm-gui: session restore: could not create a window; stopping here"
@@ -3689,7 +3689,7 @@ impl App {
         }
     }
 
-    /// A HELD PANE'S TERMINAL (round five, item 19): the pane the outgoing
+    /// A HELD PANE'S TERMINAL: the pane the outgoing
     /// process kept open after its command exited, back with its final screen,
     /// read-only — a session with no PTY and no process
     /// ([`crate::held_pane_session`]), registered and marked `Exited` as the
@@ -3697,14 +3697,14 @@ impl App {
     /// the session verbs report it exited. Closing it is closing any exited
     /// pane.
     ///
-    /// SHOWN AS THE PANE IT STANDS FOR (round six of the update audit,
-    /// findings 46, 49 and 35): its engine takes this build's terminal config
+    /// SHOWN AS THE PANE IT STANDS FOR:
+    /// its engine takes this build's terminal config
     /// and appearance, as every pooled engine does
     /// ([`crate::held_pane_session`]); its exit reaches the status observer
     /// the way a live pane's does ([`Self::note_session_exit`], with the exit
     /// status the outgoing process carried), so its tab and `status` say
     /// exited rather than idle — as a carried exit, not news
-    /// ([`Self::note_carried_exit`]; round eight, U34); and `leaf` — the
+    /// ([`Self::note_carried_exit`]); and `leaf` — the
     /// terminal leaf its placeholder retired — gives it back its user identity
     /// (the `meta set` fields), so the next update
     /// carries them on.
@@ -3746,8 +3746,8 @@ impl App {
         // names it, so sweeps reading it again see no new failure.
         let carried_block =
             crate::session_status::completed_block(&crate::term_lock(&session.term));
-        // ITS TURN LEDGER AND ARCHIVE TAIL CROSS AS AN ADOPTED SESSION'S DO
-        // (round eight, finding 730): `history`, the report reader and a
+        // ITS TURN LEDGER AND ARCHIVE TAIL CROSS AS AN ADOPTED SESSION'S DO:
+        // `history`, the report reader and a
         // resumed `since-turn=` still read the turns a manager drove into the
         // pane before its command ended. A pane the outgoing process carried
         // none for (an older one, or a carry it left out) starts with a ledger
@@ -4291,7 +4291,7 @@ impl App {
         );
     }
 
-    /// THE LINEAGE A LEAF NAMES (session log phase 2A), on the shell filling
+    /// THE LINEAGE A LEAF NAMES, on the shell filling
     /// it. The shell the leaf names (its own sid, or the handed shell its
     /// `local_id` names: a seamless update's adoption, the keeper's
     /// recovery) is the same session going on, so it only keeps the leaf's

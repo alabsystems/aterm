@@ -175,7 +175,7 @@ pub fn decompress_size_prepended(input: &[u8]) -> Result<Vec<u8>, Lz4Error> {
 /// [`Lz4Error`] surface. `OffsetOutOfBounds` maps onto `InvalidOffset`
 /// (without the precise offset/output_pos fields, which the backend does
 /// not expose); everything else collapses to `UnexpectedEof`.
-fn map_decompress_error(err: aterm_lz4::DecompressError) -> Lz4Error {
+const fn map_decompress_error(err: aterm_lz4::DecompressError) -> Lz4Error {
     match err {
         aterm_lz4::DecompressError::OffsetOutOfBounds => Lz4Error::InvalidOffset {
             offset: 0,

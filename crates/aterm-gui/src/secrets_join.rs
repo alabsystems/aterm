@@ -1399,15 +1399,40 @@ pub(crate) fn joined_notice(names: usize, follows: bool) -> Message {
 const RETYPE: &str = "a mistyped join password is fixed by running aterm secrets join in a terminal, adding the vault's URL if not the ALab one (it asks for the password again)";
 
 /// What the digest line of a join that failed or never finished, or of a subscriber that
-/// could not be installed, asks: System State's secrets vault row (*Sync credentials from
-/// the secrets vault*), whose Apply joins the vault in its field (the ALab default, the
-/// configured source or one typed there) with the join password typed there, if any, and
-/// installs the subscriber. No message intent opens that tab, so the step names its menu
-/// row.
+/// could not be installed, asks: System State's Apply with its vault row
+/// ([`Setting::Secrets`], the one switch whose label names the vault) on and its Mac
+/// settings rows (the [`Setting::is_workstation`] ones) off. That Apply joins the vault in
+/// the tab's field (the vault this Mac is configured for, else the saved plan's) with the
+/// join password typed there, if any, and installs the subscriber. System State has one
+/// Apply, which runs every row switched on again, so a Mac settings row left on resets the
+/// Dock or signs an account out again; the other rows stay as they are, since an Apply
+/// without [`Setting::Permissions`] also ends aterm's permission asks. [`rows_named`] says
+/// which rows and why. No message intent opens that tab, so the step names its menu row
+/// too.
+///
+/// [`Setting::Secrets`]: aterm_types::macos_setup::Setting::Secrets
+/// [`Setting::Permissions`]: aterm_types::macos_setup::Setting::Permissions
+/// [`Setting::is_workstation`]: aterm_types::macos_setup::Setting::is_workstation
 fn sync_in_system_state() -> String {
     format!(
-        "Sync the secrets vault in {}",
+        "In {}, Apply with the vault row on and the Mac settings rows off",
         crate::message_reporters::SYSTEM_STATE_MENU
+    )
+}
+
+/// The details line that says which rows [`sync_in_system_state`] means and why: the Mac
+/// settings rows by the first and last of their labels (they lead System State's list),
+/// which an Apply runs again, and the other rows left as they are.
+fn rows_named() -> String {
+    use aterm_types::macos_setup::Setting;
+    let mut mac = Setting::ALL
+        .iter()
+        .filter(|setting| setting.is_workstation());
+    let first = mac.next().map_or("", |setting| setting.label());
+    let last = mac.next_back().map_or(first, |setting| setting.label());
+    format!(
+        "The Mac settings rows run from {first} to {last}, which Apply runs again, the Dock and sign-outs too; leave the rest as they are (with {} off, aterm stops asking for them)",
+        Setting::Permissions.label()
     )
 }
 
@@ -1497,6 +1522,7 @@ pub(crate) fn failed_entry(why: &str) -> Entry {
     )
     .severity(Severity::Warn)
     .more(clean(why))
+    .more(rows_named())
     .more(JOIN_AGAIN)
     .log_line("secrets join-failed")
 }
@@ -1516,6 +1542,7 @@ pub(crate) fn unfinished_entry() -> Entry {
     )
     .severity(Severity::Warn)
     .more("A join was cut off before it asked the vault or installed its subscriber.")
+    .more(rows_named())
     .more(JOIN_AGAIN)
     .log_line("secrets join-unfinished")
 }
@@ -1523,7 +1550,7 @@ pub(crate) fn unfinished_entry() -> Entry {
 /// The digest line for a Mac that joined (or asked) but whose subscriber is not running,
 /// so its secrets do not follow the vault: the remedy follows the reason. A copy that goes
 /// away is moved, which System State cannot do (its own secrets vault row says the same);
-/// a failed install is that row's Apply again.
+/// a failed install is System State's Apply again ([`sync_in_system_state`]).
 pub(crate) fn unsynced_entry(why: &Unsynced) -> Entry {
     let (reason, step) = match why {
         Unsynced::Fleeting(_) => (
@@ -1549,7 +1576,7 @@ pub(crate) fn unsynced_entry(why: &Unsynced) -> Entry {
             "This aterm runs from {}. Opened from Applications, it installs the subscriber by itself.",
             clean(at)
         )),
-        Unsynced::Failed(why) => entry.more(clean(why)).more(AGENT_ON),
+        Unsynced::Failed(why) => entry.more(clean(why)).more(rows_named()).more(AGENT_ON),
     }
     .log_line("secrets not-synced")
 }
@@ -1601,6 +1628,18 @@ impl App {
             aterm_log::warn!("secrets vault: this Mac's join never finished");
             self.except(&unfinished_entry());
         }
+    }
+
+    /// Setup's Secrets stage read this Mac in its vault, synced, with its subscriber running
+    /// (System State's Apply, [`App::publish_system_state`]): every vault line ends, as at a
+    /// launch read that finds the same.
+    pub(crate) fn secrets_synced_by_setup(&mut self) {
+        aterm_log::info!("secrets vault: setup synced this Mac, and its subscriber runs");
+        self.secrets_settled(&Settled {
+            member: true,
+            subscriber: Subscriber::Running,
+            unfinished: false,
+        });
     }
 
     /// The lines a join that let this Mac in ends.
@@ -2772,14 +2811,21 @@ mod tests {
         }
     }
 
-    /// THE DIGEST LINES SEND THE PERSON WHERE THE REMEDY IS. A join that failed or never
-    /// finished, and a subscriber that could not be installed, are System State's secrets
-    /// vault row (its Apply joins the vault in its field with the password typed there, and
-    /// installs the subscriber), named by its menu row, with the terminal command kept in
-    /// the details. An approval on an admin Mac and a copy of aterm that goes away are not
+    /// THE DIGEST LINES SEND THE PERSON WHERE THE REMEDY IS, AND TO NOTHING MORE. A join
+    /// that failed or never finished, and a subscriber that could not be installed, are
+    /// System State's Apply (it joins the vault in its field with the password typed there,
+    /// and installs the subscriber), named by its menu row. That tab has one Apply, which
+    /// runs every row switched on again, so the step asks for the vault row on and the Mac
+    /// settings rows off (the Dock and the account sign-outs), whole within the step's cap.
+    /// It switches off nothing else: an Apply without the permissions row ends aterm's
+    /// permission asks (aterm-cli's setup tests run the selection the step asks for). The
+    /// details name the Mac settings rows by the labels their switches show, as the leading
+    /// run of the list, and say to leave the rest; the terminal command stays in the
+    /// details. An approval on an admin Mac and a copy of aterm that goes away are not
     /// System State's to do, and keep their own steps.
     #[test]
     fn the_vault_lines_name_system_state_only_where_it_has_the_remedy() {
+        use aterm_types::macos_setup::Setting;
         let words = |entry: &Entry| {
             let msg = entry
                 .message()
@@ -2789,6 +2835,31 @@ mod tests {
             };
             (ask.then().words().to_string(), msg.detail[2..].to_vec())
         };
+        // "The vault row" is one switch, and "the Mac settings rows" lead the list, so the
+        // first and last of their labels name exactly them.
+        let vault: Vec<_> = Setting::ALL
+            .iter()
+            .filter(|setting| setting.label().contains("vault"))
+            .collect();
+        assert_eq!(vault, [&Setting::Secrets]);
+        let mac = Setting::ALL
+            .iter()
+            .take_while(|setting| setting.is_workstation())
+            .count();
+        assert_eq!(
+            mac,
+            Setting::ALL.iter().filter(|s| s.is_workstation()).count()
+        );
+        assert!(mac > 1);
+        let span = format!(
+            "from {} to {}",
+            Setting::ALL[0].label(),
+            Setting::ALL[mac - 1].label()
+        );
+        assert_eq!(
+            span,
+            "from Use Caps Lock as Control to Sign out of FaceTime"
+        );
         for (entry, terminal) in [
             (failed_entry("the vault refused"), "aterm secrets join"),
             (unfinished_entry(), "aterm secrets join"),
@@ -2800,9 +2871,23 @@ mod tests {
             let (then, more) = words(&entry);
             assert_eq!(
                 then,
-                "Sync the secrets vault in aterm \u{25B8} System State\u{2026}",
+                "In aterm \u{25B8} System State\u{2026}, Apply with the vault row on and the Mac settings rows off",
                 "{}",
                 entry.key()
+            );
+            assert_eq!(then, sync_in_system_state(), "the step is never cut");
+            assert!(!then.contains("only"), "{then}");
+            assert!(
+                more.iter().any(|line| line.contains(&span)
+                    && line.contains("Apply runs again")
+                    && line.contains("leave the rest as they are")
+                    && line.contains(Setting::Permissions.label())),
+                "{more:?}"
+            );
+            assert!(
+                more.iter()
+                    .all(|line| line.chars().count() <= aterm_messages::DETAIL_LINE_CAP),
+                "{more:?}"
             );
             assert!(
                 more.iter()
@@ -2899,6 +2984,111 @@ mod tests {
             .live_by_key(KEY_JOIN)
             .expect("the answer is on the band");
         assert_eq!(row.msg.title, "Joined the secrets vault");
+    }
+
+    /// THE REMEDY'S APPLY ENDS THE LINES IT MENDS. A setup report (System State's status)
+    /// whose Secrets stage reads this Mac in and its subscriber running (`ok`, or `applied`
+    /// by a pass that joined) ends the failed, unfinished, pending and not-in-sync lines at
+    /// once, not at the next launch. A record of an earlier run (`applied`, no detail), a run
+    /// with a row still waiting, a later stage's read of the vault whose subscriber is not
+    /// running, and a Check's rows end nothing; a line raised while the same report still
+    /// stands stays, and the next run that syncs ends it again.
+    #[test]
+    fn a_setup_run_that_syncs_the_vault_ends_its_lines() {
+        let mut app = App::headless_for_test();
+        let open = |app: &App| {
+            let mut keys = app.messages.digest_keys_under("privacy.secrets.");
+            keys.sort();
+            keys
+        };
+        let row = |name: &str, status: &str| crate::SetupStatusRow {
+            name: name.into(),
+            status: status.into(),
+            detail: "injected".into(),
+        };
+        let report = |rows: Vec<crate::SetupStatusRow>| crate::SetupStatus {
+            rows,
+            ..crate::SetupStatus::default()
+        };
+        let raise_all = |app: &mut App| {
+            app.on_secrets_vault(VaultWake::Joined(JoinEnd::Pending {
+                code: "ABCD2345".into(),
+                host: "m99".into(),
+                with_password: false,
+                subscriber: None,
+            }));
+            app.on_secrets_vault(VaultWake::Joined(JoinEnd::Failed {
+                why: "the vault refused".into(),
+            }));
+            app.on_secrets_vault(VaultWake::Configured(Settled {
+                member: false,
+                subscriber: Subscriber::Missing(Unsynced::Failed("launchctl refused".into())),
+                unfinished: true,
+            }));
+        };
+        let raised = [
+            entry_key(CAUSE_FAILED),
+            entry_key(CAUSE_PENDING),
+            entry_key(CAUSE_UNFINISHED),
+            entry_key(CAUSE_UNSYNCED),
+        ];
+        raise_all(&mut app);
+        assert_eq!(open(&app), raised);
+
+        // The record's own row for a finished stage: `applied`, with no detail.
+        let recorded = || crate::SetupStatusRow {
+            name: "Secrets vault".into(),
+            status: "applied".into(),
+            detail: String::new(),
+        };
+        for unproven in [
+            report(vec![recorded()]),
+            report(vec![
+                row("Secrets vault", "ok"),
+                row("Secrets subscriber", "blocked"),
+            ]),
+            report(vec![row("Secrets vault", "blocked")]),
+            report(vec![
+                recorded(),
+                row("Secrets vault", "applied"),
+                row("Secrets vault", "blocked"),
+            ]),
+            crate::SetupStatus {
+                check: Some(crate::SetupCheck {
+                    plan: aterm_types::macos_setup::Plan::default(),
+                    rows: vec![
+                        row("Check: Secrets vault", "ok"),
+                        row("Check: Secrets subscriber", "ok"),
+                    ],
+                }),
+                ..crate::SetupStatus::default()
+            },
+        ] {
+            app.publish_system_state(unproven.clone());
+            assert_eq!(open(&app), raised, "{unproven:?}");
+        }
+
+        let synced = report(vec![
+            row("Selected Mac settings", "applied"),
+            row("Secrets vault", "ok"),
+        ]);
+        app.publish_system_state(synced.clone());
+        assert!(open(&app).is_empty(), "{:?}", open(&app));
+
+        // The same report again (each poll): a line raised since stands.
+        raise_all(&mut app);
+        app.publish_system_state(synced.clone());
+        assert_eq!(open(&app), raised);
+        // The next run starts with no report, and its sync ends them again.
+        app.publish_system_state(report(Vec::new()));
+        app.publish_system_state(synced);
+        assert!(open(&app).is_empty(), "{:?}", open(&app));
+        // A run whose vault item joined, synced and installed the subscriber reports its row
+        // `applied` (with why), beside the record's own row once the stage is done.
+        raise_all(&mut app);
+        app.publish_system_state(report(Vec::new()));
+        app.publish_system_state(report(vec![recorded(), row("Secrets vault", "applied")]));
+        assert!(open(&app).is_empty(), "{:?}", open(&app));
     }
 
     /// A loopback vault: an admin's home that created it, the server, and its pinned URL.

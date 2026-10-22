@@ -322,8 +322,8 @@ fn a_refused_intake_of_an_offered_handoff_exits_instead_of_booting_fresh() {
     assert!(!overlap_intake_exits(false, 3, true));
     // …and a stray channel variable with nothing offered boots fresh.
     assert!(!overlap_intake_exits(true, 0, false));
-    // An unreadable manifest is the PRODUCER's content (review round two of
-    // item 18): `no_shipped_parent_is_sent_75_for_a_refused_intake` is how
+    // An unreadable manifest is the PRODUCER's content:
+    // `no_shipped_parent_is_sent_75_for_a_refused_intake` is how
     // each parent is left.
     assert_eq!(incoming.refusal, Some(WholeRefusal::Producer));
 }
@@ -440,7 +440,7 @@ fn no_shipped_parent_is_sent_75_for_a_refused_intake() {
 }
 
 /// THE CAPABILITY IS DECLARED BESIDE THE READER THAT HONOURS IT, and reaches
-/// the new image (round eight, finding 0). The parent publishes it in the one
+/// the new image. The parent publishes it in the one
 /// list both handoff lanes publish ([`outgoing_parent_env`]); the snapshot
 /// carries it across the boot apply's re-exec; the successor takes it out
 /// before any shell; and this build's reader files 75 transient — so the
@@ -1390,7 +1390,7 @@ fn only_a_downgrade_target_gets_the_legacy_caps() {
     );
 }
 
-/// ROUND EIGHT'S LEAD U24: a rollback to v0.93.0 or later is priced at the
+/// a rollback to v0.93.0 or later is priced at the
 /// consumer it reaches, not at v0.91.0's. Every consumer from v0.93.0 on
 /// admits this build's per-grid cap (`git show v0.93.0:crates/aterm-gui/src/
 /// seamless.rs`: `MAX_HANDOFF_GRID_CELLS = MAX_HANDOFF_AGGREGATE_GRID_CELLS /
@@ -1616,7 +1616,7 @@ fn metas_cost(pool: &[WireCarry]) -> u64 {
 }
 
 /// COLOUR STACKS, TAB STOPS PAST THE WIDTH AND OSC PAYLOADS ARE SHED, NOT
-/// REFUSED (round eight of the update audit, finding 51). Tabs that pushed
+/// REFUSED. Tabs that pushed
 /// the kitty colour stack and never popped it carry 256 palette entries per
 /// push, with no OSC 133 mark to shed; a grid never shrinks its stop vector,
 /// so a pane once 4,000 columns wide carries 4,000 stops per cursor at any
@@ -1765,8 +1765,8 @@ fn metas_past_every_shed_lower_screens_instead_of_refusing() {
     }
 }
 
-/// A DESK WHOSE METAS OUTGROW THE MANIFEST DEGRADES, IT IS NOT REFUSED
-/// (round six of the update audit, item 8). Forty shell tabs, each with
+/// A DESK WHOSE METAS OUTGROW THE MANIFEST DEGRADES, IT IS NOT REFUSED.
+/// Forty shell tabs, each with
 /// about three hundred OSC 133 commands across its carried history: every
 /// carried command costs its meta a mark and an output block, and together
 /// the metas are several MiB past the manifest's 4 MiB read cap.
@@ -2060,7 +2060,7 @@ fn connections_give_way_before_held_panes_and_the_mailbox() {
     );
 
     // CONTROL: a post past the cap, which the connections cannot cover. The
-    // mailbox gives way before the update does (round seven's review, item 1:
+    // mailbox gives way before the update does (item 1:
     // `ManifestOverCap` on every retry before it), its id named, its counter
     // kept.
     let manifest = manifest_with(peers.clone(), post("\u{1b}[31m".repeat(500_000)));
@@ -4273,7 +4273,7 @@ pub(super) fn restage_session(
 /// * session 1 was halted by its OWNER and arrives as a producer from
 ///   before the title carry wrote it (no `title` key): the title its
 ///   layout leaf was captured with at the park labels the tab instead
-///   (item 8a; round eight, U47, for why not the record's copy);
+///   (item 8a; for why not the record's copy);
 /// * session 2 carries a title value that does not read: its SCREEN still
 ///   adopts exactly (a bad title costs the title, never the screen), and
 ///   its layout leaf's title stands in.
@@ -4497,8 +4497,8 @@ fn a_workers_task_record_crosses_the_real_wire() {
 }
 
 /// AN OLDER PRODUCER'S BACKGROUND TAB TAKES THE TITLE ITS ENGINE HAD AT THE
-/// PARK, NOT THE RECORD'S STALE COPY (round eight of the update audit,
-/// U47). A producer before the title carry (v0.98.0 and older) writes no
+/// PARK, NOT THE RECORD'S STALE COPY.
+/// A producer before the title carry (v0.98.0 and older) writes no
 /// `title` key in the screen meta, and its record's title is the store's
 /// copy, which it updates for the pane IN FRONT of a window only (its
 /// active tab's focused terminal). The layout leaf of each tab carries the
@@ -4689,7 +4689,7 @@ fn an_older_producers_tab_takes_its_park_title_not_the_records_stale_copy() {
         "the focused pane of the front tab, and only it, keeps the record's copy"
     );
 
-    // A FOLDED LAYOUT (round eight, the D5 review): the panes in front are
+    // A FOLDED LAYOUT (the D5 review): the panes in front are
     // the ones the outgoing build had in front, recorded before the fold
     // moved a tab (`LayoutFold::front`), not what the folded window shows.
     // Both reads missed, and tab 0 is the window's active tab in each.
@@ -4736,7 +4736,7 @@ fn an_older_producers_tab_takes_its_park_title_not_the_records_stale_copy() {
 }
 
 /// A MANIFEST AN OLDER PRODUCER WROTE PAST THE 4 MiB WRITE CAP IS STILL READ
-/// (round eight of the update audit, U8; L3). v0.98.0 and every build before
+/// (L3). v0.98.0 and every build before
 /// it put no budget on the screen metas (ab83bf3b0 budgets this build's own
 /// writes only), so a desk of shell tabs whose carried history held many OSC
 /// 133 commands wrote a manifest past 4 MiB, and this consumer, reading with
@@ -4987,8 +4987,8 @@ fn an_unparseable_layout_still_adopts_every_session_and_proves() {
     staged.teardown();
 }
 
-/// A LAYOUT NAMING A PANE THE OUTGOING PROCESS DID NOT HAND IS PLACED
-/// (round three of the 2026-09 update robustness work). Under `aterm
+/// A LAYOUT NAMING A PANE THE OUTGOING PROCESS DID NOT HAND IS PLACED.
+/// Under `aterm
 /// --hold` an exited pane stays open, the handoff hands only the live
 /// sessions, but the layout capture names every terminal view — so the
 /// layout named one id more than the manifest, and `take_incoming` dropped
@@ -5115,8 +5115,8 @@ fn an_unplaced_layout_hands_over_the_drafts_it_carried() {
     staged.teardown();
 }
 
-/// A HELD SCREEN THE SUCCESSOR CANNOT SHOW IS NOT WRITTEN (round seven,
-/// item 52). The successor strips every link from a held pane's grids and
+/// A HELD SCREEN THE SUCCESSOR CANNOT SHOW IS NOT WRITTEN.
+/// The successor strips every link from a held pane's grids and
 /// refuses to decode one past [`MAX_LINK_STRIP_BYTES`], so a dense held
 /// screen under its per-grid cap but over that bound was written, read,
 /// charged to the held budget and then dropped in silence. The writer now
@@ -5175,8 +5175,8 @@ fn a_held_screen_past_the_link_strip_bound_is_not_written() {
     );
 }
 
-/// A HELD PANE'S SID CROSSES ONLY WHERE IT NAMES NO OTHER SESSION (round
-/// eight, finding 21). The writer carries each held pane's sid; the reader
+/// A HELD PANE'S SID CROSSES ONLY WHERE IT NAMES NO OTHER SESSION.
+/// The writer carries each held pane's sid; the reader
 /// gives a pane back its sid when it has the shape this build mints and no
 /// handed session, nor an earlier held pane, answers to it. Each refused
 /// one still shows its screen, under a fresh sid ([`HeldPane::sid`] `None`).
@@ -5222,7 +5222,7 @@ fn a_held_panes_sid_crosses_unless_it_names_another_session() {
 }
 
 /// A DESCRIPTOR LIST THAT DOES NOT MATCH THE MANIFEST IS THE OUTGOING
-/// BUILD'S (round seven, item 105): the parent wrote both, so the refusal
+/// BUILD'S: the parent wrote both, so the refusal
 /// exits as a moment, never the `0` that latches a healthy new build.
 /// RED before the fix: `Some(Own)`.
 #[test]
@@ -5364,7 +5364,7 @@ fn a_refused_handoff_closes_every_master_it_was_handed() {
         incoming.adopted.is_empty() && incoming.screen_digest.is_none(),
         "a sidecar that is not this record's own is refused outright"
     );
-    // WHOSE REFUSAL (round seven, item 105): the sidecar name is what the
+    // WHOSE REFUSAL: the sidecar name is what the
     // outgoing build wrote, so the successor leaves as for the producer's
     // content, never with the `0` that latches the new build. RED before
     // item 105: `Some(Own)`.

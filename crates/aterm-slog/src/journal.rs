@@ -585,7 +585,7 @@ pub struct Take {
 
 /// The writer's take of `log` from `cursor`: at most `max` records, the gap
 /// and overlaps crossed, and the open path when `snap` asks for it or the
-/// read lost records (ruling R8: after any loss a fresh snap restates the
+/// read lost records (after any loss a fresh snap restates the
 /// open path, so a reader can tell a close that went unjournaled).
 #[must_use]
 pub fn take(log: &Log, cursor: u64, max: usize, snap: bool) -> Take {
@@ -795,7 +795,7 @@ pub struct ViewRules {
     pub snap_voids_handed: bool,
     /// Two chains that no `#handed` links and that hold different records
     /// at one `(base, seq)` are two seq spaces, ordered by when each chain
-    /// began (session log phase 6, 6A-2; off: the reader before it, which
+    /// began (off: the reader before it, which
     /// keyed a space by its base alone and let a relaunch's records hide
     /// behind a dead process's at the same seqs).
     pub split_unlinked: bool,
@@ -894,7 +894,7 @@ struct ChainSpace<'a> {
     handed: bool,
 }
 
-/// THE SEQ SPACES THE CHAINS WROTE (session log phase 6, 6A-2, ruling U1):
+/// THE SEQ SPACES THE CHAINS WROTE:
 /// for each `(chain, base)`, the number of its space among that base's,
 /// counted in the order the chains began (`start_t`, then instance). A
 /// chain continues the base's newest space when the newest chain of it

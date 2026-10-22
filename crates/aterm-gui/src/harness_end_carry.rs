@@ -2,7 +2,7 @@
 // Copyright 2026 Andrew Yates
 
 //! THE CARRIED END (`docs/DESIGN-harness-autopilot-2026-10-15.md` §11.2.3,
-//! item 8; slice 2b): what a seamless update carries of a supervised
+//! item 8): what a seamless update carries of a supervised
 //! session's task, so the successor shows what the outgoing process did.
 //!
 //! * THE END standing on the session's glass (`EndGlass`, the tab's `•`

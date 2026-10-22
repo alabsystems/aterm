@@ -31,6 +31,8 @@ fn proc(pid: u32, ppid: u32, cpu_ms: Option<u64>, mib: u64, name: &str, uid: u32
         runnable_ns: cpu_ms.map(|ms| ms * 1_200_000),
         peak: Some((mib + 10) << 20),
         at_ns: None,
+        coalition: None,
+        birth_ms: None,
     }
 }
 
@@ -1108,6 +1110,7 @@ fn snapshot_with_jobs() -> Snapshot {
         },
         demand: Demand::Fast,
         lanes_off: vec!["lane_off:kqueue_detail"],
+        parked_tabs: Vec::new(),
     }));
     s
 }

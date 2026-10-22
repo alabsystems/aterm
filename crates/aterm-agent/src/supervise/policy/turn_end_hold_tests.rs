@@ -2,7 +2,7 @@
 // Copyright 2026 Andrew Yates
 
 // WHY LAND STILL HOLDS (`docs/DESIGN-harness-autopilot-2026-10-15.md`
-// §12.3, slice 3a): the hold the policy keeps at a land act's yield that did
+// §12.3): the hold the policy keeps at a land act's yield that did
 // not land (`TurnEndState::land_held`, `hold_at_yield`), where it moved
 // (`TurnEndState::held_moved`), its `since` (`TurnEndState::ledgered`,
 // `TurnEndState::seed_land_hold`), where it begins again after a landing
@@ -844,7 +844,7 @@ fn a_land_acts_yield_names_legs_only_where_the_act_was_taken() {
 }
 
 /// SOMEONE ELSE'S TURN SEEN ONLY AT ITS END DROPS THE LEGS, as its live read
-/// does (slice 3b: the model's `TheHostIsToldWhatHoldsTheLanding` holds the
+/// does (the model's `TheHostIsToldWhatHoldsTheLanding` holds the
 /// told legs to the state, and a turn no read saw run is as much someone
 /// else's — the legs were the last land act's yield's, and that turn may
 /// have changed every one of them): the instruction's yield names open

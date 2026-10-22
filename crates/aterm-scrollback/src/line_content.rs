@@ -118,7 +118,7 @@ impl LineContent {
     /// Get the length in bytes.
     #[must_use]
     #[inline]
-    pub(crate) fn len(&self) -> usize {
+    pub(crate) const fn len(&self) -> usize {
         match self {
             Self::Inline(b) => b.len(),
             Self::Heap(v) => v.len(),
@@ -128,7 +128,7 @@ impl LineContent {
     /// Check if empty.
     #[must_use]
     #[inline]
-    pub(crate) fn is_empty(&self) -> bool {
+    pub(crate) const fn is_empty(&self) -> bool {
         self.len() == 0
     }
 }

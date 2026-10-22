@@ -267,8 +267,7 @@ pub(crate) const HARNESS_POLICY_EVENT: &str = "harness-policy";
 /// The policy cell's move to `generation`, on one session's timeline: the
 /// `harness-policy gen=<n>` row [`crate::App::announce_harness_policy`] writes on
 /// every session's (the wire goldens write theirs through it too), and in the same
-/// hold the session log's `mark - policy gen=<n>`, on every session as the row is
-/// (phase 6, 6F-5; ruling U16).
+/// hold the session log's `mark - policy gen=<n>`, on every session as the row is.
 pub(crate) fn record_policy_move(
     timeline: &std::sync::Mutex<crate::session_timeline::SessionTimeline>,
     generation: u64,

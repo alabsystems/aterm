@@ -36,13 +36,7 @@ pub struct KittyLook {
 impl Default for KittyLook {
     #[inline]
     fn default() -> Self {
-        Self {
-            variant: CatGlyphId::S103,
-            accessory: None,
-            coat: 8,
-            iris: 4,
-            age: CatAge::Adult,
-        }
+        Self::DEFAULT
     }
 }
 
@@ -133,6 +127,31 @@ fn flagship_look(app_id: &str) -> Option<KittyLook> {
 }
 
 impl KittyLook {
+    /// Default look (`CatGlyphId::S103`, coat 8, iris 4, adult).
+    pub const DEFAULT: Self = Self {
+        variant: CatGlyphId::S103,
+        accessory: None,
+        coat: 8,
+        iris: 4,
+        age: CatAge::Adult,
+    };
+
+    /// Const-friendly structural equality check.
+    #[inline]
+    #[must_use]
+    pub const fn eq_const(&self, other: &Self) -> bool {
+        let acc_eq = match (self.accessory, other.accessory) {
+            (None, None) => true,
+            (Some(a), Some(b)) => a as usize == b as usize,
+            _ => false,
+        };
+        self.variant as usize == other.variant as usize
+            && acc_eq
+            && self.coat == other.coat
+            && self.iris == other.iris
+            && self.age as u8 == other.age as u8
+    }
+
     /// The launch kitty: the base companion breed for the whole aterm process, worn at
     /// the prompt in every window. Per-app kitties ([`Self::for_app`]) ride above it once
     /// a program has held the pane past the host's tenure gate; a pinned favourite
@@ -143,7 +162,7 @@ impl KittyLook {
     /// collected cats).
     #[inline]
     #[must_use]
-    pub fn for_launch(seed: u64) -> Self {
+    pub const fn for_launch(seed: u64) -> Self {
         let gkey = crate::genome::mix(seed ^ LAUNCH_LOOK_SALT);
         let (coat, iris) = crate::genome::cat_fills_v4(gkey);
         Self {
@@ -186,21 +205,24 @@ impl KittyLook {
     /// default head), and full-cat specials wear no accessory.
     #[inline]
     #[must_use]
-    pub fn normalized(mut self) -> Self {
-        self.coat = self.coat.min(15);
-        self.iris = self.iris.min(7);
+    pub const fn normalized(mut self) -> Self {
+        if self.coat > 15 {
+            self.coat = 15;
+        }
+        if self.iris > 7 {
+            self.iris = 7;
+        }
         match GLYPHS[self.variant as usize].kind {
             GlyphKind::Head => {
-                if self
-                    .accessory
-                    .is_some_and(|id| GLYPHS[id as usize].kind != GlyphKind::Accessory)
+                if let Some(id) = self.accessory
+                    && !matches!(GLYPHS[id as usize].kind, GlyphKind::Accessory)
                 {
                     self.accessory = None;
                 }
             }
             GlyphKind::Special => self.accessory = None,
             GlyphKind::Accessory => {
-                self.variant = Self::default().variant;
+                self.variant = Self::DEFAULT.variant;
                 self.accessory = None;
             }
         }
@@ -315,8 +337,10 @@ const COAT_DISTANCE: [[f32; 16]; 16] = [
 /// [`KittyLook::normalized`] clamps `coat`.
 #[inline]
 #[must_use]
-pub fn coat_distance(a: u8, b: u8) -> f32 {
-    COAT_DISTANCE[usize::from(a.min(15))][usize::from(b.min(15))]
+pub const fn coat_distance(a: u8, b: u8) -> f32 {
+    let ai = if a > 15 { 15 } else { a as usize };
+    let bi = if b > 15 { 15 } else { b as usize };
+    COAT_DISTANCE[ai][bi]
 }
 
 /// Stable semantic key for an authored glyph. Persist this rather than the Rust
@@ -494,7 +518,7 @@ pub const TRAIT_CROWN: u8 = 1 << 7;
 ///
 /// [`genome::cat_accessory`]: crate::genome::cat_accessory
 #[cfg(test)]
-pub fn accessory_trait_bits(acc: Option<crate::genome::Accessory>) -> u8 {
+pub const fn accessory_trait_bits(acc: Option<crate::genome::Accessory>) -> u8 {
     use crate::genome::Accessory;
     match acc {
         None => 0,

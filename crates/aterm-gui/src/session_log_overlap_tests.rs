@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! WHERE THE OLD STORES AND THE LOG OVERLAP, THEY AGREE (plan 5B-6; rulings
-//! T17, T19, T21, T39). Phase 5 keeps three stores beside the session log
+//! WHERE THE OLD STORES AND THE LOG OVERLAP, THEY AGREE.
+//! Phase 5 keeps three stores beside the session log
 //! (T21): the timeline's RAM ring, the roster journal `exits` reads, and
 //! presence's story. Each is checked here against the log where the two
 //! hold the same fact, and every place they do not is a named difference
@@ -19,7 +19,7 @@
 //!   longest values its producer admits too, the two are equal, row for
 //!   record, in order (ids and clocks aside): the WHOLE payload, so an
 //!   exact pair has no field the comparison does not see. Since 6F-8
-//!   (ruling U13) the four rows whose rule differed are exact pairs too, as
+//!   the four rows whose rule differed are exact pairs too, as
 //!   the view's grammar rules them: `title-change` from the content-tier
 //!   title marks (their cadence), `cwd-change` from the `cwd` marks (a
 //!   successor does not restate the directory it carried), `meta-change`
@@ -31,6 +31,18 @@
 //!   [`KNOWN_DIFFERENCES`]: a record the log keeps under its own retention
 //!   rule (`program-state` since 6F-4, U39), driven through the row's own
 //!   writer.
+//! * THE VIEW. Since 6G-2 the log's side
+//!   is the timeline's view ([`crate::session_timeline_view::timeline_rows`]:
+//!   the records the grammar flagged, numbered by the log). Over 5B-5's
+//!   goldens script, a seamless update (carried and not), a crash adoption,
+//!   a closed session and a flood, the view is the ring: every exact row,
+//!   whole, in order, `program-state` by its retention rule, and, where
+//!   every ring row is a record's, row for row by id (the writers'
+//!   one-hold order). A hole in the ids reports a GAP; an act the mark
+//!   limiter refuses is no row. A reader at any id is told what the ring
+//!   tells it: an update's jump past the predecessor's id is the digest's
+//!   GAP, and a crashed window's id above a keeper recovery's head reads
+//!   from its first row (U13); each recovery's epoch names its rows apart.
 //! * EXITS. For every reason and actor, the roster's `Exited` row and the
 //!   closed-session index's session close agree: the reason is `out=`, the
 //!   exit code `code=`, the actor `by=` under 3A's R1 (a sid no one minted
@@ -76,10 +88,10 @@ use crate::{App, WindowId};
 /// `inbox-seen` (every one, `moved=0|1`), `post`, `post-landed` (`off=-`
 /// too) and `hold`; since 6F-7 the lossy session rows: `spawned` (the
 /// open's `state=`, or a carried session's `state carried=1` mark),
-/// `closing` (the session close's `closer=`, ruling U12), `render` (every
+/// `closing` (the session close's `closer=`), `render` (every
 /// transition, whole), `modes-restored` (every row, nothing reverted too),
 /// `in-doubt` and `handoff` (`build=`; the ring is never carried, so its
-/// `carried=0`); since 6F-8 (ruling U13) the four rows whose rule differed,
+/// `carried=0`); since 6F-8 the four rows whose rule differed,
 /// as the view's grammar: `title-change`, `cwd-change`, `meta-change` and
 /// `human` (the burst marks; the mail latch's own, `why=mail`, is no row);
 /// each checked through its own writer ([`DRIVEN`]), at its producer's
@@ -153,371 +165,35 @@ const SECTION_0_1: [&str; 25] = [
     "hold-advisory",
 ];
 
-/// A field of a record, as text (`-` when it is not set).
-fn text(f: &Fields, key: Key) -> String {
-    match f.get(key) {
-        Some(Val::U(n)) => n.to_string(),
-        Some(Val::I(n)) => n.to_string(),
-        Some(_) => f.get_str(key).unwrap_or("-").to_string(),
-        None => "-".to_string(),
-    }
-}
-
-/// A text field as it was written (`-` when it is not set).
-fn raw(f: &Fields, key: Key) -> &str {
-    f.get_str(key).unwrap_or("-")
-}
-
-/// One record as the ring rows it pairs with ([`project_whole`]), each
-/// payload cut by the ring's own rule, 256 bytes never inside an escape
+/// One record as the ring rows it pairs with: the view's grammar
+/// ([`crate::session_timeline_view::rows_of`]), each payload cut by the
+/// ring's own rule, 256 bytes never inside an escape
 /// ([`crate::session_timeline::clamp_payload`]): a view prints the ring's
 /// grammar, its bound too.
 fn project(r: &Rec) -> Vec<(String, String)> {
-    project_whole(r)
+    crate::session_timeline_view::rows_of(r)
         .into_iter()
-        .map(|(k, p)| (k, crate::session_timeline::clamp_payload(p).to_string()))
+        .map(|(k, p)| {
+            (
+                k.to_string(),
+                crate::session_timeline::clamp_payload(p).to_string(),
+            )
+        })
         .collect()
 }
 
-/// One record as the ring rows it pairs with: none, or the exact pairs'
-/// (the session close is two rows, `closing` and the last `state-change`,
-/// in that order, written in one hold as the ring's are; the first only
-/// for a close that names its reason, as the ring's `closing` row is).
-fn project_whole(r: &Rec) -> Vec<(String, String)> {
-    let row = |k: &str, p: String| vec![(k.to_string(), p)];
-    if r.node == Node::SESSION {
-        match r.op {
-            Op::Close => {
-                let mut rows = Vec::new();
-                match r.f.get_word(Key::Out) {
-                    Some("unknown") | None => {}
-                    Some(out) => rows.extend(row(
-                        "closing",
-                        format!(
-                            "reason={out} by={}",
-                            crate::control::pct_encode(raw(&r.f, Key::Closer))
-                        ),
-                    )),
-                }
-                rows.extend(row("state-change", "state=closed".to_string()));
-                return rows;
-            }
-            // The registration: the open (a carried session's is its
-            // `state carried=1` mark, below).
-            Op::Open => return row("spawned", format!("state={}", text(&r.f, Key::State))),
-            // An uncarried handoff's loss, or a keeper's crash adoption's.
-            Op::Gap if matches!(r.f.get_word(Key::Why), Some("handoff" | "crash")) => {
-                return row("handoff", handoff_row(&r.f));
-            }
-            _ => {}
-        }
-    }
-    project_mark(r).into_iter().collect()
-}
-
-/// A `handoff` row as its record says it: the ring is never carried, so
-/// `carried=0` whatever the log carried, and `build=` its `from_build=`.
-fn handoff_row(f: &Fields) -> String {
-    format!("carried=0 from_build={}", text(f, Key::Build))
-}
-
-/// A mark as the ring row it pairs with, if it is an exact pair's.
-fn project_mark(r: &Rec) -> Option<(String, String)> {
-    if r.op != Op::Mark {
-        return None;
-    }
-    let f = &r.f;
-    let row = match r.k {
-        Kind::Agent => (
-            "agent-change",
-            format!(
-                "{} rev={} gen={} fp={}",
-                f.get_word(Key::Word).unwrap_or("unknown"),
-                text(f, Key::Rev),
-                text(f, Key::Gen),
-                text(f, Key::Fp)
-            ),
-        ),
-        Kind::Status => {
-            let code = text(f, Key::Code);
-            let (outcome, exit_code, signal) = match f.get_word(Key::Out) {
-                None => ("none", "-".to_string(), "-".to_string()),
-                Some("ok") => ("success", "-".to_string(), "-".to_string()),
-                Some("fail") => ("failure", code, "-".to_string()),
-                Some("signal") => ("signal", "-".to_string(), code),
-                Some(other) => (other, code, "-".to_string()),
-            };
-            (
-                crate::session_status::STATUS_CHANGE,
-                format!(
-                    "phase={} outcome={outcome} exit_code={exit_code} signal={signal} confidence={}",
-                    text(f, Key::Phase),
-                    r.conf.word()
-                ),
-            )
-        }
-        // The burst marks (6F-8, ruling U13): the mail latch's own mark, no
-        // burst's, says `why=mail` and is no row.
-        Kind::Human if f.get_word(Key::Why) == Some("mail") => return None,
-        Kind::Human => ("human", String::new()),
-        // Phase 6 (6F-8, ruling U13): the four rows whose rule differed, as
-        // the view prints them. The title and the directory as their marks
-        // hold them (a cleared directory `-`).
-        Kind::Title => (
-            crate::session_timeline::TITLE_CHANGE,
-            format!(
-                "title={}",
-                crate::control::pct_encode(f.get_str(Key::Title).unwrap_or(""))
-            ),
-        ),
-        Kind::Cwd => (
-            crate::session_timeline::CWD_CHANGE,
-            format!(
-                "cwd={}",
-                f.get_str(Key::Cwd)
-                    .map_or_else(|| "-".to_string(), crate::control::pct_encode)
-            ),
-        ),
-        // A meta field's value, or the attention text beside its `fp=` (the
-        // content tier), `-` for none; the Autopilot pair's timer. A
-        // successor's restore (`carried=1`) is a row as any write is.
-        Kind::Meta => (
-            crate::session_timeline::META_CHANGE,
-            format!(
-                "field={} value={}{}",
-                text(f, Key::Field),
-                f.get_str(Key::Value)
-                    .or_else(|| f.get_str(Key::AttnText))
-                    .map_or_else(|| "-".to_string(), crate::control::pct_encode),
-                match f.get(Key::LandAt) {
-                    Some(Val::I(s)) => format!(" land_at={s}"),
-                    _ => String::new(),
-                }
-            ),
-        ),
-        // A self-claim's act, whole (`harness_act=`, the review of 6F-7),
-        // and its holder; a relaunch's act (`src=aterm`) is no row's.
-        Kind::Act if r.src == aterm_slog::Src::Mark => (
-            crate::session_timeline::HARNESS_ACT,
-            format!(
-                "act={} holder={}",
-                raw(f, Key::HarnessAct),
-                raw(f, Key::Holder)
-            ),
-        ),
-        // `exit=` is the log's `code=`, as a command's is (5C-1).
-        Kind::Task => (
-            "task-change",
-            format!(
-                "rev={} state={} attention={}{}{}",
-                text(f, Key::Rev),
-                text(f, Key::State),
-                text(f, Key::Attention),
-                f.get_word(Key::Why)
-                    .map(|w| format!(" why={w}"))
-                    .unwrap_or_default(),
-                match f.get(Key::Code) {
-                    Some(Val::I(c)) => format!(" exit={c}"),
-                    _ => String::new(),
-                }
-            ),
-        ),
-        Kind::Mail if f.get_word(Key::Dir) == Some("in") => (
-            "inbox",
-            format!(
-                "{} from={} kind={} off={}",
-                text(f, Key::Inbox),
-                text(f, Key::From),
-                text(f, Key::MailKind),
-                text(f, Key::Off)
-            ),
-        ),
-        // Phase 6 (6F-5): the ring-only facts, as marks; a carried
-        // session's registration is its `spawned` row (6F-7).
-        Kind::State if f.get_u(Key::Carried) == Some(1) => {
-            ("spawned", format!("state={}", text(f, Key::State)))
-        }
-        Kind::State => ("state-change", format!("state={}", text(f, Key::State))),
-        Kind::Policy => (
-            crate::harness_policy_verb::HARNESS_POLICY_EVENT,
-            format!("gen={}", text(f, Key::Gen)),
-        ),
-        Kind::Advisory => (
-            "hold-advisory",
-            format!(
-                "1 reason={} origin={}",
-                raw(f, Key::Reason),
-                text(f, Key::Origin)
-            ),
-        ),
-        Kind::MailFetch => ("fetch", format!("off={}", text(f, Key::Off))),
-        // Phase 6 (6F-6): the fabric rows, whole. A broadcast's `to=` is
-        // its topic's fingerprint on the record, the name beside it.
-        Kind::Mail if f.get_word(Key::Dir) == Some("out") => {
-            let to = match (raw(f, Key::To).strip_prefix("say:"), f.get(Key::TopicName)) {
-                (Some(_), Some(_)) => format!("say:{}", raw(f, Key::TopicName)),
-                _ => raw(f, Key::To).to_string(),
-            };
-            let opt = |k: Key, name: &str| match f.get(k) {
-                Some(_) => format!(" {name}={}", text(f, k)),
-                None => String::new(),
-            };
-            (
-                "post",
-                format!(
-                    "{} to={} kind={}{}{}{}{}",
-                    text(f, Key::Inbox),
-                    aterm_control::wire::pct_encode(&to),
-                    text(f, Key::MailKind),
-                    opt(Key::Re, "re"),
-                    opt(Key::Dl, "dl"),
-                    opt(Key::Via, "via"),
-                    opt(Key::Idem, "key"),
-                ),
-            )
-        }
-        Kind::MailLanded => (
-            "post-landed",
-            format!(
-                "{} off={}{}",
-                text(f, Key::Inbox),
-                text(f, Key::Off),
-                f.get_word(Key::Why)
-                    .map(|w| format!(" reason={w}"))
-                    .unwrap_or_default()
-            ),
-        ),
-        Kind::MailSeen => (
-            "inbox-seen",
-            format!(
-                "{} off={} floor={} seen={}{}",
-                text(f, Key::Inbox),
-                text(f, Key::Off),
-                text(f, Key::Floor),
-                text(f, Key::Seen),
-                match f.get_word(Key::Word) {
-                    Some(v) => format!(
-                        " verdict={v} kind={} from={}",
-                        text(f, Key::MailKind),
-                        raw(f, Key::From)
-                    ),
-                    None => String::new(),
-                }
-            ),
-        ),
-        Kind::Hold => (
-            "hold",
-            format!(
-                "{} reason={} origin={} hold_origin={}{}",
-                u8::from(f.get_word(Key::State) == Some("on")),
-                raw(f, Key::Reason),
-                text(f, Key::Origin),
-                text(f, Key::HoldOrigin),
-                if f.get_u(Key::Carried) == Some(1) {
-                    " carried=1"
-                } else {
-                    ""
-                }
-            ),
-        ),
-        Kind::Topic => (
-            "topic",
-            match f.get_word(Key::Change) {
-                Some("add") => format!(
-                    "add {} since={}",
-                    raw(f, Key::TopicName),
-                    raw(f, Key::Since)
-                ),
-                _ => format!("drop {}", raw(f, Key::TopicName)),
-            },
-        ),
-        // Phase 6 (6F-7): the session rows, whole.
-        Kind::Handoff => ("handoff", handoff_row(f)),
-        Kind::Render => ("render", render_row(f)),
-        Kind::Modes => {
-            let reverted = |none: &'static str| f.get_str(Key::Reverted).unwrap_or(none);
-            (
-                "modes-restored",
-                match f.get_word(Key::Source) {
-                    Some(source) => format!(
-                        "reason=manual source={source} reverted={} bytes={}",
-                        reverted("-"),
-                        text(f, Key::Bytes)
-                    ),
-                    None => format!(
-                        "from={} to={} program={} reverted={} bytes={}",
-                        text(f, Key::FromPg),
-                        text(f, Key::ToPg),
-                        f.get_str(Key::Prog)
-                            .map_or_else(|| "-".to_string(), crate::control::pct_encode),
-                        reverted(""),
-                        text(f, Key::Bytes)
-                    ),
-                },
-            )
-        }
-        Kind::InDoubt => (
-            "in-doubt",
-            format!(
-                "producer={} seq={} reply={}",
-                text(f, Key::Producer),
-                text(f, Key::KeySeq),
-                crate::control::pct_encode(f.get_str(Key::Reply).unwrap_or(""))
-            ),
-        ),
-        _ => return None,
-    };
-    Some((row.0.to_string(), row.1))
-}
-
-/// A `render` mark as the resize ledger's row: a run's verdict or an
-/// epoch's (`resize_epoch=` set), into `desync-risk` or `healed`.
-fn render_row(f: &Fields) -> String {
-    let signed = |k: Key| match f.get(k) {
-        Some(Val::I(n)) => format!("{n:+}"),
-        _ => "-".to_string(),
-    };
-    let state = text(f, Key::State);
-    match (f.get(Key::ResizeEpoch).is_some(), state.as_str()) {
-        (false, "desync-risk") => format!(
-            "desync-risk run={} displaced={} net={} at={}",
-            text(f, Key::Run),
-            signed(Key::Displaced),
-            text(f, Key::Net),
-            text(f, Key::At)
-        ),
-        (false, _) => format!(
-            "{state} run={} after_ms={}",
-            text(f, Key::Run),
-            text(f, Key::AfterMs)
-        ),
-        (true, "desync-risk") => format!(
-            "desync-risk epoch={} displaced={} pushed={} cut={} drew={} class={} at={}",
-            text(f, Key::ResizeEpoch),
-            signed(Key::Displaced),
-            text(f, Key::Pushed),
-            text(f, Key::Cut),
-            text(f, Key::Drew),
-            text(f, Key::Class),
-            text(f, Key::At)
-        ),
-        (true, _) => format!(
-            "{state} epoch={} after_ms={} by={}",
-            text(f, Key::ResizeEpoch),
-            text(f, Key::AfterMs),
-            text(f, Key::HealedBy)
-        ),
-    }
-}
-
-/// The log's records of the exact pairs as the ring's `(kind, payload)`,
-/// oldest first.
+/// THE VIEW's rows ([`crate::session_timeline_view::timeline_rows`], 6G-2)
+/// as the ring's `(kind, payload)`, oldest first.
 pub(crate) fn overlap_rows(log: &Log) -> Vec<(String, String)> {
-    overlap_rows_without(log, None)
+    crate::session_timeline_view::timeline_rows(log)
+        .into_iter()
+        .map(|e| (e.kind.to_string(), e.payload.to_string()))
+        .collect()
 }
 
-/// [`overlap_rows`] with `drop` taken out of every record first (the
-/// negative control's lossy projection).
+/// The view's grammar over every record of `log`, `drop` taken out of each
+/// first (the negative control's lossy view: a grammar blind to `why=`
+/// prints the mail latch's own mark, which the view's does not flag).
 fn overlap_rows_without(log: &Log, drop: Option<Key>) -> Vec<(String, String)> {
     projected(log.window(), drop)
 }
@@ -717,7 +393,7 @@ fn drive_human() -> Seen {
     drive_human_at(62).1
 }
 
-/// THE `human` ROWS ARE THE BURST MARKS (6F-8, ruling U13; T39): a
+/// THE `human` ROWS ARE THE BURST MARKS (T39): a
 /// person's burst, a delivered mail, then the same person typing on inside
 /// that 30 s burst, twice ([`drive_human_at`]): the ring keeps one `human`
 /// row (the burst's); the log holds its mark and one more `human` mark, the
@@ -776,8 +452,7 @@ fn the_human_rows_are_the_burst_marks_and_the_latchs_own_says_why() {
     );
 }
 
-/// How a timeline kind and the log differ (T19's named differences; since
-/// 6F-8, ruling U13, the lossy rows and the rows on another trigger are
+/// How a timeline kind and the log differ (T19's named differences; the lossy rows and the rows on another trigger are
 /// exact pairs, and a retention rule is the one difference left).
 #[derive(Clone, Copy, Debug)]
 enum Diff {
@@ -1148,7 +823,7 @@ fn drive_autopilot() -> Seen {
 /// A seamless update's successor restoring what its predecessor held (the
 /// carried identity, `restore_carried_meta`, and the keyed attention,
 /// `seed_carried_claims`): each restore a row, its mark `carried=1` (the
-/// value the log last said: no news, ruling S5) since 6F-8; then a new
+/// value the log last said: no news) since 6F-8; then a new
 /// value, a move.
 fn drive_meta_successor() -> Seen {
     use crate::session_timeline::{MetaEdit, MetaField, write_attention_owned};
@@ -1836,7 +1511,7 @@ const DRIVEN: &[Driven] = &[
         drive: drive_handoff,
         needs: Key::Build,
     },
-    // Phase 6 (6F-8, ruling U13): the four rows whose rule differed.
+    // Phase 6: the four rows whose rule differed.
     Driven {
         row: crate::session_timeline::TITLE_CHANGE,
         drive: drive_title,
@@ -2081,6 +1756,741 @@ fn every_named_difference_still_holds() {
     );
     let none = Seen::default();
     assert!(holds(known("program-state"), &none).is_err(), "no row");
+}
+
+// ---- the view (6G-2) ----------------------------------------------------------
+
+/// Rows with their ids, `(id, kind, payload)`, oldest first.
+type IdRows = Vec<(u64, String, String)>;
+
+/// The ring's rows.
+fn ring_ids(tl: &SessionTimeline) -> IdRows {
+    tl.since(None)
+        .map(|e| (e.id, e.kind.to_string(), e.payload.to_string()))
+        .collect()
+}
+
+/// THE VIEW's rows ([`crate::session_timeline_view::timeline_rows`]).
+fn view_ids(log: &Log) -> IdRows {
+    crate::session_timeline_view::timeline_rows(log)
+        .into_iter()
+        .map(|e| (e.id, e.kind.to_string(), e.payload.to_string()))
+        .collect()
+}
+
+/// Whether a row is of an exact pair.
+fn is_exact(r: &(u64, String, String)) -> bool {
+    EXACT.contains(&r.1.as_str())
+}
+
+/// `rows`' exact pairs, ids aside.
+fn exact_of(rows: &[(u64, String, String)]) -> Vec<(String, String)> {
+    rows.iter()
+        .filter(|r| is_exact(r))
+        .map(|r| (r.1.clone(), r.2.clone()))
+        .collect()
+}
+
+/// THE RETENTION RULE (6F-4; U39) the view's `program-state` rows keep
+/// the ring's by, over the same span: no more of them than the ring's, and
+/// the newest the ring's newest.
+fn program_rule(
+    view: &[(u64, String, String)],
+    ring: &[(u64, String, String)],
+) -> Result<(), String> {
+    let of = |rows: &[(u64, String, String)]| -> Vec<String> {
+        rows.iter()
+            .filter(|r| r.1 == crate::session_timeline::PROGRAM_STATE)
+            .map(|r| r.2.clone())
+            .collect()
+    };
+    let (v, r) = (of(view), of(ring));
+    if v.len() > r.len() {
+        return Err(format!(
+            "{} program rows in the view for the ring's {}",
+            v.len(),
+            r.len()
+        ));
+    }
+    if v.last() != r.last() {
+        return Err(format!(
+            "the view's newest program row {:?} is not the ring's {:?}",
+            v.last(),
+            r.last()
+        ));
+    }
+    Ok(())
+}
+
+/// How [`view_against_ring`] holds the view to the ring.
+#[derive(Clone, Copy)]
+struct Hold<'a> {
+    /// The first ring id of the view's epoch (the ring's `handoff` row's,
+    /// for a log that started over there).
+    from: u64,
+    /// Every row (`false`: the ring dropped its oldest, so the two are
+    /// held over the ring's span, from its oldest exact row).
+    whole: bool,
+    /// The ids too: every ring row is a record's, so each id is the ring's.
+    ids: bool,
+    /// Ring kinds a script hand-wrote with no writer (no record's).
+    hand_written: &'a [&'a str],
+}
+
+/// THE VIEW AGAINST THE RING (6G-2): over the same span, the view's exact
+/// rows are the ring's, whole payload, in order; its `program-state` rows
+/// keep the ring's by their retention rule ([`program_rule`]); and, held to
+/// the ids, the view is the ring row for row: the writers' one-hold order,
+/// no ring row standing where the view has none.
+fn view_against_ring(tl: &SessionTimeline, hold: Hold<'_>) -> Result<(), String> {
+    let view = view_ids(tl.slog().log());
+    let mut ring: IdRows = ring_ids(tl)
+        .into_iter()
+        .filter(|r| r.0 >= hold.from && !hold.hand_written.contains(&r.1.as_str()))
+        .collect();
+    let mut view = view.as_slice();
+    if !hold.whole {
+        // The ring's span: from its oldest exact row, which the view's
+        // exact rows end with as many of.
+        let first = ring.iter().position(is_exact).unwrap_or(ring.len());
+        ring.drain(..first);
+        let n = ring.iter().filter(|r| is_exact(r)).count();
+        let at = view
+            .iter()
+            .enumerate()
+            .rev()
+            .filter(|(_, r)| is_exact(r))
+            .nth(n.saturating_sub(1))
+            .map_or(0, |(i, _)| i);
+        view = &view[at..];
+    }
+    let (ve, re) = (exact_of(view), exact_of(&ring));
+    if ve != re {
+        return Err(format!(
+            "the view's exact rows {ve:?}\n against the ring's {re:?}"
+        ));
+    }
+    program_rule(view, &ring)?;
+    if hold.ids && view != ring.as_slice() {
+        return Err(format!(
+            "by id: the view {view:?}\n against the ring {ring:?}"
+        ));
+    }
+    Ok(())
+}
+
+/// A published status transition, as the status sweep records it: the
+/// ring's row and the log's mark in one hold.
+fn status_move(g: &mut SessionTimeline, failed: bool) {
+    use crate::session_status::{Confidence, Outcome, Phase, Status};
+    let status = Status {
+        phase: if failed { Phase::Idle } else { Phase::Running },
+        last_outcome: if failed {
+            Outcome::Failure { exit_code: 1 }
+        } else {
+            Outcome::None
+        },
+        since: Instant::now(),
+        detail: None,
+        confidence: Confidence::Exact,
+        reasons: Vec::new(),
+        conflict: false,
+    };
+    g.record(
+        crate::session_status::STATUS_CHANGE,
+        crate::session_status::status_event_payload(&status),
+    );
+    let at = g.slog().now();
+    g.slog_mut()
+        .observe_status(crate::session_status::status_facts(&status), at);
+}
+
+/// A run of the shell's, opened and closed: records no row prints.
+fn shell_run(g: &mut SessionTimeline) {
+    let at = g.slog().now();
+    let log = g.slog_mut().log_mut_for_tests();
+    let run = log
+        .open(
+            aterm_slog::Open::new(Kind::Cmd, aterm_slog::Src::Shell, aterm_slog::Conf::Strong),
+            at,
+        )
+        .expect("a run opens");
+    log.close(
+        run,
+        aterm_slog::Close::new(
+            aterm_slog::Out::Run(aterm_slog::RunOut::Ok),
+            aterm_slog::Src::Shell,
+            aterm_slog::Conf::Exact,
+        ),
+        at,
+    )
+    .expect("the run closes");
+}
+
+/// Every writer of a row and its record, interleaved on one session, round
+/// `round`: a directory, the agent's verdict, the title, a task through
+/// `task mark`, a person's burst (its row paid by the next row), a
+/// self-claim's act, a status transition, a program report, the
+/// supervisor's attention and a delivered mail.
+fn every_writer(h: &SessionHandle, store: &Store, round: u64) {
+    use aterm_core::terminal::program_state::ProgramStateWord as W;
+    {
+        let mut g = h.ctx.timeline.lock().unwrap();
+        g.record_cwd_change(Some(&format!("/tmp/x/{round}")));
+        let word = if round.is_multiple_of(2) {
+            "busy"
+        } else {
+            "idle"
+        };
+        let _ = g.publish_agent(
+            word,
+            None,
+            None,
+            Some(aterm_phase::Program::Claude),
+            stamp(round + 1),
+        );
+        assert!(g.record_title(&format!("build {round}")));
+    }
+    let mark = if round.is_multiple_of(2) {
+        "mark working"
+    } else {
+        "mark done why=marker"
+    };
+    let _ = crate::task_record::cmd_task(&h.ctx, h.local_id, crate::control::Scope::Owner, mark);
+    let _ = crate::app_input::note_person(&h.ctx, crate::human_input::Gesture::Other);
+    {
+        let mut g = h.ctx.timeline.lock().unwrap();
+        let _ = g.note_harness_act("approve", "codex-alab@1", Actor::Ctl);
+        status_move(&mut g, round % 2 == 1);
+        let state = if round.is_multiple_of(2) {
+            W::Working
+        } else {
+            W::Done
+        };
+        let _ = g.note_program_state(Some(program_report(state, None)));
+    }
+    let edit = if round.is_multiple_of(2) {
+        crate::session_timeline::MetaEdit::Set("look here")
+    } else {
+        crate::session_timeline::MetaEdit::Clear
+    };
+    let _ = crate::session_timeline::write_attention_owned(
+        &h.ctx,
+        crate::harness_host::ATTENTION_OWNER,
+        edit,
+        Actor::Harness,
+    );
+    let wake = |_: &aterm_session::SessionId| {};
+    let line = format!(
+        "{} off={} from=s-a kind=ask trust=agent text=SENTINEL",
+        h.ctx.self_id.as_str(),
+        10 + round
+    );
+    let reply = crate::fabric::cmd_deliver_waking(store, &line, &wake);
+    assert!(reply.starts_with("OK "), "{reply}");
+}
+
+/// The view held to the ring row for row, by id.
+const BY_ID: Hold<'static> = Hold {
+    from: 0,
+    whole: true,
+    ids: true,
+    hand_written: &[],
+};
+
+/// THE VIEW IS THE RING OVER 5B-5's SCRIPT (6G-2): the goldens' session,
+/// every kind of plan §0.1 through its writer, read from its update's
+/// `handoff` row (the script's update carried no log, so the log started
+/// over there) with its two hand-written rows aside (`fetch` and
+/// `hold-advisory`, which no writer of a unit test reaches, so no record
+/// stands behind them): every exact row is the view's, whole and in order,
+/// the program report by its retention rule, the session close's two rows
+/// the close's. NEGATIVE CONTROL: held to every ring row, the hand-written
+/// two are rows the view does not have.
+#[test]
+fn the_view_is_the_ring_over_the_goldens_script() {
+    let h = crate::control::wire_goldens::scripted(false);
+    let g = h.ctx.timeline.lock().unwrap();
+    let from = g
+        .since(None)
+        .rfind(|e| e.kind == "handoff")
+        .map(|e| e.id)
+        .expect("the update's row");
+    let hold = Hold {
+        from,
+        whole: true,
+        ids: false,
+        hand_written: &["fetch", "hold-advisory"],
+    };
+    view_against_ring(&g, hold).unwrap_or_else(|e| panic!("{e}"));
+    let view = view_ids(g.slog().log());
+    let kinds: Vec<&str> = view.iter().map(|r| r.1.as_str()).collect();
+    assert_eq!(kinds.first(), Some(&"handoff"), "{kinds:?}");
+    assert!(kinds.contains(&crate::session_timeline::PROGRAM_STATE));
+    assert_eq!(kinds[kinds.len() - 2..], ["closing", "state-change"]);
+    let every = Hold {
+        hand_written: &[],
+        ..hold
+    };
+    assert!(
+        view_against_ring(&g, every).is_err(),
+        "NEGATIVE CONTROL: the hand-written rows are the ring's alone"
+    );
+}
+
+/// THE VIEW IS THE RING ACROSS A SEAMLESS UPDATE, carried and not, and
+/// after a crash adoption, row for row BY ID (the writers' one-hold
+/// order): the predecessor's view is its ring; the successor's first row,
+/// its `handoff`, takes the id its ring's does, past every id the
+/// predecessor handed out (the count its manifest carried); and every
+/// writer after it keeps the two equal. A crash adoption's (no count
+/// carried) start again at 1, in its new epoch.
+#[test]
+fn the_view_is_the_ring_across_an_update_and_a_crash_adoption() {
+    for carry in [true, false] {
+        let (h, store) = rig(72);
+        let hand = super::super::tests::hand_clock(&h.ctx.timeline);
+        every_writer(&h, &store, 0);
+        let pred_high = {
+            let g = h.ctx.timeline.lock().unwrap();
+            view_against_ring(&g, BY_ID).unwrap_or_else(|e| panic!("predecessor: {e}"));
+            g.high_id().expect("rows")
+        };
+        hand.set(5_000);
+        let (next, next_store, _next_hand) = hand_over(&h, &store.read().unwrap(), 10_000, carry);
+        let shared: Store = Arc::new(std::sync::RwLock::new(next_store));
+        every_writer(&next, &shared, 1);
+        let g = next.ctx.timeline.lock().unwrap();
+        view_against_ring(&g, BY_ID).unwrap_or_else(|e| panic!("successor (carry {carry}): {e}"));
+        let first = view_ids(g.slog().log())[0].clone();
+        assert_eq!(first.1, "handoff", "carry {carry}");
+        assert!(
+            first.0 > pred_high,
+            "carry {carry}: the successor's first id {} is past the predecessor's {pred_high}",
+            first.0
+        );
+    }
+    let kept = test_handle(73);
+    crate::spawn::mark_handoff_gap(
+        &kept.ctx.timeline,
+        &kept.ctx.cast,
+        &kept.ctx.temporal,
+        Some(9),
+        0,
+        crate::session_log::LogAdopt::default(),
+        true,
+    );
+    let store = new_store();
+    store.write().unwrap().register(kept.clone());
+    every_writer(&kept, &store, 2);
+    let g = kept.ctx.timeline.lock().unwrap();
+    view_against_ring(&g, BY_ID).unwrap_or_else(|e| panic!("crash adoption: {e}"));
+    let first = &view_ids(g.slog().log())[0];
+    assert_eq!(
+        (first.0, first.1.as_str()),
+        (1, "handoff"),
+        "a crash adoption's ids start at 1"
+    );
+}
+
+/// What the ring's own digest tells a watcher at `after`
+/// ([`crate::subscribe::drain_timeline_events`]): its `GAP
+/// events-dropped=` count, 0 for none.
+fn ring_gap(tl: &SessionTimeline, after: Option<u64>) -> u64 {
+    let mut out = String::new();
+    let _ = crate::subscribe::drain_timeline_events(tl, "7", after, &mut out);
+    out.lines()
+        .find_map(|l| l.strip_prefix("GAP 7 events-dropped="))
+        .map_or(0, |n| n.parse().expect("a count"))
+}
+
+/// Every reader's id in `anchors` against the ring: the view past it is the
+/// ring's `since` past it, by id, and its `lost` the GAP the ring's digest
+/// tells. Each disagreement, labelled with `case`.
+fn readers_against_ring(
+    tl: &SessionTimeline,
+    case: &str,
+    anchors: impl IntoIterator<Item = Option<u64>>,
+) -> Vec<String> {
+    let mut wrong = Vec::new();
+    for after in anchors {
+        let view = crate::session_timeline_view::timeline_rows_since(tl.slog().log(), after);
+        let rows: IdRows = view
+            .rows
+            .iter()
+            .map(|e| (e.id, e.kind.to_string(), e.payload.to_string()))
+            .collect();
+        let ring: IdRows = tl
+            .since(after)
+            .map(|e| (e.id, e.kind.to_string(), e.payload.to_string()))
+            .collect();
+        if rows != ring {
+            wrong.push(format!(
+                "{case} after {after:?}: the view shows {} rows from {:?}, the ring {} from {:?}",
+                rows.len(),
+                rows.first().map(|r| r.0),
+                ring.len(),
+                ring.first().map(|r| r.0)
+            ));
+        }
+        let gap = ring_gap(tl, after);
+        if view.lost != gap {
+            wrong.push(format!(
+                "{case} after {after:?}: the view tells lost={}, the ring's digest GAP {gap}",
+                view.lost
+            ));
+        }
+    }
+    wrong
+}
+
+/// EVERY READER IS TOLD WHAT THE RING TELLS IT (6G-2, the review of 6G-2):
+/// across a seamless update, carried and not, and a keeper's crash
+/// recovery, a reader at every id (none, each of the predecessor's, the
+/// reserve between, each of the successor's, its head and past it, and a
+/// crashed window's 65,536 above) is shown the rows the ring's `since`
+/// shows it, by id, and told the GAP the ring's digest tells: the update's
+/// jump past the predecessor's id is a loss (`events-dropped=65536`, so a
+/// watcher re-reads its topics, T22), and a crashed window's id above the
+/// recovery's head reads from its first row (U13). CONTROL: the update's
+/// GAP is the reserve's, and the crashed window's anchor is past the head.
+#[test]
+fn the_view_tells_every_reader_what_the_ring_tells_it() {
+    use crate::session_timeline::HANDOFF_ID_RESERVE;
+    let mut wrong = Vec::new();
+    for carry in [true, false] {
+        let (h, store) = rig(78);
+        let hand = super::super::tests::hand_clock(&h.ctx.timeline);
+        every_writer(&h, &store, 0);
+        let pred_high = h.ctx.timeline.lock().unwrap().high_id().expect("rows");
+        hand.set(5_000);
+        let (next, next_store, _next_hand) = hand_over(&h, &store.read().unwrap(), 10_000, carry);
+        let shared: Store = Arc::new(std::sync::RwLock::new(next_store));
+        every_writer(&next, &shared, 1);
+        let g = next.ctx.timeline.lock().unwrap();
+        let (low, head) = (g.low_id().expect("rows"), g.high_id().expect("rows"));
+        assert_eq!(
+            ring_gap(&g, Some(pred_high)),
+            HANDOFF_ID_RESERVE,
+            "CONTROL (carry {carry}): the ring's digest tells the update's jump"
+        );
+        let anchors = [None, Some(0)]
+            .into_iter()
+            .chain((1..=pred_high + 1).map(Some))
+            .chain([low - 2, low - 1].map(Some))
+            .chain((low..=head + 1).map(Some))
+            .chain([Some(head + HANDOFF_ID_RESERVE)]);
+        wrong.extend(readers_against_ring(
+            &g,
+            &format!("update carry={carry}"),
+            anchors,
+        ));
+    }
+    // A keeper's recovery of the crashed window's shell: its ids restart at
+    // 1, below the window's anchor (3 rows, an update, 2 rows: U13's).
+    let kept = test_handle(79);
+    crate::spawn::mark_handoff_gap(
+        &kept.ctx.timeline,
+        &kept.ctx.cast,
+        &kept.ctx.temporal,
+        Some(9),
+        0,
+        crate::session_log::LogAdopt::default(),
+        true,
+    );
+    let store = new_store();
+    store.write().unwrap().register(kept.clone());
+    every_writer(&kept, &store, 2);
+    let g = kept.ctx.timeline.lock().unwrap();
+    let head = g.high_id().expect("rows");
+    let crashed = 3 + HANDOFF_ID_RESERVE + 2;
+    assert!(
+        crashed > g.slog().log().row_head(),
+        "CONTROL: the crashed window's anchor is past the recovery's head"
+    );
+    let anchors = [None, Some(0)]
+        .into_iter()
+        .chain((1..=head + 1).map(Some))
+        .chain([Some(crashed), Some(500)]);
+    wrong.extend(readers_against_ring(&g, "crash recovery", anchors));
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+/// A KEEPER'S RECOVERY NAMES ITS ROWS APART (6G-1's `(epoch, id)`, the
+/// review of 6G-1): a shell the PTY keeper held through two crashes of its
+/// window within one wall second is recovered twice, each through the
+/// production adoption (`spawn::mark_handoff_gap`, `keeper` set, its tag
+/// naming the crashed log's epoch: `Epochs::crash`); each recovery's epoch
+/// is past the one before, so the three windows' rows, keyed by epoch and
+/// id, are disjoint. CONTROL: their ids alone collide (each recovery's
+/// count restarts at 1), so the epoch is what names them apart.
+#[test]
+fn a_keeper_recovery_names_its_rows_apart_by_epoch() {
+    let keyed = |h: &SessionHandle| -> std::collections::BTreeSet<(u32, u64)> {
+        let g = h.ctx.timeline.lock().unwrap();
+        let log = g.slog().log();
+        view_ids(log).iter().map(|r| (log.ep(), r.0)).collect()
+    };
+    let ep_of = |h: &SessionHandle| h.ctx.timeline.lock().unwrap().slog().log().ep();
+    let (first, store) = rig(80);
+    let _hand = super::super::tests::hand_clock(&first.ctx.timeline);
+    every_writer(&first, &store, 0);
+    let mut windows = vec![first];
+    for round in 1..=2u64 {
+        let crashed = windows.last().expect("a window");
+        let kept = test_handle(80 + round);
+        // The recovery's clock: the same wall second as every window's.
+        let _hand = super::super::tests::hand_clock(&kept.ctx.timeline);
+        crate::spawn::mark_handoff_gap(
+            &kept.ctx.timeline,
+            &kept.ctx.cast,
+            &kept.ctx.temporal,
+            None,
+            0,
+            crate::session_log::LogAdopt {
+                keeper_ep: Some(ep_of(crashed)),
+                ..Default::default()
+            },
+            true,
+        );
+        let store = new_store();
+        store.write().unwrap().register(kept.clone());
+        every_writer(&kept, &store, round);
+        windows.push(kept);
+    }
+    let eps: Vec<u32> = windows.iter().map(ep_of).collect();
+    assert!(
+        eps.windows(2).all(|w| w[0] < w[1]),
+        "each recovery's epoch is past its crashed window's: {eps:?}"
+    );
+    let rows: Vec<_> = windows.iter().map(keyed).collect();
+    for (i, a) in rows.iter().enumerate() {
+        for b in &rows[i + 1..] {
+            assert!(a.is_disjoint(b), "two windows name one row: {eps:?}");
+        }
+    }
+    let ids = |k: &std::collections::BTreeSet<(u32, u64)>| -> std::collections::BTreeSet<u64> {
+        k.iter().map(|r| r.1).collect()
+    };
+    assert!(
+        rows.windows(2)
+            .all(|w| !ids(&w[0]).is_disjoint(&ids(&w[1]))),
+        "CONTROL: the ids alone collide"
+    );
+}
+
+/// THE VIEW IS THE RING OF A CLOSED SESSION, row for row by id, over
+/// three rounds of every writer: its close's two rows (`closing`, the last
+/// `state-change`) the session close's two ids.
+#[test]
+fn the_view_is_the_ring_of_a_closed_session() {
+    let (h, store) = rig(74);
+    for round in 0..3 {
+        every_writer(&h, &store, round);
+    }
+    let _ = store
+        .write()
+        .unwrap()
+        .deregister_local_as(74, ExitReason::CtlClose, ExitActor::Ctl);
+    let g = h.ctx.timeline.lock().unwrap();
+    view_against_ring(&g, BY_ID).unwrap_or_else(|e| panic!("{e}"));
+    let ring = ring_ids(&g);
+    for kind in [
+        "spawned",
+        crate::session_timeline::CWD_CHANGE,
+        "agent-change",
+        crate::session_timeline::TITLE_CHANGE,
+        "task-change",
+        "human",
+        crate::session_timeline::HARNESS_ACT,
+        crate::session_status::STATUS_CHANGE,
+        crate::session_timeline::PROGRAM_STATE,
+        crate::session_timeline::META_CHANGE,
+        "inbox",
+    ] {
+        assert!(
+            ring.iter().any(|r| r.1 == kind),
+            "every writer wrote: no {kind} row in {ring:?}"
+        );
+    }
+    let view = view_ids(g.slog().log());
+    let tail: Vec<&str> = view[view.len() - 2..]
+        .iter()
+        .map(|r| r.1.as_str())
+        .collect();
+    assert_eq!(tail, ["closing", "state-change"]);
+    let close = g.slog().log().rows().next_back().expect("the close's row");
+    assert_eq!((close.rec.op, close.span), (Op::Close, 2));
+    assert_eq!(close.id, view[view.len() - 2].0);
+}
+
+/// THE VIEW UNDER A FLOOD (6G-2 over 6G-1's floor): 10^4 status changes,
+/// 600 directory moves and 300 program flaps (one each 430 ms, past the
+/// run's bucket), interleaved with 1500 runs, then 500 runs more: the ring
+/// keeps its newest 512 rows, and over their span the view's exact rows
+/// are the ring's, whole, its program rows the ring's by their retention
+/// rule once the pending state is written; the view keeps the floor's 512.
+/// NEGATIVE CONTROLS: the retention rule refuses a view whose newest
+/// program row is a stale state, and one with more program rows than the
+/// ring's.
+#[test]
+fn the_view_is_the_ring_under_a_flood() {
+    use aterm_core::terminal::program_state::{ProgramBlockedKind, ProgramStateWord as W};
+    let (h, _store) = rig(75);
+    let hand = super::super::tests::hand_clock(&h.ctx.timeline);
+    let mut g = h.ctx.timeline.lock().unwrap();
+    let (mut status, mut cwd, mut program, mut runs) = (0, 0, 0, 0);
+    for block in 0..300u64 {
+        hand.advance(10);
+        let state = if block.is_multiple_of(2) {
+            W::Working
+        } else {
+            W::Blocked
+        };
+        let kind = (state == W::Blocked).then_some(ProgramBlockedKind::Auth);
+        let _ = g.note_program_state(Some(program_report(state, kind)));
+        program += 1;
+        for _ in 0..2 {
+            hand.advance(10);
+            g.record_cwd_change(Some(&format!("/tmp/x/{cwd}")));
+            cwd += 1;
+        }
+        for _ in 0..5 {
+            hand.advance(10);
+            shell_run(&mut g);
+            runs += 1;
+        }
+        for _ in 0..(33 + u64::from(block < 100)) {
+            hand.advance(10);
+            status_move(&mut g, status % 2 == 0);
+            status += 1;
+        }
+    }
+    for _ in 0..500 {
+        hand.advance(10);
+        shell_run(&mut g);
+        runs += 1;
+    }
+    assert_eq!((status, cwd, program, runs), (10_000, 600, 300, 2_000));
+    hand.advance(60_000);
+    let at = g.slog().now();
+    g.slog_mut().program_tick(at);
+    let hold = Hold {
+        from: 0,
+        whole: false,
+        ids: false,
+        hand_written: &[],
+    };
+    view_against_ring(&g, hold).unwrap_or_else(|e| panic!("{e}"));
+    let (view, ring) = (view_ids(g.slog().log()), ring_ids(&g));
+    assert_eq!(ring.len(), crate::session_timeline::TIMELINE_CAP);
+    let floor = aterm_slog::row_floor(crate::session_log::ring_limits()).records;
+    assert!(
+        view.len() >= floor,
+        "{} rows, the floor {floor}",
+        view.len()
+    );
+    let program_rows = |rows: &IdRows| {
+        rows.iter()
+            .filter(|r| r.1 == crate::session_timeline::PROGRAM_STATE)
+            .count()
+    };
+    assert!(
+        program_rows(&ring) > 0,
+        "the ring's span holds program rows"
+    );
+    // NEGATIVE CONTROLS: a stale newest program row, and more program rows
+    // than the ring's span holds.
+    let mut stale = ring.clone();
+    let newest = stale
+        .iter_mut()
+        .rfind(|r| r.1 == crate::session_timeline::PROGRAM_STATE)
+        .expect("a program row");
+    newest.2 = if newest.2 == "state=working kind=-" {
+        "state=blocked kind=auth".to_string()
+    } else {
+        "state=working kind=-".to_string()
+    };
+    assert_eq!(
+        program_rule(&ring, &ring),
+        Ok(()),
+        "CONTROL: the ring itself"
+    );
+    assert!(
+        program_rule(&stale, &ring).is_err(),
+        "a stale newest program row"
+    );
+    let mut more = ring.clone();
+    let one = more
+        .iter()
+        .find(|r| r.1 == crate::session_timeline::PROGRAM_STATE)
+        .cloned()
+        .expect("a program row");
+    more.insert(0, one);
+    assert!(program_rule(&more, &ring).is_err(), "more program rows");
+}
+
+/// A HOLE REPORTS A GAP (6G-2): 3000 directory moves, more rows than the
+/// log holds, so it takes its oldest: a reader from the start is told how
+/// many row ids it crosses that the log no longer holds, every id it is not
+/// shown, and a reader past the newest hole is told none and shown every
+/// row after it. CONTROL: at 600 moves nothing was taken, and the reader
+/// from the start is told no gap.
+#[test]
+fn a_hole_in_the_view_reports_a_gap() {
+    use crate::session_timeline_view::timeline_rows_since;
+    let (h, _store) = rig(76);
+    let mut g = h.ctx.timeline.lock().unwrap();
+    for i in 0..600 {
+        g.record_cwd_change(Some(&format!("/tmp/x/{i}")));
+    }
+    assert_eq!(
+        timeline_rows_since(g.slog().log(), None).lost,
+        0,
+        "CONTROL: nothing taken yet"
+    );
+    for i in 600..3_000 {
+        g.record_cwd_change(Some(&format!("/tmp/x/{i}")));
+    }
+    let log = g.slog().log();
+    let all = timeline_rows_since(log, None);
+    assert!(all.lost > 0, "the log took its oldest rows");
+    let issued = log.rows_issued();
+    assert_eq!(
+        all.lost + all.rows.len() as u64,
+        issued,
+        "every id is shown or told lost"
+    );
+    let newest_lost = (log.row_first()..=log.row_head())
+        .rev()
+        .find(|id| !all.rows.iter().any(|e| e.id == *id))
+        .expect("a hole");
+    let past = timeline_rows_since(log, Some(newest_lost));
+    assert_eq!(past.lost, 0, "past the holes, no gap");
+    assert_eq!(past.rows.len() as u64, log.row_head() - newest_lost);
+    let before = timeline_rows_since(log, Some(newest_lost - 1));
+    assert_eq!(before.lost, 1, "one hole crossed");
+}
+
+/// THE ROW FOLLOWS ITS RECORD for a self-claim's act (6G-2; the residual
+/// the review of 6F-7 named): a burst of 40 acts at one instant, past the
+/// actor's mark bucket, writes a `harness-act` row for each act the log
+/// recorded and none for one the limiter refused, so the view is the ring
+/// row for row. CONTROL: the limiter refused some.
+#[test]
+fn an_act_the_limiter_refuses_is_no_row() {
+    let (h, _store) = rig(77);
+    let _hand = super::super::tests::hand_clock(&h.ctx.timeline);
+    let mut g = h.ctx.timeline.lock().unwrap();
+    let ids: Vec<Option<u64>> = (0..40)
+        .map(|_| g.note_harness_act("approve", "codex-alab@1", Actor::Ctl))
+        .collect();
+    let rows = ring_rows(&g, &[crate::session_timeline::HARNESS_ACT]).len();
+    let acts = g.slog().log().window().filter(|r| r.k == Kind::Act).count();
+    assert!(acts < 40, "CONTROL: the limiter refused some: {acts}");
+    assert_eq!(rows, acts, "a row for each recorded act, none for the rest");
+    assert_eq!(ids.iter().flatten().count(), acts);
+    view_against_ring(&g, BY_ID).unwrap_or_else(|e| panic!("{e}"));
 }
 
 // ---- exits --------------------------------------------------------------------

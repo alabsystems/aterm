@@ -6,11 +6,10 @@ description: Use before building, checking, testing, linting, formatting or runn
 
 # Rust in aterm: the Trust toolchain is the default
 
-aterm installs the ALab verified Rust toolchain in `$ATPKG_BIN`, on PATH in every shell.
-It is the default in every repository, including one whose `rust-toolchain.toml` pins a
-stock channel: that pin moves only rustup's proxies (`cargo`, `rustc`, `rustfmt`,
-`cargo-clippy`), never `targo`. Only `RUSTC`, `CARGO_BUILD_RUSTC` or `build.rustc` moves
-targo off trustc.
+aterm installs the ALab verified Rust toolchain in `$ATPKG_BIN` (on PATH in every shell).
+It is the default in every repository, even when `rust-toolchain.toml` pins a stock channel
+(that pin moves only rustup's proxies `cargo`, `rustc`, `rustfmt`, `cargo-clippy`, never
+`targo`). Only `RUSTC`, `CARGO_BUILD_RUSTC` or `build.rustc` moves `targo` off `trustc`.
 
 | instead of | type | what it is |
 |---|---|---|
@@ -34,23 +33,25 @@ A bare `targo build` is refused on purpose: add the lane.
 
 ## Measure, don't assume
 
-- `aterm help rust` says which compiler this directory gets and why.
+- `aterm help rust` says which compiler this directory gets and why; where it or `aterm pkg
+  which targo` says `unavailable on <target>`, Trust has no build for this machine and stock
+  `cargo` is the toolchain.
 - `aterm pkg lane -- <command>` says whether a command runs stock Rust (exit 2 and the
-  Trust spelling); a command with quotes goes on stdin (`aterm pkg lane -`).
+  Trust spelling); pass a command with quotes on stdin (`aterm pkg lane -`).
 - A bare `cargo …` in an aterm session prints its `targo` spelling, then runs; in a Trust
-  source checkout a `cargo` or `rustc` that is not Trust is refused.
-- Stock Rust that is genuinely needed (a cross target Trust lacks, a lane labelled `STOCK
-  EXCEPTION` or `PUBLIC BOUNDARY`) runs with `ATERM_STOCK_REASON='<why>'` in front. A
-  stock pin alone is not a reason. A project's own lane rule wins in that project.
+  source checkout a non-Trust `cargo` or `rustc` is refused.
+- Stock Rust that is genuinely needed (a cross target Trust lacks, or a lane labelled `STOCK
+  EXCEPTION` / `PUBLIC BOUNDARY`) runs with `ATERM_STOCK_REASON='<why>'` in front. A stock
+  pin alone is not a reason; a project's own lane rule wins in that project.
 
 ## Errors that are not what they look like
 
-- `'rustc' is not installed for the custom toolchain 'trust'`: a stale rustup link, fixed
-  by `aterm pkg repair` (`aterm pkg doctor` says whether the machine is really blocked).
+- `'rustc' is not installed for the custom toolchain 'trust'`: stale rustup link, fixed by
+  `aterm pkg repair` (`aterm pkg doctor` checks whether the machine is blocked).
 - `refuses to create an implicitly unverified artifact`: add `trust` or `--unverified`.
 - `rustflags cannot set -Ztrust_verify` or `Host Rust cannot supply -Ztrust_verify`: a
-  verification flag in `.cargo/config.toml`; `targo --unverified` applies it itself.
-- `0 proved` after an error about a world-writable directory: `CARGO_TARGET_DIR` is under
-  `/tmp`; use a directory under `$HOME`.
+  verification flag in `.cargo/config.toml`; `targo --unverified` sets it itself.
+- `0 proved` after a world-writable directory error: `CARGO_TARGET_DIR` is under `/tmp`;
+  use a directory under `$HOME`.
 - `RUSTFLAGS` replaces a Trust-pinned repo's policy flags wholesale; a native `--target`
   strips the config from host units.

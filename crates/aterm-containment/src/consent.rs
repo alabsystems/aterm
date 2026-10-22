@@ -4898,7 +4898,7 @@ mod json {
 
 // Debugger access: the owner's change
 //
-// Design §3.4 step 3 (owner ruling O7). [`run_devtools_change`] is the one place a
+// Design §3.4 step 3. [`run_devtools_change`] is the one place a
 // `DevToolsSecurity -enable`/`-disable` process is constructed, and it runs only what the
 // owner confirmed in aterm's own alert: the GUI's live gesture arm calls it on a detached
 // worker; headless instances and every test wire an inert arm. It re-reads `-status` first

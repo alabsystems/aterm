@@ -885,7 +885,7 @@ fn a_turn_whose_row_is_missing_is_named_in_the_span_that_holds_it() {
     assert!(l.turns[1].rows.is_err() && l.turns[2].rows.is_err());
 }
 
-// ---- `--source log` (session log plan 5F-4, ruling T12) -------------------
+// ---- `--source log` -------------------
 
 /// How far the log's wall times may sit from the anchor's: the anchor is the
 /// control socket's birth, a guess at the clock's zero.
@@ -1007,7 +1007,7 @@ fn untimed(l: &Ledger) -> Vec<Untimed> {
         .collect()
 }
 
-/// THE LOG PATH AND THE ANCHOR PATH AGREE (plan 5F-4, ruling T12): over the
+/// THE LOG PATH AND THE ANCHOR PATH AGREE: over the
 /// same recorded replies, `--source log` gives the same turns — ids,
 /// kinds, texts, statuses and reply sizes — and the same mail, with every
 /// time within the anchor's error of the anchor path's, and it never asks
@@ -1104,7 +1104,7 @@ fn log_and_anchor_paths_agree_modulo_times() {
     );
 }
 
-/// NEGATIVE CONTROL (ruling T12): a close WITHOUT the restated `ledger=` (an
+/// NEGATIVE CONTROL: a close WITHOUT the restated `ledger=` (an
 /// older aterm's) loses the join — the evicted-open turn has no time, even
 /// though its close's time less its duration is exactly the anchor path's
 /// start (nothing is ever joined by time) — and SOURCES counts it twice:

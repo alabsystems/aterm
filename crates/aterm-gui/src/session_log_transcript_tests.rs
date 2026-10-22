@@ -2,7 +2,7 @@
 // Copyright 2026 Andrew Yates
 
 //! Transcript steps through the footer's own read into a real timeline
-//! (session log Phase 3B, plan §2.10; rulings S1, S6, S12, S16, S27):
+//! (plan §2.10):
 //! the records, their time order, the floor that never replays history, the
 //! chunked hold, the wake straight to the watchers, the disarm when no run
 //! takes the steps, and the leak rule (no transcript text anywhere).
@@ -585,7 +585,7 @@ fn a_tap_with_no_run_to_take_it_disarms_and_rebinds_past_the_history() {
     assert_eq!(having(&got, " turn vref=v2 ").len(), 1, "{got:?}");
 }
 
-/// THE LEAK RULE (D5 decision B; ruling S6; plan §2.7): rows carrying
+/// THE LEAK RULE (D5 decision B; plan §2.7): rows carrying
 /// sentinels in a prompt, a reply's words, a tool's input, a tool's result,
 /// a limit notice and a local command's output, read through the footer's
 /// own path into a real timeline, leave none of them in any record at the
@@ -659,7 +659,7 @@ fn a_transcripts_text_never_reaches_the_log() {
     assert!(!bus.join("\n").contains("SENTINELTOOL"), "{bus:?}");
 }
 
-// ---- the codex-alab rollout tap (session log 5G-3; plan A1's 6D-3b) ------
+// ---- the codex-alab rollout tap ------
 
 /// A thread id in UUIDv7 form: created 2025-10-20T05:03:11Z, so its rollout
 /// sits in that UTC day's folder ([`rollout_rows`]).
@@ -668,7 +668,7 @@ const THREAD: &str = "019a0000-0000-7000-8000-00000000000a";
 /// The thread's rollout rows on `build`, stamped `ms` into the test: its
 /// `session_meta`, a turn (`turn-1`) with its call, its count and its end,
 /// and a turn (`turn-2`) the usage wall ends; every text a sentinel (never
-/// kept, ruling S6).
+/// kept).
 fn rollout_rows(build: &str) -> String {
     rollout_rows_as(THREAD, build, 0, "turn")
 }
@@ -843,8 +843,8 @@ fn alab_12521(_: u32) -> Option<String> {
     Some("0.164.0-dev.12521+g3d3eb12d8".to_string())
 }
 
-/// A CODEX-ALAB'S ROLLOUT ROW REACHES `log` on the rollout tap's own thread
-/// (session log 5G-3; plan A1's 6D-3b; ruling T15): a Codex run in front,
+/// A CODEX-ALAB'S ROLLOUT ROW REACHES `log` on the rollout tap's own thread:
+/// a Codex run in front,
 /// the thread its proven claim's copy names, its rollout on a measured
 /// build. Its turn opens and closes from the rollout (`src=transcript`,
 /// exact), its call opens and closes under it, its numbers are the

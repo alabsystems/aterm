@@ -35,7 +35,7 @@ mod wasm;
 mod webgl;
 
 pub use js::Flavor;
-/// What `ship provision` acquires for the `wasm-glue` check's oracle row: the
+/// What `verify provision --record` lays for the `wasm-glue` check's oracle row: the
 /// pinned CLI, into the machine-wide tooling the row reads.
 pub use oracle::{BINDGEN, BINDGEN_INSTALL, bindgen_root, reports_pin, tooling};
 

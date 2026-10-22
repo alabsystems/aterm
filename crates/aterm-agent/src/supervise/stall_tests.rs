@@ -1087,7 +1087,7 @@ fn tier1_the_real_remedy_signals_exactly_where_the_model_terms() {
     );
     // The real loop beside a self-claim whose record never rests (a TUI
     // frozen mid-turn) restarts it all the same: the mutant's wait is not
-    // the code's (the review of 2026-10-16, finding 2).
+    // the code's (the review of 2026-10-16).
     let (signals, ..) = beside_remedy_run(INPUT_STALLED_LONG, true, 600, true, false, |_| {});
     assert_eq!(signals, [RESTART], "beside, its record busy");
 }
@@ -1204,7 +1204,7 @@ fn beside_remedy_run(
 /// the agent cannot give itself, ON THE STALL ALONE, as for every agent: the
 /// agent's record is never read for an idle point (a TUI that stopped
 /// reading its input mid-turn keeps a record that says `busy` for ever; the
-/// review of 2026-10-16, finding 2), so a record naming no idle point is
+/// review of 2026-10-16), so a record naming no idle point is
 /// restarted too. NEGATIVE CONTROL: behind another supervisor's claim (`ERR
 /// busy supervisor=<holder>`) the same freeze gets none — that supervisor
 /// answers for the session.
@@ -1418,7 +1418,7 @@ fn beside_a_proven_self_claim_the_memory_restart_waits_for_the_records_idle_poin
 /// (on the stall alone) and the memory ceiling's (at the agent's record's
 /// rest) are asked of the server, which refuses them under the halt (`ERR
 /// halted`) — or under a driver's lease or turn (`restart unavailable:
-/// driver-lease|driver-turn`, the review of 2026-10-16, finding 4) —
+/// driver-lease|driver-turn`, the review of 2026-10-16) —
 /// UNCOUNTED: each is asked again at the next step and made once the hand
 /// lifts. NEGATIVE CONTROL: a refusal that never lifts (`restart
 /// unavailable: not-relaunchable`) is counted — one ask, never again.

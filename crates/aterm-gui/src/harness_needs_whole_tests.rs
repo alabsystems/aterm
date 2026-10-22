@@ -2,8 +2,8 @@
 // Copyright 2026 Andrew Yates
 
 //! EVERY NEED WHOLE (`docs/DESIGN-harness-autopilot-2026-10-15.md` §12.2.1,
-//! §12.2.3 item 4, §12.2.6; slice 2d): the window reads the worker's NEEDS
-//! YOU set its loop told it (slice 2c's store) wherever that set was told
+//! §12.2.3 item 4, §12.2.6): the window reads the worker's NEEDS
+//! YOU set its loop told it wherever that set was told
 //! with the needs entry that stands, and says every need whole where there is
 //! room — the menu bar's Needs you section, a row one level in for each
 //! further need, the tab's hover, a line each — through the one published

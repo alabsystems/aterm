@@ -410,7 +410,7 @@ impl CursorRainbow {
     /// inside its resting rim with no wakeups.
     #[must_use]
     #[inline]
-    pub fn is_active(&self) -> bool {
+    pub const fn is_active(&self) -> bool {
         // Fingerprint law: charged or mid-flare keeps the tick; a cooling block
         // keeps it only while its last two frames differed.
         self.energy > SETTLED_ENERGY
@@ -425,7 +425,7 @@ impl CursorRainbow {
     /// [`Self::next_change_deadline`]. Disjoint from [`Self::is_active`].
     #[must_use]
     #[inline]
-    pub fn settling(&self) -> bool {
+    pub const fn settling(&self) -> bool {
         !self.is_active() && self.paint > SETTLED_ENERGY
     }
 
@@ -1440,7 +1440,7 @@ fn spectrum_at(sweep: f32, off: f32) -> u32 {
 /// toward the peak by `1 − s`, then scaled by `v`. At `s = 1, v = 1` it is the identity, so a
 /// full-energy caret is exactly the ribbon's colour.
 #[inline]
-fn shade(rgb: u32, s: f32, v: f32) -> u32 {
+const fn shade(rgb: u32, s: f32, v: f32) -> u32 {
     if s == 1.0 && v == 1.0 {
         return rgb & 0x00FF_FFFF;
     }
@@ -1450,8 +1450,10 @@ fn shade(rgb: u32, s: f32, v: f32) -> u32 {
         (rgb & 0xff) as f32,
     );
     let hi = r.max(g).max(b);
-    let ch = |c: f32| (((hi - s * (hi - c)) * v) + 0.5).clamp(0.0, 255.0) as u32;
-    (ch(r) << 16) | (ch(g) << 8) | ch(b)
+    const fn ch(hi: f32, s: f32, v: f32, c: f32) -> u32 {
+        (((hi - s * (hi - c)) * v) + 0.5).clamp(0.0, 255.0) as u32
+    }
+    (ch(hi, s, v, r) << 16) | (ch(hi, s, v, g) << 8) | ch(hi, s, v, b)
 }
 
 /// How much of the energy range the caret's light floor takes to arrive. Short,

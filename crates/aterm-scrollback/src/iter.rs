@@ -21,7 +21,7 @@ pub(crate) type SegmentResult = Result<Vec<Line>, (ScrollbackError, usize)>;
 impl Scrollback {
     /// Iterate over all lines (oldest to newest).
     #[must_use]
-    pub fn iter(&self) -> ScrollbackIter<'_> {
+    pub const fn iter(&self) -> ScrollbackIter<'_> {
         ScrollbackIter {
             scrollback: self,
             idx: 0,
@@ -169,12 +169,12 @@ pub struct DenseScrollbackIter<'a> {
 impl DenseScrollbackIter<'_> {
     /// How many placeholders (unreadable lines) the walk has yielded so far.
     #[must_use]
-    pub fn placeholders(&self) -> usize {
+    pub const fn placeholders(&self) -> usize {
         self.placeholders
     }
 
     /// Yield one placeholder for the line at the cursor.
-    fn placeholder<'a>(&mut self) -> Option<Option<Cow<'a, Line>>> {
+    const fn placeholder<'a>(&mut self) -> Option<Option<Cow<'a, Line>>> {
         self.idx = self.idx.saturating_add(1);
         self.placeholders = self.placeholders.saturating_add(1);
         Some(None)
@@ -266,7 +266,7 @@ impl ScrollbackIter<'_> {
     /// yielded fewer items than `line_count()`.
     #[must_use]
     #[cfg(test)]
-    pub fn skipped_lines(&self) -> usize {
+    pub const fn skipped_lines(&self) -> usize {
         self.skipped_lines
     }
 }

@@ -6173,6 +6173,16 @@ pub mod fixtures {
     /// The mounted-drive breaker, `rm -rf /Volumes/zz-lab-none`.
     pub const BOX_RM_MOUNTED_DRIVE_2_1_308: &str =
         include_str!("fixtures/claude-2.1.308-box-bash-rm-mounted-drive.txt");
+    /// MEASURED 2026-10-22 (the lab, 144x50, `--permission-mode default`;
+    /// `docs/measured/breaker-transcript-and-zsh-2026-10-22.md`, breaker-4):
+    /// a `find` continued over four barred rows, a `\` ending each of the
+    /// first three, under the note `This command requires approval`.
+    pub const BOX_BASH_FIND_CONTINUED_2_1_308: &str =
+        include_str!("fixtures/claude-2.1.308-box-bash-find-continued.txt");
+    /// The same lab: an `awk` program over four barred rows, its newlines
+    /// inside the quotes and no `\`, under the same note.
+    pub const BOX_BASH_AWK_MULTI_LINE_2_1_308: &str =
+        include_str!("fixtures/claude-2.1.308-box-bash-awk-multi-line.txt");
     /// The nested breaker over `X=1 if true; then echo` and 17 `${ echo a; }`
     /// (no rm), measured 2026-10-22 in the review round's lab.
     pub const BOX_RM_NESTED_2_1_308: &str =

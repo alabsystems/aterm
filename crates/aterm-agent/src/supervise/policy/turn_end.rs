@@ -595,8 +595,8 @@ pub const LAND_STATUS: &[&str] = &[
     "without being merged",
     "without being applied",
     "without applying",
-    // A landing that did not reach the remote (the integration review of
-    // 12449ff581): main moved before the push, a dry run, a change staged.
+    // A landing that did not reach the remote:
+    // main moved before the push, a dry run, a change staged.
     "moved again before",
     "moved before i pushed",
     "moved before i could",
@@ -2153,8 +2153,8 @@ pub(crate) static LAND_FAMILIES: [LandFamily; 68] = [
         Reads::Beside(CHECK_NOUNS),
         CHECKS,
     ),
-    // A CHECK RUN AGAIN UNTIL IT PASSED (the integration review of
-    // 12449ff581): AGENTS.md's checks never retry and a flaky test is
+    // A CHECK RUN AGAIN UNTIL IT PASSED:
+    // AGENTS.md's checks never retry and a flaky test is
     // deleted, so a pass on a rerun is a flake still to fix, however the
     // report words it.
     LandFamily::new(
@@ -2213,7 +2213,7 @@ pub(crate) static LAND_FAMILIES: [LandFamily; 68] = [
         &[],
     )
     .saying("a rerun"),
-    // A STATUS SAID AS A LABEL'S ITEM (the integration review of 12449ff581):
+    // A STATUS SAID AS A LABEL'S ITEM:
     // a check's skip, a later day, a part, set as a list's or a table's item
     // with no sentence around it.
     LandFamily::new(
@@ -12015,8 +12015,7 @@ pub struct TurnEndReading {
     /// bounds no message ([`aterm_phase::ScreenReader::bounds_messages`]
     /// `false`, agy alone): every other reader's words begin at the worker's
     /// own mark under the message, never on its rows, and a first line of the
-    /// worker's own that repeats the act's last words is its own (the review
-    /// of 3a4586a01e, T3).
+    /// worker's own that repeats the act's last words is its own.
     pub opens_cut: bool,
     /// THE WORKER'S OTHER WORDS IN THE SAME TURN: the messages before its
     /// last one, on the rows read, by the program's reader

@@ -133,7 +133,7 @@ pub const fn phase(t_ms: i64, d_ms: u32) -> NovaPhase {
 /// The Dip's ink envelope multiplier at `t`: `1 − 0.35·smoothstep(p)` inside
 /// the dip window, `1.0` outside (rides the ink channel, no quads).
 #[inline]
-pub fn dip_envelope(t_ms: u64) -> f32 {
+pub const fn dip_envelope(t_ms: u64) -> f32 {
     if t_ms >= DIP_MS {
         return 1.0;
     }
@@ -248,7 +248,7 @@ impl QuadSink<'_> {
 /// `1 − (1 − q)²` — the shockwave's ease-out radius curve (invertible, which
 /// §6.5's analytic crossing time relies on).
 #[inline]
-fn ease_out(q: f32) -> f32 {
+const fn ease_out(q: f32) -> f32 {
     let u = 1.0 - q.clamp(0.0, 1.0);
     1.0 - u * u
 }
@@ -256,8 +256,8 @@ fn ease_out(q: f32) -> f32 {
 /// Ring radius + fade envelope at `t`, or `None` outside the ring window.
 /// Singularity time-reverses the radius (contracts from `r_max` to 0).
 #[inline]
-pub fn ring_radius(t_ms: u64, r_max: f32, singularity: bool) -> Option<(f32, f32)> {
-    if !(FLASH_END_MS..RING_END_MS).contains(&t_ms) {
+pub const fn ring_radius(t_ms: u64, r_max: f32, singularity: bool) -> Option<(f32, f32)> {
+    if t_ms < FLASH_END_MS || t_ms >= RING_END_MS {
         return None;
     }
     let q = (t_ms - FLASH_END_MS) as f32 / (RING_END_MS - FLASH_END_MS) as f32;
@@ -709,7 +709,7 @@ pub fn crossing_ms(dist: f32, r_max: f32, singularity: bool) -> Option<u64> {
 /// The ~150 ms smoothstep in/out pulse envelope at `t` for a crossing at
 /// `cross_ms`; `None` outside the window.
 #[inline]
-pub fn pulse_env(t_ms: u64, cross_ms: u64) -> Option<f32> {
+pub const fn pulse_env(t_ms: u64, cross_ms: u64) -> Option<f32> {
     if t_ms < cross_ms || t_ms >= cross_ms + PULSE_MS {
         return None;
     }
@@ -767,14 +767,16 @@ pub fn pulse_color(anchor: u32, fringe: u32, amp: f32) -> u32 {
 /// §6.1 ember ink anchors: the settled gradient shifted to the palette's ember
 /// tone; the Singularity ends in a dim violet ember instead.
 #[inline]
-pub fn ember_pair(pair: (u32, u32), magic: Option<NovaMagic>) -> (u32, u32) {
-    if magic == Some(NovaMagic::Singularity) {
+pub const fn ember_pair(pair: (u32, u32), magic: Option<NovaMagic>) -> (u32, u32) {
+    if matches!(magic, Some(NovaMagic::Singularity)) {
         return (0x002A_2040, 0x005A_48A8); // dim violet
     }
-    let dim = |c: u32, f: f32| {
-        let m = |sh: u32| ((((c >> sh) & 0xff) as f32) * f) as u32;
-        (m(16) << 16) | (m(8) << 8) | m(0)
-    };
+    const fn dim(c: u32, f: f32) -> u32 {
+        const fn m(c: u32, f: f32, sh: u32) -> u32 {
+            ((((c >> sh) & 0xff) as f32) * f) as u32
+        }
+        (m(c, f, 16) << 16) | (m(c, f, 8) << 8) | m(c, f, 0)
+    }
     (dim(pair.0, 0.8), dim(pair.1, 0.55))
 }
 

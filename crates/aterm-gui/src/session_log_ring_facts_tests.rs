@@ -1,13 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE LOG HOLDS EVERY FACT THE RING HOLDS (session log phase 6, 6F-5 to
+//! THE LOG HOLDS EVERY FACT THE RING HOLDS (6F-5 to
 //! 6F-7): each ring row's writer writes, in the row's own hold, a mark (or a
 //! record's fields) the row's whole payload reads from. Here: each new
 //! writer's mark wakes a parked `await log` (a one-minute hang detector),
 //! and what is content tier (a topic's name, a reason, a closer, a reply)
 //! is in RAM and in no record that leaves it — the journal, the carry, a
-//! bus body, `brief`, or `log` below `tier=content` (rulings U11-U13). The
+//! bus body, `brief`, or `log` below `tier=content`. The
 //! row-for-record equalities are `session_log_overlap_tests`'.
 
 use std::sync::Arc;
@@ -158,7 +158,7 @@ fn each_ring_only_fact_wakes_a_parked_await_log() {
     });
 }
 
-/// T14, AMENDED (ruling U11): A TOPIC IS A FINGERPRINT WHEREVER ITS RECORD
+/// T14, AMENDED: A TOPIC IS A FINGERPRINT WHEREVER ITS RECORD
 /// LEAVES RAM. A planted topic name and its `since=` token are on the
 /// `topic` mark at the content tier (beside the name's `fp=`), and in no
 /// journal frame, no carry line, no bus body, no `brief` and no `log` line
@@ -214,7 +214,7 @@ fn a_topic_is_a_fingerprint_wherever_its_record_leaves_ram() {
     }
 }
 
-/// A HOLD'S REASON IS RAM ONLY (6F-6; ruling U12): the owner's planted
+/// A HOLD'S REASON IS RAM ONLY: the owner's planted
 /// reason is the `hold` mark's at the content tier, beside the row's
 /// `origin=` and `hold_origin=` below it, and in no journal frame, no carry
 /// line, no bus body, no `brief` and no `log` line below `tier=content`.
@@ -253,8 +253,8 @@ fn a_hold_reason_is_never_journaled_carried_or_published() {
     }
 }
 
-/// A SESSION'S CLOSER AND A KEYED WRITE'S REPLY ARE CONTENT TIER (6F-7;
-/// ruling U12): the raw actor that closed a session (a name no one minted,
+/// A SESSION'S CLOSER AND A KEYED WRITE'S REPLY ARE CONTENT TIER:
+/// the raw actor that closed a session (a name no one minted,
 /// so the close's `by=` says `-`, 3A's R1) is the session close's
 /// `closer=`, and the first two words of a keyed write's reply the
 /// `in-doubt` mark's `reply=`, each at the content tier beside the fields

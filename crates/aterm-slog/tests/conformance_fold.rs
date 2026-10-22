@@ -16,8 +16,8 @@
 //! second [`Fold`] is fed the log's window as it grows and, now and then, a
 //! record it already applied (`Replay`); the projection is that fold's
 //! state, and `dup` is whether it differs from the log's own fold, which
-//! never sees a replay. The ghosts (`gw`/`gc`, `sg`) are what rulings S9 and
-//! A5 say the outcome and the need's rank must be, tracked from the records
+//! never sees a replay. The ghosts (`gw`/`gc`, `sg`) are what
+//! the outcome and the need's rank must be, tracked from the records
 //! written. After every step the real state is projected onto the model and
 //! the step must be the model's.
 //!

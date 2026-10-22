@@ -831,7 +831,7 @@ impl Cell {
     /// witness does not read it. The one "is this cell live" predicate.
     #[inline]
     #[must_use]
-    pub fn leaving(&self) -> bool {
+    pub const fn leaving(&self) -> bool {
         self.retract_at.is_some() || self.retire_at.is_some()
     }
 }
@@ -1060,7 +1060,7 @@ impl Cohort {
     /// three reach beats.
     #[inline]
     #[must_use]
-    pub fn retract_start(&self) -> f32 {
+    pub const fn retract_start(&self) -> f32 {
         if self.flow.is_some() {
             0.0
         } else {
@@ -1073,7 +1073,7 @@ impl Cohort {
     /// ([`Ribbon::env_of`], [`Cohort::flow_drain`]).
     #[inline]
     #[must_use]
-    pub fn retract_span(&self) -> f32 {
+    pub const fn retract_span(&self) -> f32 {
         if self.flow.is_some() {
             FLOW_LEAD_S
         } else {
@@ -1087,7 +1087,7 @@ impl Cohort {
     /// ([`Ribbon::retract_x`]) and the settle ([`Ribbon::sample`]).
     #[inline]
     #[must_use]
-    pub fn flow_progress(&self, idle: f32) -> f32 {
+    pub const fn flow_progress(&self, idle: f32) -> f32 {
         1.0 - spend(clamp01(idle / FLOW_TOTAL_S))
     }
 
@@ -1099,7 +1099,7 @@ impl Cohort {
     /// floor ([`ember_level`]).
     #[inline]
     #[must_use]
-    pub fn flow_drain(&self, col: u16, idle: f32) -> f32 {
+    pub const fn flow_drain(&self, col: u16, idle: f32) -> f32 {
         let s = FLOW_LEAD_S * (1.0 - self.drain_rank(col));
         spend(clamp01((idle - s) / (FLOW_TOTAL_S - s)))
     }
@@ -1107,7 +1107,7 @@ impl Cohort {
     /// The idle at which this cohort's swoosh — or its fold flow — is over.
     #[inline]
     #[must_use]
-    pub fn swoosh_total(&self) -> f32 {
+    pub const fn swoosh_total(&self) -> f32 {
         if self.flow.is_some() {
             FLOW_TOTAL_S
         } else {
@@ -1121,7 +1121,7 @@ impl Cohort {
     /// instant until [`FLOW_TOTAL_S`] and then over.
     #[inline]
     #[must_use]
-    pub fn phase_at(&self, idle_s: f32) -> Option<Phase> {
+    pub const fn phase_at(&self, idle_s: f32) -> Option<Phase> {
         if self.flow.is_none() {
             return Phase::at(idle_s, self.grace_s);
         }
@@ -1157,12 +1157,12 @@ impl Cohort {
     /// so the order cannot flip mid-drain.
     #[inline]
     #[must_use]
-    pub fn drain_rank(&self, col: u16) -> f32 {
-        let span = f32::from(self.col1.saturating_sub(self.col0)).max(1.0);
+    pub const fn drain_rank(&self, col: u16) -> f32 {
+        let span = (self.col1.saturating_sub(self.col0) as f32).max(1.0);
         if self.drain_right_first {
-            f32::from(col.saturating_sub(self.col0)) / span
+            col.saturating_sub(self.col0) as f32 / span
         } else {
-            f32::from(self.col1.saturating_sub(1).saturating_sub(col)) / span
+            self.col1.saturating_sub(1).saturating_sub(col) as f32 / span
         }
     }
 
@@ -1171,8 +1171,8 @@ impl Cohort {
     /// Exact: every term is an integer.
     #[inline]
     #[must_use]
-    pub fn walk_d(&self, col: u16) -> f32 {
-        self.d0 + (f32::from(col) - f32::from(self.anchor_col))
+    pub const fn walk_d(&self, col: u16) -> f32 {
+        self.d0 + (col as f32 - self.anchor_col as f32)
     }
 
     /// The walk's zero: the `t` the walk has at distance `0`,
@@ -1183,7 +1183,7 @@ impl Cohort {
     /// continues (exactly on a cold walk, to the ulp otherwise).
     #[inline]
     #[must_use]
-    pub fn walk_zero(&self) -> f32 {
+    pub const fn walk_zero(&self) -> f32 {
         self.t0 - walk_t(self.d0)
     }
 
@@ -1196,7 +1196,7 @@ impl Cohort {
     /// bit for bit.
     #[inline]
     #[must_use]
-    pub fn t_at(&self, col: u16) -> f32 {
+    pub const fn t_at(&self, col: u16) -> f32 {
         self.walk_zero() + walk_t(self.walk_d(col))
     }
 
@@ -1208,7 +1208,7 @@ impl Cohort {
     /// ([`WalkPos::restarted`]).
     #[inline]
     #[must_use]
-    fn walk_at(&self, col: u16) -> WalkPos {
+    const fn walk_at(&self, col: u16) -> WalkPos {
         WalkPos {
             t: self.t_at(col),
             d: self.walk_d(col),
@@ -1219,7 +1219,7 @@ impl Cohort {
     /// was minted on.
     #[inline]
     #[must_use]
-    fn origin_walk(&self) -> WalkPos {
+    const fn origin_walk(&self) -> WalkPos {
         WalkPos {
             t: self.t0,
             d: self.d0,
@@ -1277,7 +1277,7 @@ impl Phase {
     /// finished and the cohort is over.
     #[inline]
     #[must_use]
-    pub fn at(idle_s: f32, grace_s: f32) -> Option<Self> {
+    pub const fn at(idle_s: f32, grace_s: f32) -> Option<Self> {
         let grace = if grace_s.is_finite() {
             grace_s.max(PHRASE_REST_MIN_S)
         } else {
@@ -1306,7 +1306,7 @@ impl Phase {
     /// True once the swoosh owns the mark and the retract is moving it.
     #[inline]
     #[must_use]
-    pub fn is_retracting(self) -> bool {
+    pub const fn is_retracting(self) -> bool {
         matches!(self, Self::Retracting | Self::Fading)
     }
 }
@@ -1355,8 +1355,8 @@ impl Band {
     /// stardust never has to re-derive the inequality.
     #[must_use]
     #[cfg(test)]
-    pub fn contains(&self, y: f32) -> bool {
-        (self.top..=self.bottom).contains(&y)
+    pub const fn contains(&self, y: f32) -> bool {
+        self.top <= y && y <= self.bottom
     }
 }
 
@@ -1442,7 +1442,7 @@ impl FieldIndex {
     /// lookup).
     #[must_use]
     #[cfg(test)]
-    pub fn live_rows(&self) -> usize {
+    pub const fn live_rows(&self) -> usize {
         self.lanes.len()
     }
 
@@ -1915,7 +1915,7 @@ pub fn rail_ink(rgb: u32) -> u32 {
 /// up to the rail's ceiling. `pub(crate)` because `InkRole` is.
 #[inline]
 #[must_use]
-pub(crate) fn light_role(cfg: &Config) -> InkRole {
+pub(crate) const fn light_role(cfg: &Config) -> InkRole {
     if cfg.ribbon_tall {
         InkRole::OverText
     } else {
@@ -1929,7 +1929,7 @@ pub(crate) fn light_role(cfg: &Config) -> InkRole {
 /// same cell against the same ceiling.
 #[inline]
 #[must_use]
-fn cov_cap(cfg: &Config) -> f32 {
+const fn cov_cap(cfg: &Config) -> f32 {
     if cfg.dark_theme {
         UNDER_COV_CAP
     } else {
@@ -2129,14 +2129,19 @@ pub fn walk_arc(t: f32) -> f32 {
 /// edges fixed.
 #[inline]
 #[must_use]
-pub fn walk_pace(x: f32) -> f32 {
+pub const fn walk_pace(x: f32) -> f32 {
     let x = clamp01(x);
     if x <= CROSS_ARC0 || x >= CROSS_ARC1 {
         return x;
     }
     let f = (x - CROSS_ARC0) / (CROSS_ARC1 - CROSS_ARC0) * (CROSS_PACE_KNOTS - 1) as f32;
-    let i = (f as usize).min(CROSS_PACE_KNOTS - 2);
-    let (a, b) = (f32::from(CROSS_PACE[i]), f32::from(CROSS_PACE[i + 1]));
+    let u = f as usize;
+    let i = if u < CROSS_PACE_KNOTS - 2 {
+        u
+    } else {
+        CROSS_PACE_KNOTS - 2
+    };
+    let (a, b) = (CROSS_PACE[i] as f32, CROSS_PACE[i + 1] as f32);
     (a + (b - a) * (f - i as f32)) / 65535.0
 }
 
@@ -2148,7 +2153,7 @@ pub fn walk_pace(x: f32) -> f32 {
 /// Below zero it is the fast line continued; the only knee is at 16.
 #[inline]
 #[must_use]
-pub fn walk_t(d: f32) -> f32 {
+pub const fn walk_t(d: f32) -> f32 {
     if !d.is_finite() {
         return 0.0;
     }
@@ -2182,7 +2187,7 @@ pub fn expiry_melt(u: f32) -> f32 {
 /// frame. Non-increasing in `f`; a floor above the cell's coverage holds what it has.
 #[inline]
 #[must_use]
-pub fn ember_level(floor: f32, f: f32) -> f32 {
+pub const fn ember_level(floor: f32, f: f32) -> f32 {
     let floor = floor.max(0.0);
     clamp01(floor + (1.0 - floor) * clamp01(f))
 }
@@ -2193,7 +2198,7 @@ pub fn ember_level(floor: f32, f: f32) -> f32 {
 /// has left; `1.0` until the window opens, exactly `0.0` at the end.
 #[inline]
 #[must_use]
-pub fn reduced_fade(remaining_s: f32) -> f32 {
+pub const fn reduced_fade(remaining_s: f32) -> f32 {
     clamp01(remaining_s / (REDUCED_MOTION_FADE_MS / 1000.0))
 }
 
@@ -2634,8 +2639,8 @@ pub struct Revive {
 impl Revive {
     /// Whether `(row, col)` is a column this re-lay lays.
     #[inline]
-    fn covers(&self, row: u16, col: u16) -> bool {
-        row == self.row && (self.col0..self.col1).contains(&col)
+    const fn covers(&self, row: u16, col: u16) -> bool {
+        row == self.row && self.col0 <= col && col < self.col1
     }
 }
 
@@ -2657,7 +2662,7 @@ impl RunOrigin {
     /// `coh`'s walk.
     #[inline]
     #[must_use]
-    pub fn of(coh: &Cohort) -> Self {
+    pub const fn of(coh: &Cohort) -> Self {
         Self {
             anchor_col: coh.anchor_col,
             t0: coh.t0,
@@ -2667,7 +2672,7 @@ impl RunOrigin {
 
     /// The pair a cohort is minted on at [`RunOrigin::anchor_col`].
     #[inline]
-    fn walk(self) -> WalkPos {
+    const fn walk(self) -> WalkPos {
         WalkPos {
             t: self.t0,
             d: self.d0,
@@ -2771,23 +2776,33 @@ impl Ribbon {
     /// park clock distinguishes its queued move from any other exact pair
     /// already buffered on that frame.
     #[inline]
-    pub(crate) fn prove_short_reanchor(&mut self, from: (u16, u16), to: (u16, u16), at: Instant) {
-        debug_assert!(from.0 == to.0 && (1..=2).contains(&from.1.saturating_sub(to.1)));
+    pub(crate) const fn prove_short_reanchor(
+        &mut self,
+        from: (u16, u16),
+        to: (u16, u16),
+        at: Instant,
+    ) {
+        debug_assert!(
+            from.0 == to.0 && {
+                let d = from.1.saturating_sub(to.1);
+                d >= 1 && d <= 2
+            }
+        );
         self.short_reanchor = Some(ShortReanchorProof { from, to, at });
     }
 
     /// The live cells, in pool (append) order. Read-only.
     #[inline]
     #[must_use]
-    pub fn cells(&self) -> &[Cell] {
-        &self.cells
+    pub const fn cells(&self) -> &[Cell] {
+        self.cells.as_slice()
     }
 
     /// The live cohorts. Read-only.
     #[inline]
     #[must_use]
-    pub fn cohorts(&self) -> &[Cohort] {
-        &self.cohorts
+    pub const fn cohorts(&self) -> &[Cohort] {
+        self.cohorts.as_slice()
     }
 
     /// The instant `cell`'s expiry is measured from — see [`live_since`].
@@ -2830,8 +2845,8 @@ impl Ribbon {
     /// Read-only.
     #[inline]
     #[must_use]
-    pub fn plan_segments(&self) -> &[Segment] {
-        &self.plan
+    pub const fn plan_segments(&self) -> &[Segment] {
+        self.plan.as_slice()
     }
 
     /// The frame's vertex density: how many [`Ribbon::plan_segments`] each
@@ -2842,14 +2857,20 @@ impl Ribbon {
     /// run's tail ([`Ribbon::emit`]). Valid after [`Ribbon::plan`].
     #[inline]
     #[must_use]
-    pub fn slabs_per_cell(&self) -> usize {
-        self.slabs.clamp(1, SLABS_PER_CELL)
+    pub const fn slabs_per_cell(&self) -> usize {
+        if self.slabs < 1 {
+            1
+        } else if self.slabs > SLABS_PER_CELL {
+            SLABS_PER_CELL
+        } else {
+            self.slabs
+        }
     }
 
     /// The caret cell as last observed, or `None` before any.
     #[must_use]
     #[cfg(test)]
-    pub fn caret(&self) -> Option<(u16, u16)> {
+    pub const fn caret(&self) -> Option<(u16, u16)> {
         self.caret
     }
 
@@ -2859,7 +2880,7 @@ impl Ribbon {
     /// spellings differ only above the spine.
     #[inline]
     #[must_use]
-    pub fn body_profile(cfg: &Config) -> BodyProfile {
+    pub const fn body_profile(cfg: &Config) -> BodyProfile {
         let dn_ch = if Self::comet(cfg) {
             COMET_DN_HAND_CH
         } else {
@@ -2887,7 +2908,7 @@ impl Ribbon {
     /// ([`Config::ribbon_flat`]) restores the flat body byte for byte.
     #[inline]
     #[must_use]
-    pub fn comet(cfg: &Config) -> bool {
+    pub const fn comet(cfg: &Config) -> bool {
         !cfg.ribbon_flat
     }
 
@@ -2896,7 +2917,7 @@ impl Ribbon {
     /// ceiling (L6) and keeps the bed alone below the baseline.
     #[inline]
     #[must_use]
-    pub fn rail_lit(cfg: &Config) -> bool {
+    pub const fn rail_lit(cfg: &Config) -> bool {
         Self::comet(cfg) && cfg.dark_theme
     }
 
@@ -3223,20 +3244,20 @@ impl Ribbon {
     /// Arm the seam on `row` at `at` ([`Ribbon::seam`]): the input continued onto that row. A
     /// newer continuation replaces it.
     #[inline]
-    pub fn arm_seam(&mut self, row: u16, at: Instant) {
+    pub const fn arm_seam(&mut self, row: u16, at: Instant) {
         self.seam = Some(Seam { row, at });
     }
 
     /// The focused pane's `(first column, width)`; `None` is the whole grid.
     #[inline]
-    pub fn set_pane(&mut self, pane: Option<(u16, u16)>) {
+    pub const fn set_pane(&mut self, pane: Option<(u16, u16)>) {
         self.pane = pane;
     }
 
     /// The focused pane's `(first row, rows)`; `None` is the whole grid.
     /// See [`Ribbon::pane_rows`] for why the band needs it.
     #[inline]
-    pub fn set_pane_rows(&mut self, pane_rows: Option<(u16, u16)>) {
+    pub const fn set_pane_rows(&mut self, pane_rows: Option<(u16, u16)>) {
         self.pane_rows = pane_rows;
     }
 
@@ -3245,12 +3266,12 @@ impl Ribbon {
     /// Every "is there leading below this row?" question asks this, not
     /// [`Geom::fx_bot`] ([`Ribbon::pane_rows`]).
     #[inline]
-    fn pane_bot(&self, ctx: &Ctx<'_>, chf: f32) -> f32 {
+    const fn pane_bot(&self, ctx: &Ctx<'_>, chf: f32) -> f32 {
         let grid = ctx.geom.fx_bot() as f32;
         match self.pane_rows {
-            Some((row0, rows)) => (f32::from(ctx.geom.origin_y)
-                + f32::from(row0.saturating_add(rows)) * chf)
-                .min(grid),
+            Some((row0, rows)) => {
+                (ctx.geom.origin_y as f32 + row0.saturating_add(rows) as f32 * chf).min(grid)
+            }
             None => grid,
         }
     }
@@ -3319,7 +3340,7 @@ impl Ribbon {
     /// and the twins' witness.
     #[inline]
     #[must_use]
-    pub fn curtained(&self) -> bool {
+    pub const fn curtained(&self) -> bool {
         self.curtain.is_some()
     }
 
@@ -3339,7 +3360,7 @@ impl Ribbon {
     /// The open phrase's id — read-only, for the twins.
     #[must_use]
     #[cfg(test)]
-    pub fn phrase_open(&self) -> Option<u32> {
+    pub const fn phrase_open(&self) -> Option<u32> {
         self.phrase_open
     }
 
@@ -3369,9 +3390,14 @@ impl Ribbon {
 
     /// Mint the next phrase and open it.
     #[inline]
-    fn open_phrase(&mut self) {
-        let id = self.next_phrase.max(1);
-        self.next_phrase = id.wrapping_add(1).max(1);
+    const fn open_phrase(&mut self) {
+        let id = if self.next_phrase > 1 {
+            self.next_phrase
+        } else {
+            1
+        };
+        let next = id.wrapping_add(1);
+        self.next_phrase = if next > 1 { next } else { 1 };
         self.phrase_open = Some(id);
     }
 
@@ -3379,11 +3405,14 @@ impl Ribbon {
     /// typed echo arrives with none open (a ledger-bridged sweep after a
     /// Return, say): a typed cell always has a phrase.
     #[inline]
-    fn phrase_for_lay(&mut self) -> u32 {
+    const fn phrase_for_lay(&mut self) -> u32 {
         if self.phrase_open.is_none() {
             self.open_phrase();
         }
-        self.phrase_open.unwrap_or(1)
+        match self.phrase_open {
+            Some(id) => id,
+            None => 1,
+        }
     }
 
     /// The hand is on the phrase under it (an erase or a kill): every un-abandoned cohort of
@@ -3474,7 +3503,7 @@ impl Ribbon {
     /// below), so a row never drains toward another row's column. Returned with
     /// the drain order ([`Cohort::drain_right_first`]).
     #[inline]
-    fn retract_target(&self, coh: &Cohort) -> (Option<u16>, bool) {
+    const fn retract_target(&self, coh: &Cohort) -> (Option<u16>, bool) {
         Self::target_toward(coh, self.caret)
     }
 
@@ -3522,12 +3551,13 @@ impl Ribbon {
     /// ([`Ribbon::curtain_hand`]) instead of against a caret the seam has
     /// already moved.
     #[inline]
-    fn target_toward(coh: &Cohort, hand: Option<(u16, u16)>) -> (Option<u16>, bool) {
+    const fn target_toward(coh: &Cohort, hand: Option<(u16, u16)>) -> (Option<u16>, bool) {
         match hand {
             None => (None, false),
             Some((hrow, hcol)) if coh.row == hrow => (Some(hcol), false),
             Some((hrow, _)) if coh.row < hrow => {
-                (Some(coh.col1.saturating_sub(1).max(coh.col0)), false)
+                let sub = coh.col1.saturating_sub(1);
+                (Some(if sub > coh.col0 { sub } else { coh.col0 }), false)
             }
             Some(_) => (Some(coh.col0), true),
         }
@@ -3687,11 +3717,11 @@ impl Ribbon {
     /// edge match the run it rejoins. Live-spine consumers (wave, wedge,
     /// caret, stars) keep reading [`Ctx::disp`].
     #[inline]
-    fn birth_price(ctx: &Ctx<'_>) -> f32 {
-        clamp01(
-            ctx.mend
-                .map_or(ctx.birth_disp, |m| ctx.birth_disp.max(m.disp)),
-        )
+    const fn birth_price(ctx: &Ctx<'_>) -> f32 {
+        clamp01(match ctx.mend {
+            Some(m) => ctx.birth_disp.max(m.disp),
+            None => ctx.birth_disp,
+        })
     }
 
     /// The life one cell earns, priced at birth (§4's chain law, verbatim)
@@ -3732,7 +3762,7 @@ impl Ribbon {
     /// repaint's home can be sampled anywhere along the row it writes.
     #[inline]
     #[must_use]
-    fn hand_changed_row(from: (u16, u16), to: (u16, u16)) -> bool {
+    const fn hand_changed_row(from: (u16, u16), to: (u16, u16)) -> bool {
         if to.0 == from.0.saturating_add(1) {
             return true;
         }
@@ -3816,9 +3846,12 @@ impl Ribbon {
     /// column and width, or the grid's when no pane is set. Read by [`Ribbon::fold_top_row`].
     #[inline]
     #[must_use]
-    fn fold_pane(&self, cols: u16) -> (i32, i32) {
-        let (c0, w) = self.pane.unwrap_or((0, cols));
-        (i32::from(c0), i32::from(w).max(1))
+    const fn fold_pane(&self, cols: u16) -> (i32, i32) {
+        let (c0, w) = match self.pane {
+            Some(p) => p,
+            None => (0, cols),
+        };
+        (c0 as i32, if w > 1 { w as i32 } else { 1 })
     }
 
     /// The topmost row [`Ribbon::lay`] would write on for this landing:
@@ -3829,10 +3862,11 @@ impl Ribbon {
     /// of the grid, as `lay`'s `r < 0` arm expects.
     #[inline]
     #[must_use]
-    fn fold_top_row(&self, caret: (u16, u16), cells: u16, cols: u16) -> i32 {
+    const fn fold_top_row(&self, caret: (u16, u16), cells: u16, cols: u16) -> i32 {
         let (pane_col0, pane_cols) = self.fold_pane(cols);
-        let left = i32::from(caret.1) - i32::from(cells) - pane_col0;
-        i32::from(caret.0) + left.div_euclid(pane_cols).min(0)
+        let left = caret.1 as i32 - cells as i32 - pane_col0;
+        let d = left.div_euclid(pane_cols);
+        caret.0 as i32 + if d < 0 { d } else { 0 }
     }
 
     /// The hand's own fold: an echoed move exactly one row down — a wrap, or
@@ -3840,7 +3874,7 @@ impl Ribbon {
     /// non-abandoning shape.
     #[inline]
     #[must_use]
-    fn folded_down(from: (u16, u16), to: (u16, u16), licence: Licence) -> bool {
+    const fn folded_down(from: (u16, u16), to: (u16, u16), licence: Licence) -> bool {
         licence.is_echo() && to.0 == from.0.saturating_add(1)
     }
 
@@ -4227,8 +4261,11 @@ impl Ribbon {
     /// what the seam reads the glass for (`CursorGlow::carried_word_left`).
     #[inline]
     #[must_use]
-    pub(super) fn carry(&self) -> Option<SoftWrap> {
-        self.carry.map(|(sw, _)| sw)
+    pub(super) const fn carry(&self) -> Option<SoftWrap> {
+        match self.carry {
+            Some((sw, _)) => Some(sw),
+            None => None,
+        }
     }
 
     /// The lifted word goes up with its text: a Space typed after `already` in
@@ -4610,9 +4647,9 @@ impl Ribbon {
     /// are only places the hand acted (a typed glyph, a relocation it made,
     /// the caret an erase was replayed against), never program output.
     #[inline]
-    fn touch_hand(&mut self, row: u16, col: u16) {
+    const fn touch_hand(&mut self, row: u16, col: u16) {
         self.hand_floor = Some(match self.hand_floor {
-            Some((r, c)) if r == row => (row, c.min(col)),
+            Some((r, c)) if r == row => (row, if c < col { c } else { col }),
             _ => (row, col),
         });
     }
@@ -4620,8 +4657,11 @@ impl Ribbon {
     /// The leftmost column the reach may take on `row`, or `None` when the
     /// hand has not been seen there — an unknown floor bounds nothing.
     #[inline]
-    fn hand_floor_on(&self, row: u16) -> Option<u16> {
-        self.hand_floor.and_then(|(r, c)| (r == row).then_some(c))
+    const fn hand_floor_on(&self, row: u16) -> Option<u16> {
+        match self.hand_floor {
+            Some((r, c)) if r == row => Some(c),
+            _ => None,
+        }
     }
 
     /// The hand's floor ([`Ribbon::hand_floor`]) as `(row, col)`, or `None` when no row has
@@ -4629,7 +4669,7 @@ impl Ribbon {
     /// under the reach's law: nothing the hand did not put there goes left of where the hand
     /// has been on that row.
     #[inline]
-    pub(super) fn hand_floor_cell(&self) -> Option<(u16, u16)> {
+    pub(super) const fn hand_floor_cell(&self) -> Option<(u16, u16)> {
         self.hand_floor
     }
 
@@ -5040,8 +5080,8 @@ impl Ribbon {
     /// reports) composites to something the glass census reads as lit:
     /// [`STATUS_LIT_COV`] of [`UNDER_COV_CAP`].
     #[inline]
-    fn reads_as_glass_light(share: f32) -> bool {
-        UNDER_COV_CAP * share >= f32::from(STATUS_LIT_COV)
+    const fn reads_as_glass_light(share: f32) -> bool {
+        UNDER_COV_CAP * share >= STATUS_LIT_COV as f32
     }
 
     /// One live wake cohort per row (v3 §2.7, K4). A jump whose corridor
@@ -7207,7 +7247,7 @@ impl Ribbon {
     /// glass — `trail status`'s `ribbon_drawn=`. See [`Ribbon::ink_quads`].
     #[inline]
     #[must_use]
-    pub fn ink_quad_count(&self) -> usize {
+    pub const fn ink_quad_count(&self) -> usize {
         self.ink_quads
     }
 
@@ -7219,7 +7259,7 @@ impl Ribbon {
     /// hairline.
     #[inline]
     #[must_use]
-    pub fn hot_edge_gain(cfg: &Config, disp: f32, typed: bool) -> f32 {
+    pub const fn hot_edge_gain(cfg: &Config, disp: f32, typed: bool) -> f32 {
         if !cfg.dark_theme || cfg.reduced_motion {
             return 0.0;
         }
@@ -7410,7 +7450,7 @@ impl Ribbon {
     /// Live cells — `Status::cells` and one term of the idle test.
     #[inline]
     #[must_use]
-    pub fn live_cells(&self) -> usize {
+    pub const fn live_cells(&self) -> usize {
         self.cells.len()
     }
 
@@ -7459,7 +7499,7 @@ impl Ribbon {
     /// "laid" and "visible" are one question (§18, seam point 8).
     #[inline]
     #[must_use]
-    pub fn at_rest(&self) -> bool {
+    pub const fn at_rest(&self) -> bool {
         self.cells.is_empty() && self.cohorts.is_empty()
     }
 
@@ -8130,7 +8170,7 @@ impl Ribbon {
     /// whose row a run lands on with the caret, and the hand's own line is no
     /// unwrap.
     #[inline]
-    pub(super) fn lift_seam(&mut self, row: u16, to: u16) {
+    pub(super) const fn lift_seam(&mut self, row: u16, to: u16) {
         if let Some(seam) = &mut self.seam
             && seam.row == row
         {
@@ -8140,8 +8180,11 @@ impl Ribbon {
 
     /// The seam's row ([`Ribbon::seam`]), for the engine's tests.
     #[cfg(test)]
-    pub(super) fn seam_row(&self) -> Option<u16> {
-        self.seam.map(|s| s.row)
+    pub(super) const fn seam_row(&self) -> Option<u16> {
+        match self.seam {
+            Some(s) => Some(s.row),
+            None => None,
+        }
     }
 
     /// Drop everything — style switch, layout change, `Engine::reset`.

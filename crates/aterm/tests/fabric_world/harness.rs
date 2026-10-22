@@ -48,8 +48,8 @@ pub fn broker_opts(tier: aterm_link::durability::Durability) -> OpenOptions {
 }
 
 /// Open a guarded broker on `log` with `opts` ([`broker_opts`]), RETAINED by
-/// aterm's default rules ([`aterm_link::broker_rules::retain`], session log
-/// Phase 6 step 6E-2, ruling U24): the one constructor `aterm link broker`
+/// aterm's default rules ([`aterm_link::broker_rules::retain`]):
+/// the one constructor `aterm link broker`
 /// opens with too, so a world's broker is the production default. The rules
 /// are set per open, as `aterm link broker` sets them at every start.
 ///
@@ -1065,8 +1065,8 @@ impl World {
 
     /// A world whose broker keeps NO retention rules: a broker from before
     /// astream's R4, or one `aterm link broker` serves when its rules cannot
-    /// be set ([`open_broker_unretained`]), the named unretaining case (ruling
-    /// U24). Restarted, it stays unretained.
+    /// be set ([`open_broker_unretained`]), the named unretaining case.
+    /// Restarted, it stays unretained.
     pub fn without_retention(tag: &str) -> Self {
         Self::boot_arm(
             tag,

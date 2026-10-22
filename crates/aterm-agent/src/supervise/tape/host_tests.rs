@@ -775,3 +775,129 @@ fn land_held_is_a_taped_notification() {
     let d = core.diverged().expect("latched");
     assert_eq!(d.door.as_deref(), Some("host.land_held"), "{d:?}");
 }
+
+/// A host whose board reads the reading it holds.
+#[derive(Debug)]
+struct Occupied(crate::supervise::occupancy::OccupancyReading);
+
+impl crate::supervise::IdleHost for Occupied {
+    fn wants(&self) -> bool {
+        false
+    }
+    fn at_idle(&self) -> Option<crate::supervise::run::HostStep> {
+        None
+    }
+    fn owns_turn_end(&self) -> bool {
+        false
+    }
+    fn occupancy(&self) -> crate::supervise::occupancy::OccupancyReading {
+        self.0.clone()
+    }
+}
+
+/// THE OCCUPANCY READING ON A TAPE (the occupancy red-team's F8): it reads
+/// back as written, every field, and a word this build does not know is
+/// refused. A replay answers it from the tape; where the tape's header says
+/// the recording build had no `host.occupancy`, it answers the empty reading
+/// and takes no record. NEGATIVE CONTROLS: where the header names the door
+/// and the tape does not hold it, the replay diverges — a newer build's tape
+/// never replays a default silently — and a door the header lacks whose
+/// answer has no absent form (`host.wants`) diverges as it always did.
+#[test]
+fn the_occupancy_reading_is_taped_and_absent_only_where_the_build_lacked_it() {
+    use astream_effects::EffectRecord;
+
+    use crate::supervise::IdleHost;
+    use crate::supervise::fx::ClockSource;
+    use crate::supervise::occupancy::{OccupancyReading, SlotsSeen};
+    use crate::supervise::tape::header::VERBATIM;
+    use crate::supervise::tape::replay::ReplayCore;
+    use crate::supervise::tape::testing::{MemoryTape, TAPE_ID};
+
+    let full = OccupancyReading {
+        taken_ms: 1_760_000_000_000,
+        stale: false,
+        avail_mib: Some(96 * 1024),
+        pressure: Some(Pressure::Warn),
+        disk: Some(crate::harness::disk::Level::Ok),
+        slots: Some(SlotsSeen { usable: 1, n: 3 }),
+        slots_free_ms: Some(1_200_000),
+        room: Some(true),
+        held_slot_last_ms: Some(1_759_999_940_000),
+    };
+    same(OccupancyReading::default());
+    same(full.clone());
+    let refused = |bytes: &[u8]| OccupancyReading::take(bytes, Instant::now()).is_err();
+    let wire = |pressure: &str, disk: &str| {
+        format!(
+            "{{\"taken-ms\":1,\"stale\":false,\"avail-mib\":null,\"pressure\":{pressure},\
+             \"disk\":{disk},\"slots\":null,\"slots-free-ms\":null,\"room\":null,\
+             \"held-slot-last-ms\":null}}"
+        )
+    };
+    assert!(refused(wire("\"panic\"", "null").as_bytes()));
+    assert!(refused(wire("null", "\"full\"").as_bytes()));
+    // CONTROL: the same bytes with words it knows are read.
+    assert!(!refused(wire("\"critical\"", "\"emergency\"").as_bytes()));
+
+    // Recorded: the window's host's answer, at its door.
+    let tape = MemoryTape::over(&Fx::over(ClockSource::Scripted(Arc::default())));
+    let host = TapedHost::new(
+        Arc::new(Occupied(full.clone())) as Arc<dyn IdleHost>,
+        tape.fx.clone(),
+    );
+    assert_eq!(IdleHost::occupancy(&host), full);
+    let read = tape.finish("done");
+    let records: Vec<EffectRecord> = read
+        .items
+        .iter()
+        .filter_map(|i| i.record().cloned())
+        .collect();
+    assert!(
+        matches!(&records[..], [EffectRecord::Exchange { door, .. }] if door == "host.occupancy"),
+        "{records:?}"
+    );
+
+    // Replayed from the tape: a core no header set, and one whose header
+    // names the door.
+    let doors = |names: &[&str]| names.iter().map(ToString::to_string).collect::<Vec<_>>();
+    for named in [None, Some(doors(&["host.wants", "host.occupancy"]))] {
+        let core = ReplayCore::start(records.clone(), VERBATIM, VERBATIM, TAPE_ID, None);
+        if let Some(named) = named {
+            core.recorded_doors(named);
+        }
+        let replay = ReplayHost::new(Fx::replay(Arc::clone(&core)));
+        assert_eq!(IdleHost::occupancy(&replay), full);
+        assert_eq!(core.left(), 0, "answered from the tape");
+    }
+
+    // A tape whose build had no such door (its header names others, or none:
+    // an older header): the empty reading, no record taken.
+    for named in [doors(&["host.wants"]), Vec::new()] {
+        let core = ReplayCore::start(Vec::new(), VERBATIM, VERBATIM, TAPE_ID, None);
+        core.recorded_doors(named);
+        let replay = ReplayHost::new(Fx::replay(Arc::clone(&core)));
+        assert_eq!(IdleHost::occupancy(&replay), OccupancyReading::default());
+        assert!(core.diverged().is_none());
+    }
+
+    // NEGATIVE CONTROL: the header names the door, the tape never asked it.
+    let core = ReplayCore::start(Vec::new(), VERBATIM, VERBATIM, TAPE_ID, None);
+    core.recorded_doors(doors(&["host.occupancy"]));
+    let replay = ReplayHost::new(Fx::replay(Arc::clone(&core)));
+    let asked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        IdleHost::occupancy(&replay)
+    }));
+    assert!(asked.is_err(), "the replay halts: the tape never asked");
+    assert!(core.diverged().is_some());
+
+    // NEGATIVE CONTROL: a door the header lacks with no absent answer.
+    let core = ReplayCore::start(Vec::new(), VERBATIM, VERBATIM, TAPE_ID, None);
+    core.recorded_doors(Vec::new());
+    let replay = ReplayHost::new(Fx::replay(Arc::clone(&core)));
+    let asked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| IdleHost::wants(&replay)));
+    assert!(
+        asked.is_err(),
+        "no absent answer: the replay halts as before"
+    );
+}

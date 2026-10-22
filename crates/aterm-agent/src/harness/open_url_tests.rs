@@ -196,6 +196,34 @@ fn mailbox_links_and_approval_keep_their_recipient_origin_and_callback() {
         Some("https://claude.ai/magic?token=abc123&state=st_99")
     );
 
+    // Base64-encoded MIME part (`<a href="https://claude.ai/magic?token=b64_ok&amp;state=s9">Sign in</a>`):
+    let b64_mime_eml = concat!(
+        "From: Claude <no-reply@claude.ai>\r\n",
+        "To: <m15-3@example.test>\r\n",
+        "Content-Type: multipart/alternative; boundary=\"b1\"\r\n\r\n",
+        "--b1\r\n",
+        "Content-Type: text/html; charset=\"utf-8\"\r\n",
+        "Content-Transfer-Encoding: base64\r\n\r\n",
+        "PGEgaHJlZj0iaHR0cHM6Ly9jbGF1ZGUuYWkvbWFnaWM/dG9rZW49YjY0X29rJmFtcDtz\r\n",
+        "dGF0ZT1zOSI+U2lnbiBpbjwvYT4=\r\n",
+        "--b1--\r\n"
+    );
+    assert_eq!(
+        extract_magic_link_from_email(b64_mime_eml, Some("m15-3@example.test")).as_deref(),
+        Some("https://claude.ai/magic?token=b64_ok&state=s9")
+    );
+
+    // JSON email with recipient array and HTML body:
+    let json_eml = r#"{"to":["m15-3@example.test"],"html":"<p><a href=\"https://claude.ai/magic?token=json_html_ok&amp;state=s2\">Log in</a></p>"}"#;
+    assert_eq!(
+        extract_magic_link_from_email(json_eml, Some("m15-3@example.test")).as_deref(),
+        Some("https://claude.ai/magic?token=json_html_ok&state=s2")
+    );
+    assert_eq!(
+        extract_magic_link_from_email(json_eml, Some("other@example.test")),
+        None
+    );
+
     let consent_html = r#"
         <html><body>
         <form method="POST" action="/oauth/approve">

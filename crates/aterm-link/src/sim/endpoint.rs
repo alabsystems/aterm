@@ -58,7 +58,7 @@ pub(crate) struct EpRules {
     /// A changed `link log` forgets offsets at all.
     pub(crate) forgets: bool,
     /// A session holding a generation of the fork's chain AFTER `was` keeps
-    /// below the fork too (finding F3); off, only one holding `was` does.
+    /// below the fork too; off, only one holding `was` does.
     pub(crate) chain: bool,
     /// A replaced log (`link log` answered `forgot=1`) forgets every session
     /// log's mirror cursor (aterm-gui's `session_log_mirror::forget_landed`):
@@ -234,7 +234,7 @@ pub(crate) struct EpState {
     /// <word>`), for the quit the world waits on.
     pub(crate) byes_acked: u64,
     /// Every alias key a take named (`log-take … key=<hex>`; empty: none),
-    /// across the node's whole life: ruling Q6 says one.
+    /// across the node's whole life.
     pub(crate) take_keys: std::collections::BTreeSet<String>,
     /// The world's clock as the sessions last stamped a record: a take's
     /// snapshot is stamped with it.
@@ -693,7 +693,7 @@ impl EpState {
             .find_map(|t| t.strip_prefix("n="))
             .and_then(|n| n.parse().ok())
             .unwrap_or(aterm_slog::TAKE_MAX);
-        // The alias key the take names (ruling Q6), for the oracle.
+        // The alias key the take names, for the oracle.
         let key = words
             .iter()
             .find_map(|t| t.strip_prefix("key="))
@@ -797,7 +797,7 @@ impl EpState {
             if forget && forgets {
                 // `was` itself, or a generation of the same log between it and
                 // this one: the fork is the chain's lowest (aterm-gui-fabric's
-                // `LogClock::keep_below`, finding F3).
+                // `LogClock::keep_below`).
                 let keep_below = continues
                     .as_ref()
                     .filter(|(_, was)| {

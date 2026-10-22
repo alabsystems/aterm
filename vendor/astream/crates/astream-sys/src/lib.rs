@@ -24,6 +24,11 @@
 //!   1.8 ms, p50 4.3 ms (n = 42,000), in steps of about 4.2 ms when the device is
 //!   already flushing for someone else. The tiers that use the barrier measure their
 //!   own cost before they become a default.
+//! - [`full_sync`] and [`full_sync_data`]: the FULL flush every durable write of the
+//!   broker ends with, [`File::sync_all`] and [`File::sync_data`] (`F_FULLFSYNC` on
+//!   Apple, `fsync(2)` / `fdatasync(2)` on Linux), in every build. Debug assertions do
+//!   not weaken a full flush: Strict acknowledgements, durable heads and recovery
+//!   identity rely on the same persistence contract in a debug application.
 //! - [`boot_session`]: THIS BOOT of the machine as the kernel names it, as 16 bytes.
 //!   Two readings are equal exactly when no boot came between them, which is the
 //!   question a log that trusts the page cache asks — "has the kernel holding my
@@ -271,6 +276,24 @@ pub fn sighup_generation() -> u64 {
 #[must_use]
 pub const fn is_apple_barrier_refused_errno(errno: i32) -> bool {
     matches!(errno, 19 | 22 | 25 | 45)
+}
+
+/// Make everything written to `file` durable, its data and metadata: [`File::sync_all`]
+/// (`F_FULLFSYNC` on Apple), in every build.
+///
+/// # Errors
+/// The flush's own error.
+pub fn full_sync(file: &File) -> io::Result<()> {
+    file.sync_all()
+}
+
+/// [`full_sync`] for `file`'s data and the metadata a read of it needs:
+/// [`File::sync_data`] (`F_FULLFSYNC` on Apple, `fdatasync(2)` on Linux), in every build.
+///
+/// # Errors
+/// The flush's own error.
+pub fn full_sync_data(file: &File) -> io::Result<()> {
+    file.sync_data()
 }
 
 /// Order every write to `file` issued before this call ahead of every write issued

@@ -1,0 +1,50 @@
+# claude-code 2.1.308 · MEASURED 2026-10-22, `aterm ctl text` of a private headless aterm (144x50, aterm 0.114.0) running the real Claude Code, launched by path with a scratch `CLAUDE_CONFIG_DIR`, a fake `apiKeyHelper` key and `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>` (a local stub of the API, crates/aterm-lab) · the Bash box over `Probe c33-awk-multi`, a realistic barred command scripted into the lab's stub (one tool call)
+❯ toolstart
+
+⏺ Bash(env -i PATH=/usr/bin:/bin HOME="$HOME" bash -lc 'echo "$PATH"; command -v git; git --version')
+  ⎿  Interrupted · What should Claude do instead?
+
+✻ Cogitated for 0s · done 11:48 AM
+
+❯ toolstart
+
+⏺ Bash(python3 -c "import json; d=json.load(open('package.json')); print('\n'.join(sorted(d.get('scripts', {}))))")
+  ⎿  Interrupted · What should Claude do instead?
+
+✻ Baked for 0s · done 11:48 AM
+
+❯ toolstart
+
+⏺ Bash(sh -c 'for f in docs/measured/*.md; do \
+        echo "$f: $(grep -c MEASURED "$f")"; \…)
+  ⎿  Interrupted · What should Claude do instead?
+
+✻ Worked for 0s · done 11:48 AM
+
+❯ toolstart
+
+  Reading 1 file… (ctrl+o to expand)
+  ⎿  $ awk -F'\t' '
+     NR > 1 && $2 == "contract" { n++ }
+     END { print n " contract rows" }
+     ' crates/aterm-agent/SPECS.md
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+ Bash command
+ Tip: auto mode handles these prompts for you — choose "switch to auto mode" below
+ Probe c33-awk-multi: Count the contract rows
+╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+ │ awk -F'\t' '
+ │   NR > 1 && $2 == "contract" { n++ }
+ │   END { print n " contract rows" }
+ │ ' crates/aterm-agent/SPECS.md
+╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+ This command requires approval
+
+ Do you want to proceed?
+ ❯ 1. Yes
+   2. Yes, and don’t ask again for: awk *
+   3. Yes, and switch to auto mode · auto mode handles these prompts for you
+   4. No
+
+ Esc to cancel · Tab to amend

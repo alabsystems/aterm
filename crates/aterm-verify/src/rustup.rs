@@ -163,6 +163,122 @@ pub fn with_std(rustup: &Path, triple: &str) -> Result<Option<Toolchain>, String
         .transpose()
 }
 
+/// The wasm32 clause of `publish/config.sh`'s `CHECK_CMD_DEFAULT` and the stock
+/// channel it names.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WasmClause {
+    pub clause: String,
+    pub pin: String,
+}
+
+/// Why `publish/config.sh` names no usable wasm32 pin, and the fix: `ship`'s refusal
+/// words ([`wasm_clause`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClauseError {
+    pub why: String,
+    pub remedy: String,
+}
+
+impl ClauseError {
+    fn new(why: impl Into<String>, remedy: impl Into<String>) -> Self {
+        Self {
+            why: why.into(),
+            remedy: remedy.into(),
+        }
+    }
+}
+
+/// Read the wasm32 clause out of `config` (the engine's own line shape,
+/// `CHECK_CMD_DEFAULT="…"`), with every refusal the stage would meet for it.
+///
+/// # Errors
+/// No clause; no stock channel; no target-add before it; no `RUSTC` naming the pin's
+/// own rustc.
+pub fn wasm_clause(config: &str) -> Result<WasmClause, ClauseError> {
+    let line = config
+        .lines()
+        .find_map(|l| l.strip_prefix("CHECK_CMD_DEFAULT=\""))
+        .and_then(|l| l.trim_end().strip_suffix('"'))
+        .unwrap_or_default();
+    let Some(clause) = line
+        .split(" && ")
+        .find(|c| c.contains("--target wasm32-unknown-unknown"))
+        .map(str::trim)
+    else {
+        return Err(ClauseError::new(
+            "publish/config.sh's CHECK_CMD_DEFAULT has no wasm32 clause — nothing before the \
+             promote compiles the site's /terminal engine",
+            "restore its `cargo check --locked --target wasm32-unknown-unknown -p aterm-wasm` \
+             clause (publish/config.sh, THE WASM32 CLAUSE)",
+        ));
+    };
+    let pin = clause
+        .split_once("rustup run ")
+        .and_then(|(_, rest)| rest.split_once(" cargo "))
+        .map(|(pin, _)| pin.to_string())
+        .filter(|p| !p.is_empty() && !p.contains(' '));
+    let Some(pin) = pin else {
+        return Err(ClauseError::new(
+            format!(
+                "publish/config.sh's wasm32 clause names no stock channel — the wasm32 pin is the \
+                 compiler this check and the stage's gate both run: {clause}"
+            ),
+            "spell the clause `rustup run <channel> cargo check …`",
+        ));
+    };
+    let add = format!("rustup target add --toolchain {pin} wasm32-unknown-unknown");
+    if !line.contains(&format!("{add} && ")) {
+        return Err(ClauseError::new(
+            format!(
+                "publish/config.sh's CHECK_CMD_DEFAULT does not add the wasm32 target to {pin} \
+                 before its wasm32 clause — `pub stage` on a host without that target fails after \
+                 the verified build"
+            ),
+            format!("put `{add} && ` before the wasm32 clause"),
+        ));
+    }
+    let rustc = format!("RUSTC=$(rustup which --toolchain {pin} rustc) ");
+    if !clause.contains(&rustc) {
+        return Err(ClauseError::new(
+            format!(
+                "publish/config.sh's wasm32 clause does not name {pin}'s own rustc — cargo would \
+                 take `rustc` from the host PATH (the gate's fresh CARGO_HOME holds no rustup \
+                 proxy): {clause}"
+            ),
+            format!("put `{rustc}` before `rustup run {pin} cargo` in the wasm32 clause"),
+        ));
+    }
+    Ok(WasmClause {
+        clause: clause.to_string(),
+        pin,
+    })
+}
+
+/// The wasm32 pin `repo`'s `publish/config.sh` names, or why it names none.
+///
+/// # Errors
+/// The file cannot be read, or its clause is refused ([`wasm_clause`]).
+pub fn wasm_pin(repo: &Path) -> Result<String, String> {
+    std::fs::read_to_string(repo.join("publish/config.sh"))
+        .map_err(|e| format!("publish/config.sh: {e}"))
+        .and_then(|c| wasm_clause(&c).map_err(|r| format!("{} — {}", r.why, r.remedy)))
+        .map(|clause| clause.pin)
+}
+
+/// The wasm32 pin a provisioned machine holds for `repo`: [`wasm_pin`], or `None` where
+/// the tree has no `publish/config.sh` at all. The pin is the release gate's (`pub stage`
+/// type-checks the site's engine on it), and the public snapshot carries no `publish/`
+/// (`publish/manifest.txt`), so a contributor's clone wants none.
+///
+/// # Errors
+/// The file exists and cannot be read, or its clause is refused ([`wasm_clause`]).
+pub fn wasm_pin_wanted(repo: &Path) -> Result<Option<String>, String> {
+    match std::fs::symlink_metadata(repo.join("publish/config.sh")) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        _ => wasm_pin(repo).map(Some),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -221,5 +337,34 @@ mod tests {
             None,
             "no toolchain around a bare rustc"
         );
+    }
+
+    #[test]
+    fn the_wasm32_clause_is_read_out_of_the_engines_own_line() {
+        // the committed line's shape (publish/config.sh, which the public snapshot
+        // withholds, so it is quoted here rather than read)
+        let good = "CHECK_CMD_DEFAULT=\"rustup run trust targo trust check && rustup target add \
+                    --toolchain 1.95.0 wasm32-unknown-unknown && sh -c \
+                    'RUSTFLAGS=-Ctarget-feature=+simd128 RUSTC=$(rustup which --toolchain 1.95.0 \
+                    rustc) rustup run 1.95.0 cargo check --locked --target wasm32-unknown-unknown \
+                    -p aterm-wasm'\"\n";
+        let clause = wasm_clause(good).unwrap();
+        assert_eq!(clause.pin, "1.95.0");
+        assert!(
+            clause
+                .clause
+                .starts_with("sh -c 'RUSTFLAGS=-Ctarget-feature=+simd128 RUSTC=")
+        );
+        for config in [
+            "CHECK_CMD_DEFAULT=\"targo check\"\n",
+            &good.replace(
+                "rustup target add --toolchain 1.95.0 wasm32-unknown-unknown && ",
+                "",
+            ),
+            &good.replace("RUSTC=$(rustup which --toolchain 1.95.0 rustc) ", ""),
+            &good.replace("rustup run 1.95.0 cargo", "cargo"),
+        ] {
+            assert!(wasm_clause(config).is_err(), "{config}");
+        }
     }
 }

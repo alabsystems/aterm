@@ -696,6 +696,7 @@ fn a_tape_an_older_build_wrote_decodes_with_what_it_lacked_named() {
                 "turn_end.refused_backoff=",
                 "types_under_hand=",
                 "tasks=",
+                "host_doors=",
             ]
             .iter()
             .any(|k| l.starts_with(k))
@@ -713,6 +714,7 @@ fn a_tape_an_older_build_wrote_decodes_with_what_it_lacked_named() {
             "[setup] person_hold_wait",
             "[setup] beside_idle_min",
             "[opts] tasks",
+            "[opts] host_doors",
             "[policy] land_at",
             "[policy] codex.enabled",
         ]
@@ -728,6 +730,38 @@ fn a_tape_an_older_build_wrote_decodes_with_what_it_lacked_named() {
     );
     assert_eq!(back.opts.policy.approve, opts.policy.approve);
     assert!(back.policy_exact);
+}
+
+/// THE HEADER NAMES THE RECORDING BUILD'S HOST DOORS (the occupancy red-team's
+/// F8): every method of the window's host, `host.occupancy` among them, and
+/// they read back as written; an older build's header, which named none,
+/// reads back as naming none — what a replay keys a door newer than the tape
+/// on (`ReplayCore::lacks_door`).
+#[test]
+fn the_header_names_the_recording_builds_host_doors() {
+    let h = Header::capture("t", Entry::Hosted, None, &watched(), &every_option());
+    let doors = h.host_doors.clone().expect("a capture names its doors");
+    assert_eq!(doors, crate::supervise::run::host_door::HOST_DOORS);
+    assert!(doors.iter().any(|d| d == "host.occupancy"), "{doors:?}");
+    let text = h.encode();
+    let back = Header::decode(&text).expect("decodes");
+    assert_eq!(back.host_doors, Some(doors));
+    assert!(back.supplied.is_empty(), "{:?}", back.supplied);
+    assert_eq!(back.encode(), text, "written back as read");
+
+    let older: String = text
+        .lines()
+        .filter(|l| !l.starts_with("host_doors="))
+        .map(|l| format!("{l}\n"))
+        .collect();
+    let back = Header::decode(&older).expect("an older build's tape");
+    assert_eq!(back.host_doors, None);
+    assert_eq!(back.supplied, ["[opts] host_doors"]);
+    assert_eq!(
+        back.encode(),
+        older,
+        "an older header is written back as it was"
+    );
 }
 
 /// Real Windows path prefixes stay distinct, while a ledger keeps its place

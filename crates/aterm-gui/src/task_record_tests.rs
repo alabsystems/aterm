@@ -65,8 +65,8 @@ fn states_and_origins_are_closed_words() {
     }
 }
 
-/// THE LOG'S TASK WORDS MIRROR THE TASK RECORD'S (plan 5C-1, ruling T16:
-/// a mirror of an aterm-gui vocabulary lives in aterm-gui). Every task state
+/// THE LOG'S TASK WORDS MIRROR THE TASK RECORD'S (a mirror of an aterm-gui vocabulary lives in aterm-gui).
+/// Every task state
 /// is a `state=` word of the session log and every `why=` word a `why=`
 /// word, so a `task` mark ([`crate::session_timeline::SessionTimeline::mark_task`])
 /// never writes one as `unknown`. The match is exhaustive: a fifth state is a

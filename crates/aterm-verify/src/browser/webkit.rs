@@ -24,7 +24,7 @@
 //!
 //! In order, the lane takes `ATERM_WEBKIT` (a Playwright WebKit
 //! executable), then the pinned build in this machine's cache (`verify
-//! fetch-browser` puts it there). Neither is a COULD NOT RUN naming the
+//! provision` puts it there). Neither is a COULD NOT RUN naming the
 //! fetch.
 
 use std::ffi::OsString;
@@ -75,10 +75,10 @@ pub(crate) fn no_windows_skip(missing: Option<&str>) -> String {
 }
 
 /// The fix a run without a WebKit names, where `pinned` (this host has a pin
-/// `verify fetch-browser` can fetch).
+/// `verify provision` can fetch).
 pub(crate) fn fix_for(pinned: bool) -> &'static str {
     if pinned {
-        "targo --unverified verify fetch-browser, or set ATERM_WEBKIT to a Playwright WebKit \
+        "targo --unverified verify provision, or set ATERM_WEBKIT to a Playwright WebKit \
          executable"
     } else {
         "set ATERM_WEBKIT to a Playwright WebKit executable; none is pinned for this host"
@@ -343,8 +343,8 @@ mod tests {
     /// Only a host with a pin is told to fetch one.
     #[test]
     fn the_fix_names_the_fetch_only_where_a_pin_exists() {
-        assert!(fix_for(true).contains("verify fetch-browser"));
-        assert!(!fix_for(false).contains("fetch-browser"));
+        assert!(fix_for(true).contains("verify provision"));
+        assert!(!fix_for(false).contains("provision"));
         assert!(fix_for(false).contains(WEBKIT_ENV));
     }
 

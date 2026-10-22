@@ -160,899 +160,297 @@ pub fn default_config_path() -> Option<PathBuf> {
 /// The usage text: the verbs and the flags. Each verb's own page is
 /// [`help_page`].
 pub const USAGE: &str = "\
-aterm harness — read views of the Claude Code harness, and the live agent
-upgrade. The supervisor that acts on a session is the window's own host, by
-default, for every Claude Code, agy, Muse Code and Gemini CLI session (`aterm
-drive` runs its readers from a terminal). A vendor `codex` is shown, not
-supervised; codex-alab supervises itself, the window watching.
+aterm harness — read views of the agent harness and live upgrades.
+A window's supervisor acts by default on Claude Code, agy, Muse Code, and Gemini CLI
+tabs (`aterm drive` runs its readers from a terminal). Vendor `codex` is shown, not
+supervised; `codex-alab` supervises itself.
 
 USAGE:
-    aterm harness usage [--json]                 this session's tokens per model, and its usage
-                                                 tap's limits where it has one; from a Codex
-                                                 session's tools, its conversation's, at list ≈$
-    aterm harness limits [@<sid>] [--json]       the wall and the painted /usage or /status windows on the session's screen
+    aterm harness usage [--json]                 this session's tokens per model and usage-tap windows
+    aterm harness limits [@<sid>] [--json]       wall and painted /usage windows on the session's screen
     aterm harness disk [<build-dir> ...] [--apply <class>] [--json]
-    aterm harness ledger [@<sid>] [<n>] [--json] the supervisor's approval ledger
-    aterm harness ledger disk [<n>] [--json]     the disk journal
-    aterm harness ledger upgrade [<n>] [--json]  the live upgrade's ledger: every act, and the owner's word
-    aterm harness ledger accounts [<n>] [--json] the accounts ledger: sign-ins, pins, limits, rotations
-    aterm harness accounts [--json]              the Claude Code accounts listed on this machine: each
-                                                 one's condition, and which is next
-    aterm harness accounts stats [--json]        what this machine has of the Claude Code account:
-                                                 its 5h, week and Fable windows, plan, credits, list-
-                                                 price dollars, sessions and login, each with its age
+                                                 report or reclaim stale build directories and caches
+    aterm harness ledger [@<sid>] [<n>] [--json] supervisor approval ledger for a session
+    aterm harness ledger disk [<n>] [--json]     disk cleanup journal
+    aterm harness ledger upgrade [<n>] [--json]  live upgrade ledger
+    aterm harness ledger accounts [<n>] [--json] accounts ledger (logins, pins, limits, rotations)
+    aterm harness accounts [--json]              Claude Code accounts on this machine and rotation order
+    aterm harness accounts stats [--json]        5h/week/Fable windows, plan, credits, \u{2248}$, and active sessions
     aterm harness accounts add <label> [--shared] [--email <e>] [--browser <b>]
-                                                 list an account: make its login directory, add its row
+                                                 create login directory and append roster row
     aterm harness accounts adopt-default <label> --email <e> [--browser <b>]
-                                                 list this machine's own login as one renewable row
-    aterm harness accounts login <label>         sign it in: Claude Code's own flow, then record whether it took
+                                                 enroll this machine's default login as a renewable row
+    aterm harness accounts login <label>         run Claude Code's sign-in flow and record auth status
     aterm harness accounts renew [--due | <label>...] [--on <host>,... | --here]
-                                                 renew logins before they end: a staging sign-in, checked
-                                                 against the row's email, then every due login elsewhere
-    aterm harness accounts use <label> | --auto  the owner's word: pin one account, or end the pin
+                                                 renew logins via staging sign-in (and over ssh)
+    aterm harness accounts use <label> | --auto  pin an account or return to automatic rotation
     aterm harness accounts sync [<source>] [--machine <mN>] [--json]
-                                                 sync this machine's accounts.toml and fleet-accounts.toml
-                                                 from the accounting CSV, Google Sheet, or LAN URL
+                                                 sync accounts.toml and fleet-accounts.toml from <source>,
+                                                 else `[fleet] accounts_source`; no default source
     aterm harness accounts serve [<source>] [--bind <addr:port>] [--machine <mN>]
-                                                 serve the LAN account dashboard and fleet-accounts.toml
+                                                 serve LAN account dashboard and fleet-accounts.toml
     aterm harness upgrade [<sid>] [--dry-run] [--json]
-                                                 move live Claude Code sessions onto a newer build
-                                                 and the newest model of their own family (else
-                                                 up the model priority list); a Codex is never
-                                                 moved live
+                                                 move live Claude Code sessions onto a newer build/model
     aterm harness upgrade [<sid>] --status [--json]
-                                                 each upgrade: how long behind, what it waits on
+                                                 show pending upgrades and what each waits on
     aterm harness upgrade <sid> --now | --defer <dur> | --skip [--json]
-                                                 the owner's word on one tab's upgrade
+                                                 hurry, defer, or skip one tab's upgrade
     aterm harness upgrade models [set <id>,<id>,...]
-                                                 the model priority list: show it (availability,
-                                                 what is on offer, the target, Claude Code's
-                                                 recommendations) or set it
-    aterm harness tap                            the usage tap: Claude Code's status-line command
-                                                 on aterm's relaunch lines (`[harness] usage_tap`)
+                                                 show or set the upgrade model priority list
+    aterm harness tap                            Claude Code statusLine usage tap (`[harness] usage_tap`)
 
-`hook` and `statusline` are RETIRED: aterm installs nothing into an agent. They do
-nothing and exit 0, for a bridge an older build installed. A starting window removes
-what that build wrote to ~/.claude/settings.json.
+`hook` and `statusline` are retired no-ops (exit 0) for bridges left by older builds.
 
 OPTIONS:
-    --state <path>      the harness state directory: the disk journal, the upgrade records and ledger,
-                        and the accounts store (<state>/accounts)
-                        (default: $ATERM_HARNESS_STATE, else <aterm state>/harness/claude-harness)
-    --config <path>     where the [disk] knobs are read from; accounts.toml is read beside it
-                        (default: $XDG_CONFIG_HOME/aterm/aterm.toml, else $HOME/.config/...)
-    --sock <path>       limits: the control socket (default: the resolved one)
-    --apply <class>     disk: the ONE safelist class to act on. atpkg-gc and
-                        claude-purge are surfaced and never removed from here;
-                        they name the command that owns them
-    --dry-run           upgrade: print each session's next step, type and signal nothing
-    --status            upgrade: print each recorded upgrade, sweep nothing
-    --now               upgrade <sid>: move it at its first pause (still never over a draft,
-                        a box, a hold, running work or a keystroke in the last
-                        20 s)
-    --defer <dur>       upgrade <sid>: not for <dur> (90s, 30m, 6h, 2d; at most 30d)
-    --skip              upgrade <sid>: stay on the running build until a newer target comes
-    --shared            accounts add: the account is `shared` (your other machines draw on it too)
-    --email <e>         accounts add, adopt-default: the account's address, which its renewal is checked against
-    --browser <b>       accounts add, adopt-default: the browser profile (display name) holding its claude.ai session
-    --due               accounts renew: every login of this machine that is due or ended
-    --on <host>,...     accounts renew: the machines to renew on next, over ssh (`host` or `host:/abs/aterm`)
-    --here              accounts renew: this machine's logins alone, no other machine (what each one runs)
-    --auto              accounts use: end the pin
-    --machine <mN>      accounts sync, serve: override this machine's id (`m8`, `m14`, …)
-    --bind <addr:port>  accounts serve: address and port to bind (default `127.0.0.1:8741`)
-    --json              the JSON form
-    -h, --help          this text; `aterm harness <verb> --help` explains one verb
-                        (`upgrade --status --help`: the status fields)
+    --state <path>      harness state directory (default: $ATERM_HARNESS_STATE, else
+                        <aterm state>/harness/claude-harness)
+    --config <path>     config file for [disk] and beside accounts.toml
+                        (default: $XDG_CONFIG_HOME/aterm/aterm.toml)
+    --sock <path>       limits: control socket (default: resolved socket)
+    --apply <class>     disk: safelist class to remove (`cargo-targets`; `atpkg-gc` and
+                        `claude-purge` are report-only and name the owning command)
+    --dry-run           upgrade: print each session's next step without typing or signalling
+    --status            upgrade: print recorded upgrades without sweeping
+    --now               upgrade <sid>: move at first pause (still requires idle, empty draft,
+                        no box/hold/child, and no keystroke in the last 20 s)
+    --defer <dur>       upgrade <sid>: hold for <dur> (90s, 30m, 6h, 2d; max 30d)
+    --skip              upgrade <sid>: stay on the running build until a newer target lands
+    --shared            accounts add: mark account `shared` across machines
+    --email <e>         accounts add, adopt-default: account email verified on renewal
+    --browser <b>       accounts add, adopt-default: browser profile display name for sign-in
+    --due               accounts renew: renew every due or expired login on this machine
+    --on <host>,...     accounts renew: machines to renew next over ssh (`host` or `host:/abs/aterm`)
+    --here              accounts renew: renew this machine's logins only
+    --auto              accounts use: clear the pin
+    --machine <mN>      accounts sync, serve: override machine id (`m8`, `m14`, \u{2026})
+    --bind <addr:port>  accounts serve: listen address (default `127.0.0.1:8741`)
+    --json              emit JSON
+    -h, --help          print help (`aterm harness <verb> --help` for one verb)
 ";
 
 /// `aterm harness usage --help`.
 const HELP_USAGE: &str = "\
-`usage` folds THIS session's transcripts — its transcript and its subagents'
-(<session>/subagents/**/agent-*.jsonl) — per model. Run from a Claude Code session's own
-tools (they inherit CLAUDE_CODE_SESSION_ID, or CLAUDE_PID), it folds that session's own
-file, named by the vendor; a named session with no transcript yet folds nothing. Anywhere
-else — aterm's shells carry no CLAUDE_* — it folds the NEWEST transcript in this working
-directory's project directory (<claude dir>/projects/<dir>/*.jsonl, the claude dir being
-CLAUDE_CONFIG_DIR, else ~/.claude) and says so: two sessions in one directory share it,
-so the newest may be the other one's; a relative CLAUDE_CONFIG_DIR folds nothing, said.
-A streamed subagent message counts once, at its final figures. It reads up to a 4 GiB
-cap and says PREFIX only when it hits it; a subagent transcript it could not count is
-said (`complete` is false in --json). Its windows (`5h`/`7d`, `windows` in --json) are
-the usage tap's last reading for the Claude Code CLAUDE_PID names in this tab, where
-`[harness] usage_tap` put one on its line (`aterm harness tap --help`); else `?`. The
-window's Claude Code footer shows the same tokens live, and a limit the session hit.
-`acct <label>` (`label` in --json) is `account` unless accounts.toml lists two or more
-accounts and the run is from a Claude Code session's own tools with CLAUDE_PID set: then
-it is the label of the row that process's login names, read from the environment the
-process was STARTED with, never from this command's own. A login no row names, a Claude
-home of its own (CLAUDE_CONFIG_DIR), a credential or a route in that environment, a
-roster that is refused, the newest-transcript pick, and a CLAUDE_PID that is no longer
-the Claude Code of the session folded all stay `account`; a credential given by a
-settings file is not seen. No account's limits or state are read here: `aterm harness
-accounts` prints them.
-
-Run from a Codex session's own tools (CODEX_THREAD_ID names its thread) where no Claude
-Code session is named, it folds that thread's conversation instead: the rollout of its
-TUI's own thread (the `session_id` the named thread's rollout gives) and every subagent
-rollout that names it, under CODEX_HOME, else ~/.codex (a relative CODEX_HOME folds
-nothing, said). Each served turn counts once: the last_token_usage of a token_count
-whose running total grew, on the model of the latest turn_context; a fork's copied
-prefix (the burst of its parent's lines it opens with) counts nothing. `in` is the
-uncached input; `cache read` is Codex's cached input. Where the shipped price table
-prices the model, `usd` is its list dollars (≈$, never a bill); a model it does not is
-unpriced (`usd` null). `acct codex`; its windows stay `?`.
+`usage` folds this session's transcript and subagent transcripts
+(<session>/subagents/**/agent-*.jsonl) per model, up to a 4 GiB cap (`PREFIX` when hit;
+`complete: false` in `--json` if any subagent transcript could not be read).
+  - From Claude Code's tools (`CLAUDE_CODE_SESSION_ID` or `CLAUDE_PID`): folds that
+    session's transcript. `5h`/`7d` (`windows` in `--json`) come from the usage tap for
+    `CLAUDE_PID` when `[harness] usage_tap` is active; `acct <label>` (`label` in `--json`)
+    resolves from `CLAUDE_PID`'s launch env when `accounts.toml` lists 2+ accounts.
+  - From a Codex tool (`CODEX_THREAD_ID`, when no Claude session is named): folds the
+    root thread's rollout and subagent rollouts under `CODEX_HOME` (else `~/.codex`),
+    skipping forked prefix bursts, and prices tokens at list `usd` (\u{2248}$, never a bill).
+  - Anywhere else: folds the newest transcript in `<claude dir>/projects/<cwd>/*.jsonl`
+    (`CLAUDE_CONFIG_DIR`, else `~/.claude`; relative `CLAUDE_CONFIG_DIR` or `CODEX_HOME`
+    folds nothing).
 ";
 
 /// `aterm harness limits --help`.
 const HELP_LIMITS: &str = "\
-`limits` reads the session's screen once over the control socket (`text --json tail=40`)
-and prints the wall the last turn ended on (the kind the supervisor acts on, its words and
-its reset), read by the grammar of the program `status` names in front (Claude Code's,
-agy's or Muse Code's; Gemini CLI's, which runs as `node`, by its screen; a Codex's screen is
-not read, so a Codex tab has no wall here), any windows that program painted (Claude Code's
-/usage panel; agy paints none, Gemini CLI's /stats model is not read as one, and Muse Code's /usage and
-/status cards hold the session's tokens and no window), and `credits=in-use` where Claude
-Code's own notice says usage credits carry the session (`-` otherwise; credits are no wall:
-under `[harness] usage_credits = true` they are work going on, and under its default, false,
-the supervisor types none of its own turns while they carry the session, but one probe turn
-past the reset their notice named, or five hours on where none is named, which another window
-may still bill to credits).
-With no @<sid> it reads the session it runs in ($ATERM_PARENT_SESSION_ID); with neither it
-refuses (exit 2) rather than read whichever session the socket defaults to. No session
-answering is exit 1.
+`limits` reads the session's screen once (`text --json tail=40`) and prints:
+  - `wall=<kind>` and `resets_at=`: the wall the last turn ended on, parsed by the foreground
+    program's grammar (Claude Code, agy, Muse Code, Gemini CLI; Codex screens are not read).
+  - `windows=`: usage windows painted on screen (Claude Code's `/usage` panel).
+  - `credits=in-use|-`: whether Claude Code's notice reports usage credits carrying the
+    session (under `[harness] usage_credits = false`, supervisor pauses until reset/5h probe).
+Defaults to `$ATERM_PARENT_SESSION_ID`; exits 2 with neither `@<sid>` nor parent session,
+or 1 if the session cannot be read.
 ";
 
 /// `aterm harness disk --help`.
 const HELP_DISK: &str = "\
-`disk` REPORTS AND REMOVES NOTHING by default. Every row carries the witness that would
-make it safe to remove, and `tier=` names the tier of the window's automatic pass that
-would take it (below). For a build directory the witness is a build tool's own marker and
-a cargo profile idle past `disk.target_stale_days` (default 1 day: nothing a compile
-writes touched that long) with a non-empty `incremental/` and locks no build holds; or a
-Claude Code version that is not the live one (not the live symlink's target; on Windows
-not the version claude.exe is a byte-for-byte copy of) and that no Claude Code lock or
-running process holds (on Windows, none newer than the live one); or a package build
-atpkg's own retention would collect (the live build and its rollback target are atpkg's to
-keep).
-Removal needs BOTH `disk.apply = true` in aterm.toml AND an explicit `--apply <class>`; a
-refusal is written to the disk journal as a denial row rather than dropped. Nothing
-under the transcripts root is removable under any flag.
-If aterm.toml cannot be read or parsed, `disk` is not a table, or a removal key
-(`apply`, `target_stale_days`, `auto_free_gib`, `dead_build_dirs`, `idle_build_dirs`,
-`idle_build_days`) has the wrong type or sits below another table's header, every removal
-is off for this verb and for the window's automatic cleanup until it is fixed; this verb
-says why on stderr.
-Build directories are the ones you NAME on the line; named none, it SEARCHES for them,
-as the window does: this working directory and its worktree, $HOME's checkouts and their
-git worktrees two levels down (a `target -> target.noindex` link resolved), x.py's
-bootstrap build directories (`build/<host>/stage<N>-<kind>`, never a sysroot, stage0 or
-llvm), aterm's Rust build cache and Claude Code's temp root (each session's scratchpad)
-— on this working directory's volume only, never into a mount point, (macOS)
-~/Desktop, ~/Documents or ~/Downloads, or (Windows) AppData, a OneDrive folder or a
-folder a look would fetch from the cloud. Under the rows it lists the largest build
-directories it can NOT reclaim and what frees each.
-THE LINES, the same for this verb and the window (`watch:` prints them): the WARNING is
-the larger of `disk.warn_free_gib` (40 GiB unwritten, held to 20 % of a small volume),
-8 % of the volume (at most 64 GiB) and twice the ROOM; the FLOOR the larger of
-`disk.auto_free_gib` (10 GiB unwritten, held to 10 % of a small volume; 0 or a negative
-value turns every automatic removal off), 5 % of the volume (at most 32 GiB) and the
-room; the emergency the larger of 4 GiB and 1 % (at most 8 GiB), never above the floor.
-A value you write is read as written. The ROOM (`room=`) is what one round of this
-machine's builds takes: the second-largest daily two-hour fall in free space of the last
-week, at least min(16 GiB, 5 %) and at most 10 % of the volume (at most 256 GiB);
-`disk.room_gib` pins it. `ok` is above the warning, `low` below it, `short` below the
-floor.
-THE WINDOW looks every minute and, by itself, takes that class only, each unit journalled
-here, CHEAPEST TO YOU FIRST, free space measured again before each row of a tier with a
-target and the tier stopped once it is reached:
-  tier 1, from low: WHOLE, the build directories whose owner is gone — an ended Claude
-    Code session's scratch build (no running Claude Code names the session, nothing of
-    it written for `disk.target_stale_days`, at least a day), a removed workspace's
-    build cache (unwritten a day at low, ten minutes below the floor; a workspace nested
-    in a removed checkout on the home volume counts as removed) — each with a signed
-    CACHEDIR.TAG, no build holding a lock, no process with its working directory,
-    executable or an open file there, no mount point inside it, nothing of another
-    user's in it, the owner checked again under its locks (`disk.dead_build_dirs`,
-    default true); all of them: nobody builds there again;
-  tier 2, from low: every idle profile's `incremental/`, the longest idle first, until
-    free space is back at the warning (below the floor, at least the floor plus 5 GiB);
-  tier 3, below the floor or for an agent's `await sys`: a live checkout's WHOLE idle
-    build directory — a signed CACHEDIR.TAG, every profile unwritten for
-    `disk.idle_build_days` (default 7), the git checkout it lies in (never one it was
-    reached from through a link, never an agent's CARGO_TARGET_DIR) quiet as long (no
-    session or process in it, aterm's own included, its git index and logs/HEAD and its
-    working tree unwritten, by one bounded walk), nothing in ~/.local/bin, ~/.cargo/bin,
-    atpkg's bin/ or rustup's toolchains linking into it — each profile EMPTIED of
-    cargo's own outputs (its caches, examples/, dep-info files and uplifted artifacts)
-    under its locks, the processes and git files read again under them, and kept with
-    its lock files and anything else in it (an app bundle, a file you put there), nothing
-    at its root that is not a profile touched (`doc/`, `criterion/`, …), to the warning;
-    `disk.idle_build_dirs` (default true; false lists its rows, `removable=false`);
-    every tier-3 removal is a line of the window's digest (`disk.freed`);
-  tier 4, below the floor only: one profile at a time and oldest first, the caches of
-    profiles a compile wrote into within `disk.target_stale_days`, until free space is
-    back at the floor plus 5 GiB, or once the bytes those removals released cover what
-    free space was short when they began (a local snapshot can keep the figure from
-    rising), or when it cannot be measured (a stop row in the journal says which).
-At `low` a pass runs at most hourly (backing off to 8 h while it frees nothing; a level
-change or a fall of a quarter room runs one at once); below the floor every 10 min; at
-an emergency at once, after the 256 MiB reserve beside aterm's cache is released. One
-pass runs at a time across aterm instances (`pass.lock` beside the reserve). An
-instance under a private state root (a development build's ATERM_STATE_HOME, or a $HOME
-that is not the account's home yet lies on its volume) measures and removes nothing, and
-one whose `[harness]` is off adopts no agent's wait (`await sys` answers `why=no-watch`).
-A profile a build holds locked is never taken, nor one on another volume, nor one written
-into within the last 10 min — not even at `target_stale_days = 0`, which otherwise makes
-every profile idle. Tiers 2 and 4, and this verb, never take a live checkout's directory,
-`deps/`, `build/`, `.fingerprint/`, an uplifted binary, `examples/`, `doc/` or a
-benchmark's data: cargo runs tests without its locks, so only tier 3's quiet checkout and
-its process checks let those go. Each removal is journalled before it starts and again after,
-with the bytes it released and every error; a removal whose intent cannot be journalled
-(a full disk, no state directory) does not start. The bytes it says it freed are
-COUNTED, not measured: the blocks of each deleted file that was that file's last name.
-A hard-linked file frees nothing and is not counted; an APFS clone's shared blocks are
-counted although the clone keeps them; a file it cannot open to measure is deleted
-uncounted. The journal is cut back to its newest 1024 rows once it passes 1 MiB.
-THIS VERB's `--apply cargo-targets` takes every row of the class it lists but tier 3's:
-the idle profiles at any free figure, the gone owners' build directories once the volume
-is low, and below the floor the recent profiles too, under tier 4's stop
-(`under_pressure_up_to=` is what every recent one would free, an upper bound;
-`reclaimable=` is what goes whole). A tier-3 row is listed (`idle_whole_up_to=` is what
-they would free) and never taken here, whatever `disk.apply` says: only the window's pass
-empties a whole build directory. So `disk.target_stale_days` says what is IDLE; once the
-volume is under the floor it does not protect a recently built checkout's cache.
+`disk` reports reclaimable build directories and caches; it removes nothing by default.
+Removal requires both `disk.apply = true` in `aterm.toml` and `--apply <class>` (refusals
+are journalled to `<state>/disk-ledger.jsonl`). Invalid `aterm.toml` or `[disk]` removal
+keys (`apply`, `target_stale_days`, `auto_free_gib`, `dead_build_dirs`, `idle_build_dirs`,
+`idle_build_days`) disable all manual and automatic removals.
+
+With no `<build-dir>` arguments, `disk` scans this working directory, `$HOME` checkouts
+and worktrees (2 levels deep), `x.py` stage build dirs, aterm's Rust build cache, and
+Claude Code's temp root on the current volume (never crossing mount points or protected
+macOS/Windows cloud folders).
+
+THRESHOLDS (`watch:`):
+  - `warn`: max(`disk.warn_free_gib` [default 40 GiB], 8% volume [<=64 GiB], 2 * `room`)
+  - `floor`: max(`disk.auto_free_gib` [default 10 GiB; <=0 disables auto], 5% [<=32 GiB], `room`)
+  - `emergency`: max(4 GiB, 1% volume [<=8 GiB]), capped at `floor`
+  - `room`: 2nd-largest 2h free-space drop in the last 7d (clamped to [min(16 GiB, 5%), 10% <=256 GiB]),
+    or `disk.room_gib`. Volume state is `ok` (>=warn), `low` (<warn), or `short` (<floor).
+
+WINDOW AUTOMATIC TIERS (cheapest first, re-measuring free space before each item):
+  - tier 1 (`low`, `disk.dead_build_dirs = true`): whole scratch/workspace build dirs whose
+    owner session or checkout is gone, with signed `CACHEDIR.TAG` and no locks or open files.
+  - tier 2 (`low`): idle Cargo profile `incremental/` dirs (idle past `disk.target_stale_days`,
+    default 1d) until free space reaches `warn` (or `floor + 5 GiB` when below floor).
+  - tier 3 (`short` or `await sys`, `disk.idle_build_dirs = true`): whole profiles of live
+    checkouts idle past `disk.idle_build_days` (default 7d) with no running process or bin link.
+  - tier 4 (`short`): recent profile caches (untouched for >=10m and unlocked) until free
+    space reaches `floor + 5 GiB` or reclaimed bytes cover the shortfall.
+
+`--apply cargo-targets` takes tier 1 (when `low`), tier 2 (at any free level), and tier 4
+(when `short`); tier 3 (`idle_whole_up_to=`) is emptied only by the window's pass.
 ";
 
 /// `aterm harness tap --help`.
 const HELP_TAP: &str = "\
-`tap` is not run by hand: it is the status-line command aterm puts on the Claude Code
-relaunch lines it types under `[harness] usage_tap = true` (off by default), an inline
-`--settings` whose statusLine command is `<aterm> harness tap`, refreshed every 10 s.
-Claude Code runs it after every reply and every 10 s, with its own usage figures on stdin;
-it writes them into <aterm state>/harness/claude-harness/rl/<tab>-<pid>.json (0600) and
-prints one line, `5h 42% \u{b7} 7d 61%`, which Claude Code draws under its composer. It
-always exits 0. It is added only on the machine's own login (no CLAUDE_CONFIG_DIR, no
-credential, profile or route of the session's own, no named login but the one `accounts
-renew` bound the machine's one account to), only where nothing in the session's settings
-sets a statusLine, disableAllHooks or an apiKeyHelper when the line is typed, only where
-you passed no --settings, and only from an aterm whose path has no space; a session
-started by hand gets it at its first relaunch (an upgrade, a restart).
-Claude Code puts the line's --settings above your settings files, so a statusLine you set
-later in a tapped session (/statusline, an edited file) shows from its next relaunch,
-which leaves the tap off. A status line from an organization's server settings or a
-plugin is not seen. Switched off, a tapped session keeps its tap, and is still recorded,
-until its next relaunch. The window records the figures for this machine's account
-(`aterm harness accounts`, `usage`); they move no session. A tapped session whose tap
-goes quiet is said once a day in Messages.
+`tap` is the statusLine command aterm adds to Claude Code relaunch lines when
+`[harness] usage_tap = true` (default false). Claude Code pipes its usage JSON to
+`<aterm> harness tap` after each reply and every 10 s; `tap` writes
+`<state>/rl/<tab>-<pid>.json` (0600), prints `5h <p>% \u{b7} 7d <p>%`, and exits 0.
+Added only on the machine's default login when no custom `CLAUDE_CONFIG_DIR`, credential,
+`statusLine`, `disableAllHooks`, `apiKeyHelper`, or `--settings` is present.
 ";
 
 /// `aterm harness ledger --help`.
 const HELP_LEDGER: &str = "\
-`ledger` prints the newest rows of the approval ledger the supervisor keeps for one
-session (<aterm state>/drive/<sid>.jsonl: every box its approval policy decided —
-approved, typed, skipped, escalated or deferred — with the rule and the command). With no @<sid>
-it reads the session it runs in.
+`ledger` prints the newest rows (default 20) of a harness jsonl ledger:
+  - `ledger [@<sid>] [<n>]`: supervisor approval decisions (`<aterm state>/drive/<sid>.jsonl`)
+  - `ledger disk [<n>]`: disk cleanup intents, removals, and denials (`<state>/disk-ledger.jsonl`)
+  - `ledger upgrade [<n>]`: live upgrade steps and owner requests (`<state>/upgrade/ledger.jsonl`)
+  - `ledger accounts [<n>]`: account walls, samples, rotations, pins, and auth checks (`<state>/accounts/ledger.jsonl`)
 ";
 
-/// `aterm harness accounts --help`, down to its limit reset paragraph's
-/// account of the kinds of reset and of the builds its texts were read in,
-/// which [`help_reset`] composes from the code; [`HELP_ACCOUNTS_VERBS`] is
-/// the rest.
+/// `aterm harness accounts --help`, down to [`help_reset`].
 const HELP_ACCOUNTS: &str = "\
-`accounts` LISTS THE CLAUDE CODE ACCOUNTS OF THIS MACHINE AND WHAT IS KNOWN OF EACH. The
-roster is `accounts.toml` beside aterm.toml: [[account]] rows of `label`, `class`
-(`dedicated`: this machine's alone; `shared`: your own account that your other machines
-draw on too), `dir` (the login's directory name; the one row with none is the login
-this machine already has), and optionally `email` and `browser` (below). It ships empty,
-and with no rows this verb says so, names the file it read and the `add` line to run — and,
-where `[harness] usage_tap` recorded this machine's own login, that login's figures and when
-the tap read them (in --json, the one row `main`). A file that does not admit — an unknown
-key, a repeated label, dir or email, a relative dir, an email that is not one address, two
-rows with no dir, more than 32 rows — is REFUSED whole (exit 1, the reason by name, an
-address never quoted). No credential is stored, read or copied: an account is a login you
-made through Claude Code's own flow, known here by its label; an email is read from this
-file alone, and no email, person or organization name is printed or logged.
-THE REPORT: `active: <label>, N of M sessions on it`, then one row per account — label,
-class, condition (`not-enrolled`: no login was made here yet — its login directory is
-missing or holds nothing, and `accounts login <label>` is what fills it — `accounts renew
-<label>` for a row with an email; `signed-out`: a login wall right after a session was moved
-onto it (before the move served a turn), a login wall on a row with an email (its login's own
-end, renewed by `accounts renew`), a first login whose flow failed, or the check after a
-sign-in said so (any other login wall records nothing yet); `limited until <time>`: a usage
-limit stands; `low`: the session window at 90% or the week at 97%, until that window resets;
-`usable`; `unseen`:
-nothing observed yet), `active`,
-`active:unproven` or `pinned` (`-` for neither), the limit-reset offer last read (`offer: 1 weekly reset left, use by <time>`, only once one was read; `offer: N left` for one an earlier build recorded), the sessions on
-it (`on: @s-…`, `(held: jobs)` for one that could not move) — then `next:`, the account
-a session at a limit would move to, or the time to wait until, and every other account's
-reason by name. The session and week percent, with their resets and when they were
-sampled, are `--json`'s alone (`null` for a figure nobody read, never 0). WHAT MOVES A SESSION is a window's supervisor (`[harness] accounts`, on unless
-`off`, and off with Claude Code's own `[harness.claude] enabled = false`): a supervised Claude Code session is relaunched on its own conversation under the
-pinned account (`use`) at its next turn end, and under `next` when its turn ends on a
-usage limit — one session first, the others once that account has served a turn. A
-session waiting at the limit of the very account `use` names is continued where it is.
-`accounts = \"off\"` stops all of that for the window's sessions: nothing is advised,
-moved or proven there, and a session's own limit is still recorded for this report. (The
-login lifecycle below has its own switch, `[harness] logins`, and goes on under it.)
-UNDER `accounts = \"early\"` (the default) a session is also moved AHEAD of a limit, at
-a plain turn end: off an account another session found at its limit, or one its last
-sample shows `low` by a window more than 15 minutes from its reset, to `next`. `wall`
-moves a session only at a limit.
-THE USAGE PROBE takes that sample, under `early` only and never with one account
-listed: at an idle turn end, nobody at the tab and nothing in the composer, the
-supervisor types `/usage` into the session, reads the Settings panel and closes it with
-Escape — at most once in three minutes per account, ninety seconds apart across
-accounts, and only where Claude Code draws full screen. It records the percentages only
-of a panel read WHOLE and SETTLED, twice the same. MEASURED by hand on Claude Code
-2.1.287: the panel stands whole for about a second, then grows taller than an ordinary
-window (58 rows at 150 columns) and its last row goes under the fold. The read is a race
-there: lost, NOTHING IS SAMPLED and the percents stay `null`. A window that never
-shows the panel's last row (110x32) is not probed again by that supervisor. RUN LIVE
-2026-10-02 against one real session at three sizes, with one account: it sampled at
-150x80 and 150x50 and recorded nothing at 110x32. Each probe is one line in the
-session's journal (<aterm state>/drive/<sid>.journal.jsonl; `aterm drive ledger @<sid>
---journal <that file>` puts it on the session's timeline): `PROBED seq=<n>
-rule=usage-probe@v1 /usage session=<p>% week=<p>%` (`?%` for a figure not read), or `…
-/usage no sample (<why>)`. A probe that was due and not run says why, once a point:
-`SKIPPED seq=<n> rule=usage-probe@v1 gate=<word>`.
-A LIMIT RESET is built and OFF BY DEFAULT (`[harness] limit_reset = true` turns it on).
-At Claude Code's usage-limit dialog a window's supervisor then takes the dialog's own
-reset row, matched by its kind's whole wording, and confirms only a confirmation it
-reads exactly — that kind's, for the limit this session's own process hit, with the
-row's count and day; anything else it closes with the reset kept. It never types a
-command for a reset. Only on this machine's own login (the row with no dir), with no
-other account on record running within 25 hours — and under `accounts = \"off\"`, which
-records no session's login, only where the roster lists no other login; once per limit
-on the machine; and only where the limit stands more than a day, or the reset on offer
-ends within one. It needs no roster: with none listed the login is recorded as `main` —
-in the ledger (`ledger accounts`); this report lists no account without a roster. How it
-ended is read from the session's transcript, never the screen — `reset-used` (the limit
-it was taken for is cleared for every session on the account, unless the vendor's line
-says that limit still stands), `reset-kept` or `reset-failed` — and while it is being
-taken no session is moved off that account. The offer column shows what a confirmation,
-or a reset used or kept, last showed, counted for its kind as Claude Code counts it
-(`offer: 1 weekly reset left`).
+`accounts` manages Claude Code logins on this machine and reports rotation state.
+The roster is `accounts.toml` beside `aterm.toml`: `[[account]]` rows with `label`,
+`class` (`dedicated` or `shared`), optional `dir` (the one row without `dir` is the
+machine's default login), and optional `email` and `browser`. Invalid rosters are refused
+whole (exit 1). No credentials or emails are ever printed or logged.
+
+REPORT & ROTATION (`[harness] accounts = \"early\" | \"wall\" | \"off\"`):
+  Prints `active: <label>, N of M sessions on it`, one row per account (`not-enrolled`,
+  `signed-out`, `limited until <time>`, `low`, `usable`, or `unseen`; `active`,
+  `active:unproven`, or `pinned`; `offer:`; `on:`), and `next:`.
+  - Under `early` (default), the supervisor rotates sessions at turn end off a limited or
+    `low` account (>=90% 5h or >=97% week with >15m to reset), and probes `/usage` on idle
+    full-screen sessions (at most once per 3m per account).
+  - Under `wall`, sessions rotate only when a turn ends on a usage limit.
+  - Under `off`, Limits are still recorded, but the supervisor never rotates sessions.
+
+LIMIT RESET (`[harness] limit_reset = true`, default false):
+  At Claude Code's usage-limit dialog on the machine's default login (with no other account
+  active in the last 25h, and limit >24h or offer expiring within 24h), the supervisor
+  selects the matching reset row and confirms it, recording `reset-used`, `reset-kept`, or
+  `reset-failed` from the transcript.
 ";
 
-/// `aterm harness accounts --help` after [`help_reset`]'s lines: the
-/// `accounts` verbs.
+/// `aterm harness accounts --help` after [`help_reset`]: the `accounts` verbs.
 const HELP_ACCOUNTS_VERBS: &str = "\
-None of it has been observed with two real accounts (the report's --json says so too, as
-`rotation.observed: false`), and the limit reset has never been run against a real wall.
-`accounts add <label> [--shared]` makes the login directory
-(<state>/accounts/logins/<label>, 0700), appends the row (creating the file) and prints
-the line to run next. THE ROW IS `not-enrolled` UNTIL THAT LINE HAS BEEN RUN: an empty
-login directory is an account listed, not one signed in, and no session is moved to it
-or offered it as `next`. The first `add` on a machine with no roster also lists this
-machine's own login as `main` (dedicated, no dir), so the login its sessions already run
-on is in the roster. A label is [a-z0-9][a-z0-9._-]{0,63} and not `help` (this command's
-help word: a roster row named so is refused like any other bad row); one already listed
-is refused (exit 1). A roster that is a symlink is written through it: the link stays and
-the file it points at gets the row and keeps its mode. A roster that defines `account`
-inline (`account = [ … ]`) cannot be appended to: the refusal prints the row to add by
-hand (both rows, where the first `add` would have listed `main` too).
-`accounts login <label>` prints `CLAUDE_CONFIG_DIR='<dir>' claude auth login` — Claude
-Code's own browser flow, in a home of its own so this machine's profile is not touched —
-and, at a terminal, runs it (`claude` from PATH; the dir exactly as the roster spells it,
-because the login is named by a hash of that string) and WAITS for it. When the flow exits
-0 it checks that one new login — `claude auth status --json` under
-CLAUDE_SECURESTORAGE_CONFIG_DIR=<dir> (empty for the row with no dir), 20 s at most —
-prints `<label>: signed in | signed out | not enrolled | could not run (<why>)` and records
-the answer: exit 0 for `signed in`, exit 1 for anything else. It reads the exit status and
-the one key `loggedIn`; the rest of that output, which names an email and an organization,
-is never printed, logged or kept. This verb runs that command only then: under a login
-that is not brand new it spends the single-use refresh token (anthropics/claude-code#95822),
-and a token minted seconds ago has nothing to refresh. A FLOW THAT FAILS — it exits
-non-zero, Ctrl-C included (on unix this command waits through the key) — RUNS NOTHING MORE
-UNDER ANY LOGIN (no check follows it) and is said (exit 1). Over a login directory that held
-anything before the flow, and for the row with no dir, nothing is recorded (one an earlier,
-unrecorded flow left its files in stays as it was). Over one that was EMPTY before the flow,
-where the flow left Claude Code's start-up files (written there before any sign-in), the row
-is recorded `signed out`: those files enrol it, and `unseen` would offer it as `next` with
-no login behind it. A flow that left nothing records nothing. A `claude` that cannot be
-started is said (exit 1) with nothing run and nothing recorded. With stdin not a terminal it
-prints the line, runs nothing and exits 0. With neither USER nor LOGNAME set the check would read
-a login that works as signed out, so the flow is not started (exit 1). The row with no dir
-is this machine's own login: its line is `claude auth login`, run in the default home with
-neither CLAUDE_CONFIG_DIR nor CLAUDE_SECURESTORAGE_CONFIG_DIR set, and checked alike.
-THE LOGIN LIFECYCLE (rows with an `email`; docs/DESIGN-claude-accounts-v2-2026-10-15.md §5).
-A row may carry `email` (the account's address) and `browser` (the display name of the
-browser profile that holds its claude.ai session). The address is read from this file to
-hint the sign-in and check a renewal, compared in memory, and never printed, logged or
-kept elsewhere. Such a row's login is `ok` (a turn served in the last 6 h), `idle`, `due`
-(its forecast end within 5 days) or `expired` (a login wall in a session on it), and the
-report adds `login: <state>, renew by <date>`: the forecast is the last renewal plus a
-lifetime learned per login (3 weeks to start, lowered by each end seen and by Claude Code's
-own notice that the login expires in N days), never by running anything under the login.
-`accounts adopt-default <label> --email <e> [--browser <b>]` lists this machine's own login
-(the row with no dir) as such a row; `add --email` lists another.
-`accounts renew [--due | <label>...] [--on <host>,... | --here]` renews each login named,
-and with --due every due or expired one: `CLAUDE_CONFIG_DIR=<state>/accounts/logins/<label>+<n>
-claude auth login --claudeai --email <e>` into a NEW staging directory, its page opened in
-the row's browser profile (aterm's own opener, `aterm-open-url`; else your default browser).
-A flow that exits non-zero (Ctrl-C included) runs nothing more and records nothing. One
-that exits 0 is checked ONCE, in that staging home — `claude auth status --json`, its
-address compared with the row's — and only on a match is the row bound to the new login
-(<state>/accounts/logins.json) and recorded `ok`: sessions on the old login move onto it at
-their next idle turn end (one stopped at its ended login is relaunched there, with its wall's
-continuation) where a window's supervisor relaunches — `[harness] enabled`, Claude Code's
-`[harness.claude] enabled`, `logins`, `relaunch` and `resume_limits` on, which the line says — and it prints the line that starts
-Claude Code under the new login by hand (`CLAUDE_SECURESTORAGE_CONFIG_DIR='<dir>'
-claude --resume`). Another account's address is REFUSED: the staging directory is removed,
-`wrong-account` recorded, and nothing live changes. Then, for each machine `--on` names
-(with --due and no --on, `[harness] hosts`), `ssh -t <host> aterm harness accounts
-renew --due --here` runs there, in this terminal — `--here`: that machine's own logins
-alone, whatever its own hosts list names, so one sitting goes one machine deep — and over
-ssh Claude Code prints its URL and waits for the code you paste at its own prompt (open the
-URL in the profile it names); aterm reads and relays nothing of it. A row with an email signs
-in only this way: `accounts login` refuses it. When a window's session on such a login loses
-it with nothing renewed, its supervisor signs it in where it stands, as any lost login:
-/login once, the method picker answered with the method the login already is, you asked
-once to finish the sign-in in the browser, `Login successful` confirmed. Once renewed, the
-session is restarted on the renewed login instead; where that restart cannot be made
-(`relaunch` or `resume_limits` off, a Claude Code aterm cannot restart, a draft in the tab)
-the tab's notice says what still holds it on its old login, which no renewal reaches: the
-draft (send it, and the tab is restarted by itself; aterm's own words left in the prompt
-are cleared, never sent, and a draft under Claude Code's open menu is reached by closing
-the menu first), or, where nothing restarts it, a sign-in in the tab (sign in to the row's
-label: type /login there, as the notice says; another account makes two rows of the
-roster one account). A notice names an account by its label, never its email. A weekly
-usage limit more than six hours from its reset, with no account move to come, gets one
-notice too: its step is the next row's sign-in by name
-(`accounts renew|login <label>`), `accounts use <label>` where another row is ready but
-aterm does not move the tab by itself (it pins that account: every session moves to it,
-until `accounts use --auto` ends the pin), the `[harness]` lines of aterm.toml that let
-the tab switch where `accounts = \"off\"`, `relaunch = false` or `resume_limits = false`
-keep it on its account (every one that does, together), or, with no row to sign in,
-another account (`accounts add <label>`, whose line then signs it in) — `aterm harness
-accounts` only where the roster or the state cannot be read, whose report says why. It
-says whether aterm then switches the tab by itself or, where the roster holds the tab at
-that limit, names the next step; and it names the reset, after which aterm continues the
-tab by itself (`resume_limits`; off, it says aterm does not).
-aterm never deletes a keychain item: each renewal leaves the old one, which nothing reads.
-`accounts use <label>` is THE OWNER'S WORD: the account's recorded limits are cleared and
-it is the active account, pinned. A label that is not listed, not enrolled or signed out
-is refused by name (exit 1). `accounts use --auto` ends the pin. Both are recorded, and a
-window's supervisor acts on them: each supervised Claude Code session moves to the pinned
-account at its next turn end (a session waiting at a limit is told at once, and one
-waiting at that account's own limit is continued there).
-A state file this build cannot read as its own — another schema, unreadable, too large —
-is never written over: `use` refuses and `login` records nothing (exit 1, naming the file),
-and the report shows an empty state beside the reason. `accounts` takes no --dry-run and
-no --sock.
-`ledger accounts` is the history (<state>/accounts/ledger.jsonl, cut to its newest 1024
-rows past 1 MiB): `wall`, `sample`, `rotate`, `proven`, `struck`, `move`, `probe`,
-`reset-used`, `reset-kept`, `reset-failed`, `auth`, `use`, `unpin`, `reset`, `epoch`, each
-with its account, session and reason. This command writes `auth`, `use` and `unpin`; a
-window's supervisor writes `wall`, `move`, `rotate`, `proven` and `struck` (with the `auth`
-and `unpin` they bring), under `early` `probe` (a `/usage` read claimed) and `sample` (what
-it read), and with `limit_reset` on the one `reset-…` row of each limit-reset attempt, with
-its reason. The usage tap's record writes `sample`, `reset` where a limit reset used inside
-a window refilled it (its figure dropped under the same reset, in a process served since;
-one row however many sessions see it), and `epoch` where another account signed in to the
-home (what was held of the account before it, its figures, walls, warnings, credits and
-reset offer, is dropped, and no figure served in the minute after it is taken: a running
-Claude Code can still be served on the old login then).
-`accounts stats [--json]` SAYS WHAT THIS MACHINE HAS OF THE CLAUDE CODE ACCOUNT of the home
-this command's environment names: a `5h` and a `week` row (% used, % left, the reset's time
-and the time to it), a `Fable` row as last seen, the plan and tier, the usage-credits word,
-a `≈$` row of list-price dollars and a `used` row (the Claude Codes running on the home now,
-and the login's state where its roster row is renewable). Every figure says `as of <age>
-(<source>, <machine>)`; a window whose reset passed reads `window reset <time>, no reading
-since`, never 0%. A limit reset used inside a window: where the usage tap saw the window's
-figure drop under the same reset, the window shows the reading after the drop; where
-aterm's own limit reset was used, or Claude Code said the window was refilled, it reads
-`reset used <time>, no reading since` until a reading comes. Either way no figure from
-before the reset counts again. Every empty figure says why: `usage_tap off` (`[harness]
-usage_tap = true` turns the tap on), `no reading yet`, `the usage tap records only the
-default home, under a roster that admits` (another home, or a refused roster: no reading of
-the tap is recorded there), `no /usage seen on this home` (the Fable week is known only
-from the `/usage` body Claude Code caches when a person opens `/usage`). What the accounts
-state holds under another account's key than
-the one the home's profile names (another login signed in to the home, and no reading of it
-has come yet) is the old account's and is not shown, here or by `aterm harness accounts`:
-its windows read as for an account nothing was read of. The windows come from
-the accounts state the usage tap writes, to a tenth of a percent, merged with the sample of
-the `/usage` probe, the cached `/usage` body, the walls and Claude Code's warnings by one
-rule: the newest reset, then the newest reset used inside it, then the largest. The dollars
-fold the home's transcripts of the last 8 days in memory, for 10 s at most (`complete:
-false` when cut), at the shipped price table's list prices: `≈$ (list)`, never a bill; with
-a current reading a window also shows what a full window holds (`≥`, a lower bound) and the
-week what is left (`≈`). The fold is the whole home's, so a window's spend since another
-account was seen on the home — the record is another's, its key changed inside the window,
-or the cached `/usage` body names another account — cannot be put on either: it reads
-`unattributed` (`spend.attribution` in --json), and neither figure is claimed until that
-window closes. The plan, credits and Fable answer are read on demand from the
-`.claude.json` of the home (beside ~/.claude with CLAUDE_CONFIG_DIR unset; inside the
-directory a set one names, ~/.claude itself included; in $HOME for an empty one), named
-`.claude-custom-oauth.json` with CLAUDE_CODE_CUSTOM_OAUTH_URL set — or, as Claude Code
-2.1.301 does, a `.config.json` in the Claude directory (~/.claude, or CLAUDE_CONFIG_DIR's;
-none is looked for under an empty one with no CLAUDE_PID, whose directory is not known) in
-its place when that is not empty, or is empty and writable while the other is absent.
-Credits read `on`, `out` or `off (<reason>)` — the word Claude Code keeps from its last
-served reply — and, as a hint, the plan bills Fable as `Fable included`, `credits only`,
-`limits end <date>` or `unknown` (a flag Claude Code caches under another name or shape than
-the one read). The account is labelled by its home, whichever of its files was read, by the
-first that applies: the roster row of the home where it is enrolled (for ~/.claude.json,
-CLAUDE_CONFIG_DIR unset or empty, the row with no `dir`; for any other, the row whose `dir`
-names CLAUDE_CONFIG_DIR, once its login was made); else `main` for ~/.claude.json; else
-`home-<key6>`. --json is schema 1 (`kind: \"account-stats\"`): each window's `used_pct`,
-`used_pct_x10`, `left_pct`, `resets_at`, `epoch_at`, `state` (`current`, `void`), `as_of`,
-`age_s`, `source` (`tap`, `usage-cache`, `wall`, `warning`, `sample`), `by` (the machine's
-id) and `missing.reason`; the account's key (`c-` and twelve hex digits of a hash of the
-account's own id, the same on every machine), plan, credits, spend, login and used_by;
-the machine's id, kept once minted beside the accounts state. The file is read by an
-allowlist: those fields and nothing else — never its API key, its MCP servers' env or
-headers, or the email, names and ids of the login — so none of that is printed or kept;
-the id is hashed as it is read. A home that could not be resolved (a relative
-CLAUDE_CONFIG_DIR with no CLAUDE_PID, or no absolute $HOME), one with no profile, or a
-profile that is not JSON says so (`no-home`, `no-profile`, `not-a-file`, `too-large`,
-`unreadable`). Writes nothing but the machine id; takes no lock; exit 0. This machine and
-Claude Code only: no other machine is asked, and Codex is not read yet.";
+VERBS:
+  - `accounts add <label> [--shared] [--email <e>] [--browser <b>]`
+    Creates `<state>/accounts/logins/<label>` (0700) and appends the row to `accounts.toml`
+    (also enrolling the default login as `main` on the first `add`). Labels match
+    `[a-z0-9][a-z0-9._-]{0,63}` (not `help`). Rows stay `not-enrolled` until signed in.
+  - `accounts adopt-default <label> --email <e> [--browser <b>]`
+    Lists the machine's default login (no `dir`) as a renewable row.
+  - `accounts login <label>`
+    Runs `CLAUDE_CONFIG_DIR='<dir>' claude auth login` in a terminal, then verifies once
+    with `claude auth status --json` (20 s cap) under `CLAUDE_SECURESTORAGE_CONFIG_DIR`
+    and records `signed in` (exit 0) or failure (exit 1). Refuses rows that carry `email`
+    (use `accounts renew`).
+  - `accounts renew [--due | <label>...] [--on <host>,... | --here]`
+    Signs in rows with `email` via a staging dir (`<label>+<n>`), verifies the account
+    email matches, and binds the row in `<state>/accounts/logins.json` so sessions move
+    at their next idle turn end (`wrong-account` deletes the staging dir and changes
+    nothing). Then runs `ssh -t <host> aterm harness accounts renew --due --here` on each
+    host in `--on` (or `[harness] hosts` under `--due`, skipped with `--here`).
+  - `accounts use <label> | --auto`
+    Pins an enrolled, signed-in account (clearing its recorded limits) or clears the pin
+    (`--auto`).
+  - `accounts stats [--json]`
+    Reads 5h, week, and Fable windows, plan, credits, 8-day list-price spend (\u{2248}$), login
+    state, and running sessions for the current home (`--json` is schema 1 `account-stats`).
+  - `accounts sync [<source>] [--machine <mN>] [--json]`
+    Synchronizes this machine's `accounts.toml` and `fleet-accounts.toml` from a source this
+    machine's person named: `<source>`, else the machine's own `fleet-accounts.toml` (only a
+    sync from a named source writes it), else `[fleet] accounts_source = \"<source>\"` in
+    aterm.toml. A source is a file (`~/` is the home), an http(s) URL fetched with curl (a
+    Google Sheets `/edit` link is read as its CSV export), or `rclone:<remote>:<path>` (rclone
+    runs for nothing else). There is NO DEFAULT: with none, nothing is read or fetched and
+    the sync says so (exit 1).
+  - `accounts serve [<source>] [--bind <addr:port>] [--machine <mN>]`
+    Serves the LAN account rotation dashboard and `fleet-accounts.toml` (default
+    `127.0.0.1:8741`) from the same source.
+  - A window keeps the fleet accounts only where a source is configured: it syncs a missing
+    `accounts.toml` (one try in 10 minutes) and signs a walled login's successor in in the
+    background (`claude auth login --claudeai --email <row's email>`, answered from
+    `<state>/accounts/mailbox` where that folder exists). Where none is configured it fetches
+    and starts nothing and logs `accounts-upkeep=unconfigured` once.
+";
 
 /// `aterm harness upgrade --help`: what moves a session, and when.
 const HELP_UPGRADE: &str = "\
-`upgrade` MOVES A LIVE CLAUDE CODE SESSION ONTO A NEWER BUILD without losing
-the conversation or anything it has running. A newer build is aterm's managed
-twin, or — for a session that runs Claude's own native install, the one whose
-footer shows Claude Code's own `Update installed` notice — that install's
-current version; never an older one.
-BY DEFAULT IT ASKS NOTHING AND TYPES NOTHING (`[harness] upgrade_ask =
-false`): a session is moved only at a GENUINELY IDLE point — its
-turn over by Claude's own status, no shell or background task, subagent or
-workflow of its own still running, no box, no draft, nobody at the tab, the
-LADDER's settle below — by SIGTERM and the relaunch line, and resumed with
-nothing typed after it (`done:resumed`): the tab's loop takes that point as if
-nothing had moved. Until then the tab only says the newer build is installed
-and that it moves over when idle, and that record always stands a look before
-the move (`wait:notice-shown`). With
-`[harness] upgrade_ask = true` it runs the COOPERATIVE flow instead, the rest
-of this paragraph: each sweep moves each session one step: when the
-agent is idle, its composer empty, no approval box up and nobody typing into the tab
-(`[harness] human_grace_s`; the LADDER below narrows it), it TYPES a notice
-asking the agent to reach a stopping point — let its background tasks finish
-while they make progress, never cancel them, but stop any wait of its own that
-can never end — naming the shells still running under the agent (up to five, by
-pid and age, and what each of the agent's own runs), and to confirm readiness
-in ordinary language. Only after that
-answer is in the transcript, with no shell still running under the agent and
-nobody holding the tab, does it send SIGTERM (never a harder signal), wait for
-the shell prompt, type a relaunch line — the atpkg hook sourced first so the
-shell's PATH is healed, then the same launch flags with `--resume <session>` —
-and, once the new process holds the conversation, type one line telling the
-agent to carry on. A launch it cannot resume (`--print`, `--worktree`, an
-unknown flag) is refused, not guessed; an unanswered notice, or a readiness
-answer that work under the agent outlives, is asked again every 30 minutes
-(at a break of the agent's background work too), four notices at most, and
-then that ROUND gives up, names what still runs, and types ONE line telling the
-agent the upgrade is off and to carry on — wherever a notice may go, a break of
-its background work included, until the round's rest ends (past it the new
-round's first notice supersedes it). NO STOP IS FOR GOOD: a
-round that gave up, was refused, or whose restart stopped rests two hours
-(one round's worth of asking: four notices, 30 minutes apart; the same stop
-again rests four hours, then eight) and then a NEW ROUND starts by itself —
-a fresh readiness request, its asks reset, `rearmed:<why>` on the ledger — whose
-first notice goes under every gate a first notice does, at an idle point or a
-break (never into a session at its limit). A late readiness answer to a round
-that gave up is still acted on, and no new round starts while it stands; one the
-agent's own work outlives past the drain is void, at a break as at an idle
-point, and the rest begins again from the void. A SESSION AT ITS USAGE LIMIT
-is never asked — its screen showing the limit, or its last
-reply the limit's, until the reset that reply names (30 minutes for one that
-names none) or a `/login` — and a notice a usage limit answered is not asked
-again until the model takes it: nothing is typed behind it and its window
-does not run. Once that limit is over and the screen shows none, the notice
-is typed again as the same ask — straight away until three upgrade notices
-wait untaken in the conversation; from then on it waits `queued` until the
-session goes on, `--now` (one copy more), or a rest after the limit's word
-ran out (one copy more): two hours, doubling with every further copy the
-model has not read, up to a day — so a limit that lasts for days adds one
-copy a day. A readiness answer is consent only from the process the notice
-reached, in its tab: a conversation resumed by hand is never restarted on it,
-and waits while that process lives (`wait:notice-owned-by-other-process`);
-once it is gone, the upgrade is pending again in a new round, with nothing
-owed to the gone one (`reopened:notice-process-gone`), and the process that
-holds the conversation now is asked afresh, under every gate a first notice
-is, only while it is still behind.
-THE LADDER — ACTIVITY DELAYS; IT NEVER DISABLES: the longer a session has
-been behind, the less the upgrade waits for a comfortable moment. Behind less
-than 20 minutes it asks for the natural idle point: the screen still 20 s and
-nobody who gave the tab input within
-`[harness] human_grace_s`. From 20 minutes a pause that only LOOKS quiet counts:
-two looks 20 s apart that read the screen idle with the same last words,
-however it repainted between them (a footer's clock). From
-an hour a person holds it only by a keystroke in the last 20 s. From two
-hours it moves at the first such pause, its settle waived. No rung ever moves
-it over a draft, a box, a keystroke in the last 20 s, a hold, a usage limit or
-the login wall, or running work — the agent's turn or status, the shells under
-it — and an empty process tree, and under `upgrade_ask = true` the
-readiness answer, still come before the restart. `--now` is the last rung at once,
-with the same floors.
-A SESSION IS MOVED ONLY WHILE THE
-AGENT IS ITS SHELL'S FOREGROUND JOB ON A TERMINAL AN ATERM TAB OWNS: an agent
-in a multiplexer pane (tmux, screen, zellij) or on any other pty the tab does
-not own (`script`, ssh) is held back — said once in the ledger, then waited
-on — because nothing typed into the tab reaches it; one started by a launcher
-script, a wrapper (`caffeinate claude`), `sh -c`, an IDE task or a shell with
-job control off is refused once, before anything is typed, because nothing
-would take the terminal back to relaunch it; and a suspended or backgrounded
-one waits. Each session's step lands in
-`<state>/upgrade/`, with a ledger of every act beside it, so the next sweep
-picks up where this one stopped — between the exit and the relaunch too, for
-5 minutes and while the agent's shell lives; past that the restart is
-recorded as failed and nothing more is typed into the tab. A restart that
-stops after its SIGTERM ended the agent stays listed though no Claude Code
-holds it any more (in the window for a day): `claude --resume <session>` in
-the tab takes the conversation back. One under way that has not moved for 5
-minutes — the agent still ending, its prompt not free, the new one never
-idle — reads stalled (`stuck:<what>`); nothing is forced.
-THE WINDOW DOES IT BY DEFAULT, with no sweep: each of its own tabs' supervisors
-takes the step at its session's idle points once atpkg, or Claude Code's own
-updater, installs a newer build, while aterm.toml's `[harness] enabled` and
-`[harness] upgrade` are not turned off; one lock keeps it and a hand-run sweep
-apart. It hands the relaunched agent straight back to its supervisor: by default
-nothing is typed (`done:resumed`); under `upgrade_ask = true` the supervisor types
-the carry-on at its first idle point. It also RELAUNCHES an agent that crashed
-(its session record left behind, read as the exit is seen — a graceful exit is
-someone's), on its conversation (`[harness] relaunch`). An agent the HARNESS'S
-OWN restart ended — its step returned with the relaunch still to type (someone
-at the returned prompt, a hold) — is never read as someone's exit, a limit's
-or a graceful one: the restart is carried at least every minute, whatever
-`[harness] relaunch` says, the line typed only once
-nobody types at the prompt and no hold stands — and a line once typed never
-typed again — until it lands or its 5 minutes run out, said on the tab either
-way, counted from the agent's exit, however long it took to shut down.
-THE MODEL goes with it: a session behind the newest model of its OWN family that
-the managed build offers (`aterm harness upgrade models`) is moved onto it on the
-relaunch line (`--model`, session-only — never `/model`, which also saves the
-person's default) — Opus 5 -> Opus 5.5 first; only with nothing newer of its
-family, up the priority list for a model nobody chose; never down, a launch
-alias like `opus` kept as it is — riding a build restart when there is one, else
-by itself once its prompt cache is cold, or at most an hour after the move came
-due. A turn that ended with the agent's own background work in flight (Claude's
-`Waiting for N dynamic workflow`, a shell it left running) is a NATURAL BREAK: once it has stood 20 s the window types the notice
-there, and again only after a whole 30 minutes with that work still running,
-four notices at most before the round gives up (and two hours later a new round
-asks again, there too). The restart still waits for an idle point with nothing
-running under the agent, so running work is never ended; a readiness answer a
-person held past the drain is void at a break as at an idle point, and the line
-that releases the agent is typed there too. CLAUDE'S OWN STATUS is read against
-its screen: a `busy` or `shell` status that has stood 20 s over a screen read
-idle two looks in a row (of the same agent, no more than about ten minutes
-apart) lets the notice and the release go as at a break, whether work runs
-under the agent (a shell whose count the screen does not draw) or nothing does.
-The restart waits for Claude's own `idle` all the same — work inside the
-agent's own process is no process under it — asking for readiness again
-after 30 minutes, and releasing the agent once the round gives up; that wait
-is `status-stale:<status>`.
-A HAND-RUN sweep obeys `[harness] enabled` too: with it off it prints `step=refused:bypassed`, types and signals nothing
-and exits 1 (a `--dry-run` says so on stderr, still prints its plan, and
-exits 0); naming the verb is the consent `[harness] upgrade` would give.
-The refusal also names, on stderr, every restart an earlier sweep left part
-way (its agent already signalled): that conversation stays where it stopped
-until the switch is back on. A `false` wins wherever it is: the line written
-below another `[table]` header, which TOML files under that table, still turns
-the sweep off, and `upgrade` says on stderr where it found it. An agent's own
-`[harness.<agent>] enabled = false` leaves that agent's sessions out of the sweep (said
-on stderr) while the others are swept, and a `--now`/`--defer`/`--skip` on its tab is
-recorded but waits, as under `[harness] enabled = false`.
-A sweep that did not run exits non-zero: `step=busy:another-sweep` (another
-sweeper holds the lock — often the window's own) exits 75, try again later;
-`step=busy:state-unwritable` or `busy:lock-unopenable` exits 1.
-A `--dry-run` line also says `pending_for=` (how long the session has been
-behind) and `wait_for=` (how long its current wait has lasted), as the last
-step recorded them. A give-up or a new round, which the upgrade takes
-whatever the session shows, is said with what holds the point it waits for
-after `@` (`step=gave-up@box`, `step=would-rearm:unanswered@not-idle:busy`).
+`upgrade` moves live supervised sessions onto a newer build (and newer model) in place,
+preserving the conversation and running work.
 
-NO CODEX IS MOVED LIVE: a vendor `codex` is shown, never moved, and a
-codex-alab upgrades itself (its contract, §5). A Codex record left in flight
-by an older aterm's Codex lane is closed (`failed:codex-lane-retired`) and
-nothing is typed into its tab; `codex resume` there takes the conversation
-back.
+MODES:
+  - Quiet mode (`[harness] upgrade_ask = false`, default): waits for a genuinely idle point
+    (turn over, no child shell/background task/subagent/workflow, no box, empty draft,
+    nobody at the tab, and ladder settle), sends SIGTERM, types the relaunch line with
+    `--resume <session>`, and resumes without typing a prompt (`done:resumed`;
+    `wait:notice-shown` before the move).
+  - Cooperative mode (`[harness] upgrade_ask = true`): types a readiness notice asking the
+    agent to finish background work and confirm readiness. Repeats every 30m up to 4
+    notices before resting 2h (then 4h, 8h) and re-arming (`rearmed:<why>`). Never types
+    into a session at a usage limit.
 
-A MUSE CODE IS MOVED THE QUIET WAY ALONE, whatever `upgrade_ask` says: once
-atpkg lands a newer build of it (its build record's version, in atpkg's own
-revision-aware order — `1.4.11-R6500.1` over `1.4.10-R6427.1`), the window
-ends a supervised Muse at a genuinely idle point — every run of its session's
-own log over, no task of it still running (a shell it sent to the background)
-and no queued end of one Muse has still to take a turn on, in its session and
-its subagents' logs; no process under it at all; its screen idle by its own
-reader and its composer empty; nobody at the tab; the new build proved to
-start (`--help`) — by SIGTERM, its exit claimed first as the upgrade's own,
-and relaunches it through the managed `muse resume <uuid>` on the same session.
-Nothing is typed after; it is done once the session's `.session.lock` names the
-new process (`done:resumed`). No notice or READY is typed into a Muse Code:
-its words are Claude Code's, and its screen reads a READY falsely. Its waits
-say what held it (`wait:turn-open`, `wait:background-work`, `wait:open-task`,
-`wait:queued-work`, `wait:child-process`, `wait:process-table`,
-`wait:screen-not-idle`, `wait:draft`, `wait:held`, `wait:build-fails`,
-`wait:log-unreadable`, `wait:log-unproved`, `wait:claim-unwritten`,
-`wait:changed-before-signal`).
-`wait:turn-open` and `wait:queued-work` at a turn's end are its log catching
-up with its screen: the window holds the supervisor's continuation there for
-two looks, as for Claude Code's settle, so a Muse kept going turn after turn
-is still moved at a turn's end. A task Muse opens to reserve the session's
-name (`session_name.allocate`) is no work: the next process redoes it. A newer
-Muse Code wakes only the window's Muse Code sessions (atpkg's
-`activation-notices/muse`), never a Claude Code's upgrade. Only the window
-moves a Muse Code; this sweep does not.
+THE LADDER (activity delays, never disables):
+  - <20m behind (`prefer`): screen still 20 s, no human input within `[harness] human_grace_s`.
+  - >=20m (`settled`): two idle reads 20 s apart with the same last words.
+  - >=1h (`keys-only`): human grace narrows to a keystroke in the last 20 s.
+  - >=2h or `--now` (`land`): first idle pause with no keystroke in the last 20 s.
+  Never moves over a draft, approval box, keystroke in the last 20 s, hold, usage/login
+  wall, or running child process.
 
-AN AGY IS MOVED THE QUIET WAY ALONE too, whatever `upgrade_ask` says: once
-atpkg lands a newer build of it (its build record's version, `1.4.1` over
-`1.4.0`), the window ends a supervised agy at a genuinely idle point — its
-screen idle by its own reader with no background task or subagent drawn
-under the composer nor counted in its footer, its composer empty; its
-conversation's summary row idle with nothing not fully idle and no subagent
-of it running (read only from agy's own database); no background task,
-timer, cron or subagent its transcript shows started since this agy started
-still open; no message waking it unread or just written; no process under it
-at all; no other agy with its conversation open (the relaunch could not
-type while one has); nobody at the tab; the new build proved to start
-(`--help`) — by SIGTERM, its exit `0` claimed first as the upgrade's own,
-and relaunches it through the managed `agy --conversation=<uuid>` on the
-same conversation.
-Nothing is typed after; it is done once the new process holds the
-conversation's presence lock (`done:resumed`). No notice or READY is typed
-into an agy: its transcript names no model and no process. Its waits say
-what held it (`wait:background-work`, `wait:subagent-working`,
-`wait:turn-open`, `wait:queued-work`, `wait:child-process`,
-`wait:process-table`, `wait:conversation-shared`, `wait:screen-not-idle`,
-`wait:draft`, `wait:held`, `wait:summary-unreadable`,
-`wait:summary-unproved`, `wait:log-unreadable`, `wait:log-unproved`,
-`wait:messages-unreadable`, `wait:build-fails`, `wait:claim-unwritten`,
-`wait:changed-before-signal`). An agy launched with a variable set on its own
-line (`GEMINI_API_KEY=… agy`) is never restarted (`skip:env-not-carried`):
-the relaunch line runs in the shell's environment and carries only `HOME`.
-`wait:turn-open` and `wait:queued-work` at a turn's end are agy's own record
-catching up with its screen, held for two looks as Muse Code's are. A standing cron holds the move for as long as it
-stands: a restart would stop it. A newer agy wakes only the window's agy
-sessions (atpkg's `activation-notices/agy`). Only the window moves an agy;
-this sweep does not. Gemini CLI is not moved live.
+SCOPE & EXIT CODES:
+  - Moves only foreground jobs on an aterm tab's own PTY (tmux/screen/ssh panes wait as
+    `held-back:<owner>`; wrapper scripts refuse).
+  - Model upgrades (`aterm harness upgrade models`) ride the relaunch line via `--model`
+    to the newest model of the same family (or up the priority list).
+  - Muse Code (`muse resume <uuid>`) and agy (`agy --conversation=<uuid>`) are moved by the
+    window in quiet mode only; Codex and Gemini CLI are never moved live.
+  - Hand-run sweeps exit 0, 1 (refused/unwritable), or 75 (`step=busy:another-sweep`).
 ";
 
 /// `aterm harness upgrade --status --help`: every field of a status line.
 const HELP_UPGRADE_STATUS: &str = "\
-`upgrade --status` READS the recorded upgrades and sweeps nothing: one line
-(and under it, indented, the move and what holds it) for each a live Claude Code still holds on a build older than its
-target, in that tab (a conversation that ended, or was moved onto the build by hand,
-leaves its file behind; it is not listed) — the tab, the conversation, from
-and to, the phase, `pending_for=`,
-`wait=` (what the last step waited on: `settling`, `awaiting-ready`,
-`ready-unrecorded` (the agent's readiness answer is on its screen, not yet in its
-transcript: the next look reads it), `superseded` (it confirmed readiness, then got
-more work before the restart: it is asked again when that turn ends),
-`background`, `draft`, `attended`, `held`, `terminal:<owner>`, `not-idle:busy`
-for a turn a hand-run sweep found in progress, `status-stale:<status>` for a status
-the idle screen does not bear out — the restart's until Claude says `idle` …,
-`release:<gate>` while that gate holds the line an abandoned notice owes the
-agent; where no look has recorded one, a Claude Code row reads Claude's own live
-status, `not-idle:waiting` for a box, never over a recorded word) with
-`wait_for=`, the owner's `request=` (`-`, `now`, `defer:<time left>`,
-`skip:<version>`), `next_round=` (for a round that stopped: how
-long until the new round it starts by itself, `due` once it has rested, `-` for
-any other, one the owner's `--skip` holds, or one that gave up and acts on a
-late readiness answer — no new round starts while that answer stands), `stalled=` — `-`
-while the upgrade will move on its own, else why it will not: `refused:<why>`
-(it stays said through the new round's first look, which meets it again unless
-something changed), `failed:<why>`, `held-back:<owner>` (a multiplexer pane),
-`stuck:<exiting|exited|relaunched>` (a restart under way that has not moved for
-5 minutes — the agent still ending, its prompt not free to type at, the new one
-never idle: nothing is forced, and no word moves it; a sweep says it once on the
-ledger, `stuck:<what>`), `blocked:<wait>` (a wait
-no rung passes, blocking the move 30 minutes whatever other wait came between:
-`no-shell-integration`, `screen-unreadable` — quit it in its tab and resume it
-there), `unwatched` (no look has read the record for an hour, its due watch
-half an hour late: aterm's own fault — the window's host stopped, none runs
-for the tab, or its watch cannot write; said over every kind below it, never
-within 10 minutes of the Mac waking or booting (the window also waits 10
-minutes after its host starts watching), never of a conversation running
-outside every aterm tab
-(no host watches it there), and the column reads
-`stalled/<to>/unwatched:<span>/<age>`, how long since it was checked), or
-`overdue` (6 hours behind — four
-past the point where it moves at its first pause — whatever it waits on, unless the owner's `--now`
-came in the last 30 minutes; and at once, whatever its age and any `--now`, for
-a usage limit an hour past its end (the reset its transcript named — plus 10
-minutes under the default
-flow; a week after its wait began where no reset was named, never for a spend
-or credit cap) with its
-notice still the recorded wait: where the reset was named,
-the default upgrade moves it at its next idle point; otherwise (no reset
-named, or `upgrade_ask = true`) only a turn typed in its tab moves it) —
-and `held_by=` (what ran under the agent at the last look that
-waited, by pid, name and age — `63492(zsh:5d4h),…`, `-` for nothing; never a
-command), `release=` (the release still owed to an agent the upgrade asked
-to wind down and did not restart — why it abandoned that notice: `gave-up`,
-`void`, `skipped`, `deferred`, `retargeted`, a stop's reason; `-` for none),
-`rung=` (the ladder's rung while the move is owed: `prefer`, `settled`,
-`keys-only`, `land` — `land` under the owner's `--now` — and `-` once it is
-under way, done or stopped), and the watch's fields last: `looked=` (how long
-ago a look off a point read the record) and `by=` (the aterm build that
-looked), `point=` (how long ago the session's loop last offered an idle point
-or a settled break) and `guard=` (the loop's guard that withheld the latest
-point: `wall`, `settle`, `no-background-wait`, `act-untaken`, `not-idle`, …),
-each `-` for none recorded, and `watch_at=` (when the record is due to be
-watched: the step's deadline, or 24 hours behind, whichever is first; `due`
-once past, `-` for a record nothing more is owed on); then `cause=` (what holds
-the move, by class, whether or not anything is told of it yet: `own-work`,
-`person`, `limit`, `limit-passed`, `notice`, `unreached`, `unrecorded`,
-`unclassified`, …; `-` once it is under way or done) and `told=` (what the
-owner is told of it: the kind of the interrupt, digest line or log fault the
-move is — `own-work` after a day, `agent-down`, `harness-stuck`,
-`limit-passed`, `no-progress`, … — and `-` for a record, however long it has
-waited: a wait is no alert); and, only while aterm's
-own fence refuses the notice due, `refused=<n>/<span>` at the very end (how
-many looks in a row it could not type it, and since how long).
-A round that GAVE UP is no stall: it rests until its `next_round=`,
-and its column reads `pending/<to>/next-round:<span>/<age>` —
-`pending/<to>/ready/<age>` while it acts on a late readiness answer instead.
-The window shows the same per tab as `upgrade=`
-in `aterm ctl status`/`sessions` and records it in Settings ▸ Messages — one
-record, `<agent> <build> installs itself in tab N`, saying there is nothing to
-do and from what time the first pause is enough. It marks a tab
-(`meta attention owner=upgrade`) and puts a row on the message band ONLY where
-the owner is needed NOW and the action is theirs alone: the agent the upgrade
-ended is not back (`agent-down`, and the command that resumes it), it came back
-and has reached no prompt in half an hour (`relaunch-stuck`), a shutdown it
-asked for has hung (`hung-exit`). Every other wait — the
-agent's own work, a person at the tab, a usage limit, a box the supervisor
-answers — is this status, the ledger, the wait log and the log of Settings ▸
-Messages; after a day of the agent's own work (and a whole round of notices
-answered `not yet`) or a draft unsent it is one line of the exceptions digest,
-and aterm's own faults are one Warn record. `--json` says which, for every
-tab: `attention` (`quiet`, `fault`, `digest`, `interrupt`), `attention_kind`,
-`cause` (what holds the move, as a class word), `cause_words` (the same, as a
-sentence) and `waits` (the last 24 changes of
-wait with the facts that decided each).
+`upgrade --status` prints recorded upgrades for live sessions without sweeping:
+  - `pending_for=`, `wait=`, `wait_for=`: time behind and current wait (`settling`,
+    `awaiting-ready`, `ready-unrecorded`, `superseded`, `background`, `draft`, `attended`,
+    `held`, `terminal:<owner>`, `not-idle:busy`, `not-idle:waiting`, `status-stale:<status>`,
+    `release:<gate>`).
+  - `request=`: owner request (`-`, `now`, `defer:<left>`, `skip:<version>`).
+  - `next_round=`: time until a stopped round re-arms (`due` when ready, `-` otherwise).
+  - `stalled=`: `-` while healthy, else `refused:<why>`, `failed:<why>`, `held-back:<owner>`,
+    `stuck:<exiting|exited|relaunched>` (>5m in restart), `blocked:<wait>` (>30m on
+    `no-shell-integration` or `screen-unreadable`), `unwatched` (>1h without a host look),
+    or `overdue` (>6h behind, or >1h past a usage-limit reset).
+  - `held_by=`: child processes (`<pid>(<name>:<age>),...` or `-`).
+  - `release=`: release line owed after an abandoned notice (`gave-up`, `void`, `skipped`,
+    `deferred`, `retargeted`, or `-`).
+  - `rung=`: ladder rung (`prefer`, `settled`, `keys-only`, `land`, or `-`).
+  - `looked=`, `by=`, `point=`, `guard=`, `watch_at=`: last host look, build, idle point,
+    loop guard (`wall`, `settle`, `no-background-wait`, `act-untaken`, `not-idle`), and
+    next watch deadline (`due` or `-`).
+  - `cause=`, `told=`, `refused=`: wait class (`own-work`, `person`, `limit`, `limit-passed`,
+    `notice`, `unreached`, `unrecorded`, `unclassified`), surfaced alert kind (`agent-down`,
+    `relaunch-stuck`, `hung-exit`, `harness-stuck`, `no-progress`, or `-`), and fence
+    refusals (`<n>/<span>`).
+  - `--json` adds `attention` (`quiet`, `fault`, `digest`, `interrupt`), `attention_kind`,
+    `cause`, `cause_words`, and `waits` (last 24 wait transitions).
 ";
 
-/// `aterm harness upgrade --help`, after [`HELP_UPGRADE`]: the owner's `--now`, `--defer` and
-/// `--skip`.
+/// `aterm harness upgrade --help`, after [`HELP_UPGRADE`]: `--now`, `--defer` and `--skip`.
 const HELP_UPGRADE_WORD: &str = "\
-THE OWNER'S WORD on one tab's upgrade — `upgrade <sid> --now|--defer
-<dur>|--skip` — is written into that upgrade's state under the sweep's own
-lock (waiting up to 10 s for a step in progress; past that it exits 75 and
-writes nothing) and put on the ledger as `requested:<word>`, and it wakes the
-window's worker for that tab, which takes it at the session's next idle
-point. The word is on the TAB named: the same conversation resumed in another
-tab is asked afresh. `--now` stands the upgrade at the LADDER'S LAST RUNG at
-once: no quiet window, and a person at the tab holds it only by a keystroke
-in the last 20 s (its `status human_ms=`) — never waived, the word included —
-and nothing else (an idle status, an empty composer, no box, no hold and
-nothing running under the agent are still required —
-and, under `upgrade_ask = true`, the readiness answer — and what is typed is still
-fenced on the screen it was judged by).
-Every word arms a NEW ROUND of the upgrade: under `upgrade_ask = true`, a
-notice after it asks for fresh readiness confirmation; no earlier answer carries.
-An upgrade the owner holds (`--defer`, `--skip`) owns none of its session's turn ends:
-the tab's supervisor goes on continuing the worker as if none were pending,
-and a notice already typed is ended — under `upgrade_ask = true` the hold's
-end brings a fresh notice and needs a fresh readiness answer. ONE
-PLACE `--now` adds an act: an upgrade that GAVE UP (no readiness answer it could act
-on after the last notice) is re-armed AT ONCE rather than at its next round,
-so, under `upgrade_ask = true`, the notice is typed again and, after its readiness
-answer, the agent is restarted. An upgrade that was REFUSED or FAILED is not
-re-armed by the word — `--now` exits 1, names why and when its next round
-starts by itself. `--skip` holds a stopped round too: it is not re-armed
-while the skip of its build stands, and a `--defer` holds it until it runs
-out. `--now`
-cannot reach an agent HELD BACK in a multiplexer pane either (typing into the
-tab does not reach it; stderr says so). `--defer` holds it until the time runs
-out; `--skip` holds it on the running build until a newer target than this
-one comes, and is what ends a stall the harness cannot move. A restart
-already under way is neither held nor hurried (exit 1).
-
-The window writes the same words, on the same path, with no shell: a
-waiting upgrade's record offers two of them (Upgrade now where `--now` moves
-it, Not today — a one-day `--defer` — and Skip version; a row that stands for
-an agent that is down offers none, for none of them brings it back), Settings ▸
-Messages offers them on the waiting record while exactly one session waits,
-and the tab's context menu offers every word that does something for the
-upgrade of the pane it was opened on. Each is for the session and the build
-it names: pressed after the upgrade moved on to a newer one, nothing is
-written.
+OWNER REQUESTS (`upgrade <sid> --now | --defer <dur> | --skip`):
+  Written under the upgrade lock (waits up to 10 s, else exits 75) as `requested:<word>`
+  on the ledger and wakes the tab's worker.
+  - `--now`: jumps to the `land` rung and immediately re-arms a round that gave up (exits 1
+    if the upgrade was refused/failed, is held in a multiplexer pane, or is already
+    restarting).
+  - `--defer <dur>`: holds the upgrade for `<dur>` (up to 30d) and cancels any open notice.
+  - `--skip`: holds the session on its current build until a newer target build arrives.
 ";
 
 // Injected environment
@@ -1348,10 +746,12 @@ pub enum AccountsCmd {
         json: bool,
     },
     /// `accounts sync [<source>] [--machine <mN>] [--json]`: synchronize this
-    /// machine's `accounts.toml` and `fleet-accounts.toml` from the accounting
-    /// CSV, Google Sheet, or LAN fleet config.
+    /// machine's `accounts.toml` and `fleet-accounts.toml` from `source`, else
+    /// the source this machine configured
+    /// ([`super::accounts_sync::configured_source`]); with neither, nothing.
     Sync {
-        /// Optional path or URL to CSV or `fleet-accounts.toml`.
+        /// Optional path, URL or `rclone:<remote>:<path>` of a CSV or a
+        /// `fleet-accounts.toml`.
         source: Option<String>,
         /// Optional machine ID override (`m8`, `m14`, …).
         machine: Option<String>,
@@ -1361,7 +761,8 @@ pub enum AccountsCmd {
     /// `accounts serve [<source>] [--bind <addr:port>] [--machine <mN>]`:
     /// serve the local/LAN account rotation dashboard and `fleet-accounts.toml`.
     Serve {
-        /// Optional path or URL to CSV or `fleet-accounts.toml`.
+        /// Optional path, URL or `rclone:<remote>:<path>` of a CSV or a
+        /// `fleet-accounts.toml`; else the configured source.
         source: Option<String>,
         /// Optional bind address (`127.0.0.1:8741` or `0.0.0.0:8741`).
         bind: Option<String>,
@@ -2608,9 +2009,8 @@ fn run_codex_usage(env: &Env, thread: &str, json: bool, out: &mut dyn Write) -> 
         out,
         "SPEND folded from {folded}, the conversation of Codex thread {thread} \
          (CODEX_THREAD_ID) under {}. A fork's copied prefix counts nothing ({} copied token \
-         counts).{short} \u{2248}$ is the list price of the table of {}, never a bill. A \
-         rollout's rate-limit windows are not read here: `aterm harness limits` reads Codex's \
-         /status card.",
+         counts).{short} \u{2248}$ is the list price of the table of {}, never a bill; \
+         rate-limit windows are not read from a rollout.",
         home.display(),
         f.copied,
         prices.as_of().unwrap_or("?"),
@@ -3060,8 +2460,8 @@ const DISK_REMOVAL_KEYS: [&str; 6] = [
 ];
 
 /// What [`removal_off`] does, as a note says it.
-const DISK_OFF: &str = "so every removal is off (disk.apply false, auto_free_gib 0, \
-                        dead_build_dirs false, idle_build_dirs false) until it is fixed";
+const DISK_OFF: &str = "so every removal is off (disk.apply=false, auto_free_gib=0, \
+                        dead_build_dirs=false, idle_build_dirs=false)";
 
 /// `config` with every removal off: the owner's verb (`apply`), the
 /// automatic floor (`auto_free_gib = 0`) and the whole-directory reclaim
@@ -5322,9 +4722,8 @@ fn upgrade_line_with(
 /// ([`accounts::advise`]) and relaunches it under the pinned account, or
 /// continues one waiting at this account's own limit. The line claims no move:
 /// this command makes none, and a session with no supervisor follows nothing.
-pub const ACCOUNTS_USE_RECORDED: &str = "recorded: a window's supervisor moves each Claude Code \
-                                         session to it at the session's next turn end, and \
-                                         continues one that waits at this account's own limit";
+pub const ACCOUNTS_USE_RECORDED: &str = "recorded: supervisor moves Claude Code sessions to it \
+                                         at the next turn end (or continues one waiting at its limit)";
 
 /// The line that lists an account, as the report names it where none is
 /// listed (`list one:`) or none can take over (`list another:`): the label is
@@ -5592,7 +4991,24 @@ fn renew_flow_of(
     browser: &RenewBrowser,
 ) -> Result<i32, String> {
     terminal_flow(
-        || renew_command(program, home, email, browser).spawn(),
+        || {
+            let mut cmd = renew_command(program, home, email, browser);
+            if let Some(harness_state) = Path::new(home)
+                .parent()
+                .and_then(Path::parent)
+                .and_then(Path::parent)
+            {
+                let store = accounts::Store::at(harness_state);
+                let user_home = std::env::var_os("HOME").map(PathBuf::from);
+                if let Some(mailbox) =
+                    super::accounts_sync::resolve_mailbox_dir(user_home.as_deref(), &store)
+                {
+                    cmd.env(super::open_url::EMAIL_ENV, email)
+                        .env(super::open_url::MAILBOX_ENV, mailbox);
+                }
+            }
+            cmd.spawn()
+        },
         |mut child| child.wait(),
         || {},
     )
@@ -5619,6 +5035,9 @@ pub(super) fn status_in_home_within(
     let mut cmd = aterm_uds::spawnfd::Command::new(program);
     cmd.args(["auth", "status", "--json"])
         .env(accounts::HOME_ENV, home);
+    if let Some(user_home) = var("HOME").filter(|v| !v.is_empty()) {
+        cmd.env("HOME", user_home);
+    }
     cmd.envs(pass);
     super::align::capture_bounded(cmd, budget, MAX_AUTH_STDOUT)
 }
@@ -7851,7 +7270,8 @@ fn run_accounts_renew(
         let _ = writeln!(out, "nothing is due on this machine");
         return ExitCode::SUCCESS;
     }
-    if !chosen.is_empty() && !host.stdin_is_terminal() {
+    let mailbox_dir = super::accounts_sync::resolve_mailbox_dir(env.home.as_deref(), &store);
+    if !chosen.is_empty() && !host.stdin_is_terminal() && mailbox_dir.is_none() {
         let _ = writeln!(out, "due here: {}", chosen.join(", "));
         let _ = writeln!(
             err,
@@ -7877,7 +7297,7 @@ fn run_accounts_renew(
             continue;
         };
         let own_dir = file_roster.row(label).and_then(|r| r.dir.as_deref());
-        let browser = if host.under_ssh() {
+        let browser = if host.under_ssh() || mailbox_dir.is_some() {
             RenewBrowser::Remote {
                 opener: opener
                     .get_or_insert_with(|| opener_link(&store, host))

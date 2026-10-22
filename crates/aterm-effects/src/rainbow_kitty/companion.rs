@@ -615,22 +615,31 @@ where
 /// into `0..cols`. A body 5.2 cells wide occludes six cells, and a fractional
 /// left edge one more.
 #[inline]
-fn cell_span(x: i32, w: i32, cw: i32, cols: u16) -> (u16, u16) {
-    let last_col = i32::from(cols.saturating_sub(1));
-    let first = x.div_euclid(cw).clamp(0, last_col);
-    let last = (x.saturating_add(w).saturating_sub(1))
-        .div_euclid(cw)
-        .clamp(first, last_col);
-    (
-        u16::try_from(first).unwrap_or(u16::MAX),
-        u16::try_from(last).unwrap_or(u16::MAX),
-    )
+const fn cell_span(x: i32, w: i32, cw: i32, cols: u16) -> (u16, u16) {
+    let last_col = cols.saturating_sub(1) as i32;
+    let first_raw = x.div_euclid(cw);
+    let first = if first_raw < 0 {
+        0
+    } else if first_raw > last_col {
+        last_col
+    } else {
+        first_raw
+    };
+    let last_raw = (x.saturating_add(w).saturating_sub(1)).div_euclid(cw);
+    let last = if last_raw < first {
+        first
+    } else if last_raw > last_col {
+        last_col
+    } else {
+        last_raw
+    };
+    (first as u16, last as u16)
 }
 
 /// Build the [`Seat`] for a resolved `x`/`y`. `col` is read off the final `x`
 /// so the struct carries one position, not two.
 #[inline]
-fn seat(
+const fn seat(
     query: &SeatQuery,
     x: i32,
     y: i32,
@@ -639,8 +648,13 @@ fn seat(
     lift_rows: u16,
     over_ink: bool,
 ) -> Seat {
-    let cw = i32::try_from(query.geom.cw.max(1)).unwrap_or(i32::MAX);
-    let w = i32::from(query.rest.w);
+    let cw_usize = if query.geom.cw > 1 { query.geom.cw } else { 1 };
+    let cw = if cw_usize > i32::MAX as usize {
+        i32::MAX
+    } else {
+        cw_usize as i32
+    };
+    let w = query.rest.w as i32;
     let side = if x + w / 2 > caret_left + cw / 2 {
         Side::Ahead
     } else {

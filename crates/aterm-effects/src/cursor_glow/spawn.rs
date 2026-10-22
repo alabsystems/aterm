@@ -1436,7 +1436,7 @@ impl CursorGlow {
     /// witnesses' neighbour captures rotate with it, so metadata and buffers
     /// stay one unit.
     #[inline]
-    pub(super) fn rotate_row_probe(&mut self) {
+    pub(super) const fn rotate_row_probe(&mut self) {
         if self.row_cur_meta.is_some() {
             std::mem::swap(&mut self.row_prev, &mut self.row_cur);
             std::mem::swap(&mut self.row_above_prev, &mut self.row_above_cur);

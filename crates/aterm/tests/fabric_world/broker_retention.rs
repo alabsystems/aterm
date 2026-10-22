@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! ONE CONSTRUCTOR OPENS THE DEFAULT BROKER (session log Phase 6 step 6E-2,
-//! ruling U24): a world's in-process broker retains its log by aterm's
+//! ONE CONSTRUCTOR OPENS THE DEFAULT BROKER:
+//! a world's in-process broker retains its log by aterm's
 //! default rules (`aterm_link::broker_rules::default_rules`), the rules
 //! `aterm link broker` opens with (`fabric_cli`'s
 //! `the_broker_binary_advertises_the_default_rules`), and its `Hello`

@@ -3,52 +3,25 @@
 
 //! `aterm-link`: the fabric bridge's command line (`USAGE` lists the subcommands).
 //!
-//! ```text
-//! aterm-link serve --fleet <F> --broker <socket>
-//!                  --cap-file <path>… [--state DIR] [--accept-from <p>,…]
-//!                  [--sock <path> --token-file <path>]
-//! aterm-link ls    --fleet <F> --broker <socket>
-//!                  --cap-file <path>… [--attention]
-//! ```
-//!
-//! An unknown word is refused by name (exit 2) rather than answered with the
-//! usage text: a typo that prints help reads as a request for help. The one
-//! exception is the retired `hook`: a surviving hook entry still runs it on
-//! every prompt, where exit 2 is Claude Code's blocking error, so it answers
-//! exit 0, nothing on stdout, and one line on stderr ([`retired_hook`]).
+//! An unknown subcommand is refused by name (exit 2). The retired `hook` verb
+//! exits 0 with one stderr line ([`retired_hook`]) so surviving settings-file
+//! hook entries do not block prompts.
 //!
 //! ## `ls` columns
 //!
-//! §7 pins the row as `<node> <host> <sid> state= inc= role= detail= driving=
-//! holder= hold= fabric= attention=`, and §9.3 uses `ls --attention` as the
-//! human's escalation view. Both are printed in that order, and `--attention`
-//! keeps only the rows carrying one.
+//! `ls` prints `<node> <host> <sid> state= inc= role= detail= driving=
+//! holder= hold= fabric= attention= gen= observer= epoch= phase= context=
+//! title= proto= aterm=`; `--attention` keeps only rows with a non-`-`
+//! `attention=`.
 //!
-//! Three of those columns have no writer on session rows and print `-` ("unknown"):
-//!
-//! * `driving=` is in §4.2's presence body, but
-//!   [`crate::bridge::Bridge::publish_session_presence`] does not publish it.
-//!   (`role=` and `detail=` are written by [`crate::presence`] on a
-//!   `presence = "meta"` bridge, the default; a `minimal` bridge shows `-`.)
-//! * `host=` and `fabric=` are published on the node's own presence row only
-//!   (`bridge.rs`'s `bring_presence_up`): `fabric=` on a session row was a
-//!   constant nothing could falsify. A session row shows `-` for both; the
-//!   node row above it carries the answer.
-//!
-//! Six columns are added at the end: `gen=` (§6.6's `<content_seq>:<fp16>`, what a
-//! `gen=`-bound approval is minted against), `observer=` (§11.2's watching,
-//! non-hosting attachment — a row an operator must not read as a host),
-//! `epoch=` (the launch nonce a drive record is fenced on), `phase=` (the
-//! server's `status agent=` verdict, relayed), `context=` (no longer written;
-//! printed for rows an older bridge wrote) and `title=` (the session's `meta
-//! set title` user title, else `-`; never the terminal's title, which the
-//! program writes — [`crate::presence`]; 128 bytes).
-//!
-//! Every printed field is untrusted: a presence body is written by whatever node
-//! holds `rw,p=<n>:/f/<F>/pub/<n>/>`, and `attention=` is free text a session
-//! chose. Each column is normalised through [`crate::pct`] before printing, so
-//! a row is always one whitespace-delimited token per column of printable ASCII
-//! and no body can move an operator's cursor.
+//! * `driving=` is not published on session rows and prints `-`. `role=`,
+//!   `detail=`, `phase=` and `title=` are written by [`crate::presence`] on a
+//!   `meta` bridge (the default); a `minimal` bridge prints `-`.
+//! * `host=`, `fabric=`, `proto=` and `aterm=` are published on the node's own
+//!   presence row only; session rows print `-`.
+//! * Every column is normalised through [`crate::pct`] into a single printable
+//!   ASCII token so untrusted presence bodies cannot inject terminal escapes or
+//!   whitespace.
 
 use std::process::ExitCode;
 
@@ -59,61 +32,40 @@ use crate::transport;
 const USAGE: &str = "\
 aterm-link — the aterm fabric bridge
 
-  aterm-link serve --fleet <F> --broker <socket> --cap-file <path>... [options]
-  aterm-link ls    --fleet <F> --broker <socket> --cap-file <path>... [--attention]
+  aterm-link serve  --fleet <F> --broker <socket> --cap-file <path>... [options]
+  aterm-link ls     --fleet <F> --broker <socket> --cap-file <path>... [--attention]
   aterm-link notify --on <attention|ask:<person>|halt>,... --exec <cmd>
-                    a command run when the fabric needs a human (`notify` for its usage)
   aterm-link broker <socket> [log] [--secret-file <path>] [--durability strict|ordered|relaxed]
-                    the local bus itself (`broker` for its usage); ordered and
-                    relaxed ack before the full flush, and a power loss can take
-                    the newest machine records they acked
   aterm-link broker --repair <log>
-                    truncate a log the broker refuses as corrupt at that record
-  aterm-link mint   <grant> --secret-file <path>    one capability line for --cap-file
-                    (a person's whole ring: `aterm fabric mint-for h-<person>`)
-  aterm-link fabric ...  the same as `aterm fabric` (`fabric help` for its usage)
+  aterm-link mint   <grant> --secret-file <path>
+  aterm-link fabric ...  (same as `aterm fabric`; see `aterm fabric --help`)
 
-`ls` defaults its flags from the rendezvous file `aterm fabric on` writes beside the
-instance control sockets (fabric.toml): --fleet and --broker, and WITH a defaulted
---broker only, the node's --cap-file and --state (a cap is minted for that one broker,
-so it is never presented to a --broker you named). A flag given on the command line wins.
+`ls` defaults --fleet and --broker from the rendezvous file (`fabric.toml`) written by
+`aterm fabric on`, and with a defaulted --broker also defaults --cap-file and --state.
+Command-line flags override defaults.
 
-  --fleet <F>            the fleet name (the `/f/<F>/` subtree)
-  --broker <socket>      the broker's Unix socket path
-  --cap-file <path>      a minted capability (`<grant> <tag-hex>` lines); repeatable
-  --state <dir>          the state dir (node id, incarnation, sequence, watermarks)
+  --fleet <F>            fleet name (`/f/<F>/` subtree)
+  --broker <socket>      broker Unix socket path
+  --cap-file <path>      minted capability file (`<grant> <tag-hex>` lines); repeatable
+  --state <dir>          state dir (node id, incarnation, sequence, watermarks)
   --accept-from <p>,...  principals whose task/control arrive undemoted
-  --sock <path>          hand-started OBSERVER mode against a control socket
-  --token-file <path>    the instance token, for --sock
-  --presence <mode>      `serve` only: what a session's presence row carries.
-                         meta (the default): role= detail= phase= title= beside
-                         attention=; phase= is aterm's agent verdict, title= the
-                         `meta set title` name only. minimal: attention= alone.
-                         Without the flag, `[fabric] presence` in aterm.toml.
-                         No screen text is published; gen= is a hash of it.
-  --receipts             `serve` only, on by default: when one of this node's
-                         sessions runs `inbox seen <id> handled|refused|deferred`
-                         on an ask or task, tell the sender (`kind=ack`), which
-                         releases their `post --wait-ack`. `--no-receipts` turns
-                         it off for one run, `[fabric] receipts = false` for good;
-                         off, a sender's `post --wait-ack` waits out its deadline.
-  --log <auto|off|turns> `serve` only, `auto` by default: mirror each
-                         session log's turns, runs, needs and the steps they
-                         rise from onto its session's `ev` face, deduplicated
-                         by readers (`aterm fabric brief` folds them), while
-                         the broker retains them (`fabric status` says
-                         `mirror=unretained` where it does not); `turns`
-                         mirrors over any broker, `off` never. Without the
-                         flag, `[fabric] log` in aterm.toml.
-  --attention            `ls` only: keep only rows carrying an `attention=`
+  --sock <path>          observer mode against an instance control socket
+  --token-file <path>    instance token for --sock
+  --presence <mode>      `serve` only (`[fabric] presence` in aterm.toml): `meta` (default:
+                         role=, detail=, phase=, title= beside attention=; no screen text)
+                         or `minimal` (attention= only)
+  --receipts             `serve` only, on by default (`[fabric] receipts` in aterm.toml):
+                         send `kind=ack` when `inbox seen <id> handled|refused|deferred`
+                         marks an ask or task (`--no-receipts` disables for one run)
+  --log <auto|off|turns> `serve` only, `auto` by default (`[fabric] log` in aterm.toml):
+                         mirror session-log turns, runs, needs and steps onto the session's
+                         `ev` face while the broker retains them (`turns` mirrors over any
+                         broker; `off` disables)
+  --attention            `ls` only: keep only rows carrying `attention=`
 
-`ls` prints one line per node and per session: <node> <host> <sid> state= inc=
-role= detail= driving= holder= hold= fabric= attention= gen= observer= epoch=
-phase= context= title= proto= aterm=, each value pct-encoded (`12%` reads `12%25`).
-driving= always reads `-`; holder= and context= do too unless an older node wrote
-them, and role= detail= phase= title= do from a `minimal` bridge. <host>, fabric=,
-proto= (the astream protocol the node speaks) and aterm= (the release it runs) are
-on the node's own line; a session's line reads `-` for them.
+`ls` prints one pct-encoded token per column:
+  <node> <host> <sid> state= inc= role= detail= driving= holder= hold= fabric=
+  attention= gen= observer= epoch= phase= context= title= proto= aterm=
 ";
 
 /// The bridge's whole command line, as a LIBRARY entry.
@@ -239,8 +191,6 @@ fn run(
         if !parsed.receipts_given {
             cfg.receipts = crate::fabric::receipts_from_config();
         }
-        // And `[fabric] log`, the bus mirror's switch (session log phase 4):
-        // what the bridge publishes, never which broker it reaches.
         if !parsed.log_given {
             cfg.log = crate::fabric::log_from_config();
         }
@@ -410,11 +360,7 @@ pub(crate) fn parse(args: &[String]) -> Result<Parsed, String> {
         sock: None,
         token: None,
         presence: crate::presence::Mode::Meta,
-        // On, matching `receipts_from_config`'s absent-key answer and what `aterm fabric on`
-        // writes.
         receipts: true,
-        // AUTO, matching `log_from_config`'s absent-key answer (D4, session
-        // log Phase 6 step 6E-3): on over a broker that retains it.
         log: crate::mirror::LogMode::Auto,
     };
     let mut token_file: Option<String> = None;
@@ -515,72 +461,24 @@ pub(crate) fn default_state_dir() -> String {
     "./aterm-link-state".to_string()
 }
 
-/// `aterm link broker`: run the bus this instance's bridge talks to, on one of two listeners.
+/// `aterm link broker`: run the local fabric bus on a Unix socket.
 ///
-/// A Unix socket created world-connectable — nothing chmods it and no peer uid
-/// is checked — so who can connect is bounded by the 0700 directory you put it
-/// in. What a connection may say is the guard's: with `--secret-file` it is
-/// `Broker::open_guarded`, every attach must carry a capability minted under
-/// that secret, and every request is authorized against the grants attached.
-/// The root's secret guards the root's socket: with no `--secret-file`, a
-/// `mint.secret` beside the socket (`aterm fabric on`'s layout) is the secret,
-/// so a supervisor job written before `on` passed the flag comes back guarded
-/// the next time it starts the broker — one that cannot be read is a refusal,
-/// never an unguarded broker. Only a socket with no secret beside it is served
-/// unguarded, and the banner says so.
-///
-/// The secret is a file, never an argument (an argv is world-readable in `ps`):
-/// a regular file of yours, mode 0600 or tighter, with one link and no access
-/// list that lets anyone else in, read through no link from a 0700 directory of
-/// yours, by astream's one secret-file rule ([`transport::read_mint_secret`]).
-///
-/// `--durability strict|ordered|relaxed` is what an ack promises, guarded or
-/// not ([`crate::durability`]): `strict` acks after the full flush; `ordered`
-/// after an ordering barrier, with a 100 ms horizon plus one batch and one
-/// full flush, and before the ack of every record aterm's escalation table
-/// names (a halt, a person's own words, mail to a person, a person's read
-/// mark), served strict by astream where the device cannot promise the order;
-/// `relaxed` after the page-cache write, which survives a broker crash and not
-/// a power loss (the table applies there too). A broker of any tier but strict
-/// takes the stop signals: its clean stop — SIGTERM, SIGINT or SIGHUP, or its
-/// exit for a replaced build — drops its listener, and astream flushes the log
-/// and records it `Closed`, so a reboot after it moves nothing. A weak run
-/// that never stopped cleanly moves the log's generation, with lineage, at the
-/// first open in another boot ([`astream_broker::LogIdentity`]), so every
-/// bridge and notifier resumes where the log continues instead of trusting an
-/// offset a power loss took. A strict broker keeps the signals' default action.
-/// A bare argv runs the build's default ([`crate::durability::default_for`]:
-/// ordered for a broker whose argv names `--secret-file`, which astream serves
-/// strict where the device cannot keep the order, and strict for one naming
-/// none) and a named tier — strict included — is kept, so `aterm fabric` reads
-/// the tier off the process table and the tier served off the broker's `Hello`.
-///
-/// It exits when its build is replaced. A supervised broker is a `KeepAlive`
-/// launchd job or a `Restart=always` unit, and an update swaps the file its
-/// argv names in place: without this the old broker serves until the next
-/// login while every bridge runs the new build, so a broker-side fix — or a
-/// wire change both ends must share — never arrives. Every [`EXE_WATCH`] it
-/// looks at its executable; once the path names a different, settled file
-/// ([`replaced`]) it shuts down (the socket unlinked) and exits 0, and the
-/// supervisor starts the new build from the unchanged argv. A broker nothing
-/// supervises then stays down: run one by hand under something that restarts
-/// it, or restart it yourself.
-///
-/// It exits when its log is poisoned ([`crate::broker_health`]). astream
-/// refuses every write to a log whose full flush failed with acked records at
-/// risk, or whose rollback could not put the file back, until the log is
-/// reopened — and only a new open reopens it. Every
-/// [`crate::broker_health::POLL`] (2 s) the broker asks astream whether its
-/// log is poisoned; when it is, it writes one line naming astream's reason on
-/// stderr (the last line of `<root>/broker.err`) and exits
-/// [`crate::broker_health::POISONED_EXIT`] (75), and the supervisor's restart
-/// reopens the log, moving its generation when astream recorded the run
-/// lossy. A broker no `aterm fabric on` job runs exits the same, and its line
-/// names the command that restarts it.
-///
-/// It retains its log by aterm's default rules ([`crate::broker_rules`],
-/// session log Phase 6 step 6E-2), set at every open before anything is
-/// served, so its first `Hello` advertises them.
+/// * **Guarding**: With `--secret-file` (or a `mint.secret` beside the socket when
+///   `--secret-file` is omitted), the broker opens guarded (`Broker::open_guarded`)
+///   and checks every attach and request against capabilities minted under that secret.
+///   An unreadable secret file is refused, never served unguarded.
+/// * **Durability** (`--durability strict|ordered|relaxed`, [`crate::durability`]):
+///   `strict` acks after a full flush (`F_FULLFSYNC` on macOS); `ordered` acks after
+///   an ordering barrier (`F_BARRIERFSYNC`) with a 100 ms full-flush horizon (served
+///   `strict` where the device cannot guarantee ordering); `relaxed` acks after the
+///   page-cache write. On `ordered` and `relaxed`, halts and person-facing records
+///   flush in full before ack, and SIGTERM/SIGINT/SIGHUP flush and mark the log
+///   `Closed`. An unclean stop advances the log generation on the next boot.
+/// * **Lifecycle & retention**: Polls its executable every [`EXE_WATCH`] and exits 0
+///   when replaced by a settled new build so its supervisor restarts it. Polls
+///   `broker.poisoned()` every [`crate::broker_health::POLL`] and exits
+///   [`crate::broker_health::POISONED_EXIT`] (75) on a poisoned log so its supervisor
+///   reopens it. Applies [`crate::broker_rules`] default log retention at open.
 fn broker(args: &[String]) -> ExitCode {
     // Capture the running image and invocation before opening the broker or
     // announcing readiness. An update during startup must remain observable.
@@ -589,93 +487,33 @@ fn broker(args: &[String]) -> ExitCode {
 usage: aterm link broker <socket> [log] [--secret-file <path>] [--durability <tier>]
        aterm link broker --repair <log>
 
-  <socket>         the Unix socket path the bridge's `--broker` names
-  [log]            the durable record log (default: <socket>.log)
-  --secret-file    32+ raw bytes, 0600: the MINT secret. The broker becomes
-                   GUARDED — every attach must carry a capability minted under
-                   it (`aterm link mint`, `aterm fabric mint-for h-<name>`), and
-                   each request is checked against the grants attached. Without
-                   it, the `mint.secret` beside <socket> is the secret when there
-                   is one (`aterm fabric on`'s root)
-  --durability <tier>
-                   what an ack promises: strict, ordered or relaxed. Unnamed,
-                   it is the build's default: ordered for a broker with
-                   --secret-file (what `aterm fabric on` runs), strict for a
-                   broker naming no secret. strict acks once the batch is
-                   flushed in full (on macOS F_FULLFSYNC, a flush of the
-                   drive's own cache): a power loss loses nothing acked.
-                   relaxed acks once it is written to the page cache, without
-                   waiting for that flush: it survives a crash or restart of
-                   the broker, but NOT a power loss, kernel panic or hard
-                   reset, which can take any machine record acked since the
-                   broker last started or stopped cleanly. ordered acks once
-                   the batch is ORDERED on the disk (F_BARRIERFSYNC, a
-                   fraction of the full flush's cost) and flushes in full
-                   100 ms after the first ack no full flush covers, once the
-                   batch in hand is written: a panic or forced power-off can
-                   lose the last 100 ms of machine records, plus a batch and a
-                   full flush, and the log keeps a prefix of whole batches. On
-                   both, a halt, a person's own words, mail to a person and a
-                   person's read mark are flushed in full before their ack
-                   (on an unguarded broker a person's
-                   posts are not told apart). astream serves ordered strict
-                   where the disk cannot promise the order: off macOS, a log
-                   off the boot volume, and says why in its start line. A
-                   broker of any tier but strict stops cleanly on SIGTERM
-                   (launchd at logout or shutdown, `aterm fabric off`), SIGINT
-                   or SIGHUP, and when it exits for a replaced build: the log
-                   is flushed and marked closed, so the next boot changes
-                   nothing. After an ordered or relaxed stop that never got
-                   that far (power loss, panic, reset, SIGKILL) the first open
-                   in another boot
-                   moves the log's GENERATION and records where the two agree:
-                   every bridge and notifier resumes where the log continues —
-                   nothing below that point re-read, nothing posted after the
-                   restart skipped — and only the records the loss took are
-                   gone. A kill -9 in the same boot costs nothing when the log
-                   is on the boot volume. Off it (a separate /home partition,
-                   an external disk), and on a host whose kernel names no
-                   boot, every relaxed stop without that clean close moves the
-                   generation, a kill -9 included. A bare argv runs the
-                   build's default; a named tier, strict included, is kept. A
-                   build older than this one refuses --durability ordered, so
-                   its broker never starts on a job that names it: before
-                   going back to one, run `aterm fabric off`, then `aterm
-                   fabric on` with that build
-  --repair <log>   serve nothing: TRUNCATE <log> at its first CORRUPT record,
-                   which the broker refuses to open, and print how many bytes
-                   went. The records from that one on are lost — possibly
-                   acked mail — and everything before it is kept. A log that
-                   opens prints `nothing to repair`; a log a NEWER aterm wrote
-                   is refused untouched (run that release). Refused while a
-                   broker holds the log
+  <socket>             Unix socket path the bridge's `--broker` names (place in a 0700 dir)
+  [log]                durable record log (default: <socket>.log)
+  --secret-file <path> 32+ raw bytes, mode 0600: the mint secret (`aterm link mint`,
+                       `aterm fabric mint-for h-<name>`). Without the flag, `mint.secret`
+                       beside <socket> is used when present; without either, the broker
+                       runs `(unguarded)`
+  --durability <tier>  what an ack promises: `strict`, `ordered` (default with
+                       --secret-file) or `relaxed` (default without --secret-file is
+                       `strict`).
+                       - `strict`: acks after a full drive-cache flush (`F_FULLFSYNC`).
+                       - `ordered`: acks after a disk barrier (`F_BARRIERFSYNC`) and
+                         flushes in full within 100 ms (served `strict` where the disk
+                         cannot promise ordering).
+                       - `relaxed`: acks after the page-cache write; survives a broker
+                         restart, not a power loss or panic.
+                       Halts, a person's words, mail to a person and read marks always
+                       flush in full before ack. Non-strict brokers flush and mark the
+                       log closed on SIGTERM/SIGINT/SIGHUP; an unclean stop across a
+                       reboot advances the log's generation.
+  --repair <log>       truncate <log> at its first corrupt record and exit (`nothing to
+                       repair` if clean; refuses if held by a running broker or written
+                       by a newer aterm release)
 
-The socket is created world-connectable, so who can connect is bounded by the
-DIRECTORY you put it in: use a 0700 one (`aterm fabric on` does). A broker with no
---secret-file and no mint.secret beside its socket checks no capability on attach,
-and says `(unguarded)` on stderr. Prints `listening <socket>` once it is bound. It
-exits 0 within a minute of its executable being replaced by another build, for its
-supervisor (launchd KeepAlive, systemd Restart=always) to start that one. It exits
-75 within seconds of its log being POISONED (a full flush that failed with acked
-records at risk, or a rollback that could not undo a failed write, after which the
-log refuses every write until it is reopened), saying astream's reason on stderr,
-so its supervisor's restart reopens the log; run by no `aterm fabric on` job, its
-line names the command that starts it again, unless something else restarts it.
-While it serves, astream keeps its health beside the log, <log>.health (0600: what
-the log holds, who is attached, its flushes, a poison), rewritten every 30 s, at
-once when the log is poisoned, and a last time when it stops cleanly: when it
-exits on its own, or, at any durability but strict, on SIGTERM, SIGINT or SIGHUP
-(a strict broker keeps their default action, so its last snapshot is the last
-periodic one); `aterm fabric` and `aterm fabric doctor` read it.
-
-It keeps its log within bounds: the `ev` records for at most 7 days within
-256 MiB, and the log is cut from its oldest end as they go. Below the cut it
-keeps the latest presence, unread mail for up to 7 days within 64 MiB of its own
-(read mail goes with the cut), and everything else for 7 days within 32 MiB.
-The trimming runs beside the log (<log>.held keeps what is held) and survives a
-crash. A read below what is kept answers `retained-from=` (`inbox get @<off>`
-says it). Unread mail given up past its limit is logged here, one line naming
-its subject and count; the recipient's inbox reads on past it.
+Prints `listening <socket>` when bound, keeps `<log>.health` (0600) beside the log,
+exits 0 when its executable is replaced, and exits 75 when its log is poisoned so its
+supervisor can restart it. Retains `ev` records up to 7 days / 256 MiB, unread mail up
+to 7 days / 64 MiB, latest presence, and other records up to 7 days / 32 MiB (`<log>.held`).
 ";
     let parsed = match crate::broker_args::BrokerArgs::parse(args) {
         Ok(parsed) => parsed,
@@ -826,14 +664,8 @@ its subject and count; the recipient's inbox reads on past it.
         }
     };
     seam.arm(&broker, std::path::Path::new(&log));
-    // THE DEFAULT RETENTION (session log Phase 6 step 6E-2, ruling U24):
-    // astream retains, and its `Hello` advertises, only the rules set since
-    // this open, so they are set at every open, before anything is served.
-    // A broker whose rules cannot be set (a poisoned log, a held store that
-    // cannot be written) still serves, unretained, and says so: its log grows
-    // as a broker before R4's did, and no bridge's mirror defaults on over it
-    // (it advertises no rule). Exiting instead would take the whole fabric
-    // down over its bound.
+    // Set default retention rules at every open before serving so `Hello` advertises them.
+    // If setting rules fails, serve unretained rather than taking the fabric down.
     let retained = match crate::broker_rules::retain(&broker) {
         Ok(()) => format!(
             "retained by aterm's default rules ({})",
@@ -863,18 +695,7 @@ its subject and count; the recipient's inbox reads on past it.
             return ExitCode::FAILURE;
         }
     };
-    // The broker's health, in astream's format ([`crate::broker_health`]):
-    // astream keeps `<log>.health` from here — written now, every
-    // [`crate::broker_health::HEALTH_EVERY`], at once when the log is
-    // poisoned, and a last time when the broker stops cleanly (the loop
-    // below drops it: an exit of its own, or a stop signal, which a strict
-    // broker does not take — killed, it leaves the last periodic one) — and
-    // `aterm fabric` and doctor read it with astream's reader. aterm writes
-    // no health file of its own. Kept once the socket is served, so a refused
-    // bind leaves no snapshot of a broker that never served. One astream
-    // cannot write is said here and tried again every period by astream; the
-    // broker serves either way, since its health is a report about it, never
-    // a condition of it.
+    // Keep `<log>.health` once the socket is served so a refused bind leaves no snapshot.
     if let Err(e) = broker.keep_health(crate::broker_health::HEALTH_EVERY) {
         eprintln!(
             "aterm link broker: {}: could not write its health ({e}); astream tries again every \
@@ -883,25 +704,16 @@ its subject and count; the recipient's inbox reads on past it.
             crate::broker_health::HEALTH_EVERY.as_secs()
         );
     }
-    // A secret that did not read stopped the broker above, so a named one
-    // here is the one guarding it.
     let guard_note = match secret_file.as_deref() {
         Some(path) => format!(" (guarded by {path})"),
         None => " (unguarded: it checks no capability)".to_string(),
     };
-    // The readiness line a supervisor waits for (`asb serve`'s word).
-    //
-    // Written, never `println!`: a supervisor may close the pipe after the first
-    // line, and `println!` on a closed stdout panics (Rust ignores SIGPIPE).
+    // Use `writeln!` rather than `println!` so a closed stdout after readiness does not panic.
     {
         use std::io::Write as _;
         let mut out = std::io::stdout().lock();
         let _ = writeln!(out, "listening {endpoint}");
         let _ = out.flush();
-        // The tier served is the broker's own word (`Hello`'s tag 0x01, the
-        // same answer status and doctor read), never inferred from the flag:
-        // astream serves `ordered` strict where the disk cannot promise the
-        // order, and the line then says "served strict" and why.
         let _ = writeln!(
             std::io::stderr(),
             "aterm link broker: unix socket on {endpoint}{guard_note}, durability {}: {}; \
@@ -915,34 +727,8 @@ its subject and count; the recipient's inbox reads on past it.
             broker.log_identity()
         );
     }
-    // The broker serves on its own threads; this one watches it and its
-    // executable and, for any tier but strict, waits for a stop signal.
-    // `BrokerHandle` has no `join` — `asb serve` parks the same way — and
-    // dropping the handle shuts the broker down and unlinks the socket, which
-    // is how it exits when its build is replaced, it is stopped, or its log is
-    // poisoned (the doc above).
-    //
-    // Always a timed park, whatever else is watched: the poison look runs
-    // every [`crate::broker_health::POLL`] on every broker, so one whose
-    // executable cannot be watched (no image answer) is cured too. The
-    // executable is still looked at every [`EXE_WATCH`] (a `stat`), and a stop
-    // signal still unparks the loop at once.
-    //
-    // The look takes no lock ([`astream_broker::Broker::poisoned`]): astream's
-    // writer holds the log's lock across a rollback and the log-identity I/O —
-    // slow on the failing disk this is for — and publishes the poison only
-    // after that I/O, so the look never waits on the device and a poison it
-    // sees has its `Lossy` record already written. It stays a timed park
-    // rather than astream's `wait_poisoned`, because a stop signal wakes this
-    // thread by unparking it, which astream's wait does not hear.
-    //
-    // Its last snapshot names the poison: the exit below drops the listeners,
-    // which stops astream's broker, whose stop writes `<log>.health` a last
-    // time and lets it go, so astream's reader calls it the last word of a
-    // broker that is gone, never a serving one's. `aterm fabric` reads the
-    // snapshot beside the log a serving process names, so while nothing serves
-    // it quotes this exit's line from `broker.err` instead, and the restarted
-    // broker's first snapshot replaces the file.
+    // Poll every `POLL` for stop signals, log poison (lock-free), and executable replacement
+    // every `EXE_WATCH`. Dropping `keep` shuts down the listeners and unlinks the socket.
     let keep = handle;
     let mut watch = watch;
     let mut exe_looked = std::time::Instant::now();
@@ -954,8 +740,6 @@ its subject and count; the recipient's inbox reads on past it.
         } else if let Some(reason) = broker.poisoned() {
             use std::io::Write as _;
             if seam.on_poison == crate::broker_health::OnPoison::Stay {
-                // The negative control's seam (a dev build's only): said once,
-                // and the broker serves on over its poisoned log.
                 if !poison_said {
                     let _ = writeln!(
                         std::io::stderr(),
@@ -968,14 +752,7 @@ its subject and count; the recipient's inbox reads on past it.
                 }
                 continue;
             }
-            // The cure ([`crate::broker_health`]): astream refuses every write
-            // until the log is reopened, and only a new open reopens it. The
-            // listeners go first, then the broker — astream's close stays
-            // silent over a poisoned log and records nothing `Closed`, so the
-            // run stays as astream left it (`Lossy` after a failed full flush,
-            // which moves the generation at the reopen) — and the line naming
-            // astream's reason last, so it is `broker.err`'s last word, the one
-            // `aterm fabric` and doctor quote.
+            // Drop listeners and broker before printing the poison line as the final stderr line.
             let restart = (!crate::broker_health::supervised()).then(|| {
                 let argv: Vec<String> = std::env::args_os()
                     .map(|a| a.to_string_lossy().into_owned())
@@ -1009,21 +786,8 @@ its subject and count; the recipient's inbox reads on past it.
         use std::io::Write as _;
         let mut err = std::io::stderr();
         let _ = writeln!(err, "aterm link broker: {why}");
-        // The clean close: dropping the last listener joins the writer —
-        // nothing acks after it — and astream then flushes the log in full and
-        // records it `Closed` before it releases the lock, so a reboot after
-        // this keeps the identity at any tier. astream says on stderr, just
-        // above this line, if that close failed (the run then stays `Open`,
-        // and the next open in another boot moves the generation once: the
-        // safe direction). Over a poisoned log astream closes nothing and says
-        // nothing, so this line says it.
-        //
-        // Read after the drop, never before: the writer's join drains the
-        // batch still queued at the signal, and that batch's failed full flush
-        // (or rollback) can poison the log inside the drop — after which
-        // astream's close returns silently over it. The broker itself is still
-        // alive here (only its listeners went), and poison is sticky, so this
-        // one look sees a poison from before the stop and one from its drain.
+        // Dropping `keep` drains queued batches and flushes/closes the log cleanly unless
+        // that drain itself poisoned the log; check `broker.poisoned()` after the drop.
         drop(keep);
         if let Some(reason) = broker.poisoned() {
             let _ = writeln!(
@@ -1044,12 +808,10 @@ its subject and count; the recipient's inbox reads on past it.
     }
 }
 
-/// The stop signals a broker of any tier but strict takes itself ([`take_stop_signals`]):
-/// the first one to arrive, once the loop asks.
+/// The first stop signal (`SIGTERM`, `SIGINT`, `SIGHUP`) received by a non-strict broker.
 struct StopSignal(std::sync::Arc<std::sync::atomic::AtomicI32>);
 
 impl StopSignal {
-    /// The signal's name, once one has arrived.
     fn taken(&self) -> Option<&'static str> {
         match self.0.load(std::sync::atomic::Ordering::Acquire) {
             0 => None,
@@ -1058,7 +820,6 @@ impl StopSignal {
     }
 }
 
-/// `SIGTERM` for 15, as a broker's stderr says it.
 fn signal_name(sig: i32) -> &'static str {
     #[cfg(unix)]
     {
@@ -1076,19 +837,8 @@ fn signal_name(sig: i32) -> &'static str {
     }
 }
 
-/// Take the stop signals, so a broker of any tier but strict stops cleanly
-/// instead of dying with its run still `Open` in the log's sidecar: SIGTERM
-/// (launchd at logout or shutdown, `launchctl bootout` under `aterm fabric
-/// off`, `systemctl stop`), SIGINT (^C) and SIGHUP (its terminal went away).
-/// They are blocked in the calling thread — which must be the process's only
-/// one: every thread started after inherits the mask — and one thread of
-/// their own takes the first with `sigwait`, records it and unparks `main`,
-/// which drops the listeners, so astream closes the log cleanly
-/// ([`aterm_uds::process::take_stop_signals`]). `None` when that thread
-/// cannot start: the signals keep their default action, the run stays `Open`,
-/// and the next open in another boot moves the generation — the safe
-/// direction. A second signal while the broker closes is left pending, and a
-/// supervisor's escalation to SIGKILL still ends it.
+/// Block `SIGTERM`, `SIGINT` and `SIGHUP` on the main thread (before worker threads spawn)
+/// and unpark `main` when one arrives so astream flushes and marks the log `Closed`.
 #[cfg(unix)]
 fn take_stop_signals(main: std::thread::Thread) -> Option<StopSignal> {
     let taken = std::sync::Arc::new(std::sync::atomic::AtomicI32::new(0));
@@ -1100,40 +850,22 @@ fn take_stop_signals(main: std::thread::Thread) -> Option<StopSignal> {
     .then_some(StopSignal(taken))
 }
 
-/// No POSIX signals here: the broker serves until it is killed.
 #[cfg(not(unix))]
 fn take_stop_signals(_main: std::thread::Thread) -> Option<StopSignal> {
     None
 }
 
-/// The words that open aterm's remedy for a log astream refuses as corrupt —
-/// the last line `aterm link broker` writes before it exits, and so the last
-/// word of `<root>/broker.err` that `aterm fabric` and doctor quote. The fix
-/// they print for it ([`crate::enable::fix_for`]) is chosen on these words,
-/// which this binary writes; astream's own refusal names `asb repair`, which
-/// aterm does not ship.
+/// Remedy prefix printed when astream refuses to open a corrupt broker log (matched by
+/// [`crate::enable::fix_for`]).
 pub const CORRUPT_LOG_REMEDY: &str = "the log has a corrupt record and is not opened: run `aterm \
                                       link broker --repair";
 
-/// The words that open aterm's line for a log astream refuses because a newer
-/// format wrote it (`Unsupported`): no repair applies — truncating would
-/// destroy records the release that wrote them reads — so the remedy is that
-/// release. Chosen on by [`crate::enable::fix_for`], like
-/// [`CORRUPT_LOG_REMEDY`], and never answered with a repair.
+/// Remedy prefix printed when astream refuses a log written by a newer format (`Unsupported`;
+/// matched by [`crate::enable::fix_for`]).
 pub const NEWER_LOG_REMEDY: &str = "the log was written by a newer aterm and is not opened";
 
-/// Aterm's remedy for a broker log astream refused to open with `kind`, as one
-/// line naming `log` — `None` for a refusal with no remedy of aterm's own (a
-/// lock held, a permission), whose astream words say enough.
-///
-/// By kind, never by astream's wording. In aterm's build (no anti-rollback)
-/// `InvalidData` from an open is the corrupt-record refusal, and
-/// `Unsupported` a record format newer than this build reads. Since the
-/// default retention (session log Phase 6 step 6E-2) the log also has the
-/// retention's sidecars (`<log>.held`, `.state`, `.base`), and one that does
-/// not read is refused `InvalidData` too, astream's words naming the file: the
-/// repair named here then opens the log the same way and touches nothing, so
-/// the remedy costs nothing where it does not apply.
+/// One-line remedy for a broker log open refusal (`InvalidData` → corrupt record or retention
+/// sidecar; `Unsupported` → newer format).
 #[must_use]
 pub fn log_refusal_remedy(kind: std::io::ErrorKind, log: &str) -> Option<String> {
     match kind {
@@ -1149,17 +881,9 @@ pub fn log_refusal_remedy(kind: std::io::ErrorKind, log: &str) -> Option<String>
     }
 }
 
-/// `aterm link broker --repair <log>`: astream's explicit, operator-invoked
-/// repair (`BrokerLog::open_repair`, the `asb repair` aterm does not ship) —
-/// the log truncated at its first corrupt record, the bytes dropped counted.
-/// Idempotent: a log that opens is left as it is and says `nothing to repair`.
-///
-/// A log that is not there is refused, not created: `open_repair` would leave
-/// an empty log behind a typo. A broker holding the log (astream's exclusive
-/// lock, `AlreadyExists`) is refused — repair it between its supervisor's
-/// restarts, or with the job stopped. A newer-format log is refused untouched
-/// by astream itself. The repair moves the log's identity on, so every bridge
-/// forgets the offsets it held on the cut log at its next attach.
+/// `aterm link broker --repair <log>`: truncate `<log>` at its first corrupt record via
+/// `BrokerLog::open_repair` (`nothing to repair` if clean). Refuses missing files, non-files,
+/// logs held by a running broker (`AlreadyExists`), and newer-format logs (`Unsupported`).
 fn repair_log(log: &str) -> ExitCode {
     match std::fs::metadata(log) {
         Ok(m) if m.is_file() => {}

@@ -2326,6 +2326,88 @@ fn the_page_writes_a_default_value_as_a_removal() {
         )
         .is_none()
     );
+
+    // A real number field (not a slider): its typed default is submitted
+    // text even though the durable patch removes the key. Both Return and
+    // semantic SetValue retire only their unchanged draft on success.
+    let key = prefs::EDIT_SCROLLBACK;
+    let set = format!("settings/set/{key}");
+    let type_draft = |lab: &mut Lab, text: &str| {
+        lab.state_mut().navigate(SettingsRoute::Terminal);
+        assert!(lab.invoke(&set, None).is_none());
+        for event in [
+            TextInputEvent::SelectAll,
+            TextInputEvent::Commit(text.to_string()),
+        ] {
+            lab.dispatch(AppEvent::TextInput(event));
+        }
+        assert_eq!(lab.state().field_inputs[key].value(), text);
+    };
+    for enter in [false, true] {
+        for (refused, newer) in [(false, false), (true, false), (false, true)] {
+            let mut lab = Lab::new("scrollback_lines = 5000\n");
+            type_draft(&mut lab, "100000");
+            let outcome = lab.dispatch_outcome(if enter {
+                AppEvent::TextInput(TextInputEvent::Submit)
+            } else {
+                AppEvent::Action(ActionInvocation {
+                    id: ActionId::new(set.as_str()),
+                    value: Some(SemanticInput::Text("100000".to_string())),
+                })
+            });
+            let (patch, operation) = outcome
+                .effects
+                .iter()
+                .find_map(|effect| match effect {
+                    AppEffect::ConfigPatch { patch, reply, .. } => {
+                        Some((patch.clone(), reply.operation))
+                    }
+                    _ => None,
+                })
+                .expect("the typed default removes the saved override");
+            assert_eq!(patch.edits[0].value, None);
+            let submitted = lab.state().field_inputs[key].clone();
+            if newer {
+                for event in [
+                    TextInputEvent::Commit("9".to_string()),
+                    TextInputEvent::Undo,
+                ] {
+                    lab.dispatch(AppEvent::TextInput(event));
+                }
+                let current = &lab.state().field_inputs[key];
+                assert_eq!(current.value(), submitted.value());
+                assert_ne!(current, &submitted, "newer equal text has its own history");
+            }
+            let current = lab.state().field_inputs[key].clone();
+            if refused {
+                lab.dispatch(AppEvent::ConfigPatchFinished {
+                    operation,
+                    outcome: ConfigPatchOutcome::Rejected {
+                        message: "owned refusal".to_string(),
+                    },
+                });
+                assert_eq!(lab.text(), "scrollback_lines = 5000\n");
+            } else {
+                lab.carry(patch, operation);
+                assert_eq!(lab.text(), "");
+            }
+            assert_eq!(
+                lab.state().field_inputs.get(key),
+                (refused || newer).then_some(&current),
+                "Return={enter}, refused={refused}, newer={newer}"
+            );
+            assert_eq!(lab.state().has_unsaved_field_drafts(), refused || newer);
+        }
+    }
+
+    // A number set while a different draft is held owns none of that draft.
+    let mut lab = Lab::new("scrollback_lines = 5000\n");
+    type_draft(&mut lab, "9000");
+    let unrelated = lab.state().field_inputs[key].clone();
+    let patch = lab.commit(&set, Some(SemanticInput::Number(100000.0)));
+    assert_eq!(patch.edits[0].value, None);
+    assert_eq!(lab.text(), "");
+    assert_eq!(lab.state().field_inputs.get(key), Some(&unrelated));
 }
 
 /// A COMMENT UNDER A TABLE'S LAST KEY STAYS WITH ITS TABLE: turning Keyword

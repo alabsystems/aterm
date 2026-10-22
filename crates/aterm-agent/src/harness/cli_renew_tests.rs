@@ -1052,3 +1052,75 @@ fn a_renewal_names_claude_codes_own_switch_when_it_holds_the_sessions() {
         "`[harness] enabled` is off, so nothing moves a session onto the new login"
     );
 }
+
+#[cfg(unix)]
+#[test]
+fn a_mailbox_directory_runs_accounts_renew_without_a_terminal_through_the_opener() {
+    let (tmp, env) = renew_env("renew-mailbox-headless");
+    let mailbox = env
+        .accounts_store()
+        .dir
+        .join(crate::harness::open_url::DEFAULT_MAILBOX_DIR);
+    std::fs::create_dir_all(&mailbox).expect("mkdir mailbox");
+    let program = tmp.path().join("bin").join("claude");
+    std::fs::create_dir_all(program.parent().expect("dir")).expect("mkdir");
+    aterm_tempfile::stand_in(
+        &program,
+        &format!(
+            "#!/bin/sh\nlog=\"${{0%/*}}/ran\"\necho \"$1 $2 browser=${{BROWSER##*/}} \
+             mailbox=${{{mailbox_env}+set}} email=${{{email_env}+set}}\" >> \"$log\"\n\
+             if [ \"$2\" = login ]; then printf '%s' \"$5\" > \"$CLAUDE_CONFIG_DIR/.email\"; \
+             echo '{{}}' > \"$CLAUDE_CONFIG_DIR/.claude.json\"; exit 0; fi\n\
+             printf '{{\"loggedIn\":true,\"authMethod\":\"claude.ai\",\"email\":\"%s\",\"subscriptionType\":\"max\"}}' \
+             \"$(cat \"$CLAUDE_CONFIG_DIR/.email\")\"\n",
+            mailbox_env = crate::harness::open_url::MAILBOX_ENV,
+            email_env = crate::harness::open_url::EMAIL_ENV,
+        ),
+    )
+    .expect("stand-in");
+    struct HeadlessMailboxStandIn(PathBuf);
+    impl AccountsHost for HeadlessMailboxStandIn {
+        fn stdin_is_terminal(&self) -> bool {
+            false
+        }
+        fn auth_status(&self, login: &str) -> Result<Captured, String> {
+            panic!("asked under {login:?}");
+        }
+        fn unaskable(&self) -> Option<String> {
+            None
+        }
+        fn login(&self, _: Option<&str>) -> Result<i32, String> {
+            panic!("no plain sign-in");
+        }
+        fn now(&self) -> i64 {
+            0
+        }
+        fn current_exe(&self) -> Option<PathBuf> {
+            Some(self.0.clone())
+        }
+        fn renew_flow(&self, home: &str, email: &str, b: &RenewBrowser) -> Result<i32, String> {
+            renew_flow_of(self.0.as_os_str(), home, email, b)
+        }
+        fn status_in_home(&self, home: &str) -> Result<Captured, String> {
+            let user = |name: &str| (name == "USER").then(|| OsString::from("someone"));
+            status_in_home_within(
+                self.0.as_os_str(),
+                home,
+                &user,
+                aterm_spec::wait::MUST_HAPPEN,
+            )
+        }
+    }
+    let host = HeadlessMailboxStandIn(program);
+    let (code, out, err) = acc(renew(&["work-2"], false, None), &env, &host);
+    assert_eq!(code, exit(0), "{out}{err}");
+    let ran = std::fs::read_to_string(tmp.path().join("bin").join("ran")).expect("it ran");
+    let lines: Vec<&str> = ran.lines().collect();
+    assert_eq!(
+        lines,
+        [
+            "auth login browser=aterm-open-url mailbox=set email=set",
+            "auth status browser= mailbox= email=",
+        ]
+    );
+}

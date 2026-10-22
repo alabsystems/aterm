@@ -45,8 +45,8 @@ What to run before a pull request:
 
 * `targo --unverified test --locked -p <crate>` for every crate you touched.
   A test that needs a tool this machine lacks ends COULD NOT RUN, naming where
-  the tool comes from and, for fish and pwsh, the `ATERM_TEST_FISH=<path>` or
-  `ATERM_TEST_PWSH=<path>` that points at an unpacked official build.
+  the tool comes from: for a tool the checkout pins (fish, pwsh, binaryen, the
+  browsers), `targo --unverified verify provision`.
 * `targo --unverified run -q -p aterm-verify -- fmt`, the formatter check
   (`fmt --fix` rewrites what it finds).
 * `targo-tippy --workspace --all-targets --keep-going -- -D warnings`,

@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! THE AUTOPILOT CHIP AS DRAWN (`docs/DESIGN-harness-autopilot-2026-10-15.md`
-//! §12.5.3, slice 5b): `aterm ctl chrome`'s `autopilot` lines, one per
+//! §12.5.3): `aterm ctl chrome`'s `autopilot` lines, one per
 //! supervised pane in every window, so a driver reads the chip as the person
 //! sees it instead of inferring it from a screenshot.
 //!

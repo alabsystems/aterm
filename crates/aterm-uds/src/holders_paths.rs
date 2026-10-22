@@ -3458,8 +3458,8 @@ mod win_tests {
     /// spelling the scan placed it by, so a caller placing it against each
     /// folder by the same rule (clause 4b over every tier-3 candidate) finds
     /// it under its own and NOT under the other — reported as the kernel
-    /// wrote it, it placed under neither and was held for both (wave 5's
-    /// live finding F1). NEGATIVE CONTROL: the working directory it reports
+    /// wrote it, it placed under neither and was held for both.
+    /// NEGATIVE CONTROL: the working directory it reports
     /// is short and places nowhere by the table alone. PREMISE, stated where
     /// it fails: the volume generates short names.
     #[test]
@@ -4407,7 +4407,7 @@ mod win_tests {
     }
 
     /// The scan's naming helper holds the system's error boxes off while it
-    /// names (wave 3's soundness review, its first finding): its queries ask
+    /// names (its first finding): its queries ask
     /// each file's own file system for its name, and one on an empty card
     /// reader or optical drive otherwise puts a box on the owner's desktop
     /// and parks the helper. Read ON the helper thread, through a probe

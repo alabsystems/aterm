@@ -219,7 +219,7 @@ impl CelebrationGesture {
     /// song signature.
     #[inline]
     #[must_use]
-    pub fn riff_bar(bar: u16, sig: u32) -> Self {
+    pub const fn riff_bar(bar: u16, sig: u32) -> Self {
         Self::RiffBar { bar, sig }
     }
 
@@ -227,7 +227,7 @@ impl CelebrationGesture {
     /// constructor, like [`Self::riff_bar`].
     #[inline]
     #[must_use]
-    pub fn outro(sig: u32) -> Self {
+    pub const fn outro(sig: u32) -> Self {
         Self::Outro { sig }
     }
 }
@@ -531,7 +531,7 @@ const BLOCK_LEAD_MAX_S: f32 = 0.050;
 /// printable glyph is `45`, one rank above the last bucket.
 #[must_use]
 #[inline]
-pub fn typed_glyph_rank(typed: Option<char>) -> u8 {
+pub const fn typed_glyph_rank(typed: Option<char>) -> u8 {
     let Some(c) = typed else { return 0 };
     if c.is_ascii_alphabetic() {
         // Case folded: the capital has its own voice in `SoundEvent::shifted`.
@@ -617,7 +617,7 @@ pub mod glyph_class {
 /// total over ASCII punctuation, and lossy by design.
 #[must_use]
 #[inline]
-pub fn typed_glyph_class(typed: Option<char>) -> u8 {
+pub const fn typed_glyph_class(typed: Option<char>) -> u8 {
     use glyph_class::*;
     match typed {
         None => LETTER,
@@ -681,7 +681,7 @@ const EXCITED_TRANSPOSE: f32 = 1.125;
 ///
 /// No table contains the bonk's minor-second/tritone intervals.
 #[inline]
-fn tone_tables(tone: Tone) -> (&'static [f32; 5], f32) {
+const fn tone_tables(tone: Tone) -> (&'static [f32; 5], f32) {
     match tone {
         Tone::Technical | Tone::Calm => (&PENTA, 1.0),
         Tone::Excited => (&PENTA, EXCITED_TRANSPOSE),
@@ -695,7 +695,7 @@ fn tone_tables(tone: Tone) -> (&'static [f32; 5], f32) {
 /// lurches. Technical (the identity) and Frustrated are exactly 1.0. Bonk
 /// voices are exempt (spawn skips `duck_exempt` prototypes).
 #[inline]
-fn tone_feel(tone: Tone) -> f32 {
+const fn tone_feel(tone: Tone) -> f32 {
     match tone {
         Tone::Technical | Tone::Frustrated => 1.0,
         Tone::Calm => 1.06,
@@ -813,7 +813,7 @@ const SONG_BASS: [i8; 12] = [0, 2, 1, 3, 0, 2, 4, 1, 0, 2, 3, 4];
 /// scale table, transpose and lean. The fold remains a total guard for the
 /// bonk, the cursor family and the column nudge.
 #[inline]
-fn tone_register(tone: Tone) -> (i32, i32) {
+const fn tone_register(tone: Tone) -> (i32, i32) {
     match tone {
         // The lean is +1: the theme occupies 1..=9.
         Tone::Excited => (0, 9),
@@ -829,7 +829,7 @@ fn tone_register(tone: Tone) -> (i32, i32) {
 /// turns the excess into a step back down the lattice. Modular (a triangle
 /// wave), so any input is handled in constant time.
 #[inline]
-fn fold_register(v: i32, lo: i32, hi: i32) -> i32 {
+const fn fold_register(v: i32, lo: i32, hi: i32) -> i32 {
     let span = hi - lo;
     if span <= 0 {
         return lo;
@@ -841,7 +841,7 @@ fn fold_register(v: i32, lo: i32, hi: i32) -> i32 {
 /// Per-tone lean added to the pitch register: Excited +1, Frustrated −1, the
 /// rest 0.
 #[inline]
-fn melody_lean(tone: Tone) -> i32 {
+const fn melody_lean(tone: Tone) -> i32 {
     match tone {
         Tone::Excited => 1,
         Tone::Frustrated => -1,
@@ -1656,7 +1656,7 @@ fn song_degree(sig: u32, ordinal: u32) -> i32 {
 /// pentatonic octave (-2..=2), so no character moves the riff into a register
 /// that reads as a different instrument.
 #[inline]
-fn celebration_root(sig: u32) -> i32 {
+const fn celebration_root(sig: u32) -> i32 {
     (sig % 5) as i32 - 2
 }
 
@@ -1669,7 +1669,7 @@ fn celebration_root(sig: u32) -> i32 {
 /// root+mode offset stays in −3..=4.
 const MODE_ROTATIONS: [i32; 3] = [0, 2, -1];
 #[inline]
-fn celebration_mode(sig: u32) -> i32 {
+const fn celebration_mode(sig: u32) -> i32 {
     MODE_ROTATIONS[(sig % 3) as usize]
 }
 
@@ -1689,7 +1689,7 @@ const CELEBRATION_VERSE: [bool; CELEBRATION_PHRASE_BARS] =
 /// tessitura: the A-family sits just over the hook's shelf, the C-family keeps
 /// the lift into bars 4/5.
 #[inline]
-fn verse_register(idx: usize) -> i32 {
+const fn verse_register(idx: usize) -> i32 {
     if idx == 4 || idx == 5 { 4 } else { 1 }
 }
 
@@ -1697,15 +1697,24 @@ fn verse_register(idx: usize) -> i32 {
 /// chorus bars). Sounding verse slots are numbered consecutively across the
 /// form, counted from the authored `REST` pattern.
 #[inline]
-fn verse_ordinal_base(idx: usize) -> Option<u32> {
+const fn verse_ordinal_base(idx: usize) -> Option<u32> {
     if !CELEBRATION_VERSE[idx] {
         return None;
     }
     let mut base = 0u32;
-    for (i, row) in CELEBRATION_PHRASE.iter().enumerate().take(idx) {
+    let mut i = 0;
+    while i < idx {
         if CELEBRATION_VERSE[i] {
-            base += row.iter().filter(|&&d| d != REST).count() as u32;
+            let row = &CELEBRATION_PHRASE[i];
+            let mut j = 0;
+            while j < row.len() {
+                if row[j] != REST {
+                    base += 1;
+                }
+                j += 1;
+            }
         }
+        i += 1;
     }
     Some(base)
 }
@@ -1724,11 +1733,13 @@ fn celebration_bar_degrees(sig: u32, idx: usize) -> [i32; 8] {
     };
     let shelf = verse_register(idx);
     let mut ordinal = base;
-    for slot in &mut row {
-        if *slot != REST {
-            *slot = song_degree(sig, ordinal) + shelf;
+    let mut i = 0;
+    while i < row.len() {
+        if row[i] != REST {
+            row[i] = song_degree(sig, ordinal) + shelf;
             ordinal += 1;
         }
+        i += 1;
     }
     row
 }
@@ -1736,7 +1747,7 @@ fn celebration_bar_degrees(sig: u32, idx: usize) -> [i32; 8] {
 /// The swung pre-delay of eighth-grid slot `slot`. Slot 0 is exactly 0.0, so
 /// every bar speaks in its first post-cue synth buffer.
 #[inline]
-fn celebration_slot_delay(slot: usize) -> f32 {
+const fn celebration_slot_delay(slot: usize) -> f32 {
     let swing = if slot.is_multiple_of(2) {
         0.0
     } else {
@@ -1749,7 +1760,7 @@ fn celebration_slot_delay(slot: usize) -> f32 {
 /// rather than ping-ponging per eighth. Degree 4 sits at the event's pan;
 /// `spawn` narrows and clamps afterwards.
 #[inline]
-fn celebration_sway(pan: f32, deg: i32) -> f32 {
+const fn celebration_sway(pan: f32, deg: i32) -> f32 {
     pan + 0.06 * (deg - 4) as f32
 }
 
@@ -1782,7 +1793,7 @@ fn celebration_lead(hz: f32, shimmer: f32, third: Partial) -> [Partial; 3] {
 /// that follow, bounded by `limit` (the turnaround bar caps this at 6 so the
 /// sustained note cannot ring under the sixteenth fill).
 #[inline]
-fn celebration_span(phrase: &[i32; 8], i: usize, limit: usize) -> usize {
+const fn celebration_span(phrase: &[i32; 8], i: usize, limit: usize) -> usize {
     let mut span = 1usize;
     while i + span < limit && phrase[i + span] == REST {
         span += 1;
@@ -2050,7 +2061,7 @@ struct Bed {
 /// The bed's energy kick per admitted trail gesture, shared by v1's trail arm
 /// and the music box's `push_v2` so both feed the bed the same amounts.
 #[inline]
-fn bed_kick(kind: SoundKind) -> f32 {
+const fn bed_kick(kind: SoundKind) -> f32 {
     match kind {
         SoundKind::Jump | SoundKind::Kill | SoundKind::Land => 0.5,
         // A word kill is per-command like the line kill, at word scale.
@@ -2318,7 +2329,7 @@ pub(crate) const MIN_GAP: f32 = 0.045;
 /// Glide, Sweep, Land, Bonk, the riff) are untouched. Kill's swoosh band is
 /// style-tinted ([`kill_swoosh_band`]), so it keeps ~3 dB of spread.
 #[inline]
-fn palette_trim(voice: SoundVoice, style: GlowStyle) -> f32 {
+const fn palette_trim(voice: SoundVoice, style: GlowStyle) -> f32 {
     match voice {
         SoundVoice::Mech => 0.68,
         // A standalone style voice delegates to its style's trim.
@@ -2353,7 +2364,7 @@ fn palette_trim(voice: SoundVoice, style: GlowStyle) -> f32 {
 /// tint. `Style` resolves the look's table; a standalone style voice takes
 /// its own style's tint (`Of(Water)` under Lumen falls through water).
 #[inline]
-fn kill_swoosh_band(voice: SoundVoice, style: GlowStyle) -> (f32, f32) {
+const fn kill_swoosh_band(voice: SoundVoice, style: GlowStyle) -> (f32, f32) {
     match voice {
         // The music box uses the default swoosh (§10.4).
         SoundVoice::RainbowKittyV2 => (1600.0, 350.0),
@@ -2448,13 +2459,13 @@ impl TrailSynth {
 
     /// Uniform in [0,1): [`xorshift01`] on the synth's stream.
     #[inline]
-    fn rnd(&mut self) -> f32 {
+    const fn rnd(&mut self) -> f32 {
         xorshift01(&mut self.rng)
     }
 
     /// Uniform in [lo, hi).
     #[inline]
-    fn rnd_in(&mut self, lo: f32, hi: f32) -> f32 {
+    const fn rnd_in(&mut self, lo: f32, hi: f32) -> f32 {
         lo + (hi - lo) * self.rnd()
     }
 
@@ -2486,13 +2497,13 @@ impl TrailSynth {
     /// pool ran dry and a live tail was cut.
     #[inline]
     #[must_use]
-    pub fn steals(&self) -> u32 {
+    pub const fn steals(&self) -> u32 {
         self.steals
     }
 
     /// Diagnostic: (bed energy, bed level) — demo/tuning hook.
     #[inline]
-    pub fn debug_bed(&self) -> (f32, f32) {
+    pub const fn debug_bed(&self) -> (f32, f32) {
         (self.bed.energy, self.bed.level)
     }
 
@@ -2530,7 +2541,7 @@ impl TrailSynth {
     /// (`rainbow_kitty_v2`'s `v2_hand_back_key`). A v1 trail event arriving
     /// first snaps instead ([`Self::push_meta`]).
     #[inline]
-    fn release_song_key(&mut self) {
+    const fn release_song_key(&mut self) {
         if self.v2_latched {
             self.v2_key_pending = self.song_key != 0;
         } else {
@@ -2548,7 +2559,7 @@ impl TrailSynth {
     /// Trail gestures only: the bonk, the sing-along riff and the output pips
     /// stay on the v1 chain even under the music box (§11).
     #[inline]
-    fn v2_engaged(&self, ev: &SoundEvent) -> bool {
+    const fn v2_engaged(&self, ev: &SoundEvent) -> bool {
         // The verdict is the one non-trail gesture the music box voices; its
         // cadence uses v2's lattice (`CHORD_LOOP`, `TINE_BASE_HZ`), so it forks
         // before palette dispatch too.
@@ -2557,7 +2568,7 @@ impl TrailSynth {
             SoundGesture::Trail(_) | SoundGesture::Output(OutputGesture::Verdict { .. })
         ) && match ev.voice {
             SoundVoice::RainbowKittyV2 | SoundVoice::Of(GlowStyle::RainbowKitty) => true,
-            SoundVoice::Style => ev.style == GlowStyle::RainbowKitty,
+            SoundVoice::Style => matches!(ev.style, GlowStyle::RainbowKitty),
             _ => false,
         }
     }
@@ -4046,7 +4057,7 @@ impl TrailSynth {
     /// bar (released with the sing duck in `render`). Derived from the same
     /// `sig` the riff transposes by, so typing and riff always agree.
     #[inline]
-    fn latch_song_key(&mut self, sig: u32) {
+    const fn latch_song_key(&mut self, sig: u32) {
         // The whole shift: root plus mode rotation, the same two axes the riff
         // applies. −3..=4 by construction (`celebration_root` is
         // `sig % 5 − 2`, `celebration_mode` one of {0, 2, −1}), so the i8
@@ -6733,7 +6744,7 @@ fn sin01(ph: f32) -> f32 {
 /// xorshift32 — deterministic, allocation-free. Uniform in [0,1). A free fn
 /// so `render` can draw while it holds a voice borrow.
 #[inline]
-fn xorshift01(rng: &mut u32) -> f32 {
+const fn xorshift01(rng: &mut u32) -> f32 {
     let mut x = *rng;
     x ^= x << 13;
     x ^= x >> 17;
@@ -6744,7 +6755,7 @@ fn xorshift01(rng: &mut u32) -> f32 {
 
 /// Triangle in turns, ±1.
 #[inline]
-fn tri(ph: f32) -> f32 {
+const fn tri(ph: f32) -> f32 {
     4.0 * (ph - 0.5).abs() - 1.0
 }
 

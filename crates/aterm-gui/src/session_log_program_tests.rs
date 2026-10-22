@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE PROGRAM MARKS (session log phase 6, 6F-4; rulings U17, U39, U44, T24's
+//! THE PROGRAM MARKS (T24's
 //! reversal): each move of what the program in front says about itself
 //! (OSC 7501) that the status sweep's gate shows is a `program` mark in the
 //! session's log, written through its run's bucket ([`PROGRAM_BURST`], then

@@ -106,7 +106,7 @@ pub(super) const LANE_AGE_GUARD_S: f32 = 0.040;
 /// [`MelodyV2::on_jump`]'s [`CASCADE_EXCLUSIVE_MS`] window.
 /// `the_lanes_hold_their_caps_and_steals_are_zero` runs §14's worst case.
 #[inline]
-pub(super) fn lane_cap(lane: u8) -> usize {
+pub(super) const fn lane_cap(lane: u8) -> usize {
     match lane {
         LANE_TUNE | LANE_CASCADE => 4,
         LANE_BLOOM | LANE_GRAFT => 2,
@@ -122,7 +122,7 @@ pub(super) fn lane_cap(lane: u8) -> usize {
 /// A missing GLINT or BLOOM is inaudible; a missing TUNE voice is a key that
 /// made no sound, so the tune always speaks.
 #[inline]
-pub(super) fn lane_drops_the_newcomer(lane: u8) -> bool {
+pub(super) const fn lane_drops_the_newcomer(lane: u8) -> bool {
     matches!(lane, LANE_GLINT | LANE_BLOOM)
 }
 
@@ -489,7 +489,7 @@ const FLOW_P2_LVL: f32 = 0.22;
 /// same amount, so the strike's sum is 0.78 at every heat: warming P2 alone
 /// would raise the onset peak, which §9.6 forbids.
 #[inline]
-fn flow_partials(flow: f32) -> (f32, f32) {
+const fn flow_partials(flow: f32) -> (f32, f32) {
     let p2 = lerp(P2_LVL, FLOW_P2_LVL, flow);
     (P1_LVL - (p2 - P2_LVL), p2)
 }
@@ -704,12 +704,12 @@ const SKY_BED_TARGETS: [[f32; 3]; SKY_BED_CHORDS] = {
 /// which on G or A would put an out-of-key B, C♯ or F♯ under the melody:
 /// C E G on I, C E A on vi and IV, D G A on V.
 #[inline]
-pub(super) fn sky_bed_degrees(chord: usize) -> [i32; 3] {
+pub(super) const fn sky_bed_degrees(chord: usize) -> [i32; 3] {
     SKY_BED_DEGREES_TABLE[chord % SKY_BED_CHORDS]
 }
 
 #[inline]
-fn lerp(a: f32, b: f32, t: f32) -> f32 {
+const fn lerp(a: f32, b: f32, t: f32) -> f32 {
     a + (b - a) * t
 }
 
@@ -831,7 +831,7 @@ const MARK_DOUBLED: u8 = 0x80;
 /// character never reaches the synth), so an echo-born cue (class 0) is a
 /// letter.
 #[inline]
-fn phrase_kind(class: u8) -> u8 {
+const fn phrase_kind(class: u8) -> u8 {
     match class {
         STOP => MARK_PERIOD,
         BANG => MARK_BANG,
@@ -847,7 +847,7 @@ fn phrase_kind(class: u8) -> u8 {
 /// asks the next Space for. `.` and `!` close on I (0, 4), `?` `,` `:` hang on
 /// V (3, 5), `;` turns to vi (1, 6). `None` is the ordinary `chord + 1`.
 #[inline]
-fn mark_chords(mark: u8) -> Option<[u8; 2]> {
+const fn mark_chords(mark: u8) -> Option<[u8; 2]> {
     match mark {
         MARK_PERIOD | MARK_BANG => Some([0, 4]),
         MARK_QMARK | MARK_COMMA | MARK_COLON => Some([3, 5]),
@@ -1892,7 +1892,7 @@ impl MelodyV2 {
     /// The sounding verse degree (test / introspection hook).
     #[must_use]
     #[cfg(test)]
-    pub fn walk(&self) -> i8 {
+    pub const fn walk(&self) -> i8 {
         self.text.walk
     }
 
@@ -1902,21 +1902,21 @@ impl MelodyV2 {
     /// caught a gate.
     #[must_use]
     #[cfg(test)]
-    pub fn steps(&self) -> u32 {
+    pub const fn steps(&self) -> u32 {
         self.steps
     }
 
     /// The live chord's index into [`CHORD_LOOP`] (test / introspection hook).
     #[must_use]
     #[cfg(test)]
-    pub fn chord(&self) -> u8 {
+    pub const fn chord(&self) -> u8 {
         self.text.chord
     }
 
     /// Letters since the last word boundary (test / introspection hook).
     #[must_use]
     #[cfg(test)]
-    pub fn word_pos(&self) -> u8 {
+    pub const fn word_pos(&self) -> u8 {
         self.text.word_pos
     }
 
@@ -1926,14 +1926,14 @@ impl MelodyV2 {
     /// (§3.1 asks for it) from a stalled repeat (§3.1 forbids it).
     #[must_use]
     #[cfg(test)]
-    pub fn motif_answering(&self) -> bool {
+    pub const fn motif_answering(&self) -> bool {
         self.text.motif_play > 0
     }
 
     /// The smoothed inter-onset interval in ms (test / introspection hook).
     #[must_use]
     #[cfg(test)]
-    pub fn ioi_ms(&self) -> f32 {
+    pub const fn ioi_ms(&self) -> f32 {
         self.ioi_ms
     }
 
@@ -1954,7 +1954,7 @@ impl MelodyV2 {
     /// `pop_undo` restores it, so "type a key, delete it" leaves `frame()`
     /// unchanged (`backspace_unsings_a_phrase`).
     #[inline]
-    fn frame(&self) -> Undo {
+    const fn frame(&self) -> Undo {
         self.text
     }
 
@@ -1973,25 +1973,25 @@ impl MelodyV2 {
     }
 
     #[inline]
-    fn pop_undo(&mut self) {
+    const fn pop_undo(&mut self) {
         let Some(n) = self.undo_len.checked_sub(1) else {
             return;
         };
-        self.text = self.undo[usize::from(n)];
+        self.text = self.undo[n as usize];
         self.undo_len = n;
     }
 
     /// Is `deg` a chord tone of the live chord (§10.3)?
     #[inline]
-    fn deg_is_lit(&self, deg: i32) -> bool {
+    const fn deg_is_lit(&self, deg: i32) -> bool {
         let pc = deg.rem_euclid(5) as u8;
-        CHORD_LOOP[usize::from(self.text.chord)].lit & (1 << pc) != 0
+        CHORD_LOOP[self.text.chord as usize].lit & (1 << pc) != 0
     }
 
     /// Is the sounding degree a chord tone of the live chord (§10.3)?
     #[inline]
-    fn lit(&self) -> bool {
-        self.deg_is_lit(i32::from(self.text.walk))
+    const fn lit(&self) -> bool {
+        self.deg_is_lit(self.text.walk as i32)
     }
 
     /// The snap (§3.1 step 6, and the rest's resolution): the degree lit by the
@@ -2022,7 +2022,7 @@ impl MelodyV2 {
     /// line's new motif. Run by a rest and by the Space behind `.` `!` `?`, where
     /// a phrase ends; an Enter keeps the subject.
     #[inline]
-    fn relatch_motif(&mut self) {
+    const fn relatch_motif(&mut self) {
         self.text.motif_len = 0;
         self.text.motif_play = 0;
         self.text.motif_k = 0;
@@ -2034,7 +2034,7 @@ impl MelodyV2 {
     /// bracket. `last_cadence_deg` survives: the anti-drone spans consecutive
     /// sentences, including across one-sentence lines.
     #[inline]
-    fn end_phrase(&mut self) {
+    const fn end_phrase(&mut self) {
         self.text.last_mark = MARK_NONE;
         self.text.token_marked = false;
         self.text.paren_deg = -1;
@@ -2046,7 +2046,7 @@ impl MelodyV2 {
     /// Ends the aside ([`ASIDE_GAIN`]), every open bracket at once: on a line
     /// boundary, a phrase rest, or the [`ASIDE_MAX_KEYS`]-th key inside it.
     #[inline]
-    fn close_aside(&mut self) {
+    const fn close_aside(&mut self) {
         self.text.aside_depth = 0;
         self.text.aside_keys = 0;
     }
@@ -2055,14 +2055,14 @@ impl MelodyV2 {
     /// bracket and whatever closes it ([`ASIDE_GAIN`]).
     #[must_use]
     #[cfg(test)]
-    pub fn in_aside(&self) -> bool {
+    pub const fn in_aside(&self) -> bool {
         self.text.aside_depth > 0
     }
 
     /// Whether a quotation is open (test / introspection hook; [`QUOTE_OPENS`]).
     #[must_use]
     #[cfg(test)]
-    pub fn in_quote(&self) -> bool {
+    pub const fn in_quote(&self) -> bool {
         self.text.quote_deg >= 0
     }
 
@@ -2071,7 +2071,7 @@ impl MelodyV2 {
     /// ([`MARK_DOUBLED`]).
     #[inline]
     #[must_use]
-    pub fn pending_mark(&self) -> u8 {
+    pub const fn pending_mark(&self) -> u8 {
         if self.text.last_mark & MARK_DOUBLED != 0 {
             MARK_NONE
         } else {
@@ -2083,7 +2083,7 @@ impl MelodyV2 {
     /// hook). Read straight after a key, it says whether that key steered.
     #[must_use]
     #[cfg(test)]
-    pub fn token_marked(&self) -> bool {
+    pub const fn token_marked(&self) -> bool {
         self.text.token_marked
     }
 }
@@ -2197,7 +2197,7 @@ impl MelodyV2 {
     /// Take the hot key's door if this key is inside [`VERDICT_LIT_MS`] of
     /// it. Spent either way — one key, and the next one prices itself.
     #[inline]
-    fn take_verdict_lit(&mut self, at: u32) -> bool {
+    const fn take_verdict_lit(&mut self, at: u32) -> bool {
         let Some(mark) = self.verdict_at_ms.take() else {
             return false;
         };
@@ -2663,7 +2663,7 @@ impl MelodyV2 {
     /// The autorepeat detectors ([`AUTOREPEAT_JITTER_MS`]). The melody still
     /// advances; either can only take the pitch off the note.
     #[inline]
-    fn detect_autorepeat(&mut self, gap: u32, rank: u8, first: bool) -> bool {
+    const fn detect_autorepeat(&mut self, gap: u32, rank: u8, first: bool) -> bool {
         if first {
             self.repeat_run = 1;
             self.prev_gap = 0;
@@ -2830,15 +2830,15 @@ impl MelodyV2 {
     }
 
     #[inline]
-    fn open_next_run_phrase(&mut self) {
+    const fn open_next_run_phrase(&mut self) {
         self.run_phrase = (self.run_phrase + 1) % (SONG_FORM.len() as u8 - 1);
-        self.run_theme_pos = SONG_FORM[usize::from(self.run_phrase)];
+        self.run_theme_pos = SONG_FORM[self.run_phrase as usize];
     }
 
     /// §10.4's `on Backspace`: rewinds one keystroke of melody state. The sound
     /// is the unpitched poof: a deletion has no note (§19.2).
     #[inline]
-    fn on_backspace(&mut self, at: u32) {
+    const fn on_backspace(&mut self, at: u32) {
         self.pop_undo();
         self.last_key_ms = Some(at);
         // A deletion ends a whitespace run: the space you type after
@@ -2850,7 +2850,7 @@ impl MelodyV2 {
     /// leaving, not the tune rewinding), but the undo history and the word go
     /// with the text.
     #[inline]
-    fn on_kill(&mut self, at: u32) {
+    const fn on_kill(&mut self, at: u32) {
         self.undo_len = 0;
         self.end_phrase();
         self.text.word_pos = 0;
@@ -2859,8 +2859,8 @@ impl MelodyV2 {
 
     /// The next glint's degree above the verse note (§13), rotating.
     #[inline]
-    fn next_glint_deg(&mut self) -> i32 {
-        let deg = i32::from(self.text.walk) + GLINT_DEGREES[usize::from(self.glint_k)];
+    const fn next_glint_deg(&mut self) -> i32 {
+        let deg = self.text.walk as i32 + GLINT_DEGREES[self.glint_k as usize];
         self.glint_k = (self.glint_k + 1) % GLINT_DEGREES.len() as u8;
         deg
     }
@@ -2883,7 +2883,7 @@ impl MelodyV2 {
 /// step 1's interval fold, for the alphabet's distance and for the gap that
 /// stands in for it when there is no pair of glyphs.
 #[inline]
-fn fold_signed13(d: i32) -> i32 {
+const fn fold_signed13(d: i32) -> i32 {
     (d + 6).rem_euclid(13) - 6
 }
 
@@ -2897,7 +2897,8 @@ fn fold_signed13(d: i32) -> i32 {
 #[inline]
 fn reflect_deg(deg: i32) -> i32 {
     let mut d = deg;
-    for _ in 0..8 {
+    let mut i = 0;
+    while i < 8 {
         if d > TUNE_DEG_HI {
             d = 2 * TUNE_DEG_HI - d;
         } else if d < TUNE_DEG_LO {
@@ -2905,6 +2906,7 @@ fn reflect_deg(deg: i32) -> i32 {
         } else {
             break;
         }
+        i += 1;
     }
     d.clamp(TUNE_DEG_LO, TUNE_DEG_HI)
 }
@@ -2912,7 +2914,7 @@ fn reflect_deg(deg: i32) -> i32 {
 /// τ_v from the smoothed inter-onset interval (§9.1). See [`TAU_V_BASE_S`] for
 /// why this is the masking law and not a taste dial.
 #[inline]
-fn tau_v_s(ioi_s: f32) -> f32 {
+const fn tau_v_s(ioi_s: f32) -> f32 {
     (TAU_V_BASE_S * (TAU_V_OFFSET + TAU_V_SLOPE * ioi_s)).clamp(TAU_V_MIN_S, TAU_V_MAX_S)
 }
 
@@ -2928,7 +2930,7 @@ fn g_ioi(ioi_s: f32) -> f32 {
 /// the arc position from [`hue_arc`] (0 red, 1 cyan); with the hue stop out
 /// the caller passes 0.0.
 #[inline]
-fn roof_hz(cps: f32, lit: bool, heat: f32, hue: f32, touch: Touch) -> f32 {
+const fn roof_hz(cps: f32, lit: bool, heat: f32, hue: f32, touch: Touch) -> f32 {
     let u = ((cps - ROOF_CPS_LO) / ROOF_CPS_SPAN).clamp(0.0, 1.0);
     let plain = ROOF_PLAIN_LO_HZ + (ROOF_PLAIN_HI_HZ - ROOF_PLAIN_LO_HZ) * u;
     let base = if lit {
@@ -2936,7 +2938,7 @@ fn roof_hz(cps: f32, lit: bool, heat: f32, hue: f32, touch: Touch) -> f32 {
     } else {
         plain
     };
-    let base = if touch == Touch::ReStrike {
+    let base = if matches!(touch, Touch::ReStrike) {
         base - RESTRIKE_ROOF_DROP_HZ
     } else {
         base
@@ -3142,7 +3144,7 @@ impl Forte {
 /// are a bypass; under a shifted key they are clamped to the highest roof that
 /// still filters. Under a plain key this returns its operand unchanged.
 #[inline]
-fn shifted_roof(lp_cut: f32, shifted: bool) -> f32 {
+const fn shifted_roof(lp_cut: f32, shifted: bool) -> f32 {
     if shifted {
         lp_cut.min(ROOF_MAX_HZ)
     } else {
@@ -3154,7 +3156,7 @@ fn shifted_roof(lp_cut: f32, shifted: bool) -> f32 {
 /// [`FORTE_FM_INDEX`] at and under [`FORTE_FM_REF_HZ`], falling as
 /// `(ref / f)²` above it.
 #[inline]
-fn forte_index(f: f32, force: f32) -> f32 {
+const fn forte_index(f: f32, force: f32) -> f32 {
     let roll = (FORTE_FM_REF_HZ / f).min(1.0);
     FORTE_FM_INDEX * force * roll * roll
 }
@@ -3221,7 +3223,7 @@ fn wood(v: &mut Voice, f: f32, touch: Touch) {
 /// also a tine, decided in `v2_typed`, since only the melody knows which dot
 /// it is.
 #[inline]
-fn pluck_class(class: u8) -> bool {
+const fn pluck_class(class: u8) -> bool {
     matches!(
         class,
         QMARK | STOP | COMMA | SEMI | COLON | CLOSE | QUOTE | LINE | RISE | MATH | SIGIL
@@ -3232,7 +3234,7 @@ fn pluck_class(class: u8) -> bool {
 /// four stops `. , ; :`. Whether a key does is the melody's answer: only the
 /// token's steering mark ([`TypedPlan::steered`]).
 #[inline]
-fn stop_breathes(class: u8) -> bool {
+const fn stop_breathes(class: u8) -> bool {
     matches!(class, STOP | COMMA | SEMI | COLON)
 }
 
@@ -3423,7 +3425,7 @@ impl TrailSynth {
     /// synth renders that rung. Production never calls this; a fresh synth is
     /// [`TimbreStops::ALL`].
     #[cfg(test)]
-    pub fn set_v2_timbre_stops(&mut self, stops: TimbreStops) {
+    pub const fn set_v2_timbre_stops(&mut self, stops: TimbreStops) {
         self.v2.stops = stops;
     }
 
@@ -3432,7 +3434,7 @@ impl TrailSynth {
     /// stamp rather than saturating, which after 49.7 days would pin every gap
     /// at zero. A wrap costs one key a nonsense gap; it still steps and speaks.
     #[inline]
-    fn v2_at_ms(&self, meta: EventMeta) -> u32 {
+    const fn v2_at_ms(&self, meta: EventMeta) -> u32 {
         if meta.at_ms != 0 {
             meta.at_ms
         } else {
@@ -3453,7 +3455,7 @@ impl TrailSynth {
     /// output units (after `× 0.35`); this is the law's input, so the draw is
     /// divided back out and the heard pan moves by ±0.03.
     #[inline]
-    fn v2_pan(&mut self, pan: f32) -> f32 {
+    const fn v2_pan(&mut self, pan: f32) -> f32 {
         pan + self.rnd_in(-PAN_JITTER, PAN_JITTER) / PAN_LAW_SCALE
     }
 

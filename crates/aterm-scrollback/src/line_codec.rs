@@ -51,7 +51,7 @@ pub(crate) const MAX_UNDERLINE_SPANS: usize = 4096;
 impl CellAttrs {
     /// Serialize to bytes (10 bytes).
     #[must_use]
-    pub(crate) fn serialize(&self) -> [u8; 10] {
+    pub(crate) const fn serialize(&self) -> [u8; 10] {
         // An array literal, not range-IndexMut + copy_from_slice, whose std
         // bodies (index_mut, the len assert) the verifier does not have.
         let fg = self.fg.to_le_bytes();
@@ -64,7 +64,7 @@ impl CellAttrs {
 
     /// Deserialize from bytes.
     #[must_use]
-    pub(crate) fn deserialize(data: &[u8]) -> Option<Self> {
+    pub(crate) const fn deserialize(data: &[u8]) -> Option<Self> {
         if data.len() < 10 {
             return None;
         }

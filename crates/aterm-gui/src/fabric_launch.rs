@@ -66,7 +66,7 @@
 //! locale — is inherited, and that is stated rather than promised away: the
 //! header used to say the child got "none of aterm's own environment beyond what
 //! it needs" while `Command` inherited the parent block in full, which put the
-//! per-op edge-token secrets that audit finding F1 moved OUT of env into a
+//! per-op edge-token secrets moved OUT of env into a
 //! `/proc`-readable environment block belonging to the one process that holds
 //! `Scope::Bridge`.
 //!

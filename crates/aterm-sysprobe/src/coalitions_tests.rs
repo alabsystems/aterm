@@ -91,7 +91,7 @@ fn a_record_whose_qos_count_is_not_seven_decodes_to_none() {
 
 /// A listed coalition that answers nothing (coalition 2 answers `EINVAL` on
 /// every read the probes made) or whose record does not decode is dropped,
-/// never a zero row; the count is the list's.
+/// never a zero row; the count and the newest id are the list's.
 #[test]
 fn a_listed_coalition_that_answers_nothing_is_dropped() {
     let usage = |id| match id {
@@ -99,11 +99,12 @@ fn a_listed_coalition_that_answers_nothing_is_dropped() {
         9 => Some([0; USAGE_WORDS]),
         _ => None,
     };
-    let read = read_of(&[(307, 1), (2, 0), (9, 1)], true, usage, (125, 3));
+    let read = read_of(&[(307, 1), (2, 0), (400, 1), (9, 1)], true, usage, (125, 3));
     assert_eq!(
         read,
         CoalitionRead {
-            listed: 3,
+            listed: 4,
+            newest: Some(400),
             truncated: true,
             rows: vec![decode_usage(307, &mds_record(), (125, 3)).expect("decodes")],
         }
@@ -156,6 +157,7 @@ mod live {
         let read = coalitions().expect("the list reads");
         assert!(read.listed > 0 && !read.truncated, "{read:?}");
         assert!(read.rows.len() <= read.listed as usize);
+        assert!(read.newest.is_some_and(|n| n >= id), "{read:?}");
         let mine = read
             .rows
             .iter()

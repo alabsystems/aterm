@@ -136,7 +136,7 @@ fn a_fenced_press_on_a_moved_screen_is_decided_again_from_a_fresh_read() {
     assert_eq!(code, 0);
     assert!(out.starts_with("idle\n"), "{out}");
     assert_eq!(s.caps().gen_fence, Some(true));
-    // The shipped `help key` names `act=` (ruling T1): the digit says it
+    // The shipped `help key` names `act=`: the digit says it
     // approves.
     assert_eq!(s.caps().act_word, Some(true));
     let g = G_PRESS.trim_start_matches("key ");
@@ -14364,7 +14364,7 @@ fn a_person_at_an_autocompact_key_gets_it_before_any_other_key() {
 /// ([`HOST_FOLLOW_UPS`]), so any run of up to that many steps that moved
 /// nothing (a give-up said again, a raced wait), each followed by such a
 /// word, went back to the host at once with no step of the wait between —
-/// to the host's own cap, the round seven residual made a loop of three
+/// to the host's own cap, the prior residual made a loop of three
 /// words where it had been one of two. The count is the point's: a step
 /// that moved nothing spends one, a step that moved spends none and keeps
 /// it, and only a step of the wait, another point or a turn the host typed
@@ -14801,14 +14801,14 @@ fn legacy_journal_times_match_only_within_the_recorded_tolerance() {
     }
 }
 
-/// `help key` of a host that takes `act=` (session log phase 5, ruling T1),
+/// `help key` of a host that takes `act=`,
 /// beside `help send`'s fence.
 const ACT_KEY_HELP: &str = "key [act=approve|deny|answer] [id=<key>] [if=<re>] [if-gen=<e.s>] \
                             [if-human=<n>] <name>: send a named key\n\
                             send [id=<key>] [if=<re>] [if-gen=<e.s>] [if-human=<n>] [--] \
                             <text>: write text\n";
 
-/// 5D-3 (ruling T1): where `help key` names `act=`, the harness's approving
+/// 5D-3: where `help key` names `act=`, the harness's approving
 /// digit says so, `key act=approve …`, read off the one `help key` the fence
 /// probe already asks (no request of its own). NEGATIVE CONTROL: the same
 /// script on a host whose `help key` names no `act=` (every recorded tape's)
@@ -14857,7 +14857,7 @@ fn the_harness_says_its_digit_approves_only_where_the_host_takes_act() {
     assert_eq!(differ.len(), 1, "{differ:?}");
 }
 
-/// 5D-3 (ruling T1): a decline's keystrokes where the host takes `act=`:
+/// 5D-3: a decline's keystrokes where the host takes `act=`:
 /// only the Enter that dismisses the box says `act=deny`; the arrow, the Tab
 /// and the reason's text say nothing.
 #[test]
@@ -14897,7 +14897,7 @@ fn the_harness_says_its_decline_enter_denies() {
     );
 }
 
-/// 5D-3 (ruling T1): a question answered where the host takes `act=`: the
+/// 5D-3: a question answered where the host takes `act=`: the
 /// arrows say nothing, the Enter that answers says `act=answer`.
 #[test]
 fn the_harness_says_its_question_enter_answers() {

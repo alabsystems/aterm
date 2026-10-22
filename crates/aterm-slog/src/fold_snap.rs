@@ -27,7 +27,7 @@
 //! ```
 //!
 //! A claim line holds the newest claim of any author; the newest of a
-//! trusted author (phase 3A ruling R13) rides the same line as `t`-prefixed
+//! trusted author rides the same line as `t`-prefixed
 //! tokens (`tword=`/`ttext=`, `tby=`, `tt=`, `tuntil=`, `tseq=`, `tas=`,
 //! `tre=`) when it is another claim, so a reader that does not know them
 //! skips them; none means the trusted one is the line's own claim when its
@@ -43,7 +43,7 @@
 //! skips them (the R13 rule), and a snapshot without them reads with no link
 //! and no ambiguity.
 //!
-//! THE MAIL LATCH AND THE WAITING MAILS (Phase 6 step 6C-5, rulings U19,
+//! THE MAIL LATCH AND THE WAITING MAILS (
 //! T10a) ride the totals line too, as `ml`-prefixed tokens and only when
 //! there is something to say: `mlh=1` while mail was delivered since the last
 //! `human` mark of an input that reached the program, and `mlw=<off>:<t>,…`
@@ -87,7 +87,7 @@ pub enum SnapError {
     /// More needs, open nodes, closed slots or fields than a fold holds.
     Bound,
     /// An open node the log the fold crossed with does not hold open as
-    /// the fold says (phase 6, ruling U2): refused, never repaired.
+    /// the fold says: refused, never repaired.
     Log,
 }
 
@@ -174,7 +174,7 @@ fn push_link(s: &mut String, link: Option<MailLink>) {
 }
 
 /// A turn's mail link from its line's `ml` tokens (after `skip` words), if
-/// it carries them. A link is heuristic and nothing else (ruling T10,
+/// it carries them. A link is heuristic and nothing else (
 /// `HeuristicStaysHeuristic`): this build's writer says `mlconf=heuristic`,
 /// so any other confidence is no line it wrote and refuses the snapshot,
 /// as every malformed token does; a carried link never reads back certain.
@@ -703,8 +703,8 @@ impl Fold {
         Ok(fold)
     }
 
-    /// WHETHER THIS FOLD AGREES WITH ITS LOG'S OPEN PATH (phase 6, ruling
-    /// U2), as a carry or a closed summary crosses the two: every node the
+    /// WHETHER THIS FOLD AGREES WITH ITS LOG'S OPEN PATH,
+    /// as a carry or a closed summary crosses the two: every node the
     /// fold tracks open is open in `open` (the log's open path), of the same
     /// kind and so at its level, at most once, and under the parent the log
     /// holds it under — the deepest open node above it, or the session. A

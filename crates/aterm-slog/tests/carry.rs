@@ -1455,7 +1455,7 @@ fn carried_turn() -> (Log, Node, Node, Node, Vec<String>) {
     (log, run, turn, ghost, out.lines)
 }
 
-/// RULING U2 (phase 6, C-1 d): a carried fold that tracks an open node
+/// a carried fold that tracks an open node
 /// twice disagrees with its log, which holds it open once. Read, the log's
 /// close of the turn would leave the fold's other copy open for good, so the
 /// carry is refused whole, never repaired. CONTROL: the carry as written
@@ -1498,7 +1498,7 @@ fn a_duplicated_fold_open_line_is_refused() {
     }
 }
 
-/// RULING U2 (phase 6, C-1 e): a carried fold's open node must be one the
+/// a carried fold's open node must be one the
 /// carried log holds open, of the same kind and under the same parent (the
 /// deepest open node above it). Each disagreement refuses the whole carry:
 /// a `fold open` line for a run the log holds closed, the open turn's line
@@ -1552,7 +1552,7 @@ fn a_fold_open_line_for_a_node_the_log_does_not_hold_open_is_refused() {
     refused(&retyped, "the open run's fold line of another run kind");
 }
 
-/// RULING U2 (phase 6), the closed summary's side: a closed session holds
+/// a closed session holds
 /// nothing open, so a summary whose fold tracks an open node disagrees with
 /// it and is refused whole. CONTROL: the summary as written reads.
 /// NEGATIVE CONTROL: without the check it reads, its fold showing a run

@@ -1051,7 +1051,7 @@ fn drain_title_event(
 /// rows are formatted straight from it into `out`, no payload cloned. The
 /// test-only `timeline` hold ([`push_held`]) is the caller's to read, under
 /// that same hold ([`frames_for_watch`]).
-fn drain_timeline_events(
+pub(crate) fn drain_timeline_events(
     tl: &crate::session_timeline::SessionTimeline,
     sid: &str,
     last_id: Option<u64>,
@@ -2099,7 +2099,7 @@ fn new_watch_at(
         _cells_hold: streams.cells.then(|| FrameSlot::hold_cells(&src.frame)),
         // A `since-block=` ABOVE the newest completed block is from elsewhere
         // (a successor that could not carry the session's blocks counts them
-        // afresh — round seven, finding 51): it is lowered to the live high,
+        // afresh): it is lowered to the live high,
         // so it can never hide a block the engine completes from here.
         last_block_id: resume_block_watermark(opts.since_block, engine.newest_block),
         // On the byte fan-out only when `bytes` is requested, so an unwatched channel

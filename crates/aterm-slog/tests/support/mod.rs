@@ -51,7 +51,7 @@ pub fn lines(log: &Log) -> Vec<String> {
         .collect()
 }
 
-/// THE RUNS' TIME ORDER over the records `lines` (ruling S4, lifted from
+/// THE RUNS' TIME ORDER over the records `lines` (lifted from
 /// `aterm-gui`'s `session_log_tests.rs`, which keeps its own copy for the
 /// timeline's logs): (1) a child's close `t=` and `dur_ms` never exceed its
 /// parent's; (2) no node closes before it opened; (3) a `cmd` run never
@@ -121,8 +121,8 @@ pub fn time_order_holds(lines: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-/// THE MAIL LINK IN `brief`, NEVER WITHOUT ITS `~` (Phase 6 step 6C-3,
-/// ruling U5), on `log` at `now_wall`: in its brief with nothing shed, a
+/// THE MAIL LINK IN `brief`, NEVER WITHOUT ITS `~`,
+/// on `log` at `now_wall`: in its brief with nothing shed, a
 /// `mail=` token is exactly `mail=@<off>~` and only on the line of a turn
 /// the fold links to mail `<off>`, heuristically; a linked turn's line
 /// carries it; and no record `log` prints holds one. `Ok` is how many

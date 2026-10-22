@@ -2559,8 +2559,8 @@ fn a_members_drive_grant_follows_its_issuers_book() {
 /// FAILS WITHOUT THE FIX: the grant reads the hand entry ("named by hand") or
 /// no peer at all, the drive is refused before any dial, and the survey
 /// refuses the place and the host as naming several peers. NEGATIVE
-/// CONTROL: a hand entry no copy stands behind is still refused as named by
-/// hand, and so is one at the copy's host on another port.
+/// CONTROL: a hand entry no copy stands behind is still named by hand, and
+/// so is one at the copy's host on another port.
 #[test]
 fn a_hand_entry_at_a_copys_place_never_hides_its_node_from_a_grant() {
     let issuer = World::new("shadow-issuer");
@@ -2619,13 +2619,33 @@ fn a_hand_entry_at_a_copys_place_never_hides_its_node_from_a_grant() {
         member.config()
     ));
 
+    // ONE grant names all four words. Every `allow` first reads the issuer's
+    // book afresh, a read that waits out the copy's bare `lab-mini` (its
+    // multicast DNS lookup, the read's whole three seconds) whatever it was
+    // asked; then it resolves each word alone ([`bound_peer`]), so a word that
+    // named no peer, a hand entry or an unbound node refuses the grant, and
+    // one that named another node adds a grant of its own. What each word
+    // resolved to, its node and key, is read after.
     let grants = || fleet_table(&member.config()).unwrap().drive_from;
     let granted = vec![format!("{node}:{}", key.hex())];
-    for word in [third.as_str(), "lab-mini", node.as_str(), by_name.as_str()] {
-        ok(allow(&member.places, &args(&["drive", "--from", word])));
-        assert_eq!(grants(), granted, "{word}");
-    }
+    let words = [third.as_str(), "lab-mini", node.as_str(), by_name.as_str()];
+    let grant: Vec<&str> = std::iter::once("drive")
+        .chain(words.iter().flat_map(|&word| ["--from", word]))
+        .collect();
+    ok(allow(&member.places, &args(&grant)));
+    assert_eq!(grants(), granted);
     let targets = known_peers(&member.places).unwrap_or_else(|f| panic!("{f:?}"));
+    let known: Vec<Peer> = targets.peers.iter().map(|(peer, _)| peer.clone()).collect();
+    for word in words {
+        match bound_peer(&member.places, &known, word) {
+            Ok(Bound::Node(peer)) => assert_eq!(
+                (peer.node.as_deref(), peer.key.map(|key| key.hex())),
+                (Some(node.as_str()), Some(key.hex())),
+                "{word}"
+            ),
+            other => panic!("{word}: {other:?}"),
+        }
+    }
     let at_third: Vec<Option<&str>> = targets
         .peers
         .iter()
@@ -2661,16 +2681,17 @@ fn a_hand_entry_at_a_copys_place_never_hides_its_node_from_a_grant() {
         assert_eq!(labels, [format!("lab-mini:{third_port}")], "{word}");
     }
 
-    // NEGATIVE CONTROL.
+    // NEGATIVE CONTROL: each is named by hand, which a grant refuses
+    // ([`allow_drive_names_only_the_nodes_the_book_binds`] reads that refusal
+    // and that it writes nothing), and a drive refuses before any dial.
     for word in [alone.as_str(), elsewhere.as_str()] {
-        match allow(&member.places, &args(&["drive", "--from", word])) {
-            Err(Failure::Failed(why)) => assert!(why.contains("named by hand"), "{word}: {why}"),
-            other => panic!("{word}: {other:?}"),
-        }
+        assert!(
+            matches!(bound_peer(&member.places, &known, word), Ok(Bound::ByHand)),
+            "{word}"
+        );
         let refused = drive_fleet_in(&member.places, word, Duration::from_secs(1))
             .err()
             .expect("refused before any dial");
         assert!(refused.why.contains("named by hand"), "{word}: {refused:?}");
     }
-    assert_eq!(grants(), granted, "a refusal writes nothing");
 }

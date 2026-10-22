@@ -614,7 +614,7 @@ fn committed_of(build: &str) -> Vec<(String, String)> {
     out
 }
 
-/// EVERY COMMITTED CODEX REDUCTION FOLDS WHOLE (ruling T8's rule, for
+/// EVERY COMMITTED CODEX REDUCTION FOLDS WHOLE (rule, for
 /// Codex): each `codex-<build>[-<leg>].jsonl` is the build its header names,
 /// every `session_meta` in it names that build, and the fold reads it with
 /// no latch, no loss and no overflow, every step at the build's state —
@@ -718,7 +718,7 @@ fn only_what_a_lab_rollout_showed_is_classed() {
     }
 }
 
-/// NO TEXT (ruling S6): no step of the lab's rollouts, or of composed rows
+/// NO TEXT: no step of the lab's rollouts, or of composed rows
 /// carrying sentinels where Codex writes text, holds any of that text.
 #[test]
 fn no_step_holds_text() {
@@ -743,7 +743,7 @@ fn no_step_holds_text() {
     }
 }
 
-/// The codex-alab builds the lab measured (session log 6D-3a): the one
+/// The codex-alab builds the lab measured: the one
 /// built from its source for the run, and the owner's managed one, read
 /// from its store.
 const ALAB_BUILDS: [&str; 2] = [ALAB, "0.164.0-dev.12479+g07a25d86a"];
@@ -1029,7 +1029,7 @@ fn rollout_says(text: &str) -> Result<Vec<String>, String> {
     Ok(out)
 }
 
-/// THE MEASURED BUILDS, EXACT (session log 6D-3a; rulings T8, T33): each
+/// THE MEASURED BUILDS, EXACT: each
 /// leg of `lab codex-alab-proof` folds, on each codex-alab build the lab ran
 /// it on ([`ALAB_BUILDS`] and [`FOREVER`]), to what the leg did
 /// ([`ALAB_LEGS`], written out for [`ALAB`], whose managed sibling's legs
@@ -1155,7 +1155,7 @@ fn a_build_is_said_as_its_release_and_matched_whole() {
 /// The other codex-alab build the lab measured (the owner's managed one).
 const ALAB_MANAGED: &str = "0.164.0-dev.12479+g07a25d86a";
 
-/// THE WRITER HOLDS THE ROWS TO ITS BUILD (session log 5G-3): a thread's
+/// THE WRITER HOLDS THE ROWS TO ITS BUILD: a thread's
 /// `session_meta` names the build that started it, and a thread resumed or
 /// re-exec'd onto another build appends without restating it (measured:
 /// the `first` leg's rollout, written by three processes, holds one

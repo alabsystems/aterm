@@ -3,9 +3,9 @@
 
 //! `aterm-verify` — every aterm check as one CLI: `targo --unverified verify [CHECK|SET ...]`.
 //!
-//! It runs in place, in the caller's checkout and target dir, offline, and
-//! takes no lock but a short machine-wide one around the checks that judge
-//! timings. A bare run is the `dev` set on the change cone. Each check's
+//! It runs in place, in the caller's checkout and target dir, offline (except
+//! `export`, `provision` and `linux`'s first provision), and takes no lock but a
+//! short machine-wide one around the checks that judge timings. A bare run is the `dev` set on the change cone. Each check's
 //! stages run concurrently where they share no resource ([`sched`]), and the
 //! run prints one line per check as it finishes ([`report`]), the full ladder
 //! going to a log. `verify perf` ([`perf`]), `verify soak` ([`soak`]) and `verify glue`
@@ -37,6 +37,10 @@ pub mod ladder;
 pub mod libtest;
 pub mod perf;
 pub mod plan;
+// `verify provision`: the tools this checkout pins, fetched or built into this user's
+// cache (unix: macOS and the Linux lane's guest).
+#[cfg(unix)]
+pub mod provision;
 pub mod report;
 pub mod rustup;
 pub mod sched;
@@ -1070,9 +1074,10 @@ pub fn checkout_root(cwd: &Path) -> Option<PathBuf> {
 /// checkout `cwd` is in, run, print, and answer the exit code.
 #[must_use]
 pub fn run_cli(args: &[String], cwd: &Path) -> i32 {
-    // `perf`, `soak`, `glue` and the browser lane's verbs (`fetch-browser`,
-    // `browser-site`, `browser-drive`) parse their own arguments, and none
-    // needs targo: a host without Trust drives the browser lane.
+    // `perf`, `soak`, `glue`, `provision` and the browser lane's verbs
+    // (`browser-site`, `browser-drive`) parse their own arguments, and none
+    // needs targo to start: a host without Trust drives the browser lane, and
+    // `provision` names what provides targo where a row needs it.
     if args.first().is_some_and(|a| a == "perf") {
         return perf::run(&args[1..]);
     }
@@ -1083,8 +1088,13 @@ pub fn run_cli(args: &[String], cwd: &Path) -> i32 {
         return wasm_glue::run(&args[1..]);
     }
     #[cfg(unix)]
-    if args.first().is_some_and(|a| a == "fetch-browser") {
-        return browser::fetch_main(&args[1..]);
+    if args.first().is_some_and(|a| a == "provision") {
+        return provision::main(&args[1..], cwd);
+    }
+    #[cfg(not(unix))]
+    if args.first().is_some_and(|a| a == "provision") {
+        eprintln!("verify provision: COULD NOT RUN — it provisions macOS and Linux hosts only");
+        return exit::COULD_NOT_RUN;
     }
     #[cfg(unix)]
     if args.first().is_some_and(|a| a == "browser-site") {

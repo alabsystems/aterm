@@ -4810,8 +4810,8 @@ mod published_commit_tests {
         assert!(!said.contains("RETIRES"), "{said}");
     }
 
-    /// SEVERAL RESCUES, EACH KEPT UNTIL IT IS RETIRED (round eight of the update
-    /// audit, r8c finding 504). A predecessor that sealed two rescues with
+    /// SEVERAL RESCUES, EACH KEPT UNTIL IT IS RETIRED.
+    /// A predecessor that sealed two rescues with
     /// different knobs, as `[[ranges]]` under their hull: a cut that keeps both
     /// passes, and so does one that keeps them inside wider or more conservative
     /// rescues. A cut that silently drops either one is refused before the claim,

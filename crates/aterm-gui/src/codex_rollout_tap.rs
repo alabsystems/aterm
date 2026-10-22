@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE CODEX ROLLOUT TAP'S HOST (session log 5G-3; plan amendment A1, step
-//! 6D-3b; ruling T15): a codex-alab session's rollout steps reach its
+//! THE CODEX ROLLOUT TAP'S HOST (plan amendment A1):
+//! a codex-alab session's rollout steps reach its
 //! session log on one named thread of their own (`aterm-codex-rollout`), as
 //! a Claude Code transcript's reach it on the footer resolver's.
 //!
@@ -38,7 +38,7 @@
 //!   and say so (`status rollout=stopped`, [`stop_session`]), and a retired
 //!   session's goes with it ([`retire_session`]).
 //!
-//! Nothing is held here but the tap (ids and numbers: ruling S6), and
+//! Nothing is held here but the tap (ids and numbers), and
 //! nothing is logged but a refusal's word.
 
 use std::collections::HashMap;

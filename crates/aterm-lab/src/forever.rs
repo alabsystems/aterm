@@ -5382,7 +5382,7 @@ fn records(run: &Run, sid: &str) -> (Vec<(i64, String)>, Vec<Row>) {
 
 /// The `status` words the judge reads, one line: the end's
 /// (`end= end_seen= end_cheered=`, §12.5.2), the needs' count (`needs_n=`)
-/// and Land's hold (`land_held= land_nudges= land_since=`, §12.3.1, slice 3c)
+/// and Land's hold (`land_held= land_nudges= land_since=`, §12.3.1)
 /// beside the record's.
 fn status_words(door: &Door<'_>, sid: &str) -> String {
     let s = on(door, sid, &["status"]);

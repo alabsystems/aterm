@@ -1,18 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The Chromium the browser lane drives: found, fetched to a cache at a
-//! pinned version and sha256, and launched headless with its DevTools
-//! protocol on two pipes.
+//! The Chromium the browser lane drives: found, pinned at a version and
+//! sha256 that `verify provision` fetches into a cache, and launched headless
+//! with its DevTools protocol on two pipes.
 //!
 //! In order, the lane takes `ATERM_BROWSER` (any Chromium-family executable),
 //! then the pinned chrome-headless-shell in this machine's cache
-//! (`verify fetch-browser` puts it there), then an installed Chromium or
+//! (`verify provision` puts it there), then an installed Chromium or
 //! Chrome. None of them is a COULD NOT RUN naming the fetch.
 
 use std::path::{Path, PathBuf};
-
-use aterm_uds::spawnfd::command;
 
 /// The Chrome for Testing release the lane pins (the Stable channel's on
 /// 2026-10-16, published 2026-10-14).
@@ -51,7 +49,7 @@ pub(crate) const BROWSER_ENV: &str = "ATERM_BROWSER";
 
 /// The fix a run without a browser names.
 pub(crate) const FETCH_FIX: &str =
-    "targo --unverified verify fetch-browser, or set ATERM_BROWSER to a Chromium executable";
+    "targo --unverified verify provision, or set ATERM_BROWSER to a Chromium executable";
 
 /// Chrome for Testing's platform name for `(os, arch)`, where a pin exists.
 pub(crate) fn platform_for(os: &str, arch: &str) -> Option<&'static str> {
@@ -86,14 +84,14 @@ pub(crate) fn host_cache_root() -> Option<PathBuf> {
     crate::host_user_cache("browser")
 }
 
-/// The unpacked pin's directory under `root`. It exists only complete: the
-/// fetch unpacks beside it and renames.
-fn pinned_dir(root: &Path, platform: &str) -> PathBuf {
+/// The unpacked pin's directory under `root`. It exists only complete:
+/// `verify provision` unpacks beside it and renames.
+pub(crate) fn pinned_dir(root: &Path, platform: &str) -> PathBuf {
     root.join(format!("chrome-headless-shell-{PIN_VERSION}-{platform}"))
 }
 
 /// The executable inside [`pinned_dir`].
-fn pinned_binary(dir: &Path, platform: &str) -> PathBuf {
+pub(crate) fn pinned_binary(dir: &Path, platform: &str) -> PathBuf {
     dir.join(format!(
         "chrome-headless-shell-{platform}/chrome-headless-shell"
     ))
@@ -192,189 +190,6 @@ pub(crate) fn find() -> Result<Browser, String> {
          none installed",
         host_cache_root().map_or_else(|| "the cache".to_string(), |p| p.display().to_string())
     ))
-}
-
-/// `verify fetch-browser`: the pinned chrome-headless-shell, Firefox and
-/// WebKit for this host, each downloaded, held to its sha256 and unpacked
-/// into the cache. Prints each executable; exit 0, 1 on a failure, 3 where nothing
-/// is pinned.
-pub fn fetch_main(args: &[String]) -> i32 {
-    if let Some(a) = args.first() {
-        eprintln!(
-            "verify fetch-browser: takes no arguments, not `{a}` (it fetches chrome-headless-shell \
-             {PIN_VERSION} and Playwright's Firefox build {} and WebKit build {} for this host)",
-            super::firefox::BUILD,
-            super::webkit::BUILD
-        );
-        return crate::exit::USAGE;
-    }
-    let Some(root) = host_cache_root() else {
-        eprintln!("verify fetch-browser: COULD NOT RUN — no HOME to put the cache under");
-        return crate::exit::COULD_NOT_RUN;
-    };
-    let chromium = host_pin().map(|pin| Archive {
-        what: format!("chrome-headless-shell {PIN_VERSION}"),
-        url: archive_url(pin.platform),
-        sha256: pin.sha256,
-        bytes: pin.bytes,
-        dir: pinned_dir(&root, pin.platform),
-        binary: pinned_binary(Path::new(""), pin.platform),
-    });
-    let firefox = super::firefox::host_pin().map(|pin| Archive {
-        what: format!(
-            "Playwright's Firefox build {} (Firefox {})",
-            super::firefox::BUILD,
-            super::firefox::VERSION
-        ),
-        url: super::firefox::archive_url(pin),
-        sha256: pin.sha256,
-        bytes: pin.bytes,
-        dir: super::firefox::pinned_dir(&root, pin),
-        binary: PathBuf::from(pin.binary),
-    });
-    let webkit = super::webkit::host_pin().map(|pin| Archive {
-        what: format!(
-            "Playwright's WebKit build {} (WebKit {})",
-            super::webkit::BUILD,
-            super::webkit::VERSION
-        ),
-        url: super::webkit::archive_url(pin),
-        sha256: pin.sha256,
-        bytes: pin.bytes,
-        dir: super::webkit::pinned_dir(&root, pin),
-        binary: PathBuf::from(pin.binary),
-    });
-    let pinned: Vec<Archive> = chromium.into_iter().chain(firefox).chain(webkit).collect();
-    if pinned.is_empty() {
-        eprintln!(
-            "verify fetch-browser: COULD NOT RUN — no browser is pinned for {}-{}; set \
-             {BROWSER_ENV} to a Chromium",
-            std::env::consts::OS,
-            std::env::consts::ARCH
-        );
-        return crate::exit::COULD_NOT_RUN;
-    }
-    if super::firefox::host_pin().is_none() {
-        eprintln!(
-            "verify fetch-browser: no Firefox is pinned for {}-{}; the browser lane's Firefox \
-             rows run only with {}",
-            std::env::consts::OS,
-            std::env::consts::ARCH,
-            super::firefox::FIREFOX_ENV
-        );
-    }
-    if super::webkit::host_pin().is_none() {
-        eprintln!(
-            "verify fetch-browser: no WebKit is pinned for {}-{}; the browser lane's WebKit \
-             rows run only with {}",
-            std::env::consts::OS,
-            std::env::consts::ARCH,
-            super::webkit::WEBKIT_ENV
-        );
-    }
-    let mut code = crate::exit::PASS;
-    for archive in &pinned {
-        match fetch(archive, &root) {
-            Ok(binary) => println!("{}", binary.display()),
-            Err(e) => {
-                eprintln!("verify fetch-browser: FAIL — {}: {e}", archive.what);
-                code = crate::exit::FAILED;
-            }
-        }
-    }
-    code
-}
-
-/// One archive `verify fetch-browser` unpacks into the cache: where it is
-/// served, what it must hash to, the directory it is unpacked into, and its
-/// executable inside that.
-struct Archive {
-    what: String,
-    url: String,
-    sha256: &'static str,
-    bytes: u64,
-    dir: PathBuf,
-    binary: PathBuf,
-}
-
-/// Download, check and unpack `archive` under `root`; the executable.
-fn fetch(archive: &Archive, root: &Path) -> Result<PathBuf, String> {
-    let binary = archive.dir.join(&archive.binary);
-    if binary.is_file() {
-        eprintln!(
-            "verify fetch-browser: {} already in the cache",
-            archive.what
-        );
-        return Ok(binary);
-    }
-    std::fs::create_dir_all(root)
-        .map_err(|e| format!("could not create {}: {e}", root.display()))?;
-    // Each fetch owns its download and unpack directory. Concurrent fetches
-    // can publish the same verified pin without removing each other's work.
-    let scratch = aterm_tempfile::Builder::new()
-        .prefix("browser-fetch-")
-        .tempdir_in(root)
-        .map_err(|e| format!("could not create scratch under {}: {e}", root.display()))?;
-    let zip = scratch.path().join("browser.zip");
-    let url = &archive.url;
-    eprintln!(
-        "verify fetch-browser: downloading {url} ({} MB)",
-        archive.bytes / 1_000_000
-    );
-    run(
-        command("curl")
-            .args(["-sSfL", "--retry", "0", "-o"])
-            .arg(&zip)
-            .arg(url),
-        "curl",
-    )?;
-    let got = crate::perf::arena::sha256_file(&zip)?;
-    if got != archive.sha256 {
-        return Err(format!(
-            "{url} hashes to {got}, the pin is {} (crates/aterm-verify/src/browser/): the \
-             archive changed under its version; nothing was unpacked",
-            archive.sha256
-        ));
-    }
-    // Only a completed, checked unpack is renamed into the shared cache.
-    let staging = scratch.path().join("unpacked");
-    if cfg!(target_os = "macos") {
-        run(
-            command("ditto").args(["-x", "-k"]).arg(&zip).arg(&staging),
-            "ditto",
-        )
-    } else {
-        run(
-            command("unzip").arg("-q").arg(&zip).arg("-d").arg(&staging),
-            "unzip",
-        )
-    }?;
-    if !staging.join(&archive.binary).is_file() {
-        return Err(format!("the archive holds no {}", archive.binary.display()));
-    }
-    if let Err(e) = std::fs::rename(&staging, &archive.dir) {
-        // Another fetch may have published the same pin while this one unpacked.
-        if !binary.is_file() {
-            return Err(format!("could not place {}: {e}", archive.dir.display()));
-        }
-    }
-    Ok(binary)
-}
-
-fn run(cmd: &mut aterm_uds::spawnfd::Command, what: &str) -> Result<(), String> {
-    use aterm_uds::output::CommandOutput as _;
-    let out = cmd
-        .output_owned()
-        .map_err(|e| format!("could not run {what}: {e}"))?;
-    if out.status.success() {
-        Ok(())
-    } else {
-        Err(format!(
-            "{what} exited {:?}: {}",
-            out.status.code(),
-            String::from_utf8_lossy(&out.stderr).trim_end()
-        ))
-    }
 }
 
 /// An ANGLE backend a session asks WebGL2 to run on (`--use-angle`). The

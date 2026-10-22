@@ -276,7 +276,7 @@ impl Grid {
     /// importer can check before reading and decoding a sidecar the attach
     /// would refuse.
     #[must_use]
-    pub fn older_history_claim_holds(&self, claim: OlderHistoryClaim) -> bool {
+    pub const fn older_history_claim_holds(&self, claim: OlderHistoryClaim) -> bool {
         claim.clear_gen == self.storage.scrollback_clear_gen
     }
 

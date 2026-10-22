@@ -1,17 +1,17 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `aterm fabric brief` (`docs/DESIGN-session-log-2026-10-15.md` §5.5, session
-//! log phase 4): a bounded fold of the session logs the bus mirror put on the
+//! `aterm fabric brief` (`docs/DESIGN-session-log-2026-10-15.md` §5.5):
+//! a bounded fold of the session logs the bus mirror put on the
 //! fleet's `ev` faces, with record contents from the BUS ALONE, no file
 //! written, under whatever caps this host's `[fabric] command` (or
 //! `--cap-file`) reads `pub/>` with. Configuration discovery reuses `tail`'s
 //! path and can inspect local control endpoints; the fold reads no session
 //! records from them.
 //!
-//! THE READER'S VIEW IS THE LAW (ruling Q0): each body is decoded
+//! THE READER'S VIEW IS THE LAW: each body is decoded
 //! (`aterm_slog::decode_bus`) into the view of its `(node, sid, ep)` — one per
-//! seq space (ruling Q9: a newer space, a crash recovery's or an uncarried
+//! seq space (a newer space, a crash recovery's or an uncarried
 //! update's, is a fresh fold, partial until it holds its first record or a
 //! snapshot) — which shows each `(ep, seq)` once, unions the covers, and
 //! folds in seq order whatever order the bus holds the bodies in. A `v=1`
@@ -27,7 +27,7 @@
 //! BOUNDED: the window is the last `--window` records of the log (65,536 by
 //! default, at most 1,048,576); it is read in pages of at most [`PAGE_MAX`]
 //! rows (each page's scan the broker's `FETCH_SCAN_MAX`), continuing on the
-//! page's mark until the window is read (ruling Q9), so one reply is at most
+//! page's mark until the window is read, so one reply is at most
 //! a page of bodies (each at most 512 bytes: half a MiB). At most
 //! [`SESSIONS_MAX`] sessions and nodes are retained: a wider roster or
 //! record window refuses the read with an error, rather than silently
@@ -36,7 +36,7 @@
 //! first, gets its share of what is left, its head line alone when its share
 //! holds no more, and the sessions past the budget are `more=sessions:<k>`.
 //!
-//! THE MACHINE FORM (`--json`, session log Phase 6 step 6E-6): the same
+//! THE MACHINE FORM (`--json`): the same
 //! fold as ONE JSON object, its `sessions` one object per session, newest
 //! first, in a closed schema of ids, closed words and counts only —
 //! `node`, `sid` (the session's face, as the bus names it), `this` (whether
@@ -48,9 +48,9 @@
 //! `partial` (the `why=` words). Like the text, it prints no host or content
 //! field: the bus never carried one. It is held to the same `--budget`: each
 //! session's object counts its tokens, and the sessions past the budget are
-//! `more`. The Overview's "On the fabric" group reads it (step 6E-7).
+//! `more`. The Overview's "On the fabric" group reads it.
 //!
-//! A session without its close is `partial why=node-gone` (ruling Q4) when
+//! A session without its close is `partial why=node-gone` when
 //! its node's presence ended (`state=gone`, its will) or its own presence
 //! row is an earlier incarnation's than the node's live one (a crash or a
 //! quit, then a relaunch that never re-announced it), and `partial
@@ -74,7 +74,7 @@ use crate::fabric::J;
 use crate::render::safe;
 use crate::transport;
 
-/// The most rows one `Fetch` page asks for (ruling Q9).
+/// The most rows one `Fetch` page asks for.
 pub const PAGE_MAX: u32 = 1024;
 /// The window's default: one broker scan's worth of records.
 pub const WINDOW_DEFAULT: u64 = 65_536;
@@ -455,8 +455,7 @@ fn render(cfg: &Config, opts: &BriefOpts, r: &Read, now_ms: u64) -> String {
         let room = share - head_t;
         if room >= BODY_MIN_TOKENS {
             // No mail links: the mail marks a link is read from never
-            // cross the bus, so a peer's brief never guesses one (Phase 6
-            // step 6C-3, ruling U5).
+            // cross the bus, so a peer's brief never guesses one.
             let b = aterm_slog::brief(sid, space.records(), None, st, &[], room, now_ms);
             // The session's own lines, not its reply header.
             body = b.text.lines().skip(1).map(|l| safe(l, 512)).collect();

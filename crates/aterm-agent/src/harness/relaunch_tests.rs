@@ -1563,7 +1563,7 @@ fn a_gemini_clis_own_restart_is_read_as_the_exit_is_seen() {
         |_| false
     ));
     // The record kept for the attempt says it too ([`ExitRecord::Restarted`],
-    // owed as a crash is; the review of 3a4586a01e, R2): the word that told
+    // owed as a crash is): the word that told
     // it may be drawn no more by then. NEGATIVE CONTROL: a plain crash is
     // `Crashed`.
     let kept = exit_record(|| Some(look(false, Some(true), true)), |_| true);
@@ -3613,7 +3613,7 @@ fn a_relaunch_after_aterm_ended_is_made_on_the_carried_line_as_the_crash_rule_ma
     let carried = snap(Some(line.clone()));
     assert_eq!(self_claimed_line(&carried), Some(&line));
     // ITS OWN EXIT IS NEVER RELAUNCHED ON THE LINE (the review of
-    // 2026-10-16, finding 1): a line that rode a snapshot past its copy — a
+    // 2026-10-16): a line that rode a snapshot past its copy — a
     // seamless update's handed leaf, the agent still running at the Commit —
     // says nothing of how it ended, and is nobody's: left. The witness is
     // unhandled here, so the crash rule's relaunch would have typed it.

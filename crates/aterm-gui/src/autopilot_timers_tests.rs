@@ -966,8 +966,8 @@ fn the_fire_says_what_it_found() {
     }
 }
 
-/// A FIRE OVER A PANE NO AGENT RUNS IN SAYS SO OF THE PANE (behaviour-4 of
-/// the post-landing check of Autopilot v3 wave 1, Claude Code 2.1.302): in
+/// A FIRE OVER A PANE NO AGENT RUNS IN SAYS SO OF THE PANE (Claude Code 2.1.302):
+/// in
 /// a tab split Claude Code | shell, a timer set on the shell's pane — or on
 /// Claude Code's before it exited there — fires with its place naming that
 /// pane, `Tab 1, right pane: …`, and says `no agent runs in this pane`,

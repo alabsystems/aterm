@@ -1676,8 +1676,7 @@ pub(crate) struct Adopted {
     /// at the park, or the handoff record's copy (`SessionRecord::title`),
     /// which is fresh only for the pane in front of its window — taken with
     /// no placed layout, and for that pane when its leaf reads as a park read
-    /// that found the engine busy (no cwd, no title) (round eight of the
-    /// update audit, U47; `seamless::take_incoming`).
+    /// that found the engine busy (no cwd, no title) (`seamless::take_incoming`).
     pub title: String,
     /// Another supervisor's lease, the record's `"<holder> <remaining_ms>"` row,
     /// unparsed; `session_timeline::seed_carried_claims` restores it before
@@ -1710,8 +1709,8 @@ pub(crate) struct Adopted {
     /// as they would have in the parent. `None`: owes nothing, or the producer
     /// predates the field, and nothing happens.
     pub render_debt: Option<aterm_core::terminal::RenderDebt>,
-    /// THE MAILBOX THE HANDOFF CARRIED (round seven of the update audit,
-    /// findings 6, 8 and 28): the record's posts still waiting, receipts still
+    /// THE MAILBOX THE HANDOFF CARRIED:
+    /// the record's posts still waiting, receipts still
     /// owed and id counters, put back by [`seed_adopted_fabric`]. Empty for
     /// every fresh construction and from a producer that predates the carry.
     pub fabric: crate::fabric::FabricCarry,
@@ -1834,7 +1833,7 @@ pub(crate) fn seed_adopted_fabric(
         crate::fabric::parse_holds(holds.iter().map(String::as_str)),
         timeline,
     );
-    // THE MAILBOX (round seven, findings 6/8/28): the posts a sender was told
+    // THE MAILBOX: the posts a sender was told
     // are queued, the receipts still owed, and the id counters the sid's
     // bridge pins are keyed by — each id this session hands out from here is
     // above the old process's.
@@ -2117,9 +2116,9 @@ pub(crate) fn apply_pty_keyboard_posture(term: &Mutex<Terminal>, master: i32) {
 
 /// The `rlimit` set a daily-driver (`user`) shell is spawned with:
 /// the launcher's, unchanged — except the soft descriptor limit, when this
-/// process raised its own to claim a launched handoff's grant (round six of
-/// the update audit, item 39, review round two) or to park its sessions for an
-/// update (round eight, #3). That raise is the update's need, not its shells':
+/// process raised its own to claim a launched handoff's grant
+/// or to park its sessions for an
+/// update (#3). That raise is the update's need, not its shells':
 /// a tab opened after an update through the launched lane, or after an
 /// attempt from this process, gets back the soft limit the process was
 /// launched with (launchd's 256), as a Dock-launched aterm's tab does. The
@@ -2233,7 +2232,7 @@ pub(crate) fn spawn_session(
         .as_ref()
         .map(|adopted| adopted.holds.clone())
         .unwrap_or_default();
-    // …and the carried mailbox and the timeline's last id (round seven).
+    // …and the carried mailbox and the timeline's last id.
     let adopt_fabric: crate::fabric::FabricCarry = adopt
         .as_ref()
         .map(|adopted| adopted.fabric.clone())
@@ -2651,7 +2650,7 @@ pub(crate) fn spawn_session(
     if id == 0 {
         register_injected_parent_edges(&ctx);
     }
-    // THE HANDOFF GAP (round five, item 17): an adopted session's recorders
+    // THE HANDOFF GAP: an adopted session's recorders
     // start here, empty, and say so — first, before the fabric and claim
     // seeds below write their rows.
     // The carried session log rides the control sidecar: taken off it here,
@@ -2937,7 +2936,7 @@ pub(crate) fn spawn_session(
         } else {
             crate::metrics::PtyCensus::counted()
         },
-        // The incoming handoff's Commit (round seven, item 20): until it, the
+        // The incoming handoff's Commit: until it, the
         // parked predecessor owns an adopted shell, and dropping this session
         // must not signal it.
         handoff_commit: adopted_handoff_commit(adopted, recovered, factory.rekey_deferred.as_ref()),
@@ -3326,7 +3325,7 @@ mod adoption_wiring_tests {
     }
 
     /// THE KEEPER'S RECOVERY RESTARTS THE COUNT, AND HIDES NOTHING FROM AN
-    /// ANCHOR ABOVE IT (round eight of the update audit, U13): a session that
+    /// ANCHOR ABOVE IT: a session that
     /// crossed one seamless update counts on 65,536 ids above its producer's
     /// last ([`crate::session_timeline::HANDOFF_ID_RESERVE`]), so a driver
     /// tailing `timeline since=<last id>` holds an anchor that high. The PTY
@@ -4763,9 +4762,9 @@ pub(crate) fn reader_attach_ready(session: &Session) -> bool {
 /// (`SessionCtx::update_parked`): from [`park_reader`]'s stop until a reader
 /// attached after it has handed the parser everything the program wrote while no
 /// reader ran ([`GatherMsg::CaughtUp`]). While it stands, the control waits hold
-/// their idle clocks and their submit windows (round seven of the update audit,
-/// findings 62 and 63), and `ready` reads no prompt off the parser (round eight's
-/// lead U12): the program's output since the park waits unread in the kernel, so
+/// their idle clocks and their submit windows,
+/// and `ready` reads no prompt off the parser:
+/// the program's output since the park waits unread in the kernel, so
 /// neither the parser's silence nor its last prompt is the program's.
 ///
 /// Ended by the reader, not by the attach: a reattached reader has read nothing
@@ -5100,8 +5099,8 @@ mod park_reader_tests {
             std::time::Instant::now() + std::time::Duration::from_secs(60),
         ));
         assert!(session.reader_join.is_none());
-        // Parked, whatever the verdict: the control waits hold their clocks
-        // (round seven, findings 62 and 63), from the onset the park rang.
+        // Parked, whatever the verdict: the control waits hold their clocks,
+        // from the onset the park rang.
         assert!(session.ctx.update_parked.is_parked());
         assert!(
             waits.wait(std::time::Duration::ZERO),
@@ -5232,7 +5231,7 @@ mod park_reader_tests {
     }
 }
 
-/// ROUND EIGHT OF THE UPDATE AUDIT, LEAD U12: an update's park ends when the
+/// an update's park ends when the
 /// reader attached after it has handed the parser what the program wrote
 /// while none ran, not at the attach ([`super::UpdatePark`]). Until then the
 /// parser speaks for the program as it was before the park: a shell at its
@@ -7539,7 +7538,7 @@ fn spawn_pty_gather(
             };
             let _ = filled_tx.send(GatherMsg::Started);
             // CAUGHT UP: what the program wrote while no reader ran (an update's
-            // park, round eight's lead U12) waits in the kernel queue, and until
+            // park) waits in the kernel queue, and until
             // it is parsed the parser speaks for the program as it was before.
             // Its depth is read now, before any read; the queue is FIFO, so once
             // that many bytes have gone out every one of them has, and

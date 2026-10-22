@@ -326,7 +326,7 @@ pub struct ReflowedScrollback {
 
 // These cross a thread boundary.
 const _: fn() = || {
-    fn assert_send<T: Send>() {}
+    const fn assert_send<T: Send>() {}
     assert_send::<PendingScrollbackReflow>();
     assert_send::<ReflowedScrollback>();
     assert_send::<ReflowStep>();
@@ -1234,7 +1234,7 @@ impl Grid {
     /// a keystroke's snap to the live bottom must then reach
     /// [`Grid::scroll_to_bottom`] even though the viewport already sits at 0.
     #[must_use]
-    pub fn reader_aim_held(&self) -> bool {
+    pub const fn reader_aim_held(&self) -> bool {
         self.storage.detached_reader_aim.is_some()
     }
 
@@ -1245,7 +1245,7 @@ impl Grid {
     /// `true` means un-drainable lazy growth. The spec's `detached` variable in
     /// `tests/conformance_offload.rs`.
     #[must_use]
-    pub fn reflow_offload_in_flight(&self) -> bool {
+    pub const fn reflow_offload_in_flight(&self) -> bool {
         self.storage.scrollback_detached_for_reflow
     }
 

@@ -38,23 +38,23 @@
 //! sender.
 //!
 //! **The transcript join (phase 3B).** The vendor's transcript drives the
-//! same tracker through ONE method, [`TurnTracker::transcript`] (ruling S2:
-//! the join and the wall judge never write to the log themselves), with
+//! same tracker through ONE method, [`TurnTracker::transcript`] (the join and the wall judge never write to the log themselves),
+//! with
 //! typed [`TxEvent`]s that hold no text (an id, a tool's name, numbers):
 //! a prompt confirms the screen's turn (`amend vref=`) or, when the screen
 //! missed it, opens the vendor turn's own; `tool_use` opens `tool` and
 //! `subagent` steps under it; a result closes them; a turn end closes the
 //! turn when no screen step holds it open (and amends `vdur_ms tok_in
-//! tok_out` after, ruling A3); the wall judge confirms (`confirmed=1`) or
+//! tok_out` after); the wall judge confirms (`confirmed=1`) or
 //! retracts the screen's wall. Every record is `src=transcript by=vendor`,
 //! `conf=exact` on a measured Claude Code build ([`TxState::On`]) and
-//! `strong` on another, where it only adds ([`TxState::Partial`], ruling S9).
+//! `strong` on another, where it only adds ([`TxState::Partial`]).
 //! Nothing before the first read of a file, the process's start, the run's
-//! open or an adoption is replayed (ruling S1), and nothing at or below the
+//! open or an adoption is replayed, and nothing at or below the
 //! watermark the join applied through (S23), which the tracker's carry line
 //! keeps across an update (A1).
 //!
-//! **Who dismissed a box (phase 5, ruling T1).** An approval or question
+//! **Who dismissed a box.** An approval or question
 //! step closes `out=passed` with `by=` the input bound to it: an input binds
 //! the step open at its ADMISSION ([`TurnTracker::admit`], the host's look
 //! under the lock it already takes before a byte is written), or, when none
@@ -88,17 +88,17 @@ pub const SETTLE_MS: u64 = 1000;
 /// How recent an input must be to be the turn's `by=` (§2.5).
 pub const ATTRIBUTION_MS: u64 = 5000;
 /// How recent an input's acceptance must be, at an approval or question
-/// step's close, to be the input that dismissed it (ruling T1): at least two
+/// step's close, to be the input that dismissed it: at least two
 /// of the host's screen reads (`aterm-gui` pins it at `>= 2 ×` its agent
 /// read interval), so the read that saw the box go is within it.
 pub const STEP_ACT_MS: u64 = 500;
 /// How soon after an input's admission, with no approval or question step
-/// open then, the first such step must open for the input to bind it
-/// (ruling T1): the screen read that shows a box can trail the box.
+/// open then, the first such step must open for the input to bind it:
+/// the screen read that shows a box can trail the box.
 pub const STEP_INPUT_LEAD_MS: u64 = 500;
 
-/// What an input says it means for the step it dismisses (`act=`, ruling
-/// T1): it closes an approval `out=approved|declined`, a question
+/// What an input says it means for the step it dismisses (`act=`):
+/// it closes an approval `out=approved|declined`, a question
 /// `out=answered`, only from a proven author.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ActWord {
@@ -160,8 +160,8 @@ pub const fn within_lead(admitted: Stamp, opened: Stamp) -> bool {
     opened.mono_ms >= admitted.mono_ms && opened.mono_ms - admitted.mono_ms <= STEP_INPUT_LEAD_MS
 }
 
-/// What the host admitted an input under ([`TurnTracker::admit`], ruling
-/// T1): the approval or question step open then, when it was admitted, and
+/// What the host admitted an input under ([`TurnTracker::admit`]):
+/// the approval or question step open then, when it was admitted, and
 /// how many such steps had opened and closed by then. A token the host holds
 /// from admission to acceptance; it names nothing the log stores.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -202,7 +202,7 @@ pub enum Binding {
     Unbound,
 }
 
-/// What the tracker holds of the inputs bound to its steps (ruling T1), for
+/// What the tracker holds of the inputs bound to its steps, for
 /// a conformance projection or a debugger.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AttributionView {
@@ -739,8 +739,8 @@ impl TurnTracker {
         self.wake_at()
     }
 
-    /// THE ADMISSION of an input the host is about to write at `at` (ruling
-    /// T1): the approval or question step open now, read under the lock the
+    /// THE ADMISSION of an input the host is about to write at `at`:
+    /// the approval or question step open now, read under the lock the
     /// host already takes before a byte, so the input can only ever bind the
     /// step the writer saw, never one the next screen read opens in its
     /// place.
@@ -756,7 +756,7 @@ impl TurnTracker {
     }
 
     /// THE ACCEPTANCE of an input admitted as `adm` (its bytes written), from
-    /// `by` with its `act=`, at `at` (ruling T1): it binds the step open at
+    /// `by` with its `act=`, at `at`: it binds the step open at
     /// its admission while that step is still open (the latest bound input is
     /// the one a close reads); with none open then, the first approval or
     /// question step that opened since, within the lead and with none closing
@@ -810,7 +810,7 @@ impl TurnTracker {
         }
     }
 
-    /// A PERSON's input at `at` (ruling T2's delivery): admitted and accepted
+    /// A PERSON's input at `at` (delivery): admitted and accepted
     /// at once (the host counts a person's key before it reaches the
     /// program), binding the approval or question step open now, or, with
     /// none open, leading as any input does (T1): the first such step to open
@@ -842,7 +842,7 @@ impl TurnTracker {
         }
     }
 
-    /// What the tracker holds of its bound inputs (ruling T1).
+    /// What the tracker holds of its bound inputs.
     #[must_use]
     pub fn attribution(&self) -> AttributionView {
         AttributionView {
@@ -1065,7 +1065,7 @@ impl TurnTracker {
             last_input,
             last_close: None,
             tx: TxJoin::from_carry(&get, now),
-            // Nothing of an input's binding crosses (ruling T1): a successor
+            // Nothing of an input's binding crosses: a successor
             // attributes only inputs it admitted.
             bound: None,
             lead: None,
@@ -1405,13 +1405,13 @@ impl TurnTracker {
 
 // ---- the transcript join (phase 3B) -------------------------------------
 
-/// The most transcript steps one turn holds open at once (ruling S23): a
+/// The most transcript steps one turn holds open at once: a
 /// ninth parallel tool call is counted `dropped=`, never opened.
 pub const TX_TOOLS_MAX: usize = 8;
 
-/// What a run's transcript source is (ruling S31; `source field=transcript
+/// What a run's transcript source is (`source field=transcript
 /// state=`): read at `conf=exact` from a Claude Code build the lab measured,
-/// at `conf=strong` from another, where it only adds (ruling S9: `vref`
+/// at `conf=strong` from another, where it only adds (`vref`
 /// amends, tool, subagent and compact steps, `vdur_ms tok_*` amends, the
 /// run's `model= effort= ver=`; never a turn's open or close, an `out=`
 /// amend, `confirmed=1` or a retraction), or not read at all (its shape
@@ -1459,7 +1459,7 @@ impl TxState {
     }
 }
 
-/// Where a transcript row was read (rulings S23, A20): the file, as its
+/// Where a transcript row was read: the file, as its
 /// path's fingerprint and, where the platform has one, its identity
 /// (`dev`, `ino`); the end offset of the row's line; and the row's own time
 /// (wall ms, its `timestamp`).
@@ -1477,7 +1477,7 @@ pub struct TxPos {
 }
 
 /// The read position the join has applied through: a row at or below it
-/// is never applied again (ruling S23's watermark).
+/// is never applied again (watermark).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct TxMark {
     /// The path's fingerprint.
@@ -1516,8 +1516,8 @@ pub enum WallJudge {
 
 /// One transcript fact, typed: an id, a tool's name (`tool=`, host tier,
 /// at most 64 bytes), a class word and numbers. No prompt, reply, tool
-/// input, result or notice text has a field here (D5 decision B; ruling
-/// S6), so none can reach a record.
+/// input, result or notice text has a field here (D5 decision B),
+/// so none can reach a record.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TxEvent<'a> {
     /// The glue bound a transcript file of `len` bytes (its first read, a
@@ -1810,7 +1810,7 @@ const fn no_earlier(at: Stamp, wall_ms: u64) -> Stamp {
     }
 }
 
-/// THE DATE OF A TRANSCRIPT CLOSE of `node` (rulings S4, A21): `chosen`,
+/// THE DATE OF A TRANSCRIPT CLOSE of `node`: `chosen`,
 /// or later — never before the node's own open, nor before any child's
 /// open or close — because [`Log::close`] clamps nothing, and a turn the
 /// screen opened late, or whose steps the host stamped, may hold a child
@@ -1853,7 +1853,7 @@ impl TurnTracker {
         }
     }
 
-    /// ONE TRANSCRIPT FACT (§2.5, §2.6; rulings S1-S4, S9, S23, S31): `ev`,
+    /// ONE TRANSCRIPT FACT (§2.5, §2.6): `ev`,
     /// read at `pos` while the source is `state`, applied at the host's
     /// `now` — through this method alone (S2). A settle that came due is
     /// applied first, as [`Self::observe`] does. Returns when to tick.
@@ -2070,7 +2070,7 @@ impl TurnTracker {
         let _ = log.amend(node, amend, at);
     }
 
-    /// THE PROMPT (§2.5's join, rulings S3, S4, S9, S13). Attaches only
+    /// THE PROMPT (§2.5's join). Attaches only
     /// within [`ATTRIBUTION_MS`] of the prompt, either side: the open turn
     /// when it has no vendor turn and opened within that of the prompt; the
     /// newest closed turn when it has none and opened within that — and
@@ -2257,7 +2257,7 @@ impl TurnTracker {
         }
     }
 
-    /// THE TURN END (rulings S2, A3): the open turn its vendor turn maps to
+    /// THE TURN END: the open turn its vendor turn maps to
     /// closes when no screen step is open under it (a measured build only),
     /// with the settle's outcome when one is armed, dated by
     /// [`tx_close_at`]; then, open or closed, the turn takes `vdur_ms tok_in
@@ -2344,7 +2344,7 @@ impl TurnTracker {
         }
     }
 
-    /// THE WALL JUDGE'S ANSWER (§2.6, ruling S2), a measured build only
+    /// THE WALL JUDGE'S ANSWER (§2.6), a measured build only
     /// (S9): a confirmation amends the screen's wall step `confirmed=1`
     /// once; a refutation closes it `out=retracted` (its need goes with
     /// it), disarms a wall settle, latches until the screen's word moves,

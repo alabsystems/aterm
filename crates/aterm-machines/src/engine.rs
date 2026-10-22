@@ -60,7 +60,7 @@ impl Place {
 
 /// A machines [`Item`] with the `System` and context it runs against: an
 /// [`aterm_converge::Item`]. It forwards the item's id, family, title, probe, apply,
-/// refresh, activation, detail, revert, effect and stood-aside line, and takes its layer,
+/// refresh, activation, detail, revert, effect and stood-aside lines, and takes its layer,
 /// class and precondition from its [`Place`].
 pub struct Bound<'a> {
     item: &'a dyn Item,
@@ -201,6 +201,10 @@ impl aterm_converge::Item for Bound<'_> {
 
     fn stood_aside(&self) -> Option<StoodAside> {
         self.item.stood_aside()
+    }
+
+    fn stands_aside(&self) -> Option<StoodAside> {
+        self.item.stands_aside(self.sys, self.ctx)
     }
 }
 

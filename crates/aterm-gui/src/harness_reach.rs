@@ -53,7 +53,7 @@ impl App {
     /// refresh and before the registry lock is taken (the host's state lock
     /// is never nested under it): all of its agent sessions while it
     /// supervises, except those it is holding off for their adopted-claim
-    /// grace after an update (round four, item 9) — nobody here answers
+    /// grace after an update — nobody here answers
     /// their boxes yet, so the menu bar raises them as it would for a
     /// session no host supervises, until a claim (the host's, or the
     /// external supervisor's it waited for) is live.

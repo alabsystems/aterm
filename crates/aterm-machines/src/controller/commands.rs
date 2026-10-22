@@ -1,34 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The owner's verbs (design §4, §6, §9): `init`, `ls`, `status`, `outstanding`, `plan`,
-//! `apply`, `attach`, `run`, `person`, `screen`, `github revoke`, `rekey`, `unenroll`, and
-//! the local `here`.
-//!
-//! A fleet command runs in three phases:
-//!
-//! 1. A `hello` sweep, in parallel: reachability, agent build, floors and cache, and where
-//!    each host answers when a rename left machines.toml's `.local` name behind, or DHCP
-//!    gave it another IP address (`reach`, which every command that contacts an enrolled
-//!    host goes through).
-//! 2. Envelopes built one after another, so the serial counter is never raced, then signed
-//!    in one `ssh-keygen` run, so a passphrase or touch is asked for once per command (and
-//!    not at all when ssh-agent already holds the key).
-//! 3. Uploads and the run itself, in parallel again. `apply` first upgrades a host whose
-//!    agent is not this controller's own build (design §4.5).
-//!
-//! Every host's newest plan or apply report lands in `state/` (a refusal is kept beside it,
-//! never in its place), and `status` and `outstanding` read only that. Everything a host
-//! said is printed through [`shown`], and every line through `outln!` or `errln!`, which
-//! never panic.
-
-// `println!` panics once its terminal is gone; the lines here go through `outln!`/`errln!`.
+//! Controller CLI verbs (`init`, `ls`, `status`, `outstanding`, `plan`, `apply`, `run`, `person`, `rekey`, `unenroll`).
 #![cfg_attr(not(test), deny(clippy::print_stdout, clippy::print_stderr))]
 
-/// `println!` that never panics. Once the terminal is gone (SIGHUP, a closed pty) a write to
-/// it fails, and `println!` would end the command with status 101 there: before a walk's
-/// closing plan saved what it read, or before its last line (VM: a walk hung up after its
-/// lock exited 101). Unit tests keep `println!`, whose output libtest captures.
 macro_rules! outln {
     ($($arg:tt)*) => {{
         #[cfg(not(test))]
@@ -41,7 +16,6 @@ macro_rules! outln {
     }};
 }
 
-/// `eprintln!` that never panics, as `outln!`.
 macro_rules! errln {
     ($($arg:tt)*) => {{
         #[cfg(not(test))]
@@ -73,26 +47,16 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Duration;
 
-/// How long a `hello` may take.
 const HELLO_BUDGET: Duration = Duration::from_secs(30);
 
-/// How long one `apply` request may stream before the controller lets it detach. The run
-/// itself goes on on the host (design §4.4); `attach` picks it up again.
 const APPLY_BUDGET: Duration = Duration::from_secs(4 * 3600);
 
-/// How long an upload may take (the aterm release zip, Emacs' image: hundreds of MB).
 const PUT_BUDGET: Duration = Duration::from_secs(3600);
 
-/// How long an agent upgrade may take on the host (expand, codesign, swap, sudoers).
 const UPGRADE_BUDGET: Duration = Duration::from_secs(900);
 
-/// How long an envelope stays valid (design §3.3: the serial floor is the anti-replay
-/// control, so this only bounds a forgotten envelope).
 const ENVELOPE_LIFETIME: u64 = 24 * 3600;
 
-/// How long the signing key stays in ssh-agent for one person flow (`ssh-add -t`). The flow
-/// removes it when it ends; a flow that is interrupted (Ctrl-C) cannot, and the key then
-/// expires from the agent after this long.
 const AGENT_KEY_LIFETIME: &str = "3600";
 
 /// What every verb needs.
@@ -107,13 +71,11 @@ pub struct Env<'a> {
     pub tty: bool,
     /// Concurrent hosts (`--parallel`), over `[controller] parallel`.
     pub parallel: Option<usize>,
-    /// This process's `SSH_AUTH_SOCK`: the ssh-agent a signing key with a passphrase may
-    /// already be loaded in.
+    /// This process's `SSH_AUTH_SOCK` for passphrase-protected signing keys.
     pub agent_sock: Option<OsString>,
 }
 
-/// The exit status design §9 names: 0 nothing failed, 1 something failed, 2 nothing failed
-/// but some hosts could not be reached. A command line that is refused is 2 as well.
+/// Aggregate fleet command exit tally (`0` ok, `1` failed, `2` unreachable/refused).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Tally {
     /// An item failed or could not be measured, or a host refused or broke.
@@ -136,16 +98,7 @@ impl Tally {
     }
 }
 
-// ── init ────────────────────────────────────────────────────────────────────────────────
-
-/// `aterm machines init [--passphrase]`: the controller directory, the fleet SSH key, the
-/// signing and recovery keys, `allowed_signers`, and the starter inventory and baseline.
-/// Nothing that exists is overwritten, and what it made is printed to `out`.
-///
-/// Every key is made with no passphrase, so nothing is asked and no terminal is needed: a
-/// signing key with none signs unattended (design §3.1). With `passphrase`, `ssh-keygen`
-/// asks one for the signing and recovery keys on the terminal, also for keys an earlier
-/// `init` made without one; the fleet key has none either way (`ssh` uses it in batch mode).
+/// `aterm machines init [--passphrase]`: initialize controller keys, signers, inventory, and starter baseline.
 #[must_use]
 pub fn init(env: &Env<'_>, passphrase: bool, out: &mut dyn std::io::Write) -> ExitCode {
     if passphrase && !env.tty {
@@ -166,7 +119,6 @@ pub fn init(env: &Env<'_>, passphrase: bool, out: &mut dyn std::io::Write) -> Ex
         return ExitCode::FAILURE;
     }
     let host = controller_name(sys);
-    // Each key, and whether `allowed_signers` names it.
     let keys = [
         (
             env.paths.ssh_key(),
@@ -189,10 +141,7 @@ pub fn init(env: &Env<'_>, passphrase: bool, out: &mut dyn std::io::Write) -> Ex
     ];
     for (path, comment, what, signer) in &keys {
         let asked = passphrase && *signer;
-        // Either half: a recovery key moved to removable media leaves only its .pub here.
         if sys.stat(path).is_ok() || sys.stat(&path.with_extension("pub")).is_ok() {
-            // --passphrase is added later too: a key made without one is given one, still
-            // the same key, so every host's allowed_signers still names it.
             if asked && sys.stat(path).is_ok() {
                 match envelope::needs_passphrase(sys, path) {
                     Read::Value(true) => {}
@@ -275,8 +224,6 @@ pub fn init(env: &Env<'_>, passphrase: bool, out: &mut dyn std::io::Write) -> Ex
     ExitCode::SUCCESS
 }
 
-/// Make the ed25519 key `path` (its `.pub` beside it) with `ssh-keygen`: with no passphrase
-/// in a plain run, or, when `asked`, on the terminal, where `ssh-keygen` asks for one.
 fn make_key(sys: &dyn System, path: &Path, comment: &str, asked: bool) -> Result<(), String> {
     let keygen = |args: &[&str]| {
         Cmd::new("/usr/bin/ssh-keygen")
@@ -300,9 +247,6 @@ fn make_key(sys: &dyn System, path: &Path, comment: &str, asked: bool) -> Result
     }
 }
 
-/// Give the key `path`, which has no passphrase, one on the terminal (`ssh-keygen -p` asks
-/// for it twice): the private file is written again, encrypted, and the key and its `.pub`
-/// stay as they are.
 fn add_passphrase(sys: &dyn System, path: &Path) -> Result<(), String> {
     match sys.run_tty(
         &Cmd::new("/usr/bin/ssh-keygen")
@@ -315,7 +259,6 @@ fn add_passphrase(sys: &dyn System, path: &Path) -> Result<(), String> {
     }
 }
 
-/// Confirm what the interactive command left before reporting protection.
 fn require_passphrase(sys: &dyn System, path: &Path) -> Result<(), String> {
     match envelope::needs_passphrase(sys, path) {
         Read::Value(true) => Ok(()),
@@ -327,7 +270,6 @@ fn require_passphrase(sys: &dyn System, path: &Path) -> Result<(), String> {
     }
 }
 
-/// This Mac's LocalHostName, for key comments and principals.
 fn controller_name(sys: &dyn System) -> String {
     sys.run(&Cmd::new("/usr/sbin/scutil").args(["--get", "LocalHostName"]))
         .ok()
@@ -336,8 +278,6 @@ fn controller_name(sys: &dyn System) -> String {
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "controller".to_owned())
 }
-
-// ── ls / status / outstanding ───────────────────────────────────────────────────────────
 
 /// `aterm machines ls`: the inventory, one host per row.
 #[must_use]
@@ -376,9 +316,6 @@ pub fn ls(env: &Env<'_>) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-/// One host's row in `status`: how it was last reached, its newest plan or apply report, a
-/// refusal of a later run, an OS build that changed since its last apply, and the macOS and
-/// agent it runs.
 fn summary(host: &Host, state: &HostState, now: u64) -> String {
     let mut reach = match (state.unreachable_since, state.last_seen) {
         (Some(since), _) => format!("unreachable for {}", age(now.saturating_sub(since))),
@@ -412,8 +349,6 @@ fn summary(host: &Host, state: &HostState, now: u64) -> String {
         let tables: Vec<String> = only.tables.iter().map(|t| shown(t)).collect();
         notes.push_str(&format!("; {} only ({rest})", tables.join(",")));
     }
-    // The version alone: the build's hash is `status --json`'s, and a host on another build
-    // than this controller's shows as the planned switch of its helper.
     let agent = hello
         .as_ref()
         .map(|h| format!("agent {}", shown(&h.agent_version)))
@@ -447,8 +382,6 @@ fn summary(host: &Host, state: &HostState, now: u64) -> String {
         Mode::Plan => "planned",
         Mode::Apply => "applied",
     };
-    // A refusal saved as the report itself: a state file from before refusals were kept
-    // beside the report, or a refused run `print_report` shows as it ends.
     let refused = report
         .refused
         .as_ref()
@@ -468,7 +401,6 @@ fn summary(host: &Host, state: &HostState, now: u64) -> String {
     )
 }
 
-/// The newest `hello` the host's state keeps, when it parses.
 fn saved_hello(state: &HostState) -> Option<Hello> {
     state
         .hello
@@ -476,9 +408,6 @@ fn saved_hello(state: &HostState) -> Option<Hello> {
         .and_then(|text| aterm_json::from_str(text).ok())
 }
 
-/// The OS build at the host's last apply and the one its newest `hello` reported, when both
-/// are known and differ (design §4.4): a macOS update brings back what `[setup]` turned off,
-/// so the host wants another apply. An unknown build on either side says nothing.
 fn os_changed(state: &HostState, hello: Option<&Hello>) -> Option<(String, String)> {
     let was = state.applied_build.as_deref().filter(|b| !b.is_empty())?;
     let is = hello
@@ -487,7 +416,6 @@ fn os_changed(state: &HostState, hello: Option<&Hello>) -> Option<(String, Strin
     (was != is).then(|| (was.to_owned(), is.to_owned()))
 }
 
-/// `3m`, `2h`, `5d`.
 fn age(secs: u64) -> String {
     match secs {
         0..60 => format!("{secs}s"),
@@ -497,8 +425,6 @@ fn age(secs: u64) -> String {
     }
 }
 
-/// A host's saved state; a state file that is there and cannot be read is said once and
-/// counts as a failure, never as a host with no report.
 fn read_state(env: &Env<'_>, host: &Host, tally: &mut Tally) -> Option<HostState> {
     match inventory::load_state(env.sys, &env.paths, &host.uuid) {
         Ok(state) => Some(state),
@@ -568,8 +494,7 @@ pub fn status(env: &Env<'_>, names: &[String], all: bool, by_item: bool) -> Exit
     tally.code()
 }
 
-/// `aterm machines rename <host> <new-name>` (alias `name`): set or rename any host's
-/// canonical display name in `machines.toml`.
+/// `aterm machines rename <host> <new-name>`: set or rename a host's canonical display name in `machines.toml`.
 #[must_use]
 pub fn rename(env: &Env<'_>, selector: &str, new_name: &str) -> ExitCode {
     match inventory::set_host_name(env.sys, &env.paths, selector, new_name) {
@@ -602,7 +527,6 @@ pub fn rename(env: &Env<'_>, selector: &str, new_name: &str) -> ExitCode {
     }
 }
 
-/// Format a [`crate::protocol::HostedSession`]'s AI CLI reading (`working: thinking (4s)`).
 fn format_session_ai_status(s: &crate::protocol::HostedSession) -> String {
     let Some(word) = s.agent.as_deref().filter(|w| !w.is_empty()) else {
         return "-".to_owned();
@@ -618,7 +542,6 @@ fn format_session_ai_status(s: &crate::protocol::HostedSession) -> String {
     out
 }
 
-/// The advertised model identifier, without inferring hardware from a host name.
 fn describe_host_hardware(model_id: Option<&str>) -> String {
     model_id
         .map(str::trim)
@@ -627,8 +550,6 @@ fn describe_host_hardware(model_id: Option<&str>) -> String {
         .to_owned()
 }
 
-/// Parse `model=` and `osxvers=` from `dns-sd -Q "<instance>._device-info._tcp.local." TXT`
-/// (supporting both ASCII TXT output and `dns-sd -Q`'s hex Rdata after `bytes:`).
 fn parse_device_info_txt(text: &str) -> (Option<String>, Option<u32>) {
     let mut decoded = String::from(text);
     for line in text.lines() {
@@ -668,14 +589,11 @@ fn parse_device_info_txt(text: &str) -> (Option<String>, Option<u32>) {
     (model, osxvers)
 }
 
-/// Resolve a `.local` hostname to its IPv4 address and read its port-22 SSH version banner.
 fn resolve_ipv4_and_ssh_banner(hostname: &str, port: u16) -> (Option<String>, Option<String>) {
     let (ipv4, banner, _) = resolve_ipv4_banner_and_rtt(hostname, port);
     (ipv4, banner)
 }
 
-/// Resolve a `.local` hostname to its IPv4 address, read its port-22 SSH version banner,
-/// and measure the TCP connect round-trip time in microseconds.
 fn resolve_ipv4_banner_and_rtt(
     hostname: &str,
     port: u16,
@@ -711,8 +629,7 @@ fn resolve_ipv4_banner_and_rtt(
     (ipv4, banner, rtt_us)
 }
 
-/// Pure parser for the batched SSH vitals probe output (supports both Linux `/proc` + `nvidia-smi`
-/// and macOS `sysctl` + `vm_stat`).
+/// Parse batched SSH vitals probe output from Linux (`/proc`, `nvidia-smi`) or macOS (`sysctl`, `vm_stat`).
 #[must_use]
 pub fn parse_ssh_vitals_output(
     out: &str,
@@ -857,8 +774,6 @@ pub fn parse_ssh_vitals_output(
     })
 }
 
-/// Try to open the native Fleet System Monitor tab (`/monitor`) in a running local `aterm`
-/// instance via its control socket. Returns the socket path on success.
 fn open_native_monitor_tab_in_aterm() -> Option<String> {
     #[cfg(unix)]
     {
@@ -927,7 +842,6 @@ fn open_native_monitor_tab_in_aterm() -> Option<String> {
     None
 }
 
-/// One complete SSH identification, bounded by bytes and a single deadline.
 fn read_ssh_banner(
     mut stream: &std::net::TcpStream,
     deadline: std::time::Instant,
@@ -965,7 +879,6 @@ fn read_ssh_banner(
     None
 }
 
-/// Report only observed OS fields and SSH banner; missing data remains unknown.
 fn format_os_and_ssh(
     os_version: Option<&str>,
     os_build: Option<&str>,
@@ -1000,8 +913,6 @@ fn working_ai_sessions(sessions: &[crate::protocol::HostedSession]) -> usize {
         .count()
 }
 
-/// Print one host's row in `aterm machines tabs` / `monitor`, followed by its live system
-/// vitals line, indented `aterm` session lines, and indented tab lines underneath each session.
 #[allow(clippy::too_many_arguments)]
 fn print_host_tabs_rows(
     host_name: &str,
@@ -1147,8 +1058,7 @@ fn print_host_tabs_rows(
     }
 }
 
-/// `aterm machines monitor [<host>…] [--open | --once | --watch] [--interval <s>] [--json]`:
-/// live continuous system monitoring across the fleet (`docs/DESIGN-fleet-monitor-2026-10-20.md`).
+/// `aterm machines monitor`: live continuous system monitoring across the fleet.
 #[must_use]
 pub fn monitor(
     env: &Env<'_>,
@@ -1193,8 +1103,7 @@ pub fn monitor(
     tabs(env, names, all)
 }
 
-/// `aterm machines tabs [<host>…] [--json]`: live spreadsheet of accessible Macs, `aterm`
-/// instances, tabs, stats and AI CLI status.
+/// `aterm machines tabs`: live table of accessible Macs, `aterm` instances, tabs, vitals, and AI CLI status.
 #[must_use]
 pub fn tabs(env: &Env<'_>, names: &[String], all: bool) -> ExitCode {
     let inv = match inventory::load(env.sys, &env.paths) {
@@ -1238,8 +1147,6 @@ pub fn tabs(env: &Env<'_>, names: &[String], all: bool) -> ExitCode {
         );
     }
 
-    // Include this Mac's own local sessions when no specific remote host filter excluded it
-    // and this Mac is not already an enrolled entry in `hosts`.
     let own_facts = crate::facts::gather(env.sys);
     let self_in_hosts = !own_facts.uuid.is_empty()
         && hosts
@@ -1384,7 +1291,6 @@ pub fn tabs(env: &Env<'_>, names: &[String], all: bool) -> ExitCode {
         }
     }
 
-    // Also include Bonjour-discovered LAN computers that are not yet enrolled in `machines.toml`.
     if live_all {
         let services = [
             super::discover::SSH_SERVICE,
@@ -1562,7 +1468,6 @@ fn natural_host_sort_key(name: &str) -> (u8, u64, String) {
     (1, 0, trimmed.to_ascii_lowercase())
 }
 
-/// The report word for an outcome.
 const fn outcome_word(outcome: Outcome) -> &'static str {
     match outcome {
         Outcome::Ok => "ok",
@@ -1577,11 +1482,7 @@ const fn outcome_word(outcome: Outcome) -> &'static str {
     }
 }
 
-/// `aterm machines outstanding`: one to-do list across the fleet: unreached hosts, hosts
-/// that refused contact or a run, failures, person steps, deferred and blocked items, hosts
-/// whose macOS changed since their last apply, hosts only `--only` runs reached, and the
-/// changes an apply made that wait for a login or a restart (until a later run reads them
-/// `ok`).
+/// `aterm machines outstanding`: fleet-wide to-do list of unreached hosts, failures, and pending person steps.
 #[must_use]
 pub fn outstanding(env: &Env<'_>) -> ExitCode {
     let inv = match load(env) {
@@ -1653,8 +1554,6 @@ pub fn outstanding(env: &Env<'_>) -> ExitCode {
             );
         }
         for row in &report.items {
-            // Only an apply changes anything, so a `changed` row is an apply's whichever run
-            // the report's mode names: an `--only` plan merged over an apply keeps its rows.
             let pending = match (row.outcome, row.effect) {
                 (Outcome::Changed, Effect::Login) => Some("at the next login"),
                 (Outcome::Changed, Effect::Restart) => Some("at the next restart"),
@@ -1692,10 +1591,6 @@ pub fn outstanding(env: &Env<'_>) -> ExitCode {
     tally.code()
 }
 
-// ── plan / apply ────────────────────────────────────────────────────────────────────────
-
-/// The to-do a host whose only reports are `--only` runs' carries: the rest of its baseline
-/// was never planned or applied, which its report's rows alone would not show.
 fn only_todo(host: &Host, state: &HostState) -> Option<String> {
     let only = state.only.as_ref().filter(|o| o.rest.is_none())?;
     let tables: Vec<String> = only.tables.iter().map(|t| shown(t)).collect();
@@ -1707,32 +1602,18 @@ fn only_todo(host: &Host, state: &HostState) -> Option<String> {
     ))
 }
 
-/// Why a host's `hello` did not answer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum HelloError {
-    /// `ssh` itself failed (exit status 255), as [`ssh::classify`] read its standard error.
     Ssh(ssh::Failure),
-    /// `ssh` did not run to completion (it could not start, or the request outlived its
-    /// budget after connecting).
     Run(String),
-    /// The host answered, and not with this host's `hello`: its own refusal (another exit
-    /// status), an answer that does not parse, or another Mac at the address.
     Answer(String),
 }
 
 impl HelloError {
-    /// Whether the host simply could not be reached (design §9's exit status 2): only what
-    /// [`ssh::Failure::unreachable`] says. A changed host key, a fleet key it no longer
-    /// takes, an agent's refusal or another Mac's answer needs the owner: a failure.
     fn unreachable(&self) -> bool {
         matches!(self, Self::Ssh(f) if f.unreachable())
     }
 
-    /// Whether this failure is one Local Network privacy could cause, or says nothing about
-    /// it: no route (how the refusal fails a connection, at once: design §1.10), no address,
-    /// or an `ssh` that did not run. Anything else reached the LAN: a host that answered at
-    /// all, or a connection that waited for an answer and timed out, which the refusal never
-    /// lets out.
     const fn blames_nothing_on_the_lan(&self) -> bool {
         matches!(
             self,
@@ -1740,7 +1621,6 @@ impl HelloError {
         )
     }
 
-    /// One line for the host's row.
     fn why(&self) -> String {
         match self {
             Self::Ssh(f) => f.why(),
@@ -1748,8 +1628,6 @@ impl HelloError {
         }
     }
 
-    /// [`HelloError::why`] for a command that reaches `host` alone, where no route to a local
-    /// address also names Local Network privacy ([`ssh::Failure::why_alone`]).
     fn why_alone(&self, host: &Host) -> String {
         match self {
             Self::Ssh(f) => f.why_alone(&host.address),
@@ -1758,16 +1636,11 @@ impl HelloError {
     }
 }
 
-/// What phase 1 learned about one host.
 struct Reached<'h> {
-    /// The host as it answered: machines.toml's, or the same Mac at another `.local` name
-    /// or IP address ([`reach`]).
     host: Cow<'h, Host>,
     hello: Result<Hello, HelloError>,
 }
 
-/// The row for a host whose `hello` did not answer, and what it adds to `tally`: exit status
-/// 2 only when it could not be reached, a failure otherwise.
 fn not_reached(tally: &mut Tally, host: &Host, why: &HelloError) {
     if why.unreachable() {
         tally.unreachable = true;
@@ -1778,8 +1651,6 @@ fn not_reached(tally: &mut Tally, host: &Host, why: &HelloError) {
     }
 }
 
-/// This controller's own agent build: the executable `enroll` installs and `apply`
-/// upgrades hosts to.
 struct OwnAgent {
     exe: PathBuf,
     sha256: String,
@@ -1794,43 +1665,31 @@ impl OwnAgent {
         Ok(Self { exe, sha256 })
     }
 
-    /// Whether the host answering `hello` runs another build. An agent too old to say
-    /// which build it runs is upgraded too: the controller's build is the fleet's.
     fn differs(&self, hello: &Hello) -> bool {
         !hello.agent_sha256.eq_ignore_ascii_case(&self.sha256)
     }
 }
 
-/// The agent archive one command uploads to the hosts it upgrades, built once.
 struct AgentArchive<'s> {
     archive: enroll::Archive,
-    /// `app-zip` when the bundle verifies as aterm's Developer ID here, else `dev-zip`.
     kind: &'static str,
     _scratch: crate::port::Scratch<'s>,
 }
 
-/// One host's work for phase 3.
 struct Job<'h> {
     host: Cow<'h, Host>,
     hello: Hello,
     needed: Vec<artifacts::Needed>,
-    /// The upgrade envelope that goes first, when the host's agent is another build.
     upgrade: Option<Vec<u8>>,
     wire: Vec<u8>,
 }
 
-/// What one command resolves and checks once for every host it builds an envelope for.
 #[derive(Default)]
 struct Resolved {
-    /// `[aterm]`, resolved to one release for the whole command.
     aterm: artifacts::AtermMemo,
-    /// The artifacts whose `cache/` copy this command already checked, by SHA-256.
     ensured: BTreeSet<String>,
 }
 
-/// The hosts a fleet verb names, or the exit code once it said why not. `--all` over an
-/// inventory with no hosts is nothing to do; a name that matches no host is a refused
-/// command line.
 fn fleet_hosts<'i>(
     inv: &'i Inventory,
     names: &[String],
@@ -1862,11 +1721,7 @@ pub fn plan_or_apply(
     plan_or_apply_only(env, names, all, mode, now, &[])
 }
 
-/// `aterm machines plan|apply [--only <table>,…]`: with `only`, each host's envelope carries
-/// those baseline tables alone (`baseline::keep_only`), so the agent runs their items and no
-/// others; the agent upgrade `apply` sends first is sent all the same. The report is merged
-/// into the host's saved one by its serial (`after_run`), so the other tables keep what their
-/// own last run said.
+/// `aterm machines plan|apply [--only <table>,…]`: plan or apply selected baseline tables and merge reports.
 #[must_use]
 pub fn plan_or_apply_only(
     env: &Env<'_>,
@@ -1884,8 +1739,6 @@ pub fn plan_or_apply_only(
         Ok(inv) => inv,
         Err(code) => return code,
     };
-    // A plan changes nothing, so naming no host plans them all, as `status` reads them all;
-    // an apply changes Macs, so it takes the ones it changes, or --all.
     let all = all || (mode == Mode::Plan && names.is_empty());
     let hosts = match fleet_hosts(&inv, names, all, verb) {
         Ok(h) => h,
@@ -1901,15 +1754,12 @@ pub fn plan_or_apply_only(
         }
     };
 
-    // Phase 1.
     let reached = hello_sweep(env, &hosts, parallel);
     if let Some(stop) = local_network_wall(&reached) {
         errln!("{stop}");
         return ExitCode::FAILURE;
     }
 
-    // Phase 2: one envelope per reachable host (two when its agent is upgraded first),
-    // built in order, then signed together.
     let principals = principals(&inv, env);
     let local_names = naming::wanted(env.sys, &env.paths, &inv);
     let mut resolved = Resolved::default();
@@ -1924,7 +1774,6 @@ pub fn plan_or_apply_only(
                 continue;
             }
         };
-        // A run in progress would refuse the envelope (`busy`) after it raised the floor.
         if let Some(run) = &hello.busy {
             tally.failed = true;
             outln!(
@@ -1935,7 +1784,6 @@ pub fn plan_or_apply_only(
             );
             continue;
         }
-        // No two Macs are given one Local hostname (design §5.1).
         if let Some(why) = local_names
             .get(&r.host.uuid.to_ascii_lowercase())
             .and_then(|local| naming::clash(&inv, &local_names, &r.host, local))
@@ -1977,7 +1825,6 @@ pub fn plan_or_apply_only(
             only,
         ) {
             Ok((body, needed)) => {
-                // Unnoted, its report would be saved as the whole baseline's: not sent.
                 if let Err(why) = remember_only(env, &r.host, body.serial, only) {
                     tally.failed = true;
                     outln!(
@@ -2020,7 +1867,6 @@ pub fn plan_or_apply_only(
         });
     }
 
-    // Phase 3.
     let outcomes = ssh::fan_out(&jobs, parallel, |job| {
         send(env, job, agent_archive.as_ref().map(|a| &a.archive))
     });
@@ -2046,13 +1892,10 @@ pub fn plan_or_apply_only(
     tally.code()
 }
 
-/// `--parallel`, else `[controller] parallel`, else 8.
 fn parallel(env: &Env<'_>, inv: &Inventory) -> usize {
     env.parallel.unwrap_or_else(|| inv.parallel()).max(1)
 }
 
-/// [`reach`] every host, `parallel` at a time, then record in machines.toml, one host after
-/// another, each one found at another address.
 fn hello_sweep<'h>(env: &Env<'_>, hosts: &[&'h Host], parallel: usize) -> Vec<Reached<'h>> {
     let reached = ssh::fan_out(hosts, parallel, |host| reach(env, host));
     for (host, r) in hosts.iter().zip(&reached) {
@@ -2061,32 +1904,12 @@ fn hello_sweep<'h>(env: &Env<'_>, hosts: &[&'h Host], parallel: usize) -> Vec<Re
     reached
 }
 
-/// [`hello_sweep`] of the one host a command reaches.
 fn reach_one<'h>(env: &Env<'_>, host: &'h Host) -> Reached<'h> {
     let reached = reach(env, host);
     record_found(env, host, &reached);
     reached
 }
 
-/// The one place the controller chooses where a host answers: one `hello` at machines.toml's
-/// address, recorded in its state ([`hello`]), and one more at a `.local` name when that
-/// address may be stale:
-///
-/// * the address is a Local hostname that no longer resolves, or that another Mac now
-///   answers at (its key is not the one pinned for this host: the freed name was taken, or
-///   a cache resolves it to an address another Mac now has): the name its baseline renamed
-///   it to ([`naming::renamed`]), for a rename whose report never came back (the connection
-///   dropped after the run renamed the Mac);
-/// * the Mac answered at a Local hostname that is not its own (a cache still resolves the
-///   old name): the name it says it has ([`naming::own_address`]);
-/// * the address is an IP address that does not answer, or that another Mac now answers
-///   at (DHCP gave the Mac another one): the `.local` name of the Local hostname its
-///   newest hello gave ([`naming::named`]), which every Mac answers at over multicast DNS.
-///
-/// Only this host answers there: `ssh` pins its key under its UUID (`HostKeyAlias`) and
-/// [`ask_hello`] checks the UUID it answers with, so another Mac at that name is refused,
-/// never followed, and the first answer stands, with nothing recorded for the other name.
-/// Not a retry: each address is asked once.
 fn reach<'h>(env: &Env<'_>, host: &'h Host) -> Reached<'h> {
     let mut answered = ask_hello(env, host);
     let mut at = Cow::Borrowed(host);
@@ -2121,15 +1944,12 @@ fn reach<'h>(env: &Env<'_>, host: &'h Host) -> Reached<'h> {
     }
 }
 
-/// Record in machines.toml that `reached` found `host` at another address ([`reach`]): an IP
-/// address it left (`moved`), or a `.local` name it was renamed from (`renamed`).
 fn record_found(env: &Env<'_>, host: &Host, reached: &Reached<'_>) {
     if let Cow::Owned(moved) = &reached.host {
         let _ = move_address(env, host, &moved.address, &found_lead(host));
     }
 }
 
-/// The lead of [`record_found`]'s line for `host`, found away from its address.
 fn found_lead(host: &Host) -> String {
     let how = if host.address.parse::<std::net::IpAddr>().is_ok() {
         "moved"
@@ -2139,18 +1959,12 @@ fn found_lead(host: &Host) -> String {
     format!("{:<16} {how}: ", host.name)
 }
 
-/// One `hello`, recorded in the host's state: an answer as the last contact; a host that
-/// could not be reached as when it was first missed; any other failure (a changed host key,
-/// another Mac at the address) as the contact error `status` and `outstanding` show. A state
-/// file that cannot be read is left as it is, never replaced by a fresh one (it holds the
-/// host's GitHub key ids).
 fn hello(env: &Env<'_>, host: &Host) -> Result<Hello, HelloError> {
     let answered = ask_hello(env, host);
     record_hello(env, host, &answered);
     answered
 }
 
-/// Record what one `hello` of `host` answered in its state ([`hello`]).
 fn record_hello(env: &Env<'_>, host: &Host, answered: &Result<Hello, HelloError>) {
     if let Ok(mut state) = inventory::load_state(env.sys, &env.paths, &host.uuid) {
         let now = env.sys.now();
@@ -2199,13 +2013,6 @@ fn ask_hello(env: &Env<'_>, host: &Host) -> Result<Hello, HelloError> {
     Ok(hello)
 }
 
-/// The one line to print instead of a row per host (design §9): every host failed the way
-/// macOS's Local Network privacy fails this process ([`HelloError::blames_nothing_on_the_lan`]),
-/// and one at least found no route to a local address. A host that answered, or one that
-/// timed out or is down (what a sleeping Mac's address reads before and after its no-route
-/// window: [`ssh::HOST_DOWN`]), shows the LAN is reachable, so one Mac a router calls
-/// unreachable never stops the rest. Every host inside that window at once still reads as
-/// the refusal: no reading tells the two apart.
 fn local_network_wall(reached: &[Reached<'_>]) -> Option<&'static str> {
     let no_route = reached.iter().any(|r| {
         matches!(&r.hello, Err(HelloError::Ssh(ssh::Failure::NoRoute)))
@@ -2217,16 +2024,8 @@ fn local_network_wall(reached: &[Reached<'_>]) -> Option<&'static str> {
     (no_route && none_reached).then_some(ssh::LOCAL_NETWORK_ROW)
 }
 
-/// How many `--only` envelopes a host's state remembers until their reports come back.
 const ONLY_SENT_KEPT: usize = 8;
 
-/// Note in `host`'s state that the envelope with `serial` carries the tables `only` alone
-/// (nothing for a whole baseline's), so its report, read now or by `attach` later, is merged
-/// rather than saved whole.
-///
-/// # Errors
-/// The state cannot be read or written: the envelope is then not sent, since its report would
-/// be saved as the whole baseline's.
 fn remember_only(env: &Env<'_>, host: &Host, serial: u64, only: &[String]) -> Result<(), String> {
     if only.is_empty() {
         return Ok(());
@@ -2238,9 +2037,6 @@ fn remember_only(env: &Env<'_>, host: &Host, serial: u64, only: &[String]) -> Re
     inventory::save_state(env.sys, &env.paths, &host.uuid, &state)
 }
 
-/// The resolved baseline text for `host`: its file, placeholders filled, `users` defaulted
-/// from the inventory, cut to the tables `only` names (none: all), and `[aterm]` pinned to
-/// the release this command resolved.
 fn resolved_baseline(
     env: &Env<'_>,
     host: &Host,
@@ -2262,14 +2058,12 @@ fn resolved_baseline(
     vars.push(("serial", hello.serial_number.as_str()));
     let text = crate::baseline::fill(&text, &vars)?;
     let text = default_users(&text, host)?;
-    // Before `[aterm]` is resolved, so `--only names` asks GitHub for nothing.
     let text = crate::baseline::keep_only(&text, only)?;
     let text = artifacts::resolve_aterm_once(env.sys, &env.paths, &text, &mut resolved.aterm)?;
     crate::baseline::parse(&text)?;
     Ok(text)
 }
 
-/// Set `users` from the inventory when the baseline leaves it out (design §5).
 fn default_users(text: &str, host: &Host) -> Result<String, String> {
     let mut doc: aterm_toml::Value =
         aterm_toml::from_str(text).map_err(|e| format!("baseline: {e}"))?;
@@ -2290,9 +2084,6 @@ fn default_users(text: &str, host: &Host) -> Result<String, String> {
     aterm_toml::to_string(&doc).map_err(|e| format!("baseline: {e}"))
 }
 
-/// The highest serial floor `hello` reports for any of `principals` (the names this
-/// controller's signing key has had: a host that has not taken a rekey yet still knows it
-/// by the old one).
 fn floor_of(hello: &Hello, principals: &[String]) -> u64 {
     hello
         .floors
@@ -2303,7 +2094,6 @@ fn floor_of(hello: &Hello, principals: &[String]) -> u64 {
         .unwrap_or(0)
 }
 
-/// An envelope for `host` with the next serial over `floor`; the caller fills the payload.
 fn body(
     env: &Env<'_>,
     host: &Host,
@@ -2331,8 +2121,6 @@ fn body(
     })
 }
 
-/// One host's plan or apply envelope (the tables `only` names, or all), and the artifacts it
-/// needs uploaded.
 #[expect(
     clippy::too_many_arguments,
     reason = "each is one input of the envelope"
@@ -2374,12 +2162,6 @@ fn baseline_body(
     Ok((envelope, needed))
 }
 
-/// What an `apply --only` envelope names beyond its own tables' artifacts: each one the host's
-/// cache holds (its `hello`). An apply's agent prunes every cached artifact the envelope does
-/// not name (`agent::apply::prune_cache`), since a whole apply names all its baseline needs;
-/// an `--only` one names its tables' alone, and would otherwise drop the app images and
-/// aterm pins of every other table, for the next whole apply to upload again. Already
-/// cached, they are copied from nowhere.
 fn kept_by_only(hello: &Hello, named: &[ArtifactRef]) -> Vec<ArtifactRef> {
     let mut kept: Vec<ArtifactRef> = Vec::new();
     for sha in &hello.cached {
@@ -2395,8 +2177,6 @@ fn kept_by_only(hello: &Hello, named: &[ArtifactRef]) -> Vec<ArtifactRef> {
     kept
 }
 
-/// The archive of this controller's own agent, in a fresh private scratch directory, and
-/// the kind its upgrade envelope names.
 fn build_agent_archive<'s>(
     sys: &'s dyn System,
     own: &OwnAgent,
@@ -2411,15 +2191,9 @@ fn build_agent_archive<'s>(
     })
 }
 
-/// The requirement an `app-zip` upgrade's bundle meets: the one the agent checks it against
-/// (`agent::job`), Developer ID team A66A9P66Z7.
 const APP_ZIP_REQUIREMENT: &str =
     "=anchor apple generic and certificate leaf[subject.OU] = \"A66A9P66Z7\"";
 
-/// `app-zip` when the bundle `exe` runs from verifies here as aterm's Developer ID
-/// (`codesign --verify --deep --strict -R`, as the agent will check it), else `dev-zip`,
-/// which the agent trusts on the signed hash alone, as enrollment did. A locally built or
-/// renamed bundle is a `dev-zip`, so the host never refuses an upgrade enrollment accepted.
 fn upgrade_kind(sys: &dyn System, exe: &Path, archive: &enroll::Archive) -> &'static str {
     if !archive.bundle {
         return "dev-zip";
@@ -2436,8 +2210,6 @@ fn upgrade_kind(sys: &dyn System, exe: &Path, archive: &enroll::Archive) -> &'st
     if verified { "app-zip" } else { "dev-zip" }
 }
 
-/// The `upgrade` envelope that puts `agent`'s archive in place of the host's agent (design
-/// §4.5).
 fn upgrade_body(
     env: &Env<'_>,
     host: &Host,
@@ -2457,7 +2229,6 @@ fn upgrade_body(
     Ok(envelope)
 }
 
-/// `0.105.0 (ab62ff892b56)`: a version and the start of its executable's SHA-256.
 fn build_name(version: &str, sha256: &str) -> String {
     match sha256.get(..12) {
         Some(short) => format!("{version} ({short})"),
@@ -2465,7 +2236,6 @@ fn build_name(version: &str, sha256: &str) -> String {
     }
 }
 
-/// The row a plan shows for a host whose agent `apply` will upgrade first.
 fn pending_upgrade_row(hello: &Hello, own: &OwnAgent) -> ItemReport {
     ItemReport {
         id: "agent.upgrade".into(),
@@ -2486,12 +2256,6 @@ fn pending_upgrade_row(hello: &Hello, own: &OwnAgent) -> ItemReport {
     }
 }
 
-/// The names this controller's signing key has, the floors `hello` reports are kept under:
-/// `[controller] principal` when the inventory sets one; else every principal
-/// `allowed_signers` (then `allowed_signers.previous`, the list a rekey replaced) gives the
-/// signing key's public half; and only when neither names it, `signing@<LocalHostName>`, the
-/// name `init` wrote. A renamed controller, or a directory restored onto another Mac, still
-/// finds its floors.
 fn principals(inv: &Inventory, env: &Env<'_>) -> Vec<String> {
     if let Some(p) = &inv.controller.principal {
         return vec![p.clone()];
@@ -2513,20 +2277,16 @@ fn principals(inv: &Inventory, env: &Env<'_>) -> Vec<String> {
     names
 }
 
-/// `<key>.pub`: where `ssh-keygen` puts a private key's public half.
 fn public_half(key: &Path) -> PathBuf {
     let mut public = key.as_os_str().to_owned();
     public.push(".pub");
     PathBuf::from(public)
 }
 
-/// `allowed_signers.previous`: the list the last rekey replaced on the controller.
 fn previous_signers(paths: &Paths) -> PathBuf {
     paths.root.join("allowed_signers.previous")
 }
 
-/// Whether ssh-agent (at [`Env::agent_sock`]) holds `key`: `ssh-add -T` on its public half
-/// signs a test message through the agent, so it answers without a prompt either way.
 fn agent_holds(env: &Env<'_>, key: &Path) -> bool {
     let Some(sock) = &env.agent_sock else {
         return false;
@@ -2536,9 +2296,6 @@ fn agent_holds(env: &Env<'_>, key: &Path) -> bool {
         .is_ok_and(|r| r.success())
 }
 
-/// How `key` signs this command's batch: unattended with no passphrase; through ssh-agent
-/// when the key has one and the agent already holds it (no prompt: a key loaded once is never
-/// asked for again); otherwise on the terminal, asked once.
 fn signing(env: &Env<'_>, key: &Path) -> Result<Signing, String> {
     match envelope::needs_passphrase(env.sys, key) {
         Read::Value(false) => Ok(Signing::Unattended),
@@ -2554,7 +2311,6 @@ fn signing(env: &Env<'_>, key: &Path) -> Result<Signing, String> {
     }
 }
 
-/// Sign `bodies` with `key` in one `ssh-keygen` run: the wires, in order.
 fn seal_all(env: &Env<'_>, bodies: &[Envelope], key: &Path) -> Result<Vec<Vec<u8>>, String> {
     if bodies.is_empty() {
         return Ok(Vec::new());
@@ -2573,7 +2329,6 @@ fn seal_with(
     envelope::seal_batch(sys, bodies, key, how, scratch.path())
 }
 
-/// Upload `path` as artifact `sha256` unless the host's cache holds it.
 fn put(
     env: &Env<'_>,
     target: &Target,
@@ -2601,9 +2356,6 @@ fn put(
     }
 }
 
-/// Send one signed envelope with `apply` and read the run's stream, `budget` long. A stream
-/// that ends without a report after the agent named its run says `detached run=<id>`; one
-/// that never named a run (ssh or sudo failed first) has no run to attach to.
 fn submit(env: &Env<'_>, host: &Host, wire: &[u8], budget: Duration) -> Result<HostReport, String> {
     let staged = crate::port::staging_file(env.sys, wire)
         .map_err(|e| format!("could not stage the envelope: {e}"))?;
@@ -2620,7 +2372,6 @@ fn submit(env: &Env<'_>, host: &Host, wire: &[u8], budget: Duration) -> Result<H
     })
 }
 
-/// Phase 3 for one host: the agent upgrade when there is one, the uploads, the run.
 fn send(
     env: &Env<'_>,
     job: &Job<'_>,
@@ -2653,10 +2404,6 @@ fn send(
             ));
         }
         first = report.items;
-        // The saved hello names the agent that answered before the upgrade; greet the new
-        // one before the baseline runs, so `status` shows the build the host now runs and a
-        // run that renames the Mac and loses its report leaves the hello `reach` finds it by
-        // (its hardware, which an older agent's hello does not describe).
         let _ = hello(env, &job.host);
     }
     for item in &job.needed {
@@ -2677,8 +2424,6 @@ fn send(
     Ok(report)
 }
 
-/// The report at the end of an `apply` or `attach` stream (a refusal becomes a report with
-/// `refused` set, stamped `now`), and the run the stream's `started` line named.
 fn read_stream(out: &str, now: u64) -> (Option<HostReport>, Option<String>) {
     let mut items: Vec<ItemReport> = Vec::new();
     let mut started: Option<String> = None;
@@ -2708,7 +2453,6 @@ fn read_stream(out: &str, now: u64) -> (Option<HostReport>, Option<String>) {
     (None, started)
 }
 
-/// Print one host's report: a summary line, then each row that needs attention.
 fn print_report(env: &Env<'_>, host: &Host, report: &HostReport) {
     if env.json {
         outln!(
@@ -2732,10 +2476,7 @@ fn print_report(env: &Env<'_>, host: &Host, report: &HostReport) {
     }
 }
 
-/// One report row as `print_report` and `unenroll` show it: the outcome, the item by its
-/// title (what the owner reads: `Computer Name, shown in Finder, AirDrop and Sharing`, not
-/// `names.computer-name`, which `status --by-item` and `--json` keep), the change and why,
-/// each value the host sent made safe to print.
+/// Format one item report row for `print_report` and `unenroll`.
 pub(crate) fn row_line(row: &ItemReport) -> String {
     let change = match (&row.from, &row.to) {
         (Some(from), Some(to)) if row.outcome != Outcome::Person => {
@@ -2758,26 +2499,17 @@ pub(crate) fn row_line(row: &ItemReport) -> String {
     )
 }
 
-/// Where a report [`after_run`] records came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Source {
-    /// A plan or apply this command sent.
     Baseline,
-    /// A run `attach` followed, which may have been any action.
     Followed,
 }
 
-/// Follow a Mac whose Local hostname `report` changed to its new `.local` address in
-/// machines.toml, so the next command reaches it there ([`naming::followed_address`]); the
-/// host as it now stands, when it moved.
 fn follow_rename(env: &Env<'_>, host: &Host, report: &HostReport) -> Option<Host> {
     let address = naming::followed_address(host, report)?;
     move_address(env, host, &address, "    names     ")
 }
 
-/// Write `address` for `host` in machines.toml and say so after `lead` (on standard error
-/// under `--json`, whose standard output is NDJSON); the host as it now stands, when the
-/// write took.
 fn move_address(env: &Env<'_>, host: &Host, address: &str, lead: &str) -> Option<Host> {
     let moved = Host {
         address: address.to_owned(),
@@ -2810,8 +2542,6 @@ fn move_address(env: &Env<'_>, host: &Host, address: &str, lead: &str) -> Option
     took.then_some(moved)
 }
 
-/// Whether `report` is a plan or apply run's: an `exec`, `rekey` or `upgrade` run reports
-/// only its own row (`exec`, `agent.*`).
 fn is_baseline_report(report: &HostReport) -> bool {
     report.items.is_empty()
         || !report
@@ -2820,12 +2550,6 @@ fn is_baseline_report(report: &HostReport) -> bool {
             .all(|r| r.family == "exec" || r.family == "agent")
 }
 
-/// Record a run in the host's state. A plan or apply report becomes the host's report and
-/// clears an older refusal; an apply's also registers the GitHub keys it carries. A refusal
-/// is kept beside the report, never in its place, and another action's report (`exec`,
-/// `upgrade`, `rekey`) leaves it alone: either would otherwise stand for the host, its
-/// failures and person steps gone. A state file that cannot be read is left alone: it holds
-/// the host's GitHub key ids.
 fn after_run(env: &Env<'_>, inv: &Inventory, host: &Host, report: HostReport, source: Source) {
     let mut state = match inventory::load_state(env.sys, &env.paths, &host.uuid) {
         Ok(s) => s,
@@ -2838,7 +2562,6 @@ fn after_run(env: &Env<'_>, inv: &Inventory, host: &Host, report: HostReport, so
     state.last_seen = now;
     state.unreachable_since = None;
     state.contact_error = None;
-    // An `--only` envelope's report covers its tables alone (`remember_only`).
     let only = state
         .only_sent
         .iter()
@@ -2848,7 +2571,6 @@ fn after_run(env: &Env<'_>, inv: &Inventory, host: &Host, report: HostReport, so
         state.last_refusal = Some((now, why.clone()));
     } else if source == Source::Baseline || is_baseline_report(&report) {
         state.last_refusal = None;
-        // A macOS update undoes what a whole apply set, so only a whole apply marks the build.
         if report.mode == Mode::Apply && only.is_none() {
             state.applied_build = Some(report.facts.os_build.clone());
         }
@@ -2884,12 +2606,6 @@ fn after_run(env: &Env<'_>, inv: &Inventory, host: &Host, report: HostReport, so
     }
 }
 
-/// The saved report after an `--only` run reported `report` for `tables`: the earlier
-/// report's rows for every other table kept as their own run left them (never done, never
-/// failed by this one), the run's own rows in place of the earlier rows of its tables (and of
-/// the `agent` rows, which speak for the newest run), and the run's mode, serial, times and
-/// facts. With no earlier report the run's rows are all there is, and the coverage says the
-/// rest was never run. A refused earlier report has no rows to keep.
 fn merge_only(
     earlier: Option<HostReport>,
     covered: Option<inventory::Only>,
@@ -2898,9 +2614,7 @@ fn merge_only(
 ) -> (HostReport, inventory::Only) {
     let earlier = earlier.filter(|r| r.refused.is_none());
     let mut covers = match (&earlier, covered) {
-        // The earlier report was itself an --only run's: its coverage grows.
         (Some(_), Some(covered)) => covered,
-        // A whole run's: every other table keeps rows from when it finished.
         (Some(whole), None) => inventory::Only {
             tables: Vec::new(),
             rest: Some(whole.finished),
@@ -2920,7 +2634,6 @@ fn merge_only(
     let mut fresh = Some(report.items);
     for row in earlier.items {
         if covered(&row.family) {
-            // The run's rows go where its tables' rows were.
             if let Some(rows) = fresh.take() {
                 items.extend(rows);
             }
@@ -2934,7 +2647,6 @@ fn merge_only(
     (HostReport { items, ..report }, covers)
 }
 
-/// The key a recorded GitHub key id registered, when it was recorded with one.
 fn key_text_of(state: &HostState, id: u64) -> Option<&str> {
     state
         .github_key_text
@@ -2943,11 +2655,6 @@ fn key_text_of(state: &HostState, id: u64) -> Option<&str> {
         .map(|(_, text)| text.as_str())
 }
 
-/// Register the public keys an apply reported (`github.key@<user>` rows) with the machine
-/// user `account`, each by the key itself, never by its user alone: a user whose key is new
-/// (a reset home, a deleted key) gets it registered and the key it replaced deleted; a key
-/// already registered is not sent again; and a key `github revoke` deleted is never
-/// registered again, whatever a report carries.
 fn register_keys(
     env: &Env<'_>,
     account: &str,
@@ -3010,7 +2717,6 @@ fn register_keys(
             Err(why) => outln!("    github    not registered: {}", shown(&why)),
         }
     }
-    // A user's other ids, once the key it reports now is registered: the keys it replaced.
     let stale: Vec<u64> = state
         .github_keys
         .iter()
@@ -3038,7 +2744,6 @@ fn register_keys(
             state.github_keys.retain(|(_, id)| !stale.contains(id));
             state.github_key_text.retain(|(id, _)| !stale.contains(id));
         }
-        // Still recorded, so the next apply, `github revoke` or `unenroll` deletes them.
         Err(why) => outln!(
             "    github    the replaced key(s) are still registered: {}",
             shown(&why)
@@ -3046,9 +2751,6 @@ fn register_keys(
     }
 }
 
-// ── attach / run ────────────────────────────────────────────────────────────────────────
-
-/// The one host `name` selects.
 fn one_host<'i>(inv: &'i Inventory, name: &str, verb: &str) -> Result<&'i Host, ExitCode> {
     match inventory::select(inv, &[name.to_owned()], false) {
         Ok(h) if h.len() == 1 => Ok(h[0]),
@@ -3074,8 +2776,6 @@ pub fn attach(env: &Env<'_>, name: &str, run: Option<&str>) -> ExitCode {
         Ok(h) => h,
         Err(code) => return code,
     };
-    // Reached first even when the run is named: the run that dropped its connection may be
-    // the one that renamed the Mac (`reach` finds it at its new name).
     let reached = reach_one(env, host);
     let host: &Host = &reached.host;
     let hello = match reached.hello {
@@ -3140,8 +2840,7 @@ pub fn attach(env: &Env<'_>, name: &str, run: Option<&str>) -> ExitCode {
     }
 }
 
-/// `aterm machines run <host…|--all> [--user <u>] -- <argv>`: one signed command, no shell
-/// (design §4.6), as root unless `user` names an account.
+/// `aterm machines run <host…|--all> [--user <u>] -- <argv>`: run one signed command without a shell.
 #[must_use]
 pub fn run(
     env: &Env<'_>,
@@ -3230,10 +2929,6 @@ pub fn run(
     tally.code()
 }
 
-/// What `run` prints of one host's `exec` report: the refusal, or each row's status, its
-/// standard output and its standard error, line by line. The program's output is whatever
-/// is on the host (file names a student made, a crafted default), so each line is made safe
-/// to print.
 fn exec_lines(report: &HostReport) -> Vec<String> {
     let mut out = Vec::new();
     if let Some(why) = &report.refused {
@@ -3251,7 +2946,6 @@ fn exec_lines(report: &HostReport) -> Vec<String> {
     out
 }
 
-/// An `exec` envelope for `host`.
 fn exec_body(env: &Env<'_>, host: &Host, floor: u64, exec: Exec) -> Result<Envelope, String> {
     let mut envelope = body(env, host, floor, Action::Exec, Disrupt::Now)?;
     envelope.idle_secs = 0;
@@ -3259,11 +2953,7 @@ fn exec_body(env: &Env<'_>, host: &Host, floor: u64, exec: Exec) -> Result<Envel
     Ok(envelope)
 }
 
-// ── person / screen ─────────────────────────────────────────────────────────────────────
-
-/// `aterm machines person [<host>…|--all]`: what only a person can do, grouped by step,
-/// from `state/` alone. A step whose row could not be read is listed as not measured, and a
-/// host whose newest run was refused is named: neither is ever "nothing outstanding".
+/// `aterm machines person [<host>…|--all]`: list outstanding interactive person steps grouped by step.
 #[must_use]
 pub fn person(env: &Env<'_>, names: &[String], all: bool) -> ExitCode {
     let inv = match load(env) {
@@ -3290,8 +2980,6 @@ pub fn person(env: &Env<'_>, names: &[String], all: bool) -> ExitCode {
             unknown.push(&host.name);
             continue;
         };
-        // A refusal saved as the report itself (a state file from before refusals were
-        // kept beside it) measured nothing.
         if let Some(why) = &report.refused {
             tally.failed = true;
             notes.push(format!(
@@ -3355,10 +3043,6 @@ pub fn person(env: &Env<'_>, names: &[String], all: bool) -> ExitCode {
     tally.code()
 }
 
-/// The signing key, kept in ssh-agent for the length of one person flow, which signs one
-/// `exec` envelope per re-probe: a passphrase is asked for once (`ssh-add`), not on every
-/// probe. Removed from the agent again when dropped, when this flow added it; a flow that is
-/// interrupted cannot remove it, and it expires after [`AGENT_KEY_LIFETIME`].
 struct AgentKey<'a> {
     sys: &'a dyn System,
     sock: OsString,
@@ -3373,15 +3057,12 @@ impl Drop for AgentKey<'_> {
     }
 }
 
-/// `/usr/bin/ssh-add <args>` handed the agent socket `sock` (`SSH_AUTH_SOCK`).
 fn ssh_add(sock: &OsStr, args: &[&str]) -> Cmd {
     Cmd::new("/usr/bin/ssh-add")
         .args(args)
         .secret_env("SSH_AUTH_SOCK", sock.to_string_lossy())
 }
 
-/// How a person flow signs: unattended with no passphrase; through ssh-agent with one,
-/// loading the key there (`ssh-add -t`, asked once) unless it already is.
 fn person_signing<'a>(env: &Env<'a>) -> Result<(Signing, Option<AgentKey<'a>>), String> {
     let key = env.paths.signing_key();
     match envelope::needs_passphrase(env.sys, &key) {
@@ -3422,8 +3103,6 @@ fn person_signing<'a>(env: &Env<'a>) -> Result<(Signing, Option<AgentKey<'a>>), 
     }
 }
 
-/// The host as the person flows reach it: each request is one signed `exec` envelope,
-/// sent with `apply`, and its report row read back as the run's status, output and errors.
 struct LiveRemote<'a> {
     env: &'a Env<'a>,
     host: &'a Host,
@@ -3455,9 +3134,6 @@ impl screen::Remote for LiveRemote<'_> {
     }
 }
 
-/// The host's newest plan or apply report, planning it first when there is none (a Mac just
-/// enrolled) or when what is saved is a refusal (a state file from before refusals were kept
-/// beside the report).
 fn report_for(env: &Env<'_>, host: &Host) -> Result<HostReport, String> {
     let saved = inventory::load_state(env.sys, &env.paths, &host.uuid)?;
     if let Some(report) = saved.report.filter(|r| r.refused.is_none()) {
@@ -3480,10 +3156,6 @@ fn report_for(env: &Env<'_>, host: &Host) -> Result<HostReport, String> {
         .ok_or_else(|| format!("{} answered no report to plan", host.name))
 }
 
-/// The per-app steps for aterm, set apart when `report` shows `/Applications/aterm.app` not
-/// installed: aterm is in neither list until `apply` installs it, so the person would wait
-/// at a pane for a switch that is not there. Each comes back as not attempted, saying to
-/// apply first; the rest are walked.
 fn waiting_for_aterm(
     report: &HostReport,
     steps: Vec<screen::Step>,
@@ -3514,10 +3186,6 @@ fn waiting_for_aterm(
     (walk, waiting)
 }
 
-/// The steps a walk takes from `report` (`step` alone when one is named), and the ones it
-/// sets apart unwalked ([`waiting_for_aterm`]). `screen` is refused while the report lists
-/// Screen Sharing itself outstanding, whichever step was named: the check reads the whole
-/// list, before it is narrowed.
 fn walk_steps(
     report: &HostReport,
     host: &Host,
@@ -3534,23 +3202,13 @@ fn walk_steps(
     Ok(waiting_for_aterm(report, steps, host))
 }
 
-/// What the end of a walk prints, in the order it prints it ([`end_walk`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Said {
-    /// A step's line, on standard output.
     Step(String),
-    /// The closing plan ([`plan_or_apply`], which prints its own lines).
     Plan,
-    /// The last line, on standard error.
     Last(String),
 }
 
-/// The end of a walk that ran: one line per step ([`tell`]), the closing plan when any reads
-/// granted, then, last, the line saying the Mac was left logged in and unlocked at its
-/// display ([`screen::Session::unlocked_line`]), which fails the command whatever the steps
-/// did: it is what the person must not miss. `emit` prints each in turn. `stops` (what
-/// `screen` still catches, [`screen::Screened::stops`]) is let go only after that line, so a
-/// second Ctrl-C during the closing plan cannot end the command before it.
 fn end_walk(
     host: &Host,
     verb: &str,
@@ -3578,9 +3236,6 @@ fn end_walk(
     code
 }
 
-/// One line per walked step, through `emit`. Returns whether any did not end granted, and
-/// whether any reads granted now: flipped during the walk or before it, either leaves the
-/// saved report out of date, so the walk plans the host again.
 fn tell(host: &Host, walked: &[screen::Walked], emit: &mut dyn FnMut(Said)) -> (bool, bool) {
     let mut failed = false;
     let mut changed = false;
@@ -3605,20 +3260,7 @@ fn tell(host: &Host, walked: &[screen::Walked], emit: &mut dyn FnMut(Said)) -> (
     (failed, changed)
 }
 
-/// `aterm machines person <host> --here` (`at_console`) and `aterm machines screen <host>
-/// [<step>]`: walk the host's outstanding person steps, at its keyboard or over Screen
-/// Sharing, then plan it again so `status` shows what changed. When `screen` could not lock
-/// a session the admin logged in to over the relay ([`screen::Session::Unlocked`]), its last
-/// line says the Mac is logged in and unlocked at its display, and it exits 1.
-///
-/// A signing key with a passphrase is loaded into ssh-agent first and held until the walk's
-/// closing plan, so the walk asks for it once: its first plan (a Mac with no report yet),
-/// every re-probe and the closing plan all sign through the agent.
-///
-/// `opener` opens Screen Sharing.app on the controller (ignored at the Mac's keyboard, where
-/// no viewer is wanted): the owner's command passes [`screen::LiveOpener`], and the dev verb
-/// `screen-headless` an opener that only prints the URL, so a test host can be walked with no
-/// window on the controller.
+/// `aterm machines person <host> --here` and `screen <host>`: walk outstanding person steps and re-plan.
 #[must_use]
 pub fn walk(
     env: &Env<'_>,
@@ -3667,8 +3309,6 @@ pub fn walk(
             how,
         };
         let clock = screen::WallClock::new();
-        // Never a panic: after SIGHUP the terminal is gone, and the walk must still close the
-        // relay and lock the session.
         let say = |line: &str| {
             let _ = writeln!(std::io::stderr(), "{}: {}", host.name, shown(line));
         };
@@ -3710,9 +3350,6 @@ pub fn walk(
             return ExitCode::FAILURE;
         }
     };
-    // The closing plan signs through the agent too; the key leaves it once the walk ends.
-    // Nothing here panics on a terminal gone after SIGHUP, the plan's lines included
-    // (`outln!`): the exit status is all that is left.
     let code = end_walk(
         host,
         verb,
@@ -3741,11 +3378,7 @@ pub fn walk(
     code
 }
 
-// ── github / unenroll / rekey ───────────────────────────────────────────────────────────
-
-/// `aterm machines github revoke <host>`: delete the host's keys from the machine user, and
-/// record each deleted key so no later report registers it again. A key the host makes anew
-/// (another body) is registered by the next apply.
+/// `aterm machines github revoke <host>`: delete the host's registered GitHub SSH keys.
 #[must_use]
 pub fn github_revoke(env: &Env<'_>, name: &str) -> ExitCode {
     let inv = match load(env) {
@@ -3779,8 +3412,6 @@ pub fn github_revoke(env: &Env<'_>, name: &str) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    // What the account held under those ids, and what the controller recorded for them (a
-    // key already deleted on GitHub by hand stays revoked too).
     let recorded = ids
         .iter()
         .filter_map(|id| key_text_of(&state, *id).map(str::to_owned));
@@ -3806,10 +3437,7 @@ pub fn github_revoke(env: &Env<'_>, name: &str) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-/// `aterm machines github login`: ask the person, at the terminal with its echo off, for a
-/// token of the `[github]` account's, and store it in the login keychain once GitHub signs it
-/// in as that account with the key scope ([`super::github::login`]). Refused without a
-/// terminal: the token is typed, never an argument or a variable.
+/// `aterm machines github login`: prompt for the `[github]` account token with echo off and store it in Keychain.
 #[must_use]
 pub fn github_login(env: &Env<'_>) -> ExitCode {
     let inv = match load(env) {
@@ -3860,8 +3488,7 @@ pub fn github_login(env: &Env<'_>) -> ExitCode {
     }
 }
 
-/// `aterm machines unenroll <host> [--unreachable]` (a person decides: refused without a
-/// terminal).
+/// `aterm machines unenroll <host> [--unreachable]`: remove a host from the fleet.
 #[must_use]
 pub fn unenroll(env: &Env<'_>, name: &str, unreachable: bool) -> ExitCode {
     if !env.tty {
@@ -3879,8 +3506,6 @@ pub fn unenroll(env: &Env<'_>, name: &str, unreachable: bool) -> ExitCode {
         Ok(h) => h,
         Err(code) => return code,
     };
-    // Where the Mac answers (`reach`), unless the owner says it cannot; one that does not
-    // answer is refused by unenroll's own hello, as before.
     let host = if unreachable {
         host.clone()
     } else {
@@ -3904,8 +3529,6 @@ pub fn unenroll(env: &Env<'_>, name: &str, unreachable: bool) -> ExitCode {
     }
 }
 
-/// The entries of an `allowed_signers` text that [`envelope::check_signers`] accepted:
-/// `(principal, key type, base64)`, comment and blank lines skipped.
 fn signer_entries(text: &str) -> Vec<(&str, &str, &str)> {
     text.lines()
         .map(str::trim)
@@ -3920,8 +3543,6 @@ fn signer_entries(text: &str) -> Vec<(&str, &str, &str)> {
         .collect()
 }
 
-/// Every principal the `allowed_signers` file `list` gives the public key in the file
-/// `public`.
 fn principals_of_key(sys: &dyn System, public: &Path, list: &Path) -> Result<Vec<String>, String> {
     let key = sys
         .read_file(public)
@@ -3943,12 +3564,6 @@ fn principals_of_key(sys: &dyn System, public: &Path, list: &Path) -> Result<Vec
     Ok(names)
 }
 
-/// The public half of the private key `key` rekey signs with: `<key>.pub` beside it, else
-/// the controller's `keys/<file name>.pub` (init keeps `keys/recovery.pub` when the private
-/// half goes to removable media).
-///
-/// # Errors
-/// One line naming both places.
 fn public_of(env: &Env<'_>, key: &Path) -> Result<PathBuf, String> {
     let beside = public_half(key);
     if env.sys.stat(&beside).is_ok() {
@@ -3969,15 +3584,7 @@ fn public_of(env: &Env<'_>, key: &Path) -> Result<PathBuf, String> {
     }
 }
 
-/// `aterm machines rekey [<host>…|--all] --signers <file> [--key <private key>]`: replace
-/// the `allowed_signers` every selected host trusts with `file`, signed with `key` (the
-/// signing key, or the recovery key from removable media).
-///
-/// The controller's own copy, which enrollment hands new hosts, becomes `file` as soon as
-/// one host took it: `file` lists this controller's signing key, so hosts still on the old
-/// list keep accepting it. The old copy is kept as `allowed_signers.previous` (the signing
-/// key's floors may sit under its old principal there), and the hosts not known to carry the
-/// new list are named.
+/// `aterm machines rekey`: replace the `allowed_signers` file trusted by selected hosts.
 #[must_use]
 pub fn rekey(
     env: &Env<'_>,
@@ -3997,8 +3604,6 @@ pub fn rekey(
         errln!("aterm machines rekey: {}: {why}", signers.display());
         return ExitCode::from(2);
     }
-    // The controller must still be able to sign afterwards: its signing key is one of the
-    // new list's entries (a commented-out line is no entry).
     let own = public_half(&env.paths.signing_key());
     let own_listed = env
         .sys
@@ -4150,12 +3755,10 @@ pub fn rekey(
     tally.code()
 }
 
-/// The SHA-256 of `text`, hex.
 fn text_sha256(text: &str) -> String {
     aterm_codec::hex::encode_lower(&aterm_digest::Sha256::digest(text.as_bytes()))
 }
 
-/// Record in `host`'s state that it carries the `allowed_signers` whose SHA-256 is `digest`.
 fn record_signers(env: &Env<'_>, host: &Host, digest: &str) {
     match inventory::load_state(env.sys, &env.paths, &host.uuid) {
         Ok(mut state) => {
@@ -4168,10 +3771,6 @@ fn record_signers(env: &Env<'_>, host: &Host, digest: &str) {
     }
 }
 
-/// Make `text` the controller's `allowed_signers`, keeping the old one as
-/// `allowed_signers.previous` first. An old copy that is there and cannot be read stops it;
-/// one that already is `text` (a rekey catching up the hosts that missed it) is left as it
-/// is, so `.previous` keeps the list those hosts still hold.
 fn replace_signers(env: &Env<'_>, text: &str) -> Result<(), String> {
     let current = env.paths.allowed_signers();
     match env.sys.read_file(&current) {
@@ -4188,11 +3787,7 @@ fn replace_signers(env: &Env<'_>, text: &str) -> Result<(), String> {
         .map_err(|e| format!("{}: {e}", current.display()))
 }
 
-// ── here ────────────────────────────────────────────────────────────────────────────────
-
-/// `aterm machines here plan|apply <baseline.toml>`: run a baseline on this Mac directly,
-/// with no controller and no envelope. Applying needs root (`sudo`), which a person types
-/// for; a plan as a user probes what it can.
+/// `aterm machines here plan|apply <baseline.toml>`: run a baseline directly on this Mac without an envelope.
 #[must_use]
 pub fn here(sys: &dyn System, mode: Mode, baseline_path: &Path, json: bool) -> ExitCode {
     if mode == Mode::Apply && sys.euid() != 0 {
@@ -4264,8 +3859,6 @@ pub fn here(sys: &dyn System, mode: Mode, baseline_path: &Path, json: bool) -> E
             return ExitCode::FAILURE;
         }
     };
-    // The journal of the account `sys` acts as: the items' own port, never one this
-    // process resolves beside it.
     let mut journal = match sys.journal() {
         Ok(journal) => journal,
         Err(why) => {
@@ -4331,11 +3924,6 @@ pub fn here(sys: &dyn System, mode: Mode, baseline_path: &Path, json: bool) -> E
     }
 }
 
-// ── helpers ─────────────────────────────────────────────────────────────────────────────
-
-/// Load the inventory, setting the controller up first when `machines.toml` does not exist
-/// yet, or print why not and return the exit code: 1, since an inventory that is missing,
-/// unreadable or invalid is a failure, never "only some hosts unreachable".
 fn load(env: &Env<'_>) -> Result<Inventory, ExitCode> {
     set_up_if_new(env.sys, &env.paths);
     inventory::load(env.sys, &env.paths).map_err(|e| {
@@ -4344,9 +3932,7 @@ fn load(env: &Env<'_>) -> Result<Inventory, ExitCode> {
     })
 }
 
-/// Set the controller up (as `init` with no passphrase) when `machines.toml` does not exist
-/// yet: the first verb that needs it does, so nobody runs `init` first. A starter baseline
-/// nobody edited is brought to the starter shipped now ([`refresh_starter_baseline`]).
+/// Initialize the controller directory on demand when `machines.toml` does not exist yet.
 pub(crate) fn set_up_if_new(sys: &dyn System, paths: &Paths) {
     if matches!(
         sys.stat(&paths.inventory()),
@@ -4357,12 +3943,6 @@ pub(crate) fn set_up_if_new(sys: &dyn System, paths: &Paths) {
     refresh_starter_baseline(sys, paths);
 }
 
-/// Rewrite `baselines/default.toml` with [`templates::DEFAULT_BASELINE`] when it is an earlier
-/// starter byte for byte ([`templates::EARLIER_DEFAULT_BASELINES`]): nobody edited it, so a
-/// fix to the starter reaches it. The 2026-10-19 rehearsal's `host_name = ""` would otherwise
-/// reach only a controller set up after it: the owner's, set up the day before, kept the
-/// starter that left a hand-set HostName at the old name. A file that differs in any byte, or
-/// cannot be read, is left as it is.
 fn refresh_starter_baseline(sys: &dyn System, paths: &Paths) {
     let path = paths.baseline("default");
     let Ok(digest) = sys.sha256(&path) else {
@@ -4373,7 +3953,6 @@ fn refresh_starter_baseline(sys: &dyn System, paths: &Paths) {
     }
 }
 
-/// Silently initialize the controller directory when `machines.toml` is missing on first use.
 fn init_quiet(sys: &dyn System, paths: &Paths) -> Result<(), ()> {
     paths.ensure(sys).map_err(|_| ())?;
     let _ = paths.ensure_control_dir(sys);
@@ -4434,7 +4013,6 @@ mod tests {
     const RECOVERY_BLOB: &str =
         "AAAAC3NzaC1lZDI1NTE5AAAAIJpFPtSPTOuLIj6oqQTj8ndNDVNHFp4renP47+wxFYao";
 
-    /// What `ssh` printed for a changed host key, measured in the VM (ssh.rs's fixture).
     const HOST_KEY_CHANGED: &str = "@    WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED!     @\r\nHost key for 0a1b2c3d-0000-4000-8000-000000000001 has changed and you have requested strict checking.\r\nHost key verification failed.\r\n";
 
     fn paths() -> Paths {
@@ -4465,8 +4043,6 @@ mod tests {
         }
     }
 
-    /// A controller holding `hosts`, this test binary standing in for the agent build, and
-    /// the signing key `allowed_signers` names `signing@old-name`.
     fn controller(hosts: &[&Host], github: bool) -> Fake {
         let sys = Fake::root();
         let mut inv = String::from("schema = 1\n");
@@ -4499,7 +4075,6 @@ mod tests {
         sys
     }
 
-    /// The command a request of `host` is scripted under.
     fn request(host: &Host, command: &str) -> String {
         ssh::request_cmd(&paths(), &Target::of(host), command)
             .unwrap()
@@ -4567,7 +4142,6 @@ mod tests {
         inventory::load(sys, &paths()).unwrap()
     }
 
-    /// No control character (an escape sequence's ESC, BEL, a carriage return) in `text`.
     fn inert(text: &str) -> bool {
         !text.chars().any(char::is_control)
     }
@@ -4576,7 +4150,6 @@ mod tests {
     fn the_starter_baseline_and_inventory_parse() {
         let b = crate::baseline::parse(templates::DEFAULT_BASELINE).unwrap();
         assert!(b.keyboard.is_some());
-        // Emacs and Caffeine (S16 takes them); S14 took gh out.
         assert_eq!(
             b.apps
                 .iter()
@@ -4589,8 +4162,6 @@ mod tests {
         assert!(inv.hosts.is_empty());
     }
 
-    /// A Mac named `ctl` with no controller yet, where each key's `ssh-keygen` run makes its
-    /// `.pub`: on the terminal for the signing and recovery keys when `protected`, else plain.
     fn uninitialized(protected: bool) -> Fake {
         let sys = Fake::root();
         sys.on("/usr/sbin/scutil --get LocalHostName", Ran::ok("ctl\n"));
@@ -4644,7 +4215,6 @@ mod tests {
     fn init_makes_every_key_with_no_passphrase_asking_nothing_and_needing_no_terminal() {
         let sys = uninitialized(false);
         let mut out = Vec::new();
-        // `env` has no terminal.
         assert_eq!(init(&env(&sys), false, &mut out), ExitCode::SUCCESS);
         let calls = sys.calls();
         for key in ["ssh_ed25519", "signing", "recovery"] {
@@ -4660,7 +4230,6 @@ mod tests {
         let signers =
             String::from_utf8(sys.written(&format!("{ROOT}/allowed_signers")).unwrap()).unwrap();
         assert!(signers.starts_with("signing@ctl ") && signers.contains("\nrecovery@ctl "));
-        // What it made, then one line: where, and the next command. No to-do list.
         let out = String::from_utf8(out).unwrap();
         assert!(
             !out.lines().any(|l| {
@@ -4681,7 +4250,6 @@ mod tests {
             !out.contains("removable media") && !out.contains("Local Network"),
             "{out}"
         );
-        // Run again, nothing that exists is made again.
         let before = sys.calls().len();
         assert_eq!(init(&env(&sys), false, &mut Vec::new()), ExitCode::SUCCESS);
         assert!(
@@ -4705,7 +4273,6 @@ mod tests {
         let asked: Vec<&String> = calls.iter().filter(|c| c.starts_with("tty ")).collect();
         assert_eq!(asked.len(), 2, "the signing and recovery keys: {calls:?}");
         assert!(asked.iter().all(|c| !c.contains("-N")), "{asked:?}");
-        // The fleet key has no passphrase either way.
         assert!(
             calls
                 .iter()
@@ -4717,8 +4284,6 @@ mod tests {
     fn init_with_passphrase_later_gives_one_to_a_signing_key_made_without() {
         let sys = uninitialized(false);
         assert_eq!(init(&env(&sys), false, &mut Vec::new()), ExitCode::SUCCESS);
-        // The signing key is here with no passphrase; the recovery key went to removable
-        // media, leaving its .pub.
         for key in ["ssh_ed25519", "signing"] {
             sys.file(&format!("{ROOT}/keys/{key}"), b"private");
         }
@@ -4755,7 +4320,6 @@ mod tests {
         assert!(String::from_utf8(out).unwrap().contains(&format!(
             "gave the signing key a passphrase: {ROOT}/keys/signing"
         )));
-        // Once it has one, it is left alone.
         let before = sys.calls().len();
         assert_eq!(init(&e, true, &mut Vec::new()), ExitCode::SUCCESS);
         assert!(
@@ -4848,7 +4412,6 @@ mod tests {
         assert!(r.refused.unwrap().starts_with("replay"));
         assert_eq!(r.finished, 1_800_000_000, "never read as decades ago");
         assert_eq!(read_stream("garbage\n", 1).0, None);
-        // A stream that named its run and then broke off: the run to attach to.
         let started = aterm_json::to_string(&Line::Started {
             run: "1800000000-7".into(),
         })
@@ -4879,7 +4442,6 @@ mod tests {
                 "arch":"arm64","floors":[],"cached":[]}"#,
         )
         .unwrap();
-        // An agent too old to report its build is upgraded.
         assert!(own.differs(&hello));
         hello.agent_sha256 = "AB".repeat(32);
         assert!(!own.differs(&hello));
@@ -4904,8 +4466,6 @@ mod tests {
         );
         assert_eq!(floor_of(&hello, &names(&["recovery@ctl"])), 0);
     }
-
-    // ── reaching hosts ──────────────────────────────────────────────────────────────────
 
     #[test]
     fn a_changed_host_key_fails_the_command_and_is_kept_with_its_reason_not_as_unreachable() {
@@ -4932,7 +4492,6 @@ mod tests {
         assert!(why.contains("host key is not the one pinned"), "{why}");
         assert_eq!(state_of(&sys, &b).unreachable_since, Some(sys.now));
         assert_eq!(state_of(&sys, &b).contact_error, None);
-        // status and outstanding read it back as a failure.
         assert_eq!(status(&e, &[], true, false), ExitCode::FAILURE);
         assert_eq!(outstanding(&e), ExitCode::FAILURE);
         assert!(
@@ -4960,7 +4519,6 @@ mod tests {
                 "ssh: connect to host 192.168.64.2 port 22: Operation timed out\r\n",
             ),
         );
-        // The next time, a Mac at b's address that answers as another.
         sys.on(
             &request(&b, "hello"),
             Ran::ok(&aterm_json::to_string(&hello_of(&a)).unwrap()),
@@ -4999,30 +4557,23 @@ mod tests {
             ])
         };
         let no_route = || Err(HelloError::Ssh(ssh::Failure::NoRoute));
-        // One Mac a router calls unreachable never stops the one that answered.
         assert_eq!(reached(Ok(hello_of(&a)), no_route()), None);
         assert_eq!(
             reached(no_route(), no_route()),
             Some(ssh::LOCAL_NETWORK_ROW)
         );
-        // A refused connection came back from a host: the LAN is reachable.
         assert_eq!(
             reached(no_route(), Err(HelloError::Ssh(ssh::Failure::Refused))),
             None
         );
-        // A connection that waited and timed out (or found the host down) was let onto the
-        // LAN: the refusal fails at once with no route. Measured: a dead address beside one
-        // in its no-route window.
         assert_eq!(
             reached(no_route(), Err(HelloError::Ssh(ssh::Failure::TimedOut))),
             None
         );
-        // A name that does not resolve says nothing either way.
         assert_eq!(
             reached(no_route(), Err(HelloError::Ssh(ssh::Failure::Unresolved))),
             Some(ssh::LOCAL_NETWORK_ROW)
         );
-        // No route to a public address is not the privacy refusal.
         let far = Host {
             address: "8.8.8.8".into(),
             ..lab(3, UUID_1)
@@ -5057,7 +4608,6 @@ mod tests {
             plan_or_apply(&env(&empty), &[], true, Mode::Apply, false),
             ExitCode::SUCCESS
         );
-        // Naming no host is a refused command line: 2.
         assert_eq!(
             plan_or_apply(&env(&empty), &[], false, Mode::Apply, false),
             ExitCode::from(2)
@@ -5075,7 +4625,6 @@ mod tests {
             ..lab(2, UUID_2)
         };
         let sys = controller(&[&m1, &spare], false);
-        // [names] alone, as the starter baseline has it: nothing else stops the envelopes.
         sys.file(
             &format!("{ROOT}/baselines/default.toml"),
             b"schema = 1\n[names]\ncomputer_name = \"{tag} {hardware}\"\nlocal_host_name = \"{tag}-{hardware}\"\n",
@@ -5086,7 +4635,6 @@ mod tests {
                 Ran::ok(&aterm_json::to_string(&hello_of(h)).unwrap()),
             );
         }
-        // A plan (an apply would stop first at this test binary's agent upgrade).
         assert_eq!(
             plan_or_apply(&env(&sys), &[], true, Mode::Plan, false),
             ExitCode::FAILURE
@@ -5115,9 +4663,6 @@ mod tests {
         assert_eq!(inv.hosts[0].name, "lab-01");
     }
 
-    /// lab-03 as the VM was enrolled (`lab-03.local`, the starter `[names]`), its newest hello
-    /// in `state/` describing the VM (27.0: `Virtual Machine M5 8GB 90GB`), and the address
-    /// its baseline renames it to.
     fn renamed_vm() -> (Fake, Host, Host) {
         let vm = Host {
             name: "lab-03".into(),
@@ -5145,8 +4690,6 @@ mod tests {
         (sys, vm, moved)
     }
 
-    /// What `ssh` prints on this Mac (macOS 27.0.1) for a `.local` name nothing answers for:
-    /// measured for `lab-03-gone.local`, after 5.05 s of looking; here for `lab-03.local`.
     const UNRESOLVED_OLD: &str = "ssh: Could not resolve hostname lab-03.local: nodename nor servname provided, or not known\r\n";
 
     #[test]
@@ -5159,7 +4702,6 @@ mod tests {
             &request(&moved, "hello"),
             Ran::ok(&aterm_json::to_string(&answer).unwrap()),
         );
-        // `attach <run>` after the apply's connection dropped: the run renamed the Mac.
         let finished = report(Mode::Apply, Vec::new());
         let stream = aterm_json::to_string(&Line::Report(Box::new(finished.clone()))).unwrap();
         sys.on(
@@ -5176,7 +4718,6 @@ mod tests {
         let state = state_of(&sys, &vm);
         assert_eq!((state.last_seen, state.unreachable_since), (sys.now, None));
         assert_eq!(state.report, Some(finished));
-        // The next command goes straight to the new name: nothing more is asked of the old.
         let at_old = |sys: &Fake| {
             sys.calls()
                 .iter()
@@ -5192,8 +4733,6 @@ mod tests {
 
     #[test]
     fn a_mac_still_reached_by_its_old_name_moves_to_the_one_it_says_it_has_once_that_answers() {
-        // Measured with the VM (27.0): a minute after the rename this Mac still resolved
-        // lab-03.local to it, and its hello said lab-03-Virtual-Machine-M5-8GB-90GB.
         let (sys, vm, moved) = renamed_vm();
         let mut answer = hello_of(&vm);
         answer.local_host_name = "lab-03-Virtual-Machine-M5-8GB-90GB".into();
@@ -5205,7 +4744,6 @@ mod tests {
         assert_eq!(reached.host.address, moved.address);
         assert_eq!(inventory_of(&sys).hosts[0].address, moved.address);
         assert_eq!(found_lead(&vm), format!("{:<16} renamed: ", vm.name));
-        // Its own name not answering yet: the old one, which did, stands.
         let (sys, vm, moved) = renamed_vm();
         let mut answer = hello_of(&vm);
         answer.local_host_name = "lab-03-Virtual-Machine-M5-8GB-90GB".into();
@@ -5231,8 +4769,6 @@ mod tests {
     fn another_mac_at_the_renamed_name_is_never_followed_and_nothing_else_is_tried() {
         let (sys, vm, moved) = renamed_vm();
         sys.on(&request(&vm, "hello"), Ran::exit(255, UNRESOLVED_OLD));
-        // A Mac at that name answering as another uuid; then one whose host key is not the
-        // one pinned for this host (ssh refuses it before any request).
         let other = lab(9, UUID_2);
         sys.on(
             &request(&moved, "hello"),
@@ -5247,13 +4783,10 @@ mod tests {
             );
             assert_eq!(inventory_of(&sys).hosts[0].address, "lab-03.local");
             let state = state_of(&sys, &vm);
-            // Unreachable as it was; the guess leaves no contact error behind.
             assert_eq!(state.unreachable_since, Some(sys.now));
             assert_eq!(state.contact_error, None);
         }
         assert!(!sys.calls().iter().any(|c| c.contains("attach ")));
-        // A name that still resolves, a Mac that just did not answer: its address is the
-        // only one asked.
         let (sys, vm, moved) = renamed_vm();
         sys.on(
             &request(&vm, "hello"),
@@ -5269,8 +4802,6 @@ mod tests {
 
     #[test]
     fn a_mac_whose_old_name_another_mac_took_is_found_at_the_name_its_baseline_gives() {
-        // The report was lost, and since then another Mac answers at lab-03.local: ssh
-        // refuses its key, which is not the one pinned under this host's UUID.
         let (sys, vm, moved) = renamed_vm();
         sys.on(&request(&vm, "hello"), Ran::exit(255, HOST_KEY_CHANGED));
         let mut answer = hello_of(&vm);
@@ -5285,8 +4816,6 @@ mod tests {
         assert_eq!(inventory_of(&sys).hosts[0].address, moved.address);
         let state = state_of(&sys, &vm);
         assert_eq!((state.contact_error, state.last_seen), (None, sys.now));
-        // Not there either (a reinstalled Mac, whose key changed): the changed key at the
-        // address machines.toml holds is the failure, as before, and nothing moves.
         let (sys, vm, moved) = renamed_vm();
         sys.on(&request(&vm, "hello"), Ran::exit(255, HOST_KEY_CHANGED))
             .on(
@@ -5313,8 +4842,6 @@ mod tests {
 
     #[test]
     fn an_upgraded_agent_is_greeted_before_the_baseline_that_may_rename_the_mac() {
-        // An agent older than the `hardware` field answered the sweep; the apply upgrades
-        // it, then sends the baseline, whose report may be lost after it renames the Mac.
         let vm = Host {
             name: "lab-03".into(),
             address: "lab-03.local".into(),
@@ -5359,8 +4886,6 @@ mod tests {
         };
         let done = send(&env(&sys), &job, Some(&archive)).unwrap();
         assert_eq!(done.items.len(), 2);
-        // The new agent answered between the upgrade and the baseline, and its hello, the
-        // one `reach` finds a renamed Mac by, is the one kept.
         let calls = sys.calls();
         let at = |cmd: String| -> Vec<usize> {
             calls
@@ -5402,10 +4927,6 @@ mod tests {
         );
     }
 
-    // ── what a run leaves in state ──────────────────────────────────────────────────────
-
-    // ── --only ──────────────────────────────────────────────────────────────────────────
-
     #[test]
     fn an_only_envelope_carries_those_tables_and_resolves_nothing_for_the_others() {
         let a = lab(1, UUID_1);
@@ -5437,7 +4958,6 @@ mod tests {
             "no release looked up: {:?}",
             sys.calls()
         );
-        // The whole baseline asks for [aterm]'s release, which nothing here answers.
         assert!(resolved_baseline(&e, &a, &hello_of(&a), &mut Resolved::default(), &[]).is_err());
     }
 
@@ -5450,8 +4970,6 @@ mod tests {
             templates::DEFAULT_BASELINE.as_bytes(),
         );
         let e = env(&sys);
-        // The cache an earlier whole apply left: an app image and an aterm pin (and a name
-        // that is no hash, which the agent's hello never lists and is not echoed back).
         let (app, pin) = ("ab".repeat(32), "CD".repeat(32));
         let mut hello = hello_of(&a);
         hello.cached = vec![app.clone(), pin.clone(), "../x".into()];
@@ -5473,7 +4991,6 @@ mod tests {
         assert!(needed.is_empty(), "nothing to upload for [names]");
         let named: Vec<&str> = apply.artifacts.iter().map(|x| x.sha256.as_str()).collect();
         assert_eq!(named, [app.as_str(), &pin.to_ascii_lowercase()]);
-        // A plan prunes nothing, so it names nothing more.
         let (plan, _) = body(Action::Plan);
         assert!(plan.artifacts.is_empty(), "{:?}", plan.artifacts);
     }
@@ -5486,7 +5003,6 @@ mod tests {
             &format!("{ROOT}/baselines/default.toml"),
             templates::DEFAULT_BASELINE.as_bytes(),
         );
-        // Cut off mid-write: its report could not be merged, only saved whole.
         sys.file(&format!("{ROOT}/state/{UUID_1}.json"), b"{\"report\":");
         sys.on(
             &request(&a, "hello"),
@@ -5498,7 +5014,6 @@ mod tests {
             ExitCode::FAILURE
         );
         let calls = sys.calls();
-        // Nothing was signed, nor the signing key so much as read.
         assert!(!calls.iter().any(|c| c.contains("ssh-keygen")), "{calls:?}");
         assert_eq!(
             sys.written(&format!("{ROOT}/state/{UUID_1}.json")),
@@ -5507,8 +5022,6 @@ mod tests {
         );
     }
 
-    /// `lab-01`'s whole apply: a name it could not set, a power setting that failed, and a
-    /// Homebrew install that waits for a restart.
     fn whole_apply() -> HostReport {
         let mut brew = row("homebrew.pkg", "homebrew", Outcome::Changed);
         brew.effect = Effect::Restart;
@@ -5524,7 +5037,6 @@ mod tests {
         r
     }
 
-    /// The `--only names` plan's report, under the serial its envelope was sent with.
     fn names_plan(serial: u64) -> HostReport {
         let mut r = report(
             Mode::Plan,
@@ -5575,19 +5087,16 @@ mod tests {
             })
         );
         assert!(state.only_sent.is_empty(), "the serial is spent");
-        // Not a whole apply, even an --only one: the build the baseline was applied on stays.
         remember_only(&e, &a, 9, &["names".to_owned()]).unwrap();
         let mut names_apply = names_plan(9);
         names_apply.mode = Mode::Apply;
         after_run(&e, &inv, &a, names_apply, Source::Baseline);
         let state = state_of(&sys, &a);
         assert_eq!(state.applied_build.as_deref(), Some("26A428"));
-        // The failure and the restart the whole apply left are still outstanding.
         assert_eq!(outstanding(&e), ExitCode::FAILURE);
         let line = summary(&a, &state, sys.now);
         assert!(line.contains("; names only (the rest "), "{line}");
         assert!(only_todo(&a, &state).is_none(), "the rest was run once");
-        // The next whole run is the report again, whole.
         after_run(
             &e,
             &inv,
@@ -5607,7 +5116,6 @@ mod tests {
         let e = env(&sys);
         let inv = inventory_of(&sys);
         remember_only(&e, &a, 8, &["names".to_owned()]).unwrap();
-        // Followed by `attach`, as a run whose connection dropped would be.
         after_run(&e, &inv, &a, names_plan(8), Source::Followed);
         let state = state_of(&sys, &a);
         assert_eq!(
@@ -5629,7 +5137,6 @@ mod tests {
             line.contains("; names only (the rest of the baseline not yet)"),
             "{line}"
         );
-        // A second --only run widens what is covered.
         remember_only(&e, &a, 9, &["power".to_owned()]).unwrap();
         let mut power = names_plan(9);
         power.items = vec![row("power.ac.sleep", "power", Outcome::Ok)];
@@ -5639,7 +5146,6 @@ mod tests {
             state.only.map(|o| o.tables),
             Some(vec!["names".to_owned(), "power".to_owned()])
         );
-        // The names rows stay; the plan's pending agent upgrade row spoke for that run alone.
         let ids: Vec<String> = state
             .report
             .unwrap()
@@ -5688,9 +5194,7 @@ mod tests {
         assert!(summary(&a, &state, sys.now).contains("REFUSED 0s ago: busy run="));
         assert_eq!(status(&e, &[], true, false), ExitCode::FAILURE);
         assert_eq!(outstanding(&e), ExitCode::FAILURE);
-        // `person` still lists the host's step, and names the refusal: never all clear.
         assert_eq!(person(&e, &[], true), ExitCode::FAILURE);
-        // The next plan or apply report clears it.
         after_run(
             &e,
             &inv,
@@ -5722,7 +5226,6 @@ mod tests {
             after_run(&e, &inv, &a, job, Source::Followed);
             assert_eq!(state_of(&sys, &a).report.as_ref(), Some(&applied));
         }
-        // An apply attach followed is the host's report.
         let later = report(
             Mode::Apply,
             vec![row("power.ac.sleep", "power", Outcome::Changed)],
@@ -5750,7 +5253,6 @@ mod tests {
             !line.contains("abababababab"),
             "the build's hash is --json's: {line}"
         );
-        // Unknown on either side says nothing, never "unchanged" or "changed".
         let unknown = HostState {
             applied_build: None,
             ..state.clone()
@@ -5763,11 +5265,8 @@ mod tests {
         assert_eq!(os_changed(&same, saved_hello(&same).as_ref()), None);
     }
 
-    // ── host text on the terminal ───────────────────────────────────────────────────────
-
     #[test]
     fn a_report_row_reads_by_its_title_never_its_id() {
-        // The rehearsal's rename, as the agent reported it (VM 27.0).
         let mut r = row("names.netbios-name", "names", Outcome::Changed);
         r.title = "Windows network name, the Computer Name cut to 15 characters".into();
         r.from = Some("\"VIRTUALMAC-6C5B\"".into());
@@ -5817,8 +5316,6 @@ mod tests {
         assert!(inert(&summary(&a, &state, 2)), "{}", summary(&a, &state, 2));
     }
 
-    // ── person steps ────────────────────────────────────────────────────────────────────
-
     #[test]
     fn a_person_row_nobody_could_read_is_listed_unmeasured_and_fails_person() {
         let a = lab(1, UUID_1);
@@ -5832,14 +5329,12 @@ mod tests {
         };
         inventory::save_state(&sys, &paths(), &a.uuid, &state).unwrap();
         assert_eq!(person(&e, &[], true), ExitCode::FAILURE);
-        // A refusal saved as the report (an older state file) measured nothing either.
         let old = HostState {
             report: Some(refusal("expired issued=1 host-clock=2")),
             ..HostState::default()
         };
         inventory::save_state(&sys, &paths(), &a.uuid, &old).unwrap();
         assert_eq!(person(&e, &[], true), ExitCode::FAILURE);
-        // Every row read and nothing outstanding: all clear.
         let done = HostState {
             report: Some(report(
                 Mode::Plan,
@@ -5872,7 +5367,6 @@ mod tests {
         let r = person_report(None);
         let err = walk_steps(&r, &a, false, Some("developer_tools:aterm")).unwrap_err();
         assert!(err.contains("Screen Sharing is not on"), "{err}");
-        // At the Mac's keyboard it is just the first step.
         let (steps, waiting) = walk_steps(&r, &a, true, None).unwrap();
         assert_eq!(steps.len(), 3);
         assert!(waiting.is_empty());
@@ -5899,7 +5393,6 @@ mod tests {
                 "{w:?}"
             );
         }
-        // Installed by the apply this report is from, or already there: walked.
         for installed in [
             ("absent", Outcome::Changed),
             ("aterm 0.105.0", Outcome::Planned),
@@ -5954,7 +5447,6 @@ mod tests {
         let line = "aterm machines screen: lab-01: the Mac is still logged in as admin and \
                     unlocked at its display: the lock after the walk failed \
                     (SACLockScreenImmediate answered 22)";
-        // Every step granted, so the walk plans again; the line still comes after the plan.
         assert_eq!(
             ended(
                 &walked(screen::Done::Granted),
@@ -5969,13 +5461,11 @@ mod tests {
                 ]
             )
         );
-        // A step the walk stopped at, with no plan: the line is still the last.
         let stopped = walked(screen::Done::NotGranted("stopped by SIGINT".into()));
         let (code, said) = ended(&stopped, &unlocked("SACLockScreenImmediate answered 22"));
         assert_eq!(code, ExitCode::FAILURE);
         assert_eq!(said.last(), Some(&Said::Last(line.into())));
         assert_eq!(said.len(), 2);
-        // Locked again, or never logged in over the relay: no line, and the steps decide.
         for session in [screen::Session::Locked, screen::Session::Kept] {
             assert_eq!(
                 ended(&walked(screen::Done::Granted), &session),
@@ -5989,7 +5479,6 @@ mod tests {
             );
             assert_eq!(ended(&stopped, &session).0, ExitCode::FAILURE);
         }
-        // What the host said reaches the terminal inert.
         let (_, said) = ended(&stopped, &unlocked("\u{1b}]52;c;aGVsbG8=\u{7}"));
         assert!(
             matches!(said.last(), Some(Said::Last(l)) if inert(l)),
@@ -5997,7 +5486,6 @@ mod tests {
         );
     }
 
-    /// Records into its log when it drops, as `screen`'s caught stops are let go.
     struct Held(std::rc::Rc<std::cell::RefCell<Vec<String>>>);
 
     impl Drop for Held {
@@ -6008,8 +5496,6 @@ mod tests {
 
     #[test]
     fn the_stops_screen_caught_are_let_go_only_after_the_last_line() {
-        // While they are held, a second Ctrl-C during the closing plan is noted and ignored, so
-        // the line saying the Mac was left unlocked still comes out.
         let a = lab(1, UUID_1);
         let log = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
         let walked = vec![screen::Walked {
@@ -6044,13 +5530,11 @@ mod tests {
             ),
         );
         let held = format!("SSH_AUTH_SOCK=\u{2026} /usr/bin/ssh-add -T {key}.pub");
-        // In the agent at first; then no longer (another walk removed it).
         sys.on(&held, Ran::ok(""));
         sys.on(&held, Ran::exit(1, "Agent signature failed\n"));
         let mut e = env(&sys);
         e.agent_sock = Some("/tmp/agent.sock".into());
         assert_eq!(signing(&e, Path::new(&key)), Ok(Signing::Agent));
-        // Not in the agent: the terminal when there is one, else a refusal.
         e.tty = true;
         assert_eq!(signing(&e, Path::new(&key)), Ok(Signing::Terminal));
         e.tty = false;
@@ -6059,15 +5543,12 @@ mod tests {
                 .unwrap_err()
                 .contains("ssh-agent does not hold it")
         );
-        // No agent at all: never asked.
         e.agent_sock = None;
         e.tty = true;
         let before = sys.calls().len();
         assert_eq!(signing(&e, Path::new(&key)), Ok(Signing::Terminal));
         assert!(!sys.calls()[before..].iter().any(|c| c.contains("ssh-add")));
     }
-
-    // ── principals, upgrades ────────────────────────────────────────────────────────────
 
     #[test]
     fn the_principal_comes_from_allowed_signers_by_key_before_the_local_host_name() {
@@ -6080,7 +5561,6 @@ mod tests {
         let e = env(&sys);
         let inv = inventory_of(&sys);
         assert_eq!(principals(&inv, &e), ["signing@old-name"]);
-        // A stale serial file still gives max(stored, the floor the host reports) + 1.
         sys.file(&format!("{ROOT}/serial"), b"5\n");
         let mut hello = hello_of(&a);
         hello.floors = vec![crate::protocol::Floor {
@@ -6090,14 +5570,12 @@ mod tests {
         let floor = floor_of(&hello, &principals(&inv, &e));
         let b = body(&e, &a, floor, Action::Plan, Disrupt::WhenIdle).unwrap();
         assert_eq!(b.serial, 42);
-        // A name the last rekey replaced still counts.
         sys.file(
             &format!("{ROOT}/allowed_signers.previous"),
             format!("signing@older namespaces=\"aterm-machines\" ssh-ed25519 {SIGNING_BLOB}\n")
                 .as_bytes(),
         );
         assert_eq!(principals(&inv, &e), ["signing@old-name", "signing@older"]);
-        // Only when no list names the key: the LocalHostName init used.
         let unlisted = Fake::root();
         unlisted.on(
             "/usr/sbin/scutil --get LocalHostName",
@@ -6141,8 +5619,6 @@ mod tests {
         );
         assert!(sys.calls().is_empty(), "a bare binary is not checked");
     }
-
-    // ── rekey ───────────────────────────────────────────────────────────────────────────
 
     #[test]
     fn a_new_list_that_only_mentions_the_signing_key_in_a_comment_is_refused() {
@@ -6211,25 +5687,20 @@ mod tests {
         );
         assert_eq!(state_of(&sys, &a).signers_sha256, Some(text_sha256(&new)));
         assert_eq!(state_of(&sys, &b).signers_sha256, None);
-        // A later rekey with the same list, catching up b, keeps the list b still holds.
         replace_signers(&e, &new).unwrap();
         assert_eq!(
             sys.written(&format!("{ROOT}/allowed_signers.previous"))
                 .unwrap(),
             old
         );
-        // The renamed principal and the old one both find the key's floors.
         assert_eq!(
             principals(&inventory_of(&sys), &e),
             ["signing@new", "signing@old-name"]
         );
     }
 
-    // ── GitHub ──────────────────────────────────────────────────────────────────────────
-
     const ALICE_OLD: &str = "AAAAC3NzaC1lZDI1NTE5AAAAIJpFPtSPTOuLIj6oqQTj8ndNDVNHFp4renP47+wxFYao";
     const ALICE_NEW: &str = "AAAAC3NzaC1lZDI1NTE5AAAAIHv2Xf9kgkNkpV3WltnLoVx25AQOEx+mch1DHT/oZdSa";
-    /// Made up; never a real token.
     const MACHINE_TOKEN: &str = "fixture_machine_user_token_only";
     const KEYS_PAGE: &str = "/user/keys?per_page=100&page=1";
 
@@ -6241,7 +5712,6 @@ mod tests {
         })
     }
 
-    /// A controller whose login keychain holds a token for `fleetbot` that signs in as it.
     fn with_token(sys: &Fake) {
         sys.stat_of(
             crate::items::github::CLT_GIT,
@@ -6268,7 +5738,6 @@ mod tests {
         );
     }
 
-    /// The listing's next answer: the account holds `held`.
     fn lists(sys: &Fake, held: &[(u64, &str)]) {
         let keys: Vec<_> = held
             .iter()
@@ -6322,7 +5791,6 @@ mod tests {
             ..HostState::default()
         };
         inventory::save_state(&sys, &paths(), &a.uuid, &state).unwrap();
-        // The same key again: nothing is sent, and the keychain is not read.
         after_run(
             &e,
             &inv,
@@ -6337,7 +5805,6 @@ mod tests {
             "{:?}",
             sys.calls()
         );
-        // A reset home made a new key: registered, and the old id deleted.
         lists(&sys, &[(5, ALICE_OLD)]);
         posts(&sys, 9);
         lists(&sys, &[(5, ALICE_OLD), (9, ALICE_NEW)]);
@@ -6385,7 +5852,6 @@ mod tests {
         let state = state_of(&sys, &a);
         assert!(state.github_keys.is_empty());
         assert_eq!(state.github_revoked, [format!("ssh-ed25519 {ALICE_OLD}")]);
-        // The host still has that key and still reports it: not sent again.
         let calls = sys.calls().len();
         after_run(
             &e,
@@ -6395,7 +5861,6 @@ mod tests {
             Source::Baseline,
         );
         assert!(!sys.calls()[calls..].iter().any(|c| c.contains("POST")));
-        // A plan reports the key too, and registers nothing whatever it carries.
         after_run(
             &e,
             &inv,
@@ -6404,7 +5869,6 @@ mod tests {
             Source::Baseline,
         );
         assert!(!sys.calls()[calls..].iter().any(|c| c.contains("POST")));
-        // A key the host makes anew is registered by the next apply.
         lists(&sys, &[]);
         posts(&sys, 11);
         after_run(
@@ -6417,9 +5881,6 @@ mod tests {
         assert_eq!(state_of(&sys, &a).github_keys, [("alice".to_owned(), 11)]);
     }
 
-    /// `github login` reads the token at the terminal with its echo off and stores it once
-    /// GitHub vouches for it. Negative controls: no terminal, and no [github] account, each
-    /// refused before anything is asked or stored.
     #[test]
     fn github_login_asks_at_the_terminal_and_stores_what_github_vouches_for() {
         let a = lab(1, UUID_1);
@@ -6467,7 +5928,6 @@ mod tests {
                 code == ExitCode::SUCCESS,
                 "{calls:?}"
             );
-            // The token is asked for with its echo off, once, and only where it is stored.
             let asked: Vec<&String> = calls.iter().filter(|c| c.starts_with("ask")).collect();
             if code == ExitCode::SUCCESS {
                 assert_eq!(asked.len(), 1, "{calls:?}");
@@ -6482,9 +5942,6 @@ mod tests {
         }
     }
 
-    /// Successful interactive keygen is followed by the existing protection query.
-    /// A protected result succeeds; an empty, unreadable or interrupted result
-    /// refuses without removing or regenerating the same private key.
     #[test]
     fn init_keeps_the_key_and_refuses_an_unconfirmed_passphrase() {
         for (label, after, protected) in [
@@ -6557,7 +6014,6 @@ mod tests {
             "{:?}",
             sys.calls()
         );
-        // One with an inventory is never touched, whatever else it lacks.
         let sys = uninitialized(false);
         sys.file(&format!("{ROOT}/machines.toml"), b"schema = 1\n");
         set_up_if_new(&sys, &paths());
@@ -6567,10 +6023,6 @@ mod tests {
 
     #[test]
     fn a_starter_baseline_nobody_edited_follows_the_starter_shipped_now() {
-        // A controller set up before S14 (docs/DESIGN-init-system-2026-10-20.md): its
-        // default.toml is the starter of 326cdca677 byte for byte, the one with an [[app]] row
-        // S14 took out (these are its bytes, data only), so the starter without it would
-        // never have reached it.
         const REMOVED_ROW: &str = "# gh's installer package carries no installer signature; its binary is checked against\n\
              # GitHub's Team ID instead (design §8).\n[[app]]\nname = \"gh\"\nkind = \"pkg\"\n\
              url = \"https://github.com/cli/cli/releases/download/v2.102.0/gh_2.102.0_macOS_universal.pkg\"\n\
@@ -6585,9 +6037,6 @@ mod tests {
             templates::EARLIER_DEFAULT_BASELINES.contains(&text_sha256(&earlier).as_str()),
             "the digest is of the starter as 326cdca677 wrote it"
         );
-        // The owner's controller, set up on 2026-10-18: its default.toml is the starter of
-        // 6045a51374 byte for byte, the one without `host_name = ""`, so the rehearsal's F1
-        // fix to the starter would never have reached it.
         let older = earlier.replace(
             "# host_name \"\" unsets a HostName set by hand, so `hostname`, shell prompts and \
              ssh show the\n# new Local hostname rather than the old name; a dotted name sets one \
@@ -6607,7 +6056,6 @@ mod tests {
         let default = format!("{ROOT}/baselines/default.toml");
         for (on_disk, after) in [
             (earlier.clone(), templates::DEFAULT_BASELINE.to_owned()),
-            // Edited, even by one line: the owner's, never rewritten.
             (format!("{earlier}# mine\n"), format!("{earlier}# mine\n")),
             (
                 templates::DEFAULT_BASELINE.to_owned(),
@@ -6623,14 +6071,12 @@ mod tests {
                 after
             );
         }
-        // No baseline at all is no baseline still.
         let sys = uninitialized(false);
         sys.file(&format!("{ROOT}/machines.toml"), b"schema = 1\n");
         set_up_if_new(&sys, &paths());
         assert!(sys.written(&default).is_none());
     }
 
-    /// What `ssh` prints when nothing answers at an IP address.
     fn timed_out(host: &Host) -> Ran {
         Ran::exit(
             255,
@@ -6641,8 +6087,6 @@ mod tests {
         )
     }
 
-    /// lab-09 held by its IP address, its newest hello in `state/` naming its Local hostname
-    /// `lab-09`, and the host at that name.
     fn dhcp_vm() -> (Fake, Host, Host) {
         let vm = lab(9, UUID_1);
         let sys = controller(&[&vm], false);
@@ -6671,9 +6115,7 @@ mod tests {
         assert!(reached.hello.is_ok());
         assert_eq!(reached.host.address, named.address);
         assert_eq!(inventory_of(&sys).hosts[0].address, named.address);
-        // `lab-09           moved: address 192.168.64.9 -> lab-09.local in machines.toml`.
         assert_eq!(found_lead(&vm), format!("{:<16} moved: ", vm.name));
-        // Asked over ssh, under the key pinned for its UUID: only that Mac can answer there.
         let asked = request(&named, "hello");
         assert!(sys.calls().contains(&asked));
         assert!(asked.starts_with("/usr/bin/ssh "), "{asked}");
@@ -6681,7 +6123,6 @@ mod tests {
         assert!(asked.contains("StrictHostKeyChecking=yes"), "{asked}");
         let state = state_of(&sys, &vm);
         assert_eq!((state.last_seen, state.unreachable_since), (sys.now, None));
-        // Another Mac took its IP address (its key answers there): looked for by name too.
         let (sys, vm, named) = dhcp_vm();
         sys.on(&request(&vm, "hello"), Ran::exit(255, HOST_KEY_CHANGED))
             .on(
@@ -6704,11 +6145,9 @@ mod tests {
         ));
         assert_eq!(reached.host.address, vm.address);
         assert_eq!(inventory_of(&sys).hosts[0].address, vm.address);
-        // The guess leaves no trace: the host is unreachable at its address, not "changed".
         let state = state_of(&sys, &vm);
         assert_eq!(state.unreachable_since, Some(sys.now));
         assert_eq!(state.contact_error, None);
-        // Nor does one whose key passes and that answers as another Mac.
         let (sys, vm, named) = dhcp_vm();
         let mut other = hello_of(&vm);
         other.uuid = UUID_2.into();
@@ -6722,7 +6161,6 @@ mod tests {
 
     #[test]
     fn only_an_ip_address_that_does_not_answer_is_looked_for_by_name() {
-        // It answers at its address: nothing else is asked.
         let (sys, vm, named) = dhcp_vm();
         sys.on(
             &request(&vm, "hello"),
@@ -6730,7 +6168,6 @@ mod tests {
         );
         assert!(reach_one(&env(&sys), &vm).hello.is_ok());
         assert!(!sys.calls().contains(&request(&named, "hello")));
-        // A refusal that is the Mac's own answer (its fleet key gone) is not a move.
         let (sys, vm, named) = dhcp_vm();
         sys.on(
             &request(&vm, "hello"),
@@ -6741,7 +6178,6 @@ mod tests {
         );
         assert!(reach_one(&env(&sys), &vm).hello.is_err());
         assert!(!sys.calls().contains(&request(&named, "hello")));
-        // No hello kept (never answered since enrollment), or one with no Local hostname.
         let vm = lab(9, UUID_1);
         let sys = controller(&[&vm], false);
         sys.on(&request(&vm, "hello"), timed_out(&vm));
@@ -6906,11 +6342,6 @@ __NVGPU__ NVIDIA GB10, 12, 45, 3.40\n";
         );
     }
 
-    /// `here` journals each change where the account its items act on is: the system it
-    /// runs against, here the fake, whose files hold the line. Negative control: a run
-    /// that changes nothing writes none. The journal this process would resolve for
-    /// itself (`aterm_types::dirs::account_state_dir`, where `here` journaled before) is
-    /// never asked: a mutant that asks it leaves the fake's journal empty and fails here.
     #[test]
     fn here_journals_each_change_in_the_journal_of_the_system_it_runs_on() {
         let journaled = |sys: &Fake| -> Vec<aterm_json::Value> {
@@ -6923,7 +6354,6 @@ __NVGPU__ NVIDIA GB10, 12, 45, 3.40\n";
         };
         let baseline = "/b/baseline.toml";
         let text: &[u8] = b"schema = 1\n[names]\nhost_name = \"lab-07.lab.example\"\n";
-        // A Mac at the login window (root owns the console), so the run has no users.
         let mac = || {
             let sys = Fake::root();
             sys.file(baseline, text).stat_of(
@@ -6939,7 +6369,6 @@ __NVGPU__ NVIDIA GB10, 12, 45, 3.40\n";
             );
             sys
         };
-        // The negative control first: the name is already as wanted, so nothing is written.
         let sys = mac();
         sys.on(
             "/usr/sbin/scutil --get HostName",
@@ -6954,7 +6383,6 @@ __NVGPU__ NVIDIA GB10, 12, 45, 3.40\n";
             Vec::<aterm_json::Value>::new(),
             "a line for a run that changed nothing"
         );
-        // A change: its line, then scutil's set and the read-back.
         let sys = mac();
         sys.on(
             "/usr/sbin/scutil --get HostName",

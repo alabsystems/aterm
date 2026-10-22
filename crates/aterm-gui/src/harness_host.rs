@@ -158,7 +158,7 @@
 //!   only while one asks), any other route is not ([`Acts::route`], read
 //!   once per agent process), and the policy continues an unreachable wall
 //!   as soon as the API is measured back.
-//! * THE ACCOUNT'S WALL (the accounts design, §5 and §12 slice 2). Where the
+//! * THE ACCOUNT'S WALL (the accounts design, §5 and §12). Where the
 //!   loop opens a limit episode on a Claude Code ([`IdleHost::limited`]), its
 //!   worker hands the session's own usage wall to the accounts recorder
 //!   ([`Acts::account_wall`]): recorded for the account the agent's own
@@ -1512,7 +1512,7 @@ impl HostCtl {
     /// instance's own socket, so the token is presented only to the process
     /// that minted it — but a seamless update's successor rebinds that path
     /// and never knew the token: on its `ERR auth` the transport takes the
-    /// token beside the socket from then on (ruling R10), and the loop's
+    /// token beside the socket from then on, and the loop's
     /// requests read `by=ctl` there instead of failing. No token minted (no
     /// entropy): the token beside the socket, as [`Self::new`].
     pub(crate) fn as_harness(endpoint: Endpoint) -> Self {
@@ -1836,7 +1836,7 @@ pub(crate) struct Kept {
     /// [`relaunch::ExitRecord::crashed`]; a codex-alab's copy read one) or a
     /// stall's remedy — and `None` once the relaunch lands, is left or can never
     /// land. What a seamless update carries across its handoff for the tab
-    /// ([`HostHandle::pending_restored_for`]; round six, F13): the back-off
+    /// ([`HostHandle::pending_restored_for`]): the back-off
     /// lived in the worker alone, the Commit's stop read as the agent being
     /// back, and neither the successor nor a failed Commit's resumed host
     /// ever relaunched the conversation. With the explicit restart's cause
@@ -2813,6 +2813,10 @@ type HoldFn = dyn Fn(&str, u64) -> bool + Send + Sync;
 /// `(sid, text)`.
 type DiskResumeFn = dyn Fn(&str, &str) -> String + Send + Sync;
 type SnapshotFn = dyn Fn(&str) -> Option<Snapshot> + Send + Sync;
+/// The occupancy facts board as session `sid`'s host reads it
+/// ([`Acts::occupancy`]).
+type OccupancyFn =
+    dyn Fn(&str) -> aterm_agent::supervise::occupancy::OccupancyReading + Send + Sync;
 type FollowFn = dyn Fn(&str, &mut Snapshot) -> Foreground + Send + Sync;
 type StatusFn = dyn Fn(&str) -> Option<String> + Send + Sync;
 type ExitLookFn = dyn Fn(&str, &Snapshot) -> Option<ExitLook> + Send + Sync;
@@ -3475,8 +3479,8 @@ pub(crate) struct Hooks {
     /// them on the Autopilot chip (`Wake::HarnessFact`). Facts only; nothing acts on them.
     pub(crate) fact: Arc<FactFn>,
     /// THE WORKER'S NEEDS YOU, WHOLE, STORED WHERE ITS ENTRY LANDS
-    /// (`docs/DESIGN-harness-autopilot-2026-10-15.md` §12.2.3 item 3, slice
-    /// 2c): the set and the entry's text the loop tells
+    /// (`docs/DESIGN-harness-autopilot-2026-10-15.md` §12.2.3 item 3):
+    /// the set and the entry's text the loop tells
     /// ([`IdleHost::needs_standing`]), written on the session's timeline on
     /// the loop's own thread, BEFORE the loop sends the entry's `meta set`,
     /// so the first publication that sees the entry has its words; the set
@@ -3490,8 +3494,8 @@ pub(crate) struct Hooks {
     /// (`HarnessFact::Needs`, through [`Self::fact`]).
     pub(crate) needs: Arc<NeedsFn>,
     /// WHY LAND STILL HOLDS, STORED WHERE THE WINDOW READS IT
-    /// (`docs/DESIGN-harness-autopilot-2026-10-15.md` §12.3.3 item 3, slice
-    /// 3c): the hold the loop tells ([`IdleHost::land_held`]), written on the
+    /// (`docs/DESIGN-harness-autopilot-2026-10-15.md` §12.3.3 item 3):
+    /// the hold the loop tells ([`IdleHost::land_held`]), written on the
     /// session's timeline on the loop's own thread
     /// ([`crate::session_timeline::SessionTimeline::set_land_held`]), made
     /// as [`Self::needs`] is. Live, [`store_land_held`]: the store's read
@@ -3543,7 +3547,7 @@ pub(crate) struct Hooks {
     /// What the workers and the disk watch tell the window about themselves
     /// ([`HostNote`]): handed to the app loop as `Wake::HostNote`.
     pub(crate) note: Arc<NoteFn>,
-    /// THE USAGE TAP'S SESSION LOG MARK (session log phase 3B, plan §3.2;
+    /// THE USAGE TAP'S SESSION LOG MARK (plan §3.2;
     /// addendum A13): a reading the worker took ([`WorkerIdle::tap_step`])
     /// while `[harness] usage_tap` is on, as `mark - usage h5= d7=` on the
     /// tab's log. Live, [`log_usage`]: the store read and let go, the
@@ -3631,6 +3635,13 @@ pub(crate) struct Acts {
     /// ([`crate::program_check_watch::BOARD`]), which the watch writes once a minute; a
     /// test's own, so the wedge it stands up holds no other test's worker.
     pub(crate) program_check: &'static Mutex<crate::program_check_watch::Board>,
+    /// THE OCCUPANCY FACTS BOARD the worker reads the machine from
+    /// ([`WorkerIdle::occupancy`], the occupancy door's reading), asked by
+    /// the worker's session id: the process's
+    /// ([`crate::occupancy_host::reading_for`]), which the disk look takes
+    /// and judges; a test's own, so the session it is asked for is the test's
+    /// to see.
+    pub(crate) occupancy: Arc<OccupancyFn>,
     pub(crate) snapshot: Arc<SnapshotFn>,
     pub(crate) follow: Arc<FollowFn>,
     pub(crate) status: Arc<StatusFn>,
@@ -3773,6 +3784,15 @@ pub(crate) struct Acts {
     /// `accounts::record_wall` with its process's facts ([`account_wall_live`]). It records and
     /// nothing more: nothing is typed, touched or shown. The word is the log's.
     pub(crate) account_wall: Arc<AccountWallFn>,
+    /// THE FLEET ACCOUNTS' UPKEEP, AS INJECTED: what the upkeep thread
+    /// ([`Upkeep`], kicked by the activation thread) and a session's wall
+    /// ([`account_wall_live`]) run. Live ([`live_acts`]):
+    /// [`maintain_accounts_live`], which reads aterm.toml and does nothing at
+    /// all on a machine whose person named no fleet accounts source
+    /// (`aterm_agent::harness::accounts_sync::upkeep_live`). [`Acts::inert`]'s
+    /// does nothing whatever is configured, so no test host built on it can
+    /// fetch a roster, start `claude auth login` or arm a mailbox sign-in.
+    pub(crate) accounts_upkeep: UpkeepFn,
     /// What the session's screen says of its account's usage, recorded for the account
     /// ([`WorkerIdle::usage_seen`]): usage credits carrying it and the vendor's warning that a
     /// window fills, handed to `accounts::record_usage` with its process's facts and the
@@ -5208,6 +5228,15 @@ impl IdleHost for WorkerIdle {
             .evidence(&self.sid, Instant::now())
     }
 
+    /// The machine as the occupancy facts board last judged it for this
+    /// session ([`Acts::occupancy`], live
+    /// [`crate::occupancy_host::reading_for`]): a copy of what the disk look
+    /// already took, under one leaf lock; it reads no process and changes
+    /// nothing.
+    fn occupancy(&self) -> aterm_agent::supervise::occupancy::OccupancyReading {
+        (self.hooks.acts.occupancy)(&self.sid)
+    }
+
     /// A supervisor's information for a person (Codex's save-then-wait hold
     /// among them): a record in the window's Messages, no row, no badge.
     fn inform(&self, text: &str) {
@@ -6152,8 +6181,8 @@ impl IdleHost for WorkerIdle {
     }
 
     /// WHY LAND STILL HOLDS ([`IdleHost::land_held`],
-    /// `docs/DESIGN-harness-autopilot-2026-10-15.md` §12.3.3 item 3, slice
-    /// 3c): the hold the loop tells where it moved — its `since`, its nudges
+    /// `docs/DESIGN-harness-autopilot-2026-10-15.md` §12.3.3 item 3):
+    /// the hold the loop tells where it moved — its `since`, its nudges
     /// and, after a land act's yield that did not land, what held it — or
     /// `None` where none stands. Stored on the session's timeline here and
     /// now ([`Hooks::hold`]), where `status` reads it; then, where it moved,
@@ -9647,8 +9676,8 @@ fn on_agent_left(job: &WorkerJob, hooks: &Hooks) {
              keystroke before it asked for the restart, not the exit"
         );
     }
-    // AN EXIT WHOSE PROGRAM STILL RUNS IS NOBODY'S YET (rulings 15 and 17,
-    // review of 1a733ed60): the act's stamped program stopped from elsewhere
+    // AN EXIT WHOSE PROGRAM STILL RUNS IS NOBODY'S YET (rulings 15 and 17):
+    // the act's stamped program stopped from elsewhere
     // inside its grace — or put in the background — reads as an exit here
     // (its shell takes the terminal back), but its end is still to come: its
     // watch ends it once it leads again and no other hand holds the tab
@@ -9874,7 +9903,7 @@ fn on_agent_left(job: &WorkerJob, hooks: &Hooks) {
     );
     keep_exit_read(job, hooks, &mut snap, &left);
     // An exit the relaunch is decided on already — a crash, a stall's remedy
-    // — is OWED through the back-off: a handoff carries it (round six, F13).
+    // — is OWED through the back-off: a handoff carries it.
     // A crash by the rule the relaunch reads ([`relaunch::ExitRecord::crashed`]):
     // a Claude Code's surviving record (a Codex never reaches here).
     if asked.is_some() || left.crashed() {
@@ -10432,8 +10461,8 @@ fn relaunch_until_with(
                         &|| job.left.is(Word::Left),
                     );
                 let read = !relaunches(job.agent) || fresh;
-                // LANDED AND GONE AGAIN (round two of the joint audit of
-                // 2026-10-01): the agent this line started — the host read
+                // LANDED AND GONE AGAIN:
+                // the agent this line started — the host read
                 // it back in the tab ([`Worker::back`]), or a Commit's stop
                 // came — is gone before this worker could read it. Nothing
                 // describes it to a worker the host would hand its exit: the
@@ -10445,12 +10474,12 @@ fn relaunch_until_with(
                 // still this relaunch's, decided as one back and gone again
                 // in the wait above: tried again on the record read at the
                 // exit, or owed through the Commit. So is one no pass named
-                // before it ended ([`Word::Left`], round three): read by no
+                // before it ended ([`Word::Left`]): read by no
                 // pass and no read here, it was nobody's to watch, and
                 // ending here left the tab at its shell with nothing said.
                 // One alive and named meanwhile ends the pause, read back
                 // ([`Worker::back`]).
-                // NOT A RESTART'S CARRY (the review of 6c7df720f, 2026-10-02): no
+                // NOT A RESTART'S CARRY: no
                 // carry types a relaunch line twice, so a try again held the
                 // harness's hand on the tab for the dead process 90 s at a time
                 // until its record went stale, then said it could never come back
@@ -10693,8 +10722,8 @@ fn revoke_kept(kept: &mut Kept, switches: &Switches) {
 /// an agent running at its stop to the host (round thirteen), and a host
 /// supervising again after a failed Commit hands it. Not after a stop for
 /// good. An agent the landing started and nothing read, gone already, is
-/// not here: its exit is still the relaunch's ([`gone_again`], round two),
-/// read back by a pass or not (round three). A restart's carry is the
+/// not here: its exit is still the relaunch's ([`gone_again`]),
+/// read back by a pass or not. A restart's carry is the
 /// exception: it is never tried again, so its landing comes here with that
 /// agent gone, and nothing here relaunches it ([`relaunch_until`], THE
 /// RESIDUAL, STATED).
@@ -11217,10 +11246,10 @@ fn failing_reason(step: &str) -> &'static str {
 /// keyed attention (200 bytes), what gives way, in order: every carried flag
 /// that sets no permission mode ([`resume::mode_of`]), the reason, and last
 /// the permission mode itself (the bare line, [`resume::bare_of`]) — the last
-/// flag a line gives up (round three of the joint audit of 2026-10-01: an
+/// flag a line gives up (an
 /// orchestrator told a bare line comes back in another permission mode) —
 /// then the head itself (`agent not back`). Every form keeps the Claude home
-/// in front of the command (LC-4 of ). `None` where not even
+/// in front of the command (LC-4 of). `None` where not even
 /// that fits — a command told under a very long `HOME`: the ask is whole or
 /// it is no mark, the digest's line then, and the log keeps the command.
 fn mark_text(head: &str, reason: &str, ask: &str, command: &str, place: &str) -> Option<String> {
@@ -11709,7 +11738,7 @@ impl Drop for Workers {
 /// margin; one step misses a loop whose last renewal fell just short of its
 /// step before the Commit.)
 ///
-/// IT DELAYS THE CLAIM, NOT THE WATCH (round eight of the update audit,
+/// IT DELAYS THE CLAIM, NOT THE WATCH (
 /// #501): the session's worker starts at once and WATCHES the grace
 /// ([`WorkerJob::watch_until`]) — it reads what a relaunch of the agent
 /// needs and is handed the agent's exit, which it decides as every worker
@@ -11771,6 +11800,8 @@ struct State {
     /// waiting out its restart's back-off acts on at once ([`Self::news`]).
     resumes: u64,
     shutting_down: bool,
+    /// The activation thread's initial start, retained until the OS accepts it.
+    activation: ActivationStart,
     /// The adopted sessions held off for their claim grace
     /// ([`ADOPTED_CLAIM_GRACE`]).
     claim_grace: ClaimGrace,
@@ -12276,7 +12307,9 @@ impl HostHandle {
 
     fn ensure_thread(&self) {
         let state = self.shared.lock();
-        if !Shared::active(&state, self.shared.headless) || state.shutting_down {
+        if (!Shared::active(&state, self.shared.headless) && state.activation.next().is_none())
+            || state.shutting_down
+        {
             return;
         }
         drop(state);
@@ -13079,8 +13112,8 @@ impl HostHandle {
                     .or_default(),
             );
             // A HANDED AGENT STILL RAN AT THE COMMIT: the snapshot KEPT for
-            // its exit carries no validated line (the review of 2026-10-16,
-            // finding 1). The line its leaf carries is the outgoing
+            // its exit carries no validated line (the review of 2026-10-16).
+            // The line its leaf carries is the outgoing
             // instance's copy's, and that copy decided nothing of an end
             // read here: kept, an exit read before the agent re-proves its
             // claim — an orderly one included — went to the crash rule's
@@ -13160,7 +13193,13 @@ impl HostHandle {
             }
         }
         self.shared.restored_wake.notify_all();
-        self.shared.lock().shutting_down = true;
+        let activation = {
+            let mut state = self.shared.lock();
+            state.shutting_down = true;
+            std::mem::take(&mut state.activation)
+        };
+        // An injected arming closure may own handles whose drop re-enters the host.
+        drop(activation);
         self.shared.net.stop();
         ring();
         if let Some(wake) = self.shared.wake.get() {
@@ -13570,8 +13609,8 @@ fn restored_step(shared: &Shared, hooks: &Hooks, taken: &RestoredTaken, relaunch
     // AUTOPILOT OFF in the tab since it was queued: over, no step, no
     // row — and the word a relaunch raised on the tab ("still trying",
     // a predecessor's carried here) is cleared, as a stop clears an Off
-    // session's badges ([`cleanup_request`]): no worker of its own will
-    // (the review of 345c41647). Asked FIRST, before whether an agent ran
+    // session's badges ([`cleanup_request`]): no worker of its own will.
+    // Asked FIRST, before whether an agent ran
     // there: that branch leaves the attention to the agent's worker,
     // which an Off session never gets.
     if restored_off(shared, hooks, agent) {
@@ -13951,8 +13990,8 @@ fn restored_queue_panicked(shared: &Shared, badge: &BadgeFn) -> Vec<RestoredMiss
 
 /// A RESTORED ATTEMPT IS OVER, `last` its last step's outcome (`step` its
 /// word): the relaunch is over, landed or not, so a word a relaunch on exit
-/// raised on the tab before a handoff carried it here ("still trying",
-/// round six F13) is no longer true — said without the queue's lock — and
+/// raised on the tab before a handoff carried it here ("still trying")
+/// is no longer true — said without the queue's lock — and
 /// one that did not land is said missed where its agent resumes a
 /// conversation ([`say_restored`]): the miss it returns, which its
 /// caller adds under the queue's lock, taken again after this. Called
@@ -14392,7 +14431,7 @@ fn say_restored(shared: &Shared, runs: &StillFn, mut missed: Vec<RestoredMiss>) 
 /// cannot be made (`Cannot`: the tab's shell gone, no state to act on) is
 /// said in the restored agents' one row ([`say_restored`]).
 ///
-/// LANDS, OR IS SAID (round six, F51): a tab whose last step still waited
+/// LANDS, OR IS SAID: a tab whose last step still waited
 /// when the bound ran out — a person at the returned prompt, a hold — is said
 /// in that row too, with what it waited on. The bound is the record's own
 /// expiry ([`relaunch::STALE_S`]) plus two of the longest pauses, so the step
@@ -15039,6 +15078,7 @@ fn host_pass(
         end_exit_watches(shared, EVERY_WATCH, |_| true);
         return ControlFlow::Break(());
     }
+    let activation_at = try_activation_start(shared, hooks, now);
     // The watches armed before the roster is read: a pass ends no other
     // ([`end_exit_watches`]).
     let armed_before = EXIT_WATCH_ARMINGS.load(Ordering::SeqCst);
@@ -15275,7 +15315,14 @@ fn host_pass(
     // A tab's stage that panicked is asked again at its rung ([`tab_caught`]).
     let fault_at = host_faults_due(shared, Instant::now());
     host.timer_at = [
-        next_look, hold_look, view_at, watch_at, disk_at, startup_at, fault_at,
+        next_look,
+        hold_look,
+        view_at,
+        watch_at,
+        disk_at,
+        startup_at,
+        fault_at,
+        activation_at,
     ]
     .into_iter()
     .flatten()
@@ -15364,8 +15411,8 @@ fn disk_roster(
 /// NO session, and then a pass reclaims only aterm's own Rust build cache
 /// ([`disk_look`]). The instant to look again.
 ///
-/// AN OFF SESSION IS NOT THE WATCH'S ([`OffSessions`]; the review of
-/// 345c41647): the harness keeps its hands off it, so its working directory
+/// AN OFF SESSION IS NOT THE WATCH'S ([`OffSessions`]):
+/// the harness keeps its hands off it, so its working directory
 /// and its agent are never handed over — a look below the floor reclaims
 /// build caches in the working directories it is handed. With supervision
 /// off no session is handed at all.
@@ -17200,8 +17247,8 @@ fn visit_workers(
             // The agent is back (relaunched, or started by someone): the exit is
             // over, and the agent the host's until its own worker starts. A
             // worker under an older policy hands over — a worker no stop reached
-            // yet, as the model's `HandOver` has it (round three of the joint
-            // audit of 2026-10-01): a hand-over is a stop for a successor
+            // yet, as the model's `HandOver` has it:
+            // a hand-over is a stop for a successor
             // (once, as a stop above), and a worker stopped already needs none.
             // One handed its exit ([`Worker::leave`] set its stop) only finishes
             // deciding it, its successor started at the pass that finds the
@@ -18243,6 +18290,19 @@ fn words_of(store: &Store) -> HashMap<String, Autopilot> {
         .collect()
 }
 
+/// The supervised sessions `sids` as the occupancy board keys them: each
+/// live one's process-local id (its tab's key in the vitals readings) and its
+/// session id. The store's lock is held only for the lookups.
+fn board_sessions(store: &Store, sids: &[String]) -> Vec<(u64, String)> {
+    let guard = store.read().unwrap_or_else(PoisonError::into_inner);
+    sids.iter()
+        .filter_map(|sid| {
+            let h = guard.by_sid(&aterm_session::SessionId::new(sid))?;
+            Some((h.local_id, sid.clone()))
+        })
+        .collect()
+}
+
 /// The process group `sid`'s program is published for (`None`: no such
 /// session, or none resolved yet).
 fn foreground_of(store: &Store, sid: &str) -> Option<i64> {
@@ -18518,6 +18578,8 @@ fn live_acts(store: Store, sock: String) -> Acts {
     let exit_home = home.clone();
     let limit_home = home.clone();
     let account_home = home.clone();
+    let upkeep: UpkeepFn = Arc::new(maintain_accounts_live);
+    let wall_upkeep = Arc::clone(&upkeep);
     let usage_home = home.clone();
     let seat_home = home.clone();
     let cold_home = home.clone();
@@ -18646,6 +18708,7 @@ fn live_acts(store: Store, sock: String) -> Acts {
         disk_board: &crate::disk_board::SHELF,
         jobs_board: &crate::vitals_jobs::BOARD,
         program_check: &crate::program_check_watch::BOARD,
+        occupancy: Arc::new(crate::occupancy_host::reading_for),
         resume: Arc::new(move |sid, grace, carry| {
             let Some(o) = o7(sid, grace) else {
                 return "refused:no-home".to_string();
@@ -18913,8 +18976,9 @@ fn live_acts(store: Store, sock: String) -> Acts {
             relaunch::standing_limit(&standing_opts(sid, 0)?, snap, &tail)
         }),
         account_wall: Arc::new(move |sid, agent, settled| {
-            account_wall_live(account_home.as_deref(), sid, agent, settled)
+            account_wall_live(account_home.as_deref(), sid, agent, settled, &*wall_upkeep)
         }),
+        accounts_upkeep: upkeep,
         account_usage: Arc::new(move |sid, agent, settled, seen, listed| {
             account_usage_live(usage_home.as_deref(), sid, agent, settled, seen, listed)
         }),
@@ -18965,12 +19029,15 @@ fn live_acts(store: Store, sock: String) -> Acts {
 /// ([`account_wall_at`]) under the home Claude's records live in, the harness state root and
 /// the roster beside the window's `aterm.toml`, on this machine's clock. Without one of them,
 /// a word and nothing more (`no-home`, `no-state`, `no-clock`). Writes the accounts state
-/// alone.
+/// alone, then makes the accounts' `upkeep` ([`Acts::accounts_upkeep`]), so a wall just
+/// recorded is renewed at once where this machine's person configured a fleet source, and
+/// nothing more is done where none is.
 fn account_wall_live(
     home: Option<&Path>,
     sid: &str,
     agent: &WalledAgent<'_>,
     settled: &dyn Fn() -> bool,
+    upkeep: &(dyn Fn() + Send + Sync),
 ) -> (&'static str, Option<String>) {
     let Some(home) = home else {
         return ("no-home", None);
@@ -18982,23 +19049,8 @@ fn account_wall_live(
         return ("no-clock", None);
     };
     let roster = accounts::default_roster_path();
-    if let Some(roster_path) = roster.as_deref() {
-        let _ = aterm_agent::harness::accounts_sync::sync_if_missing_live(
-            home,
-            &state,
-            roster_path,
-            now,
-        );
-    }
     let res = account_wall_at((home, &state, roster.as_deref()), sid, agent, settled, now);
-    if let Some(roster_path) = roster.as_deref() {
-        aterm_agent::harness::accounts_sync::auto_renew_next_account(
-            home,
-            &state,
-            roster_path,
-            now,
-        );
-    }
+    upkeep();
     res
 }
 
@@ -20788,16 +20840,17 @@ fn live_disk(store: Store, note: Arc<NoteFn>) -> Arc<DiskFn> {
     let run: Arc<DiskLookFn> = Arc::new(move |sids, cwds, agents, seen, note| {
         disk_look(sids, cwds, agents, seen, &now_store, note);
     });
+    let board_store = Arc::clone(&store);
     let watch = disk_watch(store, note, &LOOKING, run);
     let look: Arc<DiskFn> = Arc::new(move |sids: &[String]| {
         *DISK_SIDS.lock().unwrap_or_else(PoisonError::into_inner) = sids.to_vec();
-        // The occupancy board is taken at each look (its slice 0: stored and
-        // logged, nothing decided): the product's hook alone, so no test's
-        // look reaches it.
+        // The occupancy board is taken and judged at each look, for the
+        // sessions this look supervises (nothing decided or typed here): the
+        // product's hook alone, so no test's look reaches it.
         let unix_ms = aterm_time::unix_millis()
             .and_then(|ms| i64::try_from(ms).ok())
             .unwrap_or(0);
-        crate::occupancy_host::look(unix_ms);
+        crate::occupancy_host::look(unix_ms, &board_sessions(&board_store, sids));
         watch(sids);
     });
     // A POKE ([`aterm_agent::harness::disk::poke`]): whatever in this process
@@ -23389,13 +23442,18 @@ fn agent_landing_told(host: HostHandle, agent: Program) -> Box<dyn FnMut() + Sen
     })
 }
 
-/// THE ACCOUNTS' UPKEEP: the roster synced where it is missing
-/// (`accounts_sync::sync_if_missing_live`: a fetch over the network, each
-/// source bounded at 20 s, a machine id read, then the store's lock, which
-/// nothing bounds) and a renewal started where a login is walled
-/// (`accounts_sync::auto_renew_next_account`). Made on a thread of its own
-/// ([`Upkeep`]), never on the activation thread.
+/// THE ACCOUNTS' UPKEEP, LIVE ([`live_acts`]'s [`Acts::accounts_upkeep`]):
+/// `accounts_sync::upkeep_live`, which does nothing past reading aterm.toml
+/// where this machine's person named no fleet accounts source (`[fleet]
+/// accounts_source`, or the `fleet-accounts.toml` a sync with a source left),
+/// and with one syncs a missing roster (each source bounded at 20 s, then the
+/// store's lock) and starts a walled login's successor's sign-in.
+/// Made on a thread of its own ([`Upkeep`]) and after a wall, never on the
+/// activation thread. What it found is logged once each time it changes,
+/// never the source itself (a link may carry a secret).
 fn maintain_accounts_live() {
+    use aterm_agent::harness::accounts_sync::{Upkept, upkeep_live};
+    static SAID: Mutex<Option<Upkept>> = Mutex::new(None);
     let Some(home) = aterm_primer::home_dir() else {
         return;
     };
@@ -23408,11 +23466,31 @@ fn maintain_accounts_live() {
     let Some(now) = aterm_time::unix_secs().and_then(|now| i64::try_from(now).ok()) else {
         return;
     };
-    let _ = aterm_agent::harness::accounts_sync::sync_if_missing_live(&home, &state, &roster, now);
-    aterm_agent::harness::accounts_sync::auto_renew_next_account(&home, &state, &roster, now);
+    let upkept = upkeep_live(&home, &state, &roster, now);
+    let mut said = SAID
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if *said == Some(upkept) {
+        return;
+    }
+    *said = Some(upkept);
+    match upkept {
+        Upkept::Unconfigured => aterm_log::info!(
+            "harness: accounts-upkeep=unconfigured: no fleet accounts source is configured \
+             (`[fleet] accounts_source`), so no roster is fetched and no sign-in is started"
+        ),
+        Upkept::Configured {
+            kind,
+            roster,
+            renewal,
+        } => aterm_log::info!(
+            "harness: accounts-upkeep=configured source={kind} roster={roster} renewal={renewal}"
+        ),
+    }
 }
 
-/// One upkeep of the accounts ([`maintain_accounts_live`] in production).
+/// One upkeep of the accounts ([`Acts::accounts_upkeep`]; [`maintain_accounts_live`] in
+/// production).
 type UpkeepFn = Arc<dyn Fn() + Send + Sync>;
 
 /// THE ACCOUNTS' UPKEEP ON A THREAD OF ITS OWN, kicked by the activation
@@ -23532,18 +23610,136 @@ fn spawn_activation_wake(host: HostHandle) {
     spawn_activation_wake_with(host, |host| {
         let mut wake = activation_wake(host);
         let trigger = wake.trigger();
-        let wait = upkept(
-            host,
-            move || wake.wait(WAKE_FALLBACK),
-            Arc::new(maintain_accounts_live),
-        );
-        (Some(trigger), wait)
+        (
+            Some(trigger),
+            host_upkept(host, move || wake.wait(WAKE_FALLBACK)),
+        )
     });
+}
+
+/// The activation thread's `wait` with the HOST'S OWN accounts' upkeep beside
+/// it ([`upkept`] over [`Acts::accounts_upkeep`]): the live one where the
+/// host's acts are [`live_acts`], which does nothing where no fleet accounts
+/// source is configured, and nothing at all for a host built on
+/// [`Acts::inert`].
+fn host_upkept(
+    host: &HostHandle,
+    wait: impl FnMut() -> bool + Send + 'static,
+) -> Box<dyn FnMut() -> bool + Send> {
+    upkept(host, wait, Arc::clone(&host.hooks.acts.accounts_upkeep))
 }
 
 /// What [`spawn_activation_wake_with`]'s thread runs on: the wake's trigger
 /// (set on the host before the loop's first look) and its parked wait.
 type ArmedWake = (Option<WakeTrigger>, Box<dyn FnMut() -> bool + Send>);
+
+type ActivationArm = Box<dyn FnOnce(&HostHandle) -> ArmedWake + Send>;
+type ActivationTask = Box<dyn FnOnce() + Send>;
+type ActivationSpawn = Arc<dyn Fn(ActivationTask) -> std::io::Result<()> + Send + Sync>;
+
+/// A failed spawn must not consume the one-shot arming closure. The wrapper handed to the
+/// OS takes it only after the thread actually starts. The host's existing timer retries a
+/// refused spawn, without doing the arming's filesystem or account work on its caller.
+struct PendingActivation {
+    at: Instant,
+    arm: Arc<Mutex<Option<ActivationArm>>>,
+    spawn: ActivationSpawn,
+    thread: std::sync::Weak<Mutex<Option<JoinHandle<()>>>>,
+}
+
+#[derive(Default)]
+enum ActivationStart {
+    #[default]
+    Absent,
+    Pending(PendingActivation),
+    Starting,
+    Started,
+}
+
+impl ActivationStart {
+    fn next(&self) -> Option<Instant> {
+        match self {
+            Self::Pending(pending) => Some(pending.at),
+            _ => None,
+        }
+    }
+}
+
+/// One due start, claimed under the host lock and attempted after releasing it. A healthy
+/// worker owns Started permanently; only an OS refusal returns its still-unrun arm to the
+/// timer. Shutdown cancels the pending start, including a refusal racing that cancellation.
+fn try_activation_start(shared: &Arc<Shared>, hooks: &Hooks, now: Instant) -> Option<Instant> {
+    let mut pending = {
+        let mut state = shared.lock();
+        if state.shutting_down {
+            return None;
+        }
+        let at = state.activation.next()?;
+        if at > now {
+            return Some(at);
+        }
+        let ActivationStart::Pending(pending) =
+            std::mem::replace(&mut state.activation, ActivationStart::Starting)
+        else {
+            unreachable!("only a pending activation has a deadline")
+        };
+        pending
+    };
+    let Some(thread) = pending.thread.upgrade() else {
+        shared.lock().activation = ActivationStart::Absent;
+        return None;
+    };
+    let host = HostHandle {
+        shared: Arc::clone(shared),
+        thread,
+        hooks: hooks.clone(),
+    };
+    let arm = Arc::clone(&pending.arm);
+    let spawned = (pending.spawn)(Box::new(move || {
+        if host.shared.lock().shutting_down {
+            return;
+        }
+        let arm = arm.lock().unwrap_or_else(PoisonError::into_inner).take();
+        let Some(arm) = arm else { return };
+        let (trigger, wait) = arm(&host);
+        if let Some(trigger) = trigger {
+            // Publish before the shutdown check: a concurrent shutdown either pulls this
+            // trigger or is observed below, so the first wait cannot strand the worker.
+            let _ = host.shared.wake.set(trigger);
+        }
+        if host.shared.lock().shutting_down {
+            return;
+        }
+        aterm_log::info!(
+            "harness: the activation wake is armed; every session supervised before it \
+             looks at its next idle point"
+        );
+        host.note_activation();
+        activation_loop(&host, wait);
+    }));
+    let mut state = shared.lock();
+    if state.shutting_down {
+        drop(state);
+        return None;
+    }
+    match spawned {
+        Ok(()) => {
+            state.activation = ActivationStart::Started;
+            None
+        }
+        Err(e) => {
+            pending.at = now + WAKE_FALLBACK;
+            let at = pending.at;
+            state.activation = ActivationStart::Pending(pending);
+            drop(state);
+            aterm_log::warn!(
+                "harness: the activation wake could not start: {e}; its start is retried \
+                 at the host's next activation deadline"
+            );
+            Some(at)
+        }
+    }
+}
 
 /// [`spawn_activation_wake`] with the wake's arming injected, so a test sees
 /// which thread arms it.
@@ -23559,26 +23755,39 @@ fn spawn_activation_wake_with(
     host: HostHandle,
     arm: impl FnOnce(&HostHandle) -> ArmedWake + Send + 'static,
 ) {
-    let spawned = std::thread::Builder::new()
-        .name(format!("{THREAD_PREFIX}activation"))
-        .spawn(move || {
-            let (trigger, wait) = arm(&host);
-            if let Some(trigger) = trigger {
-                let _ = host.shared.wake.set(trigger);
-            }
-            aterm_log::info!(
-                "harness: the activation wake is armed; every session supervised before it \
-                 looks at its next idle point"
-            );
-            host.note_activation();
-            activation_loop(&host, wait);
+    spawn_activation_wake_on(
+        host,
+        arm,
+        Arc::new(|task| {
+            std::thread::Builder::new()
+                .name(format!("{THREAD_PREFIX}activation"))
+                .spawn(task)
+                .map(|_| ())
+        }),
+    );
+}
+
+/// The shipping start with its OS spawn injected for the existing activation aggregate.
+fn spawn_activation_wake_on(
+    host: HostHandle,
+    arm: impl FnOnce(&HostHandle) -> ArmedWake + Send + 'static,
+    spawn: ActivationSpawn,
+) {
+    {
+        let mut state = host.shared.lock();
+        if state.shutting_down || !matches!(state.activation, ActivationStart::Absent) {
+            return;
+        }
+        state.activation = ActivationStart::Pending(PendingActivation {
+            at: Instant::now(),
+            arm: Arc::new(Mutex::new(Some(Box::new(arm)))),
+            spawn,
+            thread: Arc::downgrade(&host.thread),
         });
-    if let Err(e) = spawned {
-        aterm_log::warn!(
-            "harness: the activation wake could not start: {e}; sessions are looked at for an \
-             upgrade only when their supervisor attaches"
-        );
     }
+    let _ = try_activation_start(&host.shared, &host.hooks, Instant::now());
+    host.ensure_thread();
+    ring();
 }
 
 /// The activation wake at atpkg's markers and the native link as they stand
@@ -23737,7 +23946,7 @@ pub(crate) fn store_needs(store: &Store, sid: &str, needs: &[String], entry: &st
 }
 
 /// [`Hooks::hold`], live (`docs/DESIGN-harness-autopilot-2026-10-15.md`
-/// §12.3.3 item 3, slice 3c): tab `sid`'s Land hold as its loop told it,
+/// §12.3.3 item 3): tab `sid`'s Land hold as its loop told it,
 /// stored on its timeline
 /// ([`crate::session_timeline::SessionTimeline::set_land_held`]). The
 /// store's read lock is taken to find the tab and let go, then the
@@ -23783,7 +23992,7 @@ pub(crate) fn log_usage(store: &Store, sid: &str, h5: Option<u32>, d7: Option<u3
     g.slog_take_wake();
 }
 
-/// THE LIVE ACTS' ONE ROW WRITER (session log plan 5F-2): each relaunch or
+/// THE LIVE ACTS' ONE ROW WRITER: each relaunch or
 /// upgrade row ([`upgrade_drive::Report::line_as`] under its name, in
 /// `aterm.log`), then the session log's act mark beside it ([`log_act`]).
 /// Every row [`live_acts`] writes goes through it, so no row of the hosted
@@ -23795,8 +24004,8 @@ fn live_row(store: Store) -> Arc<RowFn> {
     })
 }
 
-/// THE HOSTED LANES SAY THEY RELAUNCHED (session log plan 5F-2, rulings T25
-/// and T28): beside one relaunch or upgrade row of the live acts (`kind` its
+/// THE HOSTED LANES SAY THEY RELAUNCHED:
+/// beside one relaunch or upgrade row of the live acts (`kind` its
 /// name, `step` its step), tab `sid`'s `mark - act word=relaunch rule=<kind>`
 /// (`by=harness src=aterm conf=strong`) when the step moved the session
 /// ([`aterm_agent::harness::acts::relaunch_act`]); nothing for a row that
@@ -23804,8 +24013,8 @@ fn live_row(store: Store) -> Arc<RowFn> {
 /// up ([`upgrade_drive::started`]: never a turn typed into the running
 /// agent, a stop or a wait), the restart lifts the failure it caused
 /// (`mark - seen by=harness`, only when that failure is the session's only
-/// one, an agent ran under its run, and the relaunched run is open: Phase 6
-/// step 6C-1, `SessionLog::harness_saw_failure`). As [`log_usage`]: the store
+/// one, an agent ran under its run, and the relaunched run is open:
+/// `SessionLog::harness_saw_failure`). As [`log_usage`]: the store
 /// read to find the tab and let go, the marks written under the timeline
 /// alone, whose owed wake rings the tab's watchers under it. A tab gone
 /// writes nothing. The transport is
@@ -23907,6 +24116,8 @@ impl Acts {
                     Mutex::new(crate::program_check_watch::Board::new());
                 &INERT
             },
+            // No look taken: every session's reading the empty one.
+            occupancy: Arc::new(|_| aterm_agent::supervise::occupancy::OccupancyReading::default()),
             snapshot: Arc::new(|_| None),
             follow: Arc::new(|_, _| Foreground::Shell),
             status: Arc::new(|_| None),
@@ -23938,6 +24149,7 @@ impl Acts {
             startup_mark: Arc::new(|_, _| {}),
             standing_limit: Arc::new(|_, _| None),
             account_wall: Arc::new(|_, _, _| ("inert", None)),
+            accounts_upkeep: Arc::new(|| {}),
             account_usage: Arc::new(|_, _, _, _, _| "inert"),
             account_gone: Arc::new(|_| {}),
             account_seat: Arc::new(|| None),

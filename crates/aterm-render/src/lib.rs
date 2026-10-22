@@ -35702,7 +35702,8 @@ mod tests {
             (&parted_own, "in its own cell")
         };
         for icon in BandIcon::ALL {
-            if !matches!(icon, BandIcon::Sparkle) {
+            // A filled star or disc has no stroke for a bold cell to weigh.
+            if !matches!(icon, BandIcon::Sparkle | BandIcon::Disc) {
                 assert!(
                     parted.contains(&format!("{icon:?}")),
                     "{icon:?}: a bold cell drew it at the regular stem at every size, {layout}"
@@ -35837,6 +35838,58 @@ mod tests {
                     assert!(
                         y1 <= baseline,
                         "{at}: ink at row {y1} below the baseline {baseline}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// THE HARNESS SWITCH'S MARKS AT 1× (`BandIcon::switch_mark`): on the system face at
+    /// 12 px, where macOS's SF Mono drew `●` 8 × 9 and its fallback's `◐` 5 × 5, and at 2×,
+    /// regular and bold, spilled between blanks as the switch lays them and in a cell of
+    /// their own, the drawn `●`, `○` and `◐` measure one ink box. NEGATIVE CONTROL: a disc
+    /// sized from another face's capitals (two pixels shorter) measures another box.
+    #[test]
+    fn the_switch_marks_measure_one_box_at_1x_and_2x() {
+        let ink_box = |w: usize, bytes: &[u8]| {
+            let h = bytes.len() / w;
+            let inked = |x: usize, y: usize| bytes[y * w + x] > 0;
+            let xs: Vec<usize> = (0..w).filter(|&x| (0..h).any(|y| inked(x, y))).collect();
+            let ys: Vec<usize> = (0..h).filter(|&y| (0..w).any(|x| inked(x, y))).collect();
+            (xs[0], xs[xs.len() - 1], ys[0], ys[ys.len() - 1])
+        };
+        for px in [12.0f32, 24.0] {
+            let mut r = Renderer::from_system(px, Theme::default()).expect(NO_FONT);
+            let (cw, ch) = r.cell_size();
+            for (style, bold) in [(StyleBits::REGULAR, false), (StyleBits::BOLD, true)] {
+                for spill in [true, false] {
+                    let at = format!("{px} px ({cw}x{ch}) {style:?} spill {spill}");
+                    let boxes: Vec<_> = [BandIcon::Disc, BandIcon::Ring, BandIcon::HalfDisc]
+                        .into_iter()
+                        .map(|icon| {
+                            let key = band_icon_key(icon, style, spill, r.px_q);
+                            let GlyphImage::Mono { width, bytes, .. } = r.glyph_image(key) else {
+                                panic!("{at}: {icon:?} is a Mono raster");
+                            };
+                            ink_box(*width, bytes)
+                        })
+                        .collect();
+                    assert!(
+                        boxes.iter().all(|b| *b == boxes[0]),
+                        "{at}: ● ○ ◐ measure {boxes:?}"
+                    );
+                    let m = r.icon_metrics(bold);
+                    let w = procedural::band_icon_width(cw, spill);
+                    let other = procedural::IconMetrics {
+                        cap: m.cap - 2.0,
+                        ..m
+                    };
+                    let control =
+                        procedural::band_icon_coverage(BandIcon::Disc, cw, ch, other, spill);
+                    assert_ne!(
+                        ink_box(w, &control),
+                        boxes[0],
+                        "{at}: control, a disc off another face's capitals"
                     );
                 }
             }

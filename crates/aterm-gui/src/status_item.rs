@@ -274,7 +274,7 @@ pub(crate) struct SessionRow {
     /// tab.
     pub landed: bool,
     /// It is LANDING (`docs/DESIGN-harness-autopilot-2026-10-15.md` §12.4.3
-    /// item 1, slice 3c): its Autopilot is Land, its chip wears `⤓ land`
+    /// item 1): its Autopilot is Land, its chip wears `⤓ land`
     /// (the task open or unknown), and a hold stands — Land's instruction
     /// has been typed to it (`App::shown_hold`). A worker's row then says
     /// `landing`, not `working`; before the instruction (a worker on its
@@ -1361,7 +1361,7 @@ fn herald_key_words(kind: EscalationKind, key: u64) -> String {
 )]
 pub(crate) const NEEDS_SHOWN: usize = 10;
 /// The most rows one level in a session's further needs get under its own
-/// row (§12.2.1, slice 2d); the needs past them are counted on that row as
+/// row (§12.2.1); the needs past them are counted on that row as
 /// ` (+N more)`.
 #[cfg_attr(
     all(not(target_os = "macos"), not(test)),
@@ -2510,8 +2510,8 @@ fn need_line(row: &NeedRow, now_unix: i64, shown: usize) -> String {
     fold_clip(&line, LINE_MAX)
 }
 
-/// A SESSION'S FURTHER NEEDS, ONE ROW EACH (Autopilot v5 §12.2.1, slice
-/// 2d): under the session's own row, one level in and with no mark, each
+/// A SESSION'S FURTHER NEEDS, ONE ROW EACH (Autopilot v5 §12.2.1):
+/// under the session's own row, one level in and with no mark, each
 /// need the worker named after its first, whole up to [`LINE_MAX`] bytes;
 /// a click on any of them is the session's `go`, as on its own row. At
 /// most [`NEED_MORE_ROWS`] a session and, across the section, the `left`
@@ -7661,8 +7661,8 @@ mod tests {
         assert_ne!(shown_key(&a), shown_key(&b));
     }
 
-    /// The facts of a session whose loop told the window `needs` whole
-    /// (slice 2c's store), beside the needs owner's entry it put up for them
+    /// The facts of a session whose loop told the window `needs` whole,
+    /// beside the needs owner's entry it put up for them
     /// in its writer's form: the first need (short enough here to stand
     /// whole), then ` (+N more)`.
     fn told_facts(needs: &[&str]) -> NeedFacts {
@@ -7741,7 +7741,7 @@ mod tests {
     }
 
     /// EVERY FURTHER NEED READS ON A ROW OF ITS OWN, CAPPED (Autopilot v5
-    /// §12.2.1, §12.2.6; slice 2d): under each session's row, one row one
+    /// §12.2.1, §12.2.6): under each session's row, one row one
     /// level in per need after its first. Sessions of 1, 3 and 5 needs get
     /// 0, 2 and 2 such rows, the third's last such row counting the 2 past
     /// them (` (+2 more)`) and no session's own row counting any, and no
@@ -8135,7 +8135,7 @@ mod tests {
         assert_eq!(tips, ["Claude Code needs this too"]);
     }
 
-    /// A TOLD NEED READS WHOLE WHERE THERE IS ROOM (§12.2.1, slice 2d): need
+    /// A TOLD NEED READS WHOLE WHERE THERE IS ROOM (§12.2.1): need
     /// (a), longer than the 64 cells its entry carries, and need (b) told
     /// with that entry: the banner's body says (a) whole and ` (+1 more)`;
     /// the session's row clips (a) to the room its label and age leave,

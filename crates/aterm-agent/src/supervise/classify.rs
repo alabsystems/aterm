@@ -1876,10 +1876,11 @@ fn danger_scan(segments: &[Vec<String>]) -> Option<String> {
             }
             if prog == "sort" || prog == "tree" {
                 // `sort -o FILE` / `--output=FILE`, `tree -o FILE`: an output
-                // file. Neither has another short flag with an `o` in it.
+                // file. Neither has another short flag with an `o` in it, and
+                // sort takes any prefix of `--output` for it
+                // ([`long_option_spells`]).
                 for t in &seg[i + 1..] {
-                    if t == "--output"
-                        || t.starts_with("--output=")
+                    if long_option_spells(t, "output")
                         || (t.starts_with('-') && !t.starts_with("--") && t[1..].contains('o'))
                     {
                         return Some(format!("{prog} -o"));
@@ -2172,6 +2173,20 @@ fn expands_apart(t: &str) -> bool {
     t.contains('{') || t.contains(GLOB_CHARS) || t.chars().skip(1).any(|c| c == '~')
 }
 
+/// Whether `t` spells the long option `--{name}` as `getopt_long` (macOS
+/// `sort` 2.3-Apple, GNU tools) and git's option parser read one: the whole
+/// name or any prefix of it, bare or with `=value` (`--o`, `--outp=f`,
+/// `--compress`). MEASURED 2026-10-22: `sort --o=f` wrote `f`, an
+/// abbreviated `--compress-program` ran its program, `git config --unset-a
+/// k` removed `k` and `git config --rem s` removed section `s`. A prefix two
+/// options share is an error to the tool, so taking it for this one only
+/// over-refuses.
+fn long_option_spells(t: &str, name: &str) -> bool {
+    t.strip_prefix("--")
+        .map(|r| r.split_once('=').map_or(r, |(n, _)| n))
+        .is_some_and(|n| !n.is_empty() && name.starts_with(n))
+}
+
 /// Read tools whose write or run form an argument selects (`sort -o`, `rg
 /// --pre`, `find -delete`, `test -v`, `uniq IN OUT`, `date -s`, `less +…`, a
 /// compiling `trustc`): an expansion before `--` may be that flag, so it is
@@ -2281,7 +2296,9 @@ fn runs_or_writes_by_flag(head: &str, args: &[String]) -> Option<String> {
             .map(|t| flag(t)),
         "sort" => args
             .iter()
-            .find(|t| t.starts_with("--compress-program"))
+            .find(|t| {
+                t.starts_with("--compress-program") || long_option_spells(t, "compress-program")
+            })
             .map(|t| flag(t)),
         "printf" => {
             // Its options, then its format: a substitution among them may be
@@ -2759,6 +2776,18 @@ fn head_from<S: AsRef<str>>(
                         .any(|f| a == f || (f.starts_with("--") && a.starts_with(&format!("{f}="))))
                 })
             };
+            // A write flag also by any prefix git takes for it (`--unset-a`,
+            // `--del`: [`long_option_spells`]); the list flags that clear a
+            // positional stay exact, so a prefix of one only over-refuses.
+            let has_write = |flags: &[&str]| {
+                has(flags)
+                    || args.iter().any(|a| {
+                        flags
+                            .iter()
+                            .filter_map(|f| f.strip_prefix("--"))
+                            .any(|name| long_option_spells(a, name))
+                    })
+            };
             let writes = match sub {
                 "branch" => {
                     // Short flags combine (`-avv`), so read by letter: d D m M
@@ -2784,7 +2813,7 @@ fn head_from<S: AsRef<str>>(
                     ]);
                     let positional = args.iter().any(|a| !a.starts_with('-'));
                     write_short
-                        || has(&[
+                        || has_write(&[
                             "--delete",
                             "--move",
                             "--copy",
@@ -2800,7 +2829,7 @@ fn head_from<S: AsRef<str>>(
                         || (positional && !list_short && !list_long)
                 }
                 "tag" => {
-                    has(&["-d", "-a", "-s", "-f", "-m", "--delete", "-F"])
+                    has_write(&["-d", "-a", "-s", "-f", "-m", "--delete", "-F"])
                         || (args.iter().any(|a| !a.starts_with('-'))
                             && !has(&[
                                 "-l",
@@ -2830,7 +2859,7 @@ fn head_from<S: AsRef<str>>(
                     )
                 ),
                 "config" => {
-                    has(&[
+                    has_write(&[
                         "--unset",
                         "--unset-all",
                         "--add",
@@ -3191,8 +3220,15 @@ fn plain_number(w: &str) -> bool {
 }
 
 /// `awk [-F s] [-v a=b]... 'program' files…`: the first non-flag word is the
-/// program.
+/// program, or every `-e`/`--source` word (gawk) when there is one. Only the
+/// options that set a separator or a variable are read past: any other option
+/// may load or write (gawk's `-f`/`-E`/`-i`/`-l` read a program or a library
+/// this check does not see, `-d`/`-o`/`-p` write a dump, a pretty-print or a
+/// profile to a file they may name, `-W` spells any of them), and gawk takes
+/// an abbreviated long option (`--exe`) for the whole one.
 fn awk_args_write(args: &[String]) -> Option<String> {
+    let mut programs: Vec<&str> = Vec::new();
+    let mut explicit = false;
     let mut k = 0;
     while k < args.len() {
         let w = args[k].as_str();
@@ -3203,11 +3239,27 @@ fn awk_args_write(args: &[String]) -> Option<String> {
         {
             return Some("awk -f (a program file)".to_string());
         }
-        if matches!(w, "-F" | "-v" | "-W" | "-e" | "--source") {
-            if w == "-e" || w == "--source" {
-                break;
-            }
+        if matches!(w, "-e" | "--source") {
+            programs.extend(args.get(k + 1).map(String::as_str));
+            explicit = true;
             k += 2;
+            continue;
+        }
+        if let Some(p) = w.strip_prefix("--source=") {
+            programs.push(p);
+            explicit = true;
+            k += 1;
+            continue;
+        }
+        if matches!(w, "-F" | "-v" | "--field-separator" | "--assign") {
+            k += 2;
+            continue;
+        }
+        if w.starts_with("--field-separator=")
+            || w.starts_with("--assign=")
+            || ((w.starts_with("-F") || w.starts_with("-v")) && !w.starts_with("--"))
+        {
+            k += 1;
             continue;
         }
         if w == "--" {
@@ -3215,71 +3267,141 @@ fn awk_args_write(args: &[String]) -> Option<String> {
             break;
         }
         if w.starts_with('-') && w.len() > 1 {
-            k += 1;
-            continue;
+            return Some(format!("awk {w} (an option this check does not read)"));
         }
         break;
     }
-    // `-e PROGRAM` / `--source PROGRAM`: the program is the next word.
-    if matches!(
-        args.get(k).map(String::as_str),
-        Some("-e") | Some("--source")
-    ) {
-        k += 1;
+    if !explicit {
+        programs.push(args.get(k)?);
     }
-    let program = args.get(k)?;
-    if program.contains(SUBSTITUTION) {
+    if let Some(program) = programs.iter().find(|p| p.contains(SUBSTITUTION)) {
         return Some(format!("awk: a program this check cannot read ({program})"));
     }
-    awk_program_writes(program)
+    programs
+        .iter()
+        .any(|p| awk_program_writes(p))
         .then(|| "awk writes (system, a redirect or a pipe in the program)".to_string())
 }
 
-/// Whether an awk program does more than read: `system(…)`, `>>`, a coprocess,
-/// a `>` redirect (not a comparison against a number, field or `>=`), or a `|`
-/// to a command (not `||`, nor inside a regex or string).
+/// Whether an awk program does more than read: the `system` builtin in any
+/// spelling (`system(…)`, `system (…)`, and a bare `system`, which runs
+/// `$0`), anywhere in the text; any `@` (gawk's `@include`, `@load` and its
+/// indirect calls, which reach `system` by a computed name); `>>`; a
+/// coprocess; any `>` in a `print` or `printf` statement outside its
+/// parentheses, which awk reads as a redirect whatever follows (`print $1 >
+/// $2`, `print 1 > 2`); a `>` elsewhere unless a comparison against a
+/// number, field or `>=`; or a `|` to a command (not `||`). MEASURED
+/// 2026-10-22 on macOS awk 20200816: `system ("touch f")`, `{system}` over a
+/// line, `print $1 > $1`, `print 1 > 4`, `if (1) print "y" > 5` and
+/// `printf "%s", "z" > -6` each ran a command or made a file.
+///
+/// Strings, regexes and `#` comments are read as awk reads them, so none
+/// hides a redirect from the scan: a `/` divides only after an operand (a
+/// name, a number, `)`, `]`, a string or a regex) and starts a regex
+/// anywhere else (after an operator, at a statement's start, after `print`,
+/// `printf`, `return`, `else`, `do`, `case` or `in`); a `[…]` in a regex
+/// holds a `/` (as gawk reads it); and a `/` after `++` or `--`, which may
+/// be either, is refused.
 fn awk_program_writes(p: &str) -> bool {
-    if p.contains("system(") || p.contains(">>") || p.contains("|&") {
+    if p.contains(">>") || p.contains("|&") || p.contains('@') || names_awk_word(p, "system") {
         return true;
     }
     let cs: Vec<char> = p.chars().collect();
+    let ident = |c: char| c.is_ascii_alphanumeric() || c == '_';
     let mut k = 0;
-    // The last non-space character seen outside strings and regexes: a `/`
-    // after an operator or an opener starts a regex, elsewhere it divides.
+    // The last non-space character seen outside strings, regexes and
+    // comments, and where; `START` after a word that takes an operand and at
+    // a statement's start. A newline after `,`, `\`, `&&` or `||` goes on
+    // with the statement.
+    const START: char = '\n';
     let mut prev: Option<char> = None;
+    let mut prev_at = 0;
+    // How deep in parentheses the scan is, and the depth of the `print` or
+    // `printf` statement it is in, if any.
+    let mut depth = 0usize;
+    let mut print_at: Option<usize> = None;
     while k < cs.len() {
         let c = cs[k];
+        if (c.is_ascii_alphabetic() || c == '_') && !(k > 0 && ident(cs[k - 1])) {
+            let start = k;
+            while k < cs.len() && ident(cs[k]) {
+                k += 1;
+            }
+            let word: String = cs[start..k].iter().collect();
+            if word == "print" || word == "printf" {
+                print_at = Some(depth);
+            }
+            prev = if matches!(
+                word.as_str(),
+                "print" | "printf" | "return" | "else" | "do" | "case" | "in"
+            ) {
+                Some(START)
+            } else {
+                Some(cs[k - 1])
+            };
+            prev_at = k - 1;
+            continue;
+        }
         match c {
             '"' => {
                 k += 1;
                 while k < cs.len() && cs[k] != '"' {
                     k += if cs[k] == '\\' { 2 } else { 1 };
                 }
-                k += 1;
                 prev = Some('"');
+                prev_at = k;
+                k += 1;
                 continue;
             }
-            '/' if prev.is_none_or(|p| "{;(,!~&|=\n".contains(p)) => {
-                k += 1;
-                while k < cs.len() && cs[k] != '/' {
-                    k += if cs[k] == '\\' { 2 } else { 1 };
+            '#' => {
+                // A comment, to the line's end (the newline is the scan's).
+                while k < cs.len() && cs[k] != '\n' {
+                    k += 1;
                 }
-                k += 1;
+                continue;
+            }
+            '/' if !prev.is_some_and(|p| {
+                p.is_ascii_alphanumeric() || matches!(p, '_' | ')' | ']' | '"' | '/' | '.' | '$')
+            }) =>
+            {
+                if let Some(op @ ('+' | '-')) = prev
+                    && prev_at > 0
+                    && cs[prev_at - 1] == op
+                {
+                    // `x++ / 2` divides, `+ +/re/` matches: either may be meant.
+                    return true;
+                }
+                k = past_awk_regex(&cs, k + 1);
                 prev = Some('/');
+                prev_at = k.saturating_sub(1);
+                continue;
+            }
+            '(' => depth += 1,
+            ')' => depth = depth.saturating_sub(1),
+            ';' | '{' | '}' => print_at = None,
+            '\n' if !prev.is_some_and(|p| ",\\&|".contains(p)) => {
+                print_at = None;
+                prev = Some(START);
+                k += 1;
                 continue;
             }
             '|' => {
                 if cs.get(k + 1) == Some(&'|') {
                     k += 2;
                     prev = Some('|');
+                    prev_at = k - 1;
                     continue;
                 }
                 return true;
             }
             '>' => {
+                if print_at.is_some_and(|d| depth <= d) {
+                    return true;
+                }
                 if cs.get(k + 1) == Some(&'=') || prev == Some('-') || prev == Some('<') {
                     k += 1;
                     prev = Some('>');
+                    prev_at = k - 1;
                     continue;
                 }
                 let next = cs[k + 1..].iter().find(|d| !d.is_whitespace());
@@ -3292,10 +3414,58 @@ fn awk_program_writes(p: &str) -> bool {
         }
         if !c.is_whitespace() {
             prev = Some(c);
+            prev_at = k;
         }
         k += 1;
     }
     false
+}
+
+/// Past the regex whose text starts at `k` (after its opening `/`): to the
+/// char after its closing `/`, skipping `\` escapes and `[…]` bracket
+/// expressions (a `]` first in one, or after its `^`, is a member; `[:…:]`,
+/// `[.….]` and `[=…=]` hold a `]` of their own).
+fn past_awk_regex(cs: &[char], mut k: usize) -> usize {
+    while k < cs.len() && cs[k] != '/' {
+        match cs[k] {
+            '\\' => k += 2,
+            '[' => {
+                k += 1;
+                if cs.get(k) == Some(&'^') {
+                    k += 1;
+                }
+                if cs.get(k) == Some(&']') {
+                    k += 1;
+                }
+                while k < cs.len() && cs[k] != ']' {
+                    if cs[k] == '[' && matches!(cs.get(k + 1), Some(':' | '.' | '=')) {
+                        let close = cs[k + 1];
+                        k += 2;
+                        while k < cs.len() && !(cs[k] == close && cs.get(k + 1) == Some(&']')) {
+                            k += 1;
+                        }
+                        k += 2;
+                        continue;
+                    }
+                    k += if cs[k] == '\\' { 2 } else { 1 };
+                }
+                k += 1;
+            }
+            _ => k += 1,
+        }
+    }
+    k + 1
+}
+
+/// Whether `word` stands in `text` as a whole awk identifier (no letter,
+/// digit or `_` either side), wherever it is: in a string too, which only
+/// over-refuses.
+fn names_awk_word(text: &str, word: &str) -> bool {
+    let ident = |c: char| c.is_ascii_alphanumeric() || c == '_';
+    text.match_indices(word).any(|(at, _)| {
+        !text[..at].chars().next_back().is_some_and(ident)
+            && !text[at + word.len()..].chars().next().is_some_and(ident)
+    })
 }
 
 /// `sed [-n] [-E] [-e SCRIPT]... [SCRIPT] files…`: every `-e` script, else the

@@ -56,7 +56,37 @@ pub struct SetupStatusRow {
     pub detail: String,
 }
 
+/// The Secrets stage's row in setup's report (aterm-cli's `Stage::Secrets` name).
+const SECRETS_ROW: &str = "Secrets vault";
+
+/// The subscriber's row, which a later stage's read of the vault reports beside
+/// [`SECRETS_ROW`] (aterm-cli's `vault_rows`).
+const SUBSCRIBER_ROW: &str = "Secrets subscriber";
+
 impl SetupStatus {
+    /// Whether setup's own report, not a Check's, reads this Mac in its vault, synced, with
+    /// its subscriber running: the Secrets stage's vault item reported at least one
+    /// [`SECRETS_ROW`] row and every one `ok` or `applied` (a pass that joined, synced or
+    /// installed the subscriber reports `applied`; a Mac still waiting for approval reports
+    /// otherwise), and no [`SUBSCRIBER_ROW`] row is anything but `ok`. The record's own row
+    /// for a stage a run finished, `applied` with no detail, says what a run did once, not
+    /// what holds now, and is not read; a row the item reported always says why.
+    pub(crate) fn vault_synced(&self) -> bool {
+        let mut reported = self
+            .rows
+            .iter()
+            .filter(|row| {
+                row.name == SECRETS_ROW && !(row.status == "applied" && row.detail.is_empty())
+            })
+            .peekable();
+        reported.peek().is_some()
+            && reported.all(|row| matches!(row.status.as_str(), "ok" | "applied"))
+            && self
+                .rows
+                .iter()
+                .all(|row| row.name != SUBSCRIBER_ROW || row.status == "ok")
+    }
+
     fn rows_for(
         &self,
         plan: Option<&Plan>,

@@ -1052,7 +1052,16 @@ struct InputWatch {
 /// finds input unread until one finds nothing unread with nothing published, so
 /// an idle machine arms nothing: no entry, no deadline, and the only thing that
 /// starts a watch is the sink's input hook firing on a write that landed
-/// (`Wake::InputWatch`).
+/// (`Wake::InputWatch`). A write driven into the session (a key, a paste, a
+/// report, a control verb's bytes) starts one, and so does a caller's explicit
+/// wake (`status` meeting bytes an unseen writer queued, an adopted backlog,
+/// the gate's refusal); the terminal's own answer to a query its program sent
+/// ([`aterm_session::sink::SinkWriter::write_reply`]) does not: nobody waits on
+/// it, and the probe that met it before the program read it armed a deadline
+/// for nothing (Gemini CLI's OSC 11 answer at rest, once a minute a tab,
+/// docs/measured/vitals-multi-tab-2026-10-22.md). The sink says which woke it
+/// ([`aterm_session::sink::SinkWriter::take_input_hook_driven`], marked where
+/// bytes land), and [`Self::answers_only`] decides.
 ///
 /// Each probe decides the next ([`Self::step`]):
 ///
@@ -1286,6 +1295,16 @@ impl InputWatches {
     /// Whether session `id` is being watched (its output wakes probe it).
     pub(crate) fn armed(&self, id: u64) -> bool {
         self.watches.contains_key(&id)
+    }
+
+    /// Whether the hook wake of session `id` brought only the terminal's own
+    /// answers to its program's queries, which start no watch: the session is
+    /// not watched, and `driven` (the sink's
+    /// [`aterm_session::sink::SinkWriter::take_input_hook_driven`], taken after
+    /// the hook was rearmed) says nothing else landed and no caller woke it
+    /// since the last take.
+    pub(crate) fn answers_only(&self, id: u64, driven: bool) -> bool {
+        !driven && !self.watches.contains_key(&id)
     }
 
     /// Whether a wake-driven probe of `id` must wait: it was probed less than
@@ -1784,7 +1803,19 @@ impl crate::App {
                 self.session_status.inputs.defer(id);
                 return Vec::new();
             }
-            Some(id) => vec![id],
+            Some(id) => {
+                // The hook first, then the take: a key landing after the
+                // rearm marks it again and wakes again, and one before it
+                // marked what this takes.
+                if let Some(session) = self.pool.get(id) {
+                    session.ctx.sink.rearm_input_hook();
+                    let driven = session.ctx.sink.take_input_hook_driven();
+                    if self.session_status.inputs.answers_only(id, driven) {
+                        return Vec::new();
+                    }
+                }
+                vec![id]
+            }
             None => self.session_status.inputs.due(now),
         };
         let mut moved = Vec::new();
@@ -1798,6 +1829,8 @@ impl crate::App {
                 .latest_output_activity_ns
                 .load(std::sync::atomic::Ordering::Acquire);
             ctx.sink.rearm_input_hook();
+            // What landed before this is in the queue the probe reads.
+            let _ = ctx.sink.take_input_hook_driven();
             let (backlog, stopped, activity) = probe(
                 &ctx.sink,
                 self.session_status.inputs.published(id).is_some(),
@@ -3988,6 +4021,198 @@ pub(crate) mod tests {
             record.contains(" input=clear input_bytes=0 input_wait_ms=0 fg_rss_mb=- disk="),
             "{record}"
         );
+        aterm_pty::close_fd(master);
+        aterm_pty::close_fd(slave);
+    }
+
+    /// THE TERMINAL'S OWN ANSWER STARTS NO WATCH
+    /// (docs/measured/vitals-multi-tab-2026-10-22.md): a program at rest asks
+    /// the terminal its background colour (Gemini CLI's OSC 11, once a minute
+    /// a tab) and reads the answer a moment later; the hook's wake met it
+    /// unread and armed a deadline 10 s out that no person waits on. A wake
+    /// that brought only the answer (the sink says nothing else landed:
+    /// [`SinkWriter::take_input_hook_driven`]) arms nothing and leaves the
+    /// answer to the program. NEGATIVE CONTROLS: a key driven beside an
+    /// unread answer is watched; a wake of a watched session probes, and the
+    /// watch ends once the program read both.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn the_terminals_own_answer_starts_no_watch() {
+        let (master, slave) = raw_pty_pair();
+        let sink = std::sync::Arc::new(SinkWriter::new(master));
+        sink.note_master_nonblocking(true);
+        let mut app = crate::App::headless_for_test();
+        app.pool
+            .insert(crate::stub_session_with_sink(77, sink.clone()));
+        let answer = b"\x1b]11;rgb:0000/0000/0000\x1b\\";
+
+        sink.write_reply(answer).expect("the answer");
+        let t0 = Instant::now();
+        assert!(app.observe_input_stalls(t0, Some(77)).is_empty());
+        assert!(!app.session_status.input_armed(77), "an answer: no watch");
+        assert_eq!(app.session_status.next_input_wake(), None, "nothing armed");
+        assert_eq!(slave_read_all(slave), answer, "the program reads it");
+
+        sink.write_reply(answer).expect("the next answer");
+        sink.write_frame_nonparking(b"k").expect("a key");
+        let t1 = t0 + PROBE_MIN_GAP;
+        let _ = app.observe_input_stalls(t1, Some(77));
+        assert!(app.session_status.input_armed(77), "a key: watched");
+        assert!(app.session_status.next_input_wake().is_some());
+        let mut both = answer.to_vec();
+        both.push(b'k');
+        assert_eq!(slave_read_all(slave), both);
+        let _ = app.observe_input_stalls(t1 + PROBE_MIN_GAP, Some(77));
+        assert!(!app.session_status.input_armed(77), "read: the watch ends");
+        aterm_pty::close_fd(master);
+        aterm_pty::close_fd(slave);
+    }
+
+    /// An answer the watch lets pass rearms the hook first (review
+    /// 2026-10-22): the one-shot hook fires again for the next answer, and a
+    /// person's key after them still wakes the watch, which watches it while
+    /// it is unread. NEGATIVE CONTROL: each answer's own wake, counted.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn a_key_after_answers_let_pass_still_wakes_the_watch() {
+        let (master, slave) = raw_pty_pair();
+        let sink = std::sync::Arc::new(SinkWriter::new(master));
+        sink.note_master_nonblocking(true);
+        let wakes = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = std::sync::Arc::clone(&wakes);
+        sink.install_input_hook(move || {
+            counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        });
+        let woke = || wakes.load(std::sync::atomic::Ordering::SeqCst);
+        let mut app = crate::App::headless_for_test();
+        app.pool
+            .insert(crate::stub_session_with_sink(77, sink.clone()));
+        let answer = b"\x1b]11;rgb:0000/0000/0000\x1b\\";
+        let t0 = Instant::now();
+        for n in 1..=3 {
+            sink.write_reply(answer).expect("an answer");
+            assert_eq!(woke(), n, "answer {n} wakes the watch");
+            assert!(app.observe_input_stalls(t0, Some(77)).is_empty());
+            assert!(!app.session_status.input_armed(77), "answer {n}: passed");
+            assert_eq!(slave_read_all(slave), answer);
+        }
+        sink.write_frame_nonparking(b"k").expect("a key");
+        assert_eq!(woke(), 4, "the person's key wakes the watch");
+        let _ = app.observe_input_stalls(t0, Some(77));
+        assert!(
+            app.session_status.input_armed(77),
+            "the key unread: watched"
+        );
+        assert_eq!(slave_read_all(slave), b"k");
+        aterm_pty::close_fd(master);
+        aterm_pty::close_fd(slave);
+    }
+
+    /// `status` WAKES THE WATCH FOR BYTES AN UNSEEN WRITER QUEUED, AND ITS
+    /// WAKE PROBES (review 2026-10-22): after a probe found nothing, a byte
+    /// another writer put straight into the master (no write of this sink
+    /// announced it) is met by `status`, whose explicit wake
+    /// ([`SinkWriter::wake_input_hook`]) is no answer, so the watch probes it
+    /// and watches it while it is unread. NEGATIVE CONTROL: the key typed and
+    /// read first, which the watch saw and let go.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn an_unseen_writers_byte_status_woke_is_watched() {
+        let (master, slave) = raw_pty_pair();
+        let sink = std::sync::Arc::new(SinkWriter::new(master));
+        sink.note_master_nonblocking(true);
+        let wakes = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = std::sync::Arc::clone(&wakes);
+        sink.install_input_hook(move || {
+            counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        });
+        let mut app = crate::App::headless_for_test();
+        app.pool
+            .insert(crate::stub_session_with_sink(77, sink.clone()));
+        sink.write_frame_nonparking(b"k").expect("a key");
+        let t0 = Instant::now();
+        let _ = app.observe_input_stalls(t0, Some(77));
+        assert!(
+            app.session_status.input_armed(77),
+            "the key unread: watched"
+        );
+        assert_eq!(slave_read_all(slave), b"k");
+        let _ = app.observe_input_stalls(t0 + PROBE_MIN_GAP, Some(77));
+        assert!(!app.session_status.input_armed(77), "read: the watch ends");
+
+        let before = wakes.load(std::sync::atomic::Ordering::SeqCst);
+        // SAFETY: `master` is an open pty master and the buffer is live.
+        let n = unsafe { libc::write(master, b"\x1b[B".as_ptr().cast(), 3) };
+        assert_eq!(n, 3, "the unseen writer's byte");
+        let record = app.session_status_record(77).expect("live session");
+        assert!(record.contains(" input=pending "), "{record}");
+        assert_eq!(
+            wakes.load(std::sync::atomic::Ordering::SeqCst),
+            before + 1,
+            "status woke the unwatched session"
+        );
+        let _ = app.observe_input_stalls(t0 + 2 * PROBE_MIN_GAP, Some(77));
+        assert!(
+            app.session_status.input_armed(77),
+            "the unseen writer's unread byte is watched"
+        );
+        assert_eq!(slave_read_all(slave), b"\x1b[B");
+        aterm_pty::close_fd(master);
+        aterm_pty::close_fd(slave);
+    }
+
+    /// A KEY THAT WAITED FOR THE FD LOCK ACROSS A LOOK IS WATCHED WHEN IT
+    /// LANDS (review 2026-10-22): the key is reserved (the driven-input count
+    /// moves) and stands before the fd lock; an answer lands meanwhile and its
+    /// wake lets it pass; then the key lands and the program never reads it.
+    /// The sink marks the hook where bytes land, not where a write is
+    /// reserved, so the key's own wake probes and watches it. NEGATIVE
+    /// CONTROL: the answer's wake, with the key reserved, armed nothing.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn a_key_that_waited_for_the_lock_across_a_look_is_watched_when_it_lands() {
+        let (master, slave) = raw_pty_pair();
+        let sink = std::sync::Arc::new(SinkWriter::new(master));
+        sink.note_master_nonblocking(true);
+        let (stood, at_lock) = std::sync::mpsc::channel::<()>();
+        let (go, gate) = std::sync::mpsc::channel::<()>();
+        let stood = std::sync::Mutex::new(stood);
+        let gate = std::sync::Mutex::new(gate);
+        sink.seam_for_testing(move |seam| {
+            if seam == aterm_session::sink::Seam::FrameLock {
+                let _ = stood.lock().map(|s| s.send(()));
+                let _ = gate.lock().map(|g| g.recv());
+            }
+        });
+        let mut app = crate::App::headless_for_test();
+        app.pool
+            .insert(crate::stub_session_with_sink(77, sink.clone()));
+        let driven = sink.driven_input();
+        let key = {
+            let sink = std::sync::Arc::clone(&sink);
+            std::thread::spawn(move || sink.write_frame(b"k"))
+        };
+        at_lock
+            .recv_timeout(aterm_spec::wait::MUST_HAPPEN)
+            .expect("the key stands before the fd lock");
+        assert_ne!(sink.driven_input(), driven, "the key is reserved");
+
+        let answer = b"\x1b]11;rgb:0000/0000/0000\x1b\\";
+        sink.write_reply(answer).expect("the answer");
+        let t0 = Instant::now();
+        assert!(app.observe_input_stalls(t0, Some(77)).is_empty());
+        assert!(!app.session_status.input_armed(77), "the answer: no watch");
+        assert_eq!(slave_read_all(slave), answer, "the program reads it");
+
+        go.send(()).expect("the key goes on");
+        let landed = key.join().expect("the key's writer");
+        assert_eq!(landed.expect("the key lands"), 1);
+        let _ = app.observe_input_stalls(t0 + PROBE_MIN_GAP, Some(77));
+        assert!(
+            app.session_status.input_armed(77),
+            "the key unread: watched"
+        );
+        assert_eq!(slave_read_all(slave), b"k");
         aterm_pty::close_fd(master);
         aterm_pty::close_fd(slave);
     }

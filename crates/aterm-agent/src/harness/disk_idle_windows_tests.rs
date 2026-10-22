@@ -309,8 +309,8 @@ impl Drop for Waiting {
     }
 }
 
-/// CLAUSE 4B KEEPS ONLY THE CANDIDATE AN 8.3-SPELLED WORKING DIRECTORY IS IN
-/// (wave 5's live finding F1): one scan of the running processes over two
+/// CLAUSE 4B KEEPS ONLY THE CANDIDATE AN 8.3-SPELLED WORKING DIRECTORY IS IN:
+/// one scan of the running processes over two
 /// candidates, and a `cmd.exe` of this test's started in the first one's
 /// `target\debug` spelled with 8.3 short names (a process keeps the spelling
 /// it was started in as its working directory). The first candidate is kept

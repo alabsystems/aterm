@@ -174,7 +174,7 @@ impl CatBaker {
     /// stays per-frame when several panes tick into one frame.
     #[doc(hidden)]
     #[cfg(test)]
-    pub fn frame_clock(&self) -> u64 {
+    pub const fn frame_clock(&self) -> u64 {
         self.clock
     }
 

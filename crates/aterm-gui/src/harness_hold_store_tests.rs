@@ -2,9 +2,9 @@
 // Copyright 2026 Andrew Yates
 
 //! LAND'S HOLD, STORED ON THE LOOP'S THREAD
-//! (`docs/DESIGN-harness-autopilot-2026-10-15.md` §12.3.3 item 3; slice 3c):
-//! the window's host hears the hold from its loop (`IdleHost::land_held`,
-//! slice 3b), stores it on the session's timeline before the call returns
+//! (`docs/DESIGN-harness-autopilot-2026-10-15.md` §12.3.3 item 3):
+//! the window's host hears the hold from its loop (`IdleHost::land_held`),
+//! stores it on the session's timeline before the call returns
 //! (`Hooks::hold`, `store_land_held`, `SessionTimeline::set_land_held`),
 //! where `status` reads it, and wakes the window with a fact that carries
 //! nothing (`HarnessFact::LandHeld`) only where it moved. A run's end takes

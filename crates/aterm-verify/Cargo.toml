@@ -73,6 +73,13 @@ aterm-toolchain = { workspace = true }
 # The arena lanes' interrupt guard: block SIGINT/SIGTERM/SIGHUP, take them on
 # one thread with `sigwait`, and `killpg` the terminals under test.
 libc = { workspace = true }
+# `verify provision`: atpkg's vetted extractor lays each pinned upstream archive
+# (`atpkg::extract::extract_tree`), its Mach-O walk and load-command reader hold
+# pwsh's tree to its signer and fish's build to the OS's libraries
+# (`atpkg::macho`), and the updater's codesign check is the Developer ID
+# requirement pwsh's Mach-Os meet.
+atpkg = { workspace = true }
+aterm-update-core = { workspace = true }
 
 [lints]
 workspace = true

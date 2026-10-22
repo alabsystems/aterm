@@ -248,8 +248,8 @@ fn typed_act(rule: &str, command: &str) -> Option<(Act, Counter)> {
     }
 }
 
-/// THE SESSION LOG'S `act` MARK for a ledger row (session log phase 3B,
-/// addendum A17): the request words `act word=<w> [rule=<id>]` that follow
+/// THE SESSION LOG'S `act` MARK for a ledger row:
+/// the request words `act word=<w> [rule=<id>]` that follow
 /// `mark -`, or `None` for a row that is no act of the log's. The word is
 /// the log's act vocabulary for what [`sort`] lit, sorted whatever host the
 /// loop has:
@@ -297,11 +297,11 @@ fn log_rule(rule_id: &str) -> String {
         .collect()
 }
 
-/// The act words of a SELF-SUPERVISED agent's own acts (session log plan
-/// 5C-2): codex-alab, a proven self-claim's holder, tells each act it took
+/// The act words of a SELF-SUPERVISED agent's own acts:
+/// codex-alab, a proven self-claim's holder, tells each act it took
 /// with `meta set harness_act <act>`, the act being the rule id it acted
 /// under (`docs/measured/codex-alab-proof-2026-10-16.md`'s legs), and aterm
-/// writes it as the log's `act word=<w> rule=<act, @ written .>` beside the
+/// writes it as the log's `act word=<w> rule=<act, @ written.>` beside the
 /// `harness-act` row — the word this table gives, as [`log_mark`] gives the
 /// loop's. codex-alab runs Autopilot Cruise / Land itself (the
 /// contract's §5 Cruise and Land rows, owner 2026-10-19), under the rule ids
@@ -383,7 +383,7 @@ pub const LANDED_WORD: &str = "landed";
 /// ([`relaunch_act`]).
 pub const RELAUNCH_WORD: &str = "relaunch";
 
-/// THE HOSTED LANES' ACT MARK (session log plan 5F-2, rulings T25 and T28):
+/// THE HOSTED LANES' ACT MARK:
 /// the `rule=` of the log's `act word=relaunch` written beside one relaunch
 /// or upgrade row of the window's harness host (`relaunch`,
 /// `upgrade-at-break`, `carry-restart`, `restart:account`, …: the row's own
@@ -1100,8 +1100,8 @@ mod tests {
         assert_eq!(RELAUNCH_WORD, "relaunch");
     }
 
-    /// ONLY A STEP THAT BROUGHT A NEW AGENT UP STARTED ONE (session log
-    /// Phase 6 step 6C-1): of the hosted rows' steps that moved the session,
+    /// ONLY A STEP THAT BROUGHT A NEW AGENT UP STARTED ONE:
+    /// of the hosted rows' steps that moved the session,
     /// the relaunch line typed, the relaunched process adopted and a fresh
     /// start brought a new agent process up; a turn typed into the running
     /// agent (a notice, a carry-on, a release, a restore line, the done

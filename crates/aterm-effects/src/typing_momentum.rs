@@ -66,6 +66,16 @@ pub struct TypingMomentum {
 }
 
 impl TypingMomentum {
+    /// A fresh leaky integrator at rest.
+    #[inline]
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            value: 0.0,
+            at: None,
+        }
+    }
+
     /// The metric at `now`: the stored value decayed over the elapsed gap on
     /// [`TYPING_MOMENTUM_TAU`], snapping to exactly 0 once negligible.
     #[inline]
@@ -117,14 +127,14 @@ impl TypingMomentum {
 
     /// Pin the metric to `v` (clamped to `[0, 1]`) at `now`.
     #[inline]
-    pub fn set_value(&mut self, now: Instant, v: f32) {
+    pub const fn set_value(&mut self, now: Instant, v: f32) {
         self.value = v.clamp(0.0, 1.0);
         self.at = Some(now);
     }
 
     /// Back to rest (0, unstamped).
     #[inline]
-    pub fn reset(&mut self) {
+    pub const fn reset(&mut self) {
         self.value = 0.0;
         self.at = None;
     }

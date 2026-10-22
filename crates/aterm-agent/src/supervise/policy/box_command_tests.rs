@@ -1260,3 +1260,119 @@ fn a_reading_whose_words_turn_on_a_blank_the_screen_cannot_show_proves_nothing()
         );
     }
 }
+
+/// THE STALE CALL (MEASURED 2026-10-22, 2.1.308, the measured note's
+/// breaker-4 section): the transcript as it stood while the box of
+/// [`STALE_SCREEN`] (call N, `Probe stale`, h-wrap-same's newline twin) was
+/// up. The file refused writes while S's box stood (S: `Probe stale` too,
+/// h-wrap-same's one-line command), S was answered Yes and ran, and the
+/// writes of S's result and N's call were lost: S is the last row, waiting.
+pub(crate) const STALE_PENDING: &str =
+    include_str!("fixtures/claude-2.1.308-transcript-stale-pending.jsonl");
+/// The rows written after N's box was refused (Esc): N's result (for a call
+/// the file never held), the interruption, the turn's end.
+const STALE_REJECTED: &str =
+    include_str!("fixtures/claude-2.1.308-transcript-stale-rejected.jsonl");
+/// N's box, under S's answered row and N's own `Waiting…` row.
+pub(crate) const STALE_SCREEN: &str = include_str!("fixtures/claude-2.1.308-box-bash-stale-n.txt");
+/// S's call id in [`STALE_PENDING`].
+pub(crate) const STALE_S_ID: &str = "toolu_labe02bf4f6eb4c1b97";
+/// N's call id, named only by its result in [`STALE_REJECTED`].
+const STALE_N_ID: &str = "toolu_lab1f7a88c34ad9d8bf";
+
+/// AN OLDER CALL LEFT WAITING DRAWS AS A NEWER BOX WHOSE OWN CALL THE FILE
+/// NEVER GOT (MEASURED 2026-10-22, 2.1.308, the real-Claude lab `b4o1`):
+/// the reader names S, the one call waiting, for N's box; S's command and
+/// N's both draw as N's box and as the call's row above it (`⏺ Bash(…)`
+/// over `Waiting…`: S's answered row and N's draw alike); S is a read and N
+/// is not (its second line runs `cccccccccc`), and the screen's newline
+/// reading is not a read either. No text on the screen ties the box to one
+/// call: the description is the model's (both say `Probe stale`), the row
+/// above the box is the newest call's, no call id is drawn. So the
+/// transcript's command is one more reading, never the box's alone
+/// (`breaker-read-only@v4`).
+///
+/// NEGATIVE CONTROLS: after Esc the file holds N's result and the
+/// interruption, a user row with no result, which ends S: nothing waits;
+/// S spent on its own box leaves nothing waiting.
+#[test]
+fn an_older_call_left_waiting_draws_as_a_newer_box_whose_call_the_file_never_got() {
+    use crate::supervise::classify::classify_command;
+    let s = command_in(CALLS_308, "Probe h-wrap-same");
+    let n = command_in(CALLS_308, "Probe h-wrap-same-twin");
+    assert_ne!(s, n);
+    assert_eq!(
+        pending_bash(STALE_PENDING, &[]),
+        Ok(BoxCommand {
+            id: STALE_S_ID.to_string(),
+            command: s.clone()
+        })
+    );
+    assert!(!STALE_PENDING.contains(STALE_N_ID));
+    let (p, rows) = boxed(STALE_SCREEN);
+    assert_eq!(p.description, "Probe stale", "{p:?}");
+    assert_eq!(drawn_as(&p, &rows, &s), Ok(()));
+    assert_eq!(drawn_as(&p, &rows, &n), Ok(()));
+    assert!(classify_command(&s).read_only);
+    assert!(!classify_command(&n).read_only);
+    let readings = p.readings();
+    assert!(readings.contains(&s), "{readings:?}");
+    let newline = readings
+        .iter()
+        .find(|r| r.contains('\n'))
+        .expect("the newline reading");
+    assert!(!classify_command(newline).read_only, "{newline:?}");
+    // NEGATIVE CONTROLS
+    let after = format!("{STALE_PENDING}{STALE_REJECTED}");
+    assert!(after.contains(STALE_N_ID));
+    assert!(
+        pending_bash(&after, &[]).is_err_and(|e| e.contains("no call waiting")),
+        "{:?}",
+        pending_bash(&after, &[])
+    );
+    assert!(
+        pending_bash(STALE_PENDING, &[STALE_S_ID.to_string()])
+            .is_err_and(|e| e.contains("no call waiting"))
+    );
+}
+
+/// The transcript at the first sighting of the next box after a kill
+/// (MEASURED 2026-10-22, 2.1.308, lab `b4o1`): the box over `Probe orph213`
+/// stood when its Claude Code was killed, the harness resumed the session,
+/// and the box over `Probe after286` was up; the killed call is the last
+/// call, and nothing the resumed session wrote had reached the file.
+const ORPHAN_AT_NEXT_BOX: &str =
+    include_str!("fixtures/claude-2.1.308-transcript-orphan-at-next-box.jsonl");
+/// The resumed session's first row: the killed call's synthetic result,
+/// written 38 ms after [`ORPHAN_AT_NEXT_BOX`] was read.
+const ORPHAN_INTERRUPTED: &str =
+    include_str!("fixtures/claude-2.1.308-transcript-orphan-interrupted.jsonl");
+/// The killed call's id.
+const ORPHAN_ID: &str = "toolu_lab4132fb62a965895a";
+
+/// A KILLED SESSION'S CALL IS THE ONE WAITING AT THE RESUMED SESSION'S NEXT
+/// BOX (MEASURED 2026-10-22, 2.1.308): the resumed Claude Code holds the
+/// killed call's synthetic result, the new prompt's rows and the new call in
+/// memory and writes them in one batch after the new box is drawn, so at
+/// that box's first sighting the reader names the killed call, alone. The
+/// stale call needs no fault: a kill and a resume make one. (Its command
+/// differs from the new call's, so it would not draw as the new box; and a
+/// settle's re-read, after the batch lands, finds another call.)
+///
+/// NEGATIVE CONTROL: the synthetic result answers the killed call wherever
+/// it lands: with it, nothing in these rows waits.
+#[test]
+fn a_killed_sessions_call_is_the_one_waiting_at_the_resumed_sessions_next_box() {
+    let call = pending_bash(ORPHAN_AT_NEXT_BOX, &[]).expect("the killed call");
+    assert_eq!(call.id, ORPHAN_ID);
+    assert!(call.command.starts_with("echo $(true) "), "{call:?}");
+    assert!(!ORPHAN_AT_NEXT_BOX.contains("toolu_lab754e5f6714a7e7fc"));
+    // NEGATIVE CONTROL
+    assert!(ORPHAN_INTERRUPTED.contains(ORPHAN_ID));
+    let answered = format!("{ORPHAN_AT_NEXT_BOX}{ORPHAN_INTERRUPTED}");
+    assert!(
+        pending_bash(&answered, &[]).is_err_and(|e| e.contains("no call waiting")),
+        "{:?}",
+        pending_bash(&answered, &[])
+    );
+}

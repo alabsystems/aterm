@@ -1637,7 +1637,7 @@ fn advance_seq_file(path: &str) -> io::Result<u64> {
             &tmp,
         )?;
         f.write_all(next.to_string().as_bytes())?;
-        f.sync_all()?;
+        astream_sys::full_sync(&f)?;
         drop(f);
         rename_str(&tmp, path)
     })();
@@ -1728,7 +1728,7 @@ fn sync_parent_dir(path: &str) -> io::Result<()> {
         _ => std::path::PathBuf::from("."),
     };
     let res = match std::fs::File::open(&dir) {
-        Ok(d) => d.sync_all(),
+        Ok(d) => astream_sys::full_sync(&d),
         Err(e) => Err(e),
     };
     match res {

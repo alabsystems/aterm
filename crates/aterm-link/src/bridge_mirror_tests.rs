@@ -12,11 +12,11 @@
 // and a REAL broker (its producer-sequence dedup). After every step the world
 // is projected onto the model's variables — the ring's live `ms`, the log's
 // cursor, the bridge's pin, and the READER'S VIEW of the broker's `ev` face,
-// decoded and deduped by `(ep, seq)` as every reader does (ruling Q0) — and
+// decoded and deduped by `(ep, seq)` as every reader does — and
 // must be the model's state after the matching actions (a crash and a
 // refused landing are stutters). NEGATIVE CONTROLS: for each mutant, the
 // real system driven through the deliberately broken call the mutant stands
-// for, and the projected law breaks (ruling Q12).
+// for, and the projected law breaks.
 
 use super::*;
 use aterm_slog::{CarryAdopt, CarryBudget, Conf, Kind, Limits, Log, Mark, Src, Stamp};
@@ -63,7 +63,7 @@ impl World {
     }
 
     /// [`World::new`] over a broker that retains its log by aterm's default
-    /// rules, its `Hello` read and judged (session log Phase 6 step 6E-2).
+    /// rules, its `Hello` read and judged.
     fn retaining() -> World {
         World::with_broker(true)
     }
@@ -382,7 +382,7 @@ impl World {
         self.log(Log::lift_read_fence);
     }
 
-    /// Another writer's record at the pinned sequence (ruling Q3).
+    /// Another writer's record at the pinned sequence.
     fn plant_foreign(&mut self) {
         let pseq = self
             .bridge
@@ -446,7 +446,7 @@ fn log_mirror_conforms_to_derived_model() {
     );
 }
 
-/// RULINGS Q1 AND Q12 THROUGH AN UPDATE: a slot pinned and published under
+/// a slot pinned and published under
 /// the export's fence is refused its landing (`fenced`), the successor that
 /// has not adopted the session answers `adopting` and the bridge keeps its
 /// pin, and once adopted the pin lands on the carried cursor — past the
@@ -512,7 +512,7 @@ fn log_mirror_conforms_across_an_update_adopted_late() {
     r.check("stood down: landed");
 }
 
-/// RULING Q3: another writer's record at the pinned sequence is a collision
+/// another writer's record at the pinned sequence is a collision
 /// (the bridge drops its connection and keeps the evidence), never a
 /// landing; the slot is re-pinned at a fresh sequence and lands.
 #[test]
@@ -614,7 +614,7 @@ fn log_mirror_conforms_across_a_bridge_crash_with_a_pin_outstanding() {
 }
 
 /// **A TORN PIN AFTER A POWER CUT, AT THE BRIDGE: THE NEXT BOOT SETS IT ASIDE
-/// AND THE MIRROR RESUMES** (rulings Q6, Q13) — the real bridge, a real broker
+/// AND THE MIRROR RESUMES** — the real bridge, a real broker
 /// and a real state dir. In boot 1, its run open, the mirror lands the
 /// session's open (the key on disk in `logkey` before the take named it, the
 /// floor raised past the batch before its pin), then pins and sends the next
@@ -623,7 +623,7 @@ fn log_mirror_conforms_across_a_bridge_crash_with_a_pin_outstanding() {
 /// counted for aterm), and the hello resumes the mirror under the same alias
 /// key with its total at the floor — at or above what boot 1 counted. The
 /// record the torn pin held is taken again at a fresh sequence and lands: on
-/// the face twice, one record in the reader's view (ruling Q0), none lost.
+/// the face twice, one record in the reader's view, none lost.
 /// NEGATIVE CONTROLS: the same cut read again in boot 1 (a kill, which tears
 /// nothing: damage there is a bug's), and read in boot 2 with no copies beside
 /// it (a dir only an older build mirrored in, whose pin holds the only key and
@@ -810,8 +810,7 @@ fn a_torn_pin_after_a_power_cut_is_set_aside_and_the_next_boots_mirror_resumes()
     }
 }
 
-/// **NO PIN BESIDE ITS COPIES: THE HELLO WRITES ONE AT ONCE** (rulings Q6,
-/// Q13). A dir whose pin a person moved aside, with `logkey` and `logfloor`
+/// **NO PIN BESIDE ITS COPIES: THE HELLO WRITES ONE AT ONCE**. A dir whose pin a person moved aside, with `logkey` and `logfloor`
 /// on the media, resumes under the same key at the floor, and the hello
 /// writes that whole pin before any take — of the version an older build
 /// refuses, so one that ran here next stops rather than find no pin and mint
@@ -965,7 +964,7 @@ fn a_mirror_with_its_copies_and_no_pin_writes_one_at_its_hello() {
 }
 
 /// **A STOPPED PIN'S REMEDY SAYS WHAT EACH CHOICE COSTS, AND NO CAUSE IT
-/// CANNOT SHOW** (rulings Q6, Q13) — the real bridge's hello over a real
+/// CANNOT SHOW** — the real bridge's hello over a real
 /// state dir. The last bridge ran in boot 1 under key K (`logkey`, a floor,
 /// a pin naming K), and the next boot finds the pin torn and stops:
 ///
@@ -1183,7 +1182,7 @@ fn a_recovery_no_clean_disk_heals_is_survived_and_the_mirror_stop_names_its_reme
     }
 }
 
-/// NEGATIVE CONTROLS (ruling Q12): each mutant's witness replayed against
+/// NEGATIVE CONTROLS: each mutant's witness replayed against
 /// the real system through the broken call it stands for, and the projected
 /// law breaks.
 #[test]
@@ -1309,7 +1308,7 @@ fn log_mirror_conformance_rejects_each_mutant_through_its_broken_call() {
     );
 }
 
-/// RULING Q5 ON THE WIRE: a bridge with the mirror off sends the `hello`
+/// a bridge with the mirror off sends the `hello`
 /// it always did, and no `log-take` or `log-landed` ever.
 #[test]
 fn a_bridge_with_the_mirror_off_sends_no_mirror_byte() {
@@ -1346,7 +1345,7 @@ fn a_bridge_with_the_mirror_off_sends_no_mirror_byte() {
     );
 }
 
-/// RULING Q10: a busy landing (`fenced`) keeps the pin and waits its retry,
+/// a busy landing (`fenced`) keeps the pin and waits its retry,
 /// never a pass every round; a definite refusal that is not the budget stops
 /// the mirror for this bridge's life, said to the endpoint, the pin kept.
 #[test]
@@ -1396,7 +1395,7 @@ fn a_busy_landing_waits_and_a_definite_refusal_stops_the_mirror() {
     );
 }
 
-/// RULING Q13: the node's total of mirrored bytes rides the pin across
+/// the node's total of mirrored bytes rides the pin across
 /// batches (and bridges); at the cap the mirror stops, said as `capped`.
 #[test]
 fn the_nodes_total_rides_the_pin_and_the_cap_stops_the_mirror() {
@@ -1450,8 +1449,7 @@ fn fill(w: &World, n: u64) -> Vec<u64> {
         .collect()
 }
 
-/// THE WINDOW BUDGET REPLACES THE LIFETIME CAP ON A RETAINING BROKER (session
-/// log Phase 6 step 6E-2, ruling U41). The node's pin says it mirrored past
+/// THE WINDOW BUDGET REPLACES THE LIFETIME CAP ON A RETAINING BROKER. The node's pin says it mirrored past
 /// [`crate::mirror::TOTAL_MAX_BYTES`], a whole window's budget of it in a
 /// batch the broker's cut has since passed: the mirror reads `oldest=` again,
 /// forgets that batch, and goes on taking, landing and counting, never
@@ -1492,7 +1490,7 @@ fn a_retaining_brokers_window_lets_a_total_past_the_cap_mirror_on() {
 }
 
 /// A NODE AT ITS WINDOW BUDGET WAITS, AND GOES ON WHEN THE BROKER GIVES ITS
-/// OLDEST UP (session log Phase 6 step 6E-2, ruling U41). A landed batch at
+/// OLDEST UP. A landed batch at
 /// the window's top holds the whole budget: the take asks `oldest=` again,
 /// still finds it in the window, takes nothing, says `link mirror budget`
 /// once to a lane-6 endpoint (`fabric status mirror=budget`) and waits
@@ -1547,7 +1545,7 @@ fn a_node_at_its_window_budget_waits_and_goes_on_when_the_broker_gives_its_oldes
 }
 
 /// A BUDGET FILLED IN MANY SMALL BATCHES GOES ON ONCE THE CUT PASSES HALF OF
-/// THEM (session log Phase 6 step 6E-2, ruling U41): a busy node's window
+/// THEM: a busy node's window
 /// filled in 1024 batches, sixteen times what the ledger keeps entries, waits
 /// at its budget, and the broker's cut past the older half of them gives the
 /// room back at the next take. NEGATIVE CONTROL, run: the ledger merging its
@@ -1587,8 +1585,7 @@ fn a_budget_filled_in_many_small_batches_goes_on_once_the_cut_passes_half() {
     );
 }
 
-/// AN `auto` MIRROR RUNS ONLY OVER A BROKER THAT RETAINS IT (session log
-/// Phase 6 step 6E-3, owner decision D4). The start's `hello`, before any
+/// AN `auto` MIRROR RUNS ONLY OVER A BROKER THAT RETAINS IT (owner decision D4). The start's `hello`, before any
 /// attach, says `log=auto` and asks for nothing, whatever the endpoint
 /// answers. An attach to a broker whose `Hello` advertises the default rules
 /// says the `hello` again with `log=turns`, and its answer engages the mirror
@@ -1645,8 +1642,8 @@ fn an_auto_mirror_runs_only_over_a_broker_that_retains_it() {
     }
 }
 
-/// AN `auto` MIRROR A BROKER STOPS RETAINING IS WITHDRAWN BEFORE IT SAYS SO
-/// (session log Phase 6 step 6E-3). Asked for and acknowledged over a
+/// AN `auto` MIRROR A BROKER STOPS RETAINING IS WITHDRAWN BEFORE IT SAYS SO.
+/// Asked for and acknowledged over a
 /// retaining broker, the mirror reattaches to one that retains nothing: it
 /// says the `hello` again with `log=auto` (so the endpoint's recorded hello
 /// reads `bridge_log=auto`, and stops engaging its sessions), then `link
@@ -1712,13 +1709,13 @@ fn an_auto_mirror_a_broker_stops_retaining_is_withdrawn_before_it_says_so() {
     );
 }
 
-/// WHO SPAWNED WHOM STAYS LOCAL (session log Phase 6 step 6E-4, D4's
+/// WHO SPAWNED WHOM STAYS LOCAL (D4's
 /// "senders stay local"): a spawned session's open names its parent
 /// (`parent=<sid>`) and the turn an edge opened restates its opener on its
-/// close (`op_by=<sid>`, 6C-2), both HOST. The bridge mirrors the open, the
+/// close (`op_by=<sid>`), both HOST. The bridge mirrors the open, the
 /// run and the turn onto the session's `ev` face, and no `v=2` body there
 /// holds either key or either raw sid, while the open's `prev=` (the node's
-/// own earlier session, ruling U23(c)) still crosses and a reader still
+/// own earlier session) still crosses and a reader still
 /// folds the run and the turn. NEGATIVE CONTROL, run: `parent=` marked W
 /// fails it.
 #[test]
@@ -1819,7 +1816,7 @@ fn no_parent_sid_and_no_opener_reach_a_mirrored_body() {
     assert_eq!(fold.state().totals.done, 1, "and the turn: {bodies:#?}");
 }
 
-/// RULING Q3, IN ORDER: a foreign record at the pinned seq of a batch's
+/// a foreign record at the pinned seq of a batch's
 /// middle slot re-pins that slot and every later slot of its session at
 /// fresh seqs, in order; the slot before it keeps its own.
 #[test]
@@ -1886,7 +1883,7 @@ fn a_collision_re_pins_the_slot_and_every_later_one_of_its_session_in_order() {
     );
 }
 
-/// RULING Q3 ON A REPUBLISH: a bridge killed with a batch pinned and never
+/// a bridge killed with a batch pinned and never
 /// sent; another writer's record lands at the pinned seq meanwhile. The next
 /// bridge's republish is answered deduped, the record at that offset is read
 /// back, is not these bytes — a collision, never a landing — and the slot
@@ -2276,7 +2273,7 @@ fn a_transient_broker_refusal_is_retried_and_only_one_for_good_stops_the_mirror(
     );
 }
 
-/// THE ALIAS KEY IS THE NODE'S, NOT ITS CAPS' (fixer F12, ruling Q6): the key
+/// THE ALIAS KEY IS THE NODE'S, NOT ITS CAPS' (fixer F12): the key
 /// a bridge mirrors under rides its pin, and the next bridge of the same
 /// state dir — whatever caps it holds, renewed or none — takes the same key,
 /// so an edge is one alias on the bus across bridge lives.
@@ -2313,7 +2310,7 @@ fn the_alias_key_survives_a_bridge_restart_and_a_cap_change() {
     assert_ne!(elsewhere.key(), key, "another node's is its own");
 }
 
-/// RULING Q10 ON PRODUCTION TIMERS: the round that reads a batch's acks
+/// the round that reads a batch's acks
 /// parks for nothing while the landing they concluded is owed, so
 /// `log-landed` follows the last ack, not the roster's tick. Judging the park
 /// before the round read the acks (the defect), while every slot was still
@@ -2409,7 +2406,7 @@ fn the_round_that_reads_a_batchs_acks_parks_for_nothing_before_its_landing() {
     );
 }
 
-/// AN EMPTY TAKE THAT SAYS `more=1` IS BUSY, NOT WORK (ruling Q10): the
+/// AN EMPTY TAKE THAT SAYS `more=1` IS BUSY, NOT WORK: the
 /// endpoint copied nothing because a session's timeline lock was held at the
 /// take (`try_lock`'s `WouldBlock`: the lane never waits on the UI's lock).
 /// The take stays owed and is asked again after `BUSY_WAIT`, so the loop
@@ -2467,7 +2464,7 @@ impl Drop for RestorePermissions {
     }
 }
 
-/// A RE-PIN THAT FAILS LANDS NOTHING (ruling Q3): after a collision, a re-pin
+/// A RE-PIN THAT FAILS LANDS NOTHING: after a collision, a re-pin
 /// that cannot reserve a sequence, or cannot write its pin, leaves the
 /// collided slot owed its re-pin — the pass sends nothing and lands nothing,
 /// and the re-pin is tried again after `DEADLINE_RETRY`. Settling the batch
@@ -2545,7 +2542,7 @@ fn a_failed_re_pin_lands_nothing_and_is_tried_again() {
     w.check("landed");
 }
 
-/// A BATCH OWED ITS RE-PIN SENDS NOTHING (ruling Q3, in order): two slots of
+/// A BATCH OWED ITS RE-PIN SENDS NOTHING (in order): two slots of
 /// one session, the first collided and the second in flight when the
 /// collision dropped the connection, so owed again after the reattach. While
 /// the re-pin fails, neither the pass nor a send reached any other way puts
@@ -2770,7 +2767,7 @@ fn successor(
     (next_lane, next)
 }
 
-/// RULING Q3 UNDER RETENTION: a republished slot's dedup whose record
+/// a republished slot's dedup whose record
 /// retention took before the read-back is NOT a collision. The broker drops a
 /// record's dedup entry with the record, so the slot, sent again at its
 /// pinned seq, appends anew and lands: no `cap-compromised`, no incarnation

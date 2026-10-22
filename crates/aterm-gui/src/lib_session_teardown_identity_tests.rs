@@ -122,8 +122,8 @@ fn dropping_an_adopted_session_before_commit_leaves_its_shell_alive() {
     }
 }
 
-/// …AND SO ARE THE FILES THE PREDECESSOR HANDED THAT SHELL (round eight,
-/// findings 20 and 44). The parent re-keyed the shell, or pointed it at its
+/// …AND SO ARE THE FILES THE PREDECESSOR HANDED THAT SHELL.
+/// The parent re-keyed the shell, or pointed it at its
 /// body, at an earlier update's Commit; the shell (an agent tab) has not
 /// reached a prompt to take either, so both still wait at
 /// `<control dir>/rekey/<sid>` and `<control dir>/integration/<sid>` — paths
@@ -211,8 +211,8 @@ fn dropping_an_adopted_session_before_commit_leaves_the_predecessors_rekey_and_b
     }
 }
 
-/// THE LATCH `spawn_session` HANDS A SESSION decides that drop (round seven,
-/// item 20): built through `spawn::adopted_handoff_commit` — the one
+/// THE LATCH `spawn_session` HANDS A SESSION decides that drop:
+/// built through `spawn::adopted_handoff_commit` — the one
 /// expression `spawn_session` sets `handoff_commit` with — over a factory whose `rekey_deferred` is an overlap handoff's
 /// `Deferred::holding()`, an ADOPTED session's drop leaves its shell to the
 /// predecessor. NEGATIVE CONTROLS, each hung up as before: a fresh spawn, a

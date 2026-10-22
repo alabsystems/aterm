@@ -73,8 +73,6 @@ pub(crate) mod recorded;
 pub(crate) mod serve;
 pub(crate) mod webkit;
 
-pub use chromium::fetch_main;
-
 use std::ffi::OsString;
 use std::os::fd::OwnedFd;
 use std::path::{Path, PathBuf};
@@ -301,7 +299,7 @@ pub fn run(ctx: &Ctx, r: &mut Report) {
             Ok(_) => String::new(),
         };
         r.cannot_run(format!(
-            "{LABEL} — {c}; {f}{w} (fix: targo --unverified verify fetch-browser)"
+            "{LABEL} — {c}; {f}{w} (fix: targo --unverified verify provision)"
         ));
         return;
     }
@@ -1318,6 +1316,86 @@ fn page(cdp: &mut cdp::Cdp, origin: &str, kind: &str) -> Result<Page, Stop> {
         load_ms: Some(load_ms),
         evaluate_ms,
     })
+}
+
+/// One pinned browser `verify provision` places in the browser cache
+/// ([`chromium::host_cache_root`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Pin {
+    /// What it is, for the run's lines.
+    pub what: String,
+    /// The version the lane pins.
+    pub version: String,
+    /// Where its archive is served.
+    pub url: String,
+    /// The archive's sha256.
+    pub sha256: &'static str,
+    /// The archive's size.
+    pub bytes: u64,
+    /// Its directory under the cache root: the one the lane looks in.
+    pub dir: PathBuf,
+    /// Its executable, relative to `dir`.
+    pub binary: PathBuf,
+}
+
+/// The pin of `engine` for `(os, arch)` under the browser cache `root`, where the lane
+/// pins one for that host.
+pub(crate) fn pin_for(
+    engine: crate::provision::Engine,
+    os: &str,
+    arch: &str,
+    root: &Path,
+) -> Option<Pin> {
+    use crate::provision::Engine;
+    match engine {
+        Engine::Chromium => {
+            let platform = chromium::platform_for(os, arch)?;
+            let pin = chromium::PINNED.iter().find(|p| p.platform == platform)?;
+            Some(Pin {
+                what: format!("chrome-headless-shell {}", chromium::PIN_VERSION),
+                version: chromium::PIN_VERSION.to_string(),
+                url: chromium::archive_url(platform),
+                sha256: pin.sha256,
+                bytes: pin.bytes,
+                dir: chromium::pinned_dir(root, platform),
+                binary: chromium::pinned_binary(Path::new(""), platform),
+            })
+        }
+        Engine::Firefox => {
+            let platform = firefox::platform_for(os, arch)?;
+            let pin = firefox::PINNED.iter().find(|p| p.platform == platform)?;
+            Some(Pin {
+                what: format!(
+                    "Playwright's Firefox build {} (Firefox {})",
+                    firefox::BUILD,
+                    firefox::VERSION
+                ),
+                version: firefox::BUILD.to_string(),
+                url: firefox::archive_url(pin),
+                sha256: pin.sha256,
+                bytes: pin.bytes,
+                dir: firefox::pinned_dir(root, pin),
+                binary: PathBuf::from(pin.binary),
+            })
+        }
+        Engine::Webkit => {
+            let platform = webkit::platform_for(os, arch)?;
+            let pin = webkit::PINNED.iter().find(|p| p.platform == platform)?;
+            Some(Pin {
+                what: format!(
+                    "Playwright's WebKit build {} (WebKit {})",
+                    webkit::BUILD,
+                    webkit::VERSION
+                ),
+                version: webkit::BUILD.to_string(),
+                url: webkit::archive_url(pin),
+                sha256: pin.sha256,
+                bytes: pin.bytes,
+                dir: webkit::pinned_dir(root, pin),
+                binary: PathBuf::from(pin.binary),
+            })
+        }
+    }
 }
 
 #[cfg(test)]

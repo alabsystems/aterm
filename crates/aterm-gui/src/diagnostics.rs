@@ -25,45 +25,38 @@ pub(crate) struct DiagInfo {
     /// `empty` / `invalid`; from the shipping updater code, not binary text.
     pub update_pin_sha256: String,
     pub renderer_default: &'static str,
-    /// What shell-integration preparation actually did for the shell this configuration
-    /// spawns, unlike the advertised `shell_integration` capability: an unknown shell or an
-    /// unwritable loader cache reads "NOT ACTIVE" here while the capability stays checked.
+    /// What shell-integration preparation did for the configured shell, unlike the
+    /// advertised `shell_integration` capability (which stays checked when a shell is
+    /// unsupported or the loader cache is unwritable).
     pub shell_integration_runtime: String,
-    /// Each registry agent's primer state under the real `$HOME`, and whether this
-    /// configuration auto-primes every fresh spawn.
+    /// Registry agent primer state under `$HOME` and whether fresh spawns auto-prime.
     pub agent_primer: String,
-    /// The resolved `[privacy]` posture (switches, warm-up mode, protected-root count),
-    /// plus the full-disk-access state only through an injected probe. [`collect`] passes
-    /// the inert arm, so no report reaches tccd. See [`privacy_line`].
+    /// Resolved `[privacy]` posture plus full-disk-access state via an injected probe
+    /// ([`collect`] passes `None` so `--diagnose` never reaches `tccd`; see [`privacy_line`]).
     pub privacy: String,
-    /// The macOS debugger rule (developer mode), read only through an injected probe, and
-    /// whether this aterm is hardened against a same-user debugger. [`collect`] passes the
-    /// inert arm, so `--diagnose` spawns no `DevToolsSecurity`. See [`debugger_line`].
+    /// macOS debugger rule (developer mode) via an injected probe, plus self-hardening
+    /// ([`collect`] passes `None` so `--diagnose` never spawns `DevToolsSecurity`; see [`debugger_line`]).
     pub debugger: String,
     pub features: Vec<(&'static str, bool)>,
     pub capabilities: Vec<(&'static str, bool)>,
-    /// Of the Objective-C protocols the window layer's declared classes claim
-    /// ([`CLAIMED_OBJC_PROTOCOLS`]), the ones this host's frameworks do not register
-    /// (macOS 14.4.1 lacks `NSApplicationDelegate`), which `aterm-objc` supplies at
-    /// declaration. Empty off macOS.
+    /// Claimed Objective-C protocols ([`CLAIMED_OBJC_PROTOCOLS`]) absent from this host's
+    /// frameworks (e.g. `NSApplicationDelegate` on macOS 14.4.1), supplied at declaration
+    /// by `aterm-objc`. Empty off macOS.
     pub objc_protocols_absent: Vec<&'static str>,
     pub config_path: String,
     pub config_presence: ConfigPresence,
     pub env: Vec<(String, String)>,
 }
 
-/// What `aterm.toml` is doing for this process, printed beside its path by both stdout
-/// reports, since stderr's notice never reaches `aterm --diagnose > report.txt`. Only the
-/// launch's own load result tells "loaded" from "rejected", so
-/// [`Rejected`](Self::Rejected) carries it.
+/// What `aterm.toml` is doing for this process, printed beside its path in `--diagnose`
+/// and `--show-config` so redirected stdout still distinguishes loaded from rejected.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum ConfigPresence {
-    /// No file at the path. The defaults are in force and the report says so.
+    /// No file at the path; built-in defaults are in force.
     Absent,
-    /// The file was read and parsed: the values in the report came from disk.
+    /// The file was read and parsed.
     Loaded,
-    /// On disk but not loaded (unreadable or invalid): every value in the report is a
-    /// built-in default. Carries `app_config::launch_config_notice`'s sentence.
+    /// Present on disk but unreadable or invalid; carries `app_config::launch_config_notice`.
     Rejected(String),
 }
 
@@ -295,17 +288,10 @@ fn agent_primer_line(config: &crate::app_config::Config) -> String {
     format!("{status} — auto-prime: {auto} (agents_auto_prime)")
 }
 
-/// The `privacy:` line: the resolved `[privacy]` posture, plus the full-disk-access state
-/// only if a probe was handed in.
-///
-/// The probe is a parameter because it opens a file macOS guards, and `--diagnose` is
-/// headless-constructible and runs in test binaries: [`collect`] passes `None`
-/// (`probe=none full_disk_access=unknown`), and only a windowed `App` running from inside
-/// the bundle passes `Some`, as with `lock_modifiers` / `user_input_recent`.
-///
-/// `unknown` means aterm did not look, never denial, and `granted` never claims no prompt
-/// can appear. The scope rule lives in [`crate::privacy_report::observed_fda_scope`],
-/// which the `privacy` verb renders from too, so the two surfaces agree.
+/// The `privacy:` line: resolved `[privacy]` posture plus full-disk-access state via an
+/// injected probe ([`collect`] passes `None` so headless diagnostics and tests never touch
+/// TCC; `unknown` means unprobed, not denied, and scope follows
+/// [`crate::privacy_report::observed_fda_scope`]).
 pub(crate) fn privacy_line(
     config: &crate::app_config::Config,
     probe: Option<aterm_containment::FdaProbe>,
@@ -314,8 +300,6 @@ pub(crate) fn privacy_line(
         return "off ([privacy] enabled = false) — every consent field reads unknown".to_string();
     }
     let (fda, probe_label) = match (config.privacy_probe_gate().permits(), probe) {
-        // Named as configuration: "denied" would be false, and a bare "unknown" would
-        // read as a failure.
         (false, _) => (aterm_containment::FdaState::Unknown, "off"),
         (true, None) => (aterm_containment::FdaState::Unknown, "none"),
         (true, Some(probe)) => (probe.state, probe.label.as_str()),
@@ -332,9 +316,6 @@ pub(crate) fn privacy_line(
          folders={folders} hold_ms={hold} probe_interval_ms={interval} protected_roots={roots} \
          notice={notice} report_attribution={attribution}",
         fda = fda.as_str(),
-        // Nothing here measures a scope, so the measured half is `Unknown`, as the verb
-        // passes under `SpikeEvidence::MEASURED`. Per-folder state stays unknown:
-        // testing a folder is what raises the dialog.
         scope =
             crate::privacy_report::observed_fda_scope(fda, aterm_containment::FdaScope::Unknown,)
                 .as_str(),
@@ -347,16 +328,9 @@ pub(crate) fn privacy_line(
     )
 }
 
-/// The `debugger:` line: the macOS debugger rule (developer mode: the Authorization
-/// Services right `system.privilege.taskport.debug`, not TCC), the account's membership
-/// and this aterm's own hardening; the rule only through an injected probe.
-///
-/// The probe spawns `DevToolsSecurity -status`, so it is a parameter for the reason
-/// [`privacy_line`]'s is: [`collect`] passes `None` (`probe=none`), and `unknown` means
-/// aterm did not look, never that developer mode is off. The hardening is a parameter too,
-/// so a test renders every posture; `collect` reads it with one `csops` on its own image.
-/// `enabled = false` collapses the line to one sentence; `check = false` reads `probe=off`
-/// (design §3.9).
+/// The `debugger:` line: macOS debugger rule (`system.privilege.taskport.debug`), account
+/// membership, and self-hardening ([`collect`] passes `None` so `--diagnose` never spawns
+/// `DevToolsSecurity -status`; `unknown` means unprobed, not disabled).
 pub(crate) fn debugger_line(
     config: &crate::app_config::Config,
     probe: Option<aterm_containment::consent::DebuggerProbe>,
@@ -658,25 +632,19 @@ pub(crate) fn config_semantic_warnings(
         atpkg::config::DEV_SEAMS,
     ));
     if let Some(privacy) = config.privacy.as_ref() {
-        // Reserved and unimplemented: aterm answers no macOS consent dialog, and the key
-        // exists so this warning has somewhere to attach. It names the grant that works
-        // without promising it removes every prompt, and sends the debugger's
-        // administrator password (not TCC) to the Debugger access row
+        // Reserved and unimplemented: aterm answers no macOS consent or password dialog
         // (docs/DESIGN-macos-debugger-access-2026-09-29.md §3.9).
         if privacy.auto_accept == Some(true) {
             warnings.push(ConfigSemanticWarning {
                 key: "privacy.auto_accept",
-                message: "privacy.auto_accept is reserved and not implemented: aterm does not \
-                          answer macOS consent dialogs; grant Full Disk Access instead \
-                          (Settings \u{25b8} Security). It does not answer macOS password \
-                          dialogs either; for the debugger password, see Debugger access on \
-                          the same page (Settings \u{25b8} Security)"
+                message: "privacy.auto_accept is reserved and not implemented: aterm answers no \
+                          macOS consent or password dialogs; grant Full Disk Access or configure \
+                          Debugger access in Settings \u{25b8} Security instead"
                     .to_string(),
             });
         }
-        // The master switch outranks the features below. Only an authored key is
-        // flagged: an absent one resolves the same but has no token to underline (as in
-        // the environment-override walk).
+        // Only authored keys under `privacy.enabled = false` are flagged so the editor
+        // has a token to underline.
         if privacy.enabled == Some(false) {
             if privacy.notice == Some(true) {
                 warnings.push(ConfigSemanticWarning {
@@ -711,9 +679,6 @@ pub(crate) fn config_semantic_warnings(
                 });
             }
         }
-        // An unrecognized `warmup` spelling resolves to the default instead of
-        // failing the parse (which would discard the whole file), so this is
-        // the only place the author hears about the typo.
         if let Some(warmup) = privacy.warmup.as_deref()
             && crate::app_config::PrivacyWarmup::parse(warmup).is_none()
         {
@@ -730,8 +695,6 @@ pub(crate) fn config_semantic_warnings(
                 ),
             });
         }
-        // The folder vocabulary is the consent module's, so a name this build
-        // does not know is skipped when the warm-up resolves names to paths.
         if let Some(folders) = privacy.warmup_folders.as_ref() {
             let known = aterm_containment::Folder::ALL
                 .iter()
@@ -750,9 +713,6 @@ pub(crate) fn config_semantic_warnings(
                 }
             }
         }
-        // A relative root is dropped rather than guessed at: the consent tier
-        // refuses to pick a base for it, and a root that silently resolves
-        // nowhere is a protected set with a hole in it.
         if let Some(roots) = privacy.protected_roots.as_ref() {
             for (index, entry) in roots.iter().enumerate() {
                 let trimmed = entry.trim();
@@ -764,16 +724,12 @@ pub(crate) fn config_semantic_warnings(
                         key: "privacy.protected_roots",
                         message: format!(
                             "privacy.protected_roots[{index}]: {entry:?} is neither an absolute \
-                             path nor ~-prefixed and is ignored; the consent tier will not guess \
-                             a base for it"
+                             path nor ~-prefixed and is ignored"
                         ),
                     });
                 }
             }
         }
-        // The hold keeps the automatic in-place apply from cutting off an
-        // owner-initiated system dialog; past the ceiling it would pin a build to one
-        // instance, so the resolver clamps and this states the effective number.
         if let Some(hold_ms) = privacy.warmup_hold_ms
             && hold_ms > crate::app_config::PRIVACY_WARMUP_HOLD_MS_MAX
         {
@@ -781,8 +737,7 @@ pub(crate) fn config_semantic_warnings(
                 key: "privacy.warmup_hold_ms",
                 message: format!(
                     "privacy.warmup_hold_ms is configured as {hold_ms} ms but is effectively {} \
-                     ms; a hold longer than that is indistinguishable from pinning a build to \
-                     one instance",
+                     ms (clamped to maximum)",
                     crate::app_config::PRIVACY_WARMUP_HOLD_MS_MAX
                 ),
             });
@@ -990,29 +945,19 @@ pub(crate) fn config_semantic_warnings(
         }
     }
     if config.allow_osc52_query == Some(true) {
-        // The warning states the widest thing the key grants on this platform. On
-        // macOS/Windows the Query arm answers with the system pasteboard (the knob is
-        // for remote vim/tmux clipboard sync, which must see other apps' copies). Linux
-        // answers only aterm's own selections: a foreign-owner X11 read is a blocking
-        // round-trip inside the terminal lock (spawn.rs, the Query arm). On macOS 26 a
-        // programmatic pasteboard read raises the system's "<app> would like to paste
-        // from <app>" alert, attributed to aterm, so the macOS text names it.
+        // State the widest clipboard scope granted on this platform (macOS/Windows read
+        // the system clipboard; Linux reads only selections owned by aterm).
         let message = if cfg!(target_os = "linux") {
-            "allow_osc52_query is enabled: a program in the terminal can READ the \
-             clipboard selections aterm itself owns (a foreign app's copy is not \
-             readable on X11 today). Leave it off unless a specific tool needs it"
+            "allow_osc52_query is enabled: programs can READ clipboard selections owned by \
+             aterm (foreign X11 copies are not read). Leave off unless a tool needs it"
         } else if cfg!(target_os = "macos") {
-            "allow_osc52_query is enabled: a program in the terminal can READ the \
-             system clipboard — including text copied in OTHER apps, such as a \
-             password manager. On macOS 26 that read is what raises the system's \
-             \"aterm would like to paste from …\" alert: the program asked, the \
-             alert names aterm. Leave it off unless a specific tool needs it \
-             (e.g. remote vim/tmux clipboard sync)"
+            "allow_osc52_query is enabled: programs can READ the system clipboard (including \
+             copies from other apps) and trigger macOS's \"aterm would like to paste from …\" \
+             alert. Leave off unless a tool needs it (e.g. remote vim/tmux clipboard sync)"
         } else {
-            "allow_osc52_query is enabled: a program in the terminal can READ the \
-             system clipboard — including text copied in OTHER apps, such as a \
-             password manager. Leave it off unless a specific tool needs it \
-             (e.g. remote vim/tmux clipboard sync)"
+            "allow_osc52_query is enabled: programs can READ the system clipboard (including \
+             copies from other apps). Leave off unless a tool needs it (e.g. remote vim/tmux \
+             clipboard sync)"
         };
         warnings.push(ConfigSemanticWarning {
             key: "allow_osc52_query",
@@ -1020,13 +965,12 @@ pub(crate) fn config_semantic_warnings(
         });
     }
     if config.allow_window_ops == Some(true) {
-        // Linux wires the manipulations (`spawn::configure_window_ops` →
-        // `App::on_window_op`) but not the position and screen reports. CSI 14 t and
-        // 16 t are answered in-core on every platform from the host's cell metrics.
+        // Linux wires window ops except move; CSI 14 t / 16 t cell/pixel size reports
+        // are answered in-core on all platforms.
         let message = if cfg!(target_os = "linux") {
-            "allow_window_ops is wired to the window on Linux: manipulations (iconify, maximize, fullscreen, resize) apply and move stays denied; the window-title, text-grid-size, text-area-pixels and cell-size reports are answered, while window/screen position and screen-size reports remain unanswered"
+            "allow_window_ops is enabled: window ops (iconify, maximize, fullscreen, resize; move denied) and title/grid/pixel/cell-size reports are active; position and screen-size reports stay unanswered"
         } else {
-            "allow_window_ops answers the window-title, text-grid-size, text-area-pixels and cell-size reports only; window changes (iconify, maximize, fullscreen, resize, move) and position and screen-size reports are ignored on this platform"
+            "allow_window_ops answers title, text-grid-size, text-area-pixels and cell-size reports only; window ops and position/screen-size reports are ignored on this platform"
         };
         warnings.push(ConfigSemanticWarning {
             key: "allow_window_ops",

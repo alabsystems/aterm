@@ -374,15 +374,31 @@ fn alt_screen_transition_is_a_resync_not_activity() {
 
 /// On a shell-integrated session, output that moves nothing reads `output_activity` (the
 /// `movement_reason` the foreground-job arm uses), so `ctl status` shows whether the movement
-/// clock is stale (`docs/EFFECTS-AND-WAKE-FOLLOWUPS-2026-08-24.md` item 21).
+/// clock is stale (`docs/EFFECTS-AND-WAKE-FOLLOWUPS-2026-08-24.md` item 21). The work starts with
+/// the grid moving (output alone starts no `Running`:
+/// [`output_that_moves_no_cell_sustains_running_but_never_starts_it`]), and bytes that mark no
+/// cell keep it alive once the movement clock is stale.
 #[test]
 fn executing_names_output_only_movement_as_output_activity() {
     let t0 = Instant::now();
     let mut fsm = StatusFsm::new(policy(), t0);
     let mut ev = evidence(blank(1));
     ev.shell = Some(ShellEvidence::Executing);
+    fsm.observe(&ev, t0);
+    ev.activity.content_seq = 2;
     ev.activity.last_output = Some(t0);
-    let t1 = settle(&mut fsm, &ev, t0);
+    let t1 = settle(&mut fsm, &ev, t0 + Duration::from_millis(10));
+    assert_eq!(fsm.status().phase, Phase::Running);
+    assert_eq!(
+        fsm.status().reasons,
+        vec![Reason::ShellBlock, Reason::ContentActivity],
+        "the work started with the grid moving"
+    );
+
+    // The grid stands still past the quiet window while bytes keep coming.
+    let t2 = t1 + QUIET;
+    ev.activity.last_output = Some(t2);
+    fsm.observe(&ev, t2);
     assert_eq!(fsm.status().phase, Phase::Running);
     assert_eq!(
         fsm.status().reasons,
@@ -391,15 +407,64 @@ fn executing_names_output_only_movement_as_output_activity() {
     );
 
     // Control: the grid moves, and the record says so.
-    ev.activity.content_seq = 2;
-    ev.activity.last_output = Some(t1);
-    settle(&mut fsm, &ev, t1 + Duration::from_millis(10));
+    ev.activity.content_seq = 3;
+    ev.activity.last_output = Some(t2 + Duration::from_millis(10));
+    fsm.observe(&ev, t2 + Duration::from_millis(10));
     assert_eq!(fsm.status().phase, Phase::Running);
     assert_eq!(
         fsm.status().reasons,
         vec![Reason::ShellBlock, Reason::ContentActivity],
         "a moved grid is content activity"
     );
+}
+
+/// OUTPUT THAT MOVES NO CELL NEVER STARTS `Running`
+/// (docs/measured/vitals-multi-tab-2026-10-22.md): a program at rest whose
+/// writes mark no cell (Muse Code's SGR reset every ~9 s, Gemini CLI's OSC 11
+/// query once a minute) stays where it rests (`Quiet` with a foreground job,
+/// `Unknown` with no foreground evidence at all) and owes the sweep no wake.
+/// Before, each such write read `quiet -> running -> quiet` and cost three
+/// timed sweeps: the dwell's publish, the retirement, and its dwell.
+/// NEGATIVE CONTROLS: a write that moves the grid still starts `Running`
+/// after the dwell and owes its wakes, and a published `Running` is still
+/// sustained by output alone
+/// ([`executing_names_output_only_movement_as_output_activity`]).
+#[test]
+fn output_that_moves_no_cell_sustains_running_but_never_starts_it() {
+    for (shell, job, rest) in [
+        (None, Some(true), Phase::Quiet),
+        (Some(ShellEvidence::Executing), Some(true), Phase::Quiet),
+        (None, None, Phase::Unknown),
+    ] {
+        let t0 = Instant::now();
+        let mut fsm = StatusFsm::new(policy(), t0);
+        let mut ev = evidence(blank(1));
+        ev.shell = shell;
+        ev.foreground_job = job;
+        let t1 = settle(&mut fsm, &ev, t0);
+        let case = format!("{shell:?} {job:?}");
+        assert_eq!(fsm.status().phase, rest, "{case}: at rest");
+        assert_eq!(fsm.owed_wake(), None, "{case}");
+
+        // Writes that mark no cell, one a second for a minute.
+        for n in 1..=60 {
+            let at = t1 + Duration::from_secs(n);
+            ev.activity.last_output = Some(at);
+            assert!(!fsm.observe(&ev, at), "{case}: nothing to publish");
+            assert_eq!(fsm.status().phase, rest, "{case}");
+            assert_eq!(fsm.owed_wake(), None, "{case}: no sweep is owed");
+        }
+
+        // Control: a write that moves the grid starts the work.
+        let t2 = t1 + Duration::from_secs(61);
+        ev.activity.content_seq = 2;
+        ev.activity.last_output = Some(t2);
+        fsm.observe(&ev, t2);
+        assert_eq!(fsm.owed_wake(), Some(t2 + DWELL), "{case}: the dwell");
+        fsm.observe(&ev, t2 + DWELL);
+        assert_eq!(fsm.status().phase, Phase::Running, "{case}");
+        assert_eq!(fsm.owed_wake(), Some(t2 + QUIET), "{case}: its retirement");
+    }
 }
 
 #[test]
@@ -991,6 +1056,9 @@ fn an_exited_pane_stays_exited_instead_of_reverting_to_ready() {
     let mut ev = evidence(blank(1));
     ev.foreground_job = Some(true);
     ev.activity.last_output = Some(t0);
+    app.session_status.observe(0, &ev, t0);
+    // The job draws: a moved grid starts `Running` (output alone never does).
+    ev.activity.content_seq += 1;
     settle_observer(&mut app.session_status, 0, &ev, t0);
     assert_eq!(
         app.session_status.status(0).map(|s| s.phase),
@@ -1904,8 +1972,8 @@ fn movement_at_a_prompt_publishes_nothing_and_owes_no_wake() {
 }
 
 /// A TUI that outputs without moving the grid (identical sync-bracketed repaints, heartbeats)
-/// keeps `Running` alive through `output_recently` while `last_movement` goes stale, so the
-/// retire wake rides the fresher clock (`owed_wake` says why).
+/// keeps a `Running` its grid movement started alive through `output_recently` while
+/// `last_movement` goes stale, so the retire wake rides the fresher clock (`owed_wake` says why).
 #[test]
 fn output_without_movement_arms_the_retire_wake_off_the_freshest_clock() {
     let t0 = Instant::now();
@@ -1914,11 +1982,11 @@ fn output_without_movement_arms_the_retire_wake_off_the_freshest_clock() {
     ev.foreground_job = Some(true);
     ev.activity.last_output = Some(t0);
     observer.observe(1, &ev, t0);
-    // One real grid movement, then the grid goes still while output flows.
-    let t1 = t0 + DWELL;
+    // One real grid movement starts `Running` (output alone never does), then the grid goes
+    // still while output flows.
     ev.activity.content_seq = 2;
-    ev.activity.last_output = Some(t1);
-    observer.observe(1, &ev, t1);
+    ev.activity.last_output = Some(t0 + DWELL);
+    let t1 = settle_observer(&mut observer, 1, &ev, t0 + DWELL);
     assert_eq!(observer.status(1).map(|s| s.phase), Some(Phase::Running));
 
     // Far past `quiet_after` on the movement clock, raw output still sustains Running, so the

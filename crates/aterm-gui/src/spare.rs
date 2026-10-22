@@ -1,60 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE WARM SPARE SHELL (`docs/DESIGN-warm-spare-2026-10-16.md`).
+//! Warm spare shell management ([`Spares`]).
 //!
-//! A new tab's prompt took ~37 ms from the request: the main thread's turn was
-//! already under a millisecond, and the shell's own exec and startup files were
-//! the rest. So aterm keeps ONE shell spawned ahead, before anyone asks, and a
-//! plain Cmd-T adopts it instead of forking.
+//! Keeps one pre-spawned shell waiting on a [`SpareFifo`] so plain new-tab
+//! requests adopt it instead of forking:
+//! - Parked: waits before startup files; can retarget its directory on release ([`AdoptCheck::verdict`]).
+//! - Warm: runs startup files ahead of time once [`GateBook`] certifies the rc
+//!   generation ([`rc_generation`], [`Reported`], [`escape_scan`], [`App::spare_warm_gates`]).
 //!
-//! Two tiers, one slot ([`Spares`], on the main thread):
-//! - PARKED. The spare's wrapper waits at its first line, before any startup
-//!   file (`aterm_shell_integration`'s parked hold), for one line on a FIFO
-//!   aterm holds open ([`SpareFifo`]). Cmd-T says `go`, and the startup files
-//!   run in view exactly as in a cold tab; aterm's spawn and the shell's exec
-//!   and init are already done. No user code runs before anyone asked.
-//! - WARM. Only for an rc generation a learned gate ([`GateBook`], on the
-//!   `aterm-spare` thread) has seen run clean three times in view: the spare is
-//!   told `run`, its startup files run unseen, and it waits again at the top of
-//!   its first prompt hook, before any prompt work, clock or history-dependent
-//!   expansion. Cmd-T says `go`, and the first prompt is drawn now, with
-//!   history re-read when the file moved, `$SECONDS` carried on and the hooks
-//!   the rc put ahead of aterm's run again.
-//!
-//! Until it is adopted a spare is nobody's session: never registered (no `ls`,
-//! fabric, graph entry, restore journal, quit safety, keeper or primer), every
-//! wake its reader posts swallowed ([`SpareLink::post`], with a backstop at the
-//! top of `user_event`), its host effects only taint it ([`wire_spare_taint`]),
-//! and a control request or an askpass from inside it is refused and taints it
-//! ([`control_refusal`]). A spare whose shell shows anything the gate cannot
-//! vouch for is killed and never adopted.
-//!
-//! Who never gets a spare: every ask that is not plain (`observe=`/connected,
-//! operator, `folder_of`), pwsh, `-e`,
-//! `integrate = false`, `temporal_recording`, and Windows. They take today's
-//! cold path, unchanged. Linux (2026-10-19) keeps both tiers as macOS does,
-//! its escape scan reading `/proc` ([`escape_scan`]); where the shell reads a
-//! system file before its parked hold (Ubuntu's `/etc/zsh/zshenv` and
-//! `/etc/bash.bashrc`, `pre_hold_files`), parking waits for the warm gate,
-//! as macOS's `/etc/zshenv` always made it. A pane another program holds (an
-//! agent, vim, ssh) books its spare where its new tab opens, the folder it reported
-//! (2026-10-18), unless the spare's spawn finds that folder would fall back,
-//! which books none there until the folder moves. A PARKED spare also serves a
-//! tab asked for in another local folder (`spawn cwd=`, a folder that moved): it
-//! `cd`s there at its release, before any startup file, where a cold shell's
-//! `$PWD` is unambiguous ([`AdoptCheck::verdict`]); a WARM one ran its rc in its
-//! own folder and serves only that one. fish gets a WARM spare
-//! only (2026-10-17): no file of aterm's runs before its startup files, so it
-//! cannot park, and booking it is its `run`, under the same gates
-//! ([`App::spare_warm_gates`]); its generation stamps the startup roots its own
-//! start record names ([`Reported`], 2026-10-19). A spare exists only once a
-//! person has been seen (a human gesture, or one of its windows coming to the
-//! front), and is kept PARKED while a window is open; only promotion to WARM
-//! waits for a person present now (seen in the last 10 minutes), so the first
-//! Cmd-T after a long absence still adopts a parked spare. Wire-driven headless
-//! instances, the test suites and agents' private instances see none unless
-//! they set `spare_shell_needs_person = false`.
+//! Until adoption, wakes are swallowed ([`SpareLink::post`]) and host/control
+//! effects only taint the spare ([`wire_spare_taint`], [`control_refusal`]).
 
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
@@ -68,75 +24,53 @@ use aterm_window::event_loop::EventLoopProxy;
 
 use crate::{App, Session, Wake, WindowId};
 
-// ─── Numbers (design §0, §6, §7, §9) ───
-
-/// A spawned spare must say it is parked within this; one that does not ran past
-/// the wrapper's hold, with the rc possibly running unasked.
+/// Maximum wait for a spawned spare to report its parked mark.
 pub(crate) const PARKED_DEADLINE: Duration = Duration::from_secs(1);
-/// A parked spare older than this is replaced.
+/// Maximum age of a parked spare before replacement.
 pub(crate) const PARKED_MAX_AGE: Duration = Duration::from_secs(60 * 60);
-/// A ready warm spare older than this (since it reached its hold) is discarded.
+/// Maximum age of a verified warm spare before discard.
 pub(crate) const READY_MAX_AGE: Duration = Duration::from_secs(10 * 60);
-/// How recent a person's gesture must be for a spare to be promoted to WARM.
+/// Maximum time since user activity to allow warm promotion.
 pub(crate) const PERSON_WINDOW: Duration = Duration::from_secs(10 * 60);
-/// No spare before the first window has been up this long: never on the cold
-/// start's path.
+/// Initial grace period after first window creation before booking spares.
 pub(crate) const BOOT_GRACE: Duration = Duration::from_secs(1);
-/// How long a spare's fork waits for the event loop to park
-/// ([`crate::watchdog::forks_wait_for_park`]); nobody waits for a spare.
 const SPARE_FORK_PARK_WAIT: Duration = Duration::from_millis(20);
-/// A landing (adopted or cold) waits this before the next spare is booked.
+/// Settle delay after a tab landing or input before booking the next spare.
 pub(crate) const SETTLE: Duration = Duration::from_millis(150);
-/// Promotion to WARM waits for this long without input.
+/// Input idle duration required before warm promotion.
 pub(crate) const PROMOTE_IDLE: Duration = Duration::from_secs(1);
-/// …and this long with the focused folder unchanged.
+/// Folder stability duration required before warm promotion.
 pub(crate) const PROMOTE_FOLDER_STABLE: Duration = Duration::from_secs(3);
-/// At most this many parked spawns per rolling hour.
+/// Maximum parked spawns per rolling hour.
 pub(crate) const PARKED_BUDGET: usize = 60;
-/// At most this many warm spares discarded per rolling hour.
+/// Maximum warm spare discards per rolling hour.
 pub(crate) const WARM_BUDGET: usize = 8;
 const HOUR: Duration = Duration::from_secs(60 * 60);
-/// At least this between two replacements.
+/// Minimum interval between spare replacements.
 pub(crate) const REPLACE_MIN: Duration = Duration::from_secs(2);
-/// A parked spare's folder or window moved: replaced once the new one holds this.
+/// Delay before replacing a parked spare after the target folder or window moves.
 pub(crate) const REPLACE_PARKED_AFTER: Duration = Duration::from_secs(1);
-/// A warm spare's: kept this long (the person may come back), then replaced.
+/// Delay before replacing a warm spare after the target folder or window moves.
 pub(crate) const REPLACE_WARM_AFTER: Duration = Duration::from_secs(10);
-/// No spare within this of a critical memory-pressure episode.
+/// Holdoff duration after a critical memory-pressure episode.
 pub(crate) const PRESSURE_HOLD: Duration = Duration::from_secs(10 * 60);
-/// Retired spare ids whose late wakes the backstop still swallows.
 const TOMBSTONES: usize = 32;
-/// Clean visible runs of a generation before it may run unseen.
+/// Consecutive clean visible runs required to open a generation's warm gate.
 pub(crate) const CLEAN_STREAK: u32 = 3;
-/// A cold tab's start record must arrive within this to count clean.
+/// Maximum startup duration for a visible run to count as a clean sample.
 pub(crate) const SAMPLE_WINDOW: Duration = Duration::from_secs(2);
-/// A backoff failure's first and second ineligibility.
 const BACKOFF_FIRST: Duration = Duration::from_secs(60 * 60);
 const BACKOFF_SECOND: Duration = Duration::from_secs(24 * 60 * 60);
-/// A sample's escape scan runs at most this often (a verification's is not
-/// spaced: [`rate_limited`]).
 const SCAN_EVERY: Duration = Duration::from_secs(2);
-/// …and looks this far past the start mark: a daemon the startup files fork
-/// just before it was born up to 86.6 ms after it under load (design, As
-/// built, 2026-10-20). A spare is adoptable while its scan waits this out.
 const SCAN_GRACE: Duration = Duration::from_millis(100);
-/// The warm deadline's bounds (`T_READY = clamp(4 × max rc_ms, 1 s, 8 s)`).
 const T_READY_MIN: Duration = Duration::from_secs(1);
 const T_READY_MAX: Duration = Duration::from_secs(8);
-/// Generations the gate file keeps.
 const GATE_KEEP: usize = 16;
-/// A promotion writes `run` only on a stamp of the rc generation asked for
-/// within this ([`Job::Freshen`]).
 const FRESH_FOR: Duration = Duration::from_secs(2);
-/// The gate file's name under the state dir.
 const GATE_FILE: &str = "spare-gate-v1.tsv";
-/// The persisted gate is a small cache, never an unbounded input.
 const GATE_FILE_MAX: u64 = 128 * 1024;
 
-// ─── Config ───
-
-/// `spare_shell`: `auto` (parked, warm where the gate allows), `parked` (never
-/// a startup file before Cmd-T), `off`.
+/// Configured `spare_shell` mode (`auto`, `parked`, or `off`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum SpareMode {
     Auto,
@@ -145,10 +79,10 @@ pub(crate) enum SpareMode {
 }
 
 impl SpareMode {
-    /// The accepted spellings, in the order `--validate-config` lists them.
+    /// Accepted config spellings in `--validate-config` order.
     pub(crate) const SPELLINGS: [&'static str; 3] = ["auto", "parked", "off"];
 
-    /// `None` for an unknown spelling.
+    /// Parse a `spare_shell` value.
     pub(crate) fn parse(raw: &str) -> Option<Self> {
         match raw.trim().to_ascii_lowercase().as_str() {
             "auto" => Some(Self::Auto),
@@ -159,56 +93,35 @@ impl SpareMode {
     }
 }
 
-// ─── What a session witnesses (every session's, on `SessionCtx`) ───
-
-/// A shell's start record as its reader saw it arrive (design §4): the mark, and
-/// the session's state at that instant.
+/// Shell start mark and session state captured by the PTY reader.
 #[derive(Clone, Debug)]
 pub(crate) struct StartSeen {
     pub(crate) at: Instant,
     pub(crate) mark: StartMark,
-    /// The PTY's driven input then (keys, pastes, control writes).
     pub(crate) input: Option<aterm_session::sink::DrivenInput>,
-    /// The terminal's foreground process group then.
     pub(crate) fg_pgrp: i32,
-    /// The shell's executable then.
     pub(crate) image: Option<PathBuf>,
-    /// The alternate screen was up.
     pub(crate) alt_screen: bool,
 }
 
-/// What a session's reader, host callbacks and control seams witness that the
-/// spare's gate reads (design §4, §5.2, §5.4). Every session has one; a spare's
-/// is its [`SpareLink`]'s. Cheap: the reader pays two `Option::take`s per
-/// batch, and the syscalls run once per session, when its start mark arrives.
+/// Per-session startup and host-effect observations read by the spare gate.
 #[derive(Default)]
 pub(crate) struct Witness {
     pub(crate) parked_seen: OnceLock<Instant>,
     pub(crate) start_seen: OnceLock<StartSeen>,
-    /// Host effects the real callbacks delivered (bell, notification, clipboard).
     pub(crate) host_effects: AtomicU32,
-    /// Control requests that resolved to this session before its start mark.
     pub(crate) early_control: AtomicU32,
-    /// Askpass requests from inside this session before its start mark.
     pub(crate) askpass: AtomicU32,
-    /// The shell's pid and the executable it ran when spawned.
     pub(crate) shell: OnceLock<(i32, Option<PathBuf>)>,
-    /// The shell's pid version when spawned ([`launched_before`]): every
-    /// process its run makes takes a later one.
     shell_version: OnceLock<i32>,
-    /// A spare's FIFO is still held: the reader closes it at the first prompt.
     fifo_held: AtomicBool,
     fifo: Mutex<Option<SpareFifo>>,
-    /// The `aterm-spare` thread waits for this session's start record.
     observed: AtomicBool,
-    /// How this session's shell started, when it was an adopted spare: its
-    /// tier and its age at the adoption (`status born=`).
     born: OnceLock<(&'static str, u128)>,
 }
 
 impl Witness {
-    /// Record the shell this session runs, at spawn, with its pid `version`
-    /// as [`shell_version`] read it the moment the spawn returned.
+    /// Record the spawned shell pid, executable path, and pid version.
     pub(crate) fn note_shell(&self, pid: i32, version: Option<i32>) {
         let _ = self.shell.set((pid, shell_image(pid)));
         if let Some(version) = version {
@@ -216,14 +129,13 @@ impl Witness {
         }
     }
 
-    /// Hold `fifo` until the shell's first prompt start (or the session's end).
+    /// Hold `fifo` until the shell starts its first prompt or the session ends.
     pub(crate) fn hold_fifo(&self, fifo: SpareFifo) {
         *self.fifo.lock().unwrap_or_else(|p| p.into_inner()) = Some(fifo);
         self.fifo_held.store(true, Ordering::Release);
     }
 
-    /// Write one protocol line to the held FIFO; `false` when none is held or
-    /// the write failed.
+    /// Write a protocol line to the held FIFO.
     pub(crate) fn tell(&self, line: &str) -> bool {
         self.fifo
             .lock()
@@ -232,13 +144,13 @@ impl Witness {
             .is_some_and(|f| f.tell(line).is_ok())
     }
 
-    /// Let go of the FIFO: closed and unlinked as it drops.
+    /// Take and release the held FIFO.
     pub(crate) fn take_fifo(&self) -> Option<SpareFifo> {
         self.fifo_held.store(false, Ordering::Release);
         self.fifo.lock().unwrap_or_else(|p| p.into_inner()).take()
     }
 
-    /// `status`'s `born=` (and `spare_age_ms=` for an adopted spare).
+    /// Format `born=` and `spare_age_ms=` status fields.
     pub(crate) fn born_fields(&self) -> String {
         match self.born.get() {
             Some((tier, age)) => format!("born=spare-{tier} spare_age_ms={age}"),
@@ -247,10 +159,7 @@ impl Witness {
     }
 }
 
-/// The reader's capture after each processed chunk, under the term lock it
-/// already holds (design §4): a signed parked mark, a signed start record (with
-/// the session's state at that instant), and, for an adopted spare, the first
-/// prompt start, which proves the shell left every hold, so the FIFO goes.
+/// Record parked/start marks and release the FIFO on first prompt after processing a PTY chunk.
 #[cfg(unix)]
 pub(crate) fn witness_after_process(
     w: &Witness,
@@ -280,11 +189,7 @@ pub(crate) fn witness_after_process(
     }
 }
 
-/// `pid`'s pid version now ([`launched_before`]): read by the spawn as soon as
-/// its fork's exec is confirmed, milliseconds ahead of the shell's startup
-/// files (zsh's first `.zshenv` line: 2.18 ms after, median of 30), as an
-/// `exec` there takes a newer version than any process the rc started before
-/// it holds as its launcher's (`None` where the platform cannot say).
+/// Read `pid`'s kernel pid version (`p_idversion` on macOS).
 pub(crate) fn shell_version(pid: i32) -> Option<i32> {
     #[cfg(target_os = "macos")]
     {
@@ -300,8 +205,6 @@ pub(crate) fn shell_version(pid: i32) -> Option<i32> {
     }
 }
 
-/// `pid`'s executable, where the platform can say (Linux: the
-/// `/proc/<pid>/exe` link, read between two matching start records).
 fn shell_image(pid: i32) -> Option<PathBuf> {
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     {
@@ -316,25 +219,13 @@ fn shell_image(pid: i32) -> Option<PathBuf> {
     }
 }
 
-// ─── The FIFO (design §3.1) ───
-
-/// A spare's hold FIFO, `<control dir>/spare/<pid>-<birth>-<sid>` (this
-/// process's pid and start time: [`sweep_dead_fifos`] tells a crashed owner's
-/// from a live one's by them), with the symlink `spare/<sid>` beside it, the
-/// name the shell derives from its re-key path. 0600 in a 0700 folder, made
-/// before the fork and held open read-write for the spare's life, so the
-/// shell's open never blocks, a line written before the shell reads waits in
-/// the pipe, and nothing aterm writes can become typed input. Dropped, its
-/// names are unlinked and it is closed.
+/// Hold FIFO (`<control dir>/spare/<pid>-<birth>-<sid>`) and its `<sid>` symlink.
 pub(crate) struct SpareFifo {
     path: PathBuf,
-    /// The shell's name for it (`None`: a test's FIFO, opened at its path).
     link: Option<PathBuf>,
     file: std::fs::File,
 }
 
-/// `<pid>-<birth>`, this process's half of its FIFOs' names
-/// ([`aterm_pty::process_birth`]; a birth it cannot read is `0`).
 #[cfg(unix)]
 fn fifo_owner() -> &'static str {
     static OWNER: OnceLock<String> = OnceLock::new();
@@ -348,7 +239,6 @@ fn fifo_owner() -> &'static str {
     })
 }
 
-/// A FIFO name's owner and sid: `<pid>-<birth>-<sid>`, the sid a minted one.
 #[cfg(unix)]
 fn fifo_name_parts(name: &str) -> Option<(u32, u64, &str)> {
     let mut parts = name.splitn(3, '-');
@@ -359,7 +249,7 @@ fn fifo_name_parts(name: &str) -> Option<(u32, u64, &str)> {
 }
 
 impl SpareFifo {
-    /// Make session `sid`'s FIFO and its link, and open it.
+    /// Create and open session `sid`'s FIFO and symlink.
     #[cfg(unix)]
     pub(crate) fn make(sid: &aterm_session::SessionId) -> std::io::Result<Self> {
         let dir = crate::control_auth::private_subdir(aterm_core::shell_integration::SPARE_DIR)
@@ -368,7 +258,6 @@ impl SpareFifo {
             .ok_or_else(|| std::io::Error::other("not a minted sid"))?;
         let name = format!("{}-{}", fifo_owner(), sid.as_str());
         let mut fifo = Self::make_at(dir.join(&name))?;
-        // Relative, so it names the FIFO beside it wherever the folder is reached from.
         std::os::unix::fs::symlink(&name, &link)?;
         fifo.link = Some(link);
         Ok(fifo)
@@ -379,7 +268,7 @@ impl SpareFifo {
         Err(std::io::Error::other("no spare off unix"))
     }
 
-    /// A FIFO at `path`, opened, with no link (a test's; [`Self::make`]'s).
+    /// Create and open a FIFO at `path` without a symlink.
     #[cfg(unix)]
     pub(crate) fn make_at(path: PathBuf) -> std::io::Result<Self> {
         use std::os::unix::ffi::OsStrExt as _;
@@ -408,8 +297,6 @@ impl SpareFifo {
         }
     }
 
-    /// Write `line` and its newline. The pipe is empty and the write tiny, so
-    /// it never blocks (the descriptor is non-blocking regardless).
     fn tell(&self, line: &str) -> std::io::Result<()> {
         use std::io::Write as _;
         (&self.file).write_all(format!("{line}\n").as_bytes())
@@ -425,14 +312,7 @@ impl Drop for SpareFifo {
     }
 }
 
-/// Release and remove the FIFOs a crashed aterm left in `dir` (design §3.1).
-/// Each `<pid>-<birth>-<sid>` whose owner is gone (no process under the pid, or
-/// another one born at another time) is opened for writing, which wakes a
-/// spare still blocked opening it (one whose rc ignored the hangup); then its
-/// link and itself are unlinked, and only then closed, so that shell reads
-/// end-of-file, finds no FIFO and exits. A live owner's FIFO (this process's
-/// too), and any entry that names no owner, is left. Once per process, on the
-/// `aterm-spare` thread.
+/// Wake and unlink stale spare FIFOs left in `dir` by dead owner processes.
 #[cfg(unix)]
 pub(crate) fn sweep_dead_fifos(dir: &Path) {
     use std::os::unix::fs::{FileTypeExt as _, OpenOptionsExt as _};
@@ -461,10 +341,6 @@ pub(crate) fn sweep_dead_fifos(dir: &Path) {
     }
 }
 
-/// Whether the process that named a FIFO `<pid>-<birth>-…` still runs: a live
-/// pid whose start time is `birth`, or one whose start time cannot be read now
-/// or could not be when the name was made (`0`, [`fifo_owner`]): both left
-/// alone, as unproven.
 #[cfg(unix)]
 fn fifo_owner_alive(pid: u32, birth: u64) -> bool {
     aterm_uds::process::pid_alive(pid)
@@ -475,9 +351,7 @@ fn fifo_owner_alive(pid: u32, birth: u64) -> bool {
                 .is_none_or(|now| now == birth))
 }
 
-// ─── The link: a spare's reader, swallowed until adoption (design §5.3) ───
-
-/// Taint kinds: what a spare's program asked of the host before anyone owned it.
+/// Bitflags recording pre-adoption host effects requested by a spare.
 pub(crate) mod taint {
     pub(crate) const BELL: u32 = 1;
     pub(crate) const NOTIFY: u32 = 1 << 1;
@@ -486,38 +360,30 @@ pub(crate) mod taint {
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub(crate) const WINDOW_OP: u32 = 1 << 4;
     pub(crate) const CONTROL: u32 = 1 << 5;
-    /// Only macOS answers sudo's askpass ([`askpass_refused`]).
+    /// Askpass request from inside the spare (macOS only; [`askpass_refused`]).
     #[cfg(target_os = "macos")]
     pub(crate) const ASKPASS: u32 = 1 << 6;
 }
 
-/// What a spare's reader tells the main thread before adoption.
+/// Lifecycle notifications sent from a spare's reader or worker thread to the main thread.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum SpareNote {
-    /// It waits at the parked hold.
     Parked,
-    /// Its start record arrived.
     AtStart,
-    /// Its PTY closed.
     Gone,
-    /// The `aterm-spare` thread's verdict on a warm spare at its hold.
     Verified(Verdict),
-    /// The learned gate changed (`id` is 0).
     Gate,
 }
 
-/// A verification's outcome.
+/// Outcome of verifying a warm spare at its hold.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Verdict {
     Ok,
-    /// Ineligible until the generation changes.
     Deterministic(&'static str),
-    /// Backoff: an hour, then a day.
     Backoff(&'static str),
 }
 
-/// The state a spare's reader and the main thread share: whether it is live
-/// (adopted), which window owns it then, and what its reader reported before.
+/// Shared state between a spare's PTY reader and the main thread.
 pub(crate) struct SpareLink {
     pub(crate) id: u64,
     pub(crate) witness: Arc<Witness>,
@@ -528,7 +394,6 @@ pub(crate) struct SpareLink {
     parked_noted: AtomicBool,
     start_noted: AtomicBool,
     taint: AtomicU32,
-    /// Where its notes and (once live) its wakes go: the event loop's proxy.
     poster: Option<crate::spawn::WakePost>,
 }
 
@@ -548,7 +413,7 @@ impl SpareLink {
         }
     }
 
-    /// Record what the program asked of the host (a [`taint`] kind).
+    /// Record a pre-adoption host effect ([`taint`]).
     pub(crate) fn taint(&self, kind: u32) {
         self.taint.fetch_or(kind, Ordering::AcqRel);
     }
@@ -570,7 +435,7 @@ impl SpareLink {
         self.live.load(Ordering::Acquire)
     }
 
-    /// Adopted into `window`: every later wake is the session's.
+    /// Mark the spare as adopted into `window` so subsequent wakes are forwarded.
     pub(crate) fn go_live(&self, window: WindowId) {
         self.window.store(window.0, Ordering::Release);
         self.live.store(true, Ordering::Release);
@@ -580,12 +445,7 @@ impl SpareLink {
         self.poster.as_ref().is_some_and(|post| post(wake))
     }
 
-    /// Decide one wake the reader posts (design §5.3). Live: forwarded, its
-    /// window rewritten to the owner's. Not live: `Output` returns `false`
-    /// (the documented headless path, which clears the latch) after noting a
-    /// parked or start mark once each; `Ready` is remembered; `Exit` becomes
-    /// [`SpareNote::Gone`] and never reaches `user_event` (an `Exit` revokes a
-    /// pending update); anything else is dropped.
+    /// Route a reader wake: forward if live, or convert to [`SpareNote`] while unowned.
     pub(crate) fn decide(&self, wake: Wake) -> bool {
         if self.live.load(Ordering::Acquire) {
             let owner = WindowId(self.window.load(Ordering::Acquire));
@@ -642,21 +502,20 @@ impl SpareLink {
         }
     }
 
-    /// The reader's post for this spare.
+    /// Build the [`crate::spawn::WakePost`] callback for this spare's reader.
     pub(crate) fn post(self: &Arc<Self>) -> crate::spawn::WakePost {
         let link = Arc::clone(self);
         Arc::new(move |wake| link.decide(wake))
     }
 }
 
-/// What a spare's factory copy carries ([`crate::spawn::SessionFactory::spare`]).
+/// Spare link carried on [`crate::spawn::SessionFactory::spare`].
 #[derive(Clone)]
 pub(crate) struct SpareSpawn {
     pub(crate) link: Arc<SpareLink>,
 }
 
-/// A spare's spawn refused because its folder would fall back
-/// (`spawn::spawn_session`): nothing was forked.
+/// Error returned when a spare's target working directory would fall back.
 #[derive(Debug)]
 pub(crate) struct FolderFallsBack;
 
@@ -668,10 +527,7 @@ impl std::fmt::Display for FolderFallsBack {
 
 impl std::error::Error for FolderFallsBack {}
 
-/// A spare's host callbacks (design §5.2 step 4): the bell, notifications,
-/// clipboard, kitty file reads and window operations only taint it, and the
-/// clipboard query is revoked, so the reader never prefetches the pasteboard.
-/// Adoption replaces them with the cold path's own (`spawn::arm_host_reach`).
+/// Install pre-adoption host callbacks on `term` that only taint `link`.
 pub(crate) fn wire_spare_taint(term: &Arc<Mutex<Terminal>>, link: &Arc<SpareLink>) {
     use aterm_core::terminal::ClipboardAccess;
     let mut t = crate::term_lock(term);
@@ -702,10 +558,6 @@ pub(crate) fn wire_spare_taint(term: &Arc<Mutex<Terminal>>, link: &Arc<SpareLink
     }
 }
 
-// ─── Control and askpass (design §5.4) ───
-
-/// The live spare's sid and shell pid, consulted only on a request's
-/// not-found path and by askpass: live sessions pay nothing.
 static SPARE_SIDS: std::sync::RwLock<Option<(aterm_session::SessionId, i32, Arc<SpareLink>)>> =
     std::sync::RwLock::new(None);
 
@@ -713,12 +565,7 @@ fn publish_spare_sid(entry: Option<(aterm_session::SessionId, i32, Arc<SpareLink
     *SPARE_SIDS.write().unwrap_or_else(|p| p.into_inner()) = entry;
 }
 
-/// Whether the client this thread serves runs inside the session led by
-/// `leader` (its `getsid`).
 fn peer_inside(leader: i32) -> bool {
-    // Read the actual writer now, under the serving lane's scoped direct
-    // connection. Binary headers and handed-off subscriptions use the same
-    // context; inherited bridge descriptors establish no local pid lineage.
     let peer = crate::control::serving_peer_pid().and_then(|pid| i32::try_from(pid).ok());
     #[cfg(unix)]
     {
@@ -732,10 +579,7 @@ fn peer_inside(leader: i32) -> bool {
     }
 }
 
-/// A control request named no registered session: when it named the spare —
-/// its sid, which nobody outside it knows, or its reserved local id from a
-/// client inside it — the spare is tainted. The caller answers `ERR no such
-/// session` either way.
+/// Taint the active spare if an unmatched control request targeted its session.
 pub(crate) fn control_refusal(sid: Option<&aterm_session::SessionId>, local: Option<u64>) {
     let guard = SPARE_SIDS.read().unwrap_or_else(|p| p.into_inner());
     if let Some((spare_sid, pid, link)) = guard.as_ref()
@@ -745,9 +589,7 @@ pub(crate) fn control_refusal(sid: Option<&aterm_session::SessionId>, local: Opt
     }
 }
 
-/// A control request resolved to a registered session: one from a client
-/// inside it, before its start mark, is its rc's and is counted against its
-/// generation. A driver polling the new tab from outside counts nothing.
+/// Count control requests originating from inside `witness`'s session before its start mark.
 pub(crate) fn note_control(witness: &Witness) {
     if witness.start_seen.get().is_none()
         && let Some((pid, _)) = witness.shell.get()
@@ -757,10 +599,7 @@ pub(crate) fn note_control(witness: &Witness) {
     }
 }
 
-/// An askpass request whose invoker's session is led by `invoker_sid_leader`
-/// (`getsid` of the invoker): refused when that is the spare (and the spare is
-/// tainted); counted for an observed session before its start mark. The askpass
-/// lane is macOS's (`control_askpass`).
+/// Refuse and taint askpass requests from an unowned spare, or count early requests on observed sessions.
 #[cfg(target_os = "macos")]
 pub(crate) fn askpass_refused(invoker_pid: i32) -> bool {
     #[cfg(unix)]
@@ -792,53 +631,32 @@ pub(crate) fn askpass_refused(invoker_pid: i32) -> bool {
     false
 }
 
-/// Sessions whose start record the gate waits for, by shell pid (askpass's
-/// lookup). Pruned as observations are evaluated.
 static OBSERVED: Mutex<Vec<(i32, std::sync::Weak<Witness>)>> = Mutex::new(Vec::new());
 
-// ─── The rc generation (design §7.1) ───
-
-/// What an rc generation is computed from, captured on the main thread (cheap)
-/// and stamped off it (`$HOME` may be a network volume).
+/// Inputs captured on the main thread to compute an rc generation stamp.
 #[derive(Clone, Debug)]
 pub(crate) struct GenInputs {
     pub(crate) shell: aterm_core::shell_integration::ShellType,
-    /// The resolved shell binary.
     pub(crate) shell_path: PathBuf,
-    /// `$HOME`.
     pub(crate) home: PathBuf,
-    /// The launch environment's ZDOTDIR, else `$HOME`.
     pub(crate) launch_zdotdir: PathBuf,
-    /// [`crate::spawn::SessionFactory::spawn_fingerprint`].
     pub(crate) fingerprint: u64,
-    /// The containment mode's level.
     pub(crate) containment: u8,
 }
 
-/// What the last judged start record said of where a shell's startup files
-/// are: the final rc folder (`AtermStartRc`: zsh's ZDOTDIR, fish's
-/// `$__fish_config_dir`) and fish's other roots (`AtermStartRoots`). The
-/// generation is stamped over the files they hold, so a folder a shell reads
-/// is one it named, never one guessed (R7).
+/// Startup directory and root paths reported by the most recent start mark.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Reported {
-    /// The final rc folder.
     pub(crate) rc_dir: Option<PathBuf>,
-    /// fish's sysconf folder, then each vendor conf.d folder its conf.d loop
-    /// walks; `None` until a record names them.
     pub(crate) roots: Option<Vec<PathBuf>>,
 }
 
-/// A start record's roots as paths.
 fn roots_of(mark: &StartMark) -> Option<Vec<PathBuf>> {
     mark.roots
         .as_ref()
         .map(|roots| roots.iter().map(PathBuf::from).collect())
 }
 
-/// The files a shell of `inputs.shell` reads at start, for the folders the
-/// last record reported (before any report: the launch ZDOTDIR or HOME, and
-/// fish's XDG default with no other root).
 fn rc_paths(inputs: &GenInputs, reported: &Reported) -> Vec<PathBuf> {
     use aterm_core::shell_integration::ShellType;
     let z = reported.rc_dir.as_deref();
@@ -848,8 +666,6 @@ fn rc_paths(inputs: &GenInputs, reported: &Reported) -> Vec<PathBuf> {
             for f in ["/etc/zshenv", "/etc/zprofile", "/etc/zshrc", "/etc/zlogin"] {
                 paths.push(PathBuf::from(f));
             }
-            // Debian, Ubuntu and Arch build zsh to read its global files
-            // from /etc/zsh/ instead.
             if cfg!(target_os = "linux") {
                 for f in ["zshenv", "zprofile", "zshrc", "zlogin"] {
                     paths.push(Path::new("/etc/zsh").join(f));
@@ -863,17 +679,6 @@ fn rc_paths(inputs: &GenInputs, reported: &Reported) -> Vec<PathBuf> {
             }
         }
         ShellType::Fish => {
-            // What fish's share/config.fish sources: every `*.fish` of the
-            // user's conf.d, the sysconf conf.d and each vendor conf.d folder,
-            // then the sysconf and the user's `config.fish`. The user's folder
-            // is the last reported rc folder (`$__fish_config_dir`), else the
-            // XDG default; the sysconf folder and the vendor ones are the
-            // roots the record named — a build-configured sysconf folder and
-            // every inherited `$XDG_DATA_DIRS` entry included, which no guess
-            // from the binary's prefix finds. conf.d entries are stamped one
-            // by one (an edit in place moves no folder's mtime), and so are
-            // the user's `themes` folder's: fish 4.3 and later read its
-            // `default.theme`, when there is one, at every interactive start.
             let mut folders: Vec<PathBuf> = Vec::new();
             if let Some((sysconf, vendor)) = reported.roots.as_deref().and_then(<[_]>::split_first)
             {
@@ -901,7 +706,6 @@ fn rc_paths(inputs: &GenInputs, reported: &Reported) -> Vec<PathBuf> {
             for f in ["/etc/profile", "/etc/bashrc"] {
                 paths.push(PathBuf::from(f));
             }
-            // The system bashrc a non-login Linux bash reads before its rcfile.
             if cfg!(target_os = "linux") {
                 paths.push(PathBuf::from("/etc/bash.bashrc"));
             }
@@ -911,19 +715,12 @@ fn rc_paths(inputs: &GenInputs, reported: &Reported) -> Vec<PathBuf> {
         }
     }
     push_entries(&mut paths, inputs.home.join(".aterm").join("shell.d"));
-    // What macOS's path_helper reads into a login shell's PATH (from
-    // /etc/zprofile, /etc/profile or fish's own startup): an installer puts a
-    // tool's folder on it by adding a file to /etc/paths.d (Go's, MacTeX's),
-    // and the next tab must find the tool. Each entry is stamped too: an
-    // existing file can change in place without moving the folder's mtime.
     paths.push(PathBuf::from("/etc/paths"));
     push_entries(&mut paths, PathBuf::from("/etc/paths.d"));
     paths.push(inputs.shell_path.clone());
     paths
 }
 
-/// `dir`'s entries, sorted, then `dir` itself: an entry edited in place moves
-/// no folder's mtime, so each is stamped.
 fn push_entries(paths: &mut Vec<PathBuf>, dir: PathBuf) {
     if let Ok(entries) = std::fs::read_dir(&dir) {
         let mut names: Vec<PathBuf> = entries.flatten().map(|e| e.path()).collect();
@@ -933,10 +730,7 @@ fn push_entries(paths: &mut Vec<PathBuf>, dir: PathBuf) {
     paths.push(dir);
 }
 
-/// The rc generation: a metadata stamp over every startup file, each shell.d
-/// entry, path_helper's list, the shell binary, the script set, the factory
-/// and the containment mode (design §7.1). HISTFILE is not in it: the release
-/// re-reads history.
+/// Compute the non-zero metadata hash over shell startup files, hooks, binary, and factory state.
 pub(crate) fn rc_generation(inputs: &GenInputs, reported: &Reported) -> u64 {
     use std::hash::{Hash as _, Hasher as _};
     let mut h = std::collections::hash_map::DefaultHasher::new();
@@ -945,30 +739,22 @@ pub(crate) fn rc_generation(inputs: &GenInputs, reported: &Reported) -> u64 {
     aterm_core::shell_integration::script_set_address().hash(&mut h);
     inputs.fingerprint.hash(&mut h);
     inputs.containment.hash(&mut h);
-    // Never 0: 0 means "no generation" in the mirror.
     h.finish().max(1)
 }
 
-// ─── The learned gate (design §7.1), on the aterm-spare thread ───
-
-/// One generation's record.
+/// Persisted gate state for one rc generation.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct GenRecord {
     pub(crate) hash: u64,
     pub(crate) streak: u32,
-    /// Unix seconds; `u64::MAX` until the generation changes; 0 none.
     pub(crate) ineligible_until: u64,
-    /// Unix seconds of backoff failures in the last day.
     pub(crate) failures: Vec<u64>,
-    /// The longest qualifying rc run, in ms.
     pub(crate) max_rc_ms: u32,
-    /// The deterministic reason, when `ineligible_until` is `u64::MAX`.
     pub(crate) reason: String,
-    /// Last touched (unix seconds), for keeping the newest [`GATE_KEEP`].
     pub(crate) touched: u64,
 }
 
-/// A visible run's verdict.
+/// Verdict on a visible shell startup run.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Sample {
     Clean { rc_ms: u32 },
@@ -976,7 +762,7 @@ pub(crate) enum Sample {
     Inconclusive,
 }
 
-/// The per-generation gate: streaks, backoffs, persistence.
+/// Learned per-generation eligibility streaks, backoffs, and persistence.
 #[derive(Default)]
 pub(crate) struct GateBook {
     gens: Vec<GenRecord>,
@@ -984,14 +770,12 @@ pub(crate) struct GateBook {
     loaded: bool,
 }
 
-/// Unix seconds now.
 fn unix_now() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs())
 }
 
-/// Parse one complete persisted snapshot, or discard all of its eligibility.
 fn parse_gate_records(text: &str) -> Option<Vec<GenRecord>> {
     let mut gens: Vec<GenRecord> = Vec::new();
     for line in text.lines() {
@@ -1037,7 +821,6 @@ impl GateBook {
         }
     }
 
-    /// Read the file once, lazily, on the first decision.
     fn load(&mut self) {
         if std::mem::replace(&mut self.loaded, true) {
             return;
@@ -1047,14 +830,12 @@ impl GateBook {
                 .and_then(|bytes| String::from_utf8(bytes).ok())
         });
         let Some(text) = text else { return };
-        // A malformed cache is unknown, never partial evidence for running rc files unseen.
         let Some(gens) = parse_gate_records(&text) else {
             return;
         };
         self.gens = gens;
     }
 
-    /// Write the file (temp + rename), keeping the newest [`GATE_KEEP`].
     fn persist(&mut self) {
         self.gens.sort_by_key(|g| std::cmp::Reverse(g.touched));
         self.gens.truncate(GATE_KEEP);
@@ -1084,7 +865,6 @@ impl GateBook {
             use std::os::unix::fs::OpenOptionsExt as _;
             options.mode(0o600);
         }
-        // A collision is not ours to truncate, follow, or remove.
         let Ok(mut file) = options.open(&tmp) else {
             return;
         };
@@ -1092,7 +872,6 @@ impl GateBook {
         let written = file.write_all(text.as_bytes());
         drop(file);
         if written.is_err() || std::fs::rename(&tmp, path).is_err() {
-            // Only this successful exclusive creation established ownership.
             let _ = std::fs::remove_file(&tmp);
         }
     }
@@ -1120,7 +899,7 @@ impl GateBook {
         g
     }
 
-    /// Fold one visible run of generation `hash` in.
+    /// Record a visible run sample for generation `hash`.
     pub(crate) fn sample(&mut self, hash: u64, sample: Sample) {
         let g = self.entry(hash);
         match sample {
@@ -1134,12 +913,12 @@ impl GateBook {
         self.persist();
     }
 
-    /// A spare of generation `hash` failed.
+    /// Record a warm spare verification failure for generation `hash`.
     pub(crate) fn fail(&mut self, hash: u64, verdict: Verdict) {
         self.fail_at(hash, verdict, unix_now());
     }
 
-    /// [`Self::fail`] at unix second `now`.
+    /// Record a failure for `hash` at unix second `now`.
     pub(crate) fn fail_at(&mut self, hash: u64, verdict: Verdict, now: u64) {
         let g = self.entry(hash);
         g.streak = 0;
@@ -1165,12 +944,12 @@ impl GateBook {
         self.persist();
     }
 
-    /// Whether generation `hash` may run unseen now.
+    /// Whether generation `hash` is currently eligible to run unseen.
     pub(crate) fn eligible(&mut self, hash: u64) -> bool {
         self.eligible_at(hash, unix_now())
     }
 
-    /// [`Self::eligible`] at unix second `now`.
+    /// Whether generation `hash` is eligible at unix second `now`.
     pub(crate) fn eligible_at(&mut self, hash: u64, now: u64) -> bool {
         self.load();
         self.gens
@@ -1179,7 +958,7 @@ impl GateBook {
             .is_some_and(|g| g.streak >= CLEAN_STREAK && now >= g.ineligible_until)
     }
 
-    /// The metrics word for `hash` (design §10).
+    /// Metrics status string for generation `hash`.
     pub(crate) fn report(&mut self, hash: u64) -> String {
         self.load();
         let now = unix_now();
@@ -1192,8 +971,7 @@ impl GateBook {
         }
     }
 
-    /// `T_READY` for `hash`: four times its longest qualifying rc run, in
-    /// [1 s, 8 s].
+    /// Warm readiness deadline (`T_READY`) for generation `hash`.
     pub(crate) fn t_ready(&mut self, hash: u64) -> Duration {
         self.load();
         let rc = self
@@ -1205,9 +983,7 @@ impl GateBook {
     }
 }
 
-// ─── The escape scan (design §7.1) ───
-
-/// A scan's outcome.
+/// Outcome of an escape scan over processes started during a shell's rc run.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Scan {
     #[cfg_attr(
@@ -1226,13 +1002,10 @@ pub(crate) enum Scan {
         )
     )]
     Escaped,
-    /// The kernel did not provide a complete, stable observation.
     Unknown,
     RateLimited,
 }
 
-/// `proc_pidinfo(PROC_PIDT_BSDINFOWITHUNIQID)`'s record (`<sys/proc_info.h>`):
-/// the BSD info and the unique ids XNU keeps for a process and its parent.
 #[cfg(target_os = "macos")]
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -1250,33 +1023,16 @@ struct BsdInfoWithUniqId {
 #[cfg(target_os = "macos")]
 const PROC_PIDT_BSDINFOWITHUNIQID: libc::c_int = 18;
 
-/// Whether pid version `launcher` was handed out before `shell`'s. XNU takes
-/// each process's version from one counter for the whole host, at its fork and
-/// again at each exec (measured on Darwin 27: consecutive forks read
-/// consecutive versions, an exec takes the next one), and an orphan keeps its
-/// launcher's as its `p_orig_ppidversion`. Every process a run makes is forked
-/// after its shell's spawn, by the shell or a process forked after it, so its
-/// version, and every version it hands its children, comes later: an orphan
-/// whose launcher's is older was started by none of the run. Compared across a
-/// wrap of the counter (`i32`).
 #[cfg(target_os = "macos")]
 fn launched_before(launcher: i32, shell: i32) -> bool {
     shell.wrapping_sub(launcher) > 0
 }
 
-/// launchd's pid version (`PROC_PIDUNIQIDENTIFIERINFO` of pid 1, which any
-/// process may read): every process launchd itself starts names it as its
-/// original parent's (`p_orig_ppidversion`), and an orphan launchd adopts
-/// keeps its own original parent's through the adoption and any later exec
-/// (measured on Darwin 27: Spotlight's `mdworker_shared` and `xpcproxy` name
-/// launchd's, 1026; an orphan that execs once adopted names its launcher's,
-/// though its `p_puniqueid` then reads as launchd's). `None` when unreadable.
 #[cfg(target_os = "macos")]
 fn launchd_idversion() -> Option<i32> {
     uniq_identifier(1).map(|info| info.p_idversion)
 }
 
-/// `<sys/proc_info.h>`'s `proc_uniqidentifierinfo`.
 #[cfg(target_os = "macos")]
 #[repr(C)]
 struct UniqIdentifierInfo {
@@ -1289,15 +1045,12 @@ struct UniqIdentifierInfo {
     p_reserve3: u64,
 }
 
-/// `pid`'s identifiers (`PROC_PIDUNIQIDENTIFIERINFO`), which any process may
-/// read, another user's too. `None` when unreadable.
 #[cfg(target_os = "macos")]
 fn uniq_identifier(pid: i32) -> Option<UniqIdentifierInfo> {
     const PROC_PIDUNIQIDENTIFIERINFO: libc::c_int = 17;
     let mut info = std::mem::MaybeUninit::<UniqIdentifierInfo>::zeroed();
     let size = std::mem::size_of::<UniqIdentifierInfo>() as libc::c_int;
-    // SAFETY: `info` is `size` writable bytes; the kernel writes at most that
-    // many and returns how many it wrote.
+    // SAFETY: `info` is `size` writable bytes; the kernel writes at most `size` bytes.
     let n = unsafe {
         libc::proc_pidinfo(
             pid,
@@ -1311,9 +1064,6 @@ fn uniq_identifier(pid: i32) -> Option<UniqIdentifierInfo> {
     (n == size).then(|| unsafe { info.assume_init() })
 }
 
-/// `pid`'s parent from its short record, which a process of another user
-/// answers too (a set-user-id program refuses the full record with `EPERM`,
-/// measured on Darwin 27). `None` when it cannot be read.
 #[cfg(target_os = "macos")]
 fn short_parent(pid: i32) -> Option<i32> {
     let info = aterm_uds::process::read_short_info(pid)?;
@@ -1324,8 +1074,7 @@ fn short_parent(pid: i32) -> Option<i32> {
 fn bsdinfo_uniq(pid: i32) -> Option<BsdInfoWithUniqId> {
     let mut info = std::mem::MaybeUninit::<BsdInfoWithUniqId>::zeroed();
     let size = std::mem::size_of::<BsdInfoWithUniqId>() as libc::c_int;
-    // SAFETY: `info` is `size` writable bytes; the kernel writes at most that
-    // many and returns how many it wrote.
+    // SAFETY: `info` is `size` writable bytes; the kernel writes at most `size` bytes.
     let n = unsafe {
         libc::proc_pidinfo(
             pid,
@@ -1339,43 +1088,26 @@ fn bsdinfo_uniq(pid: i32) -> Option<BsdInfoWithUniqId> {
     (n == size).then(|| unsafe { info.assume_init() })
 }
 
-/// Whether `pid` positively reads as a zombie (`SZOMB`). Beginning exit
-/// does not establish resource teardown. An empty process-table response
-/// remains uncertain rather than proving the absence of resource holders:
-/// a pid reaped mid-scan is settled by a later listing no longer naming it
-/// ([`escape_scan_with_owner`]'s settling listings), not by this read.
 #[cfg(target_os = "macos")]
 fn exited(pid: i32) -> bool {
     let (rc, record, size) = process_table_record(pid);
     exited_observation(rc, &record, size)
 }
 
-/// Whether `pid`'s process-table record says it was born before `when`. One
-/// older than the shell is no process of its run, which only a process started
-/// after the shell can be (design §7.1), whatever its exit state: the record
-/// outlives the `proc_pidinfo` one through an exit, so it settles a process
-/// wedged mid-exit (measured on m3: a `bash` in `E` and its `sleep` in `U` for
-/// 18 days, which left every scan `Unknown` and the warm spare cold for good).
-/// An absent or short record says nothing.
 #[cfg(target_os = "macos")]
 fn born_before(pid: i32, when: std::time::SystemTime) -> bool {
     let (rc, record, size) = process_table_record(pid);
     born_before_observation(rc, &record, size, when)
 }
 
-/// The process table's record of `pid`: `sysctl`'s code, the record, and how
-/// many bytes of it the kernel wrote.
 #[cfg(target_os = "macos")]
 fn process_table_record(pid: i32) -> (libc::c_int, [u8; 1024], usize) {
-    // `KERN_PROC`, `KERN_PROC_PID` (`<sys/sysctl.h>`) and the LP64
-    // `kinfo_proc` response, which the workspace's libc does not export.
     const KERN_PROC: libc::c_int = 14;
     const KERN_PROC_PID: libc::c_int = 1;
     let mut mib = [libc::CTL_KERN, KERN_PROC, KERN_PROC_PID, pid];
     let mut record = [0u8; 1024];
     let mut size: libc::size_t = record.len();
-    // SAFETY: `record` holds `size` writable bytes and `size` says so; the
-    // kernel writes at most that many and updates `size` to what it wrote.
+    // SAFETY: `record` holds `size` writable bytes and `size` reports capacity.
     let rc = unsafe {
         libc::sysctl(
             mib.as_mut_ptr(),
@@ -1389,9 +1121,6 @@ fn process_table_record(pid: i32) -> (libc::c_int, [u8; 1024], usize) {
     (rc, record, size)
 }
 
-/// Interpret the process-table response's start time (`kp_proc.p_starttime`,
-/// the LP64 record's first field: a `timeval`, `tv_sec` an i64 then `tv_usec` an
-/// i32) without performing a process query.
 #[cfg(target_os = "macos")]
 fn born_before_observation(
     rc: libc::c_int,
@@ -1418,7 +1147,6 @@ fn born_before_observation(
     std::time::UNIX_EPOCH + Duration::from_secs(sec) + Duration::from_micros(usec) < when
 }
 
-/// Interpret the process-table response without performing a process query.
 #[cfg(target_os = "macos")]
 fn exited_observation(rc: libc::c_int, record: &[u8], size: usize) -> bool {
     const P_STAT: usize = 36;
@@ -1428,9 +1156,6 @@ fn exited_observation(rc: libc::c_int, record: &[u8], size: usize) -> bool {
     u32::from(record[P_STAT]) == libc::SZOMB
 }
 
-// `<sys/proc_info.h>` / `<libproc.h>`: the uid-filtered listing returns
-// bytes, unlike proc_listallpids' pid count. Other users' protected processes
-// cannot turn a complete observation of our uid into an unreadable one.
 #[cfg(target_os = "macos")]
 const PROC_UID_ONLY: u32 = 4;
 #[cfg(target_os = "macos")]
@@ -1443,12 +1168,7 @@ unsafe extern "C" {
     ) -> libc::c_int;
 }
 
-/// The escape scan (design §7.1): processes of our uid started between `s_pid`'s
-/// start and `until` that either (a) were reparented to launchd and are younger
-/// than the shell, or (b) still descend from the shell but left its session — and whose environment names session `sid`
-/// (`ATERM_PARENT_SESSION_ID`, which every process a session starts inherits)
-/// or cannot be read. Such a process outlives the tab it was started in: `eval
-/// $(ssh-agent)`, a tmux server, a `setsid`/`nohup` daemon.
+/// Scan for background processes or daemons escaped from `s_pid`'s startup window.
 #[cfg(target_os = "macos")]
 pub(crate) fn escape_scan(
     s_pid: i32,
@@ -1470,17 +1190,9 @@ pub(crate) fn escape_scan(
     })
 }
 
-/// Whole-uid listings an [`escape_scan`] takes before it settles for
-/// `Unknown`.
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 const SCAN_ATTEMPTS: usize = 3;
 
-/// The first verdict of up to `attempts` scans that is not `Unknown`. A
-/// process reaped between a listing and its read is settled inside the scan
-/// (`escape_scan_since`, `linux_escape_scan`); a scan still incomplete (the
-/// shell or a listing unreadable for a moment) is taken again. A later scan
-/// judges the same window, so it is as true a verdict, and a found escape
-/// still wins the scan that found it.
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 fn rescan_while_unknown(attempts: usize, mut scan: impl FnMut() -> Scan) -> Scan {
     for _ in 0..attempts {
@@ -1492,21 +1204,12 @@ fn rescan_while_unknown(attempts: usize, mut scan: impl FnMut() -> Scan) -> Scan
     Scan::Unknown
 }
 
-/// The escape scan's `Unknown` on the run's own shell `s_pid` (`why`): none
-/// named (`s_pid` ≤ 1), its record unread, gone before the scan ended, or in
-/// no listing of its uid. Every other `Unknown` is the listing's (a pid that
-/// did not settle, a record read stale, a table read failed): a busy host's
-/// churn, which another scan settles. This one is the run's, or its caller's
-/// (a wrong pid), so the log says so, where the live suite tells the two
-/// apart.
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 fn shell_unknown(s_pid: i32, why: &str) -> Scan {
     aterm_log::info!("spare gate: scan unknown: the run's shell {s_pid} {why}");
     Scan::Unknown
 }
 
-/// Every pid of `uid`, or `None` when the listing cannot be whole (a full
-/// buffer may have omitted a process born after the size query).
 #[cfg(target_os = "macos")]
 fn uid_pids(uid: u32) -> Option<Vec<i32>> {
     const PID_BYTES: usize = std::mem::size_of::<i32>();
@@ -1529,21 +1232,12 @@ fn uid_pids(uid: u32) -> Option<Vec<i32>> {
     Some(pids)
 }
 
-/// Later listings an `escape_scan_since` takes to settle the pids its first
-/// listing named but could not read (Linux's: the records naming a parent
-/// that has begun to exit), before it calls the scan incomplete. The first is
-/// taken at once; the pause before each after it doubles from
-/// [`SCAN_SETTLE_PAUSE`], 511 ms in all, for a process that has begun to exit
-/// to finish.
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 const SCAN_SETTLE_LISTINGS: usize = 10;
 
-/// The pause before the second settling listing.
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 const SCAN_SETTLE_PAUSE: Duration = Duration::from_millis(1);
 
-/// [`escape_scan_since`] with the shell's pid version unknown: a test's scan
-/// of its own fixture processes.
 #[cfg(all(target_os = "macos", test))]
 fn escape_scan_among(
     s_pid: i32,
@@ -1556,37 +1250,6 @@ fn escape_scan_among(
     escape_scan_since(s_pid, None, sid, from, until, list, read_pid)
 }
 
-/// [`escape_scan`] over the pids `list` names for our uid, each read by
-/// `read_pid`: the host's whole uid and [`bsdinfo_uniq`] in production; in a
-/// test, a fixture's own processes, so a verdict about one process tree is
-/// never another test's process exiting mid-listing, and the record a kernel
-/// race leaves (a process read before its parent's exit was done).
-///
-/// Only the first listing's pids are judged. One it names that cannot be
-/// read and is not positively a zombie is settled by a later listing (up to
-/// [`SCAN_SETTLE_LISTINGS`]): a listing holds every live process and every zombie
-/// of the uid (measured on Darwin 27: an unreaped child is listed, a reaped
-/// one is not), so a pid a later listing no longer names was reaped and
-/// holds nothing, and one it still names is read again. A pid that stays
-/// unreadable leaves the scan incomplete (`Unknown`). A busy host's churn
-/// reaps a few of a scan's pids before they are read (measured: up to 19 of
-/// 620 under 12 fork-exec loops at load 30) and every fresh whole scan
-/// meets new ones; the first listing's own settle in one later listing,
-/// except a process still exiting (`P_WEXIT`, read as nothing yet not a
-/// zombie), which a later listing names until its exit is done (measured
-/// under six loops of 200 MB processes exiting, at load 41-50: 62 of 136
-/// scans took 2-4 later listings; none was left unsettled).
-///
-/// A pid the scan drops as exited (a zombie, or reaped) can be the parent a
-/// record read before its exit was done still names: XNU hands an exiting
-/// process's children to launchd before it is a zombie, so such a record is
-/// stale (a daemon whose launcher was exiting at the read would be judged
-/// still parented, and its escape unseen). Every record that names a dropped
-/// parent is read again; one that cannot be read again as the same process,
-/// or still names a dropped parent, leaves the scan incomplete.
-///
-/// `shell_version` is the shell's pid version at its spawn, when known: an
-/// orphan whose launcher's is older is not the run's ([`launched_before`]).
 #[cfg(target_os = "macos")]
 fn escape_scan_since(
     s_pid: i32,
@@ -1610,10 +1273,6 @@ fn escape_scan_since(
     )
 }
 
-/// Whether `pid`'s environment names session `sid` (`ATERM_PARENT_SESSION_ID`,
-/// which every process a session starts inherits), or is withheld (empty: Darwin
-/// 27 hands a platform binary's `KERN_PROCARGS2` back without it). `None`:
-/// unreadable.
 #[cfg(target_os = "macos")]
 fn environment_names(pid: i32, sid: &str) -> Option<bool> {
     u32::try_from(pid)
@@ -1625,8 +1284,6 @@ fn environment_names(pid: i32, sid: &str) -> Option<bool> {
         })
 }
 
-/// Whether one of `pid`'s standard descriptors is on a dead vnode, as a
-/// revoked terminal's are ([`aterm_uds::holders::stdio_on_dead_vnode`]).
 #[cfg(target_os = "macos")]
 fn stdio_dead(pid: i32) -> Option<bool> {
     u32::try_from(pid)
@@ -1634,30 +1291,17 @@ fn stdio_dead(pid: i32) -> Option<bool> {
         .and_then(aterm_uds::holders::stdio_on_dead_vnode)
 }
 
-/// [`escape_scan_with_owner`]'s verdict on where a session leader's line of
-/// parents starts.
 #[cfg(target_os = "macos")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum LeaderLine {
-    /// Born, parent by parent, from a process older than the shell: a
-    /// stranger's session.
     Outside,
-    /// Through the shell: the run's.
     Run,
-    /// Gone, adopted by launchd, or a parent unread: no verdict.
     Unknown,
 }
 
-/// `<sys/proc_info.h>`: `pbi_flags` says the process was born on a
-/// controlling terminal (`P_CONTROLT`), has not left its session since, and
-/// has not exec'd since that terminal lost its session's leader.
 #[cfg(target_os = "macos")]
 const PROC_FLAG_CONTROLT: u32 = 0x80;
 
-/// The same scan with the environment's ownership answer (`read_owner`) and
-/// the standard descriptors' (`read_stdio_dead`) supplied. `None` is
-/// unreadable, not evidence the process exited. The production wrapper above
-/// supplies [`environment_names`] and [`stdio_dead`].
 #[cfg(target_os = "macos")]
 #[allow(
     clippy::too_many_arguments,
@@ -1698,13 +1342,8 @@ fn escape_scan_with_owner(
     for &p in &pids {
         match read(p) {
             Some(info) => infos.push((p, info)),
-            // A positively observed zombie can be skipped.
             None if exited(p) => {}
-            // Born before the shell: none of the run's, live, exiting or a
-            // zombie, and no parent a record of the run can name.
             None if born_before(p, shell_start) => older.push(p),
-            // Beginning exit or an empty process-table response is not yet
-            // an exit: a later listing settles it.
             None => unsettled.push(p),
         }
     }
@@ -1733,9 +1372,6 @@ fn escape_scan_with_owner(
             }
         });
     }
-    // The first listing's pids the scan dropped as exited (positively zombies,
-    // or reaped), and every record naming one as its parent, which was read
-    // before that parent's exit handed it to launchd: read it again.
     let held: std::collections::HashSet<i32> = infos.iter().map(|(p, _)| *p).collect();
     let gone: std::collections::HashSet<i32> = pids
         .iter()
@@ -1755,19 +1391,11 @@ fn escape_scan_with_owner(
             {
                 infos[k].1 = fresh;
             }
-            // Gone too (a zombie, or reaped: a later listing names it no
-            // more), as a parent's last child exiting with it is, with
-            // nothing recorded below it alive: it holds nothing, and no live
-            // record names it, so its stale record misjudges nothing
-            // ([`orphans_live`], as for a candidate gone since its read).
             None if (exited(p) || list(uid).is_some_and(|pids| !pids.contains(&p)))
                 && !orphans_live(&infos, p, &mut read, &mut list, uid, None) => {}
             _ => stale = true,
         }
     }
-    // Keep known positives despite unrelated churn: a pid still unsettled, or
-    // a record that cannot be read again, makes an otherwise clean scan
-    // incomplete, never an escape unseen.
     let mut incomplete = stale || !unsettled.is_empty();
     let shell_listed = infos
         .iter()
@@ -1779,26 +1407,9 @@ fn escape_scan_with_owner(
             .map(|(_, i)| i.pbsd.pbi_ppid as i32)
     };
     let launchd = launchd_idversion();
-    // The run's processes are in the shell's session or in one a process of
-    // the run made (`setsid`): a session is entered only by birth from one of
-    // its members, so each member descends from its leader. A session with a
-    // live member born before the shell is no session of the run, and an
-    // orphan in one is the busy host's (the pid naming a live session is
-    // never handed out again, measured over two pid wraps, so the id is that
-    // session's). Read only when the shell leads its own session, as a tab's
-    // does, and only once an orphan outside it needs it.
     // SAFETY: `getsid` reads the process table.
     let leads_session = unsafe { libc::getsid(s_pid) } == s_pid;
     let mut older_sessions: Option<std::collections::HashSet<i32>> = None;
-    // Where the line of `leader`, the live leader of its session, starts:
-    // `Outside` when it descends from a process born before the shell without
-    // passing through the shell, `Run` when it passes through the shell. The
-    // run's own `setsid` leader is under the shell, or launchd's once its
-    // parent is gone (Darwin has no subreaper), so a session led from outside
-    // is a stranger's (another terminal's tab, born after this shell). Each
-    // parent must be older than its child: a pid reused since its record was
-    // read ends the walk with no verdict (`Unknown`), as does a parent this
-    // uid's listing did not read, and a leader gone or adopted by launchd.
     let leader_line = |leader: i32| -> LeaderLine {
         // SAFETY: `getsid` reads the process table.
         if unsafe { libc::getsid(leader) } != leader {
@@ -1837,15 +1448,6 @@ fn escape_scan_with_owner(
         if started < start || started > until {
             continue;
         }
-        // Adopted by launchd and younger than the shell. One launchd started
-        // itself (a Spotlight worker indexing a busy host's files, an XPC
-        // service) was never anyone's orphan; any other's original parent is
-        // not launchd's ([`launchd_idversion`]). (Which one it was is not
-        // read: XNU re-points an adopted orphan's `p_puniqueid` at launchd's
-        // when it next execs, so the environment check below says whose.)
-        // Nor is one whose launcher took its pid version before the shell did:
-        // no process of the run, and nothing it started (another terminal's
-        // tab, left to launchd as its terminal quit), [`launched_before`].
         let run_orphan = |uniqueid: u64, launcher: i32| {
             uniqueid > shell.p_uniqueid
                 && launchd.is_none_or(|v| launcher != v)
@@ -1853,17 +1455,6 @@ fn escape_scan_with_owner(
         };
         let mut reparented =
             info.pbsd.pbi_ppid == 1 && run_orphan(info.p_uniqueid, info.p_orig_ppidversion);
-        // The line runs on through a live process whose record was not read
-        // (another user's: a set-user-id program still running, as `sudo` is,
-        // is in no listing of this uid), read from its short record: a daemon below one is still
-        // the shell's (before, the walk stopped there and the scan read
-        // `Clean`). One launchd adopted is an orphan of the run by the clause
-        // above, read from its identifiers (which any process may read), and
-        // so is all that runs below it (`sudo -b`). One that cannot be read
-        // ends the line, as it did: the short record answers `ESRCH` for a
-        // process exiting or dead, and reading the scan `Unknown` there cost
-        // 2.95% of scans under six loops of `crontab -e` (a set-user-id
-        // parent of ours that exits), against 0.15% without the walk.
         let attached = {
             let mut at = *pid;
             let mut attached = false;
@@ -1893,21 +1484,9 @@ fn escape_scan_with_owner(
         if !(reparented || attached) {
             continue;
         }
-        // Its session, and below its environment, are read after its record:
-        // one gone since then (a busy host's, or the shell's own short-lived
-        // child) holds nothing and is no escape, and its pid may already be
-        // another's, so each read is confirmed against the record's birth.
-        // But a live child read naming it as parent was read before its exit
-        // handed that child to launchd, and is stale: a double fork caught
-        // mid-exit, its middle process read alive, then gone, would leave its
-        // daemon judged as parented and the scan `Clean`. Such a scan is
-        // incomplete, and the next one reads the daemon as launchd's
-        // ([`orphans_live`]).
         // SAFETY: `getsid` reads the process table.
         let session = unsafe { libc::getsid(*pid) };
         match read(*pid) {
-            // The same birth under another parent: the one its line was
-            // judged by has exited since, and launchd has it.
             Some(now)
                 if now.p_uniqueid == info.p_uniqueid && now.pbsd.pbi_ppid != info.pbsd.pbi_ppid =>
             {
@@ -1915,7 +1494,6 @@ fn escape_scan_with_owner(
                 continue;
             }
             Some(now) if now.p_uniqueid == info.p_uniqueid => {}
-            // A positively observed replacement: this birth is gone.
             Some(_) => {
                 let older = leads_session.then(|| {
                     &*older_sessions.get_or_insert_with(|| {
@@ -1940,7 +1518,6 @@ fn escape_scan_with_owner(
             }
         }
         if session < 0 {
-            // Present, yet its session unreadable: no verdict on it.
             incomplete = true;
             continue;
         }
@@ -1949,14 +1526,9 @@ fn escape_scan_with_owner(
             continue;
         }
         let in_session = session == s_pid;
-        // What the terminal rule below read of its standard descriptors, for
-        // the escape line: `-` when it read nothing.
         let mut stdio = "-";
         if reparented && leads_session && !in_session && session > 0 {
             let line = leader_line(session);
-            // An orphan in a session older than the shell (a busy host's
-            // background job, adopted in the run's window), or in a younger one
-            // led from outside the run (another tab's), is not the run's.
             if session != *pid {
                 let older = older_sessions
                     .get_or_insert_with(|| older_sessions_of(&infos, &mut read, shell.p_uniqueid));
@@ -1964,33 +1536,11 @@ fn escape_scan_with_owner(
                     continue;
                 }
             }
-            // Nor is one born on a terminal (`P_CONTROLT`) outside the shell's
-            // session whose leader is not shown to be the run's: another
-            // terminal's process, as the child an interactive zsh forks for a
-            // startup file's `$(...)` (`/etc/zshrc`'s `locale LC_CTYPE`) is when
-            // that zsh's tab closes mid-startup and launchd holds the child for
-            // its last moment. A process leaves the shell's session only by
-            // `setsid`, which drops its controlling terminal for good (its
-            // children are born with none), so the run's own daemon outside its
-            // session has none, unless the run opened a terminal for its
-            // session (`script`, `expect`) and that session's leader is read
-            // under the shell (`Run`); one whose opener is gone is not told
-            // apart. Measured on Darwin 27: the flag survives the leader's exit
-            // and the adoption, not an exec after the leader's exit (0 of 30
-            // such orphans kept it); a `setsid` session's members never have it.
-            //
-            // A dead standard vnode is diagnostic context only. The read
-            // reports no terminal identity: a force-unmounted ordinary file
-            // answers the same way as a revoked terminal. It cannot show that
-            // this orphan came from another terminal, even after confirming
-            // the same process birth. Keep the terminal-flag rule, then let
-            // the ownership rule below judge the orphan as before.
             if !attached && line != LeaderLine::Run {
                 if info.pbsd.pbi_flags & PROC_FLAG_CONTROLT != 0 {
                     continue;
                 }
                 stdio = match read_stdio_dead(*pid) {
-                    // Still the same birth, so the descriptors read were its.
                     Some(true)
                         if read(*pid).is_some_and(|now| now.p_uniqueid == info.p_uniqueid) =>
                     {
@@ -2001,19 +1551,10 @@ fn escape_scan_with_owner(
                 };
             }
         }
-        // Whose it is: one still in the shell's session or its descendant line
-        // is the shell's; else its environment says (an empty one is a withheld
-        // one: Darwin 27 hands another process's `KERN_PROCARGS2` back without
-        // its environment, so a daemon there counts against the run — the
-        // window, the run alone, and the older-session rule above keep
-        // strangers out).
         let names_sid = in_session
             || left_session
             || match read_owner(*pid, sid) {
                 Some(owned) => owned,
-                // Unreadable: the run's while the same birth is observed.
-                // A missing identity is uncertain unless a positive zombie or
-                // complete fresh listing settles that the old process is gone.
                 None => match read(*pid) {
                     Some(now) => now.p_uniqueid == info.p_uniqueid,
                     None => {
@@ -2032,8 +1573,6 @@ fn escape_scan_with_owner(
                 },
             };
         if names_sid {
-            // The process the verdict rests on, for whoever reads why a
-            // generation does not learn (the live suite reads these lines).
             let comm: Vec<u8> = info
                 .pbsd
                 .pbi_comm
@@ -2067,9 +1606,6 @@ fn escape_scan_with_owner(
     }
 }
 
-/// The sessions with a live member born before the shell (`shell_uniqueid`):
-/// none of a run's, each member of which descends from its leader, and a
-/// session is entered only by birth from a member (the older-session rule).
 #[cfg(target_os = "macos")]
 fn older_sessions_of(
     infos: &[(i32, BsdInfoWithUniqId)],
@@ -2087,19 +1623,6 @@ fn older_sessions_of(
         .collect()
 }
 
-/// Whether a process recorded below `gone`, a candidate gone since its read,
-/// still lives: its record, read naming `gone` (or a gone process below it) as
-/// parent, was read before that exit handed it to launchd, and is stale. A
-/// child `gone` waited for and reaped before it exited (a pipeline, `$(…)`)
-/// orphans nothing: counting every record that named it read a clean shell's
-/// scan `Unknown` in 62 of 4645 scans under orphan pipelines of the uid
-/// (`( sleep 0.02 | cat ) &`), against 2 without the rule and 1 with this one.
-/// Nor does a live one in a session in `older` ([`older_sessions_of`], when
-/// the shell leads its own): no process of the run is born into a session
-/// older than the shell, and a rescan judges such an orphan none of the run's
-/// (counting one read 296 of 17065 clean scans `Unknown` under loops of
-/// `( sleep 0.05 & sleep 0.01 ) &` in an older session, against 61 before).
-/// Too many below to follow is no answer: `true`.
 #[cfg(target_os = "macos")]
 fn orphans_live(
     infos: &[(i32, BsdInfoWithUniqId)],
@@ -2130,11 +1653,9 @@ fn orphans_live(
                         return true;
                     }
                 }
-                // Unreadable, yet neither a zombie nor out of a fresh listing.
                 None if !exited(*p) && !list(uid).is_some_and(|pids| !pids.contains(p)) => {
                     return true;
                 }
-                // Gone too: what ran below it may live.
                 _ => below.push(*p),
             }
         }
@@ -2142,40 +1663,21 @@ fn orphans_live(
     false
 }
 
-// ─── The escape scan on Linux (design §7.1, R6) ───
-
-/// One process as Linux's `/proc/<pid>/stat` records it, and its owner.
+/// Process state parsed from `/proc/<pid>/stat` and `/proc/<pid>` ownership.
 #[cfg(any(target_os = "linux", all(test, target_os = "macos")))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct ProcRecord {
     pub(crate) ppid: i32,
     pub(crate) session: i32,
-    /// Its start, in clock ticks after boot (`starttime`): with the pid, which
-    /// process this is.
     pub(crate) start: u64,
-    /// A zombie (`Z`) or dead (`X`): it holds nothing.
     pub(crate) ended: bool,
-    /// `PF_EXITING`: it has begun to exit. Its children are handed to a
-    /// reaper only at the end of that exit (`forget_original_parent`, just
-    /// before it turns zombie), so a child read meanwhile still names it.
     pub(crate) exiting: bool,
-    /// Its thread group's live threads (`num_threads`). `/proc/<pid>/stat`
-    /// describes the group leader, which can exit (`pthread_exit` from
-    /// `main`) and read as a zombie, `PF_EXITING` set, while the others run
-    /// on: the process still holds everything it held.
     pub(crate) threads: u32,
-    /// Its effective uid (the owner of its `/proc/<pid>` folder, whatever
-    /// its dumpable state).
     pub(crate) uid: u32,
 }
 
-/// `pid`'s record from its `/proc/<pid>/stat` line (fields 3 state, 4 ppid,
-/// 6 session, 9 flags, 20 `num_threads` and 22 starttime), or `None` when the
-/// line does not parse or names another pid. The command name (field 2) may
-/// hold spaces and parentheses, so fields are counted from its last `)`.
 #[cfg(any(target_os = "linux", all(test, target_os = "macos")))]
 fn parse_proc_stat(stat: &str, pid: i32, uid: u32) -> Option<ProcRecord> {
-    /// `<linux/sched.h>`.
     const PF_EXITING: u64 = 0x4;
     let open = stat.find(" (")?;
     if stat.get(..open)?.trim().parse::<i32>().ok()? != pid {
@@ -2186,7 +1688,6 @@ fn parse_proc_stat(stat: &str, pid: i32, uid: u32) -> Option<ProcRecord> {
         return None;
     }
     let fields: Vec<&str> = stat.get(close + 1..)?.split_ascii_whitespace().collect();
-    // Field 3 is `fields[0]`.
     let state = fields.first()?.chars().next()?;
     Some(ProcRecord {
         ppid: fields.get(1)?.parse().ok()?,
@@ -2201,33 +1702,20 @@ fn parse_proc_stat(stat: &str, pid: i32, uid: u32) -> Option<ProcRecord> {
 
 #[cfg(any(target_os = "linux", all(test, target_os = "macos")))]
 impl ProcRecord {
-    /// It holds nothing a run could have left: a zombie or an exit under way,
-    /// its leader the group's last thread. A leader that exited while other
-    /// threads run reads as both, yet the process lives on.
     fn holds_nothing(&self) -> bool {
         (self.ended || self.exiting) && self.threads <= 1
     }
 }
 
-/// What a Linux escape scan reads of the host: `/proc` in production
-/// ([`Procfs`]), a fixture in a test.
+/// Process-table interface used by the Linux escape scan.
 #[cfg(any(target_os = "linux", all(test, target_os = "macos")))]
 pub(crate) trait ProcTable {
-    /// Every pid now; `None` when the listing failed.
     fn list(&mut self) -> Option<Vec<i32>>;
-    /// `pid`'s record now. Only a missing proc entry is `Ok(None)`;
-    /// inaccessible, malformed and other failed reads remain errors.
     fn read(&mut self, pid: i32) -> std::io::Result<Option<ProcRecord>>;
-    /// Whether `pid`'s environment names session `sid` (an empty one counts:
-    /// withheld, or scrubbed with `env -i`); `None` when it cannot be read (a
-    /// non-dumpable process: `ssh-agent`, a set-id program).
     fn owner(&mut self, pid: i32, sid: &str) -> Option<bool>;
-    /// Wait before a settling listing.
     fn pause(&mut self, pause: Duration);
 }
 
-/// A complete listing: one unreadable directory entry cannot disappear
-/// from a scan that later certifies the run clean.
 #[cfg(any(target_os = "linux", all(test, target_os = "macos")))]
 fn listed_proc_pids(
     entries: impl IntoIterator<Item = std::io::Result<std::ffi::OsString>>,
@@ -2244,8 +1732,6 @@ fn listed_proc_pids(
     Some(pids)
 }
 
-/// The actual proc adapter's two reads, retaining their uncertainty. A
-/// missing entry is gone; an access, I/O or parse failure proves no exit.
 #[cfg(any(target_os = "linux", all(test, target_os = "macos")))]
 fn read_proc_record(
     pid: i32,
@@ -2267,7 +1753,6 @@ fn read_proc_record(
         .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid proc record"))
 }
 
-/// The host's own `/proc`.
 #[cfg(target_os = "linux")]
 struct Procfs;
 
@@ -2302,24 +1787,7 @@ impl ProcTable for Procfs {
     }
 }
 
-/// The escape scan on Linux (design §7.1, R6): the same question as macOS's,
-/// read from `/proc`. Linux keeps no record of an orphan's launcher (XNU's
-/// `p_puniqueid`), but it says exactly where an orphan of the run can go: to
-/// the nearest child subreaper among its ancestors, else to init, and its
-/// ancestors are the shell, this process and this process's own ancestors.
-/// So a process started in the run's window that is no longer under the shell
-/// and whose parent is init or one of this process's ancestors
-/// ([`reapers`]: a `systemd --user` that launched aterm, say) is reparented;
-/// one still under the shell outside its session left it. Either is the
-/// run's when it is in the shell's session (entered only by birth from it) or
-/// left it from under the shell, or else when its environment names the
-/// session or cannot be read: Linux hands a same-uid process its environment,
-/// so unlike Darwin's withheld one this check keeps strangers out (another
-/// tab's, a service `systemd --user` started), and a daemon that made itself
-/// non-dumpable (`ssh-agent`) counts. Rejected, measured on the lane:
-/// `PR_SET_CHILD_SUBREAPER` is a whole process's attribute, not a thread's,
-/// and would hand every tab's orphans to aterm to reap; a per-spare cgroup
-/// needs a delegated subtree, and an ssh session's scope is root's.
+/// Scan `/proc` for background processes or daemons escaped from `s_pid`'s startup window.
 #[cfg(target_os = "linux")]
 pub(crate) fn escape_scan(
     s_pid: i32,
@@ -2345,11 +1813,6 @@ pub(crate) fn escape_scan(
     })
 }
 
-/// The wall-clock window `[from, until]` as the start ticks after boot of a
-/// process that could have started inside it: `/proc` counts `starttime` on
-/// the boot clock, truncated to `USER_HZ` ticks (`getauxval(AT_CLKTCK)`), so
-/// the window widens to the ticks it touches. `None` where either clock or the
-/// tick rate cannot be read.
 #[cfg(target_os = "linux")]
 #[cfg_attr(
     target_pointer_width = "64",
@@ -2362,15 +1825,11 @@ fn boot_tick_window(
     from: std::time::SystemTime,
     until: std::time::SystemTime,
 ) -> Option<(u64, u64)> {
-    // glibc's, declared here as aterm-uds's `linux_reader` declares it: the
-    // workspace's libc names it for one Linux cell only.
     unsafe extern "C" {
         fn getauxval(kind: libc::c_ulong) -> libc::c_ulong;
     }
-    /// `<elf.h>`: the auxiliary vector's clock-tick entry (the kernel ABI's
-    /// number whatever the C library).
     const AT_CLKTCK: libc::c_ulong = 17;
-    // SAFETY: a side-effect-free getter.
+    // SAFETY: side-effect-free getter.
     let per_second = u64::from(unsafe { getauxval(AT_CLKTCK) });
     if per_second == 0 {
         return None;
@@ -2387,9 +1846,6 @@ fn boot_tick_window(
     Some((tick_of(from)?, tick_of(until)?))
 }
 
-/// The processes an orphan of a run can be handed to: init (pid 1 of this
-/// pid namespace) and each of this process's ancestors (a child subreaper,
-/// such as `systemd --user`, adopts its descendants' orphans).
 #[cfg(any(target_os = "linux", all(test, target_os = "macos")))]
 fn reapers(table: &mut impl ProcTable, mut at: i32) -> Option<Vec<i32>> {
     let mut reapers = vec![1];
@@ -2406,8 +1862,6 @@ fn reapers(table: &mut impl ProcTable, mut at: i32) -> Option<Vec<i32>> {
     None
 }
 
-/// What one Linux scan read: the records of its uid, other users' (kept only
-/// as parents a line of ours runs through), and the listed pids found gone.
 #[cfg(any(target_os = "linux", all(test, target_os = "macos")))]
 struct LinuxProcs {
     ours: std::collections::HashMap<i32, ProcRecord>,
@@ -2417,7 +1871,6 @@ struct LinuxProcs {
 
 #[cfg(any(target_os = "linux", all(test, target_os = "macos")))]
 impl LinuxProcs {
-    /// `pid` read as `r`, filed by its owner.
     fn put(&mut self, pid: i32, r: ProcRecord, uid: u32) {
         if r.uid == uid {
             self.others.remove(&pid);
@@ -2435,21 +1888,16 @@ impl LinuxProcs {
             .copied()
     }
 
-    /// The birth read as `pid` is gone.
     fn drop_gone(&mut self, pid: i32) {
         self.ours.remove(&pid);
         self.others.remove(&pid);
         self.gone.insert(pid);
     }
 
-    /// Whether `r` names a parent leaving: exiting, ended or reaped.
     fn leaving(&self, r: &ProcRecord) -> bool {
         self.gone.contains(&r.ppid) || self.get(r.ppid).is_some_and(|p| p.ended || p.exiting)
     }
 
-    /// The records a line of the run's runs through: ours, and another user's
-    /// in the shell's session `session` (the run's own set-user-id process: a
-    /// session is entered only by birth from a member).
     fn run_lines(&self, session: i32) -> impl Iterator<Item = (&i32, &ProcRecord)> {
         self.ours.iter().chain(
             self.others
@@ -2458,11 +1906,6 @@ impl LinuxProcs {
         )
     }
 
-    /// Read again each record of [`Self::run_lines`] born since the shell
-    /// (`shell_start`) that names a parent leaving, with that parent, until it
-    /// names a live one (up to [`SCAN_SETTLE_LISTINGS`] times, the pause
-    /// doubling from [`SCAN_SETTLE_PAUSE`]). `Ok(false)`: one never did;
-    /// `Err`: a read failed.
     fn settle(
         &mut self,
         table: &mut impl ProcTable,
@@ -2498,10 +1941,6 @@ impl LinuxProcs {
                 }
                 match table.read(p) {
                     Ok(Some(fresh)) if fresh.start == old.start => self.put(p, fresh, uid),
-                    // Reaped, or its pid another's: this birth holds nothing,
-                    // and a record naming it is stale (a double fork's daemon
-                    // whose middle was reaped here: the middle only removed,
-                    // its daemon's walk ended there, and the scan read `Clean`).
                     Ok(_) => self.drop_gone(p),
                     Err(_) => return Err(()),
                 }
@@ -2511,11 +1950,6 @@ impl LinuxProcs {
         Ok(stale.is_empty())
     }
 
-    /// Whether a record of ours below `gone`, a candidate gone since its read,
-    /// still lives: read naming it (or a gone process below it) as parent
-    /// before that exit handed it to a reaper, it is stale. A child `gone`
-    /// waited for and reaped (a pipeline) orphaned nothing. Too many below to
-    /// follow is no answer: `Ok(true)`. `Err`: a read failed.
     fn orphans_live(&self, table: &mut impl ProcTable, gone: i32) -> Result<bool, ()> {
         let mut below = vec![gone];
         let mut seen = std::collections::HashSet::new();
@@ -2540,23 +1974,6 @@ impl LinuxProcs {
     }
 }
 
-/// [`escape_scan`]'s one pass over `table`: `window` is in start ticks
-/// (inclusive), `reapers` from [`reapers`], `uid` this process's effective
-/// one. Only processes of `uid` are judged, as on macOS.
-///
-/// A record read while its parent was exiting still names that parent
-/// ([`ProcRecord::exiting`]): one born since the shell whose parent has begun
-/// to exit, has ended or was reaped since the listing is read again, with its
-/// parent, until it names a live one (up to [`SCAN_SETTLE_LISTINGS`] times,
-/// the pause doubling from [`SCAN_SETTLE_PAUSE`]); one that never does leaves
-/// the scan `Unknown`. Only a confirmed missing entry is gone; inaccessible,
-/// malformed or otherwise failed records leave the scan `Unknown`. A process
-/// whose leader thread exited while its other threads run
-/// on is judged as the live process it is ([`ProcRecord::threads`]); a record
-/// naming it as parent stays unsettled, as one naming an exit under way does
-/// (its threads' exit may be the whole group's), so never reads `Clean`. Then
-/// each record in the window has the parent read for it read again, and one now
-/// leaving is settled the same way ([`LinuxProcs::settle`]).
 #[cfg(any(target_os = "linux", all(test, target_os = "macos")))]
 fn linux_escape_scan(
     table: &mut impl ProcTable,
@@ -2579,8 +1996,6 @@ fn linux_escape_scan(
     let Some(pids) = table.list() else {
         return Scan::Unknown;
     };
-    // Ours by uid; another user's (a set-user-id program, as `sudo` is) kept
-    // only as a parent a line of ours may run through.
     let mut procs = LinuxProcs {
         ours: HashMap::with_capacity(pids.len()),
         others: HashMap::new(),
@@ -2595,16 +2010,6 @@ fn linux_escape_scan(
             Err(_) => return Scan::Unknown,
         }
     }
-    // A record born since the shell that names a parent leaving (exiting,
-    // ended, reaped) is read again, with that parent, until it names a live
-    // one. Then the parent read for each record in the window is read once
-    // more: one read alive that began to exit after it, before its child's
-    // read (`/proc` is read in pid order, a parent first), left that child
-    // naming it, a stale record (`( daemon & )`: the daemon, launched by a
-    // subshell that exits at once, judged still under the shell and in its
-    // session). A parent nobody read is not read again: under `hidepid=2`
-    // another user's reads as gone, and settling a record that names it read
-    // the scan `Unknown` every time (a cron job's `sh`, an ssh login's shell).
     let in_window = |r: &ProcRecord| r.start >= window.0.max(shell.start) && r.start <= window.1;
     let Ok(mut settled) = procs.settle(table, shell.start, s_pid, uid) else {
         return Scan::Unknown;
@@ -2621,7 +2026,6 @@ fn linux_escape_scan(
                 Ok(Some(now)) if procs.get(p).is_some_and(|was| was.start == now.start) => {
                     procs.put(p, now, uid);
                 }
-                // Reaped, or its pid another's: the birth read is gone.
                 Ok(_) => procs.drop_gone(p),
                 Err(_) => return Scan::Unknown,
             }
@@ -2632,18 +2036,6 @@ fn linux_escape_scan(
         settled = again;
     }
     let mut incomplete = !settled;
-    // The line to the shell runs through another user's live process too: a
-    // daemon below a running `sudo` is still the shell's (before, the walk
-    // stopped there and the scan read `Clean`). One in the window handed to a
-    // reaper may be an orphan of the run, as one of ours would be, and so may
-    // all that runs below it (`sudo -b`). In the shell's session it is (a
-    // session is entered only by birth from a member); in another, what runs
-    // below it is the run's only when its environment names the session (a
-    // set-user-id `screen -dm` makes a session of its own; so does the
-    // `sshd -i` systemd starts per connection, and this uid's login below
-    // it, its environment withheld or fresh, is no escape). A parent nobody
-    // read ends the line, as it did (`hidepid=2` hides another user's).
-    // `(under the shell, below such an orphan, its environment must say)`.
     let walk = |pid: i32| -> (bool, bool, bool) {
         let mut at = pid;
         for _ in 0..64 {
@@ -2678,12 +2070,6 @@ fn linux_escape_scan(
         if !(reparented || left_session) {
             continue;
         }
-        // Whose it is: one in the shell's session, or that left it from under
-        // the shell, is the run's; an orphan in a session whose leader lives
-        // and was born before the shell is not (a session is entered only by
-        // birth from a member, and its leader's pid is not handed out again
-        // while it has one; read only when the shell leads its own session,
-        // as a tab's does); else its environment says.
         let older_session = if !(left_session || r.session == s_pid)
             && shell.session == s_pid
             && r.session > 1
@@ -2705,9 +2091,6 @@ fn linux_escape_scan(
             match table.owner(pid, sid) {
                 Some(owned) => owned,
                 None if named_only => false,
-                // Unreadable environment: require a complete birth re-read.
-                // Gone by then, it holds nothing, but a live child read naming
-                // it is a reaper's now, its record stale: the scan is incomplete.
                 None => match table.read(pid) {
                     Ok(Some(now)) if now.start == r.start && !now.holds_nothing() => true,
                     Ok(_) => {
@@ -2722,10 +2105,6 @@ fn linux_escape_scan(
             }
         };
         if owned {
-            // The process the verdict rests on, named as macOS's scan names
-            // it, for whoever reads why a generation does not learn (the live
-            // suite's L4 cases read this line: without it a Linux escape was
-            // an Unclean fold that named nothing).
             aterm_log::info!(
                 "spare gate: escape: pid={pid} ppid={} session={} in_session={} \
                  reparented={reparented} left_session={left_session} start={}",
@@ -2761,10 +2140,7 @@ pub(crate) fn escape_scan(
     Scan::Unknown
 }
 
-/// SIGKILL every process in `pid`'s session (design §9: a warm spare's retire,
-/// so a hung rc child dies and no user trap runs), the shell last. macOS and
-/// Linux: the process table (`/proc`), so a background job in another group
-/// of the session dies too; elsewhere the shell's group.
+/// Send `SIGKILL` to every process in `pid`'s session, ending with `pid`.
 #[cfg(unix)]
 pub(crate) fn kill_session(pid: i32) {
     if pid <= 1 {
@@ -2772,24 +2148,21 @@ pub(crate) fn kill_session(pid: i32) {
     }
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     for p in host_pids() {
-        // SAFETY: `getsid`/`kill` on a pid; a stale pid errs harmlessly,
-        // and only members of the spare's own session are signalled.
+        // SAFETY: `getsid`/`kill` on a pid; only members of the spare's session are signalled.
         if p > 1 && p != pid && unsafe { libc::getsid(p) } == pid {
             unsafe { libc::kill(p, libc::SIGKILL) };
         }
     }
-    // SAFETY: the spare's shell leads its own group (forkpty); its pid is ours
-    // and unreaped (the caller holds the session).
+    // SAFETY: the spare's shell leads its own group and `pid` is unreaped.
     unsafe {
         libc::killpg(pid, libc::SIGKILL);
     }
 }
 
-/// Off unix there is no process session to signal.
+/// No-op off Unix.
 #[cfg(not(unix))]
 pub(crate) fn kill_session(_pid: i32) {}
 
-/// Every pid on the host now (empty when it cannot be listed).
 #[cfg(target_os = "macos")]
 fn host_pids() -> Vec<i32> {
     // SAFETY: a null buffer asks for the count only.
@@ -2805,15 +2178,12 @@ fn host_pids() -> Vec<i32> {
     pids
 }
 
-/// Every pid on the host now (empty when `/proc` cannot be listed).
 #[cfg(target_os = "linux")]
 fn host_pids() -> Vec<i32> {
     Procfs.list().unwrap_or_default()
 }
 
-// ─── The aterm-spare thread (design §5.1) ───
-
-/// A spare's spawn, as the thread runs it.
+/// Background job to spawn a spare shell on the `aterm-spare` thread.
 pub(crate) struct SpawnJob {
     pub(crate) id: u64,
     pub(crate) window: WindowId,
@@ -2823,11 +2193,10 @@ pub(crate) struct SpawnJob {
     pub(crate) factory: crate::spawn::SessionFactory,
     pub(crate) proxy: EventLoopProxy<Wake>,
     pub(crate) cwd: Option<String>,
-    /// The shell the booking judged (`GenInputs::shell`).
     pub(crate) shell: aterm_core::shell_integration::ShellType,
 }
 
-/// A spawned spare, back on the main thread ([`Wake::SpareSpawned`]).
+/// Result of a [`SpawnJob`] returned to the main thread.
 pub(crate) struct SpareSpawned {
     pub(crate) id: u64,
     pub(crate) session: std::io::Result<Session>,
@@ -2842,8 +2211,7 @@ impl std::fmt::Debug for SpareSpawned {
     }
 }
 
-/// A visible rc run the gate learns from: a cold tab's, or a parked spare's
-/// adoption (design §7.1).
+/// Visible rc run queued for evaluation by the `aterm-spare` thread.
 pub(crate) struct Observation {
     pub(crate) witness: Arc<Witness>,
     pub(crate) sid: String,
@@ -2854,84 +2222,53 @@ pub(crate) struct Observation {
     pub(crate) inputs: GenInputs,
 }
 
-/// A warm spare at its hold, for the thread to verify.
+/// Request to verify a warm spare waiting at its hold.
 pub(crate) struct VerifyJob {
     pub(crate) id: u64,
     pub(crate) witness: Arc<Witness>,
     pub(crate) sid: String,
     pub(crate) inputs: GenInputs,
     pub(crate) generation: u64,
-    /// When it was told `run`: its rc's run starts here.
     pub(crate) run_at: Instant,
-    /// Where the verdict goes: the event loop.
     pub(crate) reply: crate::spawn::WakePost,
 }
 
-/// The thread's work.
+/// Work item for the `aterm-spare` worker thread.
 pub(crate) enum Job {
     Spawn(Box<SpawnJob>),
     Observe(Box<Observation>),
-    /// An observed session's start record arrived.
     #[cfg_attr(
         not(unix),
         expect(dead_code, reason = "only a unix reader witnesses a start")
     )]
     Marked,
     Verify(Box<VerifyJob>),
-    /// A spare of `generation` failed.
     Fail(u64, Verdict),
-    /// Recompute the current generation (the factory or the shell changed).
     Restamp(Box<GenInputs>, Option<EventLoopProxy<Wake>>),
-    /// Stamp the current generation from the disk now and mirror the gate for
-    /// it, then answer: [`Shared::fresh`] takes the number and a gate note
-    /// runs the main thread's tick. The mirror is otherwise only as fresh as
-    /// its last stamp (an observation, a failure, a restamp), and a startup
-    /// file edited since would run unseen and unproven: a promotion writes
-    /// `run` only on a stamp taken after it asked.
     Freshen(u64),
-    /// Drop a retired spare here, off the main thread; `kill` first SIGKILLs
-    /// its whole session (a warm spare, whose rc may hold a child).
     Retire(Box<Session>, bool),
-    /// Release the FIFOs a crashed aterm left ([`sweep_dead_fifos`]).
     Sweep,
     Stop(Sender<()>),
 }
 
-/// What the main thread reads of the gate, mirrored by the thread.
+/// Atomic mirror of gate state shared between the `aterm-spare` thread and main thread.
 #[derive(Default)]
 pub(crate) struct Shared {
-    /// The current generation (0 before the first stamp).
     pub(crate) generation: AtomicU64,
-    /// The last [`Job::Freshen`] answered: `generation` and `eligible` were
-    /// stamped from the disk after it was asked.
     pub(crate) fresh: AtomicU64,
-    /// It may run unseen.
     pub(crate) eligible: AtomicBool,
-    /// The shells ([`PRE_HOLD_ZSH`], [`PRE_HOLD_BASH`]) for which a system
-    /// file read before the parked hold exists (zsh's global zshenv, Linux
-    /// bash's system bashrc: `pre_hold_files`): such a parked spare ran it
-    /// unseen, so parking needs the gate too, and its folder is its own. The
-    /// thread reads the files at its start; until then every bit is set
-    /// ([`PRE_HOLD_UNREAD`]), so the first tick, which starts the thread,
-    /// parks nothing it has not read for.
     pub(crate) pre_hold: AtomicU8,
-    /// `T_READY` for the current generation, ms.
     pub(crate) t_ready_ms: AtomicU64,
-    /// The metrics word.
     pub(crate) report: Mutex<String>,
-    /// Where the last judged start record put the startup files.
     pub(crate) reported: Mutex<Reported>,
-    /// Recent qualifying rc durations (ms), for `spare_rc_ms_p50`.
     pub(crate) rc_ms: Mutex<VecDeque<u32>>,
 }
 
-/// [`Shared::pre_hold`]'s bits.
+/// Bitflags for [`Shared::pre_hold`].
 pub(crate) const PRE_HOLD_ZSH: u8 = 1;
 pub(crate) const PRE_HOLD_BASH: u8 = 1 << 1;
-/// Not read yet: as if every shell had run one.
 const PRE_HOLD_UNREAD: u8 = u8::MAX;
 
-/// [`Shared::pre_hold`]'s bit for `shell` (none for a shell with no parked hold).
 fn pre_hold_bit(shell: aterm_core::shell_integration::ShellType) -> u8 {
     use aterm_core::shell_integration::ShellType;
     match shell {
@@ -2941,8 +2278,6 @@ fn pre_hold_bit(shell: aterm_core::shell_integration::ShellType) -> u8 {
     }
 }
 
-/// [`Shared::pre_hold`]'s bits as the files are now, `exists` asked of each
-/// of `pre_hold_files`.
 fn read_pre_hold(exists: impl Fn(&str) -> bool) -> u8 {
     use aterm_core::shell_integration::{ShellType, pre_hold_files};
     [ShellType::Zsh, ShellType::Bash]
@@ -2951,11 +2286,6 @@ fn read_pre_hold(exists: impl Fn(&str) -> bool) -> u8 {
         .fold(0, |bits, shell| bits | pre_hold_bit(shell))
 }
 
-/// Whether a PARKED spare of `shell` spawned now would run a system file
-/// before its hold with no eligible gate. The files are looked for again
-/// first, and the mirror takes what was found, so the next booking reads it:
-/// one may have appeared since the thread looked (zsh installed and made the
-/// shell while aterm runs), which the booking, on the mirror, could not know.
 fn parked_spawn_runs_unseen(
     shared: &Shared,
     shell: aterm_core::shell_integration::ShellType,
@@ -2969,8 +2299,7 @@ fn parked_spawn_runs_unseen(
 }
 
 impl Shared {
-    /// The mirror before the thread has filled it: every shell's pre-hold
-    /// bit set ([`PRE_HOLD_UNREAD`]).
+    /// Initial mirror state before pre-hold system rc files are checked.
     pub(crate) fn unread() -> Self {
         Self {
             pre_hold: AtomicU8::new(PRE_HOLD_UNREAD),
@@ -2978,13 +2307,12 @@ impl Shared {
         }
     }
 
-    /// Whether a system file `shell` reads before its parked hold exists, or
-    /// has not been looked for yet ([`Self::pre_hold`]).
+    /// Whether `shell` has a system rc file that runs before its parked hold.
     pub(crate) fn ran_before_hold(&self, shell: aterm_core::shell_integration::ShellType) -> bool {
         self.pre_hold.load(Ordering::Acquire) & pre_hold_bit(shell) != 0
     }
 
-    /// The rc generation of `inputs` over the folders last reported.
+    /// Compute the rc generation for `inputs` using the last reported roots.
     pub(crate) fn stamp(&self, inputs: &GenInputs) -> u64 {
         let reported = self
             .reported
@@ -3001,19 +2329,14 @@ struct Thread {
 
 static THREAD: OnceLock<Option<Thread>> = OnceLock::new();
 static SHARED: OnceLock<Arc<Shared>> = OnceLock::new();
-/// The dev seam `ATERM_DEBUG_SPARE_ELIGIBLE=1`: skip learning.
 fn debug_eligible() -> bool {
     aterm_types::dev_seam!("ATERM_DEBUG_SPARE_ELIGIBLE").is_some_and(|v| v == "1")
 }
 
-/// The dev seam `ATERM_DEBUG_SPARE_PRESENT=1`: a headless instance takes its
-/// launch as a person's arrival, as a windowed launch's first focus is, so a
-/// measurement can stand in for the person.
 fn debug_present() -> bool {
     aterm_types::dev_seam!("ATERM_DEBUG_SPARE_PRESENT").is_some_and(|v| v == "1")
 }
 
-/// A dev-seam duration in ms.
 fn debug_ms(name: &'static str) -> Option<Duration> {
     let raw = match name {
         "T_READY" => aterm_types::dev_seam!("ATERM_DEBUG_SPARE_TREADY_MS"),
@@ -3027,38 +2350,28 @@ fn debug_ms(name: &'static str) -> Option<Duration> {
     raw.to_str()?.parse().ok().map(Duration::from_millis)
 }
 
-/// [`PERSON_WINDOW`] (its dev seam shortens it for a measurement of a return).
 fn person_window() -> Duration {
     debug_ms("PERSON").unwrap_or(PERSON_WINDOW)
 }
 
-/// [`READY_MAX_AGE`] (its dev seam, likewise).
 fn ready_max_age() -> Duration {
     debug_ms("READY_AGE").unwrap_or(READY_MAX_AGE)
 }
 
-/// [`SCAN_EVERY`] (its dev seam shortens it for the live suite, whose visible
-/// runs follow one another as fast as a test drives them, each judged only
-/// once the spacing since the last scan has passed).
 fn scan_every() -> Duration {
     debug_ms("SCAN").unwrap_or(SCAN_EVERY)
 }
 
-/// [`PARKED_DEADLINE`] (its dev seam lengthens it to the live suite's hang
-/// detector, whose proofs are never the deadline: on a loaded host a one-line
-/// rc's spare parked past the 1 s and turned spares off for the instance, 2 of
-/// 160 module runs at load ~189, so a slow park there is only slow).
 fn parked_deadline() -> Duration {
     debug_ms("PARKED").unwrap_or(PARKED_DEADLINE)
 }
 
-/// The mirror the thread keeps.
+/// Process-wide [`Shared`] gate mirror.
 pub(crate) fn shared() -> Arc<Shared> {
     Arc::clone(SHARED.get_or_init(|| Arc::new(Shared::unread())))
 }
 
-/// Hand `job` to the thread, starting it on first use. `Err` gives it back
-/// when no thread could start.
+/// Enqueue `job` on the `aterm-spare` thread, spawning the thread on first use.
 pub(crate) fn send_job(job: Job) -> Result<(), Job> {
     let thread = THREAD.get_or_init(|| {
         let (tx, rx) = channel::<Job>();
@@ -3079,7 +2392,7 @@ pub(crate) fn send_job(job: Job) -> Result<(), Job> {
     }
 }
 
-/// Stop the thread and wait for it (the final exit).
+/// Shut down and join the `aterm-spare` thread.
 pub(crate) fn stop_thread() {
     let Some(Some(thread)) = THREAD.get() else {
         return;
@@ -3096,18 +2409,15 @@ pub(crate) fn stop_thread() {
     }
 }
 
-/// One pending observation on the thread.
 struct Pending {
     obs: Box<Observation>,
     stamp: u64,
-    /// The escape scan was busy: not before this (the scan's spacing).
     not_before: Option<Instant>,
 }
 
 fn worker(rx: Receiver<Job>) {
     crate::qos::set_self(crate::qos::Role::Background);
     let shared = shared();
-    // Before the first stamp, whose gate note runs the main thread's tick.
     shared
         .pre_hold
         .store(read_pre_hold(|f| Path::new(f).exists()), Ordering::Release);
@@ -3133,7 +2443,6 @@ fn worker(rx: Receiver<Job>) {
             let _ = done.send(());
             break;
         }
-        // A panic is a failed job, never a dead thread.
         let changed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match job {
             None | Some(Job::Marked) | Some(Job::Stop(_)) => false,
             Some(Job::Spawn(job)) => {
@@ -3199,7 +2508,6 @@ fn worker(rx: Receiver<Job>) {
         }))
         .unwrap_or(false);
         let mut changed = changed;
-        // Evaluate every due observation.
         let now = Instant::now();
         let mut i = 0;
         let mut deferred = Vec::new();
@@ -3223,8 +2531,6 @@ fn worker(rx: Receiver<Job>) {
     }
 }
 
-/// When an observation is evaluated: shortly after its start mark, or at the
-/// end of the sample window.
 fn due(p: &Pending) -> Instant {
     let at = due_at(&p.obs);
     p.not_before.map_or(at, |nb| at.max(nb))
@@ -3237,8 +2543,6 @@ fn due_at(obs: &Observation) -> Instant {
     }
 }
 
-/// Recompute the current generation and mirror the gate's view of it; tell the
-/// main thread when eligibility moved.
 fn mirror(
     book: &mut GateBook,
     inputs: &GenInputs,
@@ -3269,10 +2573,6 @@ fn mirror(
     }
 }
 
-/// Judge one visible run (design §7.1) and fold it into the gate.
-/// Judge one visible run and fold it in; a run whose escape scan must wait for
-/// the scan's spacing comes back to be judged then (two tabs opened within the
-/// spacing each still teach the gate).
 fn evaluate(
     p: Pending,
     book: &mut GateBook,
@@ -3297,8 +2597,6 @@ fn evaluate(
         .retain(|(_, w)| w.upgrade().is_some_and(|w| !Arc::ptr_eq(&w, &obs.witness)));
     let w = &obs.witness;
     let Some(seen) = w.start_seen.get() else {
-        // Said, as `judge` says its rules: a busy host's run past the window
-        // otherwise reset the streak with no line at all.
         aterm_log::info!(
             "spare gate: unclean run: failed=start: no start record within {} ms",
             SAMPLE_WINDOW.as_millis()
@@ -3314,11 +2612,8 @@ fn evaluate(
         {
             reported.rc_dir = Some(PathBuf::from(dir));
         }
-        // The roots as this record named them: none leaves fish's generation
-        // without them, which never learns (`judge`).
         reported.roots = roots_of(&seen.mark);
     }
-    // The generation must not have moved under the run; else nothing is learned.
     if shared.stamp(&obs.inputs) != stamp {
         return None;
     }
@@ -3335,7 +2630,6 @@ fn evaluate(
     None
 }
 
-/// The verdict on one visible run.
 fn judge(obs: &Observation, seen: &StartSeen, last_scan: &mut Option<Instant>) -> Sample {
     let w = &obs.witness;
     if seen
@@ -3352,11 +2646,8 @@ fn judge(obs: &Observation, seen: &StartSeen, last_scan: &mut Option<Instant>) -
         .mark
         .flags
         .is_some_and(|f| f.sched == 0 && f.jobs.unwrap_or(0) == 0 && !f.periodic);
-    // fish's generation stamps the roots its record names (R7): a record that
-    // names none leaves what a spare would run unseen unknown.
     let roots_named = obs.inputs.shell != aterm_core::shell_integration::ShellType::Fish
         || seen.mark.roots.is_some();
-    // Each rule a clean run keeps, named for the log line below.
     let failed: Vec<&str> = [
         (seen.mark.kind == StartKind::Cold, "kind"),
         (rc <= SAMPLE_WINDOW, "slow"),
@@ -3423,7 +2714,6 @@ fn judge(obs: &Observation, seen: &StartSeen, last_scan: &mut Option<Instant>) -
     }
 }
 
-/// The wall-clock reading of the monotonic instant `at`.
 fn wall_of(at: Instant) -> std::time::SystemTime {
     let now = Instant::now();
     let wall = std::time::SystemTime::now();
@@ -3435,8 +2725,6 @@ fn wall_of(at: Instant) -> std::time::SystemTime {
     }
 }
 
-/// The escape scan over a run that started at `run_at` and signed its start
-/// record at `mark_at`; a sample's (`spaced`) at most once per [`SCAN_EVERY`].
 fn rate_limited_scan(
     pid: i32,
     shell_version: Option<i32>,
@@ -3457,23 +2745,12 @@ fn rate_limited_scan(
     })
 }
 
-/// `scan`, once the window it judges has ended (the mark at `mark_at` plus
-/// [`SCAN_GRACE`]: listed sooner, a daemon the startup files fork in the grace
-/// is in the window but in no listing). A sample is due then ([`due_at`]), and
-/// its scan (`spaced`) runs at most once per [`SCAN_EVERY`]; a verification, at
-/// its hold, waits here. A verification's scan is not spaced: there is one per
-/// spare (a fork apart at least, at most [`PARKED_BUDGET`] an hour), and spaced
-/// it held its spare unverified, and this thread (which forks the next spare),
-/// up to 2 s after a tab opened just before (its sample's scan or its spare's).
 fn rate_limited(
     mark_at: Instant,
     last_scan: &mut Option<Instant>,
     spaced: bool,
     scan: impl FnOnce() -> Scan,
 ) -> Scan {
-    // A precise sleep: this worker runs at UTILITY, whose plain timer woke
-    // 61-75 ms late here, and the spare is not verified, nor this thread free
-    // for the next spare's fork, until it wakes.
     crate::qos::sleep_until(mark_at + SCAN_GRACE);
     let now = Instant::now();
     if spaced && last_scan.is_some_and(|at| now.saturating_duration_since(at) < scan_every()) {
@@ -3483,7 +2760,6 @@ fn rate_limited(
     scan()
 }
 
-/// Verify a warm spare at its hold (design §6, Verifying).
 fn verify(job: &VerifyJob, last_scan: &mut Option<Instant>, shared: &Shared) -> Verdict {
     let w = &job.witness;
     let Some(seen) = w.start_seen.get() else {
@@ -3521,8 +2797,6 @@ fn verify(job: &VerifyJob, last_scan: &mut Option<Instant>, shared: &Shared) -> 
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .clone();
-    // A fish spare ran the startup files of the roots its own record names:
-    // its generation holds only if it was stamped over those.
     if job.inputs.shell == aterm_core::shell_integration::ShellType::Fish
         && roots_of(&seen.mark).is_none_or(|roots| reported.roots.as_ref() != Some(&roots))
     {
@@ -3531,7 +2805,6 @@ fn verify(job: &VerifyJob, last_scan: &mut Option<Instant>, shared: &Shared) -> 
     if rc_generation(&job.inputs, &reported) != job.generation {
         return Verdict::Backoff("stale");
     }
-    // Not spaced from the last scan ([`rate_limited`]).
     let shell_version = w.shell_version.get().copied();
     match rate_limited_scan(
         pid,
@@ -3548,11 +2821,6 @@ fn verify(job: &VerifyJob, last_scan: &mut Option<Instant>, shared: &Shared) -> 
     }
 }
 
-/// Spawn one spare on this thread and post it back. At this thread's own band:
-/// an exec'd child's priority does not follow the thread that forked it
-/// (measured: forks from a utility and a user-interactive thread run at the same
-/// priority after exec, the one `aterm_pty`'s `SHELL_ROLE` gives every shell), and
-/// nobody waits for a spare's fork.
 fn run_spawn(job: SpawnJob) {
     let SpawnJob {
         id,
@@ -3565,16 +2833,12 @@ fn run_spawn(job: SpawnJob) {
         cwd,
         shell,
     } = job;
-    // A system file that now runs before the hold, with no eligible gate:
-    // nothing is forked.
     let session = if parked_spawn_runs_unseen(&shared(), shell, |f| Path::new(f).exists()) {
         Err(std::io::Error::other(
             "a system file now runs before the parked hold",
         ))
     } else {
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            // Nobody waits for this fork, so it waits for the event loop to park,
-            // as a tab's does (`watchdog::forks_wait_for_park`).
             crate::watchdog::forks_wait_for_park(SPARE_FORK_PARK_WAIT, || {
                 crate::spawn::spawn_session(
                     id,
@@ -3586,7 +2850,7 @@ fn run_spawn(job: SpawnJob) {
                     &proxy,
                     cwd.as_deref(),
                     None,
-                    None, // no worker's task: a worker never adopts a spare
+                    None,
                     None,
                 )
             })
@@ -3598,28 +2862,17 @@ fn run_spawn(job: SpawnJob) {
         proxy.send_event(done)
         && let Ok(session) = done.session
     {
-        // No loop to take it: hang it up here.
         drop(session);
     }
 }
 
-// ─── The backstop's classification (design §5.3) ───
-
 impl Wake {
-    /// The local session a wake REPORTS about, from that session's own reader or
-    /// host plumbing (output, readiness, exit, a bell, an input watch, its meta,
-    /// footer or program): what the warm spare's backstop at the top of
-    /// `user_event` swallows for a spare nobody owns yet (`spare`). A request
-    /// that names a session (a control verb, a menu row) is `None`: its handler
-    /// resolves the name against the registry, where a spare is not. Exhaustive,
-    /// with no `_` arm, so a new variant must be classified here.
+    /// Local session id reported by a session-internal wake, if any.
     pub(crate) fn local_session(&self) -> Option<u64> {
         match self {
             Wake::Output { session, .. } => Some(*session),
             Wake::QueuedKeyDelivered { session, .. } => Some(*session),
             Wake::MetaChanged { session, .. } => Some(*session),
-            // The session's task record moved (its need is published again),
-            // as for `MetaChanged`.
             Wake::TaskChanged { session } => Some(*session),
             Wake::InputWatch { session, .. } => Some(*session),
             Wake::ClaudeFooter { session, .. } => Some(*session),
@@ -3876,22 +3129,14 @@ impl Wake {
     }
 }
 
-// ─── The slot, on the main thread (design §6) ───
-
-/// Where a spare is in its life.
+/// Lifecycle state of the spare slot.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum SlotState {
-    /// The spawn is on the `aterm-spare` thread.
     Booked,
-    /// Spawned; its parked mark has not arrived.
     Spawned,
-    /// Waiting at the parked hold: no startup file has run.
     Parked,
-    /// Told `run`: its startup files run unseen.
     Warming,
-    /// At its warm hold; the thread is verifying it.
     Verifying,
-    /// Verified at its warm hold.
     Ready,
 }
 
@@ -3905,85 +3150,57 @@ impl SlotState {
         }
     }
 
-    /// A tier whose startup files ran (or run) unseen.
+    /// Whether startup files have run (or are running) unseen in this state.
     pub(crate) const fn warm(self) -> bool {
         matches!(self, Self::Warming | Self::Verifying | Self::Ready)
     }
 }
 
-/// The grid a spare is spawned at: rows, cols and the cell box.
+/// Terminal grid dimensions `(rows, cols, cell_size)`.
 pub(crate) type Grid = (u16, u16, Option<(u16, u16)>);
 
-/// The one spare.
+/// Active spare shell slot.
 pub(crate) struct Slot {
     pub(crate) id: u64,
     pub(crate) state: SlotState,
     pub(crate) link: Arc<SpareLink>,
     pub(crate) session: Option<Session>,
-    /// The folder it was spawned in (`None`: the factory's).
     pub(crate) cwd: Option<String>,
     pub(crate) grid: Grid,
-    /// The window it was booked for.
     pub(crate) window: WindowId,
     pub(crate) fingerprint: u64,
-    /// The engine-config generation its factory copy carried (the config
-    /// carries the reported scheme, so the generation moves with it).
     pub(crate) colors: u64,
     pub(crate) booked: Instant,
-    /// When it entered its state.
     pub(crate) since: Instant,
-    /// The generation the gate opened for (warm tiers).
     pub(crate) generation: u64,
     pub(crate) t_ready: Duration,
     pub(crate) inputs: GenInputs,
 }
 
-/// An adopted spare between Cmd-T and its landing.
+/// Adopted spare in flight between `try_adopt_spare` and pool installation.
 pub(crate) struct Transit {
     pub(crate) id: u64,
     pub(crate) link: Arc<SpareLink>,
     pub(crate) tier: SlotState,
-    /// The grid it was spawned at: its landing re-sizes its pane only when the
-    /// window's differs now.
     pub(crate) grid: Grid,
     pub(crate) age: Duration,
     pub(crate) rc_ms: Option<u64>,
     pub(crate) inputs: GenInputs,
-    /// Why the spawner did not hand it over, when it did not.
     pub(crate) miss: Arc<OnceLock<&'static str>>,
-    /// The folder a parked spare `cd`s to at its release, when the spawner
-    /// retargeted it ([`AdoptCheck::verdict`]).
     pub(crate) retarget: Arc<OnceLock<String>>,
 }
 
-/// What the spawner checks before it hands an adopted spare over (design §8
-/// step 2), off the main thread.
+/// Pre-handoff validation check executed by the spawner off the main thread.
 pub(crate) struct AdoptCheck {
-    /// The folder the spare was spawned in (`None`: the factory's).
     pub(crate) cwd: Option<String>,
-    /// `Some((inputs, generation))` for a warm tier: the rc generation must not
-    /// have moved.
     pub(crate) generation: Option<(GenInputs, u64)>,
     pub(crate) link: Arc<SpareLink>,
-    /// A warm tier dies with its whole session when the check fails.
     pub(crate) kill: bool,
-    /// A PARKED spare whose shell ran nothing before its hold but its own
-    /// start (zsh with no system zshenv, or bash): it may `cd` to the folder
-    /// the tab asks for at its release.
     pub(crate) retarget: bool,
 }
 
 impl AdoptCheck {
-    /// Whether the spare may land as the tab whose cold spawn would start in
-    /// `want` (the folder the caller named, else the one the cold path takes
-    /// from the pane, `PaneFolder::first_taken`), else in `default` (the
-    /// factory's `-d` folder, which `spawn::spawn_session` takes for a spawn
-    /// naming none, the spare's own spawn included): `Ok(None)` as it is,
-    /// `Ok(Some(dir))` told to `cd` to `dir` at its release, else the miss.
-    /// A folder the cold spawn would fall back from is a miss: the cold path
-    /// says so. A spare in another folder is retargeted only when parked and
-    /// [`crate::spawn_folder::retarget_folder`] names the one `$PWD` a cold
-    /// shell there would have.
+    /// Validate that the spare can land in `want` (or `default`), returning an optional retarget directory.
     pub(crate) fn verdict(
         &self,
         session: &Session,
@@ -3995,8 +3212,6 @@ impl AdoptCheck {
         {
             return Err("stale");
         }
-        // Both folders as the spawn reads them: the one named, else the
-        // factory's.
         let want = want.or(default);
         let start = crate::spawn_folder::start_folder(want);
         if start.fell_back.is_some() {
@@ -4017,18 +3232,15 @@ impl AdoptCheck {
     }
 }
 
-/// The platform's say on running an rc unseen: Low Power Mode or a serious
-/// thermal state blocks a warm promotion. Injected, with an inert test arm.
+/// Platform probe returning whether power or thermal constraints block warm promotion.
 pub(crate) type PowerProbe = fn() -> bool;
 
-/// Whether the machine is in Low Power Mode or thermally serious (macOS
-/// `NSProcessInfo`; elsewhere never).
+/// Whether the host is in Low Power Mode or serious thermal state.
 pub(crate) fn power_constrained() -> bool {
     #[cfg(target_os = "macos")]
     {
         use aterm_objc::{class, sel};
-        // SAFETY: `+processInfo` is an immortal singleton; both getters are
-        // plain scalar properties, documented thread-safe.
+        // SAFETY: `+processInfo` is an immortal singleton; both getters are thread-safe scalar properties.
         unsafe {
             let info =
                 aterm_objc::send::send_id(class(c"NSProcessInfo").as_id(), sel!(processInfo));
@@ -4036,7 +3248,6 @@ pub(crate) fn power_constrained() -> bool {
                 return false;
             }
             let low = aterm_objc::send::send_bool(info, sel!(isLowPowerModeEnabled));
-            // NSProcessInfoThermalStateSerious = 2.
             let thermal = aterm_objc::send::send_isize(info, sel!(thermalState));
             low || thermal >= 2
         }
@@ -4047,51 +3258,36 @@ pub(crate) fn power_constrained() -> bool {
     }
 }
 
-/// The App's spare state.
+/// Main-thread warm spare controller state on [`App`].
 pub(crate) struct Spares {
     pub(crate) slot: Option<Slot>,
-    /// Retired spare ids whose late wakes are swallowed.
     tombstones: VecDeque<u64>,
     pub(crate) transit: Vec<Transit>,
     parked_spawns: VecDeque<Instant>,
     warm_discards: VecDeque<Instant>,
     last_replace: Option<Instant>,
-    /// The last person's gesture (`App::note_person_input`).
     person: std::cell::Cell<Option<Instant>>,
-    /// The next tick, if armed.
     tick_at: std::cell::Cell<Option<Instant>>,
     pub(crate) adopted: [u32; 3],
     misses: Vec<(&'static str, u32)>,
     discards: Vec<(&'static str, u32)>,
     pressure_at: Option<Instant>,
     pass_active: bool,
-    /// Where a spare should be (window, folder) and since when.
     wanted: Option<(WindowId, Option<String>, Instant)>,
-    /// A booking waits for this session's first prompt: its next output wake
-    /// arms the tick.
     wants_prompt: std::cell::Cell<Option<u64>>,
     boot_at: Option<Instant>,
-    /// A parked spare that ran past its hold: no spare again until the script
-    /// set or the shell changes (the key names both).
+    /// Shell/script fingerprint disabled after a parked spare ran past its hold.
     pub(crate) parked_failed: Option<u64>,
-    /// The folder a spare's spawn found would fall back (gone, shut, or on a
-    /// volume that did not answer; a held pane's may be another machine's): no
-    /// spare is booked there again until the wanted folder or window moves.
+    /// Target folder that failed with [`FolderFallsBack`], barred until the target moves.
     pub(crate) folder_failed: Option<Option<String>>,
     pub(crate) shared: Arc<Shared>,
     pub(crate) power: PowerProbe,
     restamped: Option<u64>,
-    /// The [`Job::Freshen`] a promotion waits for: its number and when it was
-    /// asked.
     freshen: Option<(u64, Instant)>,
     freshen_seq: u64,
-    /// The boot session's visible run was handed to the gate.
     boot_observed: bool,
-    /// A crashed run's FIFOs were handed to the thread to release.
     swept: bool,
-    /// A test's capture of the jobs the App sends the `aterm-spare` thread, and
-    /// its stand-in for the event loop (verdicts and notes come back through
-    /// the test). `None` in every run.
+    /// Captured [`Job`] queue for headless unit tests.
     #[cfg(test)]
     pub(crate) captured: Option<Vec<Job>>,
 }
@@ -4117,7 +3313,6 @@ impl Default for Spares {
             boot_at: None,
             parked_failed: None,
             folder_failed: None,
-            // A test's App keeps a mirror of its own; a run shares the thread's.
             shared: if cfg!(test) { Arc::default() } else { shared() },
             power: power_constrained,
             restamped: None,
@@ -4138,14 +3333,12 @@ fn bump(counts: &mut Vec<(&'static str, u32)>, reason: &'static str) {
     }
 }
 
-/// The entries of `log` younger than `window`.
 fn count_within(log: &VecDeque<Instant>, now: Instant, window: Duration) -> usize {
     log.iter()
         .filter(|at| now.saturating_duration_since(**at) < window)
         .count()
 }
 
-/// Drop the entries of `log` older than `window`.
 fn prune(log: &mut VecDeque<Instant>, now: Instant, window: Duration) {
     while log
         .front()
@@ -4155,25 +3348,20 @@ fn prune(log: &mut VecDeque<Instant>, now: Instant, window: Duration) {
     }
 }
 
-/// A booking's or a promotion's verdict.
+/// Decision from [`App::spare_book_check`] or [`App::spare_promote_check`].
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum BookCheck {
-    /// Go: the window and folder.
     Go {
         window: WindowId,
         cwd: Option<String>,
     },
-    /// Not before this instant.
     Wait(Instant),
-    /// The front window's focused session (if any) has not reached its prompt.
     NotAtPrompt(Option<u64>),
-    /// Not now, for this reason; a trigger looks again.
     No(&'static str),
 }
 
 impl Spares {
-    /// Whether the backstop swallows a wake naming local id `id`: the slot's,
-    /// one in transit, or a retired spare's.
+    /// Whether the event-loop backstop should swallow a wake for session `id`.
     pub(crate) fn swallows(&self, id: u64) -> bool {
         self.slot.as_ref().is_some_and(|s| s.id == id)
             || self.transit.iter().any(|t| t.id == id)
@@ -4187,7 +3375,7 @@ impl Spares {
         self.tombstones.push_back(id);
     }
 
-    /// Send `job` to the `aterm-spare` thread (a test captures it instead).
+    /// Send `job` to the worker thread (or capture it in tests).
     pub(crate) fn send(&mut self, job: Job) -> Result<(), Job> {
         #[cfg(test)]
         if let Some(captured) = self.captured.as_mut() {
@@ -4197,19 +3385,18 @@ impl Spares {
         send_job(job)
     }
 
-    /// An adopted spare that never went live: its late wakes are swallowed.
+    /// Record `id` in the tombstone ring so late wakes are swallowed.
     pub(crate) fn tombstone_public(&mut self, id: u64) {
         self.tombstone(id);
     }
 
-    /// Arm the tick no later than `at`.
+    /// Arm the next spare tick at or before `at`.
     pub(crate) fn arm(&self, at: Instant) {
         let next = self.tick_at.get().map_or(at, |t| t.min(at));
         self.tick_at.set(Some(next));
     }
 
-    /// A person's gesture, or a window coming to the front: stamped, and the
-    /// tick armed once the input settles.
+    /// Record user activity at `now` and schedule a tick after [`SETTLE`].
     pub(crate) fn note_person(&self, now: Instant) {
         let first = self
             .person
@@ -4228,8 +3415,7 @@ impl Spares {
         }
     }
 
-    /// Session `id` produced output: a booking that waited for its first
-    /// prompt looks again.
+    /// Notify that session `id` produced output while booking awaited its first prompt.
     pub(crate) fn note_output(&self, id: u64, now: Instant) {
         if self.wants_prompt.get() == Some(id) {
             self.wants_prompt.set(None);
@@ -4241,8 +3427,7 @@ impl Spares {
         bump(&mut self.misses, reason);
     }
 
-    /// Publish what `metrics` prints of the spare (design §10): the control
-    /// thread emits it ([`emit_metrics`]).
+    /// Publish spare state to the shared metrics snapshot.
     pub(crate) fn publish(&self, mode: SpareMode, now: Instant) {
         let state = if mode == SpareMode::Off {
             "off"
@@ -4280,7 +3465,6 @@ impl Spares {
     }
 }
 
-/// What the main thread last published for `metrics`.
 struct MetricsSnap {
     state: &'static str,
     booked: Option<Instant>,
@@ -4289,11 +3473,7 @@ struct MetricsSnap {
 
 static METRICS: Mutex<Option<MetricsSnap>> = Mutex::new(None);
 
-/// The spare's `metrics` fields (design §10), through the one emitter both
-/// forms read: `spare=` (off/absent/booked/parked/warming/ready), its age,
-/// the spare PTYs, the gate's word, the adoptions per tier, misses and
-/// discards per reason, the budgets left and the median qualifying rc run. A
-/// value that is a number is a count, any other a label.
+/// Emit spare metrics fields to `s`.
 pub(crate) fn emit_metrics(s: &mut dyn crate::metrics::wire::FieldSink) {
     let snap = METRICS.lock().unwrap_or_else(|e| e.into_inner());
     let (state, age, rest) = match snap.as_ref() {
@@ -4342,7 +3522,6 @@ pub(crate) fn emit_metrics(s: &mut dyn crate::metrics::wire::FieldSink) {
     s.opt_count("spare_rc_ms_p50", rc_p50.map(u64::from), "-");
 }
 
-/// The deterministic-failure key: the script set and the shell binary.
 fn parked_key(inputs: &GenInputs) -> u64 {
     use std::hash::{Hash as _, Hasher as _};
     let mut h = std::collections::hash_map::DefaultHasher::new();
@@ -4351,8 +3530,6 @@ fn parked_key(inputs: &GenInputs) -> u64 {
     h.finish()
 }
 
-/// The resolved shell binary for a factory's override (`$SHELL`, else
-/// `/bin/sh`, as `aterm_pty` resolves it).
 fn shell_binary(override_shell: Option<&str>) -> PathBuf {
     match override_shell.filter(|s| !s.is_empty()) {
         Some(s) => PathBuf::from(s),
@@ -4361,7 +3538,7 @@ fn shell_binary(override_shell: Option<&str>) -> PathBuf {
 }
 
 impl App {
-    /// The configured mode (`spare_shell`).
+    /// Configured [`SpareMode`].
     pub(crate) fn spare_mode(&self) -> SpareMode {
         if cfg!(not(any(target_os = "macos", target_os = "linux"))) {
             return SpareMode::Off;
@@ -4369,7 +3546,7 @@ impl App {
         self.config.spare_shell_mode()
     }
 
-    /// What this factory's rc generation is computed from (cheap; no stat).
+    /// Capture [`GenInputs`] for the current session factory.
     pub(crate) fn spare_gen_inputs(&self) -> GenInputs {
         let f = &self.session_factory;
         let home = aterm_types::dirs::home_dir().unwrap_or_default();
@@ -4385,10 +3562,6 @@ impl App {
         }
     }
 
-    /// Whether this factory's shells could ever be spares: integrated
-    /// zsh/bash/fish with no `-e` and no temporal recording. fish runs unseen
-    /// only for a generation stamped over the startup roots its own records
-    /// name ([`Reported`], [`judge`]).
     fn spare_factory_ok(&self) -> bool {
         let f = &self.session_factory;
         f.exec_command.is_none()
@@ -4399,9 +3572,8 @@ impl App {
             ))
     }
 
-    /// The tick's next instant, running it first when it is due (`about_to_wait`).
+    /// Next spare tick deadline, running `spare_tick` first if due at `now`.
     pub(crate) fn spare_deadline(&mut self, now: Instant) -> Option<Instant> {
-        // The first turn: the first tick waits out the boot grace.
         if self.spares.boot_at.is_none() {
             self.spares.boot_at = Some(now);
             self.spares.arm(now + BOOT_GRACE);
@@ -4417,16 +3589,13 @@ impl App {
         self.spares.tick_at.get()
     }
 
-    /// Publish the spare's `metrics` fields.
+    /// Publish spare metrics for the current mode.
     pub(crate) fn publish_spare(&self) {
         self.spares.publish(self.spare_mode(), Instant::now());
     }
 
-    /// Book, promote, replace and age the spare (design §7.2, §9). Main thread,
-    /// no filesystem access.
+    /// Advance spare booking, promotion, replacement, and aging on the main thread.
     pub(crate) fn spare_tick(&mut self, now: Instant) {
-        // A crashed run's spares are released once a launch, whatever the mode
-        // (never a test's: the sweep reads the real control dir).
         if cfg!(all(
             any(target_os = "macos", target_os = "linux"),
             not(test)
@@ -4434,10 +3603,6 @@ impl App {
         {
             let _ = self.spares.send(Job::Sweep);
         }
-        // Every cold spawn's kit and child provision are made ahead from the
-        // first tick on, whatever the mode: past the boot grace, never on the
-        // cold start's path (`spawn_prep`; never a test's, which would turn its
-        // removals asynchronous for every test in the process).
         if cfg!(not(test)) {
             crate::spawn_prep::warm();
         }
@@ -4449,7 +3614,6 @@ impl App {
             return;
         }
         self.spares.boot_at.get_or_insert(now);
-        // The gate learns this factory's generation (once per change).
         let inputs = self.spare_gen_inputs();
         let key = inputs.fingerprint ^ parked_key(&inputs);
         if self.spares.restamped != Some(key) {
@@ -4458,8 +3622,6 @@ impl App {
                 .spares
                 .send(Job::Restamp(Box::new(inputs.clone()), self.proxy.clone()));
         }
-        // The boot session's startup files ran in view before the first tick:
-        // a visible run the gate learns from like a cold tab's.
         if !std::mem::replace(&mut self.spares.boot_observed, true) && mode == SpareMode::Auto {
             self.observe_spare_run(0, inputs.clone());
         }
@@ -4473,7 +3635,6 @@ impl App {
         }
     }
 
-    /// The slot's own deadlines (design §6, §9).
     fn spare_age(&mut self, now: Instant, mode: SpareMode) {
         let Some(slot) = &self.spares.slot else {
             return;
@@ -4483,7 +3644,6 @@ impl App {
         let parked_by = parked_deadline();
         match state {
             SlotState::Spawned if age >= parked_by => {
-                // The wrapper did not hold: the rc may be running unasked.
                 aterm_log::warn!("spare: no parked mark within {parked_by:?}; spares off");
                 self.spares.parked_failed = Some(parked_key(&slot.inputs));
                 self.retire_spare("no_park", None);
@@ -4513,12 +3673,6 @@ impl App {
         }
     }
 
-    /// Where a spare should be now: the front window and the folder its
-    /// focused pane reported, which a new tab there opens in, held or not
-    /// (2026-10-18: Cmd-T while an agent runs is the usual new tab). A held
-    /// pane's folder the cold path would not take (`PaneFolder::resolve`) is
-    /// one the spare's spawn finds would fall back ([`Spares::folder_failed`]).
-    /// `None` with no front window.
     fn spare_wanted(&self) -> Option<(WindowId, Option<String>)> {
         let front = self.frontmost_window?;
         if !self.windows.contains_key(&front) {
@@ -4531,9 +3685,6 @@ impl App {
         ))
     }
 
-    /// Replace a spare whose window or folder moved, once the new one holds
-    /// (design §9): 1 s for a parked spare, 10 s for a warm one; a warm spare's
-    /// grid change, after 2 s.
     fn spare_follow(&mut self, now: Instant) {
         let wanted = self.spare_wanted();
         let moved = match (&self.spares.wanted, &wanted) {
@@ -4552,9 +3703,6 @@ impl App {
             return;
         }
         let since = self.spares.wanted.as_ref().map_or(now, |(_, _, at)| *at);
-        // One spare per process, re-keyed to the front window: only a folder
-        // that moved (or no front window) misplaces it; a warm one's grid is
-        // judged in the window it would land in.
         let misplaced = match &wanted {
             Some((_, c)) => *c != slot.cwd,
             None => true,
@@ -4600,13 +3748,8 @@ impl App {
         }
     }
 
-    /// Whether a parked spare may be booked now (design §7.2): where it goes,
-    /// when to look again, or why not. The event loop it needs is the tick's
-    /// and the booking's own check, so a test reaches every gate here.
+    /// Check whether a spare can be booked at `now`.
     pub(crate) fn spare_book_check(&self, now: Instant, inputs: &GenInputs) -> BookCheck {
-        // A person seen once is enough: a PARKED spare runs nothing of theirs,
-        // so it waits through an absence for the Cmd-T that ends it. Only WARM
-        // asks for a person now ([`Self::spare_promote_check`]).
         if self.config.spare_shell_needs_person_or_default() && self.spares.person.get().is_none() {
             return BookCheck::No("no-person");
         }
@@ -4627,16 +3770,11 @@ impl App {
         {
             return BookCheck::Wait(at + PRESSURE_HOLD);
         }
-        // A spare whose shell reads a system file before its hold (zsh's
-        // global zshenv, Linux bash's system bashrc) runs it unseen: parking
-        // it needs the gate.
         if self.spares.shared.ran_before_hold(inputs.shell)
             && !self.spares.shared.eligible.load(Ordering::Acquire)
         {
             return BookCheck::No("system-rc");
         }
-        // Time gates: the boot grace, the replacement spacing, input settled, the
-        // hourly budget.
         let settle = debug_ms("SETTLE").unwrap_or(SETTLE);
         let mut not_before = self.spares.boot_at.map_or(now, |at| at + BOOT_GRACE);
         if let Some(at) = self.spares.last_replace {
@@ -4659,7 +3797,6 @@ impl App {
         if self.spares.folder_failed.as_ref() == Some(&cwd) {
             return BookCheck::No("folder");
         }
-        // The front window's focused session has reached its prompt.
         let focused = self.focused_session_id(window);
         let at_prompt = focused
             .and_then(|id| self.pool.get(id))
@@ -4667,8 +3804,6 @@ impl App {
         if !at_prompt {
             return BookCheck::NotAtPrompt(focused);
         }
-        // A shell with no PARKED hold (fish) runs its startup files from the
-        // spawn: booking it is the `run`, under the same gates.
         if !aterm_core::shell_integration::has_parked_hold(inputs.shell)
             && let Some(no) = self.spare_warm_gates(now, now)
         {
@@ -4677,7 +3812,6 @@ impl App {
         BookCheck::Go { window, cwd }
     }
 
-    /// Book a parked spare when every condition holds.
     fn spare_book(&mut self, now: Instant, inputs: &GenInputs) {
         let (window, cwd) = match self.spare_book_check(now, inputs) {
             BookCheck::Go { window, cwd } => (window, cwd),
@@ -4686,14 +3820,11 @@ impl App {
                 return;
             }
             BookCheck::NotAtPrompt(focused) => {
-                // Its next output looks again.
                 self.spares.wants_prompt.set(focused);
                 return;
             }
             BookCheck::No(_) => return,
         };
-        // A WARM-only spawn waits, as a `run` does, for a stamp taken after
-        // it asked (`spare_promote`).
         let warm_only = !aterm_core::shell_integration::has_parked_hold(inputs.shell);
         if warm_only && !self.spare_fresh(now) {
             return;
@@ -4762,7 +3893,7 @@ impl App {
         }
     }
 
-    /// Whether the parked spare may be told `run` now (design §7.2).
+    /// Check whether a parked spare can be promoted to warm at `now`.
     pub(crate) fn spare_promote_check(&self, now: Instant) -> BookCheck {
         let Some(slot) = &self.spares.slot else {
             return BookCheck::No("none");
@@ -4779,17 +3910,11 @@ impl App {
         }
     }
 
-    /// The gates a startup-file run unseen passes (design §7.2's "Promote to
-    /// WARM"): a parked spare's `run`, and the spawn of a spare whose shell
-    /// has no PARKED hold (fish), which runs its startup files at once.
-    /// `since` is when the spare's current state began. `None`: all pass.
+    /// Check common gates required before running startup files unseen.
     pub(crate) fn spare_warm_gates(&self, now: Instant, since: Instant) -> Option<BookCheck> {
         if self.spare_mode() != SpareMode::Auto {
             return Some(BookCheck::No("mode"));
         }
-        // The startup files run unseen only while a person is here (a gesture,
-        // or a window coming to the front, within [`PERSON_WINDOW`]); their
-        // next one arms the tick again ([`Spares::note_person`]).
         if self.config.spare_shell_needs_person_or_default()
             && self
                 .spares
@@ -4832,7 +3957,6 @@ impl App {
         None
     }
 
-    /// Promote a parked spare to WARM: write `run`.
     fn spare_promote(&mut self, now: Instant) {
         match self.spare_promote_check(now) {
             BookCheck::Go { .. } => {}
@@ -4842,10 +3966,6 @@ impl App {
             }
             BookCheck::NotAtPrompt(_) | BookCheck::No(_) => return,
         }
-        // The check read the gate's mirror, which is only as fresh as its last
-        // stamp: `run` waits for one taken after this asked, so a startup file
-        // edited since the gate opened never runs unseen (a stamp that finds a
-        // new generation closes the gate before the check passes again).
         if !self.spare_fresh(now) {
             return;
         }
@@ -4868,9 +3988,6 @@ impl App {
         self.spares.arm(now + t_ready);
     }
 
-    /// Whether the gate's mirror was stamped after the last [`Job::Freshen`]
-    /// this asked, within [`FRESH_FOR`] of the ask. Else one is asked (one at
-    /// a time), and its answer's gate note runs the tick again.
     fn spare_fresh(&mut self, now: Instant) -> bool {
         let answered = self.spares.shared.fresh.load(Ordering::Acquire);
         if let Some((n, at)) = self.spares.freshen {
@@ -4880,7 +3997,6 @@ impl App {
                 return true;
             }
             if young {
-                // Asked, not answered yet: the answer's note looks again.
                 self.spares.arm(at + FRESH_FOR);
                 return false;
             }
@@ -4896,7 +4012,7 @@ impl App {
         false
     }
 
-    /// [`Wake::SpareSpawned`].
+    /// Handle [`Wake::SpareSpawned`] completion on the main thread.
     pub(crate) fn on_spare_spawned(&mut self, done: SpareSpawned) {
         let SpareSpawned { id, session } = done;
         let now = Instant::now();
@@ -4916,11 +4032,6 @@ impl App {
                     Arc::clone(&slot.link),
                 )));
                 let parked = slot.link.witness.parked_seen.get().is_some();
-                // A start record that came in before this completion (its note
-                // found the slot still Booked and was dropped): the shell ran
-                // past its hold, as `on_spare_note` judges one seen later —
-                // except a WARM-only spare's (fish), whose startup files ran
-                // from the spawn: its record is judged now, as on arrival.
                 let ran_past = slot.link.witness.start_seen.get().is_some();
                 let warm_only = !aterm_core::shell_integration::has_parked_hold(slot.inputs.shell);
                 slot.session = Some(session);
@@ -4931,13 +4042,6 @@ impl App {
                 } else {
                     SlotState::Spawned
                 };
-                // A WARM-only spare's Warming began at its spawn, not at this
-                // completion: the escape scan's window opens at `since`
-                // (`Job::Verify`'s `run_at`), and one opened here missed every
-                // process its startup files forked before the main loop read
-                // the completion (review, 2026-10-17). The booking precedes
-                // the fork, so the scan starts at the shell's own birth, as a
-                // cold tab's does.
                 slot.since = if warm_only { slot.booked } else { now };
                 if warm_only {
                     self.spares.arm(now);
@@ -4955,18 +4059,12 @@ impl App {
                 self.spares.arm(now);
             }
             Ok(session) => {
-                // Retired while it was spawning.
                 self.spares.retire_session(session, false);
             }
             Err(e) if matches => {
                 aterm_log::info!("spare: spawn failed: {e}");
                 let slot = self.spares.slot.take();
                 self.spares.tombstone(id);
-                // A folder that would fall back forked nothing: its booking is
-                // given back to the hourly budget, and the folder books no
-                // spare again until it moves, so a held pane's folder that is
-                // another machine's, or a folder that is gone, costs one check
-                // per move, never one per keystroke.
                 if e.get_ref().is_some_and(|e| e.is::<FolderFallsBack>())
                     && let Some(slot) = slot
                 {
@@ -4988,7 +4086,7 @@ impl App {
         }
     }
 
-    /// [`Wake::SpareNote`].
+    /// Handle [`Wake::SpareNote`] events on the main thread.
     pub(crate) fn on_spare_note(&mut self, id: u64, note: SpareNote) {
         let now = Instant::now();
         if note == SpareNote::Gate {
@@ -5016,10 +4114,8 @@ impl App {
                     (SlotState::Warming, Some(StartKind::Spare)) => {
                         let reply: crate::spawn::WakePost = match &self.proxy {
                             Some(proxy) => crate::spawn::post_to(proxy),
-                            // No loop (a test): the verdict comes back through it.
                             None => Arc::new(|_| false),
                         };
-                        // Its rc ran from the `run`, when it entered Warming.
                         let run_at = slot.since;
                         slot.state = SlotState::Verifying;
                         slot.since = now;
@@ -5040,8 +4136,6 @@ impl App {
                             self.retire_spare("thread", None);
                         }
                     }
-                    // A start record from a shell that should still be held: it
-                    // ran past a hold.
                     (SlotState::Spawned | SlotState::Parked, _) => {
                         aterm_log::warn!("spare: a parked spare signed a start record; spares off");
                         self.spares.parked_failed = Some(parked_key(&slot.inputs));
@@ -5087,9 +4181,7 @@ impl App {
         }
     }
 
-    /// The backstop at the top of `user_event`: a wake naming a spare that
-    /// slipped past its reader's post (design §5.3). An output wake clears that
-    /// session's latch; everything else is dropped.
+    /// Swallow wakes for unowned spares at the top of `user_event`.
     pub(crate) fn on_spare_backstop(&mut self, ev: &Wake) {
         if let Wake::Output { session, .. } = ev
             && let Some(slot) = &self.spares.slot
@@ -5100,9 +4192,7 @@ impl App {
         }
     }
 
-    /// Retire the spare: `reason` counted, a warm tier's discard budgeted, the
-    /// gate told of a `failure`, the session dropped on the `aterm-spare`
-    /// thread (a warm tier's whole session SIGKILLed first).
+    /// Retire the current spare slot, recording `reason` and optional gate `failure`.
     pub(crate) fn retire_spare(&mut self, reason: &'static str, failure: Option<Verdict>) {
         let Some(slot) = self.spares.slot.take() else {
             return;
@@ -5131,8 +4221,7 @@ impl App {
         self.publish_spare();
     }
 
-    /// The final exit: every spare retired and the thread joined, before the
-    /// final reap and the keeper's BYE (`mem::forget(app)` runs no RAII).
+    /// Retire any active spare and stop the worker thread on application exit.
     pub(crate) fn shutdown_spares(&mut self) {
         if self.spares.slot.is_some() {
             self.retire_spare("quit", None);
@@ -5140,15 +4229,14 @@ impl App {
         stop_thread();
     }
 
-    /// Critical memory pressure: retire the spare and hold off for 10 minutes.
-    /// Its one caller is the macOS-only `Wake::MemoryPressure` arm.
+    /// Retire the spare and hold off booking after critical memory pressure.
     #[cfg(target_os = "macos")]
     pub(crate) fn note_spare_pressure(&mut self) {
         self.spares.pressure_at = Some(Instant::now());
         self.retire_spare("pressure", None);
     }
 
-    /// An atpkg pass started or ended: a warm spare's rc ran before it.
+    /// Update `pass_active` and retire any warm spare when an atpkg pass starts.
     pub(crate) fn note_spare_pass(&mut self, active: bool) {
         let was = std::mem::replace(&mut self.spares.pass_active, active);
         if active && !was && self.spares.slot.as_ref().is_some_and(|s| s.state.warm()) {
@@ -5159,8 +4247,7 @@ impl App {
         }
     }
 
-    /// The config was reloaded: a spare spawned by another factory goes, and a
-    /// mode change is applied now.
+    /// Reconcile spare state after a configuration reload.
     pub(crate) fn spare_config_changed(&mut self) {
         let fingerprint = self.session_factory.spawn_fingerprint();
         let stale = self
@@ -5174,23 +4261,20 @@ impl App {
         self.spares.arm(Instant::now());
     }
 
-    /// The colors or appearance changed: a warm spare's rc may have read them.
+    /// Retire any warm spare after terminal colors or appearance change.
     pub(crate) fn spare_colors_changed(&mut self) {
         if self.spares.slot.as_ref().is_some_and(|s| s.state.warm()) {
             self.retire_spare("colors", None);
         }
     }
 
-    /// A landing (adopted or cold) or a focus change: the next spare is booked
-    /// once things settle.
+    /// Schedule a spare check after a tab lands or window focus changes.
     pub(crate) fn spare_poke(&self) {
         let settle = debug_ms("SETTLE").unwrap_or(SETTLE);
         self.spares.arm(Instant::now() + settle);
     }
 
-    /// Adoption's gates G1–G10 (design §7.3) for a spawn landing at `place` in
-    /// `window` at `grid`, asked for as `ask` says. `Ok` takes the spare out of
-    /// the slot; `Err` names the miss.
+    /// Attempt to adopt the spare for a new tab in `window` at `grid`.
     pub(crate) fn try_adopt_spare(
         &mut self,
         window: WindowId,
@@ -5199,17 +4283,12 @@ impl App {
         ask: &crate::tab_spawn::SpawnAsk,
     ) -> Result<(Slot, Session), &'static str> {
         let now = Instant::now();
-        // G1
         if self.spare_mode() == SpareMode::Off {
             return Err("off");
         }
-        // G2
         if !matches!(ask.admission, crate::tab_spawn::SpawnAdmission::Plain)
             || ask.observe.is_some()
             || ask.folder_of.is_some()
-            // Its own theme (`spawn theme=`): a warm spare's rc read the
-            // instance's colours, and the newborn's must be on its engine
-            // before its reader runs.
             || ask.theme.is_some()
         {
             return Err("ask");
@@ -5223,26 +4302,17 @@ impl App {
         let Some(slot) = &self.spares.slot else {
             return Err("none");
         };
-        // G3. A spare whose escape scan waits out its window (Verifying) is
-        // taken as a Warming one is, its startup files run, its verdict left
-        // to fall on an empty slot: refused, a tab asked for in the grace
-        // after the mark ([`SCAN_GRACE`]) went cold.
         match slot.state {
             SlotState::Parked | SlotState::Warming | SlotState::Verifying | SlotState::Ready => {}
             SlotState::Booked | SlotState::Spawned => return Err("booked"),
         }
         let warm = slot.state.warm();
-        // G4
         if fingerprint != slot.fingerprint {
             return Err("factory");
         }
         if warm && colors != slot.colors {
             return Err("colors");
         }
-        // G5: the folder, exactly, held pane or not (the spawner checks the
-        // folder the cold path would take from it); a parked spare elsewhere
-        // may be retargeted there, which the spawner decides
-        // ([`AdoptCheck::verdict`]).
         let here = match (&ask.cwd, focused) {
             (Some(cwd), _) => Some(cwd) == slot.cwd.as_ref(),
             (None, Some(f)) => Some(&f.reported) == slot.cwd.as_ref(),
@@ -5251,11 +4321,9 @@ impl App {
         if !here && !(slot.state == SlotState::Parked && self.spare_retargets(slot.inputs.shell)) {
             return Err("folder");
         }
-        // G6
         if warm && grid != slot.grid && !self.spare_blank(slot) {
             return Err("grid");
         }
-        // G7
         let age = now.saturating_duration_since(slot.since);
         let too_old = match slot.state {
             SlotState::Parked => age >= PARKED_MAX_AGE,
@@ -5265,7 +4333,6 @@ impl App {
         if too_old {
             return Err("age");
         }
-        // G8
         if warm && generation != slot.generation {
             return Err("stale");
         }
@@ -5275,7 +4342,6 @@ impl App {
         if slot.link.tainted() != 0 {
             return Err("taint");
         }
-        // G9
         if slot.link.exited()
             || slot
                 .session
@@ -5284,7 +4350,6 @@ impl App {
         {
             return Err("process");
         }
-        // G10
         if in_flight {
             return Err("update");
         }
@@ -5295,18 +4360,12 @@ impl App {
         Ok((slot, session))
     }
 
-    /// Whether a PARKED spare of `shell` may `cd` at its release: nothing but
-    /// the shell's own start ran before its hold (no system file read ahead
-    /// of the wrapper: zsh's global zshenv is absent on stock macOS, and
-    /// macOS's bash has no system bashrc; Ubuntu ships both), so a `cd` there
-    /// reads as a cold start in the folder.
+    /// Whether a parked spare of `shell` can `cd` to a new folder on release.
     pub(crate) fn spare_retargets(&self, shell: aterm_core::shell_integration::ShellType) -> bool {
         aterm_core::shell_integration::has_parked_hold(shell)
             && !self.spares.shared.ran_before_hold(shell)
     }
 
-    /// Whether a warm spare's screen is blank (primary grid, no scrollback):
-    /// it may land at any grid.
     fn spare_blank(&self, slot: &Slot) -> bool {
         slot.session.as_ref().is_some_and(|s| {
             let t = crate::term_lock(&s.term);
@@ -5316,11 +4375,7 @@ impl App {
         })
     }
 
-    /// An adopted spare landed in the pool (design §8 step 4): the session goes
-    /// live in `window`, its reader's `Ready` is replayed, the primer runs, and
-    /// the shell is told `go`. The session's own wiring (host reach, census,
-    /// latches, start, cast) was made as it landed
-    /// ([`Self::prepare_adopted_spare`]).
+    /// Finalize adoption of spare `id` into `window` and release its hold FIFO.
     pub(crate) fn adopt_live(&mut self, id: u64, window: WindowId) {
         let Some(at) = self.spares.transit.iter().position(|t| t.id == id) else {
             return;
@@ -5332,12 +4387,6 @@ impl App {
             .born
             .set((transit.tier.as_str(), transit.age.as_millis()));
         transit.link.go_live(window);
-        // A write that put bytes in its input queue while it was nobody's (an
-        // rc's query answered by its reader) fired the input watch into the
-        // swallowing post, and the watch fires once until its probe re-arms
-        // it: armed again now, and woken when input waits, as an attach does
-        // (`input_stall::watch_input`), so the tab's stall watch is a cold
-        // tab's from here.
         if let Some(s) = self.pool.get(id) {
             s.ctx.sink.rearm_input_hook();
             if s.ctx.sink.input_backlog().is_some_and(|b| b.unread() > 0) {
@@ -5351,7 +4400,6 @@ impl App {
                 .mark_alive(id);
         }
         crate::spawn::prime_agents_if_due(crate::spawn::PrimeCue::SpareAdopted);
-        // A retargeted parked spare is told its folder with the release.
         let told = match transit.retarget.get() {
             Some(dir) => transit.link.witness.tell(&format!("go {dir}")),
             None => transit.link.witness.tell("go"),
@@ -5390,8 +4438,6 @@ impl App {
         if !told {
             aterm_log::warn!("spare {id}: the release could not be written");
         }
-        // A parked spare's startup files run now, in view: a visible run the
-        // gate learns from, started at the release.
         if transit.tier == SlotState::Parked {
             self.observe_spare_run(id, transit.inputs);
         }
@@ -5399,9 +4445,7 @@ impl App {
         self.publish_spare();
     }
 
-    /// The session-side half of an adoption, on the owned session before it is
-    /// installed: the cold path's host wiring, the PTY census, fresh latches,
-    /// the shell's start, the keeper and the cast's timeline (design §8 step 4).
+    /// Wire host callbacks, census, keeper, and recording timeline on an adopted spare.
     pub(crate) fn prepare_adopted_spare(&self, session: &mut Session, window: WindowId) {
         let reach = crate::spawn::session_host_reach();
         if let Some(proxy) = &self.proxy {
@@ -5436,8 +4480,7 @@ impl App {
         crate::keeper_link::register(session, None);
     }
 
-    /// Tell the gate about a visible rc run that starts now in session `id`: a
-    /// cold tab's, or a parked spare's release (design §7.1).
+    /// Register a visible shell startup in session `id` for gate observation.
     pub(crate) fn observe_spare_run(&mut self, id: u64, inputs: GenInputs) {
         if self.spare_mode() != SpareMode::Auto {
             return;
@@ -5461,8 +4504,6 @@ impl App {
             sid: s.ctx.self_id.as_str().to_owned(),
             started_at,
             input0,
-            // A fresh session's counters start at zero, and a spare's moved
-            // nothing before its release (its effects only tainted it).
             host_effects0: 0,
             early_control0: 0,
             inputs,
@@ -5472,8 +4513,6 @@ impl App {
 }
 
 impl Spares {
-    /// Drop a retired spare's session on the `aterm-spare` thread (here when it
-    /// has none), `kill` first SIGKILLing its whole session.
     fn retire_session(&mut self, session: Session, kill: bool) {
         if let Err(Job::Retire(session, kill)) = self.send(Job::Retire(Box::new(session), kill)) {
             if kill {

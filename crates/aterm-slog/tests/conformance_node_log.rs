@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Tier-1 conformance (5J-1, ruling T27): what [`NodeLog::read`] tells a
+//! Tier-1 conformance: what [`NodeLog::read`] tells a
 //! reader, against the derived `SessionLogCursor` model
 //! (`aterm_models_session::session_log_cursor_model`, the one
 //! `conformance_cursor` holds the session ring to).

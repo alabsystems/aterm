@@ -1083,7 +1083,7 @@ fn a_short_spelled_directory_reads_its_volume() {
 }
 
 /// A VOLUME IS PLACED WITH THE SYSTEM'S ERROR BOXES OFF, on whatever thread
-/// asks (wave 3's soundness review, its first finding: the control socket's
+/// asks (its first finding: the control socket's
 /// `await sys` holds no guard of its own): [`volume_of`] resolves the path,
 /// and on Windows a query of an empty card reader or optical drive otherwise
 /// puts a box on the owner's desktop and parks the asker. Read inside the

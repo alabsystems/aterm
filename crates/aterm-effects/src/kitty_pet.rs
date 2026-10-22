@@ -4275,11 +4275,15 @@ impl PetBrain {
     /// stands at its seat. Ghosts on any other own glass keep fading there;
     /// without a pending ghost to crossfade with, they are dropped.
     #[inline]
-    pub fn come_home(&mut self, glass: u32) {
-        for carried in self.carried.iter_mut().flatten() {
-            if carried.ghost.own_glass == Some(glass) {
+    pub const fn come_home(&mut self, glass: u32) {
+        let mut i = 0;
+        while i < self.carried.len() {
+            if let Some(carried) = &mut self.carried[i]
+                && matches!(carried.ghost.own_glass, Some(own) if own == glass)
+            {
                 carried.home = true;
             }
+            i += 1;
         }
     }
 
@@ -4293,14 +4297,16 @@ impl PetBrain {
     /// `glass` is the host's key for that pane ([`PetDepartureSprite::glass`],
     /// never `0`).
     #[inline]
-    pub fn displace_resight(&mut self, glass: u32) {
-        self.resight = self.resight.take().map(|pending| PendingResight {
-            ghost: Departure {
-                own_glass: Some(glass),
-                ..pending.ghost
-            },
-            ..pending
-        });
+    pub const fn displace_resight(&mut self, glass: u32) {
+        if let Some(pending) = self.resight.take() {
+            self.resight = Some(PendingResight {
+                ghost: Departure {
+                    own_glass: Some(glass),
+                    ..pending.ghost
+                },
+                ..pending
+            });
+        }
     }
 
     /// Drop every ghost standing on own glass `glass`, pending, carried or
@@ -4308,23 +4314,32 @@ impl PetBrain {
     /// away) or no longer the pixels it was drawn at (the cell metrics
     /// changed). Ghosts on any other glass are untouched.
     #[inline]
-    pub fn forget_own_glass(&mut self, glass: u32) {
-        let on = |own: Option<u32>| own == Some(glass);
-        if self
-            .resight
-            .is_some_and(|pending| on(pending.ghost.own_glass))
-        {
+    pub const fn forget_own_glass(&mut self, glass: u32) {
+        if matches!(
+            self.resight,
+            Some(pending) if matches!(pending.ghost.own_glass, Some(own) if own == glass)
+        ) {
             self.resight = None;
         }
-        for slot in &mut self.carried {
-            if slot.is_some_and(|c| on(c.ghost.own_glass)) {
-                *slot = None;
+        let mut i = 0;
+        while i < self.carried.len() {
+            if matches!(
+                self.carried[i],
+                Some(c) if matches!(c.ghost.own_glass, Some(own) if own == glass)
+            ) {
+                self.carried[i] = None;
             }
+            i += 1;
         }
-        for slot in &mut self.departures {
-            if slot.is_some_and(|d| on(d.own_glass)) {
-                *slot = None;
+        let mut j = 0;
+        while j < self.departures.len() {
+            if matches!(
+                self.departures[j],
+                Some(d) if matches!(d.own_glass, Some(own) if own == glass)
+            ) {
+                self.departures[j] = None;
             }
+            j += 1;
         }
     }
 
@@ -4332,19 +4347,25 @@ impl PetBrain {
     /// ([`Self::displace_resight`]).
     #[must_use]
     #[inline]
-    pub fn has_own_glass_ghost(&self) -> bool {
-        self.resight
-            .is_some_and(|pending| pending.ghost.own_glass.is_some())
-            || self
-                .carried
-                .iter()
-                .flatten()
-                .any(|c| c.ghost.own_glass.is_some())
-            || self
-                .departures
-                .iter()
-                .flatten()
-                .any(|d| d.own_glass.is_some())
+    pub const fn has_own_glass_ghost(&self) -> bool {
+        if matches!(self.resight, Some(pending) if pending.ghost.own_glass.is_some()) {
+            return true;
+        }
+        let mut i = 0;
+        while i < self.carried.len() {
+            if matches!(self.carried[i], Some(c) if c.ghost.own_glass.is_some()) {
+                return true;
+            }
+            i += 1;
+        }
+        let mut j = 0;
+        while j < self.departures.len() {
+            if matches!(self.departures[j], Some(d) if d.own_glass.is_some()) {
+                return true;
+            }
+            j += 1;
+        }
+        false
     }
 
     /// A ghost stands, is carried to stand, or is about to stand on own
@@ -4352,12 +4373,34 @@ impl PetBrain {
     /// glass's pixel frame exactly as long as this holds.
     #[must_use]
     #[inline]
-    pub fn has_ghost_on_glass(&self, glass: u32) -> bool {
-        let on = |own: Option<u32>| own == Some(glass);
-        self.resight
-            .is_some_and(|pending| on(pending.ghost.own_glass))
-            || self.carried.iter().flatten().any(|c| on(c.ghost.own_glass))
-            || self.departures.iter().flatten().any(|d| on(d.own_glass))
+    pub const fn has_ghost_on_glass(&self, glass: u32) -> bool {
+        if matches!(
+            self.resight,
+            Some(pending) if matches!(pending.ghost.own_glass, Some(own) if own == glass)
+        ) {
+            return true;
+        }
+        let mut i = 0;
+        while i < self.carried.len() {
+            if matches!(
+                self.carried[i],
+                Some(c) if matches!(c.ghost.own_glass, Some(own) if own == glass)
+            ) {
+                return true;
+            }
+            i += 1;
+        }
+        let mut j = 0;
+        while j < self.departures.len() {
+            if matches!(
+                self.departures[j],
+                Some(d) if matches!(d.own_glass, Some(own) if own == glass)
+            ) {
+                return true;
+            }
+            j += 1;
+        }
+        false
     }
 
     /// The crossfade, spent on the tick that sighted the new caret. The arriver
@@ -4927,7 +4970,7 @@ impl PetBrain {
     /// The shell is executing: the OSC 133/633 C..D phase in the chased pane,
     /// restated as a level by the host each frame. It starts and stops the
     /// vigil's clock and touches no pose; `tick` does the rest.
-    pub fn note_executing(&mut self, now: Instant, executing: bool) {
+    pub const fn note_executing(&mut self, now: Instant, executing: bool) {
         if executing {
             if self.exec_since.is_none() {
                 self.exec_since = Some(now);
@@ -5037,14 +5080,14 @@ impl PetBrain {
     /// not yet performed, including one whose opening beat is playing (the
     /// perk finishes and nothing follows). Confirmed latches and begun verbs
     /// are untouched; with nothing pending this is a no-op.
-    pub fn revoke_trick(&mut self) {
-        if self.pending_trick.is_some_and(|p| !p.confirmed) {
+    pub const fn revoke_trick(&mut self) {
+        if matches!(self.pending_trick, Some(p) if !p.confirmed) {
             self.pending_trick = None;
         }
         // The tentative phrase is over; the memory is only `Some` for a
         // tentative consume, so a beat it matches is an unbegun tentative verb.
         if let Some((heard, _)) = self.trick_heard.take()
-            && self.trick_go == Some(heard)
+            && matches!(self.trick_go, Some(go) if go as u8 == heard as u8)
         {
             self.trick_go = None;
         }
@@ -5233,7 +5276,7 @@ impl PetBrain {
     /// A landing's cheer is the cat's to play now: latched by
     /// [`Self::note_room_landed`] and not yet over.
     #[inline]
-    fn cheering(&self) -> bool {
+    const fn cheering(&self) -> bool {
         self.room_cheer && self.room_cheer_in_play()
     }
 
@@ -5243,18 +5286,27 @@ impl PetBrain {
     /// wiped, each action ends on its own hold, a mote lives
     /// [`PURR_MOTE_LIFE`], the fade [`FADE_OUT`]).
     #[inline]
-    fn room_cheer_in_play(&self) -> bool {
-        self.room_cheer_leaving
+    const fn room_cheer_in_play(&self) -> bool {
+        if self.room_cheer_leaving
             || self.pending_cheer.is_some()
             || matches!(
                 self.action,
                 PetAction::Waking | PetAction::Perk | PetAction::Frolic
             )
-            || self
-                .motes
-                .iter()
-                .flatten()
-                .any(|m| matches!(m.kind, PetMoteKind::Note | PetMoteKind::Heart))
+        {
+            return true;
+        }
+        let mut i = 0;
+        while i < self.motes.len() {
+            if matches!(
+                self.motes[i],
+                Some(m) if matches!(m.kind, PetMoteKind::Note | PetMoteKind::Heart)
+            ) {
+                return true;
+            }
+            i += 1;
+        }
+        false
     }
 
     /// Whether a cheer is latched and not yet played or wiped: for the
@@ -5269,8 +5321,8 @@ impl PetBrain {
     /// Whether another pane in a split is streaming this frame, with its caret
     /// in this pet's pane cells (off-grid expected). Restated every frame; the
     /// rising edge latches one look.
-    pub fn note_room_sibling(&mut self, now: Instant, talking: Option<(f32, f32)>) {
-        let level = talking.is_some_and(|(c, r)| c.is_finite() && r.is_finite());
+    pub const fn note_room_sibling(&mut self, now: Instant, talking: Option<(f32, f32)>) {
+        let level = matches!(talking, Some((c, r)) if c.is_finite() && r.is_finite());
         let edge = level && !self.room_sibling;
         self.room_sibling = level;
         if edge && let Some((col, _)) = talking {
@@ -5315,7 +5367,7 @@ impl PetBrain {
     /// (fractional cells of this pane). Range-checked here, so a far peek never
     /// latches; consumed on the ground below every caret intent and retired at
     /// [`BAT_TTL`].
-    pub fn note_peek(&mut self, now: Instant, col: f32, row: f32) {
+    pub const fn note_peek(&mut self, now: Instant, col: f32, row: f32) {
         // Non-finite coordinates never latch: NaN passes no range gate and
         // would poison the flight target.
         if !col.is_finite() || !row.is_finite() {
@@ -8794,7 +8846,7 @@ impl PetBrain {
     /// Test seam: deal a chosen hand to the current settle (the next
     /// arrival deals its own again).
     #[cfg(test)]
-    fn force_seed(&mut self, settle: u8) {
+    const fn force_seed(&mut self, settle: u8) {
         self.settle_seed = settle;
     }
 
@@ -8802,7 +8854,7 @@ impl PetBrain {
     /// seconds whose window opens `at` seconds in. `None` before the sit and
     /// before the window opens. Every dealt idle beat uses this.
     #[inline]
-    fn sit_beat(&self, period: f32, at: f32) -> Option<(i64, f32)> {
+    const fn sit_beat(&self, period: f32, at: f32) -> Option<(i64, f32)> {
         self.sit_beat_at(self.quiet - SIT_AFTER, period, at)
     }
 
@@ -8810,13 +8862,17 @@ impl PetBrain {
     /// is doing at another instant. (The event-driven ear twitch is the
     /// exception; only its end is predictable, from `twitch_t`.)
     #[inline]
-    fn sit_beat_at(&self, since: f32, period: f32, at: f32) -> Option<(i64, f32)> {
+    const fn sit_beat_at(&self, since: f32, period: f32, at: f32) -> Option<(i64, f32)> {
         if since < 0.0 {
             return None;
         }
         let beat = (since / period).floor();
         let phase = since - beat * period - at;
-        (phase >= 0.0).then_some((beat as i64, phase))
+        if phase >= 0.0 {
+            Some((beat as i64, phase))
+        } else {
+            None
+        }
     }
 
     /// The hand this beat was dealt, `0..n`.
@@ -8841,10 +8897,12 @@ impl PetBrain {
     /// settled pose, so face-on the tail deals off the glance's beat and phase,
     /// and a hand starts only if the look will outlast it (the same fit rule
     /// as [`Self::sit_blink_beat`]; see [`LOOK_DUR_LONG`]).
-    fn sit_tail(&self) -> Option<PetGlyphId> {
+    const fn sit_tail(&self) -> Option<PetGlyphId> {
         let (period, at) = self.tail_clock();
         let (beat, p) = if self.sit_front {
-            let (beat, p) = self.sit_beat(period, at)?;
+            let Some((beat, p)) = self.sit_beat(period, at) else {
+                return None;
+            };
             // A hand the look cannot contain never starts, so eye contact
             // never cuts an excursion.
             if !self.side_on_holds(p, Self::tail_hand_len(self.beat_deal(beat, 4))) {
@@ -8852,12 +8910,26 @@ impl PetBrain {
             }
             (beat, p)
         } else {
-            self.sit_beat(period, at)?
+            let Some(bp) = self.sit_beat(period, at) else {
+                return None;
+            };
+            bp
         };
         match self.beat_deal(beat, 4) {
-            0 => (p < TAIL_FLICK).then_some(PetGlyphId::PetSitFlick),
-            1 => (p < TAIL_TAP || (TAIL_TAP + TAIL_GAP..2.0 * TAIL_TAP + TAIL_GAP).contains(&p))
-                .then_some(PetGlyphId::PetSitFlick),
+            0 => {
+                if p < TAIL_FLICK {
+                    Some(PetGlyphId::PetSitFlick)
+                } else {
+                    None
+                }
+            }
+            1 => {
+                if p < TAIL_TAP || (p >= TAIL_TAP + TAIL_GAP && p < 2.0 * TAIL_TAP + TAIL_GAP) {
+                    Some(PetGlyphId::PetSitFlick)
+                } else {
+                    None
+                }
+            }
             2 => match (p / TAIL_SWING).floor() as i64 {
                 0 | 6 => Some(PetGlyphId::PetSitFlick),
                 1 | 2 | 5 => Some(PetGlyphId::PetSitTailBack),
@@ -8900,7 +8972,7 @@ impl PetBrain {
     /// excursion. Asked about the gesture's start (`p - elapsed`) and end
     /// (`p + len - elapsed`), so the answer is constant over its life.
     #[inline]
-    fn tail_room(&self, elapsed: f32, len: f32) -> bool {
+    const fn tail_room(&self, elapsed: f32, len: f32) -> bool {
         let (period, at) = self.tail_clock();
         let Some((beat, p)) = self.sit_beat(period, at) else {
             return true;
@@ -8933,7 +9005,7 @@ impl PetBrain {
     /// so a face-on seat can check the glance outlasts it
     /// ([`Self::sit_glance_left`]).
     #[inline]
-    fn sit_blink_beat(&self) -> Option<(f32, f32)> {
+    const fn sit_blink_beat(&self) -> Option<(f32, f32)> {
         self.sit_blink_beat_at(self.quiet - SIT_AFTER)
     }
 
@@ -8944,8 +9016,10 @@ impl PetBrain {
     /// that one present (2026-10-22, the owner's Claude Code replay at
     /// 120 Hz with the harness on: the flick, 8 ms of the blink, the seat).
     #[inline]
-    fn sit_blink_shows(&self) -> Option<(f32, f32)> {
-        let (p, len) = self.sit_blink_beat()?;
+    const fn sit_blink_shows(&self) -> Option<(f32, f32)> {
+        let Some((p, len)) = self.sit_blink_beat() else {
+            return None;
+        };
         let on_glass = matches!(
             self.last_pose,
             PetGlyphId::PetSitBlink | PetGlyphId::PetSitFrontBlink
@@ -8957,21 +9031,33 @@ impl PetBrain {
         } else {
             len - p
         };
-        (on_glass || left >= STILL_SECS).then_some((p, len))
+        if on_glass || left >= STILL_SECS {
+            Some((p, len))
+        } else {
+            None
+        }
     }
 
     /// The blink beat at an arbitrary `since` ([`Self::sit_beat_at`]). A beat
     /// above it that ends inside this window would leave the lids showing
     /// alone for a flash.
     #[inline]
-    fn sit_blink_beat_at(&self, since: f32) -> Option<(f32, f32)> {
-        let period = BLINK_PERIOD + BLINK_PERIOD_STEP * f32::from((self.settle_seed / 2) % 3);
-        let (beat, p) = self.sit_beat_at(since, period, BLINK_AT)?;
+    const fn sit_blink_beat_at(&self, since: f32) -> Option<(f32, f32)> {
+        let period = BLINK_PERIOD + BLINK_PERIOD_STEP * ((self.settle_seed / 2) % 3) as f32;
+        let Some((beat, p)) = self.sit_beat_at(since, period, BLINK_AT) else {
+            return None;
+        };
         if self.beat_deal(beat, 3) == 2 {
             let len = 2.0 * BLINK_DUR + BLINK_GAP;
-            (p < BLINK_DUR || (BLINK_DUR + BLINK_GAP..len).contains(&p)).then_some((p, len))
+            if p < BLINK_DUR || (p >= BLINK_DUR + BLINK_GAP && p < len) {
+                Some((p, len))
+            } else {
+                None
+            }
+        } else if p < BLINK_DUR {
+            Some((p, BLINK_DUR))
         } else {
-            (p < BLINK_DUR).then_some((p, BLINK_DUR))
+            None
         }
     }
 
@@ -8992,20 +9078,26 @@ impl PetBrain {
     /// Returns the seconds of look still to run, `None` when not glancing.
     /// Face-on beats ride this window and may only play if it outlasts them.
     #[inline]
-    fn sit_glance_left(&self) -> Option<f32> {
+    const fn sit_glance_left(&self) -> Option<f32> {
         if self.pointer_heat > 0.0 {
             return None;
         }
-        let (beat, p) = self.sit_beat(self.glance_period(), GLANCE_AT)?;
+        let Some((beat, p)) = self.sit_beat(self.glance_period(), GLANCE_AT) else {
+            return None;
+        };
         let len = self.look_dur();
-        (p < len && self.beat_deal(beat, 3) != 0).then_some(len - p)
+        if p < len && self.beat_deal(beat, 3) != 0 {
+            Some(len - p)
+        } else {
+            None
+        }
     }
 
     /// Seconds of any look-away still to run: the dealt glance or the yawn's
     /// own look, which is exactly the yawn and ends on the loaf. The two
     /// windows never overlap ([`Self::look_dur`]'s fit keeps the yawn later).
     #[inline]
-    fn sit_look_left(&self) -> Option<f32> {
+    const fn sit_look_left(&self) -> Option<f32> {
         if self.pointer_heat > 0.0 {
             return None;
         }
@@ -9017,7 +9109,7 @@ impl PetBrain {
 
     /// The seat is looking away.
     #[inline]
-    fn sit_glance(&self) -> bool {
+    const fn sit_glance(&self) -> bool {
         self.sit_look_left().is_some()
     }
 
@@ -9030,8 +9122,14 @@ impl PetBrain {
     /// the blink opens at [`BLINK_AT`], after [`GLANCE_AT`], and the ear's
     /// [`Self::tail_room`] guard implies it was armed after the look opened.
     #[inline]
-    fn side_on_holds(&self, phase: f32, len: f32) -> bool {
-        !self.sit_front || self.sit_look_left().is_some_and(|left| left + phase >= len)
+    const fn side_on_holds(&self, phase: f32, len: f32) -> bool {
+        if !self.sit_front {
+            return true;
+        }
+        match self.sit_look_left() {
+            Some(left) => left + phase >= len,
+            None => false,
+        }
     }
 
     /// The scaled coil for a pounce winding up `span` columns:
@@ -9963,7 +10061,7 @@ impl PetBrain {
     /// Typed praise warms the ledger by [`TRICK_CONTENT`], at most once per
     /// [`TRICK_CONTENT_COOL`] of brain clock. Anything else, a scold included,
     /// moves nothing.
-    fn praise(&mut self, trick: Trick) {
+    const fn praise(&mut self, trick: Trick) {
         let praised = match trick {
             Trick::Purr | Trick::Treat => true,
             Trick::Sit
@@ -10178,8 +10276,8 @@ impl PetBrain {
     /// station, a play flight in the air lands into work, the chase ends with
     /// a short cooldown, the stakeout stands down, and the far look and owed
     /// groom are forgotten. Shared by the jump latch and the snap.
-    fn clear_play_intents(&mut self) {
-        if self.action == PetAction::Crouch
+    const fn clear_play_intents(&mut self) {
+        if matches!(self.action, PetAction::Crouch)
             && !self.pending_vigil_pounce
             && (self.vigil || self.stakeout || self.hiding)
         {
@@ -10198,8 +10296,10 @@ impl PetBrain {
         self.pending_pointer_pounce = None;
         self.play_to = None;
         self.play_land = None;
-        if let Some(big) = self.vigil_cheer.take() {
-            self.pending_cheer.get_or_insert(big);
+        if let Some(big) = self.vigil_cheer.take()
+            && self.pending_cheer.is_none()
+        {
+            self.pending_cheer = Some(big);
         }
         self.pursuit_t = None;
         self.pursuit_cool = self.pursuit_cool.max(1.0);
@@ -10231,9 +10331,9 @@ impl PetBrain {
     /// A conservative middle band of the natural body in absolute grid cells,
     /// contained like `PetFrame::body_px` so row zero stays touchable without
     /// the chrome.
-    fn stroke_point(&self, sense: &PetSense, width: f32) -> Option<(f32, f32)> {
+    const fn stroke_point(&self, sense: &PetSense, width: f32) -> Option<(f32, f32)> {
         if !self.action.settled()
-            || self.action == PetAction::Perk
+            || matches!(self.action, PetAction::Perk)
             || self.quiet < PURSUIT_QUIET
             || sense.output_burst
             || self.stream
@@ -10253,20 +10353,25 @@ impl PetBrain {
         {
             return None;
         }
-        let (x, y) = sense.pointer?;
-        let top =
-            (self.row + 1.0 - ART_ROWS).clamp(0.0, (f32::from(sense.rows) - ART_ROWS).max(0.0));
-        (x.is_finite()
+        let Some((x, y)) = sense.pointer else {
+            return None;
+        };
+        let top = (self.row + 1.0 - ART_ROWS).clamp(0.0, (sense.rows as f32 - ART_ROWS).max(0.0));
+        if x.is_finite()
             && y.is_finite()
             && x >= self.col + width * 0.15
             && x < self.col + width * 0.85
             && y >= top + ART_ROWS * 0.20
-            && y < top + ART_ROWS * 0.85)
-            .then_some((x, y))
+            && y < top + ART_ROWS * 0.85
+        {
+            Some((x, y))
+        } else {
+            None
+        }
     }
 
-    fn clear_play(&mut self) {
-        if self.action == PetAction::Crouch
+    const fn clear_play(&mut self) {
+        if matches!(self.action, PetAction::Crouch)
             && (self.play_to.is_some() || self.stakeout || self.hiding)
         {
             self.set_action_keep(PetAction::Stand);
@@ -10302,22 +10407,27 @@ impl PetBrain {
     }
 
     #[inline]
-    pub(super) fn room_cue_in_play(&self) -> bool {
-        self.action == PetAction::Perk
-            || (self.action == PetAction::Droop && self.droop_brief)
+    pub(super) const fn room_cue_in_play(&self) -> bool {
+        if matches!(self.action, PetAction::Perk | PetAction::Frolic)
+            || (matches!(self.action, PetAction::Droop) && self.droop_brief)
             || self.twitch_t > 0.0
             || self.play_to.is_some()
             || self.play_land.is_some()
-            || self.action == PetAction::Frolic
-            || self
-                .motes
-                .iter()
-                .flatten()
-                .any(|m| m.kind == PetMoteKind::Note)
+        {
+            return true;
+        }
+        let mut i = 0;
+        while i < self.motes.len() {
+            if matches!(self.motes[i], Some(m) if matches!(m.kind, PetMoteKind::Note)) {
+                return true;
+            }
+            i += 1;
+        }
+        false
     }
 
     #[inline]
-    pub(super) fn drop_room_cue(&mut self) {
+    pub(super) const fn drop_room_cue(&mut self) {
         self.room_cue_act = false;
         self.pending_room = None;
         self.room_at = None;
@@ -10355,7 +10465,7 @@ impl PetBrain {
     /// (stimuli, offers, holds, gait flags, micro-life beats). Shared by the
     /// no-caret and reduced-motion arms, so no latch pins `needs_frames`. The
     /// ledger moved at note time.
-    fn drop_theater(&mut self) {
+    const fn drop_theater(&mut self) {
         self.speed = 0.0;
         self.deferred_arc = None;
         self.pending_pounce = false;
@@ -10566,7 +10676,7 @@ impl PetBrain {
     /// The watch is live under a frozen heat; nothing changes until the cap,
     /// which `next_change_secs` names.
     #[inline]
-    fn watch_still(&self) -> bool {
+    const fn watch_still(&self) -> bool {
         self.heat_frozen()
             && self.watch_heat >= WATCH_GATE
             && !self.watch_spent
@@ -11984,10 +12094,12 @@ impl PetBrain {
     /// marking [`Self::gallop_at`] when it moves at it. Idempotent within a
     /// tick.
     #[inline]
-    fn under_gallop(&mut self) -> f32 {
+    const fn under_gallop(&mut self) -> f32 {
         if self.leg_speed() >= RUN_ART_MIN {
             self.gallop_at = self.clock;
-            self.gallop_since.get_or_insert(self.clock);
+            if self.gallop_since.is_none() {
+                self.gallop_since = Some(self.clock);
+            }
         } else {
             self.gallop_since = None;
         }
@@ -12003,9 +12115,9 @@ impl PetBrain {
     /// is nearly there, and one picked up again by the next key in a brief
     /// dip keeps its stride. Idempotent within a tick.
     #[inline]
-    fn run_planted(&mut self) -> bool {
+    const fn run_planted(&mut self) -> bool {
         let under = self.under_gallop();
-        if self.gallop_since.is_some_and(|since| since < self.clock) {
+        if matches!(self.gallop_since, Some(since) if since < self.clock) {
             self.planted = false;
         } else if under > 0.0 && (self.action.settled() || under >= RUN_ART_GRACE) {
             self.planted = true;
@@ -12019,29 +12131,30 @@ impl PetBrain {
     /// brace over a seat, drawn for a frame before a walk took it off; the
     /// seat the ladder took on the frame the station moved on).
     #[inline]
-    fn stand_held(&self) -> bool {
-        self.stand_from
-            .is_some_and(|from| self.clock - from < f64::from(STAND_MIN))
+    const fn stand_held(&self) -> bool {
+        matches!(self.stand_from, Some(from) if self.clock - from < STAND_MIN as f64)
             || self.still_fresh()
     }
 
     /// The still pose on glass went on less than [`STILL_SECS`] ago: a
     /// change now would flash it.
     #[inline]
-    fn still_fresh(&self) -> bool {
-        self.still_since
-            .is_some_and(|(at, _)| ((self.clock - at) as f32) < STILL_SECS)
+    const fn still_fresh(&self) -> bool {
+        matches!(self.still_since, Some((at, _)) if ((self.clock - at) as f32) < STILL_SECS)
     }
 
     /// The still pose on glass is a stand or the console's own: one held
     /// through any other still pose too ([`Self::hold_still_pose`]).
     #[inline]
-    fn still_held_kind(&self) -> bool {
-        self.still_since.is_some_and(|(_, p)| {
-            self.still_console
-                || p == self.species.skin(PetGlyphId::PetStand)
-                || p == self.species.skin(PetGlyphId::PetStandEar)
-        })
+    const fn still_held_kind(&self) -> bool {
+        match self.still_since {
+            Some((_, p)) => {
+                self.still_console
+                    || p as u8 == self.species.skin(PetGlyphId::PetStand) as u8
+                    || p as u8 == self.species.skin(PetGlyphId::PetStandEar) as u8
+            }
+            None => false,
+        }
     }
 
     /// The still pose on glass is held over a gather, a notice or a fright
@@ -12054,8 +12167,9 @@ impl PetBrain {
     /// The console's reaction to ink at the paws (its contact brace) is a
     /// flinch, and takes it after two.
     #[inline]
-    fn still_hold_fresh(&self) -> bool {
-        let flinch = self.console_posed && self.console_attention() == PetAttention::Contact;
+    const fn still_hold_fresh(&self) -> bool {
+        let flinch =
+            self.console_posed && matches!(self.console_attention(), PetAttention::Contact);
         self.still_fresh()
             || (self.still_held_kind()
                 && !self.still_console
@@ -12212,8 +12326,14 @@ impl PetBrain {
     /// walking does not thrash between atlas tiles as the text beneath
     /// changes.
     #[inline]
-    pub fn colors_for_appearance(&mut self, sampled: CatColorKey) -> CatColorKey {
-        *self.colors.get_or_insert(sampled)
+    pub const fn colors_for_appearance(&mut self, sampled: CatColorKey) -> CatColorKey {
+        match self.colors {
+            Some(colors) => colors,
+            None => {
+                self.colors = Some(sampled);
+                sampled
+            }
+        }
     }
 
     /// Return the palette already frozen for this resident appearance.
@@ -12227,15 +12347,23 @@ impl PetBrain {
     /// changes while the pet stays visible — every ghost's too
     /// (`Departure::colors`): a theme change re-grounds every body of this
     /// cat on glass, so each falls back to the frame's fresh sample.
-    pub fn invalidate_colors(&mut self) {
+    pub const fn invalidate_colors(&mut self) {
         self.colors = None;
-        for d in self.departures.iter_mut().flatten() {
-            d.colors = None;
+        let mut i = 0;
+        while i < self.departures.len() {
+            if let Some(d) = &mut self.departures[i] {
+                d.colors = None;
+            }
+            i += 1;
         }
-        for c in self.carried.iter_mut().flatten() {
-            c.ghost.colors = None;
+        let mut j = 0;
+        while j < self.carried.len() {
+            if let Some(c) = &mut self.carried[j] {
+                c.ghost.colors = None;
+            }
+            j += 1;
         }
-        if let Some(pending) = self.resight.as_mut() {
+        if let Some(pending) = &mut self.resight {
             pending.ghost.colors = None;
         }
     }
@@ -12250,7 +12378,7 @@ impl PetBrain {
     /// ~100 ms, and [`Self::next_change_deadline`] names each next step
     /// instead.
     #[must_use]
-    pub fn needs_frames(&self) -> bool {
+    pub const fn needs_frames(&self) -> bool {
         // The letter veil easing off owes its frames, or a cat that settled
         // after crossing letters stays a ghost until an unrelated repaint.
         // A veil at its level is not easing: a still crouch under a word (the
@@ -12348,10 +12476,14 @@ impl PetBrain {
         // a parked look on an awake pet pins the lane until the debounce
         // fires. A parked look on a sleeper pins nothing; the next wake or
         // hide lands it.
-        if self.departures.iter().any(Option::is_some) {
-            return true;
+        let mut i = 0;
+        while i < self.departures.len() {
+            if self.departures[i].is_some() {
+                return true;
+            }
+            i += 1;
         }
-        if self.pending_worn.is_some() && self.action != PetAction::Sleep {
+        if self.pending_worn.is_some() && !matches!(self.action, PetAction::Sleep) {
             return true;
         }
         if self.arrive_t > 0.0 {
@@ -12367,8 +12499,14 @@ impl PetBrain {
         // lives inside the stretch's [`WAKE_DUR`] train, and landing dust
         // outlives a [`LAND_DUR`] landing by a few frames
         // (`landing_dust_holds_the_train_for_a_bounded_beat_past_the_landing`).
-        if self.motes.iter().flatten().any(|m| !m.kind.rides_offer()) {
-            return true;
+        let mut j = 0;
+        while j < self.motes.len() {
+            if let Some(m) = self.motes[j]
+                && !m.kind.rides_offer()
+            {
+                return true;
+            }
+            j += 1;
         }
         // The vigil crouch animates nothing (no gather, speed zero), so it
         // must not pin the lane during a long build. The terms above still
@@ -12378,14 +12516,14 @@ impl PetBrain {
         if self.vigil
             && self.vigil_armed
             && self.exec_since.is_some()
-            && self.action == PetAction::Crouch
+            && matches!(self.action, PetAction::Crouch)
         {
             return false;
         }
         // The hide is a held crouch too (speed zero, one frame for its whole
         // dwell): its end is offered (`next_change_secs`), and the walk out
         // owes frames again. The walk there is `hide_to`, above.
-        if self.hiding && self.action == PetAction::Crouch {
+        if self.hiding && matches!(self.action, PetAction::Crouch) {
             return false;
         }
         if !self.action.settled() {
@@ -12403,14 +12541,14 @@ impl PetBrain {
         //     jittering sub-pixel does not read as motion.
         //
         // A perk held by a frozen watch is still; its cap is offered.
-        if (self.action == PetAction::Perk && !self.watch_still())
+        if (matches!(self.action, PetAction::Perk) && !self.watch_still())
             || self.flinch_t > 0.0
             || self.evicting
         {
             return true;
         }
         if self.col != self.col_at_tick
-            && (self.home - self.col).abs() * f32::from(self.last_cell_w) >= 1.0
+            && (self.home - self.col).abs() * (self.last_cell_w as f32) >= 1.0
         {
             return true;
         }

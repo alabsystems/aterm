@@ -5035,7 +5035,7 @@ pub(super) struct St {
     /// Recorded and read by Claude Code's lane alone; the owner's view reads
     /// it of a round that gave up (`upgrade_status::Row::work_seen`: a quiet
     /// give-up the agent's own work held, which `--now` does not move — round
-    /// eight, #4's review, and its review).
+    /// eight, #4's review).
     pub(super) work_seen: bool,
     /// The usage limit's named reset as the transcript said it at the last
     /// look that read it (unix seconds, [`upgrade::transcript_limit_reset`]:
@@ -8878,7 +8878,7 @@ pub fn lefts_of(body: &str, sid: Option<&str>, earlier: &[(String, String)]) -> 
 /// session.
 ///
 /// THE WALK ENDS AT A TAB WHOSE OWN BOOKS NO LONGER TAKE UP THOSE BEFORE IT
-/// (the review of 3af6c3da7d, KRF-3): its ledger holds rows of its own
+/// (KRF-3): its ledger holds rows of its own
 /// session and no take-up's row ([`approvals::took_up_earlier`]) — its loop's
 /// cut dropped that row once no state the books before it began stood, as a
 /// continuous ledger's cut drops their rows ([`approvals::bound`]), or a
@@ -11237,7 +11237,7 @@ pub fn moved(step: &str) -> bool {
 /// [`moved`]: a turn typed into the running agent ([`typed`]: a notice, a
 /// carry-on, a release) and a stop with no start yet (`terminated`,
 /// `exited`) brought no process up. The session log's relaunch lift reads it
-/// (`harness_host::log_act`, session log Phase 6 step 6C-1): only such a
+/// (`harness_host::log_act`): only such a
 /// step can have replaced the agent run whose failure it lifts.
 #[must_use]
 pub fn started(step: &str) -> bool {
@@ -11357,7 +11357,7 @@ pub fn owns_turn_ends(step: &str, looks: u32, grace_s: u32) -> bool {
     }
 }
 
-/// [`owns_turn_ends`] under the flow the step was taken in (round eight,
+/// [`owns_turn_ends`] under the flow the step was taken in (
 /// #25): under the QUIET flow (`quiet`, [`upgrade::Facts::quiet`], the
 /// default) a wait on the agent's own work — `wait:background` — OWNS
 /// NOTHING. That ownership exists for an

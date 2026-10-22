@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The hold's wants (slice 3c, §12.3.7) over records and reads a run would
+//! The hold's wants (§12.3.7) over records and reads a run would
 //! keep, each beside the reads it must fail: a hold before the instruction,
 //! a clock or a count that is not the ledger's, another chain's leg, an
 //! open word no nudge named or one quoted, a hover pushed before the hold

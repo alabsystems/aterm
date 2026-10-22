@@ -352,7 +352,7 @@ pub fn rosetta_present(runtime: &Path) -> Result<bool, String> {
 /// (measured 2026-10-18 and 2026-10-21 on macOS 27.0.1: uid 501, `installAuth=NO` in
 /// `/var/log/install.log`, exit 0). The census's `machines-root-door` admits this array,
 /// whole and in this file alone, as the one spelling of `softwareupdate` outside
-/// aterm-machines (owner ruling R1, docs/DESIGN-machines-2026-10-16.md).
+/// aterm-machines (docs/DESIGN-machines-2026-10-16.md).
 #[cfg(target_os = "macos")]
 const ROSETTA_INSTALL: [&str; 3] = [
     "/usr/sbin/softwareupdate",

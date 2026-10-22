@@ -160,16 +160,15 @@ keys! {
     // The session that spawned this one (`SessionHandle::parent`), on the
     // session's open: a sid, like `prev=` and `lineage=`. The design writes it
     // `par=`, but `par=` is the line's header token for a node's parent, and a
-    // session's parent is no node of its log. HOST since session log Phase 6
-    // step 6E-4 (D4's "senders stay local"): who spawned whom is the node's
+    // session's parent is no node of its log. HOST (D4's "senders stay local"): who spawned whom is the node's
     // own fact, so it never crosses the fabric with the mirror's open, where
     // `prev=` and `lineage=` (the node's own earlier sessions, whose faces are
-    // already its subjects, ruling U23(c)) still do.
+    // already its subjects) still do.
     Parent "parent" Host Cap::Id,
     Field "field" Wire Cap::Tok(Charset::Lower, 24),
-    // A bus snapshot's open path (phase 4, §5.5): `<node>:<kind>` for the
+    // A bus snapshot's open path (§5.5): `<node>:<kind>` for the
     // deepest open run, turn and need-bearing step, comma-separated; only
-    // bus-class nodes (ruling S17).
+    // bus-class nodes.
     Open "open" Wire Cap::Tok(Charset::Rollup, 64),
     // A bus snapshot's open needs, most urgent first:
     // `<word>.<node>.<kind>.<by>.<src>`, comma-separated, cut whole at the cap.
@@ -187,8 +186,7 @@ keys! {
     Cwd "cwd" Host Cap::Text(256),
     Text "text" Host Cap::Text(160),
     As "as" Host Cap::Text(40),
-    // A meta field's value (`meta field= value=`). 256 since phase 6 (6F-8,
-    // ruling U13): every byte of it a `meta-change` row's 256-byte payload
+    // A meta field's value (`meta field= value=`). 256 since phase 6: every byte of it a `meta-change` row's 256-byte payload
     // shows, a description's longest included, and a character's whole
     // escape past that, so the row is its record's (it was 160).
     Value "value" Host Cap::Text(256),
@@ -206,8 +204,7 @@ keys! {
     // (`mark - usage h5= d7=`, percent of the 5-hour and 7-day limits).
     H5 "h5" Wire Cap::U,
     D7 "d7" Wire Cap::U,
-    // A source mark's counts (`source field=transcript skipped= dropped=`,
-    // ruling S31): what was skipped at a bind without a watermark, and
+    // A source mark's counts (`source field=transcript skipped= dropped=`): what was skipped at a bind without a watermark, and
     // transcript events dropped (an over-long line, a restart, a ninth
     // parallel tool, an unmapped result, a queue overflow). Never `lost=`:
     // they were never records, so no reader folds them as ring loss (S27).
@@ -217,23 +214,23 @@ keys! {
     // supervisor-attention flag (`task attention=0|1`). The task's exit code is
     // `code=`, as a command's is.
     Attention "attention" Wire Cap::U,
-    // Phase 5 (5D-2, ruling T1), appended: what an acted control input says
+    // Phase 5, appended: what an acted control input says
     // it means (`mark - input verb=key act=approve`).
     Act "act" Wire Cap::Word(ACT_WORDS),
-    // Phase 5 (5D-4, ruling T39), appended: a person's `human` mark that no
+    // Phase 5, appended: a person's `human` mark that no
     // input reaching the program came with (`mark - human reached=0`: a view
     // scroll, a selection, a composition). The fold's mail link reads it as
     // no answer to waiting mail; absent, as before, the input reached the
     // program. Host only: the link it serves has no wire (T10b).
     Reached "reached" Host Cap::U,
-    // Phase 5 (5J, ruling T27), appended: the node log's facts. How the
+    // Phase 5 (5J), appended: the node log's facts. How the
     // previous run ended (`start prev_end=`, a caught signal's number in
     // `code=`), and a config key that changed (`config key=`): the schema's
     // NAME, a static word of aterm's own, never its value and never a name
     // a person chose (a map's member).
     PrevEnd "prev_end" Wire Cap::Word(END_WORDS),
     CfgKey "key" Wire Cap::Id,
-    // Phase 6 (6C-2, ruling U6), appended: a turn's close restates who opened
+    // Phase 6, appended: a turn's close restates who opened
     // it (`op_by=<actor word>`), so a reader holding the close alone, its open
     // evicted, still names the turn's author. The log writes it, never a
     // caller ([`crate::log_owned`]). HOST only: an edge's actor is a raw sid,
@@ -241,12 +238,12 @@ keys! {
     // crosses the fabric. Printed as text by the local `brief`, never parsed
     // back into an actor, and the fold never reads it.
     OpBy "op_by" Host Cap::Id,
-    // Phase 6 (6C-6, ruling U18), appended: whose count a `dropped=` is when
+    // Phase 6, appended: whose count a `dropped=` is when
     // it is not its mark's author's own (`pool=shared`: the shared pool the
     // mark limiter's owed-only table spilled into, `crate::limit`). A closed
     // word; HOST only, as the input marks that carry it are.
     Pool "pool" Host Cap::Word(POOL_WORDS),
-    // Phase 6 (6F-2, plan item U2; rulings U11-U13), appended so no
+    // Phase 6 (plan item U2), appended so no
     // discriminant moves: the fields of the timeline ring's rows their marks
     // carry once the log holds every fact the ring holds (6F-4..6F-9).
     // WIRE. A handoff's predecessor build (`handoff build=`, the ring's
@@ -267,11 +264,10 @@ keys! {
     Reverted "reverted" Wire Cap::Tok(Charset::Rollup, 300),
     // A hold's origin (`advisory origin=`).
     Origin "origin" Wire Cap::Word(ORIGIN_WORDS),
-    // What a program's `blocked` report waits on (`program ask=`, ruling
-    // U17): OSC 7501's `kind=`, which on a record is the mail kind's key.
+    // What a program's `blocked` report waits on (`program ask=`): OSC 7501's `kind=`, which on a record is the mail kind's key.
     Ask "ask" Wire Cap::Word(ASK_WORDS),
     // How many earlier values a throttled mark class wrote over unwritten
-    // (`program coalesced=`, `shown coalesced=`; ruling U44): the newest is
+    // (`program coalesced=`, `shown coalesced=`): the newest is
     // always written, and this counts the ones it stands for.
     Coalesced "coalesced" Wire Cap::U,
     // HOST. The holder of a self-claim's act (`act holder=`): an id the
@@ -284,7 +280,7 @@ keys! {
     // admits 560 bytes beside a 70-byte `to=` and a 64-byte `idem=`).
     Via "via" Host Cap::Text(256),
     Idem "idem" Host Cap::Text(64),
-    // CONTENT, RAM only (rulings U11-U13): never journaled, carried or
+    // CONTENT, RAM only: never journaled, carried or
     // published, as the title is. A hold's or an advisory's reason, the
     // supervisor's attention text beside its `fp=`, a topic's name beside
     // its `fp=`, and the raw actor that closed a session (`closer=`, beside
@@ -296,7 +292,7 @@ keys! {
     AttnText "attn_text" Content Cap::Text(256),
     TopicName "topic_name" Content Cap::Text(64),
     Closer "closer" Content Cap::Text(64),
-    // Phase 6 (6F-5, plan item U3; ruling U11), appended so no discriminant
+    // Phase 6 (plan item U3), appended so no discriminant
     // moves: a topic opt-in's move (`topic change=add|drop`, beside its
     // name's `fp=`; not `op=`, the record's own token in `log --json`), and
     // the `since=` token an add resumes from, CONTENT as the name is: a
@@ -347,13 +343,13 @@ keys! {
     // the act itself, and an act with no word (`word=unknown`), is read from
     // here, the `harness-act` row's whole.
     HarnessAct "harness_act" Host Cap::Text(64),
-    // Phase 6 (6F-8, plan item U4c; ruling U13), appended so no
+    // Phase 6 (plan item U4c), appended so no
     // discriminant moves: the Autopilot pair's timer on its `meta` mark
     // (`meta field=autopilot value=cruise land_at=<unix s>`), as its
     // `meta-change` row says it (`land_at=`, whole seconds, signed as the
     // timer is). HOST: a timer is this machine's.
     LandAt "land_at" Host Cap::I,
-    // Phase 6 (6F-9, ruling U26), appended so no discriminant moves: what
+    // Phase 6, appended so no discriminant moves: what
     // the person is shown of a session's need, its `shown` mark's printed
     // tuple beside `need=` (a `NeedWord`): how it is shown (`sev=`, a
     // `Severity`) and whose hold stands (`held=`, a `HoldWord`); each absent

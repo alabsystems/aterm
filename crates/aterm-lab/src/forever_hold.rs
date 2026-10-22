@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! WHY LAND STILL HOLDS, AS THE WINDOW SAYS IT (slice 3c,
+//! WHY LAND STILL HOLDS, AS THE WINDOW SAYS IT (
 //! `docs/DESIGN-harness-autopilot-2026-10-15.md` §12.3.1, §12.3.7): the wants
 //! a forever run holds each Land chain's hold to. Each is read from
 //! `status`'s `land_held= land_nudges= land_since=` (the record's status

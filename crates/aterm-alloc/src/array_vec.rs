@@ -119,7 +119,7 @@ impl<T, const N: usize> ArrayVec<T, N> {
     /// Returns the element back inside a [`CapacityError`] when `len == N`
     /// (upstream `arrayvec`'s signature).
     #[inline]
-    pub fn try_push(&mut self, value: T) -> Result<(), CapacityError<T>> {
+    pub const fn try_push(&mut self, value: T) -> Result<(), CapacityError<T>> {
         // Same local-copy idiom as `push`.
         let len = self.len;
         if len < N {

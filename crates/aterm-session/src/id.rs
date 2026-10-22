@@ -53,7 +53,7 @@ impl SessionId {
 /// lowercase hex digits. THE parser of a minted sid: a name someone chose
 /// (an edge's `src=`, which `grant` takes as given) is a session only when
 /// it reads as one, so a session log never attributes a record to a word
-/// that was never a session's (phase 3A ruling R1).
+/// that was never a session's.
 #[must_use]
 #[inline]
 pub fn is_minted_sid(s: &str) -> bool {

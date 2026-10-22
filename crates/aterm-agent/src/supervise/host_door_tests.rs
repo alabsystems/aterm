@@ -218,6 +218,22 @@ fn an_act_is_marked_where_it_is_declared() {
         planted::HOST_METHODS,
         ["wants", "planted", "first", "second", "told", "acted"]
     );
+    // Every method's door, acts and queries alike: what a tape's header names
+    // as its recording build's doors.
+    assert_eq!(
+        planted::HOST_DOORS,
+        [
+            "host.wants",
+            "host.planted",
+            "host.first",
+            "host.second",
+            "host.told",
+            "host.acted"
+        ]
+    );
+    for (door, name) in super::HOST_DOORS.iter().zip(super::HOST_METHODS) {
+        assert_eq!(door.strip_prefix(doors::HOST), Some(*name));
+    }
     for act in super::HOST_ACTS {
         assert!(doors::is_host_act(act), "{act}");
         let name = act.strip_prefix(doors::HOST).expect("a host door");

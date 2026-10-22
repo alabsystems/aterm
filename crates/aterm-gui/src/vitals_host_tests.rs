@@ -305,6 +305,41 @@ fn two_readings_give_this_process_a_scope_and_the_machine_its_cores() {
     }
 }
 
+/// A FULL READING ATTRIBUTES THE SLOTS' HOLDERS TO TABS, A HIDDEN ONE DOES
+/// NOT ([`Reader::read`], [`crate::occupancy_host::slot_tabs`]): over a slot
+/// directory of one free slot, the full reading's sweep finds no holder in
+/// any tab (`Some` of none), while the hidden reading, which sweeps no
+/// process, attributes nothing (`None`). macOS: the slot reader reads
+/// nowhere else.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_full_reading_attributes_the_slot_holders_and_a_hidden_one_does_not() {
+    let dir = aterm_tempfile::tempdir().expect("scratch slots");
+    std::fs::write(dir.path().join("slot-0"), b"").expect("a free slot");
+    let mut reader = Reader::new(Arc::default());
+    reader.slots = aterm_sysprobe::slots::SlotReader::new(dir.path().to_path_buf());
+    let req = Request {
+        self_pid: std::process::id(),
+        cadence_ms: 1_000,
+        ..Request::default()
+    };
+    let snap = reader.read(&req);
+    assert!(
+        matches!(
+            snap.slots,
+            Some(aterm_vitals::model::SlotsView::Read { n: 1, .. })
+        ),
+        "{:?}",
+        snap.slots
+    );
+    assert_eq!(snap.slot_tabs, Some(vec![]));
+    let hidden = reader.read_machine(&Request {
+        machine_only: true,
+        ..req
+    });
+    assert_eq!(hidden.slot_tabs, None);
+}
+
 /// The production producer retains its pending messages while a platform
 /// read is busy. Later ticks forgo theirs instead of accumulating work or
 /// waiting for the reader (and say so, so the layout is offered again);
@@ -1520,7 +1555,9 @@ fn a_job_with_no_window_is_read_until_it_ends_and_its_end_is_announced() {
 /// is asked right there, so it arms no deadline (left to the next turn, the
 /// loop's deadline at now fires a `system_vitals` timer wake for every write
 /// a program makes at rest). NEGATIVE CONTROL: output within the floor asks
-/// nothing and leaves the owed reading on the deadline at the floor.
+/// nothing and leaves the owed reading on the deadline at the floor. Each
+/// write moves the screen (one that moves no cell is no edge:
+/// [`a_write_that_moves_no_cell_is_no_edge_and_arms_nothing`]).
 #[test]
 fn output_with_no_window_is_read_in_its_own_wake_and_arms_nothing() {
     static BOARD: JobsBoard = JobsBoard::new();
@@ -1531,12 +1568,188 @@ fn output_with_no_window_is_read_in_its_own_wake_and_arms_nothing() {
     app.on_vitals_wake();
     app.service_vitals(t0);
     assert_eq!(asked(&rx), 0, "parked: nothing is read");
+    feed(&app, b"$ ");
     app.on_output_wake(0, t0);
     assert_eq!(asked(&rx), 1, "the output's reading, in its wake");
     assert_eq!(app.vitals_deadline(), None, "and nothing armed for it");
+    feed(&app, b"ls");
     app.on_output_wake(0, t0 + Duration::from_millis(500));
     assert_eq!(asked(&rx), 0, "within the floor: owed");
     assert_eq!(app.vitals.edge_at(t0), Some(t0 + JOBS_FLOOR));
+}
+
+/// Session `0`'s program writes `bytes`, as its PTY reader feeds them.
+fn feed(app: &crate::App, bytes: &[u8]) {
+    let term = Arc::clone(&app.pool.get(0).expect("tab 0").term);
+    term.lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .process(bytes);
+}
+
+/// Muse Code 0.10's write at rest, every ~9 s (`subscribe … bytes`,
+/// docs/measured/vitals-multi-tab-2026-10-22.md): colours reset and the
+/// cursor put back where it was. It marks no cell.
+const MUSE_RESET: &[u8] = b"\x1b[39m\x1b[49m\x1b[59m\x1b[0m\x1b[5;3H";
+
+/// Gemini CLI's write at rest, once a minute: an OSC 11 background-colour
+/// query. It marks no cell.
+const GEMINI_QUERY: &[u8] = b"\x1b]11;?\x1b\\";
+
+/// A WRITE THAT MOVES NO CELL IS NO EDGE (design §6.1, "What brings job
+/// demand back"; docs/measured/vitals-multi-tab-2026-10-22.md): with no
+/// window, an idle program's colour reset or colour query asks no reading
+/// and arms nothing, even inside the floor of another edge's reading, where
+/// main put it off to the floor on a `system_vitals` timer (with three Muse
+/// Code tabs at rest, one tab's reset landed inside another's floor 4 times
+/// in 40 s). NEGATIVE CONTROLS: one tab's write that moves the screen is
+/// read in its own wake, and the next inside the floor is owed at the floor;
+/// a write whose screen the loop cannot see (its terminal lock contended)
+/// counts as moved.
+#[test]
+fn a_write_that_moves_no_cell_is_no_edge_and_arms_nothing() {
+    static BOARD: JobsBoard = JobsBoard::new();
+    let mut app = crate::App::headless_for_test();
+    let rx = with_reader(&mut app, &BOARD);
+    let t0 = Instant::now();
+    land(&app, 1, Vec::new(), Demand::Idle);
+    app.on_vitals_wake();
+    app.service_vitals(t0);
+    assert_eq!(asked(&rx), 0, "parked: nothing is read");
+    feed(&app, b"$ ");
+    app.on_output_wake(0, t0);
+    assert_eq!(
+        asked(&rx),
+        1,
+        "the prompt moved the screen: read in its wake"
+    );
+
+    for (n, bytes) in (1_u64..).zip([MUSE_RESET, GEMINI_QUERY, MUSE_RESET]) {
+        let at = t0 + Duration::from_millis(400 * n);
+        feed(&app, bytes);
+        app.on_output_wake(0, at);
+        assert_eq!(asked(&rx), 0, "write {n} moved no cell: nothing read");
+        assert_eq!(app.vitals.edge_at(at), None, "write {n}: no edge owed");
+        assert_eq!(app.vitals_deadline(), None, "write {n}: nothing armed");
+    }
+
+    feed(&app, b"x");
+    app.on_output_wake(0, t0 + Duration::from_millis(1_800));
+    assert_eq!(asked(&rx), 0, "a moved screen inside the floor: owed");
+    assert_eq!(app.vitals.edge_at(t0), Some(t0 + JOBS_FLOOR));
+    app.service_vitals(t0 + JOBS_FLOOR);
+    assert!(read_req(&rx, "the owed reading").jobs_now);
+
+    let later = t0 + 3 * JOBS_FLOOR;
+    let term = Arc::clone(&app.pool.get(0).expect("tab 0").term);
+    let held = term.lock().unwrap_or_else(PoisonError::into_inner);
+    assert_eq!(
+        app.vitals_output_kind(0, later),
+        OutputEdge::Edge,
+        "the screen unseen: moved"
+    );
+    drop(held);
+    assert_eq!(
+        app.vitals_output_kind(0, later),
+        OutputEdge::Quiet,
+        "seen again, where it was"
+    );
+}
+
+/// IDLE WRITES OF TWO TABS INSIDE EACH OTHER'S FLOOR ASK NOTHING
+/// (docs/measured/vitals-multi-tab-2026-10-22.md, the r10 shape): each
+/// session's screen is judged against its own last output wake, so one tab's
+/// colour reset compares with that tab's screen, not with the other tab's.
+/// NEGATIVE CONTROL: a write that moves tab 1's screen inside the floor of
+/// tab 0's reading is owed at the floor.
+#[test]
+fn idle_writes_of_two_tabs_inside_each_others_floor_ask_nothing() {
+    static BOARD: JobsBoard = JobsBoard::new();
+    let mut app = crate::App::headless_for_test();
+    app.pool.insert(crate::stub_session_with_sink(
+        1,
+        Arc::new(aterm_session::sink::SinkWriter::new(-1)),
+    ));
+    let rx = with_reader(&mut app, &BOARD);
+    let t0 = Instant::now();
+    land(&app, 1, Vec::new(), Demand::Idle);
+    app.on_vitals_wake();
+    app.service_vitals(t0);
+    let feed_tab = |app: &crate::App, tab: u64, bytes: &[u8]| {
+        let term = Arc::clone(&app.pool.get(tab).expect("the tab").term);
+        term.lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .process(bytes);
+    };
+    feed_tab(&app, 0, b"$ ");
+    app.on_output_wake(0, t0);
+    assert_eq!(asked(&rx), 1, "tab 0's prompt: read at once");
+    land(&app, 2, Vec::new(), Demand::Idle);
+    app.on_vitals_wake();
+    feed_tab(&app, 1, b"% ");
+    app.on_output_wake(1, t0 + Duration::from_millis(100));
+    assert_eq!(asked(&rx), 0, "tab 1's prompt inside the floor: owed");
+    app.service_vitals(t0 + JOBS_FLOOR);
+    assert_eq!(asked(&rx), 1, "tab 1's prompt: read at the floor");
+    land(&app, 3, Vec::new(), Demand::Idle);
+    app.on_vitals_wake();
+
+    let base = t0 + 2 * JOBS_FLOOR;
+    feed_tab(&app, 0, b"x");
+    app.on_output_wake(0, base);
+    assert_eq!(asked(&rx), 1, "tab 0 moved: read, and its floor stands");
+    land(&app, 4, Vec::new(), Demand::Idle);
+    app.on_vitals_wake();
+    for k in 1..=6_u64 {
+        let tab = k % 2;
+        let at = base + Duration::from_millis(250 * k);
+        feed_tab(&app, tab, MUSE_RESET);
+        app.on_output_wake(tab, at);
+        assert_eq!(asked(&rx), 0, "write {k} (tab {tab}): nothing read");
+        assert_eq!(app.vitals.edge_at(at), None, "write {k}: nothing owed");
+        assert_eq!(app.vitals_deadline(), None, "write {k}: nothing armed");
+    }
+    let moved = base + Duration::from_millis(1_800);
+    feed_tab(&app, 1, b"y");
+    app.on_output_wake(1, moved);
+    assert_eq!(asked(&rx), 0, "tab 1 moved inside tab 0's floor: owed");
+    assert_eq!(app.vitals.edge_at(moved), Some(base + JOBS_FLOOR));
+}
+
+/// OUTPUT FED AS THE PASS STARTS IS JUDGED IN THAT PASS (review 2026-10-22):
+/// [`crate::App::on_output_wake`] clears the session's output latch before it
+/// reads the screen's generation, so a chunk the reader fed before the clear
+/// (which posted no wake, the latch still set) is in the screen it judges.
+/// A job's last write moves no cell (a colour reset) and its shell's prompt
+/// lands just before the clear: the prompt is read in that wake, where the
+/// job's end may have no other edge (off Darwin, or a watch `EMFILE` refused).
+/// NEGATIVE CONTROL: the same reset alone, past the floor, asks nothing.
+#[test]
+fn a_prompt_fed_before_the_latch_clears_is_read_in_that_pass() {
+    static BOARD: JobsBoard = JobsBoard::new();
+    let mut app = crate::App::headless_for_test();
+    let rx = with_reader(&mut app, &BOARD);
+    let t0 = Instant::now();
+    land(&app, 1, Vec::new(), Demand::Idle);
+    app.on_vitals_wake();
+    app.service_vitals(t0);
+    feed(&app, b"$ sleep 1\r\n");
+    app.on_output_wake(0, t0);
+    assert_eq!(asked(&rx), 1, "the command's echo: read");
+
+    let t1 = t0 + JOBS_FLOOR;
+    feed(&app, MUSE_RESET);
+    app.on_output_wake(0, t1);
+    assert_eq!(asked(&rx), 0, "a reset alone moves no cell: nothing");
+
+    let t2 = t1 + JOBS_FLOOR;
+    feed(&app, MUSE_RESET);
+    BEFORE_LATCH_CLEAR.set(Some(Box::new(|app, session| {
+        assert_eq!(session, 0);
+        feed(app, b"$ ");
+    })));
+    app.on_output_wake(0, t2);
+    BEFORE_LATCH_CLEAR.set(None);
+    assert_eq!(asked(&rx), 1, "the prompt fed as the pass began: read");
 }
 
 /// THE KERNEL EDGE (module docs, [`ProcEdge`]): with no window, the loop
@@ -1898,14 +2111,26 @@ fn job_at_rest_leader() {
 /// step ([`jobs_step`], which [`Reader::read`] takes): this machine's
 /// process table, the request as the loop built it (its words emptied when
 /// `words` is false: main's host built none), and the stuck engine at the
-/// turn's clock; its view lands as the thread's snapshot does, for the next
-/// turn to adopt. The job's screen came first: its output asks the edge's
-/// reading. The instants (ms into the 20 s) of the readings asked, each one
-/// main thread wake and one `system_vitals` fire in the product.
+/// turn's clock; its view lands as the thread's snapshot does, with the
+/// request's words ([`hand_over`]), for the next turn to adopt. The job's
+/// screen came first: its output asks the edge's reading. The instants (ms
+/// into the 20 s) of the readings asked, each one main thread wake and one
+/// `system_vitals` fire in the product.
 #[cfg(target_os = "macos")]
 fn readings_at_rest(app: &mut crate::App, rx: &Receiver<Msg>, words: bool) -> Vec<u64> {
+    readings_at_rest_with(app, rx, words, &mut crate::vitals_jobs::JobsPass::new())
+}
+
+/// [`readings_at_rest`] with the engine's `pass`, which the caller keeps for
+/// readings after it ([`engine_reads`]).
+#[cfg(target_os = "macos")]
+fn readings_at_rest_with(
+    app: &mut crate::App,
+    rx: &Receiver<Msg>,
+    words: bool,
+    pass: &mut crate::vitals_jobs::JobsPass,
+) -> Vec<u64> {
     let t0 = Instant::now();
-    let mut pass = crate::vitals_jobs::JobsPass::new();
     let mut asked = Vec::new();
     app.vitals.note_edge();
     for turn in 0..=200_u64 {
@@ -1921,17 +2146,38 @@ fn readings_at_rest(app: &mut crate::App, rx: &Receiver<Msg>, words: bool) -> Ve
             if !words {
                 req.ttys.clear();
             }
-            let sweep = aterm_sysprobe::processes().expect("this machine's process table");
             // The engine's clock: the turn's, past zero.
-            let jobs = jobs_step(&mut pass, 1_000 + ms, Some(&sweep.procs), &req, false);
-            app.vitals.latest.lock().unwrap().snap = Some(Arc::new(Snapshot {
-                seq: u64::try_from(asked.len()).expect("few"),
-                jobs,
-                ..Snapshot::default()
-            }));
+            let seq = u64::try_from(asked.len()).expect("few");
+            engine_reads(pass, app, &req, 1_000 + ms, seq);
         }
     }
     asked
+}
+
+/// The probe thread's reading of `req` as reading `seq`, at the engine's
+/// clock `at_ms`: this machine's process table through the thread's own step
+/// ([`jobs_step`]), its view left for the loop with the request's words
+/// ([`hand_over`]).
+#[cfg(target_os = "macos")]
+fn engine_reads(
+    pass: &mut crate::vitals_jobs::JobsPass,
+    app: &crate::App,
+    req: &Request,
+    at_ms: u64,
+    seq: u64,
+) {
+    let sweep = aterm_sysprobe::processes().expect("this machine's process table");
+    let jobs = jobs_step(pass, at_ms, Some(&sweep.procs), req, false);
+    let snap = Arc::new(Snapshot {
+        seq,
+        jobs,
+        ..Snapshot::default()
+    });
+    hand_over(
+        &app.vitals.latest,
+        &snap,
+        req.ttys.iter().map(TtyWord::seen).collect(),
+    );
 }
 
 /// The wait the held view names for tab 0's job, and its demand.
@@ -1984,6 +2230,370 @@ fn a_raw_program_at_its_prompt_is_read_once_and_then_arms_nothing() {
     assert!(
         asked.len() >= 10 && asked.last().is_some_and(|ms| *ms >= 18_000),
         "no word: read every 2 s to the end: {asked:?}"
+    );
+}
+
+/// A PARKED SCREEN'S REDRAW IS READ AT MOST ONCE A FLOOR, AND NEVER ON A
+/// DEADLINE, WHILE THE TERMINAL SAYS IT STILL WAITS (design §6.1, "What
+/// brings job demand back"): a raw program at the person's read on a real
+/// terminal, parked by the real engine from the word its reading carried,
+/// redraws each second (a clock ticking) with no window. A redraw inside
+/// [`PARKED_RECHECK`] (the floor) of the reading that last looked at it reads
+/// nothing; the next one past it reads once, in its own wake; nothing is
+/// armed or owed. So a job the program starts by itself (an agent's call,
+/// whose fork the kernel edge does not hear) is looked at within the floor of
+/// a redraw, where a 30 s recheck left one unseen for its whole life (review
+/// 2026-10-22). A recheck is never taken inside another edge's floor, and a
+/// process event past the floor is read at once. NEGATIVE CONTROLS, each a
+/// redraw the park would leave quiet read at once as an edge and the park
+/// dropped: another group in front, the terminal canonical again, echo on
+/// again with the read still raw, a key driven since the word; a canonical
+/// job, which the engine parks not; and the job's real end (the fixture's
+/// leader reaps it and exits), after which the prompt is read at once and
+/// the reading finds the job exited and parks nothing.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_parked_screens_redraw_is_read_once_a_floor_and_never_on_a_deadline() {
+    static BOARD: JobsBoard = JobsBoard::new();
+    let mut job = JobAtRest::new(true);
+    let (mut app, rx) = job.app(&BOARD);
+    let mut pass = crate::vitals_jobs::JobsPass::new();
+    let _ = readings_at_rest_with(&mut app, &rx, true, &mut pass);
+    let park = *app
+        .vitals
+        .parked
+        .get(&0)
+        .expect("the held view parks tab 0");
+    assert_eq!(
+        i32::try_from(park.pgid).ok(),
+        job.job,
+        "the job's own group"
+    );
+    let mut tick = 0_u64;
+    let mut redraw = |app: &mut crate::App, at: Instant| {
+        tick += 1;
+        feed(app, format!("\r{tick:>6}").as_bytes());
+        app.vitals_output_edge(0, at);
+    };
+
+    let mut read = Vec::new();
+    for s in 1..=20 {
+        let at = park.read_at + Duration::from_secs(s);
+        redraw(&mut app, at);
+        let reads = rx
+            .try_iter()
+            .filter_map(|m| match m {
+                Msg::Read(r) => Some(r.jobs_now),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        match reads.as_slice() {
+            [] => {}
+            [true] => read.push(s),
+            other => panic!("redraw {s}: one reading that makes the engine look: {other:?}"),
+        }
+        assert_eq!(app.vitals.edge_at(at), None, "redraw {s}: no edge owed");
+        assert_eq!(app.vitals_deadline(), None, "redraw {s}: nothing armed");
+    }
+    assert_eq!(
+        read,
+        [2, 4, 6, 8, 10, 12, 14, 16, 18, 20],
+        "once a floor, each in its redraw's own wake"
+    );
+    let last = park.read_at + Duration::from_secs(20);
+    assert_eq!(app.vitals.parked.get(&0).map(|p| p.read_at), Some(last));
+
+    app.vitals.proc_edge.install(|| {});
+    app.vitals.arm_proc_edge();
+    assert!(
+        app.vitals.proc_edge.heard(),
+        "a process event: a fork, an exec or an exit the kernel watch hears"
+    );
+    let heard = last + JOBS_FLOOR;
+    app.service_vitals(heard);
+    assert!(read_req(&rx, "past the floor: read at once").jobs_now);
+    let inside = heard + Duration::from_secs(1);
+    redraw(&mut app, inside);
+    assert_eq!(
+        asked(&rx),
+        0,
+        "a recheck inside another edge's floor: nothing read"
+    );
+    assert_eq!(app.vitals.edge_at(inside), None, "and nothing owed");
+    assert_eq!(app.vitals_deadline(), None, "or armed");
+    let past = heard + JOBS_FLOOR;
+    redraw(&mut app, past);
+    assert!(read_req(&rx, "the recheck, in its own wake").jobs_now);
+    assert_eq!(app.vitals.parked.get(&0).map(|p| p.read_at), Some(past));
+
+    let held = app.vitals.parked.clone();
+    let sink = Arc::clone(&app.pool.get(0).expect("tab 0").ctx.sink);
+    let mut at = past;
+    // Each control redraws past the floor of the last reading, with the park
+    // just looked at: quiet while it holds, so a reading is the change's.
+    let mut control = |app: &mut crate::App, why: &str, change: &dyn Fn(&mut crate::App)| {
+        at += JOBS_FLOOR;
+        app.vitals.parked.clone_from(&held);
+        if let Some(p) = app.vitals.parked.get_mut(&0) {
+            p.read_at = at;
+        }
+        change(app);
+        redraw(app, at);
+        assert!(read_req(&rx, why).jobs_now, "{why}");
+        assert!(
+            !app.vitals.parked.contains_key(&0),
+            "{why}: the park dropped"
+        );
+    };
+    control(&mut app, "another group in front", &|app| {
+        app.vitals.parked.get_mut(&0).expect("parked").pgid += 1;
+    });
+    let master = job.master();
+    let set_mode = |canonical: bool, echo: bool| {
+        // SAFETY: this test owns the live PTY and its termios.
+        unsafe {
+            let mut t: libc::termios = std::mem::zeroed();
+            assert_eq!(libc::tcgetattr(master, &mut t), 0, "tcgetattr");
+            t.c_lflag &= !(libc::ICANON | libc::ECHO);
+            if canonical {
+                t.c_lflag |= libc::ICANON;
+            }
+            if echo {
+                t.c_lflag |= libc::ECHO;
+            }
+            assert_eq!(libc::tcsetattr(master, libc::TCSANOW, &t), 0);
+        }
+    };
+    control(&mut app, "the terminal canonical again", &|_| {
+        set_mode(true, true)
+    });
+    control(&mut app, "echo on again, the read still raw", &|_| {
+        set_mode(false, true)
+    });
+    set_mode(false, false);
+    control(&mut app, "a key driven since the word", &|_| {
+        assert_eq!(sink.write_frame(b"k").expect("typed"), 1);
+    });
+
+    // The job ends for real, and the prompt that follows is read at once:
+    // the group in front is no longer the park's.
+    app.vitals.parked.clone_from(&held);
+    assert!(job.stop(), "the job ended and was reaped");
+    at += JOBS_FLOOR;
+    if let Some(p) = app.vitals.parked.get_mut(&0) {
+        p.read_at = at;
+    }
+    feed(&app, b"\r\n$ ");
+    app.vitals_output_edge(0, at);
+    let req = read_req(&rx, "the end's prompt: read at once");
+    assert!(req.jobs_now);
+    assert!(!app.vitals.parked.contains_key(&0), "the park dropped");
+    engine_reads(&mut pass, &app, &req, 1_000 + 600_000, 1_000);
+    app.adopt_vitals(Audience::None, at, false);
+    let view = app
+        .vitals
+        .snapshot
+        .as_ref()
+        .and_then(|s| s.jobs.clone())
+        .expect("the end's view");
+    assert!(
+        view.rows
+            .iter()
+            .filter(|r| r.tab == 0)
+            .all(|r| r.verdict == aterm_vitals::jobs::Verdict::Exited),
+        "the reading finds the job exited: {:?}",
+        view.rows
+    );
+    assert!(app.vitals.parked.is_empty(), "and parks nothing");
+
+    static CANONICAL: JobsBoard = JobsBoard::new();
+    let canonical = JobAtRest::new(false);
+    let (mut app, rx) = canonical.app(&CANONICAL);
+    let _ = readings_at_rest(&mut app, &rx, true);
+    assert!(app.vitals.parked.is_empty(), "a canonical job: no park");
+    let at = Instant::now() + 30 * JOBS_FLOOR;
+    feed(&app, b"\r tick");
+    app.vitals_output_edge(0, at);
+    assert!(read_req(&rx, "its redraw is an edge").jobs_now);
+}
+
+/// THE THREAD HANDS BACK THE WORDS IT READ WITH, AND THE LOOP PARKS FROM
+/// THEM (review 2026-10-22): the real probe thread ([`run`], started as the
+/// product starts it) reads a raw program at the person's read on a real
+/// terminal through the engine's own step over this machine's process table,
+/// and hands its view back beside the words of the request it read; the
+/// loop names the park from them: the job's group, the word's raw mode and
+/// the driven input before it. NEGATIVE CONTROL: before any reading lands,
+/// nothing is parked.
+#[cfg(target_os = "macos")]
+#[test]
+fn the_thread_hands_back_the_words_it_read_with_and_the_loop_parks_from_them() {
+    /// The engine's step over this machine's process table, as the probe
+    /// thread's [`Source`].
+    struct Engine {
+        vitals: aterm_vitals::Vitals,
+        pass: crate::vitals_jobs::JobsPass,
+        t0: Instant,
+        seq: u64,
+    }
+    impl Source for Engine {
+        fn reading(&mut self, req: &Request) -> Snapshot {
+            self.seq += 1;
+            let sweep = aterm_sysprobe::processes().expect("this machine's process table");
+            let at_ms = 1_000 + u64::try_from(self.t0.elapsed().as_millis()).unwrap_or(0);
+            Snapshot {
+                seq: self.seq,
+                jobs: jobs_step(&mut self.pass, at_ms, Some(&sweep.procs), req, false),
+                ..Snapshot::default()
+            }
+        }
+        fn model(&mut self) -> &mut aterm_vitals::Vitals {
+            &mut self.vitals
+        }
+    }
+    static BOARD: JobsBoard = JobsBoard::new();
+    let job = JobAtRest::new(true);
+    let sink = Arc::new(aterm_session::sink::SinkWriter::new(job.master()));
+    let input = sink.driven_input();
+    let mut app = crate::App::headless_for_test_with_sink(sink);
+    app.pool.sessions.get_mut(&0).expect("tab 0").session.pid =
+        i32::try_from(job.leader.as_ref().expect("owned leader").id()).expect("pid");
+    app.vitals.board = &BOARD;
+    app.vitals.start(
+        || Engine {
+            vitals: aterm_vitals::Vitals::new(),
+            pass: crate::vitals_jobs::JobsPass::new(),
+            t0: Instant::now(),
+            seq: 0,
+        },
+        || true,
+        None,
+        None,
+    );
+    assert!(app.vitals.parked.is_empty(), "nothing read: nothing parked");
+    app.vitals.note_edge();
+    let park = aterm_spec::wait::within(
+        aterm_spec::wait::MUST_HAPPEN,
+        Duration::from_millis(10),
+        || {
+            let now = Instant::now();
+            app.adopt_vitals(Audience::None, now, false);
+            app.serve_windowless_vitals(Audience::None, now, false);
+            app.vitals.parked.get(&0).copied()
+        },
+    )
+    .expect("the thread's reading parks tab 0");
+    assert_eq!(
+        i32::try_from(park.pgid).ok(),
+        job.job,
+        "the job's own group"
+    );
+    assert_eq!(
+        park.word,
+        WordSeen {
+            key: 0,
+            canonical: false,
+            echo: false,
+            input,
+        },
+        "the word the request carried"
+    );
+    assert!(
+        app.vitals.stop_at_exit(aterm_spec::wait::MUST_HAPPEN),
+        "the thread ended"
+    );
+}
+
+/// A PARK HOLDS ONLY WHILE THE TERMINAL SAYS THE PROGRAM STILL WAITS
+/// ([`Parked::holds`]): the same group in front, the same `ICANON` and
+/// `ECHO`, and no input driven since the word. NEGATIVE CONTROLS, one
+/// change each: another group, canonical again, echo on again with the read
+/// still raw, no terminal to ask, and a key driven since.
+#[cfg(unix)]
+#[test]
+fn a_park_holds_only_while_the_terminal_says_the_program_still_waits() {
+    let (_read, write) = std::os::unix::net::UnixStream::pair().expect("socketpair");
+    let sink = aterm_session::sink::SinkWriter::new(std::os::fd::AsRawFd::as_raw_fd(&write));
+    let input = sink.driven_input();
+    let park = Parked {
+        pgid: 42,
+        word: WordSeen {
+            key: 0,
+            canonical: false,
+            echo: false,
+            input,
+        },
+        read_at: Instant::now(),
+    };
+    assert!(
+        park.holds(42, Some((false, false)), input),
+        "it still waits"
+    );
+    assert!(
+        !park.holds(43, Some((false, false)), input),
+        "another group"
+    );
+    assert!(
+        !park.holds(42, Some((true, false)), input),
+        "canonical again"
+    );
+    assert!(!park.holds(42, Some((false, true)), input), "echo on again");
+    assert!(!park.holds(42, None, input), "no terminal to ask");
+    assert_eq!(sink.write_frame(b"k").expect("a key"), 1);
+    assert!(
+        !park.holds(42, Some((false, false)), sink.driven_input()),
+        "a key driven since"
+    );
+}
+
+/// A PARK IS NAMED FROM ITS OWN TAB'S WORD ([`Parked::of`]), whatever order
+/// the request carried the words in, and only for a parked tab whose live
+/// jobs share one group. NEGATIVE CONTROLS: a tab the view does not park
+/// (its word first in the request), a parked tab whose live jobs span two
+/// groups, and a parked tab the request carried no word for.
+#[test]
+fn a_park_is_named_from_its_own_tabs_word() {
+    use aterm_vitals::jobs::Verdict;
+    let input = aterm_session::sink::SinkWriter::new(-1).driven_input();
+    let word = |key, canonical| WordSeen {
+        key,
+        canonical,
+        echo: canonical,
+        input,
+    };
+    let row = |tab, pgid, verdict| JobRow {
+        tab,
+        pgid,
+        ..crate::stats_paint::tests::job_row("j", verdict, None, Some(1_000))
+    };
+    let view = JobsView {
+        rows: vec![
+            row(1, 7, Verdict::Fine),
+            row(0, 42, Verdict::Fine),
+            row(0, 41, Verdict::Exited),
+            row(2, 9, Verdict::Fine),
+            row(2, 10, Verdict::Fine),
+            row(3, 11, Verdict::Fine),
+        ],
+        parked_tabs: vec![0, 2, 3],
+        ..JobsView::default()
+    };
+    let words = [word(1, true), word(2, false), word(0, false)];
+    let now = Instant::now();
+    let parks = Parked::of(&view, &words, now);
+    assert_eq!(
+        parks.keys().copied().collect::<Vec<_>>(),
+        [0],
+        "tab 0 alone"
+    );
+    assert_eq!(
+        parks.get(&0),
+        Some(&Parked {
+            pgid: 42,
+            word: word(0, false),
+            read_at: now,
+        }),
+        "its own word and its live job's group"
     );
 }
 
@@ -2207,7 +2817,10 @@ fn a_cold_pulls_first_reading_hands_its_events_to_the_published_one() {
     let seqs: Vec<u64> = snap.events.iter().map(|e| e.seq).collect();
     assert_eq!(seqs, vec![4, 5], "the warm reading's first, none lost");
     let slot = Mutex::new(Handover::default());
-    assert!(hand_over(&slot, &Arc::new(snap)), "the loop hears of it");
+    assert!(
+        hand_over(&slot, &Arc::new(snap), Vec::new()),
+        "the loop hears of it"
+    );
 }
 
 /// The hand-over keeps every job event until the loop takes it (a later
@@ -2241,9 +2854,12 @@ fn the_hand_over_keeps_job_events_for_the_loop_and_says_when_one_moved() {
         }
         Arc::new(s)
     };
-    assert!(!hand_over(&slot, &snap(1, false)), "nothing moved");
-    assert!(hand_over(&slot, &snap(2, true)));
-    assert!(hand_over(&slot, &snap(3, true)));
+    assert!(
+        !hand_over(&slot, &snap(1, false), Vec::new()),
+        "nothing moved"
+    );
+    assert!(hand_over(&slot, &snap(2, true), Vec::new()));
+    assert!(hand_over(&slot, &snap(3, true), Vec::new()));
     let mut v = VitalsHost {
         latest: Arc::new(slot),
         ..VitalsHost::default()

@@ -10,7 +10,7 @@
 //! worker behind an inline confirm that only a second ⌫ from the same hand
 //! resolves (⏎ always goes there), esc closes.
 //!
-//! ON THE FABRIC (session log Phase 6 step 6E-7, ruling U42): where this
+//! ON THE FABRIC: where this
 //! aterm's fabric is on, a group after the windows lists each session on the
 //! fabric's other machines whose bus log says it needs the person
 //! ([`FabricChip`], composed by [`crate::overview_fabric`] from one bounded
@@ -154,7 +154,7 @@ pub(crate) struct OverviewChip {
     pub(crate) task_words: Option<String>,
     /// Who drives it: one word, the person's hold first, so it is no count.
     pub(crate) driver: Option<Driver>,
-    /// WHY LAND STILL HOLDS (Autopilot v5 §12.3.1, slice 3c), where a land
+    /// WHY LAND STILL HOLDS (Autopilot v5 §12.3.1), where a land
     /// act's yield did not land: the hold's words with no clock, as the menu
     /// bar's landing worker's tip says them (`not landed yet: 2 unpushed
     /// commits; open work in its report: follow-up · 3 nudges`,
@@ -188,7 +188,7 @@ pub(crate) struct OverviewGroup {
 }
 
 /// One session on another machine of this aterm's fabric whose log, read
-/// from the bus alone, says it needs the person (step 6E-7): never one of
+/// from the bus alone, says it needs the person: never one of
 /// this aterm's, never acted on.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct FabricChip {
@@ -1652,7 +1652,7 @@ mod tests {
     }
 
     /// WHY LAND HOLDS IS A LINE OF ITS OWN UNDER ITS CHIP (Autopilot v5
-    /// §12.3.1, the review of slice 3c): at the card's widest (760 px) a held
+    /// §12.3.1): at the card's widest (760 px) a held
     /// chip's own line keeps its words whole, `typed by` last, and the hold's
     /// words are painted under it, past its mark, in the secondary ink; a
     /// line too long for the card ends in `…` at its edge, never cut

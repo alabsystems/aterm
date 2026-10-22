@@ -1,55 +1,17 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! SETTINGS ▸ THEMES: one job, show your terminal in another theme, then
-//! keep it or go back.
+//! Settings ▸ Themes page: theme chooser, live demo stage, action strip, and Customize sheet.
 //!
-//! The page is three parts ([`view`] lays them out):
+//! [`view`] lays out the chooser ([`ShowcaseCard`] rows), the scripted demo session
+//! ([`crate::settings_theme_demo`]), and the action strip. Selecting a row starts a live
+//! preview ([`ShowcaseTrial::Trying`]) synced via [`crate::App::sync_settings_theme_trial`];
+//! Keep writes `theme` through the config patch lane ([`ShowcaseTrial::Keeping`]) without
+//! blocking further interactions, and Revert ([`SettingsApp::revert_trial`]) or leaving the
+//! page restores the prior state.
 //!
-//! * **The chooser** — one 32pt row per theme ([`ShowcaseCard`], built once
-//!   per catalog generation): aterm's signature themes first, then the other
-//!   built-ins, the person's own files, and the community pack behind one
-//!   disclosure. A filter matches a name, id, description, `dark`/`light`,
-//!   `yours`, `font` or `community`. The row the keyboard or the pointer
-//!   picks is the trial: highlight equals trial, and the theme in use is no
-//!   trial. Hover only tints.
-//! * **The demo** — a real terminal parser and the shipping renderer playing
-//!   a scripted shell session ([`crate::settings_theme_demo`]) in the
-//!   candidate theme, its window chrome in the theme's chrome tokens.
-//! * **The strip** — one row under the demo, always reserved, offering one
-//!   obvious action per moment: Customize while idle, Revert and Keep while a
-//!   theme is tried, Done while the Customize sheet is open.
-//!
-//! TRYING A THEME. The view records the trial ([`ShowcaseTrial::Trying`]) and
-//! the host draws it everywhere through the transient preview lane
-//! ([`crate::App::sync_settings_theme_trial`]), writing nothing; a community
-//! pack theme is drawn from the embedded pack, so no file is written either.
-//! Keep writes `theme` once through the patch lane (while the theme follows
-//! the system, only one side: the one the person chose in the segment, else
-//! the one the kept theme is made for, which the segment shows meanwhile);
-//! a pack theme's Keep
-//! adds its file first and writes `theme` once the catalog lists it. Revert,
-//! Esc, leaving the page, Search Results or the category list replacing it,
-//! and closing Settings all end the trial the same way: no view asks for it
-//! any more, so the host reverts.
-//!
-//! NO PRESS WAITS ON A KEEP. Keep's write shows at once (the kept theme is
-//! the one in use) and the strip's controls take every press while it saves,
-//! as every Settings control does: a second Keep asks for nothing more,
-//! Revert (or Esc) takes the Keep back with a write that follows it in the
-//! config lane ([`SettingsApp::revert_trial`]), Keep colours only follows
-//! it (and a Keep after that takes its type pins off again), and another
-//! row is tried over it. What each key held before the trial's first Keep
-//! is the trial's own record ([`ShowcaseTrial::Keeping`]), so Revert and
-//! the strip's "was" read through every Keep of it on its way. The themes
-//! folder's requests are each their own, never refused for another on its
-//! way.
-//!
-//! THE CUSTOMIZE SHEET ([`customize`]) replaces the chooser: the five colour
-//! overrides with their Resets, the sixteen palette slots, and "Save as
-//! theme…", which writes the colours the demo shows as a new theme file
-//! through the host's one theme write path, then — once the catalog lists it
-//! — selects it and clears the overrides it now carries, in one patch.
+//! [`customize`] replaces the chooser with color overrides, the 16-slot palette editor, and
+//! "Save as theme…".
 
 use super::*;
 use crate::control_theme::ThemeTrialIntent;
@@ -101,8 +63,7 @@ const CUSTOMIZE_DONE: &str = "settings/showcase/customize-done";
 const PACK: &str = "settings/showcase/pack";
 /// Follow system light/dark (Appearance's switch).
 const FOLLOW_SYSTEM: &str = "settings/showcase/follow-system";
-/// The Dark | Light segment while the theme follows the system:
-/// `settings/showcase/side/<dark|light>`.
+/// Dark | Light segment action prefix (`settings/showcase/side/<dark|light>`).
 const SIDE_PREFIX: &str = "settings/showcase/side/";
 const SAVE_CONFIRM: &str = "settings/showcase/save";
 const SAVE_CANCEL: &str = "settings/showcase/save-cancel";
@@ -112,8 +73,7 @@ const OPEN_FOLDER: &str = "settings/showcase/open-folder";
 const PALETTE_PREFIX: &str = "settings/showcase/palette/";
 const PALETTE_SLOT_RESET: &str = "settings/showcase/palette-slot-reset";
 const PALETTE_SLOT_CLOSE: &str = "settings/showcase/palette-slot-close";
-/// Reset every palette slot: the `palette` list and the `palette_overrides`
-/// table.
+/// Reset both `palette` and `palette_overrides`.
 const PALETTE_RESET_ALL: &str = "settings/showcase/palette-reset";
 /// A Yours row's file actions: `settings/showcase/card/<slug>/<verb>`.
 const CARD_OPEN: &str = "open";
@@ -121,13 +81,10 @@ const CARD_TRASH: &str = "trash";
 
 /// The page's heading.
 const SHOWCASE_TITLE: &str = "Themes";
-/// The room a scrolling column keeps clear at its trailing edge for the
-/// list's scroll thumb, which paints 3pt wide at 7pt in.
+/// Trailing gutter reserved for the scroll thumb.
 pub(super) const THUMB_GUTTER: f32 = 12.0;
 
-/// The colour overrides the Customize sheet edits, in the order it lists
-/// them (`COLOR_KEYS` also holds the cursor trail's two colours, which a
-/// theme does not set).
+/// Color override keys edited by the Customize sheet.
 pub(super) const SHOWCASE_COLOR_KEYS: [&str; 5] = [
     prefs::EDIT_FOREGROUND,
     prefs::EDIT_BACKGROUND,
@@ -142,21 +99,14 @@ pub(crate) enum ShowcaseTrial {
     /// Nothing is tried: the terminal draws the configured theme.
     #[default]
     Idle,
-    /// `id` is drawn everywhere in place of the configured theme; nothing
-    /// is written.
+    /// `id` is previewed live without writing config.
     Trying { id: String },
-    /// Keep wrote `theme` for `id`; the trial stands until that write lands
-    /// (or is refused, which goes back to Trying). Every control of the page
-    /// takes a press meanwhile: Revert takes the Keep back, Keep colours
-    /// only and a save's select follow it, another row is tried.
+    /// Keep wrote `theme` for `id` and is waiting for the config patch to settle.
     Keeping {
         id: String,
         /// The newest of the trial's Keeps on its way.
         operation: OperationId,
-        /// What each key the trial's Keeps write held before the first of
-        /// them wrote it: what Revert puts back, what the strip says the
-        /// trial replaces, and what a Keep after Keep colours only leaves
-        /// the type settings at, however many of its Keeps are on their way.
+        /// Prior values of keys written by this trial's Keep operations, for Revert.
         under: BTreeMap<String, Option<String>>,
     },
 }
@@ -165,17 +115,13 @@ pub(crate) enum ShowcaseTrial {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct SaveAsState {
     pub(crate) name: crate::native_text_input::TextInputState,
-    /// Why the typed name cannot be saved, as it is typed (or why the last
-    /// write failed).
+    /// Validation or write error for the save name.
     pub(crate) error: Option<String>,
-    /// "Include type settings": the file also carries the Customize view's
-    /// type rows (family, line height, ligatures, weight, size scale; never
-    /// `font_px`). Off by default.
+    /// Whether the saved theme file includes Customize typography settings.
     pub(crate) include_type: bool,
 }
 
-/// The type rows Save as theme can carry ("Include type settings"):
-/// Customize's type settings a theme file has a key for (never `font_px`).
+/// Typography config keys included when [`SaveModal::include_type`] is enabled.
 pub(super) const SAVE_TYPE_KEYS: [&str; 5] = [
     prefs::EDIT_FONT_FAMILY,
     prefs::EDIT_LINE_HEIGHT,
@@ -184,34 +130,26 @@ pub(super) const SAVE_TYPE_KEYS: [&str; 5] = [
     prefs::EDIT_FONT_SIZE_SCALE,
 ];
 
-/// The drafts a saved theme carries, as they were when it was saved: they
-/// stay drafts until the theme is selected, then go (each only while it
-/// still holds the saved value, so a later edit survives).
+/// Unsaved drafts carried into a newly saved theme and cleared once it is selected.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct CarriedDrafts {
-    /// Each drafted registry field exactly as submitted (text, selection
-    /// and history): retyping the same text is a newer draft.
+    /// Drafted registry fields at save time.
     fields: BTreeMap<String, crate::native_text_input::TextInputState>,
-    /// The palette slot editor exactly as submitted: a later same-colour
-    /// edit can carry newer selection and undo state too.
+    /// Open palette slot editor state at save time.
     slot: Option<(usize, crate::native_text_input::TextInputState)>,
 }
 
-/// A saved theme waiting for the write, then for the catalog to list it,
-/// then to be selected.
+/// Saved theme waiting for file publication and catalog discovery before selection.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct PendingSelect {
     id: String,
     operation: OperationId,
-    /// The file write must report its own successful publication before a
-    /// catalog observation may trigger the config patch.
+    /// Whether the theme file write has succeeded.
     saved: bool,
-    /// The admitted intent, including exact raw values from the Save click.
-    /// A later snapshot may observe it, never rebase it onto newer edits.
+    /// Config edit to select the saved theme.
     theme: ConfigEdit,
     side: Option<aterm_types::Appearance>,
-    /// The override keys the saved theme now carries: cleared with the
-    /// selection, so they are not applied twice.
+    /// Config edits clearing overrides now carried by the saved theme.
     clears: Vec<ConfigEdit>,
     drafts: CarriedDrafts,
 }
@@ -221,14 +159,11 @@ pub(crate) struct PendingSelect {
 pub(crate) struct SlotEditor {
     pub(crate) index: usize,
     pub(crate) input: crate::native_text_input::TextInputState,
-    /// The colour the slot shows without this editor's draft: what the field
-    /// opened with, or what it last committed.
+    /// Slot color before this editor's unsaved draft.
     opened: aterm_types::Rgb,
 }
 
-/// A community pack theme being kept: the add request, the theme id, and
-/// whether its file is written. Once written and listed by the catalog, Keep
-/// writes `theme`.
+/// Community pack theme waiting for its file write and catalog listing before Keep writes `theme`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct PendingKeep {
     pub(crate) operation: OperationId,
@@ -236,11 +171,7 @@ pub(crate) struct PendingKeep {
     pub(crate) written: bool,
 }
 
-/// What the strip's live region settled on when a trial ended, and the theme
-/// those words name. The words stand only while that theme is the one in use
-/// on the side the page shows: an Undo, a save's select, the Follow switch,
-/// the Dark | Light segment, a hand edit or the system's appearance can put
-/// another theme in use without a trial, and the strip then says that one.
+/// Strip status message and the theme id it describes after a trial settles.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Settled {
     pub(crate) id: String,
@@ -262,23 +193,16 @@ pub(crate) struct ShowcaseState {
     pub(crate) filter: crate::native_text_input::TextInputState,
     /// The Customize sheet stands in the chooser's place.
     pub(crate) sheet_open: bool,
-    /// The community pack's rows are shown (a filter shows its matches
-    /// whether or not).
+    /// Whether the community pack disclosure is expanded.
     pub(crate) pack_open: bool,
     /// The Keep split button's one-item list (Keep colours only) is open.
     pub(crate) keep_more: bool,
     /// The chooser's rows, built from the catalog this view admitted.
     pub(crate) cards: Arc<[ShowcaseCard]>,
-    /// The theme files that did not load, for NEEDS ATTENTION.
+    /// Theme files that failed to load.
     pub(crate) attention: Arc<[AttentionRow]>,
     pub(crate) trial: ShowcaseTrial,
-    /// The side the theme the highlight last moved to is made for, by the
-    /// catalog: while the theme follows the system and the person has chosen
-    /// no side in the Dark | Light segment, the side the page shows and Keep
-    /// writes ([`SettingsViewState::showcase_highlight_side`]), so a theme is
-    /// filed by the side it is made for, never by the OS's. `None` (the OS
-    /// side) until the highlight moves, after a Revert, and for a theme the
-    /// catalog does not know.
+    /// Appearance side of the last highlighted theme when following system appearance.
     pub(crate) highlight_side: Option<aterm_types::Appearance>,
     /// The palette slot being edited.
     pub(crate) slot: Option<SlotEditor>,
@@ -286,41 +210,27 @@ pub(crate) struct ShowcaseState {
     pub(crate) pending_select: Option<PendingSelect>,
     /// A community theme's Keep, waiting for its file and the catalog.
     pub(crate) pending_keep: Option<PendingKeep>,
-    /// The select patch a save sent, and the drafts it carries: they go
-    /// when it lands.
+    /// In-flight select patch for a saved theme and the drafts it carries.
     selecting: Option<(OperationId, String, CarriedDrafts)>,
     /// The Yours row whose Trash was pressed once: a second press moves it.
     pub(crate) trash_armed: Option<String>,
-    /// Why the last Keep (or a community theme's add) did not land: the
-    /// strip's second line, in the danger ink, until the next trial.
+    /// Error from the last Keep or community pack add.
     pub(crate) error: Option<String>,
-    /// What the strip's live region last settled on ("Kept Dracula",
-    /// "Reverted to Aterm Night"), until the next trial starts or the theme
-    /// in use is no longer the one it names ([`Settled`]).
+    /// Last settled strip announcement ([`Settled`]).
     pub(crate) settled: Option<Settled>,
-    /// The rows the chooser lists, in order, as the last render laid them
-    /// out: the arrows, Home, End and the page keys walk them.
+    /// Visible chooser row slugs in last-rendered order.
     order: RefCell<Vec<String>>,
-    /// The rows a screen of the list holds, as the last render laid it out
-    /// (Page Up and Page Down move by it).
+    /// Number of chooser rows per viewport page.
     page_rows: Cell<usize>,
-    /// The least a theme's name keeps beside what shares its line, as last
-    /// measured: for which rows (`cards`, by address), at which text scale and
-    /// in which face (the strip's title, a row's name), so a frame measures
-    /// every name once, not once a layout ([`view::name_floor`]).
+    /// Cached minimum width measurements for theme names ([`view::name_floor`]).
     pub(super) name_floors: RefCell<Vec<NameFloor>>,
-    /// The animation clock's reading when the page opened: the demo's
-    /// phase counts from it, so a theme change never restarts the tape.
+    /// Animation clock epoch when the page opened.
     pub(crate) demo_epoch_ms: Cell<Option<u64>>,
-    /// The clock's reading at the last input on the page: three loops after
-    /// it the demo rests on its settled frame.
+    /// Animation phase at the last user input on the page.
     pub(crate) last_input_phase_ms: Cell<u64>,
-    /// An input arrived since the last render read the clock (reducers have
-    /// none): the next render stamps it.
+    /// Whether user input occurred since the last render.
     pub(crate) input_pending: Cell<bool>,
-    /// Escape asked for a Revert while the trial's Keep is on its way: the
-    /// reducer that took the Escape sends the write that takes the Keep back
-    /// ([`SettingsApp::revert_trial`]); Escape's own reduction writes nothing.
+    /// Whether Escape requested a revert of an in-flight Keep.
     pub(crate) revert_asked: bool,
 }
 
@@ -359,15 +269,12 @@ impl ShowcaseState {
         self.filter.value().trim().to_lowercase()
     }
 
-    /// The rows the filter admits, as indices into `cards`, in list order.
-    /// Community rows are admitted while the disclosure is open or a query
-    /// is typed.
+    /// Indices into `cards` admitted by the current filter and disclosure state.
     pub(crate) fn visible(&self) -> Vec<usize> {
         self.visible_for(&self.query())
     }
 
-    /// The rows `query` (trimmed, lowercase) admits: [`Self::visible`] for
-    /// that filter.
+    /// Indices into `cards` admitted by `query` (trimmed, lowercase).
     pub(crate) fn visible_for(&self, query: &str) -> Vec<usize> {
         let reach = self.reach_for(query);
         self.cards
@@ -381,10 +288,7 @@ impl ShowcaseState {
             .collect()
     }
 
-    /// How far the filter `query` reaches over the whole list — the themes
-    /// needing attention and every card ([`MatchReach`]): word hits where
-    /// any row has one, else loose ones, so a filter nothing starts a word
-    /// with still lists the themes that hold it.
+    /// Match reach ([`MatchReach`]) for `query` across attention rows and cards.
     pub(crate) fn reach_for(&self, query: &str) -> MatchReach {
         MatchReach::of(
             self.attention
@@ -433,8 +337,7 @@ impl ShowcaseState {
     }
 }
 
-/// Whether the filter `query` (trimmed, lowercase) at `reach`
-/// ([`ShowcaseState::reach_for`]) admits a theme needing attention, by its id.
+/// Whether `row` matches `query` under `reach`.
 pub(crate) fn attention_row_matches(row: &AttentionRow, query: &str, reach: MatchReach) -> bool {
     query.is_empty()
         || crate::native_config_language::candidate_match_score(
@@ -454,23 +357,14 @@ pub(super) enum ShowcaseText {
 }
 
 impl SettingsViewState {
-    /// Whether the Themes page is the surface on glass: its route, with no
-    /// Search Results and no compact category list replacing it. Its trial,
-    /// previews and Escape steps belong to it only then; another surface
-    /// replacing it ends them ([`SettingsViewState::page_replaced`]).
+    /// Whether the Themes page is visible without an active search or compact category overlay.
     pub(super) fn showcase_on_glass(&self) -> bool {
         self.route == SettingsRoute::Themes
             && self.search.trim().is_empty()
             && !self.compact_navigation
     }
 
-    /// THE SIDE OF THE THEME THE HIGHLIGHT IS ON, while the Themes page is
-    /// on glass and the theme follows the system: the side the page shows
-    /// where the person chose none ([`theme_visible_side`]) — the segment
-    /// shows it, the strip says it ("for Light") and Keep writes it, so
-    /// keeping a light theme while the OS is dark files it under Light (a
-    /// theme is filed by the side it is made for). Over one theme there is no
-    /// side to file under, and the OS's stays the side shown.
+    /// Appearance side of the highlighted theme when following system with no manual side chosen.
     pub(super) fn showcase_highlight_side(&self) -> Option<aterm_types::Appearance> {
         let following = prefs::theme_mode(self.raw_value(prefs::EDIT_THEME).as_deref())
             == prefs::ThemeMode::FollowSystem;
@@ -479,9 +373,7 @@ impl SettingsViewState {
             .flatten()
     }
 
-    /// The side a theme `id` is made for (declared or measured), as the
-    /// catalog admitted it, else as the chooser's row for it says (a
-    /// community theme not yet added); `None` for one neither knows.
+    /// Appearance side that theme `id` targets according to the catalog or chooser card.
     fn theme_made_for(&self, id: &str) -> Option<aterm_types::Appearance> {
         self.assets
             .themes
@@ -490,9 +382,7 @@ impl SettingsViewState {
             .or_else(|| self.showcase.card(id.trim()).map(|card| card.appearance))
     }
 
-    /// What this view asks of the live theme: the theme it tries, or keeps
-    /// drawn while its Keep write is in flight. `None` off the page, except
-    /// a Keep in flight, which the host holds until its write lands.
+    /// Active theme preview or in-flight Keep intent for the host.
     pub(crate) fn theme_trial_intent(&self) -> Option<ThemeTrialIntent> {
         if self.route != SettingsRoute::Themes {
             return None;
@@ -508,8 +398,7 @@ impl SettingsViewState {
         }
     }
 
-    /// The host could not draw the tried theme `id`: the trial ends and the
-    /// status line says why (the strip is back to Idle).
+    /// End the trial of `id` and record `why` when the host cannot preview it.
     pub(crate) fn refuse_theme_trial(&mut self, id: &str, why: &str) {
         if self
             .showcase
@@ -523,9 +412,7 @@ impl SettingsViewState {
         }
     }
 
-    /// The page's rows follow a new catalog; a trial whose theme no longer
-    /// draws ends, and says why: its file is gone (and the community pack
-    /// has none by that name), or its file no longer loads.
+    /// Rebuild chooser cards from the catalog and end any trial whose theme is no longer valid.
     pub(super) fn refresh_showcase(&mut self) {
         let cards: Arc<[ShowcaseCard]> = showcase_cards(&self.assets.themes).into();
         self.showcase.attention =
@@ -548,13 +435,7 @@ impl SettingsViewState {
         }
     }
 
-    /// A ROW THAT LEAVES THE LIST TAKES NO KEYBOARD WITH IT: where the
-    /// keyboard is on a row (or its Open or Trash) that the new catalog no
-    /// longer lists — its file moved to the Trash here, or gone from the
-    /// folder — it goes to the row that followed it as the last render
-    /// listed them, else the one before it, else the highlighted row, and
-    /// that row is shown. Never on nothing: a key no tree holds makes the
-    /// next Tab start over at the window's first control.
+    /// Move focus to a neighboring or highlighted row when the focused row leaves the catalog.
     fn reseat_focus_off_a_gone_row(&mut self) {
         if self.route != SettingsRoute::Themes || self.showcase.sheet_open {
             return;
@@ -578,8 +459,6 @@ impl SettingsViewState {
                 .any(|&index| self.showcase.cards[index].slug == slug)
         };
         let still_there = match action.as_deref() {
-            // A row's file actions are a Yours row's (or a NEEDS ATTENTION
-            // row's Open).
             Some(_) => {
                 visible.iter().any(|&index| {
                     let card = &self.showcase.cards[index];
@@ -611,21 +490,14 @@ impl SettingsViewState {
         self.reveal_control(key);
     }
 
-    /// What [`Self::follow_showcase_change`] compares: the row highlighted
-    /// before the configuration or the catalog changes.
+    /// Currently highlighted slug before a config or catalog update.
     pub(super) fn showcase_highlight_before_change(&self) -> Option<String> {
         (self.route == SettingsRoute::Themes)
             .then(|| self.highlighted_slug())
             .flatten()
     }
 
-    /// The configuration or the catalog changed under the page without a
-    /// trial (an Undo or Redo, a save's select, the Follow switch, a hand
-    /// edit, a rescan): the strip's settled words go once they no longer name
-    /// the theme in use, and a keyboard that was on the highlighted row
-    /// (`highlighted_before`) goes with the highlight to the row of the theme
-    /// now in use, shown — the keyboard never stays on a row the highlight
-    /// has left.
+    /// Reconcile settled strip text and keyboard focus after a non-trial config or catalog change.
     pub(super) fn follow_showcase_change(&mut self, highlighted_before: Option<String>) {
         if self
             .showcase
@@ -648,9 +520,7 @@ impl SettingsViewState {
         }
     }
 
-    /// Leaving the page: the trial ends (the host reverts it) and the page's
-    /// transient state goes. The filter and the disclosure stay, so a return
-    /// finds the list as it was left; the demo starts its tape again.
+    /// End any active trial and clear transient page state when leaving the Themes page.
     pub(super) fn leave_showcase(&mut self) {
         self.showcase.trial = ShowcaseTrial::Idle;
         self.showcase.highlight_side = None;
@@ -667,15 +537,12 @@ impl SettingsViewState {
         self.showcase.note_input();
     }
 
-    /// End the trial: the highlight goes back to the theme in use, and the
-    /// live region says so once.
+    /// End the active trial and return the highlight to the configured theme.
     pub(super) fn revert_showcase(&mut self) {
         self.showcase.pending_keep = None;
         self.showcase.keep_more = false;
         if matches!(self.showcase.trial, ShowcaseTrial::Trying { .. }) {
             self.showcase.trial = ShowcaseTrial::Idle;
-            // Back to what the terminal draws: the side the OS picks, unless
-            // the person chose one.
             self.showcase.highlight_side = None;
             self.showcase.error = None;
             let id = self.configured_theme_id();
@@ -688,13 +555,8 @@ impl SettingsViewState {
         }
     }
 
-    /// Escape on the page, first applicable step: a Trash waiting for its
-    /// second press, the palette slot editor or the save name (its draft let
-    /// go), the Customize sheet, the filter's text (while the keyboard is in
-    /// it), a save or community add still waiting, the trial. Whether it took
-    /// the Escape; otherwise the page is left the normal way.
+    /// Handle Escape on the Themes page, dismissing the innermost active transient state.
     pub(super) fn cancel_showcase(&mut self) -> bool {
-        // Escape aimed at Search Results or the category list is theirs.
         if !self.showcase_on_glass() {
             return false;
         }
@@ -735,8 +597,6 @@ impl SettingsViewState {
             self.revert_showcase();
             return true;
         }
-        // A Keep on its way is taken back by a write, which the reducer
-        // that took the Escape sends.
         if matches!(self.showcase.trial, ShowcaseTrial::Keeping { .. }) {
             self.showcase.revert_asked = true;
             return true;
@@ -744,8 +604,7 @@ impl SettingsViewState {
         false
     }
 
-    /// Close the Customize sheet: the chooser comes back, the keyboard on
-    /// Customize, the list on the highlighted row ([`Self::showcase_landing`]).
+    /// Close the Customize sheet and return focus to the Customize button.
     pub(super) fn close_showcase_sheet(&mut self) {
         self.showcase.sheet_open = false;
         self.showcase.slot = None;
@@ -758,15 +617,7 @@ impl SettingsViewState {
         self.common.last_focus = Some(UiKey::new(CUSTOMIZE));
     }
 
-    /// THE CHOOSER COMES ON GLASS ON ITS HIGHLIGHTED ROW — Settings ▸ Themes
-    /// opening, a return to it from another page, Search Results or the
-    /// category list, the Customize sheet closing: the row of the theme in
-    /// use (or the one being tried) is where the list lands, whole, as Cursor
-    /// Styles lands on the saved style's row. The list's first screen used to
-    /// leave it wherever it fell: off the screen on a short window, or cut
-    /// by the chooser's bottom edge (GitHub Light at 220×60). `None` where
-    /// the list does not show that row (the filter hides it, or the closed
-    /// Community holds it), so no landing waits to pull the list later.
+    /// Scroll target key for the highlighted chooser row when the chooser appears.
     pub(super) fn showcase_landing(&self) -> Option<UiKey> {
         if !self.showcase_on_glass() || self.showcase.sheet_open {
             return None;
@@ -806,8 +657,7 @@ impl SettingsViewState {
         }
     }
 
-    /// The theme the page draws in place of the configured one: the trial.
-    /// Hover never previews (highlight equals trial).
+    /// Theme id currently previewed by a trial, if any.
     pub(super) fn showcase_preview_id(&self) -> Option<String> {
         if !self.showcase_on_glass() {
             return None;
@@ -815,8 +665,7 @@ impl SettingsViewState {
         self.showcase.trial_id().map(str::to_string)
     }
 
-    /// The theme the demo draws: the trial, else the configured theme on the
-    /// side the page shows (never the raw `dark:…,light:…` value).
+    /// Theme id rendered by the demo stage.
     pub(super) fn showcase_stage_theme_id(&self) -> Option<String> {
         if !self.showcase_on_glass() {
             return None;
@@ -835,21 +684,14 @@ impl SettingsViewState {
         card_slug_of(self.common.last_focus.as_ref()?).map(str::to_string)
     }
 
-    /// Whether Up, Down, Home, End and the page keys move the chooser's
-    /// highlight: the keyboard is on a row, or in the filter.
+    /// Whether navigation keys step the chooser highlight.
     pub(super) fn showcase_steps_highlight(&self) -> bool {
         self.showcase_focused_card().is_some()
             || self.showcase_pack_focused()
             || self.showcase_text_focus() == Some(ShowcaseText::Filter)
     }
 
-    /// Move the highlight to `id`: that theme is tried, or, when it is the
-    /// theme in use, the trial ends. Nothing is written, and a saved theme
-    /// waiting to be selected no longer is: the person chose another row.
-    /// The live region says it once, after the frame's install. Whether the
-    /// highlight moved. While a Keep is on its way the theme it keeps is the
-    /// one in use (its write shows at once), so another row is tried over it
-    /// and the kept row's own press changes nothing.
+    /// Move the chooser highlight to `id`, starting or ending a trial as appropriate.
     pub(super) fn highlight_card(&mut self, id: &str) -> bool {
         self.showcase.note_input();
         if matches!(&self.showcase.trial, ShowcaseTrial::Keeping { id: kept, .. }
@@ -861,10 +703,6 @@ impl SettingsViewState {
         self.showcase.keep_more = false;
         self.showcase.error = None;
         self.showcase.pending_keep = None;
-        // The page shows the side the highlighted theme is made for (where
-        // the person chose none), so the theme in use there is what it is
-        // compared with: the light side's own theme, highlighted on a dark
-        // OS, is in use, not a trial.
         self.showcase.highlight_side = self.theme_made_for(id);
         if id.eq_ignore_ascii_case(&self.configured_theme_id()) {
             if self.showcase.trial != ShowcaseTrial::Idle {
@@ -881,12 +719,7 @@ impl SettingsViewState {
         true
     }
 
-    /// Up and Down (`delta` ±1), Page Up and Page Down (± a screen), Home and
-    /// End (± everything) in the chooser: the highlight moves along the rows
-    /// the list shows, trying the one it lands on, and the keyboard goes with
-    /// it — unless it is in the filter, where it stays. From the Community
-    /// disclosure it moves as from between the rows over it and its own, so
-    /// the keyboard never lands on a row the highlight is not on.
+    /// Step the chooser highlight by `delta` visible rows and move focus with it.
     pub(super) fn step_highlight(&mut self, delta: isize) -> bool {
         let order = self.showcase.order.borrow().clone();
         if order.is_empty() {
@@ -903,13 +736,9 @@ impl SettingsViewState {
                 })
                 .unwrap_or(order.len());
             if delta > 0 && first == order.len() {
-                // Closed: no row is under it, so Down leaves it as it
-                // leaves any control in the list.
                 let _ = self.step_list_focus(1);
                 return true;
             }
-            // The disclosure sits at `first - ½`: Down lands on `first`, Up
-            // on the row over it.
             let from = first as isize - isize::from(delta > 0);
             usize::try_from(from.saturating_add(delta).max(0))
                 .unwrap_or(0)
@@ -934,7 +763,6 @@ impl SettingsViewState {
             return true;
         };
         if !self.highlight_card(&id) {
-            // The keyboard stays with the highlight on the row being kept.
             return true;
         }
         if from_pack || self.showcase_focused_card().is_some() {
@@ -948,16 +776,7 @@ impl SettingsViewState {
         true
     }
 
-    /// THE THEME LIST IS ONE TAB STOP (the list-box pattern its roles
-    /// claim): Tab (`forward`) or Shift-Tab from `current` toward `next`,
-    /// where `next` is a theme row or a Yours row's file action, enters the
-    /// run of rows it belongs to at the highlighted row, and from inside
-    /// the run leaves it in one step for the control past its far end; the
-    /// highlighted row's own Open and Trash stay on the way. A run that does
-    /// not hold the highlighted row, while another does, is passed over;
-    /// where none does (the filter hides it), a run is entered at its first
-    /// row. `order` is the window's Tab order, for leaving a run the list
-    /// ends with. The arrows move between rows. `None` keeps `next`.
+    /// Route Tab / Shift-Tab across a theme row run as a single list-box tab stop.
     pub(crate) fn tab_past_options(
         &self,
         current: Option<&UiKey>,
@@ -968,7 +787,6 @@ impl SettingsViewState {
         if self.route != SettingsRoute::Themes || self.showcase.sheet_open {
             return None;
         }
-        // The card a row or a Yours row's file action belongs to.
         let owner = |key: &UiKey| {
             let rest = key.as_str().strip_prefix(CARD_PREFIX)?;
             let slug = rest.split('/').next().unwrap_or(rest);
@@ -1004,7 +822,6 @@ impl SettingsViewState {
                 start.checked_sub(1).and_then(|index| controls.get(index))
             };
             past.cloned().or_else(|| {
-                // The list ends with this run: the window's next stop.
                 let inside = |key: &UiKey| run.contains(key);
                 let target = if forward {
                     let last = order.iter().rposition(inside)?;
@@ -1020,7 +837,6 @@ impl SettingsViewState {
             })
         };
         if let Some(current) = current.filter(|current| run.contains(current)) {
-            // The highlighted row's own file actions are on the way out.
             if owner(current) == owner(next) {
                 return None;
             }
@@ -1059,19 +875,7 @@ impl SettingsViewState {
         self.showcase.page_rows.get().max(1)
     }
 
-    /// PAGE UP AND PAGE DOWN TURN THE CHOOSER BY THE SCREEN IT DRAWS: how
-    /// far along the list's rows (`direction` +1, Page Down, or -1) the
-    /// highlight moves ([`Self::step_highlight`]), measured on the screens of
-    /// the list the last render seated. Page Down lands on the last row whole
-    /// on the screen whose first stop is the one after the keyboard's, so
-    /// every row between is whole on the screen it lands on; Page Up on the
-    /// first row of the screen that ends at the stop before it; where that
-    /// screen holds no row, the next row. `0` where no row lies that way:
-    /// the page keys then turn the list's page past its rows, as every
-    /// list's do. (A step of the list's room in row heights skipped a row
-    /// wherever a screen repeated a section's caption over its first row: at
-    /// 102×29 One Dark was only ever a 1pt peek.) Where no screen was
-    /// measured, the rows a screen holds.
+    /// Row count to step for Page Up (`-1`) or Page Down (`+1`) based on measured scroll stops.
     pub(super) fn showcase_page_step(&self, direction: isize) -> isize {
         let direction = direction.signum();
         let fallback = direction * self.showcase_page_rows() as isize;
@@ -1081,10 +885,6 @@ impl SettingsViewState {
         let order = self.showcase.order.borrow();
         let row_stop =
             |index: usize| plan.stop_of(&UiKey::new(format!("{CARD_PREFIX}{}", order[index])));
-        // Where the step counts from: the keyboard's stop, and the place
-        // among the rows the highlight moves from — the keyboard's row, or,
-        // from the Community disclosure, between the rows over it and its
-        // own, as [`Self::step_highlight`] reads it.
         let (here, from) = if self.showcase_pack_focused() {
             let first = order
                 .iter()
@@ -1147,8 +947,7 @@ impl SettingsViewState {
             .map(|slug| UiKey::new(format!("{CARD_PREFIX}{slug}")))
     }
 
-    /// Open the Community disclosure when `key` is the row of a community
-    /// theme it holds closed: `true` when it did.
+    /// Expand the Community disclosure if `key` names a row inside it.
     pub(crate) fn open_disclosure_holding(&mut self, key: &UiKey) -> bool {
         let Some(slug) = card_slug_of(key) else {
             return false;
@@ -1165,16 +964,12 @@ impl SettingsViewState {
         closed
     }
 
-    /// The theme the configuration draws on the side the page shows (what
-    /// Keep replaces, and what a card marked Current names).
+    /// Configured theme id for the currently displayed appearance side.
     pub(super) fn configured_theme_id(&self) -> String {
         self.theme_id_drawn_by(self.raw_value(prefs::EDIT_THEME))
     }
 
-    /// The theme a trial replaces: [`Self::configured_theme_id`], save
-    /// that a Keep on its way is weighed against what aterm.toml holds under
-    /// it ([`Self::theme_under_trial`]), so its strip still says what was in
-    /// use before it.
+    /// Theme id that an active trial replaces on the displayed appearance side.
     pub(super) fn theme_id_under_trial(&self) -> String {
         self.theme_id_drawn_by(self.theme_under_trial())
     }
@@ -1192,15 +987,7 @@ impl SettingsViewState {
         config.resolved_colors(side, &self.assets.themes, None).id
     }
 
-    /// The value Keep writes for `id`, by the rule for a choice whose side is
-    /// named ([`prefs::theme_choice_value`]): over one theme, the name; over a
-    /// Follow-system split, the split with only one side replaced — the side
-    /// the person chose in the page's Dark | Light segment (as a slot
-    /// picker's side is theirs), else the side `id` is made for (a theme is
-    /// filed by the side it is made for: a light theme kept while the OS is
-    /// dark goes to Light), else, for a theme the catalog does not know, the
-    /// side the OS picks. The segment shows that same side while the
-    /// highlight is on `id` ([`Self::showcase_highlight_side`]).
+    /// Config `theme` value and appearance side written when keeping `id`.
     fn keep_value(&self, id: &str) -> (Option<String>, Option<aterm_types::Appearance>) {
         let raw = self.raw_value(prefs::EDIT_THEME);
         let side = chosen_theme_side(self)
@@ -1211,16 +998,13 @@ impl SettingsViewState {
         (Some(value), side)
     }
 
-    /// The colours the page's demo draws: the trial
-    /// (else the configured theme) under every override and draft.
+    /// Resolved colors for the demo stage, including active trial and drafts.
     pub(super) fn showcase_colors(&self) -> crate::resolved_colors::ResolvedColors {
         let system_dark = self.presented_motion.get().system_dark;
         preview_resolved_colors_with(self, system_dark, self.showcase.trial_id())
     }
 
-    /// The type settings the saved `theme` names for the side the page shows
-    /// (never a trial: Try is colour-only). Resolved over the theme alone, so
-    /// `declared` and `applied` agree; a row the config sets beats it there.
+    /// Typography declared by the saved `theme` for the displayed appearance side.
     pub(crate) fn theme_typography(&self) -> crate::resolved_typography::ResolvedTypography {
         let side = theme_visible_side(self, self.presented_motion.get().system_dark);
         let config = Config {
@@ -1230,8 +1014,7 @@ impl SettingsViewState {
         config.resolved_typography_with_flag(side, &self.assets.themes, None)
     }
 
-    /// The text size scale the saved theme applies where the config sets none
-    /// (`1.0` when it applies none).
+    /// Font size scale from the saved theme when unset in config (`1.0` by default).
     pub(crate) fn theme_typography_scale(&self) -> f32 {
         self.theme_typography()
             .applied
@@ -1239,8 +1022,7 @@ impl SettingsViewState {
             .map_or(1.0, |milli| f32::from(milli) / 1000.0)
     }
 
-    /// The theme's own sixteen colours under the stage, without any palette
-    /// override: what a palette slot resets to.
+    /// Base 16-color ANSI palette of the stage theme without overrides.
     fn theme_palette(&self) -> [aterm_types::Rgb; 16] {
         let system_dark = self.presented_motion.get().system_dark;
         let side = theme_visible_side(self, system_dark);
@@ -1254,8 +1036,7 @@ impl SettingsViewState {
             .ansi
     }
 
-    /// The palette entries as authored or drafted (`#rrggbb`, in slot
-    /// order; may be shorter or longer than sixteen).
+    /// Authored or drafted positional `palette` entries.
     fn palette_entries(&self) -> Vec<String> {
         let text = self.field_inputs.get(prefs::EDIT_PALETTE).map_or_else(
             || {
@@ -1272,8 +1053,7 @@ impl SettingsViewState {
             .collect()
     }
 
-    /// Record `entries` as the palette draft (the comma form the save path
-    /// writes), and make it the edited field so close and carry see it.
+    /// Record `entries` as the `palette` field draft.
     fn set_palette_draft(&mut self, entries: &[String]) {
         let text = entries.join(", ");
         self.field_inputs.insert(
@@ -1283,14 +1063,12 @@ impl SettingsViewState {
         self.invalidate_result_page_limit();
     }
 
-    /// Whether slot `index` is written in the person's positional `palette`
-    /// list (else it is a `palette_overrides` slot).
+    /// Whether slot `index` is covered by the positional `palette` list.
     fn slot_on_list(&self, index: usize) -> bool {
         self.palette_entries().len() > index
     }
 
-    /// The slot editor's draft for a `palette_overrides` slot: the colour
-    /// typed, while it parses and differs from what the slot shows without it.
+    /// Parsed `(slot, color)` draft from the open `palette_overrides` editor, if changed.
     fn slot_override_draft(&self) -> Option<(usize, aterm_types::Rgb)> {
         let slot = self.showcase.slot.as_ref()?;
         if self.slot_on_list(slot.index) {
@@ -1301,9 +1079,7 @@ impl SettingsViewState {
             .map(|color| (slot.index, color))
     }
 
-    /// The `palette_overrides` table the stage resolves with: the slots
-    /// `aterm.toml` sets, and the open slot's draft over them. `None` when
-    /// there are none.
+    /// Effective `palette_overrides` map including any open slot draft.
     pub(super) fn showcase_palette_overrides(&self) -> Option<BTreeMap<String, String>> {
         let prefix = format!("{}.", prefs::EDIT_PALETTE_OVERRIDES);
         let mut table: BTreeMap<String, String> = self
@@ -1320,8 +1096,7 @@ impl SettingsViewState {
         (!table.is_empty()).then_some(table)
     }
 
-    /// The theme the configuration draws on each side: a theme either side
-    /// uses is in use.
+    /// Configured `[dark, light]` theme ids.
     fn configured_theme_ids(&self) -> [String; 2] {
         let config = Config {
             theme: self.raw_value(prefs::EDIT_THEME).or_else(|| {
@@ -1338,28 +1113,21 @@ impl SettingsViewState {
     }
 }
 
-/// The slug a card key names (`settings/showcase/card/<slug>`), not one of
-/// its file actions' keys.
+/// Extract the theme slug from a card key (`settings/showcase/card/<slug>`).
 fn card_slug_of(key: &UiKey) -> Option<&str> {
     key.as_str()
         .strip_prefix(CARD_PREFIX)
         .filter(|slug| !slug.contains('/'))
 }
 
-/// `entries` with slot `index` set to `value`, when the list reaches that
-/// slot. A slot past the list's end is not written here: it is a
-/// `palette_overrides` slot, so the list never grows to reach it (growing it
-/// would copy today's theme into every slot before it).
+/// Return `entries` with slot `index` set to `value` if `index < entries.len()`.
 pub(super) fn palette_with(entries: &[String], index: usize, value: &str) -> Option<Vec<String>> {
     let mut out = entries.to_vec();
     *out.get_mut(index)? = value.to_string();
     Some(out)
 }
 
-/// `entries` with slot `index` back on the theme's colour, and every
-/// trailing entry that equals the theme's dropped (an empty list removes the
-/// key). A slot before others the person set stays written, as the theme's
-/// colour: positions in the list cannot have holes.
+/// Reset slot `index` in `entries` to `theme`'s color and trim trailing entries matching `theme`.
 pub(super) fn palette_reset(
     entries: &[String],
     index: usize,
@@ -1382,9 +1150,7 @@ pub(super) fn palette_reset(
     out
 }
 
-/// The palette slot a `palette_overrides.<index>` key tunes, by its index
-/// and ANSI name ("Palette colour 4, blue"), as its chip is spoken; `None`
-/// for any other key.
+/// Spoken label for a `palette_overrides.<index>` key (`"Palette colour 4, blue"`).
 pub(super) fn palette_slot_name(key: &str) -> Option<String> {
     let index = key
         .strip_prefix(prefs::EDIT_PALETTE_OVERRIDES)?
@@ -1449,10 +1215,7 @@ pub(super) fn save_name_problem(
     None
 }
 
-/// The first `<label> Custom`, `<label> Custom 2`, … no theme answers to.
-/// A label that is itself such a name (a theme saved here, customized
-/// again) counts from its own base: `Dracula Custom` suggests
-/// `Dracula Custom 2`, never `Dracula Custom Custom`.
+/// First unused `<label> Custom`, `<label> Custom 2`, … theme name.
 pub(super) fn suggested_save_name(label: &str, themes: &crate::app_config::ThemeCatalog) -> String {
     let label = label.trim();
     let stem = label
@@ -1477,10 +1240,7 @@ pub(super) fn suggested_save_name(label: &str, themes: &crate::app_config::Theme
     name
 }
 
-/// The native theme file Save as theme writes for `resolved` under `name`,
-/// and the overrides it carries (to clear once it is selected). The text is
-/// read back before it is returned: what the page offers to write parses to
-/// exactly the colours it shows.
+/// Serialize `resolved` as a native theme file named `name` along with its carried override keys.
 pub(super) fn save_as_text(
     resolved: &crate::resolved_colors::ResolvedColors,
     name: &str,
@@ -1488,10 +1248,6 @@ pub(super) fn save_as_text(
     typography: &aterm_types::scheme::ThemeTypography,
 ) -> Result<String, String> {
     let mut scheme = resolved.scheme.clone();
-    // The name as the file spells it (`aterm theme new` and import do the
-    // same): the writer drops a space before `#` or `;` and caps the length,
-    // and the read-back below compares the scheme whole. The file itself is
-    // still named by the id the person typed.
     scheme.name = aterm_types::scheme_import::sanitize_text(name).unwrap_or_default();
     scheme.appearance = resolved.reported;
     let description = if typography.is_empty() {
@@ -1518,10 +1274,7 @@ pub(super) fn save_as_text(
 }
 
 impl SettingsViewState {
-    /// The type settings "Include type settings" writes: each of
-    /// [`SAVE_TYPE_KEYS`] as the page shows it in force (a draft, the saved
-    /// value, else the current theme's), when a theme file can carry it
-    /// (a font named by family, not a path; a number in the theme's range).
+    /// Typography settings to serialize when "Include type settings" is enabled.
     pub(super) fn save_typography(&self) -> aterm_types::scheme::ThemeTypography {
         let mut typography = aterm_types::scheme::ThemeTypography::NONE;
         for key in SAVE_TYPE_KEYS {
@@ -1530,8 +1283,6 @@ impl SettingsViewState {
                 .filter(|value| !value.is_empty())
                 .or_else(|| self.theme_fallback_for(key).map(|(value, _)| value));
             let Some(value) = value else { continue };
-            // One key at a time through the theme reader, so a value a theme
-            // cannot carry drops alone.
             let probe = format!("fg = #ffffff\nbg = #000000\n{key} = {value}\n");
             if let Ok(parsed) = aterm_types::scheme::parse_theme_str(&probe) {
                 typography.fill_from(&parsed.typography);
@@ -1540,9 +1291,7 @@ impl SettingsViewState {
         typography
     }
 
-    /// Whether any type setting is in force beyond aterm's defaults: set in
-    /// aterm.toml, drafted, or carried by the current theme. Only then does
-    /// Save as theme offer "Include type settings".
+    /// Whether any non-default typography setting is active or drafted.
     pub(super) fn save_type_in_force(&self) -> bool {
         SAVE_TYPE_KEYS.iter().any(|key| {
             self.raw_value(key).is_some()
@@ -1552,20 +1301,13 @@ impl SettingsViewState {
     }
 }
 
-/// The config keys a theme saved from `resolved` now carries: every colour
-/// override in force, the `palette` list and the `palette_overrides` table
-/// once each for all their slots.
+/// Config keys carried by a theme saved from `resolved` so they can be cleared on select.
 pub(super) fn carried_override_keys(
     resolved: &crate::resolved_colors::ResolvedColors,
     typography: &aterm_types::scheme::ThemeTypography,
 ) -> Vec<String> {
     let overrides = format!("{}.", prefs::EDIT_PALETTE_OVERRIDES);
     let source_keys = resolved.config_keys();
-    // A native theme carries sixteen ANSI slots, while either config source
-    // can name extended colours (or contain text that did not parse). Keep
-    // such a container whole: selecting this file cannot authorize deleting
-    // values the file never serialized. The ordinary override notice keeps
-    // reporting those retained settings.
     let fully_carried = |prefix: &str| {
         !resolved
             .issues
@@ -1605,7 +1347,6 @@ pub(super) fn carried_override_keys(
             keys.push(key);
         }
     }
-    // The type settings the file carries too, so selecting it lets them go.
     keys.extend(
         typography
             .keys()
@@ -1616,9 +1357,7 @@ pub(super) fn carried_override_keys(
     keys
 }
 
-/// How many of the person's colour settings draw on top of every theme: each
-/// of the five colour overrides in force, and each palette slot the `palette`
-/// list or the `palette_overrides` table sets.
+/// Number of active color and palette overrides on top of the theme.
 pub(super) fn override_count(resolved: &crate::resolved_colors::ResolvedColors) -> usize {
     let mut named = 0;
     let mut slots = BTreeSet::new();
@@ -1645,16 +1384,12 @@ pub(super) fn count_noun(count: usize, one: &str, many: &str) -> String {
     format!("{count} {}", if count == 1 { one } else { many })
 }
 
-/// The one noun for the person's color settings ([`override_count`]): the
-/// Customize button, the strip, the sheet and what a reader hears all count
-/// them in it.
+/// Format `count` as `"1 custom color"` / `"N custom colors"`.
 pub(super) fn custom_colors(count: usize) -> String {
     count_noun(count, "custom color", "custom colors")
 }
 
-/// The strip's note while the person's color settings draw on top of every
-/// theme (`2 custom colors on every theme`), whether a theme is tried or
-/// not — a tried theme is drawn under them too — or `None` when none does.
+/// Strip note summarizing active custom color overrides, if any.
 pub(super) fn override_note(resolved: &crate::resolved_colors::ResolvedColors) -> Option<String> {
     let count = override_count(resolved);
     (count > 0).then(|| format!("{} on every theme", custom_colors(count)))
@@ -1662,8 +1397,6 @@ pub(super) fn override_note(resolved: &crate::resolved_colors::ResolvedColors) -
 
 /// The page's palette commands while it is the route.
 pub(super) fn showcase_commands(view: &SettingsViewState) -> Vec<Command> {
-    // A Keep on its way is still the trial: Revert takes it back and Keep
-    // colours only follows it.
     let trying = view.showcase.trial_id().is_some();
     vec![
         Command {
@@ -1682,8 +1415,6 @@ pub(super) fn showcase_commands(view: &SettingsViewState) -> Vec<Command> {
             id: ActionId::new(SHOWCASE_KEEP_COLOURS),
             title: "Themes: Keep Colors Only".to_string(),
             shortcut: None,
-            // Only while the tried theme would change the face, and every
-            // change can be kept apart.
             enabled: view
                 .showcase
                 .trial_id()
@@ -1712,7 +1443,6 @@ impl SettingsApp {
             _ => None,
         };
         view.showcase.note_input();
-        // A Trash press arms only the next press of that same Trash.
         let armed = view.showcase.trash_armed.take();
         if let Some(rest) = action.strip_prefix(CARD_PREFIX) {
             match rest.split_once('/') {
@@ -1742,7 +1472,6 @@ impl SettingsApp {
             view.reduce_page_scroll(0, SettingsPageScrollCommand::Absolute(0));
             view.common.last_focus = Some(UiKey::new(CUSTOMIZE_DONE));
         } else if action == CUSTOMIZE_DONE {
-            // The open slot's draft is saved first, as its own Done saves it.
             self.close_palette_slot(view, cx);
             view.close_showcase_sheet();
         } else if action == PACK {
@@ -1753,8 +1482,6 @@ impl SettingsApp {
             view.invalidate_result_page_limit();
             view.common.last_focus = Some(UiKey::new(PACK));
         } else if action == FOLLOW_SYSTEM {
-            // The switch is Appearance's Follow system, written at once:
-            // a setting, not a trial.
             let _ = self.reduce_action(
                 view,
                 ActionInvocation {
@@ -1768,9 +1495,6 @@ impl SettingsApp {
             .strip_prefix(SIDE_PREFIX)
             .and_then(parse_appearance_word)
         {
-            // The segment picks the side Keep writes; the highlight goes to
-            // that side's theme, and the list lands on its row (✓ and all)
-            // while the keyboard stays on the segment.
             view.theme_preview_side = Some(side);
             if matches!(view.showcase.trial, ShowcaseTrial::Trying { .. }) {
                 view.showcase.trial = ShowcaseTrial::Idle;
@@ -1784,7 +1508,6 @@ impl SettingsApp {
             view.showcase.filter = crate::native_text_input::TextInputState::new(String::new());
             view.invalidate_result_page_limit();
             view.reduce_page_scroll(0, SettingsPageScrollCommand::Absolute(0));
-            // The field takes the keyboard: Clear is gone with the query.
             view.common.last_focus = Some(UiKey::new(SHOWCASE_FILTER));
         } else if action == SHOWCASE_FILTER {
             if let Some(text) = text {
@@ -1855,8 +1578,6 @@ impl SettingsApp {
             .and_then(|index| index.parse::<usize>().ok())
             .filter(|index| *index < 16)
         {
-            // Another slot: the open one's draft is saved first, as Done
-            // saves it.
             self.close_palette_slot(view, cx);
             let shown = view.showcase_colors().scheme.ansi[index];
             let mut input = crate::native_text_input::TextInputState::new(hex_of(shown));
@@ -1891,10 +1612,7 @@ impl SettingsApp {
         EventResult::Handled
     }
 
-    /// A row was pressed (a click, Return or Space on it, or `act`): the
-    /// highlight moves to it, which tries it. The theme in use is no trial,
-    /// so pressing its row reverts. The row already tried is pressed by Return
-    /// (the keyboard is on it), so that press keeps it.
+    /// Activate chooser row `slug`: preview it, revert if current, or keep if already previewed.
     fn activate_card(&mut self, view: &mut SettingsViewState, slug: &str, cx: &mut UpdateCx<'_>) {
         let Some(card) = view.showcase.card_by_slug(slug).cloned() else {
             view.feedback = Some("That theme is no longer listed".to_string());
@@ -1906,8 +1624,6 @@ impl SettingsApp {
             self.keep_trial(view, cx);
             return;
         }
-        // A community row pressed while its section is closed (a filter or
-        // `act` reached it) opens the section, so the row it tries is shown.
         if card.section == Section::Community {
             view.showcase.pack_open = true;
             view.invalidate_result_page_limit();
@@ -1939,9 +1655,7 @@ impl SettingsApp {
         view.feedback = Some(format!("Opening {label}\u{2026}"));
     }
 
-    /// A Yours card's Trash: the first press asks, the second moves the file
-    /// to the Trash. A theme in use (either side of a split), or the one
-    /// being tried, stays.
+    /// Arm or confirm moving user theme `slug` to the Trash.
     fn trash_card(
         view: &mut SettingsViewState,
         slug: &str,
@@ -1990,20 +1704,11 @@ impl SettingsApp {
         view.feedback = Some(format!("Moving {} to the Trash\u{2026}", card.label));
     }
 
-    /// Revert (its button, the palette, or Escape over a Keep on its way):
-    /// the trial ends and the theme in use before it shows again. A Keep
-    /// still on its way is taken back by a write that puts each key it
-    /// writes back to what it held, following it in the config lane, so
-    /// the press shows at once and the file ends as it began; a Keep's
-    /// Revert is never refused for waiting on the Keep.
+    /// Revert the active trial, or write back prior values if a Keep is already in flight.
     pub(super) fn revert_trial(&mut self, view: &mut SettingsViewState, cx: &mut UpdateCx<'_>) {
         view.showcase.pending_select = None;
         view.showcase.revert_asked = false;
         if let ShowcaseTrial::Keeping { id, under, .. } = view.showcase.trial.clone() {
-            // Every key the trial's Keeps write goes back to what it held
-            // before the first of them (a Keep and the Keep colours only
-            // over it are taken back together), composed over what the keys
-            // show now, which is what the lane holds once those Keeps land.
             let back: Vec<ConfigEdit> = under
                 .into_iter()
                 .filter_map(|(key, before)| {
@@ -2025,19 +1730,14 @@ impl SettingsApp {
                     },
                 )
             });
-            // Ended as a trial is: the highlight and the live region go back
-            // to the theme the take-back shows.
             view.showcase.trial = ShowcaseTrial::Trying { id };
             view.revert_showcase();
             let to = view.showcase.label_of(&view.configured_theme_id());
             view.feedback = Some(match operation {
-                // Its landing says it reverted, named by the page's own
-                // operation, not by the keys it wrote back.
                 Some(operation) => {
                     view.name_write(operation, WriteKind::Revert { to: to.clone() });
                     format!("Reverting to {to}\u{2026}")
                 }
-                // Every key already shows what it held: nothing to write.
                 None => format!("Reverted to {to}"),
             });
             return;
@@ -2045,8 +1745,7 @@ impl SettingsApp {
         view.revert_showcase();
     }
 
-    /// Keep the tried theme: one `theme` write through the patch lane (one
-    /// side of a Follow-system pair), the trial standing until it lands.
+    /// Keep the tried theme by writing `theme` through the config patch lane.
     fn keep_trial(&mut self, view: &mut SettingsViewState, cx: &mut UpdateCx<'_>) {
         let id = match view.showcase.trial.clone() {
             ShowcaseTrial::Trying { id } => id,
@@ -2060,9 +1759,6 @@ impl SettingsApp {
             ShowcaseTrial::Idle => return,
         };
         view.showcase.keep_more = false;
-        // A community theme is drawn from the embedded pack: Keep adds its
-        // file first, and writes `theme` once the catalog lists it
-        // ([`Self::showcase_after_snapshot`]).
         if view.assets.themes.resolve(&id).is_err()
             && view.assets.themes.pack_fallback(&id).is_some()
         {
@@ -2102,11 +1798,7 @@ impl SettingsApp {
         };
     }
 
-    /// Keep pressed while the trial's Keep is on its way: the trial is kept
-    /// as tried, its theme with its own type settings. After a Keep that
-    /// asks nothing more (its write already holds it); after Keep colours
-    /// only, the type settings that pinned go back to what they held before
-    /// the trial, in a write that follows it.
+    /// Handle Keep while a Keep is already in flight, unpinning any "Keep colours only" overrides.
     fn keep_over_keeping(
         &mut self,
         view: &mut SettingsViewState,
@@ -2153,16 +1845,8 @@ impl SettingsApp {
         };
     }
 
-    /// Keep the tried theme's colours and the type settings in force now:
-    /// ONE patch writes `theme` (as Keep does) and pins each type setting the
-    /// theme would change at its current value, so the face stays. Where a
-    /// change has no aterm.toml value that keeps the current face (aterm's own
-    /// `font_weight`, the font's own weight), nothing is written and the
-    /// feedback says why: the button is drawn disabled then, so this is the
-    /// palette or a stale press.
+    /// Keep the tried theme's colors while pinning current typography settings in a single patch.
     fn keep_colours_only(&mut self, view: &mut SettingsViewState, cx: &mut UpdateCx<'_>) {
-        // Over a Keep on its way too: this write follows it. A save's
-        // select on its way keeps the saved theme, not the trial.
         let id = match view.showcase.trial.clone() {
             ShowcaseTrial::Trying { id } => id,
             ShowcaseTrial::Keeping { id, operation, .. } if !view.showcase_select_is(operation) => {
@@ -2192,8 +1876,6 @@ impl SettingsApp {
                 });
             }
         }
-        // A second press of it while its first saves asks for what that
-        // write already holds: nothing more to write.
         if edits
             .iter()
             .all(|edit| edit.expected == ExpectedConfigValue::Exact(edit.value.clone()))
@@ -2210,8 +1892,6 @@ impl SettingsApp {
             .showcase
             .card(&id)
             .map_or_else(|| id.clone(), |card| card.label.clone());
-        // Its landing and its refusal say what it kept, named by the page's
-        // own operation, not by the keys it wrote ("Changed 3 settings").
         view.name_write(
             operation,
             WriteKind::KeepColours {
@@ -2228,17 +1908,12 @@ impl SettingsApp {
         };
     }
 
-    /// A config patch finished. A Keep (or a save's select) that landed
-    /// ends the trial (the reload draws the kept theme); one that did not
-    /// goes back to trying, and this says so (`true`). A save's select that
-    /// landed also lets go of the drafts the saved theme now carries.
+    /// Settle an in-flight Keep or save-select operation once its config patch finishes.
     pub(super) fn finish_showcase_keep(
         view: &mut SettingsViewState,
         operation: OperationId,
         applied: bool,
     ) -> bool {
-        // The theme the patch wrote: a save's select writes the saved one,
-        // whatever trial it ended.
         let mut written = None;
         if view
             .showcase
@@ -2271,9 +1946,6 @@ impl SettingsApp {
             });
             view.showcase.error = None;
             view.showcase.trial = ShowcaseTrial::Idle;
-            // The strip's Keep, Keep colours only and Revert go with the
-            // trial: a keyboard on one of them lands on the kept row (else
-            // on Customize, which takes their place), never on nothing.
             if view.common.last_focus.as_ref().is_some_and(|key| {
                 [
                     SHOWCASE_KEEP,
@@ -2289,15 +1961,12 @@ impl SettingsApp {
                 )));
             }
         } else {
-            // The trial stands; the strip says why the write did not land.
             view.showcase.trial = ShowcaseTrial::Trying { id: id.clone() };
         }
         !applied
     }
 
-    /// Save as theme: write the colours the stage shows as a new theme file.
-    /// Nothing the person typed is let go here: the drafts stay drafts (the
-    /// stage keeps drawing them) until the saved theme is selected.
+    /// Write the current stage colors (and optional typography) as a new user theme file.
     fn save_as_theme(&mut self, view: &mut SettingsViewState, cx: &mut UpdateCx<'_>) {
         let Some(name) = view
             .showcase
@@ -2343,8 +2012,6 @@ impl SettingsApp {
         let fields = carried
             .iter()
             .filter(|key| view.field_has_unsaved_draft(key))
-            // A partially invalid palette may contribute some stage colours,
-            // but the file does not carry its invalid text. Keep that draft.
             .filter(|key| {
                 key.as_str() != prefs::EDIT_PALETTE
                     || view.field_inputs.get(key.as_str()).is_some_and(|input| {
@@ -2363,8 +2030,6 @@ impl SettingsApp {
             .collect();
         let drafts = CarriedDrafts {
             fields,
-            // A retained table may still shadow the saved slot. Its editor
-            // remains a draft until the person applies it.
             slot: view
                 .slot_override_draft()
                 .filter(|_| {
@@ -2409,25 +2074,17 @@ impl SettingsApp {
             drafts,
         });
         view.showcase.save = None;
-        // The name row closes and Save as theme takes its place again: the
-        // keyboard goes back to it, as Cancel and Escape send it, never on
-        // nothing.
         view.common.last_focus = Some(UiKey::new(SHOWCASE_SAVE_AS));
         view.feedback = Some(format!("Saving {name}\u{2026}"));
         view.invalidate_result_page_limit();
     }
 
-    /// After a snapshot: a saved theme the catalog now lists is selected,
-    /// and the overrides it carries are cleared, in one patch. A trial that
-    /// stands keeps drawing until that patch lands, as Keep's does, so the
-    /// screen goes from the tried theme straight to the saved one.
+    /// Complete pending pack keeps or saved-theme selections once the catalog lists the new file.
     pub(super) fn showcase_after_snapshot(
         &mut self,
         view: &mut SettingsViewState,
         cx: &mut UpdateCx<'_>,
     ) {
-        // A community theme's Keep whose file is written and now listed:
-        // the `theme` write follows, as any Keep's.
         if let Some(PendingKeep {
             id, written: true, ..
         }) = &view.showcase.pending_keep
@@ -2444,7 +2101,6 @@ impl SettingsApp {
         let Some(select) = view.showcase.pending_select.as_ref() else {
             return;
         };
-        // Still waiting for the write to report, or for the catalog to see it.
         if !select.saved || view.assets.themes.resolve(&select.id).is_err() {
             return;
         }
@@ -2461,12 +2117,6 @@ impl SettingsApp {
             ));
             return;
         }
-        // The value is chosen now, by the rule Keep uses, against the raw
-        // value the Save click saw (checked unchanged above) and the catalog
-        // that now knows the saved theme's appearance: a light theme saved
-        // on a dark OS is then made for the other side, as a catalog theme
-        // would be, instead of a name nobody knew yet. The page then shows
-        // the side it went to, so the saved theme is the one highlighted.
         let mut select = select;
         let (value, side) = view.keep_value(&select.id);
         select.theme.value = value;
@@ -2502,10 +2152,7 @@ impl SettingsApp {
         });
     }
 
-    /// The Save as theme write finished. Its own success lets the catalog's
-    /// listing select it; a write that failed reopens the name row with the
-    /// name typed and the reason, and the drafts were never let go. Whether
-    /// the save is now waiting to be selected.
+    /// Handle completion of a "Save as theme" file write.
     pub(super) fn finish_showcase_save(
         view: &mut SettingsViewState,
         operation: OperationId,
@@ -2547,10 +2194,7 @@ impl SettingsApp {
         false
     }
 
-    /// The palette slot field's text changed: on a slot the person's
-    /// `palette` list reaches, a valid colour becomes that entry in the list's
-    /// draft; on any other slot the field itself is the draft (the stage and
-    /// chips follow both).
+    /// Update the open palette slot draft and sync positional `palette` drafts when applicable.
     pub(super) fn edit_palette_slot(&mut self, view: &mut SettingsViewState, text: &str) {
         let Some(slot) = view.showcase.slot.as_mut() else {
             return;
@@ -2578,8 +2222,7 @@ impl SettingsApp {
         view.invalidate_result_page_limit();
     }
 
-    /// Save the palette drafts in one patch: the `palette` list's draft, and
-    /// the open slot's `palette_overrides` draft.
+    /// Commit `palette` and open `palette_overrides` drafts in a single patch.
     fn commit_palette(&mut self, view: &mut SettingsViewState, cx: &mut UpdateCx<'_>) {
         let list = view.field_has_unsaved_draft(prefs::EDIT_PALETTE);
         let slot = view.slot_override_draft();
@@ -2602,7 +2245,6 @@ impl SettingsApp {
                 key,
                 value: Some(hex_of(color)),
             });
-            // Committed: the slot now shows this colour without a draft.
             if let Some(editor) = view.showcase.slot.as_mut() {
                 editor.opened = color;
             }
@@ -2615,8 +2257,7 @@ impl SettingsApp {
         view.feedback = Some("Applying\u{2026}".to_string());
     }
 
-    /// Close the palette slot editor, saving its `palette_overrides` draft
-    /// (a list draft stays a draft, as any other field's does).
+    /// Close the palette slot editor, committing any `palette_overrides` draft.
     fn close_palette_slot(&mut self, view: &mut SettingsViewState, cx: &mut UpdateCx<'_>) {
         if let Some((index, color)) = view.slot_override_draft() {
             let key = crate::resolved_colors::palette_override_key(index);
@@ -2634,10 +2275,7 @@ impl SettingsApp {
         view.showcase.slot = None;
     }
 
-    /// The edited slot goes back to the theme's colour: its
-    /// `palette_overrides` key is removed, and on a slot the `palette` list
-    /// reaches the list's entry goes back too (in the draft when one is
-    /// held, else saved at once).
+    /// Reset the open palette slot to the theme's base color.
     fn reset_palette_slot(&mut self, view: &mut SettingsViewState, cx: &mut UpdateCx<'_>) {
         let Some(index) = view.showcase.slot.as_ref().map(|slot| slot.index) else {
             return;
@@ -2665,8 +2303,6 @@ impl SettingsApp {
                 });
             }
         }
-        // The slot without any override is the theme's colour (a slot the
-        // list reaches is back on it above).
         if let Some(editor) = view.showcase.slot.as_mut() {
             editor.input = crate::native_text_input::TextInputState::new(hex_of(theme[index]));
             editor.opened = theme[index];
@@ -2682,9 +2318,7 @@ impl SettingsApp {
         view.invalidate_result_page_limit();
     }
 
-    /// Reset Palette: every slot back on the theme's colours — the `palette`
-    /// list and the `palette_overrides` table removed in one patch, and the
-    /// palette drafts let go.
+    /// Reset all palette overrides (`palette` and `palette_overrides`) and clear palette drafts.
     fn reset_palette(&mut self, view: &mut SettingsViewState, cx: &mut UpdateCx<'_>) {
         view.field_inputs.remove(prefs::EDIT_PALETTE);
         if view.editing_field.as_deref() == Some(prefs::EDIT_PALETTE) {
@@ -2715,9 +2349,7 @@ impl SettingsApp {
         view.invalidate_result_page_limit();
     }
 
-    /// One editing event in a page text field. Return in the filter keeps
-    /// the trial its rows list; in the name field it saves; in the palette
-    /// slot it saves the palette.
+    /// Handle text editing events in the filter, save-name, or palette-slot fields.
     pub(super) fn reduce_showcase_text(
         &mut self,
         view: &mut SettingsViewState,
@@ -2738,9 +2370,6 @@ impl SettingsApp {
                     view.invalidate_result_page_limit();
                     view.reduce_page_scroll(0, SettingsPageScrollCommand::Absolute(0));
                 }
-                // Return in the filter keeps the theme its arrows tried,
-                // while the filter still lists it: a row the text hid is not
-                // what Return in a search field takes.
                 let listed = view.showcase.trial_id().is_some_and(|id| {
                     view.showcase
                         .visible()
@@ -2825,8 +2454,7 @@ impl SettingsApp {
     }
 }
 
-/// What a Keep of `id` on its way says, once its write shows: the side it
-/// keeps it for (`side`), or both where the theme follows the system.
+/// Status phrase for an in-flight or completed Keep of `id`.
 fn keeping_words(
     view: &SettingsViewState,
     id: &str,
@@ -2842,8 +2470,7 @@ fn keeping_words(
     }
 }
 
-/// The selected saved theme carries `drafts` now: each goes, while it still
-/// holds the value that was saved (a later edit stays a draft).
+/// Clear `drafts` that still match the values carried into a newly selected theme.
 fn drop_carried_drafts(view: &mut SettingsViewState, drafts: &CarriedDrafts) {
     for (key, input) in &drafts.fields {
         if view.field_inputs.get(key) == Some(input) {
@@ -2871,11 +2498,7 @@ fn text_width(text: &str, role: SemanticRole, style: StyleRef) -> f32 {
     crate::tray_raster::ui_text_width_for(face, text, px)
 }
 
-/// `text` fitted to `width` in the face `role`/`style` paints it in: where
-/// it is cut, after a whole word, as every one-line native label is
-/// ([`crate::native_ui::whole_word_cut`]) — the strip at 2× text in a
-/// 24-column window named GitHub Light "GitHub L…". Only a first word too
-/// wide alone is cut inside it.
+/// Truncate `text` to `width` at a word boundary using [`crate::native_ui::whole_word_cut`].
 fn fit_text(text: &str, role: SemanticRole, style: StyleRef, width: f32) -> String {
     let (px, face) = crate::native_ui::text_paint_metrics(role, style);
     crate::native_ui::whole_word_cut(
@@ -2939,9 +2562,7 @@ fn button(
     )
 }
 
-/// A button as wide as its label needs: the painter's 10pt lead and its
-/// 10pt end, so the words sit centred, and a point of slack so the measure
-/// never elides them.
+/// Button width hugging `label` with 10pt horizontal padding.
 fn hug_width(label: &str) -> f32 {
     crate::native_ui::native_button_label_width(label) + 21.0
 }
@@ -3011,16 +2632,13 @@ fn control_row(key: &str, label: &str, children: Vec<UiNode>) -> (UiNode, f32) {
     )
 }
 
-/// One type setting a tried theme would change once kept: its key, the
-/// value it takes, and what keeps the value in force now.
+/// A typography setting that would change if a tried theme is kept.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct TypeChange {
     pub(super) key: &'static str,
-    /// The value the setting takes once the theme is kept, as aterm.toml
-    /// writes it (empty: aterm's own choice).
+    /// Value the setting takes once the theme is kept.
     pub(super) theme: String,
-    /// What "Keep colours only" writes to keep the current value, `None`
-    /// when no setting keeps it (aterm's own `font_weight`).
+    /// Config value that pins the current appearance (`None` when unpinnable).
     pub(super) pin: Option<String>,
 }
 
@@ -3032,14 +2650,12 @@ pub(super) struct TrialTypography {
 }
 
 impl TrialTypography {
-    /// Whether "Keep colours only" can keep the face exactly: the theme
-    /// changes some type setting, and every change has a value that pins it.
+    /// Whether the theme changes typography and every change can be pinned.
     pub(super) fn keeps_colours_only(&self) -> bool {
         !self.changes.is_empty() && self.changes.iter().all(|change| change.pin.is_some())
     }
 
-    /// Why "Keep colours only" is not offered for a theme that changes the
-    /// face: the settings no aterm.toml value keeps as they are now.
+    /// Reason "Keep colours only" is unavailable when a typography change cannot be pinned.
     fn why_not_colours_only(&self, state: &SettingsViewState) -> Option<String> {
         let unpinned: Vec<String> = self
             .changes
@@ -3058,10 +2674,7 @@ impl TrialTypography {
 }
 
 impl SettingsViewState {
-    /// The `theme` a trial is weighed against: what aterm.toml holds under
-    /// the trial's own Keep while that write is on its way (the key already
-    /// shows the kept value), else what the page shows. So the strip and Keep
-    /// colours only read a Keep on its way as the trial it keeps.
+    /// Baseline `theme` value beneath an active trial or in-flight Keep.
     fn theme_under_trial(&self) -> Option<String> {
         if let ShowcaseTrial::Keeping { under, .. } = &self.showcase.trial
             && let Some(before) = under.get(prefs::EDIT_THEME)
@@ -3071,9 +2684,7 @@ impl SettingsViewState {
         self.raw_value(prefs::EDIT_THEME)
     }
 
-    /// The trial's record of what its Keeps replace ([`ShowcaseTrial::Keeping`]),
-    /// with `edits`, a Keep about to be sent, added: a key no Keep of the
-    /// trial has written yet held what the edit expects.
+    /// Prior values of keys modified by this trial's Keep operations, extended with `edits`.
     fn trial_under(&self, edits: &[ConfigEdit]) -> BTreeMap<String, Option<String>> {
         let mut under = match &self.showcase.trial {
             ShowcaseTrial::Keeping { under, .. } => under.clone(),
@@ -3088,8 +2699,7 @@ impl SettingsViewState {
         under
     }
 
-    /// Whether `operation` is a save's select (Save as theme's write of the
-    /// saved theme), which keeps the saved theme rather than the trial.
+    /// Whether `operation` is the selection patch for a newly saved theme.
     fn showcase_select_is(&self, operation: OperationId) -> bool {
         self.showcase
             .selecting
@@ -3097,9 +2707,7 @@ impl SettingsViewState {
             .is_some_and(|(selecting, ..)| *selecting == operation)
     }
 
-    /// A config that sets exactly the typography keys aterm.toml sets (with
-    /// stand-in values: only whether each is set matters to the resolver),
-    /// and `theme`.
+    /// Synthetic [`Config`] preserving only whether each typography key is set alongside `theme`.
     fn typography_presence_config(&self, theme: Option<String>) -> Config {
         let mut config = Config {
             theme,
@@ -3130,10 +2738,7 @@ impl SettingsViewState {
         config
     }
 
-    /// The value in force for the typography key `key` (aterm.toml leaves
-    /// it unset) under the theme whose typography is `typo`: the theme's,
-    /// else aterm's default, in the words [`type_value_words`] compares in,
-    /// with what keeps it.
+    /// Effective display string and pin value for unset typography key `key` under `typo`.
     fn type_value_under(
         &self,
         key: &'static str,
@@ -3145,9 +2750,7 @@ impl SettingsViewState {
         self.default_type_value(key)
     }
 
-    /// aterm's own value for the typography key `key`, whatever the theme:
-    /// its words and the aterm.toml value that keeps it (`None` for aterm's
-    /// own `font_weight`, which no value names).
+    /// Default display string and pin value for typography key `key`.
     fn default_type_value(&self, key: &'static str) -> (String, Option<String>) {
         match key {
             prefs::EDIT_FONT_FAMILY => {
@@ -3156,7 +2759,6 @@ impl SettingsViewState {
                     .as_deref()
                     .and_then(|families| families.automatic.clone())
                     .unwrap_or_else(|| "aterm's own face".to_string());
-                // A blank family is aterm's own choice and outranks a theme.
                 (name, Some(String::new()))
             }
             prefs::EDIT_FONT_FAMILY_BOLD
@@ -3179,12 +2781,7 @@ impl SettingsViewState {
         }
     }
 
-    /// What trying `id` would change in the type once kept: computed against
-    /// the value Keep would write, the side the page shows, and the keys
-    /// aterm.toml sets (and `--font`). A setting the tried theme sets that
-    /// differs from the value in force is a change; so is one only the
-    /// configured theme sets, which Keep returns to aterm's own. Empty
-    /// between two colours-only themes.
+    /// Typography changes that keeping `id` would introduce relative to the current state.
     pub(super) fn trial_typography(&self, id: &str) -> TrialTypography {
         let (value, _) = self.keep_value(id);
         let side = theme_visible_side(self, self.presented_motion.get().system_dark);
@@ -3198,7 +2795,6 @@ impl SettingsViewState {
         let tried = resolve(value);
         let base = self.theme_under_trial();
         let configured = resolve(base.clone());
-        // In force now: under the trial's own Keep while it is on its way.
         let base_typography = Config {
             theme: base,
             ..Config::default()
@@ -3211,8 +2807,6 @@ impl SettingsViewState {
         {
             let theme = match tried.applied.value_text(spec.key) {
                 Some(theme) => theme,
-                // Keep drops the configured theme's setting: aterm's own
-                // value comes back.
                 None if configured.applied.value_text(spec.key).is_some() => {
                     self.default_type_value(spec.name).1.unwrap_or_default()
                 }
@@ -3231,8 +2825,7 @@ impl SettingsViewState {
     }
 }
 
-/// A typography value in one vocabulary on both sides of a comparison: a
-/// switch reads `on`/`off`, anything else as written.
+/// Normalize a typography setting value for comparison (`on`/`off` for booleans).
 fn type_value_words(key: &str, value: &str) -> String {
     match (key, value.trim()) {
         (prefs::EDIT_LIGATURES | prefs::EDIT_FONT_SYNTHETIC_STYLE, "true") => "on".to_string(),

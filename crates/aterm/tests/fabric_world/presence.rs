@@ -185,8 +185,8 @@ fn an_unhosted_presence_row_is_retired_and_a_newer_incarnations_is_left_alone() 
 }
 
 /// **A LATER BRIDGE OF THE STATE DIR RETIRES WHAT AN EARLIER ONE LEFT, AND
-/// NEVER WHAT A COPY OF THE DIR LEFT UNDER THE SAME NUMBER** (the simulation's
-/// finding F4, decided), on a real broker and a real state dir.
+/// NEVER WHAT A COPY OF THE DIR LEFT UNDER THE SAME NUMBER**,
+/// on a real broker and a real state dir.
 ///
 /// The ghost: a `live` row at the node's FIRST incarnation, a session it
 /// carried that went with nobody to say so, carrying the state dir's mark

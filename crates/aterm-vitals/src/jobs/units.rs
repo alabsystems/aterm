@@ -841,6 +841,7 @@ impl Jobs {
             .map(|j| (j.key.tab, j.id.as_str()))
             .collect();
         let demand = demand_of(&rows, &at_person);
+        let parked_tabs = parked_tabs(&rows, &at_person);
         let mut lanes_off = Vec::new();
         if !tick.lanes.kqueue_detail {
             lanes_off.push("lane_off:kqueue_detail");
@@ -853,6 +854,7 @@ impl Jobs {
             findings,
             demand,
             lanes_off,
+            parked_tabs,
         }
     }
 
@@ -1415,17 +1417,16 @@ fn named_standing(
 /// makes progress the terminal does not show (a full-screen program at its
 /// prompt appending to its own log, as agy 1.4.0 does every 5 s while its
 /// telemetry is refused): it can accrue nothing while it reads keys, so it
-/// is watched again at its next terminal output (the host's edge), as the
-/// design's "a session parked at a raw-mode prompt: 0 job samples until its
-/// next PTY output" says; one that stalls or spins is still watched fast.
+/// is watched again at its next terminal output that moves its screen (the
+/// host's edge; a redraw while the terminal still says it waits, at most once
+/// a floor, design §6.1), as the design's "a session parked at a raw-mode
+/// prompt: 0 job samples until its next PTY output" says; one that stalls or
+/// spins is still watched fast.
 fn demand_of(rows: &[JobRow], at_person: &BTreeSet<(u64, &str)>) -> Demand {
     let mut d = Demand::Idle;
     for r in rows.iter().filter(|r| r.verdict != Verdict::Exited) {
         let reads_keys = at_person.contains(&(r.tab, r.id.as_str()));
-        if (r.class == Class::Running && !reads_keys)
-            || r.verdict == Verdict::Stuck
-            || matches!(r.standing, Some(Standing::Capable | Standing::Capped))
-        {
+        if (r.class == Class::Running && !reads_keys) || watched_fast(r) {
             return Demand::Fast;
         }
         let person = reads_keys
@@ -1441,4 +1442,29 @@ fn demand_of(rows: &[JobRow], at_person: &BTreeSet<(u64, &str)>) -> Demand {
         }
     }
     d
+}
+
+/// A live job the engine watches at its fast cadence whatever it waits on:
+/// stuck, or capable of suspicion (an agent's call, §11.5).
+fn watched_fast(r: &JobRow) -> bool {
+    r.verdict == Verdict::Stuck || matches!(r.standing, Some(Standing::Capable | Standing::Capped))
+}
+
+/// The tabs whose every live job holds the foreground at the person's own
+/// terminal read (`at_person`, [`Job::person_read`]) and is not watched fast
+/// ([`watched_fast`], [`demand_of`]'s own exception), ascending:
+/// [`JobsView::parked_tabs`]. A tab with any other live job (a background
+/// one, an agent's call, a canonical read) is not parked, nor one with no
+/// live job.
+fn parked_tabs(rows: &[JobRow], at_person: &BTreeSet<(u64, &str)>) -> Vec<u64> {
+    let mut parked = BTreeSet::new();
+    let mut not = BTreeSet::new();
+    for r in rows.iter().filter(|r| r.verdict != Verdict::Exited) {
+        if at_person.contains(&(r.tab, r.id.as_str())) && !watched_fast(r) {
+            parked.insert(r.tab);
+        } else {
+            not.insert(r.tab);
+        }
+    }
+    parked.difference(&not).copied().collect()
 }

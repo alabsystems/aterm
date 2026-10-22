@@ -121,7 +121,7 @@ impl Backing {
     /// `F_FULLFSYNC` (the drive's cache emptied too) and elsewhere `fdatasync`.
     pub(crate) fn sync_data(&self) -> io::Result<()> {
         match self {
-            Backing::Os(f) => f.sync_data(),
+            Backing::Os(f) => astream_sys::full_sync_data(f),
             #[cfg(test)]
             Backing::Sim(s) => {
                 s.full_flush();
@@ -195,7 +195,7 @@ impl Backing {
     /// A FULL flush of the file's data and metadata (`sync_all`).
     pub(crate) fn sync_all(&self) -> io::Result<()> {
         match self {
-            Backing::Os(f) => f.sync_all(),
+            Backing::Os(f) => astream_sys::full_sync(f),
             #[cfg(test)]
             Backing::Sim(s) => {
                 s.full_flush();
@@ -311,7 +311,7 @@ impl FlushHandle {
             return Err(io::Error::other("injected fsync fault"));
         }
         match &self.backing {
-            HandleBacking::Os(f) => f.sync_data(),
+            HandleBacking::Os(f) => astream_sys::full_sync_data(f),
             #[cfg(test)]
             HandleBacking::Sim(s) => {
                 s.full_flush();
@@ -367,7 +367,7 @@ impl BatchOut {
     /// A FULL flush of the file's data, as [`Backing::sync_data`].
     pub(crate) fn sync_data(&self) -> io::Result<()> {
         match &self.0 {
-            HandleBacking::Os(f) => f.sync_data(),
+            HandleBacking::Os(f) => astream_sys::full_sync_data(f),
             #[cfg(test)]
             HandleBacking::Sim(s) => {
                 s.full_flush();
@@ -448,7 +448,7 @@ impl Dir {
                 {
                     let mut f = create_fresh(&tmp, &mut OpenOptions::new())?;
                     f.write_all(bytes)?;
-                    f.sync_all()?;
+                    astream_sys::full_sync(&f)?;
                 }
                 crate::store::rename_path(&tmp, &path)?;
                 sync_parent_dir(&path)

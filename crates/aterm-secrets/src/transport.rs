@@ -36,8 +36,9 @@ pub enum Source {
 pub enum Fetched {
     /// The bytes at the source.
     Body(Vec<u8>),
-    /// A long-poll that ended with nothing newer (`204`).
-    NoNewer,
+    /// A long-poll that ended with nothing newer (`204`), and the seq the server holds, as its
+    /// `ETag` names it (none without one).
+    NoNewer(Option<u64>),
     /// Nothing there: a `404`, or no file at the path.
     Missing,
 }
@@ -260,8 +261,8 @@ fn transport_error(what: &str, url: &str, error: &aterm_http::Error) -> Error {
 /// `wait` bounds the whole request. A path ignores `after`.
 ///
 /// The request's own deadline is `wait` plus [`FETCH_MARGIN`]. `200` is the body, `204` is
-/// [`Fetched::NoNewer`], `404` (or no file at a path) is [`Fetched::Missing`], anything else
-/// an error naming the status and the server's reason.
+/// [`Fetched::NoNewer`] with the seq its `ETag: "<seq>"` names, `404` (or no file at a path)
+/// is [`Fetched::Missing`], anything else an error naming the status and the server's reason.
 pub fn fetch(source: &Source, after: Option<u64>, wait: Duration) -> crate::Result<Fetched> {
     match source {
         Source::Url(url) => match get(url, after, wait)? {
@@ -308,13 +309,24 @@ pub fn get(url: &str, after: Option<u64>, wait: Duration) -> crate::Result<Answe
     };
     match response.status() {
         200 => Ok(Answer::Fetched(Fetched::Body(response.body().to_vec()))),
-        204 => Ok(Answer::Fetched(Fetched::NoNewer)),
+        204 => Ok(Answer::Fetched(Fetched::NoNewer(
+            response.header("etag").and_then(etag_seq),
+        ))),
         404 => Ok(Answer::Fetched(Fetched::Missing)),
         status if foreign_status(status) => Ok(Answer::Foreign(
             refused("fetching", url, status, response.body()).0,
         )),
         status => Err(refused("fetching", url, status, response.body())),
     }
+}
+
+/// The seq an `ETag` names: `"<seq>"`, as the server sends it; anything else names none.
+fn etag_seq(value: &str) -> Option<u64> {
+    let digits = value.trim().strip_prefix('"')?.strip_suffix('"')?;
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    digits.parse().ok()
 }
 
 /// A status the vault server never answers a GET with: a redirect (server.rs has none), or a
@@ -918,11 +930,13 @@ mod tests {
         assert!(!error.0.contains("second"), "{error}");
     }
 
+    /// A long-poll's 204 says the seq the server holds by its `ETag`, which a machine holding a
+    /// newer version reads; a 204 without one, or with one that names no seq, says none.
     #[test]
     fn a_long_poll_asks_after_the_seq_and_reads_no_newer() {
-        let (url, server) = stub(b"HTTP/1.1 204 No Content\r\n\r\n".to_vec());
+        let (url, server) = stub(b"HTTP/1.1 204 No Content\r\nETag: \"40\"\r\n\r\n".to_vec());
         let fetched = fetch(&Source::Url(url), Some(41), HANG_DETECTOR).expect("fetched");
-        assert_eq!(fetched, Fetched::NoNewer);
+        assert_eq!(fetched, Fetched::NoNewer(Some(40)));
         let head = server.join().expect("stub");
         assert!(
             head.starts_with("GET /v1/alab?after=41 HTTP/1.1\r\n"),
@@ -932,6 +946,12 @@ mod tests {
             !head.to_ascii_lowercase().contains("content-length"),
             "{head}"
         );
+        for etag in ["", "ETag: 40\r\n", "ETag: \"\"\r\n", "ETag: \"+40\"\r\n"] {
+            let (url, server) = stub(format!("HTTP/1.1 204 No Content\r\n{etag}\r\n").into_bytes());
+            let fetched = fetch(&Source::Url(url), Some(41), HANG_DETECTOR).expect("fetched");
+            assert_eq!(fetched, Fetched::NoNewer(None), "{etag:?}");
+            server.join().expect("stub");
+        }
     }
 
     /// `text` with its last character changed to another bech32 one: a broken checksum.

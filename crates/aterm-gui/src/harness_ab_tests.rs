@@ -916,7 +916,7 @@ fn note(book: &mut AbBook, session: u64, (arm, lands): (AbArm, bool), at_ms: u64
 /// landed 1 and no sample; a mode that leaves Land drops the start; an end after midnight goes in its own
 /// day; the session's end forgets its task. NEGATIVE CONTROLS: a book fed
 /// no calendar counts nothing; a second landing in the same Land stretch
-/// has no start (slice 2a's `task_opened` sets one), so it is a count with
+/// has no start (`task_opened` sets one), so it is a count with
 /// no sample.
 #[test]
 fn the_book_counts_each_end_and_the_time_from_land_to_landed() {

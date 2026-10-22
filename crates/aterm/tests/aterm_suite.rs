@@ -27,6 +27,8 @@ mod live_ctl;
 #[path = "support/standin.rs"]
 mod standin;
 
+#[cfg(target_os = "macos")]
+mod accounts_upkeep_live_headless;
 #[cfg(unix)]
 mod agent_prime_live_headless;
 #[cfg(unix)]

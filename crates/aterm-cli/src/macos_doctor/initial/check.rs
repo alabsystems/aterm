@@ -30,14 +30,14 @@ impl InitialCheckHost for LiveCheck {
     fn spotlight(&mut self) -> Result<Vec<Row>, String> {
         aterm_machines::init::run_initial_spotlight(
             &aterm_machines::port::Live::new(),
-            &LiveInitial.context()?,
+            &LiveInitial::live().context()?,
             aterm_machines::model::Mode::Plan,
         )
         .map(item_rows)
     }
 
     fn permissions(&mut self) -> Result<Vec<Row>, String> {
-        LiveInitial.permissions()
+        LiveInitial::live().permissions()
     }
 
     fn vault(&mut self, plan: &Plan) -> Result<Vec<Row>, String> {
@@ -47,7 +47,7 @@ impl InitialCheckHost for LiveCheck {
     fn repositories(&mut self) -> Result<Vec<Row>, String> {
         aterm_machines::init_github::run_initial_repositories(
             &aterm_machines::port::Live::new(),
-            &LiveInitial.context()?,
+            &LiveInitial::live().context()?,
             aterm_machines::model::Mode::Plan,
         )
         .map(item_rows)
@@ -57,7 +57,7 @@ impl InitialCheckHost for LiveCheck {
 /// Read local vault readiness for an explicit check or before repository access.
 /// This never joins, synchronizes, installs a service or reads another source's files.
 pub(super) fn current_vault_rows(plan: &Plan) -> Result<Vec<Row>, String> {
-    let context = LiveInitial.context()?;
+    let context = LiveInitial::live().context()?;
     let [user] = context.users.as_slice() else {
         return Err("checking the vault needs exactly one console account".into());
     };
@@ -78,18 +78,14 @@ pub(super) fn current_vault_rows(plan: &Plan) -> Result<Vec<Row>, String> {
     )
 }
 
-pub(super) fn selected_vault<'a>(
+/// The vault this Mac reads, when it is the one the plan selects: the rule the Secrets
+/// stage's item joins by ([`aterm_machines::init_secrets::selected_vault`]).
+fn selected_vault<'a>(
     plan: &Plan,
     home: &Path,
     status: &'a Status,
 ) -> Result<Option<&'a client::Config>, String> {
-    let (source, pin) = aterm_secrets::transport::parse_source(&plan.vault_url, home)
-        .map_err(|_| "the selected vault source is invalid")?;
-    let name = aterm_secrets::transport::vault_name(&source)
-        .map_err(|_| "the selected vault source needs a valid vault name")?;
-    Ok(status.config.as_ref().filter(|config| {
-        config.source == source && config.name == name && client::pin_admitted(config, pin)
-    }))
+    aterm_machines::init_secrets::selected_vault(&plan.vault_url, home, status)
 }
 
 fn vault_rows(

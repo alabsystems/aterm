@@ -421,7 +421,7 @@ impl OutputStreak {
     /// One accepted editor input at `now` (a key, mapped sequence, IME text or paste receipt),
     /// for the echo discount.
     #[inline]
-    pub fn note_keystroke(&mut self, now: Instant) {
+    pub const fn note_keystroke(&mut self, now: Instant) {
         self.last_key = Some(now);
     }
 
@@ -1017,9 +1017,9 @@ fn idle_duration(idle_secs: f32) -> Option<Duration> {
 
 /// Equal-power pan position `-1..=1` from a span's centre column.
 #[inline]
-fn pan_of(pending: Pending, geom: Geom) -> f32 {
-    let cols = geom.cols.max(1) as f32;
-    let centre = (f32::from(pending.left) + f32::from(pending.right)) * 0.5;
+const fn pan_of(pending: Pending, geom: Geom) -> f32 {
+    let cols = if geom.cols < 1 { 1 } else { geom.cols } as f32;
+    let centre = (pending.left as f32 + pending.right as f32) * 0.5;
     ((centre / cols) * 2.0 - 1.0).clamp(-1.0, 1.0)
 }
 
@@ -1047,12 +1047,12 @@ fn nearest_spectrum_stop_by_hue(rgb: u32) -> usize {
 /// cannot cross into a neighbour however the arc is paced. Endpoints use their one gap and
 /// clamp to the arc in `hue_for`.
 #[inline]
-fn spectrum_stop_jitter_radius(index: usize) -> f32 {
+const fn spectrum_stop_jitter_radius(index: usize) -> f32 {
     let last = crate::spectrum::SPECTRUM_STOPS.saturating_sub(1);
     if last == 0 {
         return 0.0;
     }
-    let index = index.min(last);
+    let index = if index > last { last } else { index };
     let at = spectrum_stop_position(index);
     let gap = if index == 0 {
         spectrum_stop_position(1) - at

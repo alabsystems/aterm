@@ -499,8 +499,12 @@ aterm_objc::declare_class! {
         /// canceled" (-128) though the mug quits. A logout's, a restart's or a shutdown's
         /// ([`terminate_is_the_systems`]) ends it now with the mode kept, as before: a restart
         /// starts it off anyway, and the mug's next start in this boot (the next login's, with
-        /// Enable at Startup on) brings back what was on. So does a quit the mug could not take
-        /// (a handler it is nested in holds the mug).
+        /// Enable at Startup on) brings back what was on. Exit 0 is right even for a logout:
+        /// loginwindow asks a UI element only past the logout's point of no return (measured
+        /// on macOS 27: the GUI apps, Finder, `PointOfNoReturn`, then the UI elements), so a
+        /// logout another app cancels never reaches the mug, and a restart would start it in a
+        /// session that is ending. A quit the mug could not take (a handler it is nested in
+        /// holds the mug) ends it now too.
         /// Activity Monitor's Quit is a SIGTERM, not this ([`term`]).
         @sel(applicationShouldTerminate:)
         fn application_should_terminate(&self, _app: Id) -> usize {
@@ -846,8 +850,10 @@ fn stop_observing_wake(target: Id) {
 }
 
 /// The one stderr line of a mug that will not run, and exit 0: launchd's KeepAlive starts the
-/// job again on any other status, only for it to refuse the same way.
-fn refuse(why: &str) -> ExitCode {
+/// job again on any other status, only for it to refuse the same way. Nothing holds the
+/// activity, so neither does a bridge an update restart left: it lets go now, not at its bound.
+fn refuse(paths: &Paths, why: &str) -> ExitCode {
+    bridge::release(paths);
     eprintln!("aterm caffeine: {why}");
     ExitCode::SUCCESS
 }
@@ -856,7 +862,10 @@ fn refuse(why: &str) -> ExitCode {
 /// ([`launchd::EXIT_RESTART`]); on the process main thread only.
 pub(super) fn run(ctx: ServeContext) -> ExitCode {
     let Some(main) = MainThread::new() else {
-        return refuse("the menu-bar mug runs only on the process main thread");
+        return refuse(
+            &ctx.paths,
+            "the menu-bar mug runs only on the process main thread",
+        );
     };
     let ServeContext {
         paths,
@@ -911,13 +920,14 @@ pub(super) fn run(ctx: ServeContext) -> ExitCode {
 fn run_app(main: MainThread, mug: Mug) -> ExitCode {
     let app = shared_app();
     if app.is_null() {
-        return refuse("AppKit gave no application");
+        return refuse(&mug.paths, "AppKit gave no application");
     }
     // SAFETY: `-setActivationPolicy:` is `B24@0:8q16`; set before the app runs or shows
     // anything, so it never takes a Dock icon. Its answer (whether the policy took) changes
     // nothing here.
     let _ =
         unsafe { send_bool_isize(app, sel!(setActivationPolicy:), ACTIVATION_POLICY_ACCESSORY) };
+    let paths = mug.paths.clone();
     let Some(target) = CaffeineTarget::alloc_init(
         main,
         TargetIvars {
@@ -926,7 +936,7 @@ fn run_app(main: MainThread, mug: Mug) -> ExitCode {
             tracking: Cell::new(false),
         },
     ) else {
-        return refuse("the runtime refused the mug's target");
+        return refuse(&paths, "the runtime refused the mug's target");
     };
     // Registered before the mode is read: a writer's post from here on reaches the observer
     // (queued until `-run`), so a change saved while the mug starts is never missed.
@@ -957,11 +967,7 @@ fn run_app(main: MainThread, mug: Mug) -> ExitCode {
             rows,
         );
         if mug.ui.is_none() {
-            // Exit 0, so launchd does not start it again only to fail the same way; nothing
-            // holds the activity, so neither does a bridge an update restart left.
-            bridge::release(&mug.paths);
-            eprintln!("aterm caffeine: the menu bar refused the mug");
-            return ExitCode::SUCCESS;
+            return refuse(&mug.paths, "the menu bar refused the mug");
         }
         if !mug.begin(now) {
             return Exit::Quit.code();
@@ -1010,6 +1016,23 @@ mod tests {
     use crate::model::{Choice, HOUR};
 
     const NOW: u64 = 1_790_000_000;
+
+    /// A mug that will not run lets a bridge an update restart left go, and exits 0.
+    #[test]
+    fn a_refusal_lets_a_left_bridge_go() {
+        let dir = aterm_tempfile::tempdir().expect("tempdir");
+        let paths = Paths {
+            state_dir: dir.path().join("state"),
+            home: dir.path().join("home"),
+            logs_dir: dir.path().join("logs"),
+        };
+        std::fs::create_dir_all(&paths.state_dir).expect("state dir");
+        std::fs::write(paths.bridge_file(), "4242\n").expect("bridge file");
+        assert_eq!(refuse(&paths, "a test refusal"), ExitCode::SUCCESS);
+        assert!(!paths.bridge_file().exists(), "the bridge was left holding");
+        // Nothing to let go is no error.
+        assert_eq!(refuse(&paths, "a test refusal"), ExitCode::SUCCESS);
+    }
 
     #[test]
     fn a_tick_comes_every_minute_or_just_after_a_closer_deadline() {

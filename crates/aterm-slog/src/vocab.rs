@@ -224,19 +224,19 @@ kinds! {
     Gap => "gap",
     Snap => "snap",
     // Phase 3B, appended so no kind moves: a run's view of one of its
-    // sources (`source field=transcript state=on|partial|off skipped= dropped=`,
-    // ruling S31), and a post the broker landed (`mail-landed inbox= off=`: a
+    // sources (`source field=transcript state=on|partial|off skipped= dropped=`),
+    // and a post the broker landed (`mail-landed inbox= off=`: a
     // mark is no node, so the post's `mail` mark cannot be amended, plan §1
     // item 5). A reader without them maps either to `unknown`.
     Source => "source",
     MailLanded => "mail-landed",
-    // Phase 5 (step 5C-1, ruling T21), appended so no kind moves: a worker's
+    // Phase 5, appended so no kind moves: a worker's
     // task moved (`task rev= state= attention= why= code=`, the fact of the
     // timeline's `task-change` row: closed words and counters only). Local:
     // never bus class, journaled with the rest of its session's log (D3, on
     // by default), no brief line. A reader without it maps it to `unknown`.
     Task => "task",
-    // Phase 6 (6F-2, plan item U2; rulings U11-U13, U15-U17, U26), appended
+    // Phase 6 (plan item U2), appended
     // so no kind moves: the facts the timeline ring held and the log did not,
     // each a mark its ring row's writer writes in the same hold (6F-4, 6F-5,
     // 6F-9). A session's state (`state state=`), a harness policy's
@@ -558,8 +558,8 @@ impl fmt::Display for ShortId {
     }
 }
 
-/// The words of the actors a connection's class names (§2.5, phase 3A ruling
-/// R1): never a session's. An [`Actor::Sid`] holding one of them is not one
+/// The words of the actors a connection's class names (§2.5):
+/// never a session's. An [`Actor::Sid`] holding one of them is not one
 /// ([`Actor::sid`] makes it [`Actor::Nobody`], and [`Actor::word`] prints such
 /// a value as `-`), so no record, carry line or fold snapshot ever turns a
 /// name someone chose into one of these actors when it is read back
@@ -656,7 +656,7 @@ impl Actor {
         matches!(self, Actor::Human | Actor::Ctl)
     }
 
-    /// A claim's TRUSTED author (design §7.3, phase 3A ruling R13): the
+    /// A claim's TRUSTED author (design §7.3): the
     /// harness or the owner class. Their newest verdict and label are kept
     /// beside the newest of any author, so no other author displaces them,
     /// and a label reaches `brief` and the clause only from one of them.
@@ -840,7 +840,7 @@ pub const NEED_WORDS: &[&str] = &[
     "decision",
     "help",
     "unknown",
-    // Phase 6 (6F-9, ruling U26), appended: the printed need words
+    // Phase 6, appended: the printed need words
     // (`aterm_types::needs::NeedWord`, `status needs=`) a `shown` mark names
     // (`question` is above). No need shown is no `need=`, never a word.
     "frozen",
@@ -942,7 +942,7 @@ pub const WHY_WORDS: &[&str] = &[
     "held",
     "turn",
     "moved",
-    // phase 6 (6F-2, ruling U13): why a person's `human` mark was written
+    // phase 6: why a person's `human` mark was written
     // when it is not the ring's burst row: the first input after delivered
     // mail (`mail`, the 5D-4 latch's mark), or the burst's own (`burst`).
     "mail",
@@ -958,11 +958,11 @@ pub const WHY_WORDS: &[&str] = &[
 pub const VERB_WORDS: &[&str] = &["send", "key", "paste", "feed", "turn", "unknown"];
 
 /// What a control input says it means for the box it dismisses (`key`/`send
-/// act=`, ruling T1): [`crate::ActWord`]'s words, in its order.
+/// act=`): [`crate::ActWord`]'s words, in its order.
 pub const ACT_WORDS: &[&str] = &["approve", "deny", "answer"];
 
 /// Whose count an input mark's `dropped=` is when it is not the mark's
-/// author's own (`pool=`, Phase 6 step 6C-6, ruling U18): the mark
+/// author's own (`pool=`): the mark
 /// limiter's shared pool ([`crate::Owed::Shared`]).
 pub const POOL_WORDS: &[&str] = &["shared"];
 
@@ -1028,43 +1028,43 @@ pub const STATE_WORDS: &[&str] = &[
     "blocked",
 ];
 
-/// A hold's origin (`advisory origin=`, `hold origin=`; Phase 6 step 6F-2):
+/// A hold's origin (`advisory origin=`, `hold origin=`):
 /// the slots `aterm_gui_fabric::Holds` keeps, `person`, `remote`, `fleet`
 /// and `local`.
 pub const ORIGIN_WORDS: &[&str] = &["person", "remote", "fleet", "local"];
 
 /// What a program's `blocked` report waits on (`program ask=`, OSC 7501's
-/// `kind=`, Phase 6 step 6F-2): `kind=` is the mail kind's key.
+/// `kind=`): `kind=` is the mail kind's key.
 pub const ASK_WORDS: &[&str] = &["permission", "question", "auth"];
 
-/// How a session's topic opt-ins moved (`topic change=`, Phase 6 step 6F-5):
+/// How a session's topic opt-ins moved (`topic change=`):
 /// the two moves `topic add` and `topic drop` make. Not `op=`: that is the
 /// record's own token in `log --json`.
 pub const CHANGE_WORDS: &[&str] = &["add", "drop"];
 
-/// Whether a resize run's geometry came back (`render net=`, Phase 6 step
-/// 6F-7): the resize ledger's `net=` words.
+/// Whether a resize run's geometry came back (`render net=`):
+/// the resize ledger's `net=` words.
 pub const NET_WORDS: &[&str] = &["zero", "changed"];
 
-/// The class of program a render epoch judged (`render class=`, Phase 6
-/// step 6F-7): `aterm-gui`'s `resize_epoch::ProgramClass` words.
+/// The class of program a render epoch judged (`render class=`):
+/// `aterm-gui`'s `resize_epoch::ProgramClass` words.
 pub const CLASS_WORDS: &[&str] = &["agent", "learned", "unknown"];
 
-/// How a shown need is shown (`shown sev=`, Phase 6 step 6F-9, ruling U26):
+/// How a shown need is shown (`shown sev=`):
 /// `aterm_types::needs::Severity`'s words. No need shown is no `sev=`.
 pub const SEV_WORDS: &[&str] = &["stuck", "decide"];
 
-/// Whose hold the person is shown (`shown held=`, Phase 6 step 6F-9, ruling
-/// U26): `aterm_types::needs::HoldWord`'s words (`hold_by=`). No hold is no
+/// Whose hold the person is shown (`shown held=`):
+/// `aterm_types::needs::HoldWord`'s words (`hold_by=`). No hold is no
 /// `held=`. Not `origin=`: that is a hold's slot, `fleet` among them.
 pub const HELD_WORDS: &[&str] = &["person", "remote", "local", "bridge"];
 
-/// What healed a render epoch (`render healed_by=`, Phase 6 step 6F-7):
+/// What healed a render epoch (`render healed_by=`):
 /// `aterm-gui`'s `resize_epoch::EpochBy` words, an open epoch's `-` aside.
 /// Not `by=`: that is the record's actor.
 pub const HEALED_BY_WORDS: &[&str] = &["app", "undo", "nudge"];
 
-/// Where a manual reset came from (`modes source=`, Phase 6 step 6F-7):
+/// Where a manual reset came from (`modes source=`):
 /// `aterm-gui`'s `manual_reset::ResetSource` words, the `reset` verb's and
 /// the menu's.
 pub const SOURCE_WORDS: &[&str] = &["ctl", "menu"];
@@ -1073,8 +1073,7 @@ pub const SOURCE_WORDS: &[&str] = &["ctl", "menu"];
 /// node log, 5J): `aterm_update::recovery_ledger::EndClass`'s row tokens, a
 /// caught signal as `signal` with its number in `code=`, and `-` while the
 /// recovery ledger has not been read (a launch that never reads it, a plain
-/// headless or dev one, keeps `-`; a lab desk reads its private root's own,
-/// Phase 6 step 6C-4).
+/// headless or dev one, keeps `-`; a lab desk reads its private root's own).
 pub const END_WORDS: &[&str] = &[
     "clean", "handoff", "killed", "signal", "panic", "running", "unknown", "none", "-",
 ];

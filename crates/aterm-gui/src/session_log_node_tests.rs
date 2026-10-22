@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The node log's producers (session log 5J-2, ruling T27): each one's fact
+//! The node log's producers: each one's fact
 //! reaches the node log, read under the one-minute hang detector; config
 //! facts name schema keys, never a value and never a name a person chose
 //! (the leak test, with a planted value); and nothing the node log holds is

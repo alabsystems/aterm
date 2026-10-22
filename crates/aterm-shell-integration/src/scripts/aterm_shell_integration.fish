@@ -17,8 +17,10 @@
 # - Loader + body split: a running shell sources a newer build's integration
 #   body at its next prompt when the host updates the body pointer.
 #
-# Compatible with fish 3.4+ (`return` outside a function requires 3.4;
-# `string escape --style=url` requires 3.1).
+# Compatible with fish 3.7+: the floor a lane runs is apt's fish 3.7.0 in the
+# Linux guest (`targo --unverified verify linux`); on macOS the tests run the
+# pinned 4.9.3 that `targo --unverified verify provision` builds. (`return`
+# outside a function needs 3.4; `string escape --style=url` needs 3.1.)
 
 # Only run in interactive shells. Use `return` (not `exit`, which kills the
 # fish process when loaded via XDG_DATA_DIRS conf.d).

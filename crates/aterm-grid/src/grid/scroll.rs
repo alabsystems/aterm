@@ -65,7 +65,7 @@ impl Grid {
     /// bottom moved nothing, and the machine putting a reader there is not
     /// their choice. `scrollback_offload`'s re-attach reads the count.
     #[inline]
-    fn note_reader_descent_to_live_bottom(&mut self, before: usize) {
+    const fn note_reader_descent_to_live_bottom(&mut self, before: usize) {
         if before != 0 && self.storage.display_offset == 0 {
             self.storage.reader_live_bottom_gen += 1;
         }

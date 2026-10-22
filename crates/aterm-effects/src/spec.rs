@@ -215,7 +215,7 @@ impl SpecTable {
     /// resolve gate (`enabled && (ink_enabled || has_custom_specs)`).
     #[inline]
     #[must_use]
-    pub fn has_custom(&self) -> bool {
+    pub const fn has_custom(&self) -> bool {
         !self.specs.is_empty()
     }
 

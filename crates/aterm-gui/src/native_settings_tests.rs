@@ -3339,7 +3339,7 @@ fn a_debugger_press_the_row_does_not_offer_asks_nothing() {
     );
 }
 
-/// THE DEBUGGER-ACCESS ALERT, for both callers (owner rulings O7, O8 and O29;
+/// THE DEBUGGER-ACCESS ALERT, for both callers (
 /// the owner's 2026-10-20 "more concise and organized"), judged by what it must
 /// say and how it is laid out rather than by its sentences. Every body is short
 /// paragraphs, each one line or a list of `• ` bullets, with no line a wall. The
@@ -42036,7 +42036,7 @@ fn a_short_choices_default_reads_as_its_segment() {
 fn session_controls_save_reset_and_disclose_observed_runtime() {
     use crate::session_log_journal::{Attention, Cause, Phase, Status};
     // Each switch's default (the journal is on since D3 and the clause since
-    // D6, Phase 6 steps 6B-1 and 6B-2).
+    // D6).
     for (key, default) in [
         (prefs::EDIT_KEEPER_ENABLED, false),
         (prefs::EDIT_SESSION_LOG_JOURNAL, true),

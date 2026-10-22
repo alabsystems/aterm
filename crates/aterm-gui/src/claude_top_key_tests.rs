@@ -136,11 +136,17 @@ fn the_ghost_is_drawn_only_on_evidence_of_off() {
     assert_eq!(hit.cols, (w - 15, w - 2), "its glyphs");
     let row = top_row(&app, wid);
     let rule = top_cells(&app, wid)[w - 1];
+    // Greyed as a hidden fact's `off` is: Claude's rule gray where it reads
+    // below the facts' values; here the rule is drawn in the pane's own ink,
+    // so the values' ink quieted toward the ground.
+    let greyed =
+        crate::claude_footer::greyed_ink(rule.fg, app.windows[&wid].input_scratch.implicit_blank);
+    assert_ne!(greyed, rule.fg, "CONTROL: a rule in the pane's own ink");
     for cell in &top_cells(&app, wid)[w - 15..w - 2] {
         assert_eq!(
             (cell.fg, cell.bold, cell.script),
-            (rule.fg, false, Script::Normal),
-            "Claude's rule gray, not bold, full size"
+            (greyed, false, Script::Normal),
+            "greyed, not bold, full size"
         );
     }
     // Claude's tag live: its own cells, never written, the target.

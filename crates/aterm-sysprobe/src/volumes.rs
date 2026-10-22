@@ -1,71 +1,28 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! VOLUMES — the machine's mount table, a fresh reading of one volume, and the
-//! pure lookups between a path and its mount (design
-//! `docs/DESIGN-disk-awareness-2026-10-17.md` §2.1, under the module name the
-//! system-awareness design §10.1 fixed).
+//! Mount-table enumeration, volume space queries, and pure path-to-mount lookups.
 //!
-//! Platform reads only: no timer, no thread, no policy. Where a volume STANDS
-//! (its lines, its level, its room) is `aterm_agent::harness::disk`'s.
-//!
-//! * [`table`] lists every mount without asking any file system
-//!   (`getfsstat(MNT_NOWAIT)` on macOS, one bounded read of
-//!   `/proc/self/mountinfo` on Linux, the mount manager and the object
-//!   manager on Windows). A table cut at [`MAX_MOUNTS`] (or at
-//!   [`MOUNTINFO_CAP`] bytes) says so ([`Table::complete`]): a fence that
-//!   needs every mount reads a cut table as proving nothing.
-//! * [`mount_of`] and [`mounts_under`] are PURE: they touch no path. On macOS
-//!   a firmlinked root (`/Users`, `/private`, …, from `/usr/share/firmlinks`)
-//!   is read in its data-volume spelling first. On Windows both sides are
-//!   compared by [`crate::paths::windows_key`] (verbatim or plain, any case),
-//!   a `\\?\Volume{…}\` path read through its volume's mount first, a `subst`
-//!   letter followed to where it points.
-//! * [`Table::is_under`] and [`Table::is_mount_point`] are the same rule for
-//!   two paths, and for a path and the mount points: on Windows every
-//!   comparison of two paths from two sources goes through them (a `subst`
-//!   letter, a volume's second mount point, a share that may be the local
-//!   disk again: what the table-less [`crate::paths::is_under`] cannot
-//!   relate).
-//! * [`read`] asks the file system only through a mount point the table calls
-//!   local and not automounted (one `statfs`/`statvfs`; on Windows one
-//!   `GetDiskFreeSpaceExW` and one `GetVolumeInformationW` on the volume's
-//!   GUID root), so a hung network mount cannot block a reader. macOS's
-//!   `getfsstat` keeps a free figure of its own, which can be stale; it is
-//!   never used as one.
-//! * [`file_id`] is one file's identity (`st_dev`/`st_ino`; on Windows the
-//!   `FILE_ID_INFO` serial and id): the one device and inode every fence on
-//!   the disk path compares.
-//!
-//! APFS: every volume of one container reports the container's free space, so
-//! a set of readings dedupes by [`VolumeKey::Container`]; `free` is what a
-//! write can use now (`f_bavail`), purgeable space not counted.
-//!
-//! Windows: a volume is keyed by its GUID ([`VolumeKey::Volume`]), which the
-//! mount manager keeps across boots and which two volumes never share (a
-//! cloned disk keeps its serial). `free` is free to this caller, its quota
-//! honoured; storage the system reserves is not counted; a shadow copy keeps
-//! a freed file's blocks as an APFS snapshot does, so a removal can free less
-//! than it counted.
+//! [`table`] lists mounts without querying remote filesystems; [`mount_of`],
+//! [`mounts_under`], [`Table::is_under`], and [`Table::is_mount_point`] resolve
+//! paths lexically across macOS firmlinks and Windows volume GUIDs/`subst` drives.
+//! [`read`] queries only local, non-automounted volumes, and [`file_id`] returns
+//! device and inode/file-ID identity.
 
 use std::path::{Component, Path, PathBuf};
 
 use crate::paths;
 
-/// The most mounts one [`table`] lists; a longer table is cut there and
-/// marked incomplete ([`Table::complete`]).
+/// Maximum mounts returned by [`table`]; longer tables mark [`Table::complete`] false.
 pub const MAX_MOUNTS: usize = 256;
 
-/// The most bytes of `/proc/self/mountinfo` one [`table`] reads (Linux): the
-/// crate's 4 KiB [`crate::READ_CAP`] is too small for a mount table. A table
-/// cut here is incomplete.
+/// Maximum bytes read from `/proc/self/mountinfo` on Linux.
 pub const MOUNTINFO_CAP: usize = 64 * 1024;
 
 /// macOS's data volume, where every firmlinked root lives.
 pub const DATA_VOLUME: &str = "/System/Volumes/Data";
 
-/// The file systems the Linux arm calls LOCAL (an allowlist: a network or FUSE
-/// type is [`Unread::Remote`] and never `statvfs`ed).
+/// Linux filesystem types treated as local (`statvfs`-safe).
 pub const LOCAL_FSTYPES: &[&str] = &[
     "ext2", "ext3", "ext4", "xfs", "btrfs", "zfs", "f2fs", "tmpfs", "overlay", "vfat", "exfat",
     "ntfs3",
@@ -80,37 +37,23 @@ pub struct Mount {
     pub from: String,
     /// Its file system type (`apfs`, `autofs`, `ext4`).
     pub fstype: String,
-    /// On a local device (macOS `MNT_LOCAL`; Linux [`LOCAL_FSTYPES`];
-    /// Windows a `\Device\HarddiskVolume<n>`). Local is not FIXED: on Windows
-    /// a USB stick's volume is a `HarddiskVolume` too (`DRIVE_REMOVABLE` to
-    /// `GetDriveTypeW`), and so is an attached VHD(X) wherever its backing
-    /// file lives, a share included. A removal that must stay on fixed disks
-    /// asks that itself: nothing in this table does.
+    /// True for a local device (`MNT_LOCAL` on macOS, [`LOCAL_FSTYPES`] on Linux,
+    /// `\Device\HarddiskVolume<n>` on Windows).
     pub local: bool,
     /// Mounted by the automounter (macOS `MNT_AUTOMOUNTED`, or `autofs`).
     pub automounted: bool,
-    /// On removable media (macOS `MNT_REMOVABLE`: a USB disk, a card; touching
-    /// one can raise the removable-volumes privacy prompt). Linux reads it from
-    /// where udisks mounts such media (`/media/…`, `/run/media/…`), since
-    /// mountinfo carries no flag for it; Windows from the device class
-    /// (`\Device\CdRom<n>`, `\Device\Floppy<n>`), not from a USB stick's
-    /// `HarddiskVolume` (see `local`).
+    /// True for removable media (`MNT_REMOVABLE` on macOS, `/media` or `/run/media`
+    /// on Linux, optical/floppy devices on Windows).
     pub removable: bool,
     /// Mounted read-only.
     pub read_only: bool,
-    /// What every mount sharing one free figure names alike: the APFS
-    /// container (`disk3` of `/dev/disk3s5`), or on Windows the volume's
-    /// GUID name (`Volume{6140fc3b-…}`: `\\?\` before it and `\` after it is
-    /// its root) — for each mount point of the volume and for a `subst`
-    /// letter onto it. `None` elsewhere ([`Mount::key`]).
+    /// Shared free-space pool identifier: APFS container (`disk3`) or Windows
+    /// volume GUID name (`Volume{...}`).
     pub container: Option<String>,
 }
 
 impl Mount {
-    /// The key of the free space this mount reads, where the table names
-    /// it: a Windows volume GUID name (`Volume{…}`) is
-    /// [`VolumeKey::Volume`], any other container [`VolumeKey::Container`].
-    /// `None` without a container: a reading keys by [`VolumeKey::Fsid`].
+    /// Free-space deduplication key ([`VolumeKey::Volume`] or [`VolumeKey::Container`]), if any.
     #[must_use]
     pub fn key(&self) -> Option<VolumeKey> {
         let c = self.container.as_deref()?;
@@ -121,8 +64,7 @@ impl Mount {
     }
 }
 
-/// The GUID (`{6140fc3b-…}`) of a Windows volume name (`Volume{6140fc3b-…}`),
-/// else `None`.
+/// Extract `{guid}` from a `Volume{guid}` name.
 fn volume_guid(name: &str) -> Option<&str> {
     let guid = name
         .get(6..)
@@ -130,12 +72,8 @@ fn volume_guid(name: &str) -> Option<&str> {
     (guid.len() == 38 && guid.starts_with('{') && guid.ends_with('}')).then_some(guid)
 }
 
-/// One file's identity: the device it lives on and its number there
-/// ([`file_id`]). Unix: `st_dev` and `st_ino`. Windows: `FILE_ID_INFO`'s
-/// 64-bit volume serial and 128-bit file id (ReFS and Dev Drive ids do not
-/// fit 64 bits; an NTFS id's low 64 bits are its file reference number) —
-/// never the 32-bit serial `GetFileInformationByHandle` answers, so no two
-/// widths ever meet in one comparison.
+/// Device and file identifier (`st_dev`/`st_ino` on Unix; 64-bit volume serial
+/// and 128-bit file ID from `FILE_ID_INFO` on Windows).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct FileId {
     /// The device: `st_dev`; the 64-bit volume serial on Windows.
@@ -144,20 +82,9 @@ pub struct FileId {
     pub ino: u128,
 }
 
-/// The identity of the file at `path` — of a link itself unless `follow`
-/// — read now: `stat`/`lstat` on unix; on Windows one open for
-/// `FILE_READ_ATTRIBUTES` (every sharing mode granted, a directory too,
-/// `FILE_FLAG_OPEN_REPARSE_POINT` unless `follow`) and
-/// `GetFileInformationByHandleEx(FileIdInfo)`, any spelling (verbatim,
-/// plain, any case, past `MAX_PATH`). `None` where it cannot be read: the
-/// path is missing or refused, its volume keeps no file ids (FAT and exFAT:
-/// never a narrower stand-in), or the platform has no reader. A caller
-/// reads `None` as UNKNOWN: in a removal fence it refuses, never "any
-/// device".
+/// Read [`FileId`] for `path` (following symlinks/reparse points only when `follow` is true).
 ///
-/// Every device and identity a Windows disk fence compares comes from here
-/// (or from `file_id_of_handle`, Windows only, on a handle already open), so
-/// two of them always mean the same width.
+/// Returns `None` if missing, inaccessible, or on a filesystem without stable file IDs.
 #[must_use]
 pub fn file_id(path: &Path, follow: bool) -> Option<FileId> {
     #[cfg(unix)]
@@ -185,9 +112,7 @@ pub fn file_id(path: &Path, follow: bool) -> Option<FileId> {
     }
 }
 
-/// The identity of the file `handle` has open ([`file_id`]):
-/// `GetFileInformationByHandleEx(FileIdInfo)`. `None` where its volume keeps
-/// no file ids (FAT, exFAT) or the query fails.
+/// Read [`FileId`] from an open Windows handle via `GetFileInformationByHandleEx(FileIdInfo)`.
 #[cfg(windows)]
 #[must_use]
 pub fn file_id_of_handle(handle: std::os::windows::io::BorrowedHandle<'_>) -> Option<FileId> {
@@ -199,12 +124,9 @@ pub fn file_id_of_handle(handle: std::os::windows::io::BorrowedHandle<'_>) -> Op
 pub struct Table {
     /// Every mount read, at most [`MAX_MOUNTS`].
     pub mounts: Vec<Mount>,
-    /// Every mount was read: nothing was cut and the read did not fail. A
-    /// fence that must see every mount point reads `false` as "proves
-    /// nothing".
+    /// True when the full mount table was read without truncation or error.
     pub complete: bool,
-    /// macOS's firmlinks: each root (`/Users`) and its data-volume spelling
-    /// (`/System/Volumes/Data/Users`). Empty elsewhere.
+    /// macOS firmlinks mapping root paths (`/Users`) to data-volume paths.
     pub firmlinks: Vec<(PathBuf, PathBuf)>,
 }
 
@@ -219,34 +141,27 @@ pub struct Reading {
     pub total: u64,
     /// Bytes free to an unprivileged writer now (`f_bavail`).
     pub free: u64,
-    /// Inodes free, where the file system counts them (never on Windows:
-    /// NTFS and ReFS have no fixed budget).
+    /// Free inodes, if tracked by the filesystem (`None` on Windows).
     pub files_free: Option<u64>,
-    /// The mount point's device (`st_dev`; on Windows the [`file_id`]
-    /// serial of the volume's root): the removal fence's.
+    /// Mount point device ID (`st_dev` on Unix, volume root serial on Windows).
     pub dev: u64,
     /// Mounted read-only.
     pub read_only: bool,
 }
 
-/// Which free space a reading is of: an APFS container's (every volume in it
-/// shares one), a Windows volume's, else one file system's.
+/// Identifier for a shared free-space pool.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum VolumeKey {
     /// An APFS container (`disk3`).
     Container(String),
     /// A file system's id (Linux `f_fsid`; macOS the mount point's `st_dev`).
     Fsid(u64),
-    /// A Windows volume, by the GUID the mount manager names it with
-    /// (`{6140fc3b-044f-43d7-b060-cb98170c7a63}` of
-    /// `\\?\Volume{6140fc3b-…}\`), lowercase: kept across boots and letter
-    /// changes, and unique where two volumes share a serial.
+    /// Lowercase Windows volume GUID (`{...}`).
     Volume(String),
 }
 
 impl VolumeKey {
-    /// A short spelling for a line or a file's key (`container:disk3`,
-    /// `fsid:16777234`, `volume:{6140fc3b-044f-43d7-b060-cb98170c7a63}`).
+    /// Canonical string key (`container:<c>`, `fsid:<id>`, or `volume:<guid>`).
     #[must_use]
     pub fn spelled(&self) -> String {
         match self {
@@ -266,8 +181,7 @@ pub enum Unread {
     Automounted,
     /// No mount of the table holds the path.
     NoMount,
-    /// The system refused the read (an errno; on Windows the Win32 error,
-    /// `ERROR_NOT_READY` for a drive with no medium).
+    /// OS error code (`errno` or Win32 error) when the query failed.
     Refused(i32),
     /// This platform has no reader.
     Unsupported,
@@ -288,9 +202,7 @@ impl Unread {
 }
 
 impl Table {
-    /// The data-volume spelling of `path` when it lies under a firmlinked
-    /// root (`/Users//x` → `/System/Volumes/Data/Users//x`), else `None`.
-    /// Lexical.
+    /// Translate `path` to its macOS data-volume path if under a firmlinked root.
     #[must_use]
     pub fn on_data(&self, path: &Path) -> Option<PathBuf> {
         self.firmlinks
@@ -300,94 +212,26 @@ impl Table {
             .and_then(|(root, data)| path.strip_prefix(root).ok().map(|rest| data.join(rest)))
     }
 
-    /// `path` as the file system places it (unix): its data-volume spelling
-    /// where a firmlink names it ([`Self::on_data`]), else itself. A mount
-    /// point is listed as it was mounted (`/Volumes/Recovery` lies under the
-    /// `/Volumes` firmlink), so both sides of a comparison are read this
-    /// way. Windows places by [`windows_placed`].
+    /// Return `path` mapped through macOS firmlinks if applicable.
     fn placed(&self, path: &Path) -> PathBuf {
         self.on_data(path).unwrap_or_else(|| path.to_path_buf())
     }
 
-    /// Whether `path` is `dir` or lies under it, as this table places both:
-    /// on Windows THE rule for comparing two paths from two sources (a
-    /// process's working directory or image against a build directory, a
-    /// session's directory against a mount), where a false "not under" reads
-    /// as "nobody uses it":
-    ///
-    /// * any spelling ([`paths::windows_key`]): verbatim or plain, any case;
-    /// * a `subst` letter followed to the directory it names (`S:\x` of
-    ///   `subst S: C:\work` lies under `C:\work`), a `\\?\Volume{…}\` path
-    ///   read through its volume's mount;
-    /// * through every mount point of a volume: `D:\x` lies under `C:\mnt\d`
-    ///   where `D:`'s volume is mounted at that folder too, and so does
-    ///   `C:\mnt\d\x` under `D:\`.
-    ///
-    /// `None` where it cannot be placed, which a caller reads as IN USE /
-    /// unknown: either side refused by [`paths::windows_key`] (an 8.3 short
-    /// name among them); a drive letter the table does not list (a `subst`
-    /// made since it was read); a path on a share or a network letter that
-    /// does not lie lexically under the other — a share can be the local
-    /// disk again (`\\localhost\C$\work`, a `net use` onto one), which only
-    /// its server knows; a table that is not [`Self::complete`], where a
-    /// mount point it missed may relate the two. Still lexical: a junction
-    /// or a symbolic link (canonicalize a recorded path first, or compare
-    /// [`file_id`]s).
-    ///
-    /// Elsewhere `Path::starts_with`, as [`paths::is_under`]: always placed.
+    /// Check whether `path` is at or under `dir`, resolving macOS firmlinks and
+    /// Windows volume mounts/`subst` drives. Returns `None` if placement is ambiguous.
     #[must_use]
     pub fn is_under(&self, path: &Path, dir: &Path) -> Option<bool> {
         under_in(path, dir, self, cfg!(windows))
     }
 
-    /// `path` in a spelling [`paths::windows_key`] places: THE one rule for a
-    /// path a process or a shell reported with an 8.3 short name in it
-    /// (`C:\Users\ANDREW~1\x`: a process started in that spelling keeps it as
-    /// its working directory and image, a short `%TEMP%` hands it to every
-    /// child), which the key refuses and so places nowhere. Where the key
-    /// refuses `path` only for such names ([`paths::short_spelled`]) and
-    /// this table places the part before them on a mount it calls local and
-    /// not automounted, the file system is asked for the long spelling of
-    /// the part through the LAST short name ([`long_name`]:
-    /// `GetLongPathNameW`, each short name replaced by the long name its own
-    /// directory lists for it, with the system's error boxes off), and the
-    /// names after it are appended as they are — they need not exist, so a
-    /// directory a tab names before it is made, or after it is removed,
-    /// places too (`\\?\C:\Users\Andrew Yates\x\not-yet`).
-    ///
-    /// LEXICAL, as the key is: a link among the short names keeps its own
-    /// long name, never its target's, so a short spelling places exactly
-    /// where its long spelling would — a working directory inside a junction
-    /// under a candidate is under the candidate either way — and whatever
-    /// reads a long spelling by identity besides (a process's handle to its
-    /// directory, the file mapped at a module's base, a `canonicalize` before
-    /// a volume read) reads the short one so too.
-    ///
-    /// Otherwise `path` as it is, which the key still refuses, so its caller
-    /// holds it as unknown: the part before its short names on a share or an
-    /// automounted volume (never asked: a stalled one answers by blocking) or
-    /// placed nowhere, a part through the short names that is gone or
-    /// refuses the listing, a long name the key refuses too. A path the key
-    /// places comes back as it is, untouched. Elsewhere always `path`: no
-    /// other platform has short names.
-    ///
-    /// Only the part before the first short name is placed before the file
-    /// system is asked: a link between it and the last short name can lead
-    /// to a share, where the call waits as long as the server does. A caller
-    /// that must not wait on one asks through [`Self::long_spelling_by`]
-    /// under a deadline of its own (the path-user scan's naming helper).
+    /// Expand 8.3 short components in `path` via [`long_name`] when its prefix lies on a
+    /// local, non-automounted Windows mount; returns `path` unchanged elsewhere or on failure.
     #[must_use]
     pub fn long_spelling<'p>(&self, path: &'p Path) -> std::borrow::Cow<'p, Path> {
         long_spelling_in(path, self, cfg!(windows), long_name)
     }
 
-    /// [`Self::long_spelling`], with `expand` asked in place of [`long_name`]
-    /// for the long spelling of the part through the last short name (an
-    /// existing verbatim path, [`paths::ShortSpelled::through`]) — the same
-    /// rule, the file system's call run where the caller says: the path-user
-    /// scan runs [`long_name`] on its naming helper under its deadline, so a
-    /// share that stalls holds one process, never the scan. `None` from
-    /// `expand` leaves `path` as it is: unplaced, so held.
+    /// Like [`Self::long_spelling`], using `expand` to resolve the short-named prefix.
     #[must_use]
     pub fn long_spelling_by<'p>(
         &self,
@@ -397,26 +241,13 @@ impl Table {
         long_spelling_in(path, self, cfg!(windows), expand)
     }
 
-    /// Whether `path` is one of this table's mount points: where a walk
-    /// stops. On Windows in any spelling, as [`Self::is_under`] places it —
-    /// a folder mount point verbatim or plain, any case, through a `subst`
-    /// letter or through another mount point of the volume it is on; a
-    /// `subst` letter is no mount point (it names a directory); `None` where
-    /// it cannot be placed, or is not found in a table that is not
-    /// [`Self::complete`]. Elsewhere one of [`Self::points`], spelled alike.
+    /// Check whether `path` is a mount point in this table (`None` if placement is ambiguous).
     #[must_use]
     pub fn is_mount_point(&self, path: &Path) -> Option<bool> {
         point_in(path, self, cfg!(windows))
     }
 
-    /// Every mount point as a walk meets it: each one's own spelling and, for
-    /// one on macOS's data volume, its firmlinked form (`/System/Volumes/Data/
-    /// home` and `/home`), sorted, each once. What a walk never enters or
-    /// `stat`s (`aterm_agent::harness::disk::discover`'s `Roots::mounts`). On
-    /// Windows each as the mount manager spells it (`C:\`, `C:\mnt\data`),
-    /// with the network's [`NETWORK`] and every `subst` letter: a path a walk
-    /// meets is spelled otherwise (`\\?\C:\…`, another case), so it is
-    /// compared by [`Self::is_mount_point`], never by `Path` equality.
+    /// All mount points in this table (including firmlink aliases on macOS), sorted and deduplicated.
     #[must_use]
     pub fn points(&self) -> Vec<PathBuf> {
         let mut out: Vec<PathBuf> = self.mounts.iter().map(|m| m.on.clone()).collect();
@@ -433,42 +264,18 @@ impl Table {
     }
 }
 
-/// The mount holding `path` in `t`: the longest mount point that is a prefix
-/// of it, component by component, each side read in its data-volume spelling
-/// where a firmlink names it ([`Table::on_data`]) — on Windows each side by
-/// its [`paths::windows_key`], so `\\?\C:\Users\x` and `c:\USERS\x\` place
-/// on `C:\` alike, a `\\?\Volume{…}\` path on that volume's mount and a path
-/// on a `subst` letter where the letter points. PURE: no path is touched, so
-/// a stalled mount cannot block it. `None` for a relative path, one that
-/// walks up through `..`, a spelling Windows cannot place
-/// ([`paths::windows_key`]), a table holding no mount of it, or a Windows
-/// table holding a mount point it cannot key (the path may lie on that
-/// point's volume, and never on the one above it).
+/// Longest-prefix mount in `t` containing `path` (pure, without touching the filesystem).
 #[must_use]
 pub fn mount_of<'a>(path: &Path, t: &'a Table) -> Option<&'a Mount> {
     mount_in(path, t, cfg!(windows))
 }
 
-/// Every mount of `t` AT or UNDER `dir` (lexical, both spellings of a
-/// firmlinked path; on Windows any spelling, through every mount point of a
-/// volume, as [`Table::is_under`] places it). PURE. A whole-directory
-/// removal reads this as "a volume is mounted inside": a Linux bind mount
-/// shares its source's `st_dev`, and a Windows folder mount point is a
-/// reparse point a walk must never cross, so a device fence alone cannot
-/// see either. A relative `dir` (or one with `..`, or a Windows spelling
-/// that cannot be placed) answers every mount, and on Windows every folder
-/// mount point not proven outside it is listed (one that cannot be keyed,
-/// or any in a table that is not complete): nothing is ruled out on a path
-/// nobody can place.
+/// All mounts in `t` at or lexically under `dir` (conservative when `dir` or table is ambiguous).
 pub fn mounts_under<'a>(dir: &Path, t: &'a Table) -> impl Iterator<Item = &'a Mount> + 'a {
     mounts_in(dir, t, cfg!(windows))
 }
 
-/// [`mount_of`] by the rule of Windows (`windows`) or of unix, so the pure
-/// tests hold the Windows rule on every platform. Windows: the mount
-/// [`holder`] of the path's [`windows_placed`] key — never a `subst` letter
-/// (a path on it is placed where the letter points), and none at all while
-/// a mount point cannot be keyed (the path may lie on that point's volume).
+/// Platform-selectable implementation of [`mount_of`].
 pub(crate) fn mount_in<'a>(path: &Path, t: &'a Table, windows: bool) -> Option<&'a Mount> {
     if windows {
         let key = windows_placed(path, &t.mounts)?;
@@ -486,11 +293,7 @@ pub(crate) fn mount_in<'a>(path: &Path, t: &'a Table, windows: bool) -> Option<&
         .map(|(m, _)| m)
 }
 
-/// [`mounts_under`] by the rule of Windows (`windows`) or of unix. Windows:
-/// a `subst` letter is no volume mounted anywhere, never listed; a root (a
-/// drive letter, [`NETWORK`]) is inside nothing but itself; a folder mount
-/// point is listed unless [`under_keys`] says it is not inside `dir` (so an
-/// unkeyed point, or an incomplete table, lists it).
+/// Platform-selectable implementation of [`mounts_under`].
 pub(crate) fn mounts_in<'a>(
     dir: &Path,
     t: &'a Table,
@@ -523,9 +326,7 @@ pub(crate) fn mounts_in<'a>(
     )
 }
 
-/// [`Table::long_spelling`] by the rule of Windows (`windows`) or of unix,
-/// asking `expand` for the long spelling of the part through the last short
-/// name, so the pure tests hold the rule on every platform.
+/// Platform-selectable implementation of [`Table::long_spelling_by`].
 pub(crate) fn long_spelling_in<'p>(
     path: &'p Path,
     t: &Table,
@@ -561,17 +362,7 @@ pub(crate) fn long_spelling_in<'p>(
     }
 }
 
-/// The long spelling the file system gives the existing `path`, whose names
-/// may be 8.3 short names ([`Table::long_spelling`]'s one call, public for a
-/// caller that runs it under a deadline of its own through
-/// [`Table::long_spelling_by`]). On Windows `GetLongPathNameW` with the
-/// system's error boxes off: each name replaced by the long name its own
-/// directory lists for it (`\\?\C:\Users\ANDREW~1` reads `\\?\C:\Users\Andrew
-/// Yates`), the spelling otherwise kept — a verbatim prefix stays, and a link
-/// is NOT followed (a junction answers its own long name). Every directory on
-/// the way is listed, so a link among them to a share waits on its server.
-/// `None` when the call fails (a name gone, a listing refused, an empty
-/// drive), and always elsewhere: no other platform has short names.
+/// Resolve 8.3 short names in an existing path via `GetLongPathNameW` on Windows (`None` elsewhere).
 #[must_use]
 pub fn long_name(path: &Path) -> Option<PathBuf> {
     #[cfg(windows)]
@@ -597,9 +388,7 @@ pub(crate) fn under_in(path: &Path, dir: &Path, t: &Table, windows: bool) -> Opt
     )
 }
 
-/// [`Table::is_under`] of two [`windows_placed`] keys: lexically under, or
-/// a [`spellings`] of `path` under one of `dir`'s; `None` where those
-/// cannot all be named, or `t` is not complete.
+/// Check whether placed Windows key `path` is under `dir` across all volume mount spellings.
 fn under_keys(path: &str, dir: &str, t: &Table) -> Option<bool> {
     if paths::key_under(path, dir) {
         return Some(true);
@@ -639,10 +428,7 @@ pub(crate) fn point_in(path: &Path, t: &Table, windows: bool) -> Option<bool> {
     )
 }
 
-/// The [`paths::windows_key`] of a Windows mount point as the mount manager
-/// lists it (`C:\`, `C:\mnt\data`), read VERBATIM: those are the names on
-/// disk, a folder named `data.` included, which a plain spelling would
-/// trim. [`NETWORK`] keys as itself. `None` where it cannot be keyed.
+/// Verbatim [`paths::windows_key`] for a mount-manager path (`NETWORK` maps to itself).
 fn point_key(on: &Path) -> Option<String> {
     let s = on.to_str()?;
     if s == NETWORK {
@@ -654,12 +440,7 @@ fn point_key(on: &Path) -> Option<String> {
     paths::windows_key(Path::new(&format!(r"\\?\{s}")))
 }
 
-/// The mount of the Windows `mounts` holding the placed key `key`: the
-/// deepest mount point it is at or under (strictly under when `strict`),
-/// never a `subst` letter, with the rest of `key` below that point
-/// (`USERS\X` of `C:\USERS\X` on `C:\`). `None` where no mount holds it, or
-/// where any mount point cannot be keyed ([`point_key`]): the key may lie
-/// on that point's volume, and is then on no other.
+/// Deepest non-`subst` mount containing `key`, and the relative suffix beneath it.
 fn holder<'a, 'k>(key: &'k str, mounts: &'a [Mount], strict: bool) -> Option<(&'a Mount, &'k str)> {
     let mut best: Option<(&Mount, usize)> = None;
     for m in mounts.iter().filter(|m| m.fstype != SUBST) {
@@ -675,20 +456,10 @@ fn holder<'a, 'k>(key: &'k str, mounts: &'a [Mount], strict: bool) -> Option<(&'
     Some((m, key[len..].trim_start_matches('\\')))
 }
 
-/// The most spellings [`spellings`] names one location by, and the most
-/// folder mount points it follows up from one: more is a volume mounted
-/// inside itself, and is not placed.
+/// Maximum alias spellings or folder-mount hops followed for a single path.
 const SPELLINGS: usize = 64;
 
-/// Every key the Windows namespace spells the location of the placed key
-/// `key` by: each mount point of its volume (a drive letter, each folder
-/// mount point) joined with its rest below the one holding it, and, for a
-/// folder mount point, each spelling of that folder on the volume holding
-/// it — `C:\MNT\D\X` and `D:\X` both, where `D:`'s volume is mounted at
-/// `C:\mnt\d` too. `None` where they cannot all be named: no mount holds
-/// it, or one with no volume GUID does (a share, a network letter, a letter
-/// whose volume was not read: what else names it only its server knows), a
-/// mount point cannot be keyed, or there are more than [`SPELLINGS`].
+/// All canonical Windows keys naming the same volume location as `key`.
 fn spellings(key: &str, mounts: &[Mount]) -> Option<Vec<String>> {
     let (m, rest) = holder(key, mounts, false)?;
     let mut out = Vec::new();
@@ -696,8 +467,7 @@ fn spellings(key: &str, mounts: &[Mount]) -> Option<Vec<String>> {
     Some(out)
 }
 
-/// [`spellings`] of `rest` below the root of volume `name`, `depth` folder
-/// mount points up from where it started.
+/// Recursively collect mount-point spellings for `rest` on volume `name`.
 fn spell(
     name: &str,
     rest: &str,
@@ -721,8 +491,6 @@ fn spell(
             out.push(spelled);
         }
         if !on.ends_with('\\') {
-            // A folder mount point: a folder of the volume holding it, which
-            // may itself be spelled more ways.
             let (above, at) = holder(&on, mounts, true)?;
             spell(volume_of(above)?, &joined(at, rest), mounts, depth + 1, out)?;
         }
@@ -735,9 +503,7 @@ fn volume_of(m: &Mount) -> Option<&str> {
     m.container.as_deref().filter(|c| volume_guid(c).is_some())
 }
 
-/// The key `base` with the relative key `rest` below it (`C:\` and `X` is
-/// `C:\X`; `C:\A` and `X` is `C:\A\X`; either alone where the other is
-/// empty).
+/// Join a Windows mount key `base` with relative suffix `rest`.
 fn joined(base: &str, rest: &str) -> String {
     match (base.is_empty() || base.ends_with('\\'), rest.is_empty()) {
         (_, true) => base.to_owned(),
@@ -746,21 +512,7 @@ fn joined(base: &str, rest: &str) -> String {
     }
 }
 
-/// [`paths::windows_key`] of `path` as the Windows table places it:
-///
-/// * a volume GUID path (`\\?\Volume{G}\x`, which names no letter) is
-///   spelled first through a mount point of volume `G` in `mounts`
-///   (`\\?\C:\x`; never a `subst` letter, which names a directory of the
-///   volume, not its root);
-/// * a path on a `subst` letter is the path the letter names (`S:\x` of
-///   `subst S: C:\work` is `C:\work\x`), letter after letter, at most
-///   [`SUBST_HOPS`] of them;
-/// * [`NETWORK`], the network's synthetic mount point, keys as itself, so
-///   every UNC path lies under it.
-///
-/// `None` where it cannot be placed: [`paths::windows_key`]'s refusals, a
-/// volume GUID path whose volume `mounts` mounts nowhere, a `subst` chain
-/// longer than [`SUBST_HOPS`].
+/// Normalize `path` into a Windows key, resolving `Volume{...}` roots and `subst` drives.
 fn windows_placed(path: &Path, mounts: &[Mount]) -> Option<String> {
     let s = path.to_str()?;
     if s == NETWORK {
@@ -792,7 +544,6 @@ fn windows_placed(path: &Path, mounts: &[Mount]) -> Option<String> {
         }) else {
             return Some(key);
         };
-        // The object manager's target (`\??\C:\work`) is literal: verbatim.
         let target = paths::windows_key(Path::new(target))?;
         let rest = key[on.len()..].trim_start_matches('\\');
         key = match (rest.is_empty(), target.ends_with('\\')) {
@@ -804,17 +555,13 @@ fn windows_placed(path: &Path, mounts: &[Mount]) -> Option<String> {
     None
 }
 
-/// The `fstype` of a Windows table's `subst` letter: its `from` is the
-/// object manager's target (`\??\C:\work`).
+/// Synthetic `fstype` for a Windows `subst` drive mapping.
 pub const SUBST: &str = "subst";
 
-/// The most `subst` letters one Windows placement follows ([`mount_of`],
-/// [`mounts_under`]): a longer chain is not placed.
+/// Maximum `subst` redirection hops followed when placing a Windows path.
 pub const SUBST_HOPS: usize = 8;
 
-/// The mount point of the Windows table's synthetic network mount: every
-/// UNC path (`\\srv\share\x`, `\\?\UNC\srv\share\x`) lies under it, so a
-/// caller reads [`Unread::Remote`] for one, never asking the server.
+/// Synthetic mount point covering all Windows UNC paths.
 pub const NETWORK: &str = r"\\";
 
 /// Absolute, and no `.` or `..` component.
@@ -825,9 +572,7 @@ fn plain_absolute(p: &Path) -> bool {
             .any(|c| matches!(c, Component::ParentDir | Component::CurDir))
 }
 
-/// The APFS container a mount's source names: `disk3` of `/dev/disk3s5`, of
-/// `/dev/disk3s1s1` (a sealed system snapshot) and of
-/// `com.apple.os.update-…@/dev/disk3s1`. `None` for any other source.
+/// Extract the APFS container name (`disk3`) from a mount source like `/dev/disk3s5`.
 #[must_use]
 pub fn apfs_container(from: &str) -> Option<String> {
     let dev = from.rsplit('@').next()?;
@@ -840,9 +585,7 @@ pub fn apfs_container(from: &str) -> Option<String> {
     Some(format!("disk{digits}"))
 }
 
-/// `/usr/share/firmlinks`' lines (`/Users\tUsers`): each root and its
-/// data-volume spelling. A line that is not two fields, or whose root is not
-/// absolute, is left out.
+/// Parse `/usr/share/firmlinks` tab-separated lines into `(root, data_volume_path)` pairs.
 #[must_use]
 pub fn parse_firmlinks(text: &str) -> Vec<(PathBuf, PathBuf)> {
     text.lines()
@@ -880,10 +623,7 @@ pub fn unescape_mount(field: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
-/// `/proc/self/mountinfo`'s `text` as a [`Table`]. `cut`: the read stopped at
-/// [`MOUNTINFO_CAP`]. A torn last line (no newline: the read was cut inside
-/// it) is dropped; a cut text, a line that does not parse, or more than
-/// [`MAX_MOUNTS`] mounts makes the table incomplete. PURE.
+/// Parse Linux `/proc/self/mountinfo` text into a [`Table`].
 #[must_use]
 pub fn parse_mountinfo(text: &str, cut: bool) -> Table {
     let whole = if text.ends_with('\n') {
@@ -897,7 +637,6 @@ pub fn parse_mountinfo(text: &str, cut: bool) -> Table {
         if line.trim().is_empty() {
             continue;
         }
-        // `<id> <parent> <maj:min> <root> <point> <opts> [optional…] - <type> <source> <super>`
         let fields: Vec<&str> = line.split(' ').collect();
         let Some(dash) = fields.iter().position(|f| *f == "-") else {
             complete = false;
@@ -941,8 +680,7 @@ pub fn parse_mountinfo(text: &str, cut: bool) -> Table {
     }
 }
 
-/// The strings of a `MULTI_SZ` buffer (each NUL-terminated, the list ended
-/// by an empty one or by the buffer). PURE.
+/// Split a NUL-separated `MULTI_SZ` UTF-16 buffer into slices.
 #[cfg(any(windows, test))]
 pub(crate) fn multi_sz(buf: &[u16]) -> Vec<&[u16]> {
     buf.split(|&c| c == 0)
@@ -950,28 +688,21 @@ pub(crate) fn multi_sz(buf: &[u16]) -> Vec<&[u16]> {
         .collect()
 }
 
-/// What a Windows DOS device name points at, as `QueryDosDeviceW` spells
-/// its target ([`device_class`]).
+/// Classification of a Windows `QueryDosDeviceW` target path.
 #[cfg(any(windows, test))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Device<'a> {
-    /// `\Device\HarddiskVolume<n>`: a partition, an attached VHD(X), a
-    /// Storage Spaces, BitLocker or Dev Drive volume. LOCAL.
+    /// Local `\Device\HarddiskVolume<n>` volume.
     Volume,
-    /// `\Device\CdRom<n>`, `\Device\Floppy<n>`: removable media, where a
-    /// question may wait for a medium. Never read ([`Unread::Automounted`]).
+    /// Optical or floppy drive (`\Device\CdRom<n>`, `\Device\Floppy<n>`).
     Removable,
     /// `\??\C:\work`: a `subst` letter onto the drive path it carries.
     Subst(&'a str),
-    /// Anything else: a network redirector (`\Device\LanmanRedirector\…`,
-    /// `\Device\Mup\…`, WebDAV's, RDP's `RdpDr`, WSL's `P9Rdr`), a user-mode
-    /// file system, a `subst` onto a share, a device nobody has measured.
-    /// Never asked ([`Unread::Remote`]): a stalled one answers by blocking.
+    /// Network redirector, virtual filesystem, or unclassified device.
     Remote,
 }
 
-/// The class of the object-manager target `target` (an allowlist: only a
-/// numbered `\Device\HarddiskVolume` is local). PURE.
+/// Classify an NT object-manager device target string.
 #[cfg(any(windows, test))]
 pub(crate) fn device_class(target: &str) -> Device<'_> {
     let numbered = |prefix: &str| {
@@ -1003,38 +734,13 @@ pub(crate) fn device_class(target: &str) -> Device<'_> {
 pub(crate) struct VolumeSeen {
     /// Its GUID name, `Volume{6140fc3b-…}`.
     pub(crate) name: String,
-    /// The NT device it is (`\Device\HarddiskVolume3`); `None` when that
-    /// could not be read.
+    /// NT device path (`\Device\HarddiskVolume3`), if readable.
     pub(crate) device: Option<String>,
-    /// Every path it is mounted at (`C:\`, `C:\mnt\data\`); `None` when
-    /// they could not be read.
+    /// Mounted paths (`C:\`, `C:\mnt\data\`), if readable.
     pub(crate) paths: Option<Vec<PathBuf>>,
 }
 
-/// The Windows [`Table`] of what the mount manager and the object manager
-/// said: `volumes`, each with its device and mount points; `letters`, every
-/// drive letter this process sees with its target in this session (`None`:
-/// unread); `complete`: the volume enumeration finished. PURE.
-///
-/// * Each mount point of a volume is a mount: `from` its device, `fstype`
-///   empty (no file system is asked), `container` its GUID name, LOCAL for a
-///   `\Device\HarddiskVolume<n>`, automounted for removable media
-///   ([`device_class`]).
-/// * A letter whose target in this session is not its volume's device (a
-///   per-session `subst` or `net use` over it) is read as that target, and
-///   so is every folder mount point spelled through it (`D:\mnt\x\` of
-///   another volume lies on the share this session's `D:` is). A folder
-///   mount point spelled through a letter no volume read here owns is kept,
-///   and the table is incomplete.
-/// * Every other letter is a mount of its own, from its target: a volume's
-///   letter (LOCAL), removable media, a [`SUBST`] letter (local and
-///   keyed as what it points at; never placed on: [`mount_of`] follows it),
-///   or a remote one.
-/// * The synthetic [`NETWORK`] mount holds every UNC path, remote.
-/// * A volume or letter that could not be read, or more than
-///   [`MAX_MOUNTS`] mounts, makes the table incomplete: a fence that needs
-///   every mount (a folder mount point missed inside a build directory)
-///   reads it as proving nothing.
+/// Assemble a Windows [`Table`] from enumerated volumes and per-session drive letters.
 #[cfg(any(windows, test))]
 pub(crate) fn windows_table(
     volumes: &[VolumeSeen],
@@ -1058,8 +764,6 @@ pub(crate) fn windows_table(
             .find(|(l, _)| l.eq_ignore_ascii_case(&letter))
             .map(|(_, t)| t.as_deref())
     };
-    // The device a drive letter names for every session: the volume's whose
-    // mount points hold its root.
     let owner = |letter: char| {
         volumes
             .iter()
@@ -1082,8 +786,6 @@ pub(crate) fn windows_table(
         for p in points {
             let root = letter_root(p).is_some();
             if let Some(letter) = drive_letter(p) {
-                // A root is this volume's letter; a folder mount point is
-                // spelled through the letter of the volume it is a folder of.
                 let global = if root {
                     v.device.as_deref()
                 } else {
@@ -1091,14 +793,8 @@ pub(crate) fn windows_table(
                 };
                 match in_session(letter) {
                     Some(Some(t)) if global.is_some_and(|d| d.eq_ignore_ascii_case(t)) => {}
-                    // This session's letter names something else (a
-                    // per-session `subst` or `net use` over it): the letter
-                    // is read below as it points, and so is every folder
-                    // spelled through it.
+                    // Skip mounts shadowed by a per-session `subst` or network drive.
                     Some(Some(_)) if root || global.is_some() => continue,
-                    // A folder spelled through a letter no volume read here
-                    // owns, or a letter's target unread: kept, and the
-                    // table proves nothing.
                     Some(_) => complete = false,
                     None => {}
                 }
@@ -1157,7 +853,6 @@ pub(crate) fn windows_table(
         complete,
         firmlinks: Vec::new(),
     };
-    // A `subst` letter reads as the mount it points into.
     for i in 0..t.mounts.len() {
         if t.mounts[i].fstype != SUBST {
             continue;
@@ -1180,8 +875,7 @@ fn letter_root(p: &Path) -> Option<char> {
     }
 }
 
-/// The drive letter a path is spelled through (`C` of `C:\` and of
-/// `C:\mnt\data\`), else `None`.
+/// Leading ASCII drive letter of `p`, if any.
 #[cfg(any(windows, test))]
 fn drive_letter(p: &Path) -> Option<char> {
     match p.to_str()?.as_bytes() {
@@ -1190,10 +884,7 @@ fn drive_letter(p: &Path) -> Option<char> {
     }
 }
 
-/// The drive letters of `GetLogicalDrives`' mask (bit 0 `A:`), or `None`
-/// for a mask naming none: that call answers 0 only when it fails (a booted
-/// Windows always has its system drive), and a table read without its
-/// letters misses every per-session `subst` and `net use`. PURE.
+/// Decode a `GetLogicalDrives` bitmask into uppercase drive letters (`None` if zero).
 #[cfg(any(windows, test))]
 pub(crate) fn drive_letters(mask: u32) -> Option<Vec<char>> {
     let letters: Vec<char> = (b'A'..=b'Z')
@@ -1204,8 +895,7 @@ pub(crate) fn drive_letters(mask: u32) -> Option<Vec<char>> {
     (!letters.is_empty()).then_some(letters)
 }
 
-/// A mount point as the mount manager spells it (`C:\mnt\data\`), without
-/// its trailing separator unless it is a drive's root (`C:\`).
+/// Strip trailing backslash from non-root Windows mount points.
 #[cfg(any(windows, test))]
 fn mount_point(p: &Path) -> PathBuf {
     match p.to_str() {
@@ -1216,19 +906,7 @@ fn mount_point(p: &Path) -> PathBuf {
     }
 }
 
-/// The machine's mount table now, read without asking any file system:
-/// `getfsstat(MNT_NOWAIT)` and `/usr/share/firmlinks` on macOS, one bounded
-/// read of `/proc/self/mountinfo` on Linux; on Windows the mount manager
-/// (`FindFirstVolumeW`/`FindNextVolumeW`, `GetVolumePathNamesForVolumeNameW`
-/// for every drive letter and folder mount point) and the object manager
-/// (`GetLogicalDrives`, `QueryDosDeviceW` for each volume's device and each
-/// letter's target: `subst` and network letters). There a volume's mount
-/// points are LOCAL only for a `\Device\HarddiskVolume<n>`, removable media
-/// are automounted, every other device is remote, a `subst` letter is
-/// followed to where it points ([`SUBST`]), every UNC path lies under the
-/// synthetic remote [`NETWORK`] mount, and anything unread leaves the table
-/// incomplete. An empty INCOMPLETE table elsewhere (and where the read
-/// fails).
+/// Read the machine's current mount table without querying remote filesystems.
 #[must_use]
 pub fn table() -> Table {
     #[cfg(target_os = "macos")]
@@ -1252,19 +930,11 @@ pub fn table() -> Table {
     }
 }
 
-/// One volume read now, through its mount point `m` — only one the table
-/// calls local and not automounted ([`Unread`] otherwise): one `statfs`
-/// (macOS) or `statvfs` (Linux) and one `stat` for its device. On Windows,
-/// through the volume's GUID root (`\\?\Volume{…}\`: no letter, no `subst`,
-/// no `MAX_PATH`) with the system's error boxes off: `GetDiskFreeSpaceExW`
-/// (`free` is free to this caller), `GetVolumeInformationW` (read-only) and
-/// the root's [`file_id`] for its device — a volume that keeps no file ids
-/// (FAT, exFAT) is refused rather than given a device of another width.
+/// Query capacity, free space, and device ID for a local, non-automounted [`Mount`].
 ///
 /// # Errors
 ///
-/// The mount is remote or automounted, the system refused the read, or this
-/// platform has no reader.
+/// Returns [`Unread`] if the mount is remote, automounted, refused by the OS, or unsupported.
 pub fn read(m: &Mount) -> Result<Reading, Unread> {
     if m.automounted || m.fstype == "autofs" {
         return Err(Unread::Automounted);
@@ -1282,16 +952,7 @@ pub fn read(m: &Mount) -> Result<Reading, Unread> {
     }
 }
 
-/// Is the volume `m` mounts a FIXED disk (`GetDriveTypeW` on its root, the
-/// volume's GUID root where the table names one, else its own mount point,
-/// verbatim)? Windows only: the table's [`Mount::local`] is a local DEVICE,
-/// and a USB stick's or an attached VHD's volume is one too; a removal that
-/// must stay on fixed disks asks this as well. `Some(false)` for a mount the
-/// table calls remote (the synthetic [`NETWORK`] one included), for a
-/// [`SUBST`] letter (an alias, never a volume of its own: [`mount_of`]
-/// follows it to the volume, which is asked instead) and for every other
-/// kind (removable, optical, RAM disk, remote); `None` when the kind could
-/// not be named — which a removal reads as refused.
+/// Check whether `m` is backed by a fixed disk (`DRIVE_FIXED`) on Windows (`None` if unknown).
 #[cfg(windows)]
 #[must_use]
 pub fn is_fixed(m: &Mount) -> Option<bool> {
@@ -1301,12 +962,11 @@ pub fn is_fixed(m: &Mount) -> Option<bool> {
     arm::drive_type(m).map(|kind| kind == crate::win_paths::DRIVE_FIXED)
 }
 
-/// [`read`] of the volume holding `path` in `t` ([`mount_of`]).
+/// Resolve `path` in `t` via [`mount_of`] and [`read`] its volume.
 ///
 /// # Errors
 ///
-/// As [`read`]; [`Unread::NoMount`] when no mount of `t` holds it, and
-/// [`Unread::Unsupported`] where there is no reader.
+/// Returns [`Unread::NoMount`] if unmounted in `t`, or the error from [`read`].
 pub fn read_path(path: &Path, t: &Table) -> Result<Reading, Unread> {
     if cfg!(not(any(target_os = "macos", target_os = "linux", windows))) {
         return Err(Unread::Unsupported);
@@ -1320,7 +980,6 @@ fn read_capped(path: &Path, cap: usize) -> Option<(String, bool)> {
     use std::io::Read as _;
     let f = std::fs::File::open(path).ok()?;
     let mut buf = Vec::with_capacity(cap.min(16 * 1024));
-    // One byte past the cap says whether there was more.
     let n = f
         .take(u64::try_from(cap).unwrap_or(u64::MAX).saturating_add(1))
         .read_to_end(&mut buf)
@@ -1335,11 +994,7 @@ mod arm {
     use super::{Mount, Reading, Table, Unread, VolumeKey, apfs_container, parse_firmlinks};
     use std::path::{Path, PathBuf};
 
-    // `<sys/mount.h>`: `int getfsstat(struct statfs *buf, int bufsize, int mode)`.
-    // Declared here because the first-party `libc` does not carry it; Intel
-    // spells the 64-bit-inode `statfs` it fills as `getfsstat$INODE64`, as
-    // `libc::statfs` itself is `statfs$INODE64` there (`spawn_folder.rs`
-    // declares it the same way).
+    // `<sys/mount.h>` `getfsstat` (`getfsstat$INODE64` on x86_64 macOS).
     unsafe extern "C" {
         #[cfg_attr(target_arch = "x86_64", link_name = "getfsstat$INODE64")]
         fn getfsstat(
@@ -1349,7 +1004,6 @@ mod arm {
         ) -> libc::c_int;
     }
 
-    /// `<sys/mount.h>`.
     const MNT_NOWAIT: libc::c_int = 2;
     const MNT_RDONLY: u32 = 0x0000_0001;
     const MNT_LOCAL: u32 = 0x0000_1000;
@@ -1380,8 +1034,6 @@ mod arm {
         };
         // SAFETY: `statfs` is integers and arrays of them: all-zero is a value.
         let blank: libc::statfs = unsafe { std::mem::zeroed() };
-        // Room for a few mounted between the two calls, and one past the cap
-        // to tell a table longer than it.
         let room = count.saturating_add(4).min(super::MAX_MOUNTS + 1);
         let mut buf = vec![blank; room];
         let Ok(bytes) = libc::c_int::try_from(std::mem::size_of_val(buf.as_slice())) else {
@@ -1390,9 +1042,7 @@ mod arm {
                 ..Table::default()
             };
         };
-        // SAFETY: `buf` is `bytes` writable bytes of whole `statfs` records,
-        // and getfsstat writes at most that many, answering how many it wrote.
-        // MNT_NOWAIT asks no file system, so a stalled mount cannot block it.
+        // SAFETY: `buf` has `bytes` writable bytes; `MNT_NOWAIT` does not block on mounts.
         let written = unsafe { getfsstat(buf.as_mut_ptr(), bytes, MNT_NOWAIT) };
         let Ok(written) = usize::try_from(written) else {
             return Table {
@@ -1512,7 +1162,6 @@ mod arm {
         let volumes: Vec<VolumeSeen> = names
             .iter()
             .map(|full| {
-                // `\\?\Volume{…}\`: the object manager knows it as `Volume{…}`.
                 let name = full
                     .trim_start_matches(r"\\?\")
                     .trim_end_matches('\\')
@@ -1533,8 +1182,7 @@ mod arm {
         windows_table(&volumes, &letters, complete && drives.is_some())
     }
 
-    /// The root every reading of `m` goes through: its volume's GUID root
-    /// where the table names one, else its own mount point, verbatim.
+    /// Verbatim volume GUID root or mount path for querying `m`.
     fn root(m: &Mount) -> PathBuf {
         match m.container.as_deref().filter(|c| volume_guid(c).is_some()) {
             Some(name) => PathBuf::from(format!(r"\\?\{name}\")),

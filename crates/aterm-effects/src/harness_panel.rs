@@ -334,7 +334,7 @@ pub fn name_x(row_t: f32, j: usize, len: usize) -> f32 {
 /// Cell `i` of a `cells`-wide bar: the whole palette, first cell to last.
 #[must_use]
 #[inline]
-pub fn bar_x(i: usize, cells: usize) -> f32 {
+pub const fn bar_x(i: usize, cells: usize) -> f32 {
     if cells > 1 {
         (i as f32 / (cells - 1) as f32).clamp(0.0, 1.0)
     } else {

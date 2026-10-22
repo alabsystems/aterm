@@ -81,8 +81,8 @@ fn reap_in_background(
 }
 
 /// Replays the steps the real stand-down emitted against the derived overlap
-/// model from the launched-but-ungranted state — dialled and held, or (round
-/// eight's lead U41) never dialled — requiring each to be enabled. A stand-down
+/// model from the launched-but-ungranted state — dialled and held, or
+/// never dialled — requiring each to be enabled. A stand-down
 /// that skipped the kill or retired before the reap has no admitted trace.
 fn project_onto_the_model(model: &Model, steps: &[StandDownStep], dialled: bool) -> State {
     let mut state = model.init_state();
@@ -409,7 +409,7 @@ fn assert_the_undialled_stand_down_licenses_the_retire(steps: &[StandDownStep]) 
     assert_a_live_successor_cannot_retire(&model, false);
 }
 
-/// ROUND EIGHT'S LEAD U41. The dial budget runs out with the launched successor
+/// The dial budget runs out with the launched successor
 /// alive and undialled — inside its boot on a loaded desk, or wedged — and the
 /// deadline arm retired the attempt over it, killing nothing: a retry launched
 /// beside it, a wedged one lived on window-less, and one the machine killed

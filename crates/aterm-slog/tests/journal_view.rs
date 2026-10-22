@@ -615,8 +615,8 @@ fn relaunched(ep: u32, start: u64, marks: u64) -> Log {
     log
 }
 
-/// THE JOURNAL SHOWS THE RELAUNCH'S OWN OPEN (session log phase 6, 6A-2,
-/// ruling U1): a session relaunched under the same sid (a
+/// THE JOURNAL SHOWS THE RELAUNCH'S OWN OPEN:
+/// a session relaunched under the same sid (a
 /// `$ATERM_SESSION_ID` re-adoption) by a process that quit, journaled by
 /// two chains. This build's producer starts the relaunch's log in an epoch
 /// above the predecessor's, a space of its own; and a producer that reused
@@ -675,9 +675,9 @@ fn the_journal_shows_the_relaunchs_own_open() {
     );
 }
 
-/// A `#handed` LINK KEEPS ONE SPACE THROUGH A DISAGREEMENT (session log
-/// phase 6, 6A-2, ruling U1: the view splits two chains "that no `#handed`
-/// line links"): a seamless update's predecessor journals the session and
+/// A `#handed` LINK KEEPS ONE SPACE THROUGH A DISAGREEMENT (the view splits two chains "that no `#handed`
+/// line links"):
+/// a seamless update's predecessor journals the session and
 /// hands it on (`#handed`); its carried successor, in the same base,
 /// journals its own records and one record at a seq of the predecessor's
 /// that is not the predecessor's (a restatement that does not match). The
@@ -932,6 +932,88 @@ fn a_burst_between_passes_loses_nothing_the_writer_could_write() {
     );
 }
 
+/// A host's row rule for [`a_burst_loses_nothing_the_writer_could_write_with_rows_kept`]:
+/// a status mark is a timeline row.
+fn status_rows(r: &Rec) -> u8 {
+    u8::from(r.op == Op::Mark && r.k == Kind::Status)
+}
+
+/// THE ROW FLOOR YIELDS TO THE WRITER (6G-1's floor, the review of 6G-1):
+/// the burst above on a ring that keeps a host's rows (16 status rows, the
+/// floor of a ring of 64, then 20 commands, all taken by the writer, then
+/// 25 commands before its next pass) still loses nothing the writer could
+/// write: within the records the writer holds the floor runs last, and
+/// every record it holds goes before one it has not reached, so the rows
+/// the batch took are rows the writer holds (the view tells their ids as a
+/// hole). CONTROL: the same burst with no row rule loses nothing either,
+/// and the batch did take rows. NEGATIVE CONTROL (scratch, at the fix):
+/// the floor's passes outside the writer's tiers take 5 records it had not
+/// reached.
+#[test]
+fn a_burst_loses_nothing_the_writer_could_write_with_rows_kept() {
+    let burst = |rows: bool| -> (u64, Log) {
+        let limits = Limits::new(64, 1 << 20).expect("a ring");
+        let mut log = Log::with_limits(1, limits);
+        if rows {
+            log.keep_rows(status_rows, 0);
+        }
+        open_session(&mut log, 0);
+        let mut ms = 1;
+        for i in 0..16u32 {
+            ms += 1;
+            log.mark(
+                Mark::new(Kind::Status, Src::Status, Conf::Strong).fields(
+                    Fields::new()
+                        .word(
+                            Key::Phase,
+                            if i.is_multiple_of(2) {
+                                "running"
+                            } else {
+                                "idle"
+                            },
+                        )
+                        .expect("a phase"),
+                ),
+                at(ms),
+            )
+            .expect("a status mark");
+        }
+        let run = |log: &mut Log, ms: &mut u64| {
+            *ms += 2;
+            let r = cmd(log, *ms);
+            log.close(
+                r,
+                Close::new(Out::Run(RunOut::Ok), Src::Shell, Conf::Exact),
+                at(*ms + 1),
+            )
+            .expect("closes");
+        };
+        for _ in 0..20 {
+            run(&mut log, &mut ms);
+        }
+        let mut w = Writer::new("p1-a1", 0);
+        w.pass_once(&mut log, 512, true, false);
+        assert_eq!(log.lost(), 0, "the writer took everything");
+        for _ in 0..25 {
+            run(&mut log, &mut ms);
+        }
+        assert!(log.len() <= 64, "the ring keeps its bounds");
+        let tk = take(&log, w.cursor, 512, false);
+        (tk.gap.map_or(0, |g| g.lost), log)
+    };
+    let (lost, log) = burst(true);
+    assert_eq!(lost, 0, "nothing the writer could take was evicted");
+    let taken = log.rows_lost_between(0, log.row_head());
+    assert!(taken > 0, "the batch took floor rows: {taken}");
+    assert_eq!(
+        log.rows().count() as u64 + taken,
+        16,
+        "every row is live or a hole"
+    );
+    let (lost, _) = burst(false);
+    assert_eq!(lost, 0, "CONTROL: no row rule, no loss");
+}
+
 /// A TAKE IS DONE only when the session's close is among what it took: a
 /// session that closes during an update's overlap is fenced past its close,
 /// and its writer must keep it to write the close after a rollback.
@@ -1049,7 +1131,7 @@ fn a_dropped_session_is_said_in_its_space() {
     assert_eq!(v.log.last_seq(), through);
 }
 
-/// THE WRITER'S WAKE (ruling R6) lives in the log: every append (each record
+/// THE WRITER'S WAKE lives in the log: every append (each record
 /// of a cascade), every eviction, an overlap and a fence change ring the
 /// host's notifier; a log without one rings nothing, and a copy kept for the
 /// closed index rings nothing either.

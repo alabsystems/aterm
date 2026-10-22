@@ -10,7 +10,7 @@ use crate::native_ui::ActionId;
 #[path = "harness_every_tests.rs"]
 mod every;
 
-/// The page counts landings (design §12.4, slice 4c).
+/// The page counts landings (design §12.4).
 #[path = "harness_landings_tests.rs"]
 mod landings;
 
@@ -961,8 +961,8 @@ fn the_sweep_the_meta_wake_and_the_policy_feed_the_ab_clock() {
     host.shutdown_and_join();
 }
 
-/// A LAPSED CLAIM MOVES THE ARM AS A RELEASED ONE DOES (the review of
-/// a295792e4): an Off session behind another supervisor's ttl claim is on
+/// A LAPSED CLAIM MOVES THE ARM AS A RELEASED ONE DOES:
+/// an Off session behind another supervisor's ttl claim is on
 /// the Unsupervised arm; the holder dies without releasing it, and the
 /// presence timer's lapse (`Desk::lapse_supervisor`) removes the claim — the
 /// waiting stretch is the Off baseline's from that instant, and an open
@@ -1435,10 +1435,10 @@ fn a_failed_reread_beside_a_reading_is_said() {
 /// Land's prompts are `Land prompts` (they count the prompts typed, never
 /// landings); `Declined` and `Waited at limits` are drawn; the presses no
 /// safe rule proved are the row under `Approved`, labelled a part of it
-/// (`of those`), both windows, where the week had one — said once (the
-/// post-check of wave 1, owner-eye-6: the week holds today, so a suffix
-/// after each window said it twice), and never in the ledger's word
-/// `unproven` (its review, finding 4). Land's landings are their own row
+/// (`of those`), both windows, where the week had one — said once (owner-eye-6: the week holds today, so a suffix
+/// after each window said it twice),
+/// and never in the ledger's word
+/// `unproven` (its review). Land's landings are their own row
 /// over the prompts (§12.4.1), standing where the week had a prompt.
 /// NEGATIVE CONTROL: no `of those` row in a week with none.
 #[test]
@@ -1549,8 +1549,8 @@ fn what_the_harness_did_draws_every_family_the_fold_keeps() {
     );
 }
 
-/// ONE NAME FOR EACH COUNT, FROM THE CHIP TO THE PAGE (the post-check of
-/// wave 1, owner-eye-6): STATUS's today line, a SESSIONS row's day line
+/// ONE NAME FOR EACH COUNT, FROM THE CHIP TO THE PAGE (owner-eye-6):
+/// STATUS's today line, a SESSIONS row's day line
 /// and WHAT THE HARNESS DID say every count in one table's words — the
 /// label the line's word with its first letter upper case, and where the
 /// chip lights the act, the chip's own word (`↻ kept going`): `Kept going`,
@@ -1946,7 +1946,7 @@ fn the_sessions_state_line_is_formatted_from_the_glass_for_every_state() {
             "{view:?}: its own day names none"
         );
     }
-    // A WEEK ON (the review's finding 3): a face's clock and the `last:` act
+    // A WEEK ON: a face's clock and the `last:` act
     // name their date, never the weekday that is today's own (`Fri` on the
     // Friday after).
     for (view, glass, line) in [
@@ -2447,7 +2447,7 @@ fn a_page_held_open_across_the_minute_names_the_day_from_then_on() {
 }
 
 /// A PAGE HELD OPEN PAST MIDNIGHT READS THE NEW DAY (§10.3.3 item 10,
-/// §10.2.3 item 6; the review of v3/stats-fold, finding 1): with no
+/// §10.2.3 item 6; the review of v3/stats-fold): with no
 /// `[harness] land_at`, Settings ▸ Harness shown at 23:50 on a Friday over
 /// that day's reading owes ONE wake, at the next local midnight; short of
 /// it nothing is read, and past it the page asks for a reading (STATUS's
@@ -2571,7 +2571,7 @@ fn a_page_held_open_past_midnight_reads_the_new_day() {
 }
 
 /// THE LANDING LETS GO AT THE NEXT PRESS OR SCROLL (§10.3.1; the review of
-/// v3/stats-fold, finding 3): the landed row's Show is drawn selected until
+/// v3/stats-fold): the landed row's Show is drawn selected until
 /// the wheel (`ScrollLines`), Page Up or Down (`ScrollPage`), or Up or Down
 /// (`StepFocus`, which moves the keyboard or, with no control of the list
 /// focused, scrolls the list a row) — read from the view's own focus, since
@@ -3226,7 +3226,7 @@ fn show_raises_the_sessions_tab_and_focuses_its_pane() {
     assert_eq!(tab_pane(&app), Some(right), "a gone session moves nothing");
 }
 
-/// A LANDING STANDS UNTIL A RENDER HAS DRAWN IT (post-check of wave 1,
+/// A LANDING STANDS UNTIL A RENDER HAS DRAWN IT (
 /// behaviour-2 and owner-eye-2): the Autopilot menu's `Harness settings…`
 /// (or `⊘ off`) on a Settings ▸ Harness tab that is already open and drawn —
 /// scrolled to its bottom, or at its top with the row below the fold —

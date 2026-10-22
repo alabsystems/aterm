@@ -2,7 +2,7 @@
 // Copyright 2026 Andrew Yates
 
 //! THE BUS MIRROR, BRIDGE HALF, its pure parts (`docs/DESIGN-session-log-2026-10-15.md`
-//! §5.5, session log phase 4): the `[fabric] log` mode, a take's slots as the
+//! §5.5): the `[fabric] log` mode, a take's slots as the
 //! endpoint frames them, the PIN that holds one batch across a crash, the
 //! landing line and its answer, the rate bucket and the node's alias key
 //! (minted once, kept durably in `logkey` and copied into the pin,
@@ -10,7 +10,7 @@
 //!
 //! WHAT OUTLIVES A REBOOT HAS A DURABLE COPY. The pin is atomic only, so a
 //! power cut may roll it back or tear it, and two things in it no reboot ends:
-//! the alias key (ruling Q6) and the node's lifetime total (ruling Q13). The
+//! the alias key and the node's lifetime total. The
 //! key is written durably to `logkey` before the first take that names it, so
 //! no alias derived from it reaches the bus before it is on the media; the
 //! total has a durable FLOOR, `logfloor`, raised by [`FLOOR_LEASE_BYTES`] past
@@ -30,11 +30,11 @@
 //! sequence, session, cursor and body. A bridge killed at any point after the
 //! pin republishes exactly the pinned bytes at exactly the pinned sequences,
 //! which the broker answers with the original offsets, and a deduped answer
-//! is read back and compared before it counts (ruling Q3): a foreign record
+//! is read back and compared before it counts: a foreign record
 //! at a pinned sequence is a collision, never a landing. Only when every slot
 //! is on the bus does the bridge say `log-landed`, and only once every
 //! session has answered for its pairs is the pin emptied. Readers dedupe by
-//! the body's `(node, sid, ep, seq)` (ruling Q0), so what the pin buys is a
+//! the body's `(node, sid, ep, seq)`, so what the pin buys is a
 //! duplicate-free bus in the ordinary case, not a correctness claim.
 
 use std::fmt::Write as _;
@@ -44,7 +44,7 @@ use aterm_slog::BusCursor;
 /// `[fabric] log`: whether the bridge mirrors the session logs.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum LogMode {
-    /// THE DEFAULT (owner decision D4, session log Phase 6 step 6E-3): the
+    /// THE DEFAULT (owner decision D4): the
     /// bus class is mirrored while the broker RETAINS it, its `Hello`
     /// advertising a prefix rule over this node's `ev` faces
     /// ([`crate::broker_rules::retains_ev`]), as `aterm link broker` does by
@@ -85,8 +85,7 @@ impl LogMode {
 }
 
 /// The most slots one batch takes: half the publisher's pipeline window, so
-/// a batch never fills it and another publish never waits behind it in line
-/// (ruling Q10).
+/// a batch never fills it and another publish never waits behind it in line.
 pub const BATCH_MAX: usize = 32;
 /// The rate bucket's sustained records a second, before retention exists in
 /// the broker (§8.1): past it records wait in their rings and become exact
@@ -94,17 +93,16 @@ pub const BATCH_MAX: usize = 32;
 pub const RATE_PER_SEC: u64 = 10;
 /// The rate bucket's burst.
 pub const RATE_BURST: u64 = 2048;
-/// THE NODE'S TOTAL of mirrored body bytes on a broker that retains nothing
-/// (ruling Q13): past it the mirror stops, said in `fabric status`
+/// THE NODE'S TOTAL of mirrored body bytes on a broker that retains nothing:
+/// past it the mirror stops, said in `fabric status`
 /// (`mirror=capped`). 256 MiB of bodies is about two million records, some
 /// two hundred days of a busy agent node at the sustained rate's typical use.
 /// A lifetime gate, so it holds only where nothing is ever given up: on a
 /// broker whose `Hello` advertises a prefix rule over this node's `ev` faces
 /// ([`crate::broker_rules::retains_ev`]) the [`NODE_WINDOW_BYTES`] window
-/// budget replaces it (session log Phase 6 step 6E-2, ruling U41).
+/// budget replaces it.
 pub const TOTAL_MAX_BYTES: u64 = 256 * 1024 * 1024;
-/// THE NODE'S WINDOW BUDGET on a retaining broker (session log Phase 6 step
-/// 6E-2, ruling U41; §5.5's "64 MiB per node"): the mirrored body bytes this
+/// THE NODE'S WINDOW BUDGET on a retaining broker (§5.5's "64 MiB per node"): the mirrored body bytes this
 /// node landed at offsets at or above the broker's `oldest=` for its `ev`
 /// faces are at most this, held by the producer. The broker's bulk stream
 /// keeps 256 MiB ([`crate::broker_rules::EV_BYTES`]): four nodes at their
@@ -122,7 +120,7 @@ pub const NODE_WINDOW_BYTES: u64 = 64 * 1024 * 1024;
 /// (2 MiB of a full window). So a node at its budget goes on once the cut has
 /// passed that much more than its exact share, whatever its batch sizes.
 pub const WINDOW_LEDGER_MAX: usize = 64;
-/// THE FLOOR'S LEASE (ruling Q13 across a power cut): how far past a batch's
+/// THE FLOOR'S LEASE: how far past a batch's
 /// bytes `logfloor` is raised, durably, when the batch would pass it — so the
 /// floor costs one durable write per MiB of bodies (some eight thousand
 /// records, minutes at the sustained rate). The price is paid at each reboot
@@ -206,15 +204,15 @@ pub struct PinSlot {
 }
 
 /// THE PIN: the one batch in flight, the node's running total of mirrored
-/// body bytes (ruling Q13), the node's ALIAS KEY (ruling Q6) and its WINDOW
-/// LEDGER (ruling U41), as `logpin` holds them.
+/// body bytes, the node's ALIAS KEY and its WINDOW
+/// LEDGER, as `logpin` holds them.
 ///
 /// ```text
 /// logpin v=2 inc=<inc> n=<k> total=<bytes> key=<32 hex> win=<off>:<bytes>,…
 /// <pseq> <sid> <ep>:<seq>:<ms> <body>        (k lines)
 /// ```
 ///
-/// `win=` (session log Phase 6 step 6E-2) is read past by a reader from
+/// `win=` is read past by a reader from
 /// before it, as every word after `total=` is; a pin without it has an empty
 /// ledger.
 ///
@@ -247,7 +245,7 @@ pub struct Pin {
     pub total: u64,
     /// The node's alias key (`None`: a pin written before it, or none minted).
     pub key: Option<[u8; 16]>,
-    /// THE WINDOW LEDGER (ruling U41): per landed batch, oldest first, the
+    /// THE WINDOW LEDGER: per landed batch, oldest first, the
     /// highest offset it landed at and its body bytes. A batch counts against
     /// [`NODE_WINDOW_BYTES`] while its highest offset is at or above the
     /// broker's `oldest=` ([`Pin::window_bytes`]); at most
@@ -362,7 +360,7 @@ impl Pin {
     /// that does not parse, a count that is not the lines' — and a pin that does
     /// not end at the newline every line of it ends with ([`Pin::render`]): a
     /// power cut may leave a prefix, and one cut inside its header still reads
-    /// as a pin with a lower total and no key (rulings Q13 and Q6, reset), one
+    /// as a pin with a lower total and no key (reset), one
     /// cut inside its last slot as that slot with its body's tail gone. So
     /// what this refuses is exactly what is not PROVABLY WHOLE, the rule the
     /// state dir's sweep sets a torn file aside by (`StateDir::reconcile_logpin`).
@@ -453,7 +451,7 @@ impl Pin {
 /// Each session's last cursor IN EACH SEQ SPACE of `slots`, in the order
 /// they first appear: what one `log-landed` names. A take can hold two spaces
 /// of one session (an uncarried update's old-space `why=reset` cover, then
-/// the new space's records, ruling Q7); each lands, or the old space's cover
+/// the new space's records); each lands, or the old space's cover
 /// is owed again on every take.
 #[must_use]
 pub fn landed_pairs(slots: &[PinSlot]) -> Vec<(String, BusCursor)> {
@@ -488,7 +486,7 @@ pub enum LandedWord {
     /// Already there, or another seq space: on the bus already.
     Stale,
     /// A closed session's tail is all on the bus and forgotten: its `ev` face
-    /// may be retired (ruling Q8).
+    /// may be retired.
     Done,
     /// An update's export holds the cursor: keep the slots, land again later.
     Fenced,

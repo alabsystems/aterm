@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The node log's own laws (5J-1, ruling T27): what it takes, its bound and
+//! The node log's own laws: what it takes, its bound and
 //! exact counts, its cursor resets, and that none of its records is a bus
 //! or turn record (D3, D4: local, additive, RAM only).
 

@@ -2525,19 +2525,16 @@ fn usage() -> String {
     let mut s = String::from(
         "usage: aterm agents [status | install [<agent>…] | remove [<agent>…] | primer [<agent>]]\n\
          \n\
-         Manage the aterm primer block in coding agents' global context files, so any\n\
-         agent launched inside aterm knows what aterm is and to run `aterm help`. The\n\
-         aterm window also re-installs it for every detected agent when it starts (an\n\
-         update's restored tabs too) and when it spawns a session — at most once a\n\
-         minute, only while `agents_auto_prime` is on; a plain `aterm` shell session\n\
-         never does.\n\
+         Manage the aterm primer block and bundled skills in coding agents' global\n\
+         config directories. An aterm window also updates every detected agent when it\n\
+         starts and when it spawns a session (at most once a minute while\n\
+         `agents_auto_prime` is on; a plain `aterm` shell session never does).\n\
          \n\
-         \x20 status    each agent's context file and whether the primer is installed (default)\n\
-         \x20 install   install/update the primer for every detected agent (config dir exists);\n\
+         \x20 status    each agent's context file, primer state and skill state (default)\n\
+         \x20 install   install/update the primer and skills for every detected agent;\n\
          \x20           name agents to force them (creates the file if needed)\n\
-         \x20 remove    remove the primer block (everywhere, or from the named agents)\n\
-         \x20 primer    print the block itself — paste it into any AGENTS.md/CLAUDE.md;\n\
-         \x20           name an agent to include its agent-specific addendum (codex: sandbox)\n\
+         \x20 remove    remove the primer block, bundled skills and retired aterm hooks\n\
+         \x20 primer    print the block itself (`primer codex` includes its sandbox note)\n\
          \n\
          agents:\n",
     );

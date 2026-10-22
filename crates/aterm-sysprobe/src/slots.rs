@@ -202,6 +202,17 @@ pub struct Holder {
     pub birth_us: u64,
 }
 
+impl Holder {
+    /// Whether the process at its pid now is still this holder: the
+    /// kernel's record of that pid names its birth. `false` where the pid is
+    /// gone, was taken by another process since, or this platform has no
+    /// reader of the record.
+    #[must_use]
+    pub fn running(&self) -> bool {
+        crate::kproc::record(self.pid).is_some_and(|p| birth_us(&p) == self.birth_us)
+    }
+}
+
 /// One slot as one read saw it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Sight {

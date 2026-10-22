@@ -1,44 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
-//
-//! Models for audio trails, input pairing, maintenance lanes, search, capture,
-//! prewarm and budgets. Each constructor is re-exported from this crate's
-//! root.
+
+//! Formal models for audio trails, input pairing, maintenance lanes, search,
+//! capture, prewarm, and resource budgets.
 
 use aterm_spec::derive::*;
 
-/// Trail-audio UI→worker handoff and AudioQueue idle lifecycle.
-///
-/// The event loop may only do a bounded nonblocking enqueue. The shipping FIFO has 64 slots;
-/// `CommandCap=2` is its finite-state projection: an available slot accepts the newest cue,
-/// and a full FIFO keeps every queued cue and drops (and counts) the newest. Every device
-/// open/start/push belongs to the worker. A worker that applies a cue resets the exact-silence
-/// counter before pause housekeeping can observe it. A running queue owns exactly one low-rate
-/// worker timeout, which a successful idle pause (or explicit start failure) disarms. The
-/// device may fail, but failure is explicit and cannot turn every later keystroke into another
-/// synchronous platform call.
-///
-/// `Buggy=1` combines the defects: the UI touches the platform while enqueuing, blocks and
-/// omits drop accounting on a full queue, and a cue applied to a running device keeps the
-/// pre-cue silence count. One slip per remaining law:
-/// * the idle pause keeps its housekeeping timeout armed (the loop choosing `recv_timeout` on
-///   `output.is_some()` instead of `is_running()`, so a paused worker polls for ever;
-///   `RunningOwnsOneDeadline`);
-/// * exhaustion latches `STATE_FAILED` but the loop does not `return`, so its receiver lives,
-///   ingress stays open and the next cue reopens the device
-///   (`StartFailureIsExplicitAndTerminal`; both guards read `failed <= Buggy`, which over the
-///   0..1 flag is `failed == 0` at the committed config);
-/// * an unbounded `mpsc::channel()` in place of `sync_channel(COMMAND_CAPACITY)`, which admits
-///   a cue past capacity instead of dropping it (`WorkerMailboxIsBounded`; `PushCueAvailable`'s
-///   guard admits one slot more). The Tier-1
-///   `shipping_ingress_conforms_to_bounded_drop_newest_model` fills the real 64 slots and sees
-///   the 65th dropped.
-///
-/// One device fault is not terminal: a failed open, start or enqueue, a faulted or stalled
-/// callback, or a queue AudioToolbox stopped (the `kAudioQueueProperty_IsRunning` listener)
-/// each spend one of `REOPEN_BUDGET` reopens, and only exhaustion latches `STATE_FAILED` and
-/// seals ingress. Here that ladder is abstracted as its end (`WorkerStartFails`, the exhausting
-/// fault); [`trail_audio_reopen_ladder_model`] is the ladder itself.
+/// Trail-audio UI-to-worker handoff and `AudioQueue` idle lifecycle model.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn trail_audio_lifecycle_model() -> Model {
@@ -48,19 +16,15 @@ pub fn trail_audio_lifecycle_model() -> Model {
             const CommandCap = 2;
             const DropCap = 2;
             const SilentCap = 2;
-            // Bounded projection of the shipping capacity-64 SyncSender.
             var queued = 0;
             var dropped = 0;
-            // Marks the most recent ingress decision as a full-queue drop.
             var last_full = 0;
             var running = 0;
             var silent = 0;
             var service_deadline = 0;
-            // True only between worker cue application and its first render.
             var cue_applied = 0;
             var failed = 0;
             var paused = 0;
-            // Observable event-loop violations; healthy executions keep both zero.
             var ui_blocked = 0;
             var ui_platform_calls = 0;
 
@@ -151,9 +115,6 @@ pub fn trail_audio_lifecycle_model() -> Model {
                 };
             invariant RunningOwnsOneDeadline:
                 if running == 1 { service_deadline == 1 } else { service_deadline == 0 };
-            // No "idle pause disarms" law: `PauseIdle`, the one writer of `paused = 1`, writes
-            // `running = 0`, and every writer of `running = 1` clears `paused`, so it is
-            // `RunningOwnsOneDeadline` at `running = 0`.
             invariant StartFailureIsExplicitAndTerminal:
                 if failed == 1 {
                     running == 0 && queued == 0 && service_deadline == 0
@@ -164,25 +125,7 @@ pub fn trail_audio_lifecycle_model() -> Model {
     }
 }
 
-/// AudioQueue buffer ownership and first-audible-buffer latency across cold start and idle
-/// resume.
-///
-/// The three queue buffers are allocated but available while stopped. A cue is applied before
-/// the worker renders and enqueues all three, so the first audible samples occupy buffer 1
-/// (`MaxAudibleBuffer`), not buffer 4 behind three silent priming buffers. Idle uses a
-/// synchronous immediate stop/reset: callback recycling is disabled first, and every scheduled
-/// buffer is reclaimed before a resume prime can write it. That the parked worker holds no
-/// timeout is [`trail_audio_lifecycle_model`]'s `RunningOwnsOneDeadline`; the fake queue here
-/// has no worker to wake.
-///
-/// `Buggy=1` has both dangerous alternatives: pre-enqueued, pause-retained silence puts sound
-/// in buffer 4, and overwriting those still-scheduled pointers on resume is an ownership
-/// violation. It also removes the enqueue/stop gate, admitting a stop while the callback is
-/// inside its enqueue critical section: the shipping `stop_and_reclaim` refuses that stop
-/// (`false`, every buffer still queued), while the mutant ignores the refusal and marks all
-/// three buffers available while the queue owns them (`BufferOwnershipConserved`). Tier-1:
-/// `audio_queue_post_cue_prime_conforms_with_callback_free_fake` drives the shipping
-/// prime/stop helpers with an ownership-checking fake queue.
+/// `AudioQueue` buffer ownership and first-audible-buffer latency across cold start and idle resume.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn trail_audio_start_latency_model() -> Model {
@@ -191,15 +134,11 @@ pub fn trail_audio_start_latency_model() -> Model {
             const Buggy = 0;
             const BufferCount = 3;
             const MaxAudibleBuffer = 1;
-            // 0 available/cold, 1 cold cue, 2 cold primed, 3 cold running,
-            // 4 idle stopped, 5 resume cue, 6 resume primed, 7 resumed,
-            // 8 an old-generation callback returned after resume.
             var phase = 0;
             var available = 3;
             var queued = 0;
             var recycling = 0;
             var running = 0;
-            // One-based queue position; zero means no cue has been primed.
             var audible_buffer = 0;
             var unsafe_writes = 0;
             var generation = 0;
@@ -232,9 +171,6 @@ pub fn trail_audio_start_latency_model() -> Model {
             action CallbackEnqueueEnds when (phase == 3 && enqueue_in_flight == 1) {
                 enqueue_in_flight = 0;
             }
-            // Over 0..1, `enqueue_in_flight <= Buggy` is `Buggy == 1 || enqueue_in_flight == 0`.
-            // Buggy: the pause keeps its buffers queued (and says so), while a refused
-            // mid-enqueue stop's books free them anyway.
             action StopIdle when (phase == 3 && enqueue_in_flight <= Buggy) {
                 phase = 4;
                 available = if Buggy == 1 && enqueue_in_flight == 0 { 0 } else { BufferCount };
@@ -275,79 +211,22 @@ pub fn trail_audio_start_latency_model() -> Model {
             invariant WritesRequireAvailableOwnership: unsafe_writes == 0;
             invariant StaleCallbackCannotReenqueue: stale_enqueue == 0;
             invariant StopNeverOverlapsEnqueue: stop_overlap == 0;
-            // No "idle is callback-free" law: `StopIdle` is phase 4's only
-            // entry and writes `running`, `recycling` and `enqueue_in_flight`
-            // to zero at every `Buggy`, and `ParkIdle` writes none of them.
             bound PhaseBounded: phase <= 8;
         }
     }
 }
 
-/// The typing-sound seam: which ticks leave a keystroke heard, and whether the `tone` verb's
-/// answer agrees with the key path.
-///
-/// One writer and two readers share one bit. The writer is `CursorGlow::tick`, which leaves
-/// `sound_live` open or closed on every frame; the readers are the key path
-/// (`keystroke_click_audible` then `CursorGlow::cue_keystroke_shifted`, which records nothing
-/// unless the seam is open) and the `aterm ctl tone` verb (`sound_seam`, which names the gate
-/// that closed it). Each tick action is one class of host config, as `App::cursor_frame` folds
-/// it (`sound_seam::fold_window_audibility`):
-///
-/// * `TickLit`: master on, the window focused, amplitude nonzero.
-/// * `TickDarkMotion`: dark only because of a motion policy (macOS Reduce Motion,
-///   `motion = "reduced"`, or the load-shed envelope).
-/// * `TickDarkUnfocused`: dark because the key belongs to another window.
-/// * `TickDarkUserOff`: dark because the person set the aurora's own brightness knob to zero.
-/// * `TickMasterOff`: the trail is off (`cursor_trail_style = "off"`) or serious mode.
-///
-/// A tick class is the host's config class whatever the engine then does: every style (the
-/// classic wake included) and every grid (a degenerate one too) must answer each class the
-/// same way, and the Tier-1 conformance drives them all.
-///
-/// `key` and `tone` are what the two readers answered since the last tick (`0` not asked, `1`
-/// heard / `open`, `2` refused / `closed:<named gate>`, `3` `closed:engine-silent`); every tick
-/// clears them, so each invariant relates a reader's answer to the tick it read.
-///
-/// Invariants: a key pressed while the only darkness is a motion or performance policy is
-/// heard (`FocusedKeyIsHeard`); a key in an unfocused window, with the aurora dimmed to zero,
-/// or with the master off is not (`ForeignKeyIsSilent`); the verb and the key path never
-/// disagree (`ToneAgreesWithTheKey`); and `closed:engine-silent`, the sensor for a future
-/// policy that re-subordinates audio, is unreachable while every closed gate has a name
-/// (`EngineSilentIsUnreachable`). That last holds for a window that has run a frame: before
-/// its first frame the real verb does say `engine-silent` (no config gate explains a seam no
-/// tick has resolved), which the conformance pins as a separate reading.
-///
-/// There are no action guards: every tick class and both readers are enabled in every state,
-/// so no invariant can hold merely because a guard made its counterexample unreachable. Every
-/// decision lives in an update, which is what the Tier-1 conformance binds.
-///
-/// `Buggy=1` combines three defects, each on its own action: `TickDarkMotion` closing the seam
-/// (an unconditional zero-amplitude return), `TickDarkUnfocused` opening it
-/// (`sound_live = true` on every dark return), and the verb reading `trail_on` as
-/// `GlowConfig::enabled` alone, which reports a user-dimmed aurora as `closed:engine-silent`.
-///
-/// Tier-1: `aterm-gui/src/sound_seam_conformance.rs` drives the real resolver,
-/// `MotionPolicy::resolve`, host fold, `CursorGlow::tick` on every style and grid, key seam and
-/// the verb's own input constructor into the real `sound_seam` table over the whole host input
-/// domain, and rejects replays of each defect (and of a classic wake that writes no seam and an
-/// empty grid that closes it like the master switch). `app_input`'s `tone_status_tests` bind
-/// the verb's call site. Not modelled: the host's own sound knobs (`trail_sounds`, volume,
-/// resize-quiet, the audio host), which `Key` pins open and the `sound_seam` table tests cover.
+/// Typing-sound scheduling seam and `tone` probe agreement model.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn trail_sound_seam_model() -> Model {
     aterm_spec::ty_model! {
         TrailSoundSeam {
             const Buggy = 0;
-            // The last tick's config class, as the engine and the verb saw it.
             var master = 0;
             var amplitude = 0;
-            // 0 none (lit, or master off), 1 motion or shed, 2 unfocused,
-            // 3 the user's brightness knob at zero.
             var dark_cause = 0;
-            // `CursorGlow::sound_seam_open()`.
             var seam = 0;
-            // What each reader answered since the last tick.
             var key = 0;
             var tone = 0;
 
@@ -391,13 +270,9 @@ pub fn trail_sound_seam_model() -> Model {
                 key = 0;
                 tone = 0;
             }
-            // The key path, with the host's own sound knobs open: it records
-            // a click exactly when the engine's seam is open.
             action Key {
                 key = if seam == 1 { 1 } else { 2 };
             }
-            // The verb, in `sound_seam`'s precedence: what the user set (`trail_on`), then
-            // where the user is (`focused`), then the engine's bare refusal.
             action Tone {
                 tone = if master == 0 {
                     2
@@ -441,60 +316,7 @@ pub fn trail_sound_seam_model() -> Model {
     }
 }
 
-/// The audio host's bounded device-reopen ladder: a fault spends one reopen, a device that
-/// plays through a healthy window hands the budget back, and only exhaustion is terminal.
-///
-/// The sibling of [`trail_audio_lifecycle_model`] (ingress, the idle pause and the terminal
-/// failed state): this machine models what happens between a fault and that terminal state,
-/// which the lifecycle abstracts as `WorkerStartFails`. It projects `RetryState`,
-/// `reopen_after_fault` and the `worker_loop` call sites that drive them
-/// (`aterm-gui/src/trail_audio.rs`):
-///
-/// * `attempts` is `RetryState::attempts` (the wire's `reopens_left` is `Budget - attempts`);
-///   `Budget` is `REOPEN_BACKOFF.len()`.
-/// * `spent` is the spec's own count of reopens scheduled since a device last delivered after
-///   playing through a healthy window, kept apart from `attempts` so the code's counter can be
-///   checked against it. Its reset reads `evidence`, never `played`: sharing the code's reset
-///   condition would make `attempts == spent` true of any reset law.
-/// * `evidence` is the spec's own record of what the device did since the last scheduled
-///   reopen, kept apart from the code's `played` clock: `0` nothing delivered, `1` delivered,
-///   `2` delivered and then the window elapsed (also the value before any fault). The two agree
-///   on the committed machine; a change to the code's reset law, or to what starts or finishes
-///   its clock, makes them disagree, and `ResetOnlyOnPlayedWindow` says so.
-/// * `waiting` is inside the backoff window (`!RetryState::ready`). The schedule's first step
-///   is zero and the rest strictly increase, so the first reopen is immediate and the last
-///   wait is the longest step, which is also the healthy window.
-/// * `played` is the healthy window's clock: wall time from the first delivery after the last
-///   fault (`RetryState::played_since`) with no fault since; `0` no delivery since the last
-///   fault, `1` running, `2` run out. A delivery is a successful enqueue and start
-///   (`Delivery::Sounded`). A device that stops its queue without flagging a fault is not seen
-///   as one here, so the window can run over idle time; the IsRunning-listener lane is what
-///   would make it true play time.
-/// * `stale` is the clock a fault-anchored reset would read: time since the last fault has
-///   reached the window's length.
-///
-/// Actions: `Cue` (a cue reaches a worker holding no device: it opens one, or is dropped and
-/// counted inside the window or against sealed ingress), `CueSounds` (a delivery,
-/// `RetryState::delivered`), `DeviceFaults` (a failed open, start or enqueue, a faulted or
-/// stalled callback: the one handler, which schedules a reopen or reports exhaustion), and the
-/// three clock actions. Every decision the invariants depend on lives in an update: a
-/// guard-conjunct audit refused two guards the first draft of this machine had, each carrying
-/// `SilenceIsPermanentOnlyWhenTheBudgetIsSpent` by premise. The guards that remain are
-/// environment facts (a clock can only run out once started, a worker that exited touches no
-/// platform), and the Tier-1 conformance binds each to the real predicate
-/// (`Model::action_enabled` against the real ladder in every visited configuration).
-///
-/// `Buggy=1` replays three defects, scoped so none masks another: an open failure terminal on
-/// the spot ("one fault is for ever"); a successful open inside the window resetting the
-/// ladder (defeated by a device that constructs and never plays); and a delivery once the
-/// fault is stale resetting it (with the window measured from the fault, and the last wait
-/// being the window, the first delivery after the final reopen hands the whole budget back, so
-/// a device that plays one block and stalls cycles the ladder for ever).
-///
-/// Tier-1: `aterm-gui/src/trail_audio_reopen_conformance.rs` drives the real
-/// `RetryState`/`reopen_after_fault` exhaustively on a fabricated clock with the shipping
-/// schedule (two-way: every model state is reached), and validates traces of the real
-/// `worker_loop` against this machine, with each defect replayed as a negative control.
+/// Bounded audio device reopen ladder and terminal fault latch model.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn trail_audio_reopen_ladder_model() -> Model {
@@ -507,16 +329,10 @@ pub fn trail_audio_reopen_ladder_model() -> Model {
             var device = 0;
             var waiting = 0;
             var played = 0;
-            // No fault has happened yet, so nothing is recent.
             var stale = 1;
             var failed = 0;
-            // Nothing is owed before the first fault.
             var evidence = 2;
 
-            // A cue after exhaustion meets sealed ingress and opens nothing. The law is in the
-            // update: as a `failed == 0` guard it would carry
-            // `SilenceIsPermanentOnlyWhenTheBudgetIsSpent` by premise, which no conformance can
-            // refute.
             action Cue when (device == 0) {
                 device = if failed == 1 || waiting == 1 { 0 } else { 1 };
                 attempts = if Buggy == 1 && waiting == 0 && failed == 0 && stale == 0 {
@@ -525,17 +341,12 @@ pub fn trail_audio_reopen_ladder_model() -> Model {
                     attempts
                 };
             }
-            // The reset law, in the update: the ladder is handed back only on evidence the
-            // device played through the window. As a `device == 1` guard it would carry the
-            // terminal law by premise, so the action is unguarded and a delivery with no device
-            // changes nothing.
             action CueSounds {
                 attempts = if device == 1 && played == 2 {
                     0
                 } else {
                     if Buggy == 1 && device == 1 && stale == 1 { 0 } else { attempts }
                 };
-                // The spec's reset law: on evidence, not on the code's clock.
                 spent = if device == 1 && evidence == 2 { 0 } else { spent };
                 evidence = if device == 1 && evidence == 0 { 1 } else { evidence };
                 played = if device == 1 && played == 2 {
@@ -573,8 +384,6 @@ pub fn trail_audio_reopen_ladder_model() -> Model {
                         waiting
                     }
                 };
-                // A scheduled reopen restarts both clocks; exhaustion returns before touching
-                // either (`reopen_after_fault`).
                 played = if Buggy == 1 && device == 0 {
                     played
                 } else {
@@ -585,7 +394,6 @@ pub fn trail_audio_reopen_ladder_model() -> Model {
                 } else {
                     if attempts <= Budget - 1 { 0 } else { stale }
                 };
-                // A scheduled reopen owes new evidence.
                 evidence = if Buggy == 1 && device == 0 {
                     evidence
                 } else {
@@ -595,7 +403,6 @@ pub fn trail_audio_reopen_ladder_model() -> Model {
             }
             action BackoffElapses when (waiting == 1) {
                 waiting = 0;
-                // The last wait is the schedule's longest step: the window.
                 stale = if attempts == Budget { 1 } else { stale };
             }
             action StaleElapses when (stale == 0) {
@@ -612,8 +419,6 @@ pub fn trail_audio_reopen_ladder_model() -> Model {
             invariant ReopensLeftIsTruthful: attempts == spent;
             invariant SilenceIsPermanentOnlyWhenTheBudgetIsSpent:
                 if failed == 1 { attempts == Budget } else { failed == 0 };
-            // The ladder is handed back only on evidence the device played through a healthy
-            // window since the last reopen.
             invariant ResetOnlyOnPlayedWindow:
                 if attempts == 0 { evidence == 2 } else { evidence <= 2 };
         }
@@ -621,15 +426,6 @@ pub fn trail_audio_reopen_ladder_model() -> Model {
 }
 
 /// Tab-stop checkpoint preservation across a narrow seamless handoff.
-///
-/// Grid width and tab-stop backing length differ on purpose: shrinking a terminal keeps
-/// bounded stops beyond the visible width so a later grow has the same tab semantics. A
-/// carried projection is admitted exactly when it covers the current columns and stays within
-/// the protocol maximum. The mutant truncates backing storage at shrink/restore, losing the
-/// off-width custom stop, and admits a projection of any length, copying whatever prefix
-/// overlaps the destination's stops (an undersize vector applied over the defaults, an
-/// oversize one truncated), where `restore_tab_stops` rejects both
-/// (`AdmissionIsCoveringAndBounded`, `InvalidProjectionIsNeverAdmitted`).
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn tab_stop_handoff_model() -> Model {
@@ -640,10 +436,6 @@ pub fn tab_stop_handoff_model() -> Model {
             const Wide = 8;
             const Future = 6;
             const MaxCols = 8;
-            // phase: 0 source narrow, 1 source wide, 2 custom stop set,
-            // 3 source narrowed, 4 captured, 5 admitted, 6 restored,
-            // 7 destination grown, 8 tab executed, 9 invalid supplied,
-            // 10 invalid rejected.
             var phase = 0;
             var cols = 4;
             var backing_len = 4;
@@ -708,8 +500,6 @@ pub fn tab_stop_handoff_model() -> Model {
                 phase = 9;
                 carried_len = MaxCols + 1;
             }
-            // Buggy: the restore admits the invalid vector and copies its overlapping prefix
-            // into the destination's own stops.
             action RejectUndersizeProjection when (
                 phase == 9 && carried_len <= Narrow - 1
             ) {
@@ -770,17 +560,7 @@ pub fn tab_stop_handoff_model() -> Model {
     }
 }
 
-/// Event-loop lane-isolation contract for bulk scrollback maintenance.
-///
-/// Ordinary PTY output is latency-critical and must never begin a terminal scan, take a
-/// blocking lock, or evict. The explicitly delivered OS memory-pressure event is the sole
-/// bulk-work capability. The allocator/evictor is abstracted behind `unbounded_work` and
-/// `mutation`; this is about event routing, not a bound on emergency reclamation itself. The
-/// mutant admits output directly into the bulk lane (an amortized
-/// `enforce_global_scrollback_cap` on the output-wake arm, which scans every session, takes
-/// their locks and evicts mid-scan), so all four capabilities fire on ordinary output and the
-/// eviction lands with no completed pressure trim behind it
-/// (`MutationRequiresCompletedPressureTrim`).
+/// Event-loop lane isolation for bulk scrollback maintenance.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn scrollback_maintenance_lane_model() -> Model {
@@ -836,8 +616,6 @@ pub fn scrollback_maintenance_lane_model() -> Model {
                 if blocking_lock == 1 { event == 2 } else { event <= 2 };
             invariant UnboundedWorkRequiresMemoryPressure:
                 if unbounded_work == 1 { event == 2 } else { event <= 2 };
-            // Its first conjunct is the whole of "mutation requires memory
-            // pressure", so that weaker law is not stated separately.
             invariant MutationRequiresCompletedPressureTrim:
                 if mutation == 1 {
                     event == 2 && completed == 1 && scan_started == 0
@@ -850,18 +628,7 @@ pub fn scrollback_maintenance_lane_model() -> Model {
     }
 }
 
-/// History-retention contract for a full-width, top-anchored partial scroll.
-///
-/// Terminal UIs such as Codex keep status/input rows below a DECSTBM region and scroll
-/// committed transcript lines through row zero. Such a scroll archives exactly the displaced
-/// row when primary-screen history is enabled, while an interior region, a horizontally
-/// margined rectangle, or a history-free alternate-screen grid stays ephemeral. Rows below the
-/// vertical margin are preserved in every regime. The mutant drops the eligible displaced row
-/// because the region is not full-height, and its scroll runs to the screen bottom instead of
-/// the DECSTBM bottom margin, displacing the fixed footer (`FixedFooterIsPreserved`; a
-/// hypothetical slip). `footer` is a flag only the slip writes, so at Tier-0 the law is the
-/// flag; the Tier-1 bind gives it content by reading `footer` off the real grid's bottom row
-/// and replaying the slip as a real interior scroll whose bottom margin is the screen bottom.
+/// History retention across full-width, top-anchored partial scrolls.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn top_anchored_scroll_history_model() -> Model {
@@ -878,12 +645,8 @@ pub fn top_anchored_scroll_history_model() -> Model {
             var selection_alive = 1;
             var selection_region_row = 2;
             var selection_footer_row = 4;
-            // Whether the selection lies outside the rows this scroll damages: with the
-            // regime, it decides the selection's fate.
             var selection_disjoint = 0;
 
-            // Disjoint/overlapping flavours of each regime rather than a new phase, so the
-            // `phase == 2` tests stay intact.
             action ChooseArchivalOverlapping when (phase == 0) {
                 phase = 1;
                 top = 0;
@@ -952,10 +715,6 @@ pub fn top_anchored_scroll_history_model() -> Model {
                 } else {
                     footer_anchor
                 };
-                // An interior or margined scroll damages only its rows, so a disjoint
-                // selection survives (a status-bar repaint must not destroy a highlight in
-                // scrollback). An overlapping one clears in every regime: over-clearing is
-                // safe, a stale highlight over replaced content is not.
                 selection_alive = if top == 0 && full_width == 1 && history_enabled == 1 {
                     if Buggy == 1 { 0 } else { selection_alive }
                 } else if selection_disjoint == 1 {
@@ -963,8 +722,6 @@ pub fn top_anchored_scroll_history_model() -> Model {
                 } else {
                     0
                 };
-                // The remap moves only a selection above the splice's boundary, one the
-                // scrolled region covers; `adjust_for_row_splice` leaves one below it alone.
                 selection_region_row = if top == 0 && full_width == 1 && history_enabled == 1
                     && selection_disjoint == 0 {
                     if Buggy == 1 { selection_region_row } else { selection_region_row - 1 }
@@ -991,8 +748,6 @@ pub fn top_anchored_scroll_history_model() -> Model {
                 } else {
                     footer_anchor == 0
                 };
-            // A selection survives iff it was piecewise-remapped (the archival regime) or was
-            // disjoint from the damage.
             invariant EligibleSelectionUsesPiecewiseRemap:
                 if phase == 2 && top == 0 && full_width == 1 && history_enabled == 1
                     && selection_disjoint == 0 {
@@ -1018,15 +773,7 @@ pub fn top_anchored_scroll_history_model() -> Model {
     }
 }
 
-/// Settings ▸ Manual host diagnostics run on one worker behind a one-entry
-/// request channel and a one-entry latest-wins pending slot. The modeled
-/// revision is the monotonic identity of a `(document revision, host analysis
-/// generation)` pair, so byte-identical environment refreshes participate in
-/// the same stale-completion law as text edits. Every request remains
-/// represented until it completes; only the exact current identity may publish.
-/// `Buggy=1` retains the older pending request when a third generation arrives
-/// while the channel is full, reproducing stale diagnostics or loss of the
-/// final edit.
+/// Single-worker diagnostics channel and latest-wins pending slot for Settings ▸ Manual.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn manual_config_diagnostics_lane_model() -> Model {
@@ -1128,9 +875,7 @@ pub fn manual_config_diagnostics_lane_model() -> Model {
     }
 }
 
-/// Config/font generation publication: a completion may publish only when its
-/// ticket is still the newest request. The mutant accepts generation one after
-/// generation two was requested, reproducing a stale face/config rollback.
+/// Monotonic generation gate for asynchronous config and font publication.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn font_catalog_generation_model() -> Model {
@@ -1169,16 +914,7 @@ pub fn font_catalog_generation_model() -> Model {
     }
 }
 
-/// Path-feed snapshot publication binds a prepared consumer and its content
-/// fingerprint to one bounded, same-handle admitted read. `live` is the
-/// pathname's currently visible byte generation; `admitted` is the immutable
-/// source returned by that read; and `prepared`/`fingerprint` are the two
-/// projections derived from those admitted bytes. Later pathname replacement
-/// or ABA restoration may move `live`, but cannot alter either projection.
-///
-/// `Buggy=1` is the TOCTOU shape: `Publish` re-reads `live` for the fingerprint instead of
-/// keeping the value `Read` produced, so a mutation after admission publishes a consumer from
-/// one generation with another generation's fingerprint.
+/// Same-handle snapshot admission and fingerprint binding for path feeds.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn path_feed_snapshot_model() -> Model {
@@ -1222,39 +958,7 @@ pub fn path_feed_snapshot_model() -> Model {
     }
 }
 
-/// A theme-catalog generation or an OS appearance flip can overtake an
-/// expensive font/config prepare, and a theme's typography makes both of them
-/// face changes (DTP §9.1). The current config observation must be
-/// re-prepared against the newer theme AND side rather than publishing a face
-/// resolved from the old ones, and the colours of the new theme or side must
-/// not reach the screen before the face that belongs to them: the colour swap
-/// is HELD while a generation is owed, and the publish installs both.
-///
-/// Sources: config tickets (`requested`, `completed`, `published`), the theme
-/// generation (`theme`, `completed_theme`, `published_theme`), the appearance
-/// (`side`, `completed_side`, `published_side`), the colours on screen
-/// (`colour_theme`, `colour_side`), the held swap (`held`), and `degraded`:
-/// the one documented exception, a flip the font worker could not take,
-/// whose colours install at once over the old face (a flip is never lost; the
-/// next config generation brings the face). Before any publish, `published_*`
-/// name the launch face (theme 0, side 0).
-///
-/// Laws, each with its own mutant:
-/// - `PublishedThemeIsCurrentOrEmpty` (Buggy 1: the re-preparation publishes
-///   the stale completion);
-/// - `FaceMatchesColours` (Buggy 2: the colours swap at once on a theme
-///   change or flip while the face is still being prepared);
-/// - `HeldSwapIsOwed` (Buggy 3: a refused worker leaves the swap held with no
-///   generation coming, a lost flip).
-///
-/// Tier-1: aterm-gui's
-/// `overtaking_theme_catalog_conforms_to_font_theme_generation_model`
-/// (`native_font_catalog.rs`) drives this model's whole reachable space on a
-/// real headless App and the worker's real `prepare` — a typography catalog
-/// reload and an OS flip during a prepare, and a refused worker — reading back
-/// which completion the config service holds, which colours are installed and
-/// whether a swap is held; it rejects the pre-theme-generation guard and a
-/// colours-first finish, and the shipped App is refused by every mutant.
+/// Coupled theme-catalog, appearance-side, and typography re-prepare gate.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn font_theme_generation_model() -> Model {
@@ -1355,16 +1059,7 @@ pub fn font_theme_generation_model() -> Model {
     }
 }
 
-/// Staged-update activation through both native and portable menu faces.
-///
-/// Once a strictly-newer update is staged and the Version surface is refreshed,
-/// its `ApplyUpdate` row is present, enabled, and decodes to the apply command.
-/// That decision is independent of whether a terminal or a native Settings/About
-/// tab is frontmost: only genuinely terminal-only actions use that content gate.
-/// This is a menu-model/dispatch contract; the AppKit click relay is bound at its
-/// pure tag/validation seams rather than claiming an automated OS click harness.
-/// The mutant applies the terminal-tab gate to `ApplyUpdate`, leaving the visible update row
-/// grey and unselectable.
+/// Staged-update activation across native and portable menu surfaces.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn native_update_menu_activation_model() -> Model {
@@ -1372,7 +1067,6 @@ pub fn native_update_menu_activation_model() -> Model {
         NativeUpdateMenuActivation {
             const Buggy = 0;
             var staged = 0;
-            // 0 native Settings/About tab, 1 terminal tab.
             var terminal_tab = 0;
             var row_present = 0;
             var row_enabled = 0;
@@ -1441,13 +1135,6 @@ pub fn native_update_menu_activation_model() -> Model {
 }
 
 /// Per-window modifier-cache reset at the focus-loss boundary.
-///
-/// Winit reports modifier snapshots and focus as independent window events. Focus loss must
-/// unconditionally invalidate the previous ambient snapshot, because a backend may omit the
-/// matching key-up. Every later snapshot stays authoritative whatever the focus bit: Windows
-/// can report the genuinely held modifiers before `Focused(true)` and need not repeat them.
-///
-/// `Buggy=1` reproduces only the unsafe reset transition: `FocusOut` retains Ctrl.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn focus_modifier_cache_model() -> Model {
@@ -1502,56 +1189,7 @@ pub fn focus_modifier_cache_model() -> Model {
     }
 }
 
-/// Selection custody: which key events may take the user's reading position.
-///
-/// The viewport has two owners: the tail-follower while `display_offset == 0`, the user from
-/// the moment a scroll gesture lifts the view off the bottom. Ownership transfers back on
-/// exactly one event, a byte-producing key press ("start typing and jump back to the prompt").
-/// The selection has one owner, the user, and is dropped only by that press or a deliberate
-/// deselect.
-///
-/// Three event classes must disturb neither:
-///
-/// * a key release (a Kitty `REPORT_EVENT_TYPES` key-up is not typing),
-/// * an auto-repeat tick (the same held press continuing; snapping at the ~30 Hz repeat rate
-///   destroys any scroll or selection made mid-hold),
-/// * a bare modifier or lock key (Shift/Control/Alt/Super/Caps…), the first half of ⌘-C and
-///   the Shift of a shift-click extend.
-///
-/// Nor must output: a program writing while the user reads repins the offset so the same
-/// content stays under the eye, never sliding the view or handing it back to the
-/// tail-follower.
-///
-/// Output and the selection differ: output that replaced the selected rows may destroy the
-/// highlight (a highlight over new text makes a copy return something never selected), and
-/// ED 3, `clear_scrollback` and RIS take the viewport back outright because the space the
-/// offset named is gone. Both are their own event kinds below, not exceptions under one
-/// invariant.
-///
-/// The custody invariants are stated over the observable state (`offset`, `owner`,
-/// `selection`) against a shadow of the pre-action values (`prev_*`) that every action writes
-/// from the pre-state, never over a self-reported "this press disturbed something" flag: a
-/// flag written by hand at every site lets an implementation that moves the viewport without
-/// setting it pass. Here, moving the viewport is the violation.
-///
-/// `Buggy=1` is the regression family: an inert press and an auto-repeat tick each snap the
-/// viewport and clear the selection (so the ⌘ keydown destroys the selection before the `c`
-/// arrives and ⌘-C copies nothing); a release that disturbs; output that snaps the reader back
-/// to live instead of repinning; output that takes custody while clearing the rows it damaged;
-/// and a typing press that deselects without snapping. Every invariant except the
-/// state-consistency guard `TailOwnerAtBottom` is falsified by one of them, and
-/// `derived_ring_ty.rs` checks that invariant by invariant.
-///
-/// Output that takes the highlight without moving the view (an in-place rewrite over the
-/// selected rows, or a re-pin saturated at the history floor), and output that takes it for a
-/// reason the damage lattice cannot attribute (`post_process`'s fail-closed arms), are their
-/// own actions under the same tag and law as a damaging take. A user gesture back toward live
-/// that is not typing (End, a downward scroll, the ⌘-V and IME snaps) is `SnapToLive` /
-/// `UserScrollTowardLive`: it moves the view down and keeps the highlight.
-///
-/// Scope: the press-path half of custody plus the output repin it must not fight. Eviction
-/// and wholesale invalidation are [`selection_custody_model`]'s; the alt-screen round-trip is
-/// [`alt_selection_park_model`]'s.
+/// Selection custody across printable, navigation, and viewport-scroll key events.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn press_custody_model() -> Model {
@@ -1560,24 +1198,12 @@ pub fn press_custody_model() -> Model {
             const Buggy = 0;
             const MaxOffset = 2;
 
-            // 0 = the tail-follower owns the viewport, 1 = the user does.
             var owner = 0;
-            // Bounded projection of `Grid::display_offset`.
             var offset = 0;
-            // A completed text selection exists.
             var selection = 0;
-            // Shadow of the pre-action observable state, written by every action from the
-            // pre-state.
             var prev_owner = 0;
             var prev_offset = 0;
             var prev_selection = 0;
-            // What kind of event just fired: 0 a user gesture, 1 a typing press, 2 an
-            // auto-repeat tick, 3 a bare modifier, 4 a release, 5 output that missed the
-            // selected rows, 6 output that took the highlight (replaced the selected rows,
-            // or `post_process` failed closed on it), 7 output that invalidated the
-            // coordinate space (ED 3, clear_scrollback, RIS), 8 a user gesture back toward
-            // live that is not typing (a downward scroll, End / ScrollToBottom, the paste
-            // and IME snaps).
             var last_event = 0;
 
             action UserScroll when (offset <= MaxOffset - 1) {
@@ -1595,7 +1221,6 @@ pub fn press_custody_model() -> Model {
                 selection = 1;
                 last_event = 0;
             }
-            // A plain click that deselects — a deliberate clear, always allowed.
             action UserClear {
                 prev_owner = owner;
                 prev_offset = offset;
@@ -1603,8 +1228,6 @@ pub fn press_custody_model() -> Model {
                 selection = 0;
                 last_event = 0;
             }
-            // Output while the user is reading: the repin keeps the same content under the
-            // eye, so the offset rises with the new lines and ownership stays with the user.
             action OutputWhileReading when (owner == 1 && offset <= MaxOffset - 1) {
                 prev_owner = owner;
                 prev_offset = offset;
@@ -1614,7 +1237,6 @@ pub fn press_custody_model() -> Model {
                 selection = if Buggy == 1 { 0 } else { selection };
                 last_event = 5;
             }
-            // Output while the tail-follower owns the viewport: stays at live.
             action OutputAtLive when (owner == 0) {
                 prev_owner = owner;
                 prev_offset = offset;
@@ -1622,12 +1244,6 @@ pub fn press_custody_model() -> Model {
                 offset = 0;
                 last_event = 5;
             }
-            // Output that replaced the selected rows (an overlapping `SelectionDamage`): the
-            // engine destroys the selection here (a highlight over replaced text makes ⌘-C
-            // return something never selected), but may not take the reading position. The
-            // commonest case is at live (a status line repainting the highlighted rows), so
-            // the guard does not read `owner`; the repin rides the new lines only for a
-            // reader. `Buggy = 1` snaps the reader to live (`OutputNeverTakesCustody`).
             action OutputDamagesTheSelectedRows
                 when (selection == 1 && offset <= MaxOffset - 1)
             {
@@ -1639,10 +1255,6 @@ pub fn press_custody_model() -> Model {
                 selection = 0;
                 last_event = 6;
             }
-            // The same take in place: a damaging batch that advanced no rows (`\r` plus EL
-            // over the selected row, a DECERA, a status line repainting itself) or whose
-            // re-pin saturated at the history floor. The view does not move; only the
-            // highlight goes. `Buggy = 1` snaps the reader to live (`OutputNeverTakesCustody`).
             action OutputDamagesTheSelectedRowsInPlace when (selection == 1) {
                 prev_owner = owner;
                 prev_offset = offset;
@@ -1652,11 +1264,6 @@ pub fn press_custody_model() -> Model {
                 selection = 0;
                 last_event = 6;
             }
-            // Output took the highlight for a reason other than damage overlap
-            // (`post_process`'s fail-closed arms: a malformed or saturated splice projection,
-            // a splice mixed with another scroll, the `left_alt` re-check, a whole-interval
-            // eviction at the history floor). Same tag and law as a damaging take: the
-            // highlight may go, the reading position may not. The re-pin rides the lines…
             action OutputTookTheSelectionUnattributed
                 when (selection == 1 && offset <= MaxOffset - 1)
             {
@@ -1668,7 +1275,6 @@ pub fn press_custody_model() -> Model {
                 selection = 0;
                 last_event = 6;
             }
-            // …or, when no row arrived or the re-pin saturated, stays where it was.
             action OutputTookTheSelectionUnattributedInPlace when (selection == 1) {
                 prev_owner = owner;
                 prev_offset = offset;
@@ -1678,27 +1284,15 @@ pub fn press_custody_model() -> Model {
                 selection = 0;
                 last_event = 6;
             }
-            // ED 3, `clear_scrollback` and RIS: `repin_display_offset` clamps to 0 because
-            // the coordinate space the offset named is gone, so output hands the viewport
-            // back, spelled as its own event kind. The model does not police the label (as
-            // with `selection_custody_model`'s `WholesaleInvalidate`, an implementation that
-            // called everything wholesale would satisfy it); the separate kind keeps the
-            // ordinary path checked and the exception visible.
             action OutputInvalidatesTheCoordinateSpace {
                 prev_owner = owner;
                 prev_offset = offset;
                 prev_selection = selection;
                 offset = 0;
                 owner = 0;
-                // `Buggy = 1` keeps the highlight across the invalidation: a selection
-                // naming rows that no longer exist, the fail-open direction.
                 selection = if Buggy == 1 { selection } else { 0 };
                 last_event = 7;
             }
-            // The user brings the view back to live without typing (End / `ScrollToBottom`,
-            // a page or wheel step that lands at the tail, the ⌘-V and IME snaps). Ownership
-            // returns to the tail-follower; the highlight is the user's and stays. `Buggy = 1`
-            // deselects on the way (`ReturningTowardLiveKeepsTheSelection`).
             action SnapToLive when (offset > 0) {
                 prev_owner = owner;
                 prev_offset = offset;
@@ -1708,9 +1302,6 @@ pub fn press_custody_model() -> Model {
                 selection = if Buggy == 1 { 0 } else { selection };
                 last_event = 8;
             }
-            // A downward scroll that stops short of live: the user still owns the
-            // view, one row nearer the tail. (Granularity as for `UserScroll`: a
-            // real page or notch moves further; Tier-1 drives the one-row form.)
             action UserScrollTowardLive when (offset > 1) {
                 prev_owner = owner;
                 prev_offset = offset;
@@ -1719,8 +1310,6 @@ pub fn press_custody_model() -> Model {
                 selection = if Buggy == 1 { 0 } else { selection };
                 last_event = 8;
             }
-            // The one handover. `Buggy = 1` gives it a member too (typing that deselects
-            // without snapping): an invariant no mutant can falsify states nothing.
             action TypingPress {
                 prev_owner = owner;
                 prev_offset = offset;
@@ -1781,9 +1370,6 @@ pub fn press_custody_model() -> Model {
                 } else {
                     last_event <= 8
                 };
-            // Output never takes the reading position, damaging or not. `prev_offset <=
-            // offset` rather than equality: the repin raises the offset by the lines that
-            // arrived; what it may never do is move the view back toward live.
             invariant OutputNeverTakesCustody:
                 if last_event == 5 {
                     owner == prev_owner && prev_offset <= offset
@@ -1794,9 +1380,6 @@ pub fn press_custody_model() -> Model {
                         last_event <= 8
                     }
                 };
-            // …and the selection half, only where it holds: output that did not touch the
-            // selected rows leaves the highlight alone. Which damage may clear is
-            // `selection_custody_model`'s `OverlapDamageClears`.
             invariant OutputSparesAnUndamagedSelection:
                 if last_event == 5 {
                     selection == prev_selection
@@ -1809,18 +1392,12 @@ pub fn press_custody_model() -> Model {
                 } else {
                     last_event <= 8
                 };
-            // ED 3, `clear_scrollback` and RIS destroy the space the anchors are stated in,
-            // so handing the viewport back is correct, but a selection may not outlive it.
-            // Every other invariant reaches event 7 only through a trivially true `else` arm;
-            // without this one the model would say nothing about the action.
             invariant InvalidationCannotLeaveADanglingSelection:
                 if last_event == 7 {
                     offset == 0 && owner == 0 && selection == 0
                 } else {
                     last_event <= 8
                 };
-            // A gesture back toward live moves the view down and nothing else: it is not
-            // typing, so the highlight survives it.
             invariant ReturningTowardLiveKeepsTheSelection:
                 if last_event == 8 {
                     selection == prev_selection && offset <= prev_offset - 1
@@ -1835,52 +1412,7 @@ pub fn press_custody_model() -> Model {
     }
 }
 
-/// Selection custody: when a selection may be destroyed, as a lifecycle.
-///
-/// A highlight is the user's, and only an act that destroys the content it names may destroy
-/// it; a status bar repainting at the bottom of the screen must not destroy a highlight
-/// anchored far up in scrollback.
-///
-/// The model works in the absolute row space that `intersects_absolute_band` converts into, not
-/// in the selection's own space: `TextSelection` anchors are relative `i32` rows, converted at
-/// the damage boundary only. A uniform scroll advances `absolute_row_counter` by the same delta
-/// `adjust_for_scroll` subtracts, so the interval is stable under ordinary output.
-///
-/// Damage bands are literal per action, because the `ty_model!` grammar has no
-/// nondeterministic range arm. Two bands and three selections give all four overlap/disjoint
-/// pairings plus the single-row shape eviction needs: `RegionDamageLow` covers rows 0..1,
-/// `RegionDamageHigh` row 3; `SelectLow` takes rows 0..1, `SelectHigh` rows 2..3, and
-/// `SelectOldest` row 0 alone.
-///
-/// Every invariant is stated over the observable change, the post-state against a shadow of
-/// the pre-state (`prev_alive`, `prev_sel_lo`, `prev_sel_hi`), never over a value the action
-/// just wrote; and every action that may not destroy a selection carries a `Buggy = 1` branch
-/// that destroys one, so no invariant follows from a guard alone.
-///
-/// Scope: the engine's destroyers, reachable from `Terminal::post_process` and its callers. The
-/// GUI's own clear sites (`app_search`, `app_mouse`, `subscribe`, `control_host`) and the wasm
-/// bridges' are not in this environment.
-///
-/// `WholesaleInvalidate` is one action, not an alt-enter/alt-exit pair: the three engine sites
-/// that record `SelectionDamage::All` outside the screen switch (ED 3 / `clear_scrollback` via
-/// `Grid::discard_history_selection`, reflow pullback, and a Kitty unscroll that renumbers
-/// history via `force_selection_invalidation`) are one class: the coordinate space the
-/// selection named is gone, so no band can describe the damage. Whether a site also moves host
-/// coordinates is outside this model: ED 3 evicts history without moving a live coordinate
-/// (`discarding_scrollback_evicts_history_and_moves_no_live_coordinate`), a Kitty unscroll
-/// renumbers retained rows; both destroy the selection identically.
-///
-/// `Buggy = 1` is the regression family, one member per destroyer, each falsifying a named
-/// invariant (`derived_ring_ty.rs` asserts the mapping member by member):
-///
-/// * `RegionDamageLow` clears whatever it hit (`DisjointDamagePreserves`).
-/// * `RegionDamageHigh` never clears, so a highlight survives over replaced text
-///   (`OverlapDamageClears`).
-/// * `InertPress` and `UniformScroll` each destroy the selection (their own invariants).
-/// * `Evict` reports the loss without acting on it: it raises the floor and records
-///   `truncated`, but neither clamps the head nor drops a selection both of whose endpoints
-///   are gone (`PartialEvictionTruncates`, `NoDanglingAnchors`,
-///   `TruncationImpliesAClampedHead`).
+/// Selection lifecycle across screen-clearing and scrollback mutations.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn selection_custody_model() -> Model {
@@ -1888,32 +1420,18 @@ pub fn selection_custody_model() -> Model {
         SelectionCustody {
             const Buggy = 0;
 
-            // A completed selection exists.
             var alive = 0;
-            // Its absolute row interval, `sel_lo <= sel_hi`.
             var sel_lo = 0;
             var sel_hi = 0;
-            // The last damage band recorded this step.
             var band_lo = 0;
             var band_hi = 0;
-            // The oldest retained absolute row. Rises on eviction.
             var floor = 0;
-            // A head clamped to the floor by partial eviction.
             var truncated = 0;
-            // Shadow of the pre-action selection, written by every action from the pre-state
-            // (assignments are simultaneous), so an invariant can say "this event changed
-            // nothing" about an action that writes nothing.
             var prev_alive = 0;
             var prev_sel_lo = 0;
             var prev_sel_hi = 0;
-            // What just happened. Ordered, so membership tests are prefixes: the grammar
-            // renders `&&` unparenthesised and `||` parenthesised, so every test below is a
-            // nested `if`. 0 none, 1 user gesture, 2 typing press, 3 inert press, 4 region
-            // damage, 5 uniform scroll, 6 eviction, 7 wholesale.
             var last_event = 0;
 
-            // Guarded on the floor: an evicted row is not on screen to select. Without it the
-            // model reaches a dangling anchor no code path can produce.
             action SelectLow when (floor == 0) {
                 prev_alive = alive;
                 prev_sel_lo = sel_lo;
@@ -1924,8 +1442,6 @@ pub fn selection_custody_model() -> Model {
                 truncated = 0;
                 last_event = 1;
             }
-            // A one-row selection on the oldest retained row, so `Evict`'s both-endpoints-gone
-            // arm is reachable (`SelectLow` and `SelectHigh` both have `sel_hi > 0`).
             action SelectOldest when (floor == 0) {
                 prev_alive = alive;
                 prev_sel_lo = sel_lo;
@@ -1946,7 +1462,6 @@ pub fn selection_custody_model() -> Model {
                 truncated = 0;
                 last_event = 1;
             }
-            // A deliberate deselect, always allowed.
             action UserClear {
                 prev_alive = alive;
                 prev_sel_lo = sel_lo;
@@ -1955,7 +1470,6 @@ pub fn selection_custody_model() -> Model {
                 truncated = 0;
                 last_event = 1;
             }
-            // The one handover: typing means take me to the prompt, and deselect.
             action TypingPress {
                 prev_alive = alive;
                 prev_sel_lo = sel_lo;
@@ -1964,8 +1478,6 @@ pub fn selection_custody_model() -> Model {
                 truncated = 0;
                 last_event = 2;
             }
-            // A bare modifier. The guard keeps the space to selections that exist to be
-            // destroyed; the invariant compares against `prev_alive`, not the guard.
             action InertPress when (alive == 1) {
                 prev_alive = alive;
                 prev_sel_lo = sel_lo;
@@ -1973,8 +1485,6 @@ pub fn selection_custody_model() -> Model {
                 alive = if Buggy == 1 { 0 } else { alive };
                 last_event = 3;
             }
-            // Ordinary output while the user reads: the anchors ride the content, so
-            // in the absolute space the interval does not move at all.
             action UniformScroll when (alive == 1) {
                 prev_alive = alive;
                 prev_sel_lo = sel_lo;
@@ -1982,8 +1492,6 @@ pub fn selection_custody_model() -> Model {
                 alive = if Buggy == 1 { 0 } else { alive };
                 last_event = 5;
             }
-            // Rows 0..1 replaced. Overlap reduces to `sel_lo <= 1`, because
-            // `band_lo == 0 <= sel_hi` holds for every reachable selection.
             action RegionDamageLow when (alive == 1) {
                 prev_alive = alive;
                 prev_sel_lo = sel_lo;
@@ -1997,9 +1505,6 @@ pub fn selection_custody_model() -> Model {
                 };
                 last_event = 4;
             }
-            // Row 3 replaced. Overlap reduces to `sel_hi > 2`, because `sel_lo <= 3 ==
-            // band_hi` holds for every reachable selection. Its mutant is the inverse of
-            // `RegionDamageLow`'s (damage that hit and did not clear).
             action RegionDamageHigh when (alive == 1) {
                 prev_alive = alive;
                 prev_sel_lo = sel_lo;
@@ -2013,12 +1518,6 @@ pub fn selection_custody_model() -> Model {
                 };
                 last_event = 4;
             }
-            // Retention drops the oldest row. A head below the new floor clamps and records
-            // the loss; only both endpoints gone destroys the selection. Every right-hand
-            // side reads the pre-eviction state (assignments are simultaneous), so
-            // `truncated` and `sel_lo` agree. `truncated = 0` on the survivor branch restates
-            // the pre-value: `Evict` is the only writer of `1` and its `floor == 0` guard
-            // lets it fire at most once per trace.
             action Evict when (alive == 1 && floor == 0) {
                 prev_alive = alive;
                 prev_sel_lo = sel_lo;
@@ -2045,8 +1544,6 @@ pub fn selection_custody_model() -> Model {
                 };
                 last_event = 6;
             }
-            // ED 3 / clear_scrollback / RIS / Kitty unscroll: the coordinate space
-            // itself is gone.
             action WholesaleInvalidate when (alive == 1) {
                 prev_alive = alive;
                 prev_sel_lo = sel_lo;
@@ -2056,9 +1553,6 @@ pub fn selection_custody_model() -> Model {
                 last_event = 7;
             }
 
-            // A bare modifier expresses no intent and may not destroy anything: stated as
-            // "the event changed nothing", which is falsifiable, not "a selection exists",
-            // which the guard would grant for free.
             invariant InertPressPreservesTheSelection:
                 if last_event == 3 {
                     alive == prev_alive && sel_lo == prev_sel_lo &&
@@ -2066,7 +1560,6 @@ pub fn selection_custody_model() -> Model {
                 } else {
                     alive <= 1
                 };
-            // Ordinary output cannot take a highlight.
             invariant UniformScrollPreservesTheSelection:
                 if last_event == 5 {
                     alive == prev_alive && sel_lo == prev_sel_lo &&
@@ -2074,8 +1567,6 @@ pub fn selection_custody_model() -> Model {
                 } else {
                     alive <= 1
                 };
-            // Damage that missed the selected rows leaves them alone. Disjointness is decided
-            // on the pre-state anchors and the conclusion read off the post-state.
             invariant DisjointDamagePreserves:
                 if last_event == 4 {
                     if prev_sel_lo > band_hi {
@@ -2092,8 +1583,6 @@ pub fn selection_custody_model() -> Model {
                 } else {
                     alive <= 1
                 };
-            // …and damage that hit them must clear: a highlight over replaced text makes a
-            // copy return something the user never selected.
             invariant OverlapDamageClears:
                 if last_event == 4 {
                     if prev_sel_lo > band_hi {
@@ -2104,9 +1593,6 @@ pub fn selection_custody_model() -> Model {
                 } else {
                     alive <= 1
                 };
-            // Losing the oldest line of a selection is not losing it: the head clamps to the
-            // new floor and the loss is recorded. Losing every line of it is. The arm is
-            // decided by the pre-eviction interval.
             invariant PartialEvictionTruncates:
                 if last_event == 6 {
                     if prev_sel_hi > 0 {
@@ -2121,10 +1607,8 @@ pub fn selection_custody_model() -> Model {
                 } else {
                     alive <= 1
                 };
-            // Whatever else happens, a live selection never names an evicted row.
             invariant NoDanglingAnchors:
                 if alive == 1 { floor <= sel_lo } else { alive == 0 };
-            // A truncation is only ever recorded against a clamped head.
             invariant TruncationImpliesAClampedHead:
                 if truncated == 1 { floor <= sel_lo } else { truncated == 0 };
             bound StateIsBounded:
@@ -2136,39 +1620,7 @@ pub fn selection_custody_model() -> Model {
     }
 }
 
-/// Selection custody: the alt-screen selection park, as a lifecycle.
-///
-/// A text selection belongs to the screen it was made on. Entering the alternate screen parks
-/// the main screen's selection and leaves the alt buffer with none; leaving restores it and
-/// empties the parked slot (two `mem::take`s at the top of `Terminal::post_process`).
-///
-/// The property is the slot's lifetime: `parked_sel` is alive only between an enter and the
-/// next leave, which bounds the clear-site list to a handful of destroyers rather than giving
-/// every future destroyer a second obligation. They come in three shapes, one action each:
-///
-/// * `Wholesale`: `clear_scrollback` and a width resize destroy what both slots named and leave
-///   the screen where it is;
-/// * `Reset`: `Terminal::reset` and byte-stream RIS destroy both and drop the alternate buffer,
-///   so they also land on the main screen (for a direct reset an alt->main switch the restore
-///   in `post_process` never sees, and for RIS followed by a re-entry in the same batch a
-///   switch it never runs);
-/// * `RestoreMain` / `RestoreAlt`: `restore_checkpoint` adopts another session's grids and
-///   whichever screen it was on. It retires the parked slot, whose anchors name a lineage this
-///   terminal never saw, and leaves the live selection standing: that is the seamless-update
-///   adopt path, where clearing it would make a highlight vanish across an in-place update.
-///
-/// `Buggy=1` has two members naming different invariants: a symmetric swap instead of an
-/// asymmetric take, under which the alt screen's own selection stays parked after the leave
-/// and reappears on the next round trip over a buffer the user cannot see; and a destroyer
-/// that forgets the parked slot, at every one of the three shapes, the failure mode of
-/// coordinated clear sites that no compiler notices.
-///
-/// Tier-1: `aterm-core/src/terminal/alt_selection_park_conformance.rs` walks the whole
-/// reachable space on the real `Terminal` (real `?1049h` / `?1049l` bytes, `clear_scrollback`,
-/// a width resize, `Terminal::reset`, byte-stream RIS alone and RIS then `?1049h` in one batch,
-/// and `restore_checkpoint` from a main-screen and an alt-screen checkpoint) from both screens,
-/// reading the parked slot itself, and rejects each `Buggy = 1` member injected into the same
-/// real trace at its own action.
+/// Alternate-screen selection park and restore lifecycle.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn alt_selection_park_model() -> Model {
@@ -2176,14 +1628,9 @@ pub fn alt_selection_park_model() -> Model {
         AltSelectionPark {
             const Buggy = 0;
 
-            // 1 while the alternate screen is up.
             var on_alt = 0;
-            // A selection on the active screen, whichever that is.
             var live_sel = 0;
-            // The other screen's selection, held across the switch.
             var parked_sel = 0;
-            // What just fired: 0 a user gesture, 1 an enter, 2 an in-place
-            // destroyer, 3 a leave, 4 a reset, 5 a checkpoint restore.
             var last_event = 0;
 
             action Select {
@@ -2194,38 +1641,29 @@ pub fn alt_selection_park_model() -> Model {
                 live_sel = 0;
                 last_event = 0;
             }
-            // The park. Assignments are simultaneous, so every right-hand side reads the
-            // pre-state: at Buggy=1 this pair is a swap, at Buggy=0 the live slot is emptied.
             action Enter when (on_alt == 0) {
                 parked_sel = live_sel;
                 live_sel = if Buggy == 1 { parked_sel } else { 0 };
                 on_alt = 1;
                 last_event = 1;
             }
-            // The restore. At Buggy=1 the alt screen's selection lands in the parked
-            // slot instead of dying with the buffer it named.
             action Leave when (on_alt == 1) {
                 live_sel = parked_sel;
                 parked_sel = if Buggy == 1 { live_sel } else { 0 };
                 on_alt = 0;
                 last_event = 3;
             }
-            // clear_scrollback, a width resize: the content under both selections is gone, so
-            // both slots go. The screen stays where it is.
             action Wholesale {
                 live_sel = 0;
                 parked_sel = if Buggy == 1 { parked_sel } else { 0 };
                 last_event = 2;
             }
-            // `Terminal::reset`, RIS: both slots go, and so does the alt buffer.
             action Reset {
                 on_alt = 0;
                 live_sel = 0;
                 parked_sel = if Buggy == 1 { parked_sel } else { 0 };
                 last_event = 4;
             }
-            // `restore_checkpoint` of a session that was on the main screen / on
-            // the alternate screen. The live selection is left standing.
             action RestoreMain {
                 on_alt = 0;
                 parked_sel = if Buggy == 1 { parked_sel } else { 0 };
@@ -2245,8 +1683,6 @@ pub fn alt_selection_park_model() -> Model {
                 } else {
                     last_event <= 5
                 };
-            // Caught on its own by a forgetful restore of an alt checkpoint, which
-            // `ParkedEmptyOffAlt` cannot see: the stale slot is still "on alt".
             invariant RestoreRetiresTheParkedSlot:
                 if last_event == 5 { parked_sel == 0 } else { last_event <= 5 };
             bound StateBounds:
@@ -2255,37 +1691,14 @@ pub fn alt_selection_park_model() -> Model {
     }
 }
 
-/// One-key press/repeat/release pairing at the GUI-to-PTY boundary.
-///
-/// A press consumed by a physical-key GUI gate or by the engine-key overlay gate records a
-/// per-key disposition. Repeats only peek at it, and the matching release removes it without
-/// emitting Kitty CSI-u bytes. A press already forwarded to the PTY stays outstanding through
-/// overlay/gate changes and is owed its repeat/release reports at the exact press-time target.
-/// The two-window lattice moves focus while the key is held: the physical release may arrive
-/// through window 2, but a consumed owner stays byte-silent, a forwarded encoded/literal owner
-/// routes to window/session 1, and an untracked repeat is byte-silent. The model projects one
-/// entry of the process-wide physical-key owner map; other-key independence and the full
-/// window/session identity are Tier-1 negative controls. Explicit controller releases with no
-/// preceding physical episode are outside this pairing environment.
-///
-/// `Buggy=1` is the regression family: a consumed press emits an orphan release/repeat, a
-/// repeat re-decides or consumes the press-time disposition, closing an overlay clears its
-/// still-needed tracker entry, an overlay swallows the untracked release owed to a pre-overlay
-/// forwarded press, or repeat/release routing re-resolves current focus instead of keeping the
-/// original target. The literal (`[key_sequences]`) and local-repeat (`[keybindings]`) releases
-/// are decided again at release time (a chord re-lookup): a modifier let go mid-hold misses the
-/// chord, and the release falls through to the encoder as an orphan Kitty report for a press
-/// the PTY never saw.
+/// Single-key press, repeat, and release pairing at the GUI-to-PTY boundary.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn input_release_pairing_model() -> Model {
     aterm_spec::ty_model! {
         InputReleasePairing {
             const Buggy = 0;
-            // phase: 0 idle, 1 held, 2 release complete, 3 physical focus epoch ended.
             var phase = 0;
-            // tracker: 0 none, 1 physical GUI gate, 2 engine overlay gate,
-            // 3 literal text/raw payload, 4 repeatable local/native action.
             var tracker = 0;
             var overlay_open = 0;
             var press_consumed = 0;
@@ -2298,9 +1711,6 @@ pub fn input_release_pairing_model() -> Model {
             var release_emitted = 0;
             var untracked_release_swallowed = 0;
             var orphan_csi_u = 0;
-            // Two-window focus/ownership projection. Physical repeats/releases
-            // may arrive through `focused_window`, but routing authority remains
-            // the immutable `press_window` for the entire held-key episode.
             var focused_window = 1;
             var press_window = 0;
             var repeat_routed_window = 0;
@@ -2549,48 +1959,17 @@ pub fn input_release_pairing_model() -> Model {
     }
 }
 
-/// Full two-phase overlap handoff shared by native-update parent and child.
-///
-/// The parent parks its readers, a readerless child paints and proves the exact
-/// adoption/layout/session set, the parent rechecks every mutable admission fact, and one
-/// atomic Commit+exit grants ownership. The child releases its prebuilt reader gate directly
-/// from Commit; the later UI wake is diagnostic only. Every pre-Commit failure signals the
-/// candidate's entire process group and then reaps the direct child before parent readers
-/// resume or deferred teardown replays, including when the group leader has exited but a
-/// descendant lives. The guarded v0.52 one-byte branch requires an exact, strictly-newer,
-/// zero-history legacy payload before ACK+release.
-///
-/// This is a process/event-loop interleaving model through the atomic Commit linearization
-/// point. It claims no power-loss durability, and physical input arriving after Commit belongs
-/// to the replacement process's input path. Input that reaches this parent while its main
-/// thread holds the claim (`arbiter == 1`) is the parent's: what the claim answers before the
-/// write (a live `video` request, the messages flush) can take real time, so the Commit drains
-/// that input through one more dispatch fence before it writes, or, undrained, gives the claim
-/// to the rejection.
-///
-/// `Buggy=1` admits the regression family: a partial/stale proof Commit, reader release on
-/// ProofReady, legacy ACK for ambiguous/scrolled state, parent resume before reap, a wait
-/// before the group signal (stranding a live descendant after its leader exited), a parent
-/// that exits after its Commit write without checking the result (an EPIPE from a child
-/// already gone still ends the parent, and nobody owns the terminal), a reject sweep whose
-/// signal reaches only the leader (`kill(pid)` for `kill(-pgid)`), and a Commit written over
-/// input queued to the parent after its claim, which dies with the parent's `_exit`.
+/// Two-phase overlap handoff between native-update parent and child processes.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn native_update_overlap_handoff_model() -> Model {
     aterm_spec::ty_model! {
         NativeUpdateOverlapHandoff {
             const Buggy = 0;
-            // protocol: 0 modern two-channel, 1 guarded legacy one-byte ACK.
             var protocol = 0;
-            // phase: 0 live parent, 1 parked, 2 readerless child, 3 proof ready,
-            // 4 modern Commit+parent exit, 5 child active, 6 killed, 7 reaped,
-            // 8 parent resumed, 9 deferred teardown replayed.
             var phase = 0;
             var parent_readers = 1;
             var child_readers = 0;
-            // `child_live` is the direct process-group leader. Its waitable
-            // identity remains owned after exit until `child_reaped`.
             var child_live = 0;
             var descendant_live = 0;
             var group_signaled = 0;
@@ -2604,18 +1983,11 @@ pub fn native_update_overlap_handoff_model() -> Model {
             var layout_exact = 1;
             var epoch_exact = 1;
             var teardown_allows = 1;
-            // Session death (HUP/ERR) rejects, while queued readable output
-            // (`pty_output_queued`) is tolerated: post-park bytes wait gap-free in the kernel
-            // and replay through the child's fresh parser after Commit.
             var sessions_alive = 1;
             var pty_output_queued = 0;
-            // Queued-but-undispatched hardware input defers Commit (it must drain through the
-            // live input path into the persistent masters before `_exit`) but is no failure.
             var input_queue_quiet = 1;
             var native_safe = 1;
             var commit_channel = 1;
-            // Shared atomic linearization point after ProofReady:
-            // 0 Waiting, 1 Committing, 2 Rejecting, 3 Committed.
             var arbiter = 0;
             var reject_contender = 0;
             var late_cancel = 0;
@@ -2633,27 +2005,10 @@ pub fn native_update_overlap_handoff_model() -> Model {
             var legacy_strict_newer = 1;
             var legacy_ack = 0;
             var diagnostic_wake = 1;
-            // The late park. On the launched lane the successor exists before the parent
-            // parks: launched, booted and dialled with every reader live, holding nothing
-            // until the post-park grant's first descriptor message (`granted`; a grant of more
-            // than 62 sessions continues in further messages, `NativeUpdateRendezvousGrant`).
-            // Until then a revocation kills, reaps and retires the candidate with the parent's
-            // readers never stopped, and a parked parent whose capture missed may resume its
-            // readers beside the live candidate and park again, since no descriptor has left.
-            // `granted` is the one flag both lanes share: the fork lane grants at the spawn.
             var launched_early = 0;
             var granted = 0;
             var retired = 0;
-            // A revoked successor is proven gone one of two ways: with no signal of ours (this
-            // flag: it exits on the closed rendezvous, or had died before), or it ignores the
-            // EOF for the whole grace and we kill it. Both reach `child_reaped`. Who gives its
-            // counted trial launch back is the death evidence's to decide, not modelled here.
             var successor_exited = 0;
-            // The launched successor has dialled the rendezvous: the hold, the park and the
-            // grant all come after it. Before it the attempt can still end — the dial budget
-            // runs out under load, or the cancel comes — with the successor alive in its
-            // boot, and that end is a revocation like any other: its retire needs the reap
-            // too (round eight of the update audit, lead U41).
             var dialled = 0;
 
             action SelectLegacyBridge when (
@@ -2684,8 +2039,6 @@ pub fn native_update_overlap_handoff_model() -> Model {
                 child_live = 1;
                 launched_early = 1;
             }
-            // Its claim is accepted, with every reader live; a revocation before this is
-            // the dial wait's (`app_update_handoff::await_launched_dial`'s budget or cancel).
             action SuccessorDials when (
                 phase == 0 && launched_early == 1 && child_live == 1 && dialled == 0 &&
                 failure == 0
@@ -2723,11 +2076,6 @@ pub fn native_update_overlap_handoff_model() -> Model {
                 child_killed = 1;
                 group_signaled = 1;
             }
-            // The other, commoner way a revoked successor ends: the closed rendezvous is a
-            // zero-byte `recv` it maps to "the parent closed the rendezvous", so it forgives
-            // its own trial launch and exits before any window, unsignalled
-            // (`group_signaled` stays 0). A successor already dead when the revoke lands (a
-            // hang-up, the machine's kill during the hold) takes this action too.
             action SuccessorExitsOnRevoke when (
                 phase == 0 && launched_early == 1 && child_live == 1 &&
                 granted == 0 && failure == 1 && arbiter == 2 &&
@@ -2818,16 +2166,11 @@ pub fn native_update_overlap_handoff_model() -> Model {
                 epoch_exact = 0;
                 failure = 1;
             }
-            // Queued output during the overlap is no failure: the parent consumes no post-park
-            // bytes, so the carried checkpoint stays a valid ground-state prefix and the child
-            // drains the queue after Commit. Commit admission never reads this variable.
             action PtyOutputQueues when (
                 phase == 3 && pty_output_queued == 0 && arbiter == 0
             ) {
                 pty_output_queued = 1;
             }
-            // Session death fails closed: the adoption proof's live-set identity is stale, so
-            // the attempt must reject.
             action PtySessionDies when (
                 phase > 1 && phase <= 3 && sessions_alive == 1 &&
                 arbiter == 0 && failure == 0
@@ -2835,10 +2178,6 @@ pub fn native_update_overlap_handoff_model() -> Model {
                 sessions_alive = 0;
                 failure = 1;
             }
-            // Hardware input queued in the OS is no failure: it parks Commit (admission needs
-            // the queue drained) until the run loop delivers it to the persistent masters.
-            // Input queues to the parent until it exits, including while its claim is held
-            // (`arbiter == 1`), since what the claim answers before the write takes real time.
             action QueueHardwareInput when (
                 phase == 3 && input_queue_quiet == 1 && arbiter <= 1
             ) {
@@ -2933,9 +2272,6 @@ pub fn native_update_overlap_handoff_model() -> Model {
             ) {
                 late_cancel = 1;
             }
-            // The write waits for the input queued under the claim to drain
-            // into the masters: the dispatch fence the held claim goes through
-            // (`App::finish_proven_handoff`, `HeldCommit`).
             action CommitModern when (
                 protocol == 0 && phase == 3 && child_live == 1 &&
                 arbiter == 1 && commit_admission_exact == 1 && input_queue_quiet == 1
@@ -2945,10 +2281,6 @@ pub fn native_update_overlap_handoff_model() -> Model {
                 commit = 1;
                 parent_exited = 1;
             }
-            // The held claim's fence ran out with input still undelivered (its
-            // drain deadline, a sink that never settles), or its admission, read
-            // again after the fence, refused it: the claim goes to the
-            // rejection, as a failed Commit write's does, and grants nothing.
             action HeldClaimRefused when (
                 protocol == 0 && phase == 3 && arbiter == 1 &&
                 commit_admission_exact == 1 && commit == 0 && input_queue_quiet == 0
@@ -2957,11 +2289,6 @@ pub fn native_update_overlap_handoff_model() -> Model {
                 failure = 1;
                 commit_admission_exact = 0;
             }
-            // Shipping never reaps (`try_wait`) after ProofReady. A child that exits before
-            // Commit is seen by the worker's non-reaping liveness probe, which rejects through
-            // `WorkerWinsRejectArbiter`; once the main thread's Commit has won the arbiter, the
-            // exit shows only when the atomic Commit-pipe write fails (normally EPIPE), and
-            // this transfers the arbiter to rollback without granting authority.
             action CommitWriteFails when (
                 protocol == 0 && phase == 3 && child_live == 1 &&
                 arbiter == 1 && commit_admission_exact == 1 && commit == 0
@@ -3012,8 +2339,6 @@ pub fn native_update_overlap_handoff_model() -> Model {
                 parent_exited = 1;
                 commit_write_failed = 1;
             }
-            // The Commit written at once after what its claim answered, over the input queued
-            // to the parent meanwhile, which then dies with the `_exit`.
             action BuggyCommitOverQueuedInput when (
                 Buggy == 1 && protocol == 0 && phase == 3 && child_live == 1 &&
                 arbiter == 1 && commit_admission_exact == 1 && input_queue_quiet == 0
@@ -3191,10 +2516,6 @@ pub fn native_update_overlap_handoff_model() -> Model {
                 } else {
                     parent_resumed == 0
                 };
-            // A reap follows the signal that licensed it, unless there was nothing to signal:
-            // a direct child is never `wait`ed before its group is swept (the `wait` reaps the
-            // leader and destroys the pid identity the sweep needs). A successor that exited
-            // on the closed rendezvous was never signalled: a vacant pid proves its end.
             invariant ProcessGroupSignalPrecedesDirectChildReap:
                 if child_reaped == 1 && successor_exited == 0 {
                     group_signaled == 1 && waited_before_group_signal == 0
@@ -3247,10 +2568,6 @@ pub fn native_update_overlap_handoff_model() -> Model {
                 } else {
                     parent_readers <= 1
                 };
-            // An attempt retires only over a successor proven gone, so a retry never launches
-            // beside a candidate still running, dialled or not. The proof is the reap,
-            // licensed either by the successor's own exit on the closed rendezvous or by our
-            // kill.
             invariant UngrantedRetireRequiresReap:
                 if retired == 1 {
                     (child_killed == 1 || successor_exited == 1) &&
@@ -3269,23 +2586,13 @@ pub fn native_update_overlap_handoff_model() -> Model {
     }
 }
 
-/// Exact live-caret DFA for canonical profanity completion.
-///
-/// Every proper prefix of `fuck`, including `fuc`, is ordinary text. Only the complete token
-/// activates and creates an episode; harmless continuations, non-token contexts, ignore rules,
-/// and a delimiter-settled `fuc` stay inactive. The mutant activates one character early, with
-/// two consequences: the cue that fired at `fuc` cannot be taken back, so a `fuchsia`
-/// continuation or a delimiter retracts the highlight but keeps the episode
-/// (`HarmlessAndSettledAreInactive`); and the completing `k` mints a fresh episode instead of
-/// continuing the prefix's, so `fuck` cues twice (`CompletionCreatesExactlyOneEpisode`).
+/// Live-caret DFA for canonical profanity completion.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn exact_profanity_completion_model() -> Model {
     aterm_spec::ty_model! {
         ExactProfanityCompletion {
             const Buggy = 0;
-            // phase: 0 empty, 1 f, 2 fu, 3 fuc, 4 canonical fuck,
-            // 5 harmless/context-suppressed, 6 delimiter-settled fuc.
             var phase = 0;
             var active = 0;
             var canonical_identity = 0;
@@ -3367,9 +2674,6 @@ pub fn exact_profanity_completion_model() -> Model {
                 } else {
                     active == 0
                 };
-            // `active`, `canonical_identity` and `episode` move together in
-            // every phase: the prefix, completion and settled laws pin all three
-            // at once, so no separate law ties them to each other.
             invariant HarmlessAndSettledAreInactive:
                 if phase > 4 {
                     active == 0 && canonical_identity == 0 && episode == 0
@@ -3386,74 +2690,7 @@ pub fn exact_profanity_completion_model() -> Model {
     }
 }
 
-/// Process-crash/interleaving model for the native updater's fixed-path install transaction
-/// and boot-health confirmation. It models process crashes, which preserve every completed
-/// filesystem transition represented here, not sudden power loss: every ledger record goes
-/// through `manifest::write_durable` (file `sync_all`, rename, parent-directory sync) and the
-/// fixed-path swap syncs its parent directory, but a filesystem that reports sync unsupported
-/// degrades to non-durable, so power-loss durability is no claim of this model.
-///
-/// Identity `1` is exact OLD, `2` exact authorized NEW, and `3` a same-build or
-/// superseding-but-unauthorized artifact. The committed path verifies OLD's build+sealed commit
-/// before preparation, arms the exact trial before one atomic fixed-path swap, records NEW's
-/// exact build+commit+digest receipt, reconstructs that receipt after the swap-before-receipt
-/// crash cut, and GCs rollback only after a real first-present, health proof, and successful
-/// disarm. Startup consumes inherited re-exec/expected-artifact authority before any verifier
-/// can inherit it, then observes an armed trial before interpreting that authority.
-///
-/// A WINDOW'S CONFIRMATION KEEPS THE PREDECESSOR'S BYTES (2026-10-17). A window that makes
-/// the swap itself and then execs (a cold launch with a stage ready, a fork-lane successor,
-/// and before 2026-10-19 the window LaunchServices started for an update) is judged by macOS
-/// for its whole life by the bundle at the path its first consent check saw: the fixed path.
-/// Deleted there, the window's consent checks are refused even with the grant on. Since
-/// 2026-10-19 a LaunchServices-launched successor swaps nothing (its parent runs this same
-/// transaction before the launch; the model has no process identity, so that is no new
-/// step), and identity `4` remains for the lanes that exec. So
-/// `GarbageCollectRollback` ends the predecessor's authority but keeps the bytes for that
-/// window (identity `4`, `install::keep_settled_predecessor`), and `ReleaseKeptPredecessor`
-/// deletes them once the window is gone and no trial is armed
-/// (`install::release_kept_predecessor_under_apply_lock`). A kept predecessor is never a
-/// revert source (`KeptPredecessorIsNoAuthority`); the next transaction's preparation reuses
-/// the path as it reuses any stale rollback.
-///
-/// THE VERIFIER IS NOT THE SAME ACROSS BUILDS (2026-10-16). OLD passed the swap's
-/// rollback-source check under its own policy, and the trial build's Team-ID-pinned verifier
-/// may refuse the same bytes with a verdict (`fixed_refused`, the environment step
-/// `RunningVerifierRefusesRetainedOld`). The bytes are still exact OLD, but no revert can
-/// restore them (`install::Predecessor::Unavailable`), and they are no candidate this build
-/// placed (every candidate passes its verifier first), so they are no reason to hold the
-/// trial. A window's confirmation proves health and collects them as any confirmation does;
-/// a counted launch settles the trial WITHOUT REVERT (`SettleWithoutRevert`,
-/// `install::settle_trial_without_revert`) once the installed identity and its exact receipt
-/// are proved, disarming before it removes the fixed path. In this model nothing a running
-/// build VERIFIES is collected without a health proof and a disarm
-/// (`GarbageCollectionRequiresProofAndDisarm`).
-///
-/// THE MODEL TAKES THE RUNNING VERIFIER'S ANSWER AS STABLE WITHIN A TRIAL:
-/// `RunningVerifierRefusesRetainedOld` needs `rollback_verified == 0`, and
-/// `VerifyExactRollback` needs `fixed_refused == 0`. The code keeps no such memory: each
-/// FullProof launch asks `install::fixed_predecessor` afresh, so a verdict after an earlier
-/// pass (a transient Gatekeeper rejection of a genuine predecessor) settles the trial over a
-/// predecessor that once verified, which is `BuggySettleOverVerifiedRollback`'s shape. That is
-/// the accepted transient-verdict risk, and this model does not cover it. Only a verdict
-/// settles: a helper ended by a signal, or a failed wait on one, is a passing refusal and
-/// keeps the trial. A fixed path emptied by something outside the updater, or holding a
-/// non-directory, is answered like a refused one by the code and is not modelled: the updater
-/// itself never empties it or leaves a non-directory there under an armed NEW
-/// (`ArmedNewRetainsExactRollback`).
-///
-/// `Buggy=1` enables independent shortcut controls, each its own action dead at `Buggy=0`:
-/// build-only OLD or mismatched prior-receipt authority, an inherited-authority early return, a
-/// superseded swap, pre-present disarm, proof-failed early GC, and failed receipt restoration
-/// that leaves NEW's receipt authoritative. Nine more are slips the recovery laws refuse: a
-/// legacy refusal that disarms the trial it was deferring for; a receipt written ahead of the
-/// swap it describes; a two-rename "swap" failing between its renames with NEW installed and
-/// OLD off the fixed path (`RENAME_SWAP` makes that cut impossible); a failed restore that
-/// disarms the trial to stop the crash loop; an exec failure that runs the rollback GC before
-/// any restore; a crash-loop restore of an unverified rollback; a restored rollback GC'd
-/// while its trial is still armed; a settle without revert over a predecessor that verifies,
-/// which discards a revert the trial still has; and a predecessor kept as its window's bundle
-/// while its trial is still armed.
+/// Process-crash and interleaving model for fixed-path native update installation and boot-health confirmation.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn native_update_disk_transaction_model() -> Model {
@@ -3461,12 +2698,7 @@ pub fn native_update_disk_transaction_model() -> Model {
         NativeUpdateDiskTransaction {
             const Buggy = 0;
             const MaxCrashes = 3;
-            // startup_phase: 0 inherited environment may still be present,
-            // 1 authority consumed/cleared, 2 boot-health observed, 3 verdict
-            // applied (either the disk lane is live or startup safely returned).
             var startup_phase = 0;
-            // inherited_authority: 0 absent, 1 exact matching re-exec/trial,
-            // 2 malformed or incomplete expected-artifact authority.
             var inherited_authority = 0;
             var inherited_env_live = 0;
             var boot_health_attempted = 0;
@@ -3474,9 +2706,6 @@ pub fn native_update_disk_transaction_model() -> Model {
             var startup_returned = 0;
             var startup_deferred = 0;
             var disk_lane_ready = 0;
-            // A v0.52 parent can hand off an already-swapped NEW with an armed trial and exact
-            // OLD rollback but no ready/installed receipt: a reachable startup state of its own,
-            // not a post-swap start treated as staged OLD.
             var legacy_postswap = 0;
             var legacy_variant = 0;
             var ready_present = 0;
@@ -3487,13 +2716,7 @@ pub fn native_update_disk_transaction_model() -> Model {
             var legacy_trial_digest_exact = 0;
             var legacy_rollback_strict_old = 0;
             var modern_receipt_recovered = 0;
-            // phase: 0 staged OLD, 1 fixed NEW prepared, 2 trial armed,
-            // 3 atomically swapped, 4 exact receipt available, 5 disarmed,
-            // 6 terminal, 7 crashed after swap/before receipt, 8 crash-loop
-            // rollback required, 9 exact OLD restored but trial still armed.
             var phase = 0;
-            // Installed/fixed identity: 0 absent, 1 exact OLD, 2 exact NEW,
-            // 3 unauthorized identity, 4 (fixed only) settled OLD kept for its window.
             var installed = 1;
             var fixed = 0;
             var fixed_exact = 0;
@@ -3506,8 +2729,6 @@ pub fn native_update_disk_transaction_model() -> Model {
             var receipt = 0;
             var receipt_exact = 0;
             var rollback_verified = 0;
-            // The RUNNING build's verifier refused the exact OLD at the fixed path with a
-            // verdict: no revert can restore it. A fact about the verifier, not the bytes.
             var fixed_refused = 0;
             var settled_without_revert = 0;
             var first_present_done = 0;
@@ -3522,9 +2743,6 @@ pub fn native_update_disk_transaction_model() -> Model {
             var gc = 0;
             var rollback_restored = 0;
             var rollback_gc = 0;
-            // OLD's pre-transaction receipt is unsigned local state until it is
-            // bound to OLD's just-verified sealed build+commit. Only that bound
-            // value may be retained for an exec-failure inverse swap.
             var previous_receipt_present = 1;
             var previous_receipt_matches_old = 1;
             var previous_receipt_saved = 0;
@@ -3697,10 +2915,6 @@ pub fn native_update_disk_transaction_model() -> Model {
                 startup_deferred = 1;
                 boot_health_attempted = 1;
             }
-            // No receipt and no ready record: no evidence is left to rebuild from, so the
-            // shipping code returns "no exact receipt or authorized recovery record" and
-            // defers, keeping the armed trial and fixed rollback for a later launch. Modelling
-            // that refusal keeps this state reachable but not stuck.
             action RefuseLegacyMissingRecoveryEvidence when (
                 legacy_postswap == 1 && startup_phase == 1 &&
                 receipt == 0 && ready_present == 0
@@ -4072,24 +3286,16 @@ pub fn native_update_disk_transaction_model() -> Model {
                 fixed_exact = 0;
                 gc = 1;
             }
-            // The window the settled predecessor was kept for is gone, and no trial owns
-            // the fixed path: a later launch deletes the bytes.
             action ReleaseKeptPredecessor when (
                 phase == 6 && fixed == 4 && trial == 0
             ) {
                 fixed = 0;
             }
-            // The slip `KeptPredecessorIsNoAuthority` refuses: the predecessor kept as the
-            // window's bundle while its trial is still armed, where a crash-loop revert
-            // would still take it as the rollback.
             action BuggyKeepPredecessorBeforeDisarm when (
                 Buggy == 1 && phase == 4 && trial == 1 && health_proved == 1 && fixed == 1
             ) {
                 fixed = 4;
             }
-            // A counted launch of the trial: the installed identity and its exact receipt
-            // are proved and the predecessor is unrevertible, so the trial is disarmed and
-            // only then the fixed path cleared. No health was proved, so none is booked.
             action SettleWithoutRevert when (
                 phase == 4 && trial == 1 && installed == authorized_new &&
                 swap_identity == authorized_new && receipt == 1 && receipt_exact == 1 &&
@@ -4311,9 +3517,6 @@ pub fn native_update_disk_transaction_model() -> Model {
                 } else {
                     startup_deferred <= 1
                 };
-            // A receipt rebuilt from Ready stays exact until a crash-loop restore
-            // retires it with its rollback. (That it needs a Ready record at all is
-            // `RecoverModernReceiptFromReady`'s guard, the flag's only writer.)
             invariant ModernReadyRecoveryIsExact:
                 if modern_receipt_recovered == 1 {
                     if rollback_restored == 1 {
@@ -4362,10 +3565,6 @@ pub fn native_update_disk_transaction_model() -> Model {
                 } else {
                     receipt_exact == 0
                 };
-            // The fixed path goes, or stays for its window as no authority, only after a
-            // disarm, with the receipt exact. A bundle the running build VERIFIES goes only
-            // after a health proof too; one it refused is no revert, so a settle needs no
-            // proof of health for it.
             invariant GarbageCollectionRequiresProofAndDisarm:
                 if gc == 1 {
                     disarmed == 1 && trial == 0 && receipt_exact == 1 &&
@@ -4379,8 +3578,6 @@ pub fn native_update_disk_transaction_model() -> Model {
                 } else {
                     disarmed <= 1
                 };
-            // A predecessor kept for its window is no revert source: it outlives only a
-            // proved, disarmed trial, and never as an exact rollback.
             invariant KeptPredecessorIsNoAuthority:
                 if fixed == 4 {
                     phase == 6 && gc == 1 && trial == 0 && disarmed == 1 &&
@@ -4485,12 +3682,7 @@ pub fn native_update_disk_transaction_model() -> Model {
     }
 }
 
-/// A Settings page's scroll list is a bounded cursor over its stops, shared by the wheel and
-/// arrow keys (a row), Page Up/Down (the rows shown, a signed multi-row delta) and absolute
-/// accessibility scroll positions. Every transition first clamps an obsolete cursor to the
-/// current limit (a grown window or a changed layout shrinks it), then applies its motion and
-/// clamps again. `Buggy=1` drops the upper clamp for a row forward, Absolute, and a forward
-/// page.
+/// Bounded scroll-cursor clamping across wheel, arrow, page, and accessibility motions.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn settings_page_scroll_model() -> Model {
@@ -4500,7 +3692,6 @@ pub fn settings_page_scroll_model() -> Model {
             const Max = 3;
             var limit = 0;
             var cursor = 0;
-            // Absolute-scroll input; Max + 1 exercises an out-of-range request.
             var target = 0;
             action GrowLimit when (limit <= Max - 1) {
                 limit = limit + 1;
@@ -4552,83 +3743,23 @@ pub fn settings_page_scroll_model() -> Model {
     }
 }
 
-/// Video recording and publication are one serialized, fail-closed lifecycle.
-///
-/// The control thread pre-creates a private, server-named directory before the event-loop
-/// request is armed. `recording_slot` owns that request through the pending/recording phases;
-/// `BeginExport` atomically hands ownership to the process-wide `export_permit`. Success
-/// transfers the directory from private ownership to a published artifact, while rejection,
-/// cancellation, encode failure, owner loss, and a live opacity transition all remove it.
-///
-/// Mode is honest about the presentation source: a swapchain tap requires glass, and an
-/// offscreen present-real recording requires no glass and owns a pacing timer, its sole redraw
-/// driver. A glass recording owns one exactly when the request asked for `pace`
-/// (`video <seconds> ... pace`), because the post-present hook alone starves once an unchanged
-/// frame is skipped; `video_initial_next_frame` arms both (`RecordingOwnsItsPacingTimer`). The
-/// timer lives in the recording itself, so outside the recording phase it does not exist. A
-/// translucent transition aborts a live tap before another frame can be accepted.
-///
-/// `Buggy=1` exposes independently reachable failure classes: cleanup that strands the private
-/// directory, a windowed request taking the headless arm, a second recording acquiring
-/// ownership while the first still exports (the begin guard testing `video_rec` without
-/// `video_export.is_busy()`), publication without winning the cancellation CAS, and a tap
-/// retained after the glass becomes translucent. Six more dead mutants are each one line of
-/// the shipping lifecycle written wrong:
-/// * `BuggyExportRetainsVirtualTarget`: `video_finalize` hands the take to the exporter
-///   without `ws.present = None`, so a headless window keeps its recording-only `Virtual`
-///   target (the idle-zero law `finalize_drops_virtual_target_and_timer` pins).
-///   `ModeMatchesRecordingPhase`.
-/// * `BuggyFinalizeKeepsRecordingSlot`: `video_finalize` reading `video_rec` through
-///   `as_mut()` instead of `take()`, so the slot still reads occupied during the export and
-///   every later `video` request is refused as "already in progress". `SlotMatchesPhase`.
-/// * `BuggyDetachGlassDuringTap`: a window close drops its glass without
-///   `video_abort_window_close`, so the swapchain tap outlives the surface it copies.
-///   `TapOnlyOnGlass`.
-/// * `BuggyBeginHeadlessUntimed`: `video_initial_next_frame` written as `pace.then_some(now)`,
-///   so an unpaced offscreen loop begins with no deadline and records nothing.
-///   `RecordingOwnsItsPacingTimer`.
-/// * `BuggyPacedTapUntimed`: the same function returning `None` for every swapchain tap, so a
-///   paced glass recording starves on its first skipped unchanged frame.
-///   `RecordingOwnsItsPacingTimer`.
-/// * `BuggyLateCancelRevokes`: `VideoCancellation::cancel` as a blind store of
-///   `VIDEO_CANCELLED` instead of the CAS from `VIDEO_CANCEL_LIVE`, so a timeout after
-///   `authorize_commit` revokes an export already past its rename boundary.
-///   `CancelledOwnsNothing`: a won cancellation has ended the lifecycle, while this one still
-///   exports.
-///
-/// No law restates another. "Recording and export never overlap" and "at most one lifecycle is
-/// live" are `SlotMatchesPhase` and `PrivateDirectoryOwnedByLifecycle`, which the
-/// second-recording mutant breaks on its first step; "a published take owns nothing" is
-/// `CommitAuthorizationScope` (published only at phase 0) read through the same two laws, and
-/// "a cancelled lifecycle owns nothing" is `CancelledOwnsNothing` (cancelled only at phase 0)
-/// read through them too. A losing cancel changes nothing, so `CancelAfterAuthorization` is a
-/// stutter.
-///
-/// Tier-0 exercises each mutant directly in addition to the exhaustive prove-and-catch check.
+/// Serialized fail-closed video recording and publication lifecycle.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn video_recording_lifecycle_model() -> Model {
     aterm_spec::ty_model! {
         VideoRecordingLifecycle {
             const Buggy = 0;
-            // 0 Idle, 1 Reserved/pending, 2 Recording, 3 Exporting.
             var phase = 0;
             var glass = 0;
-            // The request's `pace` flag.
             var pace = 0;
-            // 0 None, 1 SwapchainTap, 2 OffscreenPresentReal.
             var mode = 0;
             var timer = 0;
             var translucent = 0;
-            // The pending/recording side and exporting side of the serialized
-            // lifecycle. They must never overlap.
             var recording_slot = 0;
             var export_permit = 0;
-            // Private, server-owned directories for the current lifecycle.
             var private_dirs = 0;
-            // The current lifecycle completed its atomic publication.
             var published = 0;
-            // Publication CAS: 0 Live, 1 Cancelled, 2 CommitAuthorized.
             var cancel_state = 0;
 
             action AttachGlass when (phase == 0) { glass = 1; }
@@ -4683,8 +3814,6 @@ pub fn video_recording_lifecycle_model() -> Model {
             ) {
                 cancel_state = 2;
             }
-            // The losing side of the CAS: a cancel after authorization changes
-            // nothing.
             action CancelAfterAuthorization when (
                 phase == 3 && cancel_state == 2
             ) {
@@ -4749,10 +3878,6 @@ pub fn video_recording_lifecycle_model() -> Model {
                 published = 0;
                 cancel_state = 1;
             }
-            // Each mutant is its own action, not a `Buggy` arm inside a live one: the
-            // strict-vacuity audit removes the dead set and requires the remaining Buggy=1
-            // baseline to be safe, so an inline arm would make every dead action uncreditable
-            // as a negative control.
             action BuggyStrandPrivateDirOnCleanup when (
                 Buggy == 1 && phase > 0
             ) {
@@ -4853,10 +3978,6 @@ pub fn video_recording_lifecycle_model() -> Model {
                 };
             invariant PrivateDirectoryOwnedByLifecycle:
                 if phase > 0 { private_dirs == 1 } else { private_dirs == 0 };
-            // Phase 0 owns no slot, permit, or directory
-            // (`SlotMatchesPhase`, `PrivateDirectoryOwnedByLifecycle`) and a
-            // cancelled take publishes nothing (`CommitAuthorizationScope`), so
-            // "a won cancellation has ended the lifecycle" is all this law adds.
             invariant CancelledOwnsNothing:
                 if cancel_state == 1 { phase == 0 } else { cancel_state <= 2 };
             invariant CommitAuthorizationScope:
@@ -4878,30 +3999,15 @@ pub fn video_recording_lifecycle_model() -> Model {
     }
 }
 
-/// Retention of per-process capture namespaces is decided by the exact instance lease, not
-/// merely by PID liveness.
-///
-/// Lease state `0` is a legacy namespace with no lease file, `1` a lock held by a live exact
-/// process instance, `2` a well-formed but freely lockable stale instance, and `3`
-/// malformed/untrusted lease metadata. A held lease and malformed metadata fail closed to keep.
-/// A free lease is exact proof of staleness and is removed even if its recorded PID has been
-/// reused. Only the missing-legacy case falls back to the coarse PID probe.
-///
-/// `Buggy=1` independently recreates removal of held/malformed namespaces, the PID-reuse leak
-/// that keeps a free lease when the numeric PID is alive, and a legacy namespace kept though its
-/// PID is dead (the `InstanceLeaseState::Missing if !pid_alive => Remove` arm of
-/// `decide_instance_namespace_sweep` folded into the fail-closed `Keep` arm, so every pre-lease
-/// capture namespace leaks for ever).
+/// Instance-lease retention of per-process capture namespaces.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn exact_instance_retention_model() -> Model {
     aterm_spec::ty_model! {
         ExactInstanceRetention {
             const Buggy = 0;
-            // 0 MissingLegacy, 1 Held, 2 Free, 3 Malformed.
             var lease = 0;
             var pid_alive = 0;
-            // 0 Pending, 1 Keep, 2 Remove.
             var decision = 0;
 
             action SelectHeld when (decision == 0) { lease = 1; }
@@ -4946,44 +4052,19 @@ pub fn exact_instance_retention_model() -> Model {
     }
 }
 
-/// A confined artifact operation is a retained-handle transaction, not a path string that may
-/// be resolved again after an attacker swaps an ancestor.
-///
-/// `ConfinePin` retains the original inside object and its identity. Reads and writes target
-/// that pinned object even when the path's ancestor is swapped. `ValidateReply` then compares
-/// the reply-time path identity with the pin: unchanged identity may be certified; a swap fails
-/// closed, whether it happened before the operation or in the operation-to-reply interval.
-///
-/// `Buggy=1` exposes both forbidden TOCTOU classes: re-resolving a swapped path reads or writes
-/// the outside object (`BuggyReresolveRead`/`Write`), which is every operation under path-only
-/// confinement (`AnchoredAccessNeverOutside`); and reply construction certifies the swapped
-/// identity despite having pinned a different object (`BuggyCertifySwapped`), which is what a
-/// reply built without `validate_for_reply` says once the ancestor has moved.
-///
-/// No state records that the transaction is pinned or that the reply was validated: such a
-/// flag would be written only by the action it names, so a law over it restates that
-/// assignment. The harm is the outside effect and the false certificate, and the two laws
-/// judge exactly those. "A swapped path is never certified" and "a successful reply certifies
-/// the original" break together (a reply can certify something other than the pinned original
-/// only once the path has moved), so `SuccessfulReplyCertifiesOriginal` states both.
+/// Retained-handle confinement across ancestor directory swaps.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn anchored_artifact_transaction_model() -> Model {
     aterm_spec::ty_model! {
         AnchoredArtifactTransaction {
             const Buggy = 0;
-            // 0 Unconfined, 1 Pinned, 2 Operated, 3 Replied.
             var phase = 0;
             var swapped = 0;
-            // 0 None, 1 OriginalInside, 2 SwappedOutside.
             var path_identity = 0;
-            // 0 None, 1 Read, 2 Write.
             var operation = 0;
-            // 0 None/fail-closed, 1 OriginalInside, 2 Outside.
             var effect_target = 0;
-            // 0 Pending, 1 Success, 2 FailClosed.
             var reply = 0;
-            // 0 None, 1 OriginalInside, 2 SwappedOutside.
             var certified_identity = 0;
 
             action ConfinePin when (phase == 0) {
@@ -5056,47 +4137,7 @@ pub fn anchored_artifact_transaction_model() -> Model {
     }
 }
 
-/// A filesystem artifact reply is a transaction that spans two threads, the
-/// complete control-socket write, and a nonce-bound peer acknowledgement. Timeout
-/// cancellation and final-name authorization have one winner. A successful
-/// worker queues a publication guard; the socket thread revalidates it before
-/// any OK byte, then writes and flushes the complete frame plus a fresh nonce challenge.
-/// Only the matching post-challenge echo permits immediate release. A failed or
-/// abandoned ACK enters an additional central nonblocking quarantine; its two
-/// bounded ticks abstract the shipping 30-second delay, and the guard survives
-/// until explicit expiry. A partial `write_all` failure enters the same
-/// quarantine because path bytes may already be visible even though the complete
-/// frame receipt guarantee was never established. A pre-wire abort remains the
-/// only direct cleanup path because it removes an unpublished artifact.
-///
-/// `Buggy=1` exposes ten independently audited failures: publishing after
-/// timeout won, dropping a queued guard before the reply reaches the wire,
-/// pruning a leased artifact, releasing without a valid ACK, reading an ACK
-/// before the server's causal challenge exists, releasing quarantine before
-/// expiry, and four lines of the shipping writer or guard written wrong:
-/// * `BuggyChallengeBeforeBody` — `ControlReply::into_wire` queueing the
-///   challenge ahead of the body, so an echo no longer proves the client read
-///   the complete frame (`ChallengeRequiresCompleteWire`);
-/// * `BuggyOkBeforeRevalidation` — `Outbox::attach` queueing the OK body before
-///   `retention.prepare_write()`: when revalidation then fails, the client has
-///   read OK for a file the abort removes (`CommitRequiresWirePreparation`);
-/// * `BuggyTrailerErrorIgnored` — `Outbox::deliver_to` dropping the error of a
-///   write that left the challenge unsent, so the partial frame awaits an ACK
-///   that cannot come, instead of entering quarantine
-///   (`CompleteReplyPrecedesAck`);
-/// * `BuggyAbortRetainsArtifact` — `CaptureReplyRetention`'s drop without its
-///   uncommitted `remove_exact` arm (`AbortReleaseRemovesUncommittedArtifact`).
-///
-/// Each law is one claim, placed by `phase`; none repeats another's clause.
-/// "A failed ACK or partial write enters quarantine" is not a law of its own:
-/// every other exit is refused by the law of the phase it would land in — an
-/// immediate release needs a valid ACK (`ImmediateReleaseRequiresValidAck`), a
-/// committed reply never takes the abort path (`CommitRequiresWirePreparation`),
-/// and a quarantined guard is held (`OwnedThroughClassifiedExitRetainsGuard`)
-/// until the delay has run (`QuarantineReleaseRequiresExpiry`). Quarantined is
-/// phase 7 and expired is phases 8/11; the verdicts `ack_failed`/`write_error`
-/// are the ACK wait's and writer's observations, which the Tier-1 binds compare
-/// step by step.
+/// Two-thread filesystem artifact publication, nonce challenge, and quarantine lifecycle.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn artifact_reply_publication_model() -> Model {
@@ -5104,11 +4145,6 @@ pub fn artifact_reply_publication_model() -> Model {
         ArtifactReplyPublication {
             const QuarantineDelay = 1;
             const Buggy = 0;
-            // 0 Live, 1 Cancelled, 2 Authorized, 3 Queued,
-            // 4 WirePrepared, 5 WireWritten, 6 PeerAcked,
-            // 7 Quarantined, 8 QuarantineExpired, 9 AbortPending,
-            // 10 ReleasedAfterAck, 11 ReleasedAfterQuarantine,
-            // 12 ReleasedAbort.
             var phase = 0;
             var artifact = 0;
             var guard = 0;
@@ -5279,8 +4315,6 @@ pub fn artifact_reply_publication_model() -> Model {
                 } else {
                     phase <= 3 || phase == 9 || phase == 12
                 };
-            // The ACK phases (5, 6, 10) carry the complete frame, and the frame
-            // exists only once it was written after preparation.
             invariant CompleteReplyPrecedesAck:
                 if reply == 1 {
                     phase == 5 || phase == 6 || phase == 7 ||
@@ -5301,42 +4335,13 @@ pub fn artifact_reply_publication_model() -> Model {
                 } else {
                     quarantine_age <= QuarantineDelay
                 };
-            // Only the file: the commit/reply/challenge/ACK laws place their variables in
-            // phases that exclude 12, and the guard's drop is the release that enters it.
             invariant AbortReleaseRemovesUncommittedArtifact:
                 if phase == 12 { artifact == 0 } else { artifact <= 1 };
         }
     }
 }
 
-/// Aggregate admission bound for queued, in-flight, and quarantined path
-/// artifacts and their directory chains (aterm-gui's
-/// `ArtifactBudgets::descriptors`, a `UnitBudget`). A failed acknowledgement
-/// releases its worker immediately but not its filesystem guard, so worker
-/// count alone cannot bound retained resources.
-/// Admission stops at either the object cap or the aggregate descriptor-unit
-/// cap; any release returns both charges atomically. The three charge buckets
-/// are a bounded multiset of live permits (one, two, or three units). `Select*`
-/// are ghost scheduler choices that let the checker explore every release and
-/// reconciliation order without collapsing heterogeneous permits into one
-/// unsound "last charge" scalar. `Charge` is the representative acquisition
-/// cost, chosen so descriptor saturation occurs while the count still has room.
-///
-/// `Buggy=1` enables four dead negative controls, each one line of
-/// `UnitBudget` written wrong:
-/// * `BuggyOverbook` admits past either cap (`Bounded`);
-/// * `BuggyReconcileOverbook` grows a permit past the unit cap (`Bounded`);
-/// * `BuggyRefuseLeaksSlot` is `try_take` taking the count slot before the unit
-///   check and returning `None` without giving it back — each refusal at the
-///   unit cap leaks one slot until the pool answers busy forever
-///   (`CountMatchesCharges`);
-/// * `BuggyReleaseProvisionalCharge` is `UnitPermit::reconcile` updating the
-///   pool without recording the permit's new charge, so the grown permit's
-///   drop returns its provisional charge and strands the unit reconciliation
-///   added (`UnitsMatchCharges`).
-///
-/// No separate "each live permit owns a unit" law: every bucket charges at
-/// least one unit, so that follows from the two conservation laws.
+/// Aggregate object and descriptor-unit budget for queued, in-flight, and quarantined path artifacts.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn artifact_handoff_capacity_model() -> Model {
@@ -5483,10 +4488,6 @@ pub fn artifact_handoff_capacity_model() -> Model {
                 charge_three = charge_three;
                 selected = selected;
             }
-            // Fires only while the charges still balance: the slip strands one
-            // unit per firing, and letting it repeat would grow
-            // `descriptor_units` without bound and leave the Buggy=1 space
-            // unenumerable.
             action BuggyReleaseProvisionalCharge when (
                 Buggy == 1 && selected == 3 && charge_three > 0 &&
                 descriptor_units ==
@@ -5514,17 +4515,7 @@ pub fn artifact_handoff_capacity_model() -> Model {
     }
 }
 
-/// Durability ordering for one published video batch. Each `WriteMember` is a member whose file
-/// contents are already synced; `SyncBatch` records the directory barrier covering every member
-/// written so far, and a later member invalidates that coverage until another barrier
-/// completes. The reader-visible marker may be published only while the barrier covers the
-/// whole current batch.
-///
-/// `Buggy=1` enables two dead negative controls. `BuggyPublishBeforeSync` shows the marker over
-/// members no barrier covers (`MarkerCoversEveryMember`). `BuggySyncAhead` is
-/// `ConfinedVideoDir::write_batch_member_authorized` without its `batch_synced.set(false)`: a
-/// flag that stays set claims every later member too. `MarkerCoversEveryMember` cannot see it
-/// (once the batch fills the counts agree), so `BarrierCoversOnlyWrittenMembers` catches it.
+/// Directory-sync barrier ordering before reader-visible video batch publication.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn video_batch_publication_durability_model() -> Model {
@@ -5574,45 +4565,7 @@ pub fn video_batch_publication_durability_model() -> Model {
     }
 }
 
-/// Refcounted video retention is a bounded lifecycle separate from publication. The producer
-/// and several `video frames` readers may share one exact recording identity. Marker
-/// publication or final reader validation requests one capability-bound convergence sweep. A
-/// non-final release cannot start maintenance; the last release schedules it, new acquisitions
-/// fail closed while that schedule/sweep is live, and only completion reopens acquisition. A
-/// replacement recording at the same lexical name is refused while any original-identity lease
-/// remains.
-///
-/// `pending` is the seam between the last count decrement and `StartSweep`. Shipping code does
-/// both under one registry mutex, so no acquisition observes it; it is explicit so the ordering
-/// obligation is checkable.
-///
-/// Two variables are not registry fields; each makes a law independent of the entry it judges:
-/// * `requested` is the obligation `arm_video_retention_sweep` created, set by `Arm` and
-///   discharged only by a finished sweep. The registry's own record (`armed`, the entry's
-///   `video_sweep_requested`) disappears with the entry, so a law over `armed` alone could not
-///   see a release that removes an armed entry instead of sweeping it.
-/// * `admission_spent` is an entry whose reserved retention admission (`video_retention`) the
-///   last release has taken; `join_video_artifact_state` refuses every reader of it.
-///
-/// `Buggy=1` enables six dead negative controls: a sweep started before the last release, an
-/// acquisition during the sweep, a replaced recording joining the lease group, and three that
-/// are one line of the registry written wrong:
-/// * `BuggyArmedReleaseDropsEntry`: `ArtifactPathLease::drop` removing an armed entry at count
-///   zero instead of sweeping it (the `video_sweep_requested` case folded into
-///   `else { held.remove(&key) }`, or the `_ =>` arm a release build takes when the capability
-///   or admission is missing), so the requested retention never runs
-///   (`RequestedRetentionRunsAtLastRelease`).
-/// * `BuggyReleaseSweepsUnarmed`: `ArtifactPathLease::drop` without its
-///   `state.video_sweep_requested` test, so the last release of an unarmed recording schedules
-///   the sweep around a publication nothing confirmed (`MaintenanceRequiresArm`).
-/// * `BuggyFinishKeepsEntry`: `finish_video_retention_sweep` resetting `sweeping` and
-///   `video_sweep_requested` instead of `held.remove(key)`; the kept entry has spent its
-///   admission, so every later reader is refused with `WouldBlock`, and after a same-name
-///   replacement with the stale identity's `NotFound` (`IdleNameAdmitsReaders`).
-///
-/// "One maintenance phase at a time" and "a finished sweep leaves the entry unarmed" are not
-/// laws of their own: both branches of `RequestedRetentionRunsAtLastRelease` bound
-/// `pending + sweeping` by one, and an armed count-zero entry with neither is what it refuses.
+/// Refcounted video retention and convergence-sweep scheduling lifecycle.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn artifact_reader_lease_model() -> Model {
@@ -5751,14 +4704,7 @@ pub fn artifact_reader_lease_model() -> Model {
     }
 }
 
-/// Fixed-path snapshot publication is a generation-fenced transaction. Beginning
-/// generation two invalidates generation one's completion marker before the new
-/// request returns; an overtaken worker may finish encoding privately, but it may
-/// not publish either its stale payload or a marker certifying that payload.
-///
-/// `Buggy=1` recreates the stale-worker race by allowing generation one's commit
-/// after generation two has begun. The resulting marker certifies payload one as
-/// current even though the path's latest generation is two.
+/// Generation-fenced fixed-path snapshot publication.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn snapshot_generation_commit_model() -> Model {
@@ -5790,21 +4736,7 @@ pub fn snapshot_generation_commit_model() -> Model {
     }
 }
 
-/// A native control mutation may stage pixels before the compositor accepts a
-/// present. Screenshot capture is authorized only after that present succeeds.
-/// A capture makes at most `AttemptLimit` present attempts and then fails closed;
-/// dropped attempts before that bound may retry, but they never fall through to
-/// reading the previous composited frame.
-///
-/// `Buggy=1` enables two independent slips in `capture_after_present_decision`, each a
-/// dead-at-`Buggy=0` action beside the healthy `Decide`:
-/// * `BuggyStaleCapture` treats a dropped present as capture authorization (`NoStaleCapture`,
-///   `CaptureRequiresPresent`);
-/// * `BuggyRetryAtLimit` reads the retry arm as `attempts <= attempt_limit` for the shipping
-///   `<`, so the last dropped present asks for a retry instead of failing closed
-///   (`DecisionMatchesOutcome`'s fail-closed arm). The barrier loop's own
-///   `while attempts < attempt_limit` still stops it (`Retry` keeps that guard), so only the
-///   decision law sees it.
+/// Compositor-present fencing and bounded retry for native control screenshot capture.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn capture_after_present_model() -> Model {
@@ -5814,11 +4746,7 @@ pub fn capture_after_present_model() -> Model {
             const AttemptLimit = 3;
             var staged = 0;
             var present_succeeded = 0;
-            // One-based number of real present attempts already made. Mutate
-            // enters the first attempt; Retry advances to the next one. This is
-            // the exact accounting used by run_capture_present_barrier.
             var attempts = 0;
-            // 0 Pending, 1 Capture, 2 Retry, 3 FailClosed.
             var decision = 0;
             var captured = 0;
             var failed = 0;
@@ -5849,8 +4777,6 @@ pub fn capture_after_present_model() -> Model {
                 ) { 1 } else { 0 };
                 staged = if present_succeeded == 1 { 0 } else { staged };
             }
-            // A dropped present authorizes capture, and the pixels read are the
-            // previous composited frame's.
             action BuggyStaleCapture when (
                 Buggy == 1 && staged == 1 && decision == 0 &&
                 attempts > 0 && present_succeeded == 0
@@ -5859,8 +4785,6 @@ pub fn capture_after_present_model() -> Model {
                 captured = 1;
                 stale_capture = 1;
             }
-            // The retry arm's `<` read as `<=`: at the bound a dropped present
-            // decides Retry, not FailClosed.
             action BuggyRetryAtLimit when (
                 Buggy == 1 && staged == 1 && decision == 0 &&
                 attempts == AttemptLimit && present_succeeded == 0
@@ -5889,10 +4813,6 @@ pub fn capture_after_present_model() -> Model {
                 } else {
                     decision == 3 && captured == 0 && failed == 1
                 };
-            // The attempt bound only restates `Retry`'s guard (the barrier loop's
-            // `while attempts < attempt_limit`), so it is the space, not a law; Tier-1 binds the
-            // real loop's call bound. Failing closed at the bound is `DecisionMatchesOutcome`'s,
-            // and `BuggyRetryAtLimit` is its counterexample.
             bound ValuesBounded:
                 attempts <= AttemptLimit &&
                 staged <= 1 && present_succeeded <= 1 && decision <= 3 &&
@@ -5901,40 +4821,16 @@ pub fn capture_after_present_model() -> Model {
     }
 }
 
-/// The one-shot presented-destination tap owns exactly one staging buffer. A
-/// validated destination copy advances `Armed -> Pending`; the serial-bound
-/// successful-present hook advances `Pending -> InFlight`; and only a successful
-/// map/conversion produces a frame. Geometry/metadata rejection and every async
-/// completion failure terminate explicitly with an error.
-///
-/// `Buggy=1` enables three dead negative controls, each one arm of the shipping
-/// `presented_frame_transition` gate written wrong:
-/// * `BuggyMapErrorPublishesFrame` — the `MapError` arm returning
-///   `(Complete, Frame)`: the fail-open map callback publishes a frame without
-///   any successful mapping (`SuccessRequiresMappedCopy`);
-/// * `BuggyRejectReservesSlot` — the `RejectEnqueue` arm copied from
-///   `EnqueueValid`, `(Pending, None)`, so a rejected destination reserves the
-///   staging buffer with no copy in it and maps whatever an earlier capture
-///   left there (`ReservedPhaseRequiresAcceptedCopy`);
-/// * `BuggyMapErrorWithoutOutcome` — the `MapError` arm returning
-///   `(Complete, None)`: the one-shot ends with no error for its waiter to take
-///   (`TerminalPhaseHasResult`).
-///
-/// "A result exists only at the terminal" is `TerminalPhaseHasResult` read
-/// backwards, so it is not stated twice; nor is "a frame is published only at
-/// the terminal, from an accepted copy" beside `SuccessRequiresMappedCopy`: a
-/// result lives only at phase 3, and only an accepted copy is ever mapped.
+/// Single-slot staging buffer lifecycle for the one-shot presented-destination tap.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn presented_frame_tap_model() -> Model {
     aterm_spec::ty_model! {
         PresentedFrameTap {
             const Buggy = 0;
-            // 0 Armed, 1 Pending, 2 InFlight, 3 Complete.
             var phase = 0;
             var accepted = 0;
             var mapped = 0;
-            // 0 None, 1 Frame, 2 Error.
             var result = 0;
             action EnqueueValid when (phase == 0) {
                 phase = 1;
@@ -5989,33 +4885,7 @@ pub fn presented_frame_tap_model() -> Model {
     }
 }
 
-/// One staging slot in the streaming video tap cycles
-/// `Free -> Pending -> InFlight -> Free`. Map errors and finalization aborts
-/// release the reserved slot while counting one loss. Invalid live colour
-/// metadata never reserves a slot and counts one loss only after the fps gate
-/// accepted that sampling opportunity (decimation is outside this transition).
-/// The bounded harvested-store projection then drives callback arrival
-/// `3,1,2`: insertion must publish sorted `1,2,3`, and a two-frame budget must
-/// evict the lowest sequence and retain tail `2,3`.
-///
-/// `Buggy=1` enables five dead negative controls, one fail-open slip each, so
-/// every law is the first thing its own slip breaks:
-/// * `BuggyMapErrorLeaksSlot` — a failed map counts its loss but leaves the
-///   slot `InFlight` (`ErrorResolutionFreesSlot`);
-/// * `BuggyRejectInvalidUncounted` — invalid metadata discarded as though it
-///   were client decimation, `dropped` untouched (`InvalidMetadataIsCounted`,
-///   which counts losses by cause, so the slip is caught whatever error or
-///   abort was counted before it);
-/// * `BuggyHarvestCallbackOrder`: an append in callback order, `3,1` (`HarvestedStoreSorted`);
-/// * `BuggyEvictNewest` — `ordered_capture_store_push` with `pop_back` for
-///   `pop_front`: the budget drops the newest capture and keeps `1,2`
-///   (`BudgetKeepsNewestTail`);
-/// * `BuggyEvictionUnreported` — the same push with its `evicted += 1` lost, so
-///   the take's `head_truncated` reads false over a recording whose head is
-///   gone (`EvictionMatchesOverflow`).
-///
-/// "A reserved slot carries no resolved error" is not stated beside
-/// `ErrorResolutionFreesSlot`: it is the same law read backwards.
+/// Streaming video tap slot lifecycle, loss accounting, and bounded sequence-ordered harvest.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn video_tap_slot_model() -> Model {
@@ -6023,16 +4893,11 @@ pub fn video_tap_slot_model() -> Model {
         VideoTapSlot {
             const Buggy = 0;
             const MaxDrops = 2;
-            // 0 Free, 1 Pending, 2 InFlight.
             var phase = 0;
             var dropped = 0;
-            // The losses by cause: map errors and aborts, and a bounded
-            // one-shot witness that invalid metadata was rejected.
             var errors = 0;
             var invalid = 0;
-            // The immediately preceding slot resolution was an error/abort.
             var last_error = 0;
-            // Bounded two-frame harvested store under callback arrival 3,1,2.
             var harvest_phase = 0;
             var store_first = 0;
             var store_second = 0;
@@ -6144,14 +5009,7 @@ pub fn video_tap_slot_model() -> Model {
     }
 }
 
-/// Cursor trails, predictive ghosts, fades, and rain occupancy are retained in
-/// window-local renderer coordinates. Before a frame may present after the
-/// focused visible leaf moves, resizes, changes identity, enters/leaves zoom, or
-/// changes physical surface/DPI metrics, every charged coordinate-bound effect
-/// must be reset and rebound to the new space.
-///
-/// `Buggy=1` is a composed/single boolean-only gate: a same-class geometry change leaves the
-/// charged effect bound to the old coordinate space.
+/// Window-local effect coordinate reset and rebind across leaf geometry and DPI changes.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn layout_coordinate_reset_model() -> Model {
@@ -6162,7 +5020,6 @@ pub fn layout_coordinate_reset_model() -> Model {
             var coordinate = 0;
             var bound_coordinate = 0;
             var charged = 0;
-            // A coordinate mutation must pass Prepare before another Present.
             var prepared = 1;
             var stale_present = 0;
             action Charge when (prepared == 1) {
@@ -6212,28 +5069,7 @@ pub fn layout_coordinate_reset_model() -> Model {
     }
 }
 
-/// The semantic preview font worker owns one replacement queue slot and tags
-/// every job/result with the live renderer generation. Reload clears an obsolete
-/// queued fork while an already-running old parse may finish; polling must ignore
-/// that stale result and install only the current generation. `Buggy=1` enables
-/// four dead negative controls:
-/// * `BuggyInstallStaleResult` — the stale-worker installation defect, accepting
-///   an obsolete generation's result: the classification is wrong
-///   (`CurrentResultOnly`) and the stale renderer installs
-///   (`ReadyGenerationIsCurrent`);
-/// * `BuggyReloadKeepsInstalled` — `install_chrome_faces_locked` without
-///   `fonts.semantic = semantic`: the reload bumps the generation but the
-///   previous generation's renderer keeps painting under the new configuration
-///   (`ReadyGenerationIsCurrent`);
-/// * `BuggyIgnoreCurrentResult` — `semantic_prewarm_result_is_current` written
-///   strictly (`result_generation > current_generation`): the current
-///   generation's result is dropped with the stale ones and the semantic preview
-///   never installs (`CurrentResultOnly`, whose other direction this is);
-/// * `BuggyReloadKeepsQueued` — `reload_chrome_fonts_locked`, the one reload
-///   body `set_chrome_fonts` and `set_prepared_chrome_fonts` share, without
-///   `worker.cancel_queued()`: the obsolete fork stays queued
-///   (`QueueContainsOnlyCurrent`). Tier-1 drives that body on a local font
-///   context (`tray_raster`'s `chrome_font_reload_conforms_to_the_generation_queue_reset`).
+/// Generation-tagged replacement queue and stale-result rejection for the semantic preview font worker.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn semantic_prewarm_generation_model() -> Model {
@@ -6242,7 +5078,6 @@ pub fn semantic_prewarm_generation_model() -> Model {
             const Buggy = 0;
             const MaxGeneration = 3;
             var current = 1;
-            // 0 means no queued/running/result generation.
             var queued = 0;
             var running = 0;
             var result = 0;
@@ -6253,7 +5088,6 @@ pub fn semantic_prewarm_generation_model() -> Model {
             var decision = 0;
             var resolved = 0;
             action Request when (ready == 0) {
-                // Replacement slot: repeated demand retains the newest current fork.
                 queued = current;
                 resolved = 0;
             }
@@ -6340,9 +5174,7 @@ pub fn semantic_prewarm_generation_model() -> Model {
     }
 }
 
-/// A static Settings preview must retain its convergence cadence until the completed font epoch
-/// reaches the retained raster. Polling completion can happen while arming or firing a deadline;
-/// neither may silently abandon the last repaint. `Buggy=1` decides on `pending` alone.
+/// Convergence-cadence retention until completed font epochs reach the retained Settings preview raster.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn native_preview_font_convergence_model() -> Model {
@@ -6383,73 +5215,23 @@ pub fn native_preview_font_convergence_model() -> Model {
     }
 }
 
-/// The semantic preview font worker has two coupled ownership decisions beyond its generation
-/// guard. Replacing a queued, not-yet-started install job must carry its unique committed
-/// renderer base into the newest candidate job. At completion, only an exact generation +
-/// request + candidate match may become active; an exact-match construction failure clears the
-/// active renderer, while superseded successes are cache-only and leave the active slot alone.
-///
-/// `DecideResult` is the shipping `poll_semantic_renderer` over
-/// `semantic_prewarm_result_decision`, and each law judges one arm of that match:
-/// `DecisionMatchesIdentity` the pure classification, `InstallOnlyLatestReady` the
-/// `InstallCurrent` arm, `CurrentFailureFailsClosed` the `FailClosedCurrent` arm,
-/// `CacheOnlySupersededReady` the `CacheSuperseded` arm, and `NoncurrentPreservesActive` every
-/// arm that is not exact-current. Each is conditioned on the decision and says what its arm
-/// does to the slot or the cache.
-///
-/// `Buggy=1` enables seven dead negative controls. `BuggyReplacementKeepsOnlyNewBase`
-/// (replacement keeps only the new job's optional base, dropping the displaced one;
-/// `ReplacementCarriesBase`) and `BuggyMixedCandidateInstalls` (a ready mixed/superseded
-/// candidate installs as current), and five that are one line of the main-thread boundary
-/// written wrong:
-/// * `BuggyReadinessBeforeGeneration`: `semantic_prewarm_result_decision` testing readiness
-///   before generation, so a ready renderer forked from an obsolete generation's base is filed
-///   as `CacheSuperseded` and later served under the new configuration
-///   (`DecisionMatchesIdentity`);
-/// * `BuggyInstallKeepsStaleIdentity`: the `InstallCurrent` arm without
-///   `self.semantic_identity = Some(result.candidate)`, so the preview never recognises its own
-///   install (`InstallOnlyLatestReady`);
-/// * `BuggyFailClosedKeepsPrevious`: the `FailClosedCurrent` arm without
-///   `self.semantic = None`, so an exact-current construction failure leaves the previous
-///   candidate painting (`CurrentFailureFailsClosed`);
-/// * `BuggyDropSuperseded`: the `CacheSuperseded` arm folded into the ignore arms, so a ready
-///   superseded renderer is dropped and its warmup paid again (`CacheOnlySupersededReady`);
-/// * `BuggyCacheParksActive`: the `CacheSuperseded` arm opening with `InstallCurrent`'s
-///   `cache_active_semantic()`, so a superseded result parks the active renderer and nothing
-///   paints (`NoncurrentPreservesActive`).
-///
-/// Tier-1 (aterm-gui), in two halves: `src/semantic_prewarm_conformance.rs` enumerates the pure
-/// `semantic_prewarm_result_decision` over the lattice, and `tray_raster`'s
-/// `semantic_prewarm_poll_conforms_to_the_handshake_slot_effects` lands every lattice point
-/// through the real `poll_semantic_renderer` and reads the active slot (`active_after`,
-/// `active_after_latest`) back off the fonts.
-///
-/// The bounds are per-variable. "The latest active renderer is an active renderer" is a
-/// definition, not a law: the `Mark*` inputs are built that way, every decision arm assigns the
-/// two fields together, and the Tier-1 projection defines `latest` as `active` and the
-/// requested identity.
+/// Base-renderer carry-over and exact-match activation for the semantic preview font worker.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn semantic_prewarm_handshake_model() -> Model {
     aterm_spec::ty_model! {
         SemanticPrewarmHandshake {
             const Buggy = 0;
-            // Replacement inputs and their resolved one-slot ownership.
             var new_base = 0;
             var replaced_base = 0;
             var replacement_base = 0;
             var replacement_resolved = 0;
-            // Result-classification inputs. Each Mark action spreads one Boolean
-            // dimension, so DecideResult explores the complete 2^5 lattice.
             var generation_matches = 0;
             var request_matches = 0;
             var candidate_matches = 0;
             var renderer_ready = 0;
             var active_before = 0;
             var active_before_latest = 0;
-            // Classification/effect projection. 0 Pending, 1 Ignore stale
-            // generation, 2 Install current, 3 Fail closed current, 4 Cache
-            // superseded, 5 Ignore failed superseded.
             var decision = 0;
             var cached = 0;
             var active_after = 0;
@@ -6634,13 +5416,7 @@ pub fn semantic_prewarm_handshake_model() -> Model {
     }
 }
 
-/// Once a non-host semantic preview renderer is ready, it is exact for that
-/// candidate only. Scheduling a different uncached candidate must move the
-/// ready renderer into the bounded cache, leaving no mismatched active paint
-/// source while the new request is pending. The unready committed host seed is
-/// retained because it is the deliberate broad fallback and carries the first
-/// worker-generation base. `Buggy=1` recreates the race by retaining a ready,
-/// mismatched renderer during the next request.
+/// Active-to-cache demotion of ready non-host semantic preview renderers when switching candidates.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn semantic_prewarm_request_swap_model() -> Model {
@@ -6687,12 +5463,6 @@ pub fn semantic_prewarm_request_swap_model() -> Model {
                 } else {
                     should_cache == 0 && active_after == 0
                 };
-            // No "inputs are well formed" law: the three `Mark*` inputs are the
-            // only writers of `active_present`/`active_ready`/`candidate_matches`,
-            // each guarded on an empty slot, so such a law restates their guards.
-            // Nor "retained paint is exact or the host seed": once resolved, the
-            // law above keeps the active renderer exactly when it is not a
-            // ready mismatch, which is that sentence.
             bound FlagsBounded:
                 active_present <= 1 && active_ready <= 1 && candidate_matches <= 1 &&
                 should_cache <= 1 && active_after <= 1 && resolved <= 1;
@@ -6700,14 +5470,7 @@ pub fn semantic_prewarm_request_swap_model() -> Model {
     }
 }
 
-/// Session chrome caches own an explicit expiry deadline. One due entry moves
-/// into an incremental fan-out cursor; each event-loop turn may inspect/refresh
-/// at most `Budget` windows, and the cursor retains the unvisited remainder.
-/// Other due entries remain cached and armed. Retiring all cache/cursor state
-/// removes the deadline, preserving the event loop's pure-Wait idle state.
-///
-/// `Buggy=1` models the bulk fan-out: every remaining window is scanned in one
-/// turn, violating the UI work budget even though only one session was admitted.
+/// Incremental fan-out cursor and expiry-deadline lifecycle for session chrome caches.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn session_chrome_expiry_model() -> Model {
@@ -6770,10 +5533,6 @@ pub fn session_chrome_expiry_model() -> Model {
                 work = 0;
             }
             invariant WorkPerTurnBounded: work <= Budget;
-            // The deadline is armed exactly while the cache holds something (dial 2 leaves
-            // it armed after a retire); the cache holds all of it or none (dial 3 drops an
-            // entry at the end of its scan); a scan has windows left exactly while it runs
-            // (dial 4 never ends one).
             invariant DeadlineTracksRetainedCache:
                 armed == if fresh + due + scanning > 0 { 1 } else { 0 };
             invariant CapacityConservedOrRetired:
@@ -6790,68 +5549,16 @@ pub fn session_chrome_expiry_model() -> Model {
     }
 }
 
-/// Budgeted search resume: the public lifecycle contract of
-/// `aterm_core::terminal::Terminal::search_budgeted`.
-///
-/// This machine models the owner-level capability that binds a partial full-buffer scan and
-/// its result-delta stream to one query/content snapshot and one non-repeating `search_id`. The
-/// projection covers every public field that controls host accumulation:
-///
-/// * `progress` / `total` are `rows_fed` / `total_rows`;
-/// * `scan_done` distinguishes indexing completion from API completion;
-/// * `live` / `cursor` encode the optional resume capability;
-/// * `search_id` and `reset` are projected directly from the returned step;
-/// * `delivery` counts a bounded dense-result trace: the scan turn delivers the first delta,
-///   one drain turn leaves a backlog, and the final drain completes;
-/// * `issued`, `prior_id` and `stream_id` are trace ghosts. Real process-global `u64` IDs are
-///   normalized to first-seen rank, proving freshness without assuming IDs are contiguous
-///   within one `Terminal`; `stream_id` is the identity the host last saw `reset` announce.
-///
-/// The live cursor and `search_id` are one field in the shipping step
-/// (`cursor: (!complete).then_some(state.cursor)`, `search_id: state.cursor`), and a fresh
-/// identity is minted only where the new state is installed, so every action writes the two
-/// together. What a slip can break is that the identity changes only with `reset`
-/// (`IdentityStableWithoutReset`).
-///
-/// `Rows = 3` is the three-row Tier-1 terminal; `DeliveryTurns = 3` stands for an arbitrary
-/// match backlog, not the shipping payload cap. `StartBacklog`/`Drain`/`DrainComplete` prove
-/// the seam: scanning may finish while the cursor stays live, drain-only resumes preserve row
-/// progress and identity, and only the last delta retires the cursor. `StartComplete` and
-/// `RestartComplete` scan and deliver everything in one turn; the latter still returns
-/// `reset = true` and a fresh `search_id` with no cursor. `ContentRestart` covers either
-/// content-snapshot key, `QueryRestart` query/options, and `ForgedRestart` forged, foreign,
-/// dropped, or otherwise stale tokens. Construction/exhaustion errors return no step and are
-/// covered by the owner's fail-closed unit tests.
-///
-/// `Buggy = 1` is stale continuation: restart actions preserve the old identity/progress
-/// instead of minting/resetting (`ResetMintsFresh`, `ResetStartsAtBeginning`). Two more slips,
-/// each applied at every step it touches:
-/// * `cursor: Some(state.cursor)` without its `(!complete).then_some` gate, so every completing
-///   turn (`StartComplete`, `FinishScan`, `DrainComplete`, `RestartComplete`) hands back a live
-///   token for a completed stream (`LifecycleShape`);
-/// * a resume that allocates a fresh token each turn (`state.cursor = allocate_cursor(..)` on
-///   the resume path), rotating cursor and `search_id` together without `reset`, so a host
-///   keyed on `search_id` discards live results as a superseded snapshot
-///   (`IdentityStableWithoutReset`).
-///
-/// A third slip is an alternative to `StartBacklog`, so it is its own action (a stutter at
-/// `Buggy=0`) and the healthy backlog stays reachable beside it: `BuggyScanOnlyCompletion` is
-/// the dense scan turn under `complete = engine.is_complete()` without the
-/// `&& emitted_matches >= result_count` term a bounded delta needs, so the first delta comes
-/// back complete and cursorless and the host never sees the rest (`DeliveryShape`).
-///
-/// Tier-1: `aterm-core/tests/conformance_budgeted_search.rs` replays all three on real steps
-/// (`delivery` is read from the host's delivery ledger against the snapshot's real match
-/// count, not from `complete`), with transition negative controls.
+/// Budgeted incremental search resume and continuation validation for `Terminal::search_budgeted`.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn budgeted_search_resume_model() -> Model {
     aterm_spec::ty_model! {
         BudgetedSearchResume {
-            const Rows = 3;          // real bounded Terminal row window in Tier-1
-            const DeliveryTurns = 3; // scan delta + repeated drain + final drain
-            const MaxTokens = 10;    // bounded fresh-start/restart trace budget
-            const Buggy = 0;         // 1 = the stale-continuation family documented above
+            const Rows = 3;
+            const DeliveryTurns = 3;
+            const MaxTokens = 10;
+            const Buggy = 0;
 
             var live = 0;
             var progress = 0;
@@ -6866,9 +5573,6 @@ pub fn budgeted_search_resume_model() -> Model {
             var delivery = 0;
             var stream_id = 0;
 
-            // Unit-budget fresh start: mint a logical stream, expose reset, and
-            // consume the first row. This action is also used after cancellation or
-            // completion, where presenting the retired token cannot resume state.
             action Start when (live == 0 && issued <= MaxTokens - 1) {
                 live = 1;
                 progress = 1;
@@ -6884,7 +5588,6 @@ pub fn budgeted_search_resume_model() -> Model {
                 stream_id = issued + 1;
             }
 
-            // A sparse fresh search may scan and deliver all rows in one call.
             action StartComplete when (live == 0 && issued <= MaxTokens - 1) {
                 live = if Buggy == 1 { 1 } else { 0 };
                 progress = Rows;
@@ -6900,8 +5603,6 @@ pub fn budgeted_search_resume_model() -> Model {
                 stream_id = issued + 1;
             }
 
-            // A dense fresh search scans all rows and emits its first bounded
-            // result delta, but remains live because more deltas are queued.
             action StartBacklog when (live == 0 && issued <= MaxTokens - 1) {
                 live = 1;
                 progress = Rows;
@@ -6917,13 +5618,8 @@ pub fn budgeted_search_resume_model() -> Model {
                 stream_id = issued + 1;
             }
 
-            // A valid unit-budget resume preserves stream identity and advances one
-            // non-final scan row. The final sparse scan turn is separate so its
-            // cursor retirement is explicit.
             action Resume when (live == 1 && scan_done == 0 && progress <= Rows - 2) {
                 progress = progress + 1;
-                // Buggy mints a fresh token per turn: cursor and search_id move
-                // together, as the one field they are, and `reset` stays off.
                 cursor = if Buggy == 1 && issued <= MaxTokens - 1 { issued + 1 } else { cursor };
                 search_id = if Buggy == 1 && issued <= MaxTokens - 1 { issued + 1 } else { search_id };
                 issued = if Buggy == 1 && issued <= MaxTokens - 1 { issued + 1 } else { issued };
@@ -6940,9 +5636,6 @@ pub fn budgeted_search_resume_model() -> Model {
                 prior_id = 0;
             }
 
-            // Explicit None while a scan is live supersedes it. The three stale
-            // input classes below have the identical observable restart effect,
-            // but remain separate actions so Tier-1 exercises every guard class.
             action Supersede when (live == 1 && issued <= MaxTokens - 1) {
                 live = 1;
                 progress = if Buggy == 1 { progress } else { 1 };
@@ -7000,9 +5693,6 @@ pub fn budgeted_search_resume_model() -> Model {
                 stream_id = if Buggy == 1 { search_id } else { issued + 1 };
             }
 
-            // A stale/superseding call may scan and deliver its fresh snapshot in
-            // one turn. There is no cursor, but reset + fresh search_id remain
-            // observable so hosts discard the superseded stream before appending.
             action RestartComplete when (live == 1 && issued <= MaxTokens - 1) {
                 live = if Buggy == 1 { 1 } else { 0 };
                 progress = Rows;
@@ -7018,11 +5708,6 @@ pub fn budgeted_search_resume_model() -> Model {
                 stream_id = if Buggy == 1 { search_id } else { issued + 1 };
             }
 
-            // The dense scan turn with completion read from the scan alone: the
-            // same step as StartBacklog, except that it reports complete, hands
-            // back no cursor, and so strands the undelivered backlog. A stutter
-            // at `Buggy=0`, so no action is dead at the committed config (the
-            // strict-vacuity rule for negative controls).
             action BuggyScanOnlyCompletion when (live == 0 && issued <= MaxTokens - 1) {
                 live = live;
                 progress = if Buggy == 1 { Rows } else { progress };
@@ -7038,9 +5723,6 @@ pub fn budgeted_search_resume_model() -> Model {
                 stream_id = if Buggy == 1 { issued + 1 } else { stream_id };
             }
 
-            // Once scanning has finished, a valid resume can make pure delivery
-            // progress without changing rows_fed. The same cursor/search_id stays
-            // live until the last pending delta has been emitted.
             action Drain when (
                 live == 1 && scan_done == 1 && delivery > 0 &&
                 delivery <= DeliveryTurns - 2
@@ -7060,8 +5742,6 @@ pub fn budgeted_search_resume_model() -> Model {
                 delivery = delivery + 1;
             }
 
-            // Cancellation retires the partial scan. A subsequent call is Start
-            // even when the caller presents the now-stale retired token.
             action Cancel when (live == 1) {
                 live = 0;
                 progress = 0;
@@ -7118,34 +5798,17 @@ pub fn budgeted_search_resume_model() -> Model {
     }
 }
 
-/// Host-minted hyperlink scheme capability: the abstract twin of `HyperlinkAuth`'s
-/// extra-scheme allowlist (#4384). The host may mint a small set of extra OSC-8 URI schemes
-/// (e.g. `orca`) on top of the hardcoded safe allowlist:
-///
-///   * the extra set is bounded (`MAX_EXTRA_SCHEMES` in the code, `Cap` here):
-///     `Authorize`/`AuthorizeOther` grow it only under the bound, and `RefuseAtCap` is the
-///     at-capacity refusal (the API returns `false`, state unchanged);
-///   * a never-allow scheme (`javascript`/`data`/`file`/…) is refused even when the host
-///     asks: `RefuseNeverAllow` is a no-op at `Buggy=0`, and `Buggy=1` models the admission
-///     defect the invariant must catch;
-///   * `Revoke` removes the distinguished scheme, restoring the default allowlist: `Accept`
-///     (the OSC-8 gate saying yes to an extra-scheme URI) is enabled iff the scheme is
-///     currently minted, which Tier-1 binds to the real `is_allowed_scheme` decision.
-///
-/// `orca` is the distinguished tracked scheme (0/1); `others` counts the rest of the extra set
-/// so the bound is proven over the whole set, not one entry. Proves `Bounded` +
-/// `NeverAllowRefused` at `Buggy=0`; at `Buggy=1` the unbounded grow and the never-allow
-/// admission each yield a counterexample.
+/// Host-minted OSC-8 hyperlink scheme allowlist and capacity model.
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn hyperlink_scheme_cap_model() -> Model {
     aterm_spec::ty_model! {
         HyperlinkSchemeCap {
             const Buggy = 0;
-            const Cap = 4; // == the real MAX_EXTRA_SCHEMES, so Tier-1 hits the true refusal point
+            const Cap = 4;
 
-            var orca = 0;   // distinguished host scheme currently minted (0/1)
-            var others = 0; // count of OTHER live extra schemes
-            var never = 0;  // 1 iff a never-allow scheme was ever admitted
+            var orca = 0;
+            var others = 0;
+            var never = 0;
 
             action Authorize when (orca == 0 && orca + others <= Cap - 1) {
                 orca = 1;
@@ -7174,37 +5837,24 @@ pub fn hyperlink_scheme_cap_model() -> Model {
     }
 }
 
-/// Module-wide scrollback budget sharing: N panes in one memory space each apply
-/// `min(configured, global / live)` at their own touch points, so the applied budgets sum within
-/// the one global cap at every quiescent point and panes cannot multiply the per-pane budget into
-/// an OOM. Two panes bound the membership lattice (join/leave/apply in all orders); `fresh*`
-/// tracks "applied since the last membership change", so the invariant is exact at quiescence
-/// and waived while a share is stale (for one touch). `Buggy=1` drops the global: each pane
-/// applies its full configured budget, which two fresh live panes overrun.
-///
-/// Proves `QuiescentSumBounded` and `DepartedHoldsNothing`. Tier-1:
-/// `aterm-core/tests/conformance_shared_budget.rs` drives the real `ScrollbackBudgetShare`
-/// registry (and real `Terminal` eviction) in lockstep.
+/// Module-wide scrollback budget sharing across live panes.
 #[cfg_attr(trust_verify, trust::skip)]
 #[must_use]
 pub fn shared_budget_model() -> Model {
     aterm_spec::ty_model! {
         SharedScrollbackBudget {
-            const Global = 6;  // module-wide budget (scaled bytes)
-            const HalfShare = 3;    // Global/2 — the two-pane equal share (no division in exprs)
-            const Cfg = 6;     // per-pane configured budget (> HalfShare so the share binds)
-            const Buggy = 0;   // 1 = apply configured budget, ignore the global divide
+            const Global = 6;
+            const HalfShare = 3;
+            const Cfg = 6;
+            const Buggy = 0;
 
-            var live2 = 0;  // pane 2 registered (pane 1 is always live)
-            var a1 = 6;     // pane 1 APPLIED budget (= Cfg: a fresh store carries
-                            // its configured budget until first touch)
-            var a2 = 0;     // pane 2 APPLIED budget
-            var fresh1 = 0; // pane 1 applied since the last membership change
+            var live2 = 0;
+            var a1 = 6;
+            var a2 = 0;
+            var fresh1 = 0;
             var fresh2 = 0;
-            var steps = 0;  // run bound
+            var steps = 0;
 
-            // Pane 2 registers (its store constructed at Cfg): both shares go
-            // stale until each pane's next touch.
             action Join when (live2 == 0 && steps <= 5) {
                 live2 = 1;
                 a2 = Cfg;
@@ -7212,7 +5862,6 @@ pub fn shared_budget_model() -> Model {
                 fresh2 = 0;
                 steps = steps + 1;
             }
-            // Pane 2 drops: its Scrollback (and applied share) is freed with it.
             action Leave when (live2 == 1 && steps <= 5) {
                 live2 = 0;
                 a2 = if Buggy == 2 { a2 } else { 0 };
@@ -7220,7 +5869,6 @@ pub fn shared_budget_model() -> Model {
                 fresh2 = 0;
                 steps = steps + 1;
             }
-            // Pane 1 touched: pending_effective() -> set_memory_budget.
             action Apply1 when (steps <= 5) {
                 a1 = if Buggy == 1 {
                     Cfg
@@ -7246,8 +5894,6 @@ pub fn shared_budget_model() -> Model {
                 steps = steps + 1;
             }
 
-            // The global contract: once every live pane has applied its current share, applied
-            // budgets sum within the one global cap.
             invariant QuiescentSumBounded:
                 if fresh1 == 0 {
                     0 <= 1
@@ -7256,74 +5902,42 @@ pub fn shared_budget_model() -> Model {
                 } else {
                     a1 + a2 <= Global
                 };
-            // A departed pane holds no share.
-            // (Dial 2 keeps the departed pane's share.)
             invariant DepartedHoldsNothing:
                 if live2 == 0 { a2 == 0 } else { 0 <= 1 };
         }
     }
 }
 
-/// `aterm.log` rotation shared by several writing processes — the GUI, every
-/// `aterm --session`, an update's successor (`aterm-gui/src/logging.rs`,
-/// `RotatingFile`).
-///
-/// Each writer holds the file open with `O_APPEND`. Before a write it looks at
-/// the path again once `Step` lines (64 KiB) or one `Tick` (30 s) have passed
-/// since its last look: if the path names another file it reopens it (another
-/// writer rotated), and if the live file is over `Cap` it renames it to
-/// `aterm.log.1`, replacing the older copy, and starts a fresh one. That
-/// rename runs under a sibling lock taken without waiting and looks at the
-/// file again under it, which is what lets the model treat a look as one step.
-/// A process that starts (`RestartB`) rotates an oversized file the same way.
-///
-/// Writer handles: 0 = `aterm.log`, 1 = `aterm.log.1`, 2 = a deleted older
-/// copy (a line written there is gone). `aged` counts lines retired with an
-/// older copy — the retention limit, not a loss. `ea`/`eb`/`er` are ticks since
-/// each writer's last look and since the last rotation, saturating at `Window`.
-///
-/// Environment assumption: `aterm.log` fills more slowly than one whole file per check interval
-/// (4 MiB in 30 s), stated as the guard on a write into it: `live <= Cap - 1 || Window <= er`.
-/// Under it no writer falls two files behind before its time check comes due, so no line lands
-/// in a deleted file.
-///
-/// Proves `EveryLineOnce` (every line written is in `aterm.log`, in `aterm.log.1`, or was
-/// retired with an older copy: none lost, none duplicated) and `FilesBounded` (each file stays
-/// within the cap plus the writers' slack between looks). `Buggy=1`: no look while running, so
-/// the file grows without limit, and a start that truncates an oversized file, erasing lines
-/// other writers put there. Tier-1: `aterm-gui/src/logging.rs` `rotation_conformance` drives
-/// two real writers on one path through rotation, a follow and a restart.
+/// Multi-process `O_APPEND` log rotation and bounded retention for `aterm.log`.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn log_rotation_model() -> Model {
     aterm_spec::ty_model! {
         LogRotation {
-            const Cap = 1;       // lines one file may hold before rotation
-            const Step = 1;      // lines a writer adds between looks
-            const Window = 1;    // ticks in one check interval
-            const MaxLines = 4;  // run bound
-            const Buggy = 0;     // 1 = no look while running, truncate at start
+            const Cap = 1;
+            const Step = 1;
+            const Window = 1;
+            const MaxLines = 4;
+            const Buggy = 0;
 
-            var live = 0;     // lines in aterm.log
-            var old = 0;      // lines in aterm.log.1
-            var aged = 0;     // lines retired with a replaced older copy
-            var written = 0;  // lines logged by any writer
-            var ga = 0;       // writer A's handle (0 live, 1 older copy, 2 deleted)
-            var gb = 0;       // writer B's handle
-            var na = 0;       // lines A wrote since its last look
+            var live = 0;
+            var old = 0;
+            var aged = 0;
+            var written = 0;
+            var ga = 0;
+            var gb = 0;
+            var na = 0;
             var nb = 0;
-            var ea = 0;       // ticks since A's last look
+            var ea = 0;
             var eb = 0;
-            var er = 1;       // ticks since the last rotation (none yet: saturated)
+            var er = 1;
 
-            // Time passes.
             action Tick when (ea <= Window - 1 || eb <= Window - 1 || er <= Window - 1) {
                 ea = if ea <= Window - 1 { ea + 1 } else { ea };
                 eb = if eb <= Window - 1 { eb + 1 } else { eb };
                 er = if er <= Window - 1 { er + 1 } else { er };
             }
 
-            // One line into the file A holds, while no look is due.
             action WriteA when (
                 written <= MaxLines - 1
                 && (ga > 0 || live <= Cap - 1 || Window <= er)
@@ -7345,8 +5959,6 @@ pub fn log_rotation_model() -> Model {
                 nb = if nb <= Step - 1 { nb + 1 } else { nb };
             }
 
-            // A's look: follow another writer's rotation, then rotate the
-            // live file if it is oversized — the same look does both.
             action CheckA when (Buggy == 0 && (Step <= na || Window <= ea)) {
                 aged = if live > Cap { aged + old } else { aged };
                 old = if live > Cap { live } else { old };
@@ -7368,8 +5980,6 @@ pub fn log_rotation_model() -> Model {
                 eb = 0;
             }
 
-            // B's process exits and a new one opens the log: an oversized
-            // file is rotated (Buggy: truncated).
             action RestartB {
                 aged = if live > Cap && Buggy == 0 { aged + old } else { aged };
                 old = if live > Cap && Buggy == 0 { live } else { old };

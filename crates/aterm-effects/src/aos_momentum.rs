@@ -274,6 +274,15 @@ pub struct GeomRecord {
 impl From<&Geom> for GeomRecord {
     #[inline]
     fn from(g: &Geom) -> Self {
+        Self::from_geom(g)
+    }
+}
+
+impl GeomRecord {
+    /// Record `g` as plain encodable data.
+    #[inline]
+    #[must_use]
+    pub const fn from_geom(g: &Geom) -> Self {
         GeomRecord {
             cw: g.cw,
             ch: g.ch,
@@ -286,9 +295,7 @@ impl From<&Geom> for GeomRecord {
             head: g.head,
         }
     }
-}
 
-impl GeomRecord {
     /// The geometry it records.
     #[inline]
     #[must_use]
@@ -329,6 +336,15 @@ pub struct ConfigRecord {
 impl From<&MomentumGlowConfig> for ConfigRecord {
     #[inline]
     fn from(c: &MomentumGlowConfig) -> Self {
+        Self::from_config(c)
+    }
+}
+
+impl ConfigRecord {
+    /// Record `c` bit-for-bit.
+    #[inline]
+    #[must_use]
+    pub const fn from_config(c: &MomentumGlowConfig) -> Self {
         ConfigRecord {
             enabled: c.enabled,
             intensity: c.intensity.to_bits(),
@@ -343,9 +359,7 @@ impl From<&MomentumGlowConfig> for ConfigRecord {
             glyph_span: c.glyph_span,
         }
     }
-}
 
-impl ConfigRecord {
     /// The config it records, bit for bit.
     #[inline]
     #[must_use]
@@ -516,7 +530,7 @@ impl MomentumSchema {
 }
 
 /// A snapshot refusal as the wire fault a state decoder reports.
-fn snapshot_fault(r: SnapshotRefusal) -> WireFault {
+const fn snapshot_fault(r: SnapshotRefusal) -> WireFault {
     match r {
         SnapshotRefusal::Length { expected, found } => WireFault::Truncated {
             field: "state.snapshot",
@@ -570,8 +584,8 @@ fn usize_field(d: &mut Dec<'_>, field: &'static str) -> Result<usize, WireFault>
 }
 
 #[inline]
-fn usize_u64(v: usize) -> u64 {
-    u64::try_from(v).unwrap_or(u64::MAX)
+const fn usize_u64(v: usize) -> u64 {
+    v as u64
 }
 
 /// The length of one encoded quad: `row`, `x`, `y`, `w`, `h` as `u16`, then `color` (`u32`),
@@ -585,7 +599,7 @@ const FRAME_HEAD_LEN: usize = 1 + 5 + 1 + 8 + 8 + 8;
 /// One quad's encoding: its nine fields in order, each little-endian, which is exactly what
 /// the nine field writes `e.u16(q.row)`, `e.u16(q.x)`, … `e.u8(q.alpha2)` append. Written as
 /// one 20-byte slice.
-fn quad_bytes(q: &GlowQuad) -> [u8; QUAD_LEN] {
+const fn quad_bytes(q: &GlowQuad) -> [u8; QUAD_LEN] {
     let [r0, r1] = q.row.to_le_bytes();
     let [x0, x1] = q.x.to_le_bytes();
     let [y0, y1] = q.y.to_le_bytes();
@@ -619,7 +633,7 @@ fn encode_frame(e: &mut Enc, frame: &MomentumGlowFrame, out: &[GlowQuad], under:
 
 /// Room for a frame observation's encoding over `quads` quads: [`FRAME_HEAD_LEN`] and
 /// [`QUAD_LEN`] each. A capacity hint; it writes nothing.
-fn frame_room(quads: usize) -> usize {
+const fn frame_room(quads: usize) -> usize {
     FRAME_HEAD_LEN.saturating_add(QUAD_LEN.saturating_mul(quads))
 }
 
@@ -1022,14 +1036,14 @@ impl MomentumCode {
     /// Frame cadence: the glow is hot and its last two frames differed.
     #[inline]
     #[must_use]
-    pub fn is_active(self, s: &MomentumState) -> bool {
+    pub const fn is_active(self, s: &MomentumState) -> bool {
         s.glow.is_active()
     }
 
     /// Hot, but its last two frames were identical.
     #[inline]
     #[must_use]
-    pub fn settling(self, s: &MomentumState) -> bool {
+    pub const fn settling(self, s: &MomentumState) -> bool {
         s.glow.settling()
     }
 
@@ -1234,7 +1248,7 @@ impl NoStrandedLight {
 }
 
 #[inline]
-fn fail(cursor: u64, law: &'static str, detail: String) -> Verdict {
+const fn fail(cursor: u64, law: &'static str, detail: String) -> Verdict {
     Verdict::Fail {
         cursor,
         law,
@@ -1243,8 +1257,13 @@ fn fail(cursor: u64, law: &'static str, detail: String) -> Verdict {
 }
 
 #[inline]
-fn nanos(d: Duration) -> i128 {
-    i128::try_from(d.as_nanos()).unwrap_or(i128::MAX)
+const fn nanos(d: Duration) -> i128 {
+    let n = d.as_nanos();
+    if n > i128::MAX as u128 {
+        i128::MAX
+    } else {
+        n as i128
+    }
 }
 
 impl Contract<MomentumSchema> for NoStrandedLight {
@@ -1481,9 +1500,9 @@ fn refill(v: &mut Vec<GlowQuad>, from: &[GlowQuad]) {
 
 /// The hosted horizon in signed nanoseconds.
 #[inline]
-fn horizon_ns() -> i128 {
+const fn horizon_ns() -> i128 {
     // Every `Duration` is below 2^94 ns, so its nanoseconds fit in `i128`.
-    i128::try_from(MOMENTUM_PROFILE.horizon.as_nanos()).unwrap_or(i128::MAX)
+    nanos(MOMENTUM_PROFILE.horizon)
 }
 
 /// An input's time, if it has one.
@@ -1848,7 +1867,7 @@ impl MomentumHost {
     /// Frame cadence (`MomentumGlow::is_active`); `false` while paused.
     #[inline]
     #[must_use]
-    pub fn is_active(&self) -> bool {
+    pub const fn is_active(&self) -> bool {
         match &self.mode {
             HostMode::Direct(g) => g.is_active(),
             HostMode::Hosted(h) => !h.boundary.is_paused() && h.code().is_active(h.state()),
@@ -1858,7 +1877,7 @@ impl MomentumHost {
     /// Hot with no frame-to-frame change (`MomentumGlow::settling`); `false` while paused.
     #[inline]
     #[must_use]
-    pub fn settling(&self) -> bool {
+    pub const fn settling(&self) -> bool {
         match &self.mode {
             HostMode::Direct(g) => g.settling(),
             HostMode::Hosted(h) => !h.boundary.is_paused() && h.code().settling(h.state()),

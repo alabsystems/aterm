@@ -51,18 +51,18 @@ use aterm_spec::derive::Model;
 /// owner again — one whose own boot reopened nothing, so not on probation —
 /// and is judged by THAT owner's end, so a successor that dies before its own
 /// first image leaves the desk to reopen rather than a clean end nobody
-/// reopens; round seven of the update audit, finding 5), `SuccessorDies` (the
+/// reopens), `SuccessorDies` (the
 /// successor ends before it owns the journal: a successor runs this build's
 /// code on the live sessions only once the journal is its own — its Commit
 /// waiter takes it over, then releases the adopted readers — so the shipping
-/// one dies there only when the parent left nothing to take; round eight of
-/// the update audit, finding 45. A kill in the instants between the Commit's
+/// one dies there only when the parent left nothing to take; A kill in the instants between the Commit's
 /// receipt and the take-over, which run no code of this build, is outside the
-/// model), `WriteQuitLayout`
+/// model),
+/// `WriteQuitLayout`
 /// (the quit's first step: its `session.toml`, naming the run that wrote it,
 /// is on disk before the journal is retired and the crash marker removed —
-/// a quit cut short there by a kill or a crash leaves all three; finding
-/// 48's review), `Die` (a SIGKILL, a
+/// a quit cut short there by a kill or a crash leaves all three),
+/// `Die` (a SIGKILL, a
 /// force quit, the system: the empty marker) and
 /// `Crash` (a fatal signal or a panic). `Claim` is any later launch's: it
 /// takes the image by renaming it (a second launch finds nothing under the

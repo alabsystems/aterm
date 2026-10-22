@@ -817,7 +817,7 @@ fn with_no_transcript_a_hooks_words_under_its_own_rows_are_not_acted_on() {
 /// right-aligned on the mode row (as `claude-2.1.304-footer-not-logged-in-no-statusline` measured
 /// it), and stacked under the mode row (as at 26 columns) — composed onto the measured screen,
 /// are acted on. A status line of several fields, its notice words in a later one after two
-/// spaces short of the right edge, is no wall either: the review of 87faa9bf23 typed `/login`
+/// spaces short of the right edge, is no wall either: an earlier version `/login`
 /// on the first and waited for a 3pm reset on the second.
 #[test]
 fn with_no_transcript_a_status_lines_words_are_not_acted_on() {
@@ -1607,8 +1607,8 @@ fn a_confirmed_unnamed_api_error_is_named_by_its_notice_at_the_decision() {
     }
 }
 
-/// A NOTICE THE SCREEN SHOWS WHOSE TURN IS NOT CLOSED YET (the review of
-/// 013c9446a): Claude Code writes the `turn_duration` 1 to 14 ms after the
+/// A NOTICE THE SCREEN SHOWS WHOSE TURN IS NOT CLOSED YET:
+/// Claude Code writes the `turn_duration` 1 to 14 ms after the
 /// notice, and a read can fall between the two. Read then, a model not
 /// found drawn like prose was an ordinary turn end: the continuation typed
 /// into it, and after a retry its refused request's track dropped and its
@@ -1931,14 +1931,14 @@ fn a_wall_whose_call_is_above_the_rows_read_is_judged_on_the_whole_screen() {
 /// read under no owner and `/compact` typed; now it stands under the call and is refused with no
 /// transcript (the 2026-10-08 ruling's loss of recall), and confirmed with the session's own
 /// transcript. The SPOOF (2.1.294's measured screen of an MCP result whose first block of 60 rows
-/// scrolled the call off, its second block a column-2 `⎿  Not logged in · Please run /login`;
+/// scrolled the call off, its second block a column-2 `⎿ Not logged in · Please run /login`;
 /// the history above it COMPOSED as Claude Code draws a call: the call row, the block's first 19
 /// rows): `/login` was typed on the base; now refused. CONTROLS: the same history with the
 /// worker's message where the call row was is acted on; an evicted row refuses, as a whole read
 /// that fails does. ON THE ALTERNATE SCREEN (Claude Code's fullscreen renderer keeps no history)
 /// the same rows are read from aterm's archive of the rows that scrolled off it (`offscreen`, the
 /// screen under the same lock): the spoof is refused, the worker's message over the wall is acted
-/// on — refused on the base, which read no archive (the review of 87faa9bf23) — and a gap in the
+/// on — refused on the base, which read no archive — and a gap in the
 /// archive refuses.
 #[test]
 fn a_wall_whose_call_scrolled_off_is_judged_with_the_history_above() {
@@ -2113,7 +2113,7 @@ fn a_wall_whose_call_scrolled_off_is_judged_with_the_history_above() {
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
-/// (item 6 of the review of 87faa9bf23): A STOP HOOK'S `stopReason` TALLER THAN
+/// : A STOP HOOK'S `stopReason` TALLER THAN
 /// THE LOOP'S TAIL is read with the rows above it ([`Session::limit_words_read_above`]). MEASURED
 /// on 2.1.304 at 144x50 in the real-Claude lab: 35 lines ending `Usage limit reached · resets
 /// 3pm` draw the summary on row 6, above the loop's 40-row tail, which the loop read as a session

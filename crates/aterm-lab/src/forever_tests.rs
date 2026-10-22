@@ -5191,7 +5191,7 @@ fn the_remembered_wall_passes_where_the_screen_without_its_notice_was_waited_out
     );
 }
 
-// ---- the window (slice 5c, §12.5.4)
+// ---- the window (§12.5.4)
 
 /// The window as a run that read it records it of the tab labelled `label`.
 fn window(label: &str) -> surfaces::Window {
@@ -5212,7 +5212,7 @@ fn st(t: i64, task: &str, needs: &str, n: &str, end: &str, seen: &str) -> (i64, 
     )
 }
 
-/// `line` with Land's hold's three fields (slice 3c, §12.3.1): `land_held=`
+/// `line` with Land's hold's three fields (§12.3.1): `land_held=`
 /// its legs, `land_nudges=`, `land_since=` its land act's second.
 fn hold(line: (i64, String), held: &str, nudges: &str, since: &str) -> (i64, String) {
     (
@@ -5469,7 +5469,7 @@ fn seen_cruise_n() -> Seen {
         )
     };
     // Its row says the first need with no count: every other one has a row
-    // of its own one level in under it (slice 2d).
+    // of its own one level in under it.
     let row = |t: i64, others: &[&str]| {
         let under: String = others
             .iter()
@@ -5718,7 +5718,7 @@ fn cruise_n_fails_a_wrong_window_read_and_leaves_a_step_after_a_failed_one_unobs
     );
 }
 
-/// cruise-n's OTHER NEEDS ON ROWS ONE LEVEL IN (slice 2d, §12.5.4's
+/// cruise-n's OTHER NEEDS ON ROWS ONE LEVEL IN (§12.5.4's
 /// N1–N4 row): each step wants exactly its other needs on rows one level in
 /// under its row — (b) at N1, none at N2 and N3, (c) at N4. NEGATIVE
 /// CONTROLS, each a FAIL: N4 still drawing (b) under the same first need

@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! WHAT THE PERSON IS SHOWN IS A `shown` MARK (phase 6, 6F-9; rulings U26,
-//! U44): each move of the printed need tuple (`status needs=`, its
+//! WHAT THE PERSON IS SHOWN IS A `shown` MARK:
+//! each move of the printed need tuple (`status needs=`, its
 //! severity, `hold_by=`) the one verdict writer publishes
 //! (`SessionTimeline::set_need`) is one `mark - shown` by aterm, never a
 //! publication that moves only the verdict's other facts; a per-session

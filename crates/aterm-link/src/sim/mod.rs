@@ -33,9 +33,9 @@
 //!   scratch directory and are journalled, and a power cut rewrites the
 //!   directory to an image aterm-durable's contract allows (a durable write
 //!   and a flushed directory entry kept, an atomic-only write kept or lost,
-//!   whole or — POSIX's worst case, which the committed device draws — TORN:
-//!   finding F1, which the bridge now survives by setting a torn file aside;
-//!   an unflushed unlink kept or lost: finding F2, a landed post's in-flight
+//!   whole or — POSIX's worst case, which the committed device draws — TORN, which
+//!   the bridge now survives by setting a torn file aside;
+//!   an unflushed unlink kept or lost: a landed post's in-flight
 //!   entry brought back and republished behind its sender's later posts,
 //!   which the bridge now closes by retiring an earlier boot's entries) —
 //!   and, in every other eight seeds, a device that FAILS WRITES (sim item
@@ -56,7 +56,7 @@
 //!   under the node's producer and the copy's mark — its attach, its
 //!   session's row, its will — so the bridge's ghost sweep meets another
 //!   state dir's rows, at an incarnation this dir took too in the racing world
-//!   (finding F4: a ghost row whose writer's successors all died inside the
+//!   (a ghost row whose writer's successors all died inside the
 //!   sweep's patience stood for good, which the bridge closes by reading the
 //!   state dir's mark on the row, and never a sibling's);
 //! * the ENTROPY: the back-off's jitter is the seed's.

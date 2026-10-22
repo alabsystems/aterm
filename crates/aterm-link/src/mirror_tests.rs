@@ -18,7 +18,7 @@ fn slot(pseq: u64, sid: &str, ms: u64) -> PinSlot {
     }
 }
 
-/// D4, RULED (session log Phase 6 step 6E-3): the mode reads its three
+/// D4, RULED: the mode reads its three
 /// words, and the default is `auto`, the turn class on over a broker that
 /// retains it (the bridge's half is `bridge_mirror_tests.rs`'s
 /// `an_auto_mirror_runs_only_over_a_broker_that_retains_it`). NEGATIVE CONTROL, run:
@@ -33,7 +33,7 @@ fn the_mode_reads_its_three_words_and_defaults_to_turns_on_a_retaining_broker() 
     assert_eq!(LogMode::parse("TURNS"), None);
 }
 
-/// RULING Q11: the take's frame round-trips — the header's byte count is the
+/// the take's frame round-trips — the header's byte count is the
 /// body's (what a Bytes reader counts), each line a sid, a cursor and a body
 /// with spaces in it.
 #[test]
@@ -133,7 +133,7 @@ fn a_pin_round_trips_and_a_damaged_one_reads_as_damage() {
 
 /// A PIN A POWER CUT CUT SHORT NEVER READS: every pin ends at the newline of
 /// its last line, so a prefix of one is damage — never a pin with a lower
-/// total and no key (ruling Q13's count and Q6's key reset) nor a slot whose
+/// total and no key (count and key reset) nor a slot whose
 /// body lost its tail (republished cut). The mirror then stops, keeping the
 /// pin on disk, rather than mint a fresh key.
 #[test]
@@ -164,7 +164,7 @@ fn a_pin_cut_anywhere_short_of_its_last_byte_does_not_read() {
     }
 }
 
-/// THE WINDOW LEDGER (session log Phase 6 step 6E-2, ruling U41) rides the
+/// THE WINDOW LEDGER rides the
 /// pin as `win=` after the key and reads back exactly, with or without a key;
 /// one that does not read is damage. The window from `oldest=` counts every
 /// batch whose highest offset is at or above it, a cut forgets the batches it
@@ -219,8 +219,8 @@ fn the_window_ledger_rides_the_pin_and_counts_what_the_broker_keeps() {
     assert_eq!(Pin::parse(&full.render()), Ok(full));
 }
 
-/// A FULL LEDGER GIVES ITS BYTES UP AS THE CUT PASSES THEM (session log
-/// Phase 6 step 6E-2, ruling U41). A busy node fills its window in far more
+/// A FULL LEDGER GIVES ITS BYTES UP AS THE CUT PASSES THEM.
+/// A busy node fills its window in far more
 /// batches than the ledger keeps entries, evenly and unevenly: at every cut
 /// the ledger counts at least the bytes truly at or above it, and at most one
 /// merged entry more (1/32 of what it holds), so a window filled in 1024
@@ -280,10 +280,10 @@ fn a_full_ledger_gives_its_bytes_up_as_the_cut_passes_them() {
     }
 }
 
-/// RULING Q10: one landing names every session's last cursor once in each
+/// one landing names every session's last cursor once in each
 /// seq space, in the order they first appear, and its answer is one word a
 /// pair. A take holding an uncarried update's old-space `why=reset` cover
-/// before the new space's records (ruling Q7) lands both spaces: naming only
+/// before the new space's records lands both spaces: naming only
 /// the session's last cursor left the cover owed, taken again every take.
 #[test]
 fn a_landing_names_each_sessions_last_cursor_and_reads_a_word_a_pair() {
@@ -349,7 +349,7 @@ fn the_bucket_spends_its_burst_then_refills_at_its_rate() {
     assert_eq!(b.room(10_000_000), RATE_BURST, "never past the burst");
 }
 
-/// RULING Q6: the alias key is minted, 16 random bytes, never a function of
+/// the alias key is minted, 16 random bytes, never a function of
 /// the node's caps: two mints differ, and none is all zeros.
 #[test]
 fn the_alias_key_is_minted_never_derived() {

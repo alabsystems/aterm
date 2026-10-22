@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! PHASE 6 (6F-1, ruling U1): EACH RECORD KEEPS ITS PROCESS-CLOCK READING.
+//! PHASE 6: EACH RECORD KEEPS ITS PROCESS-CLOCK READING.
 //! Every append's `Stamp.mono_ms` rides the record's ring entry
 //! ([`Log::window_mono`], [`Log::mono_of`]), so a view that ages or orders
 //! records on this process's monotonic clock (the timeline's `t_ms`) reads it

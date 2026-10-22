@@ -22,7 +22,7 @@ enum Shape {
     Seq(&'static Shape),
     /// [`Shape::Seq`] that keeps ONLY a list: any other value (a prompt's
     /// plain-string content) is validated and read as null, never copied —
-    /// the step fold's [`STEP_PARTS`], which keeps no text (ruling S6).
+    /// the step fold's [`STEP_PARTS`], which keeps no text.
     Parts(&'static Shape),
     /// [`Shape::Object`] that keeps ONLY an object: any other value (a bare
     /// string where a part belongs) is validated and read as null — the
@@ -273,7 +273,7 @@ const CONVERSATION: Shape = Shape::Object(&[
 /// A tool call or a tool's result as the session log's step fold reads it
 /// (`harness::steps`): its kind, the call's id and tool, the id of the call
 /// a result answers and whether it failed. Never a call's `input`, never a
-/// result's `content`, never a text part's `text` (ruling S6).
+/// result's `content`, never a text part's `text`.
 const STEP_PART: Shape = Shape::Record(&[
     ("type", Shape::Scalar),
     ("id", Shape::Scalar),
@@ -544,7 +544,7 @@ pub(crate) fn codex_limits(line: &str) -> aterm_json::Result<Value> {
 /// closed word of a turn's error (never its message), and a `token_count`'s
 /// running total and last turn. A call's arguments and input, a result's
 /// output, messages, instructions, settings, a compaction's history and the
-/// rate limits are validated, never materialized (ruling S6).
+/// rate limits are validated, never materialized.
 const CODEX_STEPS: Shape = Shape::Object(&[
     ("type", Shape::Scalar),
     ("timestamp", Shape::Scalar),
@@ -713,8 +713,8 @@ pub(crate) fn steps_bare(line: &str) -> aterm_json::Result<Value> {
 /// where the line is no row that shape reads). Every reader here decides
 /// what it decides of a row from one of these (module docs: a row is never
 /// read whole), so two rows whose reads are equal read alike to each of
-/// them. What a reduction of a transcript is held to (`aterm-lab reduce`,
-/// session log ruling U7): a closed word one of these keeps is a word a
+/// them. What a reduction of a transcript is held to (`aterm-lab reduce`):
+/// a closed word one of these keeps is a word a
 /// committed reader reads, and is kept; a word none keeps is read by
 /// nothing here.
 #[must_use]

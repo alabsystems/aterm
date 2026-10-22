@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE READER'S VIEW OF THE BUS (design §5.5, phase 4 ruling Q0): what a
+//! THE READER'S VIEW OF THE BUS (design §5.5): what a
 //! consumer of a session's mirrored records holds, and the one place its
 //! laws are stated. The bus itself may hold a body twice (a republish at a
 //! new producer seq after a crash, an update or a collision): the view never
@@ -22,7 +22,7 @@
 //!   is a record's or inside a cover; [`BusSpace::holes`] lists any that is
 //!   neither, which is loss nobody said (the broker's clamp, a retention).
 //! - **Order** is `(ep, seq)`, never the bus's offsets: a slot re-pinned after
-//!   a collision lands after later ones of its session (ruling Q3), and the
+//!   a collision lands after later ones of its session, and the
 //!   fold applies it in its place. A body that arrived after a later seq of
 //!   its space is counted `reordered`.
 //! - **A body is the bus's, not the mirror's** until it reads as one: a

@@ -33,16 +33,18 @@ aterm-uds = { workspace = true }
 # aterm-link's broker opens its log in, so the mug and the bus name a boot one
 # way. Every target, not only macOS where the mug reads its boot: the state
 # file's parser is the pure model's, which compiles everywhere. Zero
-# dependencies; its one cordoned `unsafe` module is its Apple FFI calls
-# (`sysctlbyname` for the boot id among them), so this crate declares no
-# `sysctlbyname` of its own. Not a new edge on Apple, where aterm-durable above
+# dependencies; its two cordoned `unsafe` modules are hand-declared FFI calls,
+# `apple` (`sysctlbyname` for the boot id among them, so this crate declares no
+# `sysctlbyname` of its own) and `owner` (`cfg(unix)`: `geteuid` and the ACL
+# calls). Not a new edge on Apple, where aterm-durable above
 # links it, nor on Linux, where aterm-link does; on Windows it is a new one,
 # and a harmless one: no dependencies, and no `unsafe` compiled there.
 astream-sys = { path = "../../vendor/astream/crates/astream-sys" }
 
 [target.'cfg(unix)'.dependencies]
 # `kill` (`aterm caffeine quit`), the code directory's backup exclusion
-# (`getxattr`/`setxattr`) and `notify_post`.
+# (`getxattr`/`setxattr`), the SIGTERM watch (`sigaction`, `raise`) and the
+# open flags; `notify_post` is declared by hand in notify.rs.
 libc = { workspace = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]

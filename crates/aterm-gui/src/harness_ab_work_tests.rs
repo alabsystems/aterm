@@ -149,11 +149,11 @@ fn a_task_opened_under_land_starts_the_span_again() {
     assert_eq!(book.land_from(3), None, "first read in Land: no start");
 }
 
-/// A WORD CARRIED FROM BEFORE THIS PROCESS MOVES NO TASK (`AbBook::carry_mode`,
-/// slice 6's restored word): it reads the mode as a first read does — Land
+/// A WORD CARRIED FROM BEFORE THIS PROCESS MOVES NO TASK (`AbBook::carry_mode`):
+/// it reads the mode as a first read does — Land
 /// with no start — but the work the task has done is the task's, kept: 25 s,
 /// the word carried into Land, then 10 s is 35 s. NEGATIVE CONTROL: the
-/// carry as a fresh entry (slice 6's own `AbTask::first_read`) zeroes the
+/// carry as a fresh entry zeroes the
 /// sum (10 s), so this fails.
 #[test]
 fn a_carried_word_keeps_the_tasks_work() {

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE WINDOW'S READS OF A FOREVER RUN (slice 5c,
+//! THE WINDOW'S READS OF A FOREVER RUN (
 //! `docs/DESIGN-harness-autopilot-2026-10-15.md` §12.5.4): what a person at the
 //! window would see of each chain, read at every look the run takes, and the
 //! wants each scenario holds it to beside its records ([`super::judge`]).
@@ -117,7 +117,7 @@ pub struct Window {
     pub strip: Vec<(i64, String)>,
     /// Its tab's hover, who drives it: the `driven by aterm (…)` line of its
     /// `toolbar-tabs` tooltip as the strip was last stamped with it
-    /// ([`StripTab::tip`]; §12.4.1; slice 3c says why a landing holds there,
+    /// ([`StripTab::tip`]; §12.4.1; why a landing holds there,
     /// `driven by aterm (land: not landed yet, …)`); `-` where the tooltip
     /// names no driver, or the strip holds no tab of its label.
     pub hover: Vec<(i64, String)>,
@@ -286,7 +286,7 @@ pub struct Idle {
     pub relogged: Vec<String>,
     /// The tabs whose ends stood unseen in it, and whose holds stood: a pause
     /// (`WAITING … until=` still ahead, [`due_and_quiet`]). §12.3's Land hold
-    /// is on `status` (`land_held=`, slice 3c, [`hold`]); 5d reads it here.
+    /// is on `status` (`land_held=`, [`hold`]); 5d reads it here.
     pub ends: Vec<String>,
     pub holds: Vec<String>,
     /// The page was open in it (its view read after).
@@ -384,7 +384,7 @@ impl StripTab {
 /// `done`, `here`, `look`; `-` past a separator), its label, its `at=` and
 /// its `indent=` (how many levels in it is drawn within its own menu, 0
 /// where the line names none: a harness's further need, one level in under
-/// its session's row, slice 2d; never a submenu's row, which `chrome` leads
+/// its session's row; never a submenu's row, which `chrome` leads
 /// with two spaces and this reader passes over).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct MenuRow {
@@ -606,8 +606,8 @@ fn is_head(r: &MenuRow) -> bool {
 /// for you) with the rows the menu lists under it (`<section>-head|<label>
 /// rows=<n>`: the sessions' own rows, never a row one level in), then each
 /// row naming it (`<section>|<label>`), each followed by the rows one level
-/// in under it, its further needs (`<section>|<label> indent=<n>`, slice
-/// 2d), ages masked.
+/// in under it, its further needs (`<section>|<label> indent=<n>`),
+/// ages masked.
 #[must_use]
 pub fn menu_of(menu: &[MenuRow], tab: &str) -> String {
     let named: Vec<(&MenuRow, &[MenuRow])> = menu
@@ -986,8 +986,8 @@ pub fn end_runs(chains: &[Chain]) -> bool {
 /// The chains a need is scripted for (L3, L6, N1–N4).
 const NEEDING: [Chain; 3] = [Chain::LandA, Chain::LandD, Chain::CruiseN];
 
-/// THE WINDOW'S WANTS (§12.5.4's table, the rows main gives, and §12.3.7's,
-/// slice 3c's: why Land still holds, [`hold`]): each judged beside its
+/// THE WINDOW'S WANTS (§12.5.4's table, the rows main gives, and §12.3.7's:
+/// why Land still holds, [`hold`]): each judged beside its
 /// scenario's records ([`with_window`]). The `indent=1` rows of a need's
 /// others (N1–N4) are 2d's, here ([`n_further`]). A later slice (5d) adds
 /// its rows here: END's holds read as Land's (`land_held=`, read as pauses
@@ -2095,7 +2095,7 @@ fn n_status(seen: &Seen, cx: &Ctx<'_>, k: usize) -> Verdict {
 /// N1–N4 on the window: every chip line standing in the span drawn as its
 /// face (the front tab; Gemini CLI its no-footer line), and, settled, its
 /// need row naming the first need with no count (every other need has a
-/// row of its own one level in, [`n_further`]: slice 2d), and its page
+/// row of its own one level in, [`n_further`]), and its page
 /// state naming the first need with the others' count (` (+1 more)`), the
 /// need alone, or none.
 fn n_window(seen: &Seen, cx: &Ctx<'_>, k: usize) -> Verdict {
@@ -2182,11 +2182,11 @@ fn n_window(seen: &Seen, cx: &Ctx<'_>, k: usize) -> Verdict {
 }
 
 /// N1–N4's further needs, each on a row of its own one level in under the
-/// tab's row (slice 2d, `indent=1`): (b) at N1, none at N2 and N3, (c) and
+/// tab's row (`indent=1`): (b) at N1, none at N2 and N3, (c) and
 /// never (b) at N4 — a set that moved under the same first need.
 const N_OTHERS: [&[&str]; 4] = [&[NEED_B], &[], &[], &[NEED_C]];
 
-/// N1–N4's ROWS ONE LEVEL IN (§12.2.1, §12.5.4's N1–N4 row; slice 2d):
+/// N1–N4's ROWS ONE LEVEL IN (§12.2.1, §12.5.4's N1–N4 row):
 /// settled at the span's end, the rows the menu draws one level in under
 /// the tab's own need row ([`menu_of`]'s `indent=1` lines) are exactly that
 /// step's other needs, whole ([`N_OTHERS`]). A row printed as a submenu's

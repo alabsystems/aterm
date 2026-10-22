@@ -37,7 +37,7 @@ fn session(turns: u64) -> (Log, u64) {
             tr.observe(&mut log, v, None, at(ms));
         }
         // A mark worth a line (a person's hands; a bell gives none since
-        // phase 3B, ruling S15).
+        // phase 3B).
         if i % 3 == 0 {
             log.mark(
                 Mark::new(Kind::Human, Src::Input, Conf::Strong).by(Actor::Human),
@@ -325,8 +325,8 @@ fn brief_keeps_the_open_turn_its_window_lacks() {
     assert!(turn.contains("· p1 approval edit open"), "{turn}");
 }
 
-/// A TURN WHOSE OPEN WAS EVICTED KEEPS ITS AUTHOR AND ITS EXCHANGE (Phase 6
-/// step 6C-2, ruling U6): on a 20-record ring, a harness `ctl turn`
+/// A TURN WHOSE OPEN WAS EVICTED KEEPS ITS AUTHOR AND ITS EXCHANGE:
+/// on a 20-record ring, a harness `ctl turn`
 /// (`ledger=7`) settles, and later turns evict its open record while its
 /// close stays; the close restates `ledger=` (5F-4a) and its opener as
 /// `op_by=harness`, so the brief's line for it still says `by=harness
@@ -434,7 +434,7 @@ fn turn_line_of(log: &Log, t: Node, ms: u64) -> String {
         .to_string()
 }
 
-/// THE MAIL A TURN PROBABLY ANSWERED (Phase 6 step 6C-3, ruling U5): a
+/// THE MAIL A TURN PROBABLY ANSWERED: a
 /// `ctl` turn opened after one delivered `kind=task` mail briefs
 /// ` mail=@9~` after its own fields, open and once closed (the fold keeps
 /// the newest closed turn's link); a `kind=note` mail, two task mails (the
@@ -736,7 +736,7 @@ fn brief_reads_an_exact_refinement_and_never_a_strong_one() {
     assert!(tl.contains(" · 3 steps shell 2 edit 1"), "{tl}");
 }
 
-/// PHASE 3B's MARKS LEAVE THE BRIEF AS IT WAS (ruling S15, addendum A23): a
+/// PHASE 3B's MARKS LEAVE THE BRIEF AS IT WAS: a
 /// busy agent session's brief, every 3B mark written on every turn, holds
 /// every line it holds without them, at every budget; mail is the `mail in ·
 /// out` line and `act` and `story` one count line, both the first lines shed.
@@ -873,8 +873,8 @@ fn the_3b_marks_leave_the_brief_as_it_was() {
     );
 }
 
-/// A CODEX-ALAB SESSION'S ACTS ARE THE ONE COUNT LINE (plan 5C-2, ruling
-/// T28): a self-supervised agent's acts (`meta set harness_act`, written as
+/// A CODEX-ALAB SESSION'S ACTS ARE THE ONE COUNT LINE:
+/// a self-supervised agent's acts (`meta set harness_act`, written as
 /// `act` marks by the connection's actor, `src=mark conf=claim`) leave the
 /// brief with every line it had without them, plus `acts N · stories 0`,
 /// which is shed first. NEGATIVE CONTROL: the count line is there when it
@@ -984,8 +984,8 @@ fn relaunched(acts: bool) -> (Log, u64) {
     (log, WALL0 + ms + 40_000)
 }
 
-/// A RELAUNCHED SESSION'S ACTS ARE THE ONE COUNT LINE (plan 5F-2, rulings
-/// T25 and T28): the hosted lanes' `act word=relaunch` marks (`by=harness
+/// A RELAUNCHED SESSION'S ACTS ARE THE ONE COUNT LINE:
+/// the hosted lanes' `act word=relaunch` marks (`by=harness
 /// src=aterm conf=strong`) leave the brief with every line it had without
 /// them — both runs, their turns and the exit — plus `acts 2 · stories 0`,
 /// which is shed first. NEGATIVE CONTROL: the count line is there when it
@@ -1153,7 +1153,7 @@ fn tx_session(turns: u64, tx: bool) -> (Log, u64) {
     (log, WALL0 + ms + 40_000)
 }
 
-/// Ruling S15: what a transcript adds is shed before any line the brief
+/// what a transcript adds is shed before any line the brief
 /// held without it — its closed steps' lines and the open turn's open
 /// steps to the newest and a count first, then all of it — and with all
 /// of it shed the brief reads as it did without the transcript.

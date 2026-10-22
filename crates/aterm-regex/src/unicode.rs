@@ -25,30 +25,33 @@
 
 /// Membership test for a sorted, disjoint, inclusive range table.
 #[inline]
-fn in_ranges(table: &[(u32, u32)], c: char) -> bool {
+const fn in_ranges(table: &[(u32, u32)], c: char) -> bool {
     let cp = c as u32;
-    table
-        .binary_search_by(|&(lo, hi)| {
-            if cp < lo {
-                core::cmp::Ordering::Greater
-            } else if cp > hi {
-                core::cmp::Ordering::Less
-            } else {
-                core::cmp::Ordering::Equal
-            }
-        })
-        .is_ok()
+    let mut lo_idx = 0;
+    let mut hi_idx = table.len();
+    while lo_idx < hi_idx {
+        let mid = lo_idx + (hi_idx - lo_idx) / 2;
+        let (lo, hi) = table[mid];
+        if cp < lo {
+            hi_idx = mid;
+        } else if cp > hi {
+            lo_idx = mid + 1;
+        } else {
+            return true;
+        }
+    }
+    false
 }
 
 /// `\s`: Unicode `White_Space`, which is exactly `char::is_whitespace`.
 #[inline]
-pub(crate) fn is_space(c: char) -> bool {
+pub(crate) const fn is_space(c: char) -> bool {
     c.is_whitespace()
 }
 
 /// `\d`: General_Category `Nd` (decimal number).
 #[inline]
-pub(crate) fn is_digit(c: char) -> bool {
+pub(crate) const fn is_digit(c: char) -> bool {
     if c.is_ascii() {
         return c.is_ascii_digit();
     }

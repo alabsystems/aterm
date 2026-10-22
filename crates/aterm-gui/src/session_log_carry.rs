@@ -237,8 +237,7 @@ impl SessionLog {
             || "-".to_string(),
             |c| format!("{},{}", c.base, opt_wall(c.cursor)),
         );
-        // The remaining marks' last values ride as additive tokens (phase
-        // 3B, ruling S5: words, tenths and fingerprints, never text).
+        // The remaining marks' last values ride as additive tokens (words, tenths and fingerprints, never text).
         out.push(format!(
             "state v=1 origin={} opened={} root={} last_blk={} csnap={csnap} cmd_end={} arrivals={}{}",
             origin_word(self.origin),
@@ -338,13 +337,13 @@ impl SessionLog {
             at,
         };
         let (log, host, stats) = Log::from_carry_built(lines, a, build)?;
-        // A carried successor's epoch is its predecessor's plus one (ruling
-        // U1), held without being issued: every later issue is above it.
+        // A carried successor's epoch is its predecessor's plus one,
+        // held without being issued: every later issue is above it.
         self.epochs.note(log.ep());
         self.replace_log(log);
         self.origin = Kind::Adopt;
-        // The predecessor journaled the session up to the carried head
-        // (ruling R5): this process's journal starts after it. Without the
+        // The predecessor journaled the session up to the carried head:
+        // this process's journal starts after it. Without the
         // line (its journal off, stopped, or an older build) this process
         // journals the carried records itself; a reader shows each once.
         if host.iter().any(|l| l == JOURNAL_HOST_LINE) {

@@ -3246,8 +3246,8 @@ fn footer_notice(
 /// short of 144, of 80) and starts at the hint column ([`HINT_COLUMN`]) or
 /// the row stands there whole ([`is_against_right_edge`]); else nothing. A
 /// status line's later field, after two spaces, is no notification short of
-/// the edge: `  opus-5.5  ~/proj  Not logged in · Run /login` read as the
-/// login notice before (the review of 87faa9bf23). A status line that itself
+/// the edge: ` opus-5.5 ~/proj Not logged in · Run /login` read as the
+/// login notice before. A status line that itself
 /// prints a status glyph first, or whose words reach the right edge, reads
 /// as the vendor's.
 fn footer_text(
@@ -6649,7 +6649,7 @@ mod tests {
     /// 2.1.299), or into a row under it at the same column; the transcript's
     /// own text has the next line after a newline. The time and its zone are
     /// the reset, nothing after them — but A DATE IS NEVER CUT OFF ITS TIME
-    /// (the review of fix/r15-banner, 2026-10-14: `resets at 3pm on Oct 15`
+    /// (2026-10-14: `resets at 3pm on Oct 15`
     /// cut to `3pm` is read by `aterm-agent`'s `limit::parse_reset` as today's
     /// session clock). A key followed by no time is passed over: the
     /// countdown toast that follows a `/goal` echo names the time.

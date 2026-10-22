@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The Codex rollout tap (session log 5G-3; plan A1's 6D-3b): its gate (a
+//! The Codex rollout tap: its gate (a
 //! codex-alab thread's own rollout, on a measured build, and nothing else),
 //! where it finds the rollout, the read that goes on from where it stopped,
 //! a file replaced at its path, and history (the floor and the watermark).
@@ -345,7 +345,7 @@ fn history_below_the_floor_or_the_watermark_is_never_queued() {
     );
 }
 
-/// THE RUNNING BUILD (session log 5G-3): a thread's `session_meta` names the
+/// THE RUNNING BUILD: a thread's `session_meta` names the
 /// build that started it, and a thread resumed or re-exec'd onto another
 /// build appends to the same rollout without restating it, so the tap reads
 /// only while the claimant's image runs a measured build too. A thread

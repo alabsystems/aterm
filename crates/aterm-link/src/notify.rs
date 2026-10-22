@@ -1,133 +1,37 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `aterm-link notify`: the fabric's only push to a human (§9.3). `ls` and `aterm fabric` are
-//! pulls, so without this an `attention` raised on a headless box reaches nobody. It runs a
-//! command the operator chose (ntfy, mail, a webhook) once per matching record; [`USAGE`] has
-//! the flags.
+//! `aterm-link notify`: run a command when the fabric needs a human ([`USAGE`] lists the flags).
 //!
-//! ```text
-//! aterm-link notify --fleet <F> --broker <socket> --cap-file <p>...
-//!                   --on <attention|ask:<person>|halt>,... --exec <cmd>
-//!                   [--rate <n>/<window>] [--state DIR] [--since head|start|<off>] [--once]
-//!                   [--exec-timeout <ms>]
-//! ```
+//! * **Untrusted record bodies**: `--exec <cmd>` runs as `/bin/sh -c <cmd>`. Nothing from a
+//!   record is interpolated into `<cmd>`; every fact arrives in `$ATERM_NOTIFY_*` with free text
+//!   flattened to printable ASCII and capped at [`TEXT_MAX`] bytes.
+//! * **Rate budget & suppression**: `--rate <n>/<window>` bounds fires, not matches. A
+//!   rate-limited record gets a durable `dropped` journal line, a stderr line, and increments
+//!   the persisted `suppressed` counter (`ATERM_NOTIFY_SUPPRESSED=<n>`), which is cleared only
+//!   when a command exits `rc=0`. Dropped records are terminal and stay on the bus for `ls` and
+//!   `inbox`.
+//! * **Durable state (`<state>/notify/`, written temp + `fsync` + `rename`)**:
 //!
-//! `--rate <n>/<window>` bounds fires, not matches, and drops nothing silently: a refused record
-//! gets a durable `dropped` journal line, a stderr line, and a bump of the persisted
-//! `suppressed` counter, handed to the next command as `ATERM_NOTIFY_SUPPRESSED=<n>`. Only a
-//! command that answered `rc=0` clears the counter. A dropped record is terminal; the bus still
-//! holds it for `ls` and the digest.
+//!   | file | contents |
+//!   |---|---|
+//!   | `cur/<key>` | monotone next offset to scan for selector `<key>` |
+//!   | `journal` | newest [`JOURNAL_KEEP`] verdicts (`<off> firing\|fired\|dropped …`) |
+//!   | `log` | identity of the root bus log (`cur/` and `journal` belong to this log) |
+//!   | `logs/<identity>/` | `cur/`, `journal` and `standing` for up to [`LOGS_KEEP`] other logs ([`Store::for_log`]), carried over across generation moves at the lineage fork |
+//!   | `logs/used` | LRU order of `logs/<identity>/` ([`Store::prune_logs`]) |
+//!   | `standing` | per presence subject, the `attention=` token last paged with `rc=0` ([`STANDING_KEEP`]) |
+//!   | `rate` | fire timestamps within the rate window |
+//!   | `suppressed` | rate-dropped notifications not yet reported to a command |
 //!
-//! `--exec` is the operator's own line, run as `/bin/sh -c <cmd>`. Nothing from a record is
-//! interpolated into it: every fact arrives as an environment variable, the free text flattened
-//! to printable ASCII and capped at [`TEXT_MAX`] bytes.
-//!
-//! State lives under `<state>/notify/`, each file written temp, `fsync`, `rename`:
-//!
-//! | file | what it holds |
-//! |---|---|
-//! | `cur/<key>` | the next offset to scan for one selector; monotone |
-//! | `journal` | the newest [`JOURNAL_KEEP`] verdicts, `<off> firing\|fired\|dropped …` |
-//! | `rate` | the timestamps of the last fires, for the budget window |
-//! | `suppressed` | rate-dropped notifications a human has not been told about yet |
-//!
-//! Dedup is by offset (§9.3), the only identity a record has: the same `attention=` at a new
-//! offset is a new notification, and the budget is what bounds a storm.
-//!
-//! A dropped record is terminal — it is not re-offered when the window rolls,
-//! because a queue of deferred 3 a.m. pushes arriving at 6 a.m. is its own kind
-//! of noise, and the bus still holds every one of them for `ls` and the digest.
-//!
-//! ## The body is untrusted data, and it never becomes a command
-//!
-//! `--exec` is the operator's own shell line and is run as `/bin/sh -c <cmd>`.
-//! NOTHING from a record is interpolated into it: every fact reaches the command
-//! as an environment variable, and the free text is flattened to printable ASCII
-//! and capped at [`TEXT_MAX`] bytes first. A record body cannot become argv, a
-//! shell word, or terminal input — the same rule the bridge keeps at the PTY seam,
-//! kept here at the exec seam.
-//!
-//! ## What is remembered, and where
-//!
-//! Under `<state>/notify/`, beside the bridge's own durable state, each file
-//! written temp, `fsync`, `rename` — [`crate::state`]'s durable tier, and for
-//! its reason: these dedup a human's notifications by bus offset, and the bus
-//! outlives a reboot:
-//!
-//! | file | what it holds |
-//! |---|---|
-//! | `cur/<key>` | the next offset to scan for one selector; monotone |
-//! | `journal` | the newest [`JOURNAL_KEEP`] verdicts, `<off> firing\|fired\|dropped …` |
-//! | `log` | the identity of the bus log the two above are offsets on |
-//! | `logs/<identity>/` | `cur/` and `journal` of any other log this notifier read ([`Store::for_log`]) — a moved generation's carried over from the one it continues, clamped at the fork — the newest [`LOGS_KEEP`] kept |
-//! | `logs/used` | those other logs' identities, the latest read last ([`Store::prune_logs`]) |
-//! | `standing` | per presence subject, the `attention=` a human was last told of ([`STANDING_KEEP`]) |
-//! | `rate` | the timestamps of the last fires, for the budget window |
-//! | `suppressed` | rate-dropped notifications a human has not been told about yet |
-//!
-//! Dedup is BY OFFSET, which is §9.3's word and the only identity a record has —
-//! and, for `attention`, ALSO BY VALUE PER SUBJECT, once per transition. A
-//! presence row is a LAST-VALUE face, not an event stream: the bridge writes a
-//! session's row again, standing `attention=` and all, on every attach (its
-//! first, every reconnect, the successor's after a seamless update), on every
-//! role, detail, phase or title change in `meta` mode, and in its `exited` row.
-//! Paged once per offset, one open escalation re-paged the human on each of
-//! those and spent the budget a genuinely new one then found empty. So a row
-//! whose `attention=` is the one the human was last TOLD of on that subject
-//! pages nobody and charges nothing (`standing=` in the closing line); a clear
-//! (`attention=-`, or none) re-arms the subject, and a raise after it pages
-//! again, the same text included. This is not the silent drop the module
-//! refuses: the publisher already collapses an unchanged value inside its own
-//! window, and every offset of the face is read in order, so a clear that
-//! reached the bus is seen before the raise after it — an escalation the bus
-//! can tell apart from the last one always pages. "Told" is a command that
-//! answered `rc=0`, as for `suppressed`: a rate-dropped escalation, or one whose
-//! command failed, leaves nothing standing, so its next republish is offered
-//! again — told twice, never untold. The one loss: a retention trim that
-//! removed a clear below this notifier's cursor before it read it. The budget is
-//! still what bounds a storm of distinct escalations.
-//!
-//! ## On a broker that serves ordered, a page waits until its record is durable
-//!
-//! A push leaves the machine; a power loss on the broker's host can then take
-//! the record it was about ([`crate::durability`]: an ordered broker acks
-//! after an ordering barrier, and flushes in full at most its horizon plus a
-//! batch and a full flush later).
-//! A human paged at 3 a.m. for an escalation the log no longer holds is told
-//! of something nobody can find. So on a broker whose `Hello` says it SERVES
-//! ordered (tag 0x01), a record is paged only once a `Mark` this notifier read
-//! says the broker's durable head is past it — the catch-up `Fetch`'s closing
-//! mark, or the DURABLE MARK astream sends a subscription that asked for idle
-//! marks when a full flush covers what it was delivered. The records the
-//! broker escalates (a halt, mail to a person: `ask:<person>` and `halt`) are
-//! durable before anyone can see them, so they page at once; an `attention=`
-//! row waits at most the horizon plus one batch and one full flush.
-//!
-//! WHILE IT WAITS, nothing moves past it: the record is held in memory in
-//! read order with every later record of its selector, and the selector's
-//! cursor stays AT it, so a notifier killed while holding re-reads it. A
-//! `--once` run leaves a record no full flush covers yet, and everything after
-//! it on that selector, for the next run, and says so. A first record held
-//! says so on stderr too. Held records are bounded ([`HOLD_MAX`] bytes): past
-//! the bound they are paged as they were read, said on stderr — the module's
-//! chosen failure, a page about a record a power loss may still take, never a
-//! page withheld. A broker that LATCHES from ordered to strict while this
-//! notifier is connected (its device refused the barrier while serving) keeps
-//! sending durable marks for the rest of its open — astream sends them to every
-//! idle-marks tail of a log that served ordered at its open, and after the
-//! latch every batch is flushed in full — so what is held pages at the next
-//! batch, not at the idle mark ten seconds of quiet later. A reconnect to the
-//! same log keeps what it holds (the new connection's first mark says how far
-//! it is durable) — unless its broker no longer serves ordered, which sends no
-//! durable mark for it: then it pages at once, in read order, ahead of the new
-//! connection's records. A reconnect to ANOTHER log drops it, and the reader
-//! re-reads from that log's cursor, which never passed it.
-//!
-//! A strict broker's records are durable when visible, and a relaxed broker's
-//! durable head does not move between its opens: waiting there would never
-//! page, and relaxed is the operator's choice of exactly that cost. Both, and a
-//! broker too old to report its tier, page as they always did.
+//! * **Deduplication**: By record offset (`journal`), and for `attention` also by value per
+//!   presence subject (`standing`): republishing the same `attention=` on a session row does not
+//!   re-page (`standing=` in the summary line), while clearing (`attention=-` or absent) re-arms
+//!   the subject. Only a fire with `rc=0` records a standing token.
+//! * **Ordered-broker durability hold**: On a broker serving `ordered`, records not yet covered
+//!   by a full flush wait in read order (up to [`HOLD_MAX`] bytes) until a `Mark` reports the
+//!   broker's durable head past them, keeping the selector cursor at the first held record.
+//!   `--once` leaves records not yet durable for the next run.
 
 use aterm_uds::spawnfd::Stdio;
 use std::io::{self, Write};
@@ -141,79 +45,43 @@ use crate::bridge::ACK_DEADLINE;
 use crate::subject::{is_fleet, is_principal};
 use crate::transport::{self, Backoff, Closer, Conn};
 
-/// How many records one `Fetch` page asks for while catching up.
-///
-/// [`crate::transport::POST_PAGE`]'s width, NOT a row face's, for two reasons.
-/// An `ask:<p>` selector reads posts, whose bodies a page buffers whole. And
-/// the page is the unit of crash re-scan: a catch-up moves its cursor once per
-/// page, so the journal must outlive every hit one page can hold ([`JOURNAL_KEEP`]) —
-/// an `attention` page of presence rows can be ALL hits, and a re-scan past an
-/// evicted verdict tells a human twice. Widening this means re-keying the
-/// journal, not changing a number.
+/// Records per `Fetch` page while catching up (`POST_PAGE` so `JOURNAL_KEEP` outlives any single
+/// page re-scan after a crash).
 const PAGE: u32 = crate::transport::POST_PAGE;
 
-/// How many verdicts the journal keeps. Far above [`PAGE`]: the cursor never moves backwards,
-/// so the only re-scan is of the page a crash interrupted.
+/// Verdicts kept in `journal` (must exceed [`PAGE`]).
 const JOURNAL_KEEP: usize = 1024;
 
-/// How many other logs' stores (`logs/<identity>/`) are kept beside the
-/// root's ([`Store::prune_logs`]): the newest read, so a log that comes back
-/// after an off/on of its broker resumes, and the rest are removed.
+/// Number of non-root log stores (`logs/<identity>/`) retained by [`Store::prune_logs`].
 const LOGS_KEEP: usize = 4;
 
-/// How many subjects `standing` remembers. Past it the oldest is forgotten,
-/// which can only cost a re-page of an escalation already told, never a missed
-/// one.
+/// Subjects remembered in `standing`.
 const STANDING_KEEP: usize = JOURNAL_KEEP;
 
-/// The cap on the free text handed to the command.
+/// Cap on free text passed in `$ATERM_NOTIFY_*`.
 const TEXT_MAX: usize = 256;
 
-/// How often the exec wait looks at the child; it only keeps the wait off a core.
 const EXEC_POLL: Duration = Duration::from_millis(10);
-
-/// How long a notification command may run before it is killed: a hung `curl` would wedge
-/// every later notification behind it.
 const DEFAULT_EXEC_TIMEOUT: Duration = Duration::from_secs(30);
-
-/// The default budget: ten pushes a minute.
 const DEFAULT_LIMIT: u32 = 10;
 const DEFAULT_WINDOW_MS: u64 = 60_000;
 
-/// How many bytes of records (subject and body) a follow-mode notifier holds
-/// back while it waits for an ordered broker to say they are durable (the
-/// module doc). The horizon (aterm's is 100 ms), the batch in hand and a
-/// full flush bound the normal wait. This cap bounds memory even when traffic
-/// outruns that wait or a broker stops flushing. Past it every held record
-/// is paged as it was read, before durability is known, with a warning.
+/// Maximum bytes of records held while waiting for an ordered broker's durable mark; past this
+/// bound, held records are paged immediately with a warning.
 const HOLD_MAX: usize = 4 << 20;
 
 #[derive(Debug)]
 enum Notice {
     Record(usize, u64, String, Vec<u8>),
-    /// The broker scanned through `next`, unmatched offsets included. Sent after the page's
-    /// records, so it is persisted only once each of them is handled.
+    /// Broker scanned through `next` (including unmatched offsets); sent after the page's records.
     Checkpoint(usize, u64),
-    /// The reader at this index just connected, to a broker serving the log
-    /// with this identity (`None`: one that predates identity). Sent before
-    /// any record of that connection, so the executor files each record's
-    /// verdict and cursor under the log it was read from ([`Store::for_log`]).
+    /// Reader connected to `ReadLog`; sent before any record of that connection.
     Log(usize, ReadLog),
-    /// The broker's DURABLE head as a `Mark` on this reader's connection told
-    /// it ([`astream_broker::Event::Mark`]): every record below it is on
-    /// stable media. Sent after the page or the deliveries the mark follows,
-    /// so a record it covers is already in the executor's hands. What
-    /// releases a record held on a broker that serves ordered (the module
-    /// doc).
+    /// Broker's durable head (`Event::Mark`), releasing held records below it on an ordered broker.
     Durable(usize, u64),
 }
 
-/// The log a connection reached: its identity (`None`: a broker that predates
-/// identity) and the lineage the same `Hello` told beside it (`None`: a broker
-/// before lineage, or a log astream recorded none for) — what
-/// [`Store::for_log`] files a reader's cursors and verdicts under, and carries
-/// a moved generation's store over by — and whether that `Hello` said the
-/// broker SERVES ordered, which is when a page waits for durability.
+/// Identity, lineage, and served durability (`ordered`) of the log a reader connected to.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct ReadLog {
     id: Option<astream_broker::LogIdentity>,
@@ -490,34 +358,15 @@ pub enum Since {
     At(u64),
 }
 
-/// `<state>/notify/`: the four files of the module doc's table.
+/// `<state>/notify/`: durable cursors, journal, standing tokens, and rate-limit state.
 ///
-/// THE CURSORS AND THE JOURNAL ARE ONE LOG'S. Both are bus offsets, and an
-/// offset names a record in one log only: pointed at a log that was deleted
-/// and recreated, repaired, restored, or another host's, a `cur/` past its
-/// head pages to an empty "head" and subscribes beyond every escalation below
-/// it, and a journal verdict keyed by a bare offset skips a new record that
-/// reuses it. So they are filed by the log's identity ([`Store::for_log`]):
-/// the root's are the log `notify/log` names (the first one this notifier
-/// read under an identity — the files from before identity were that log's),
-/// and any other log's live in `notify/logs/<identity>/`, where a log this
-/// notifier has never read starts the way a first run does, from `--since`.
-/// The rate budget and the `suppressed` count are the human's, not a log's,
-/// and stay at the root.
-///
-/// A MOVED GENERATION OF A LOG IT READ IS NOT A FIRST RUN. After a power loss
-/// under a weak tier (or a torn batch cut, or a repair's cut) astream moves
-/// the log's generation and says where the generations still agree
-/// ([`astream_broker::LogIdentity::continues`], from the lineage its `Hello`
-/// tells). Read from `--since head`, the new generation would start past every
-/// escalation posted between the broker's restart and this notifier's first
-/// read of it — the cost the relaxed tier used to carry. So its store is
-/// CARRIED OVER from the store of the generation it continues
-/// ([`Store::carry`]): each cursor resumes at the lower of itself and the
-/// fork, and the journal keeps only the verdicts below it — one at or above
-/// it names a record the loss took, and keyed by bare offset it would swallow
-/// the new record that reuses that offset. Nothing below the fork pages twice;
-/// nothing after it is skipped.
+/// Cursors (`cur/<key>`), `journal` and `standing` are scoped per bus log identity
+/// ([`Store::for_log`]): the root store holds the first log named in `notify/log` (or a
+/// pre-identity broker), and additional logs live under `notify/logs/<identity>/`. When a log's
+/// generation moves with lineage (`LogIdentity::continues`), [`Store::carry`] carries over its
+/// predecessor's cursors and journal clamped at the fork so nothing below the fork re-pages and
+/// nothing after it is skipped. `rate` and `suppressed` are global to the human and stay at the
+/// root.
 #[derive(Clone)]
 struct Store {
     root: PathBuf,
@@ -559,13 +408,9 @@ impl Store {
             .filter(|s| !s.is_empty())
     }
 
-    /// The store whose `cur/` and `journal` are the log `log`'s
-    /// ([`Store`]'s doc): this root for a broker that predates identity, for
-    /// the log the root's `log` file names, and — recorded there — for the
-    /// first identity read; `logs/<identity>/` for any other, which for a
-    /// moved generation of a log this notifier read is first CARRIED OVER from
-    /// that log's store, clamped where `lineage` (the one the same `Hello`
-    /// told) says the two agree ([`Store::carry`]).
+    /// Return the [`Store`] for `log` (`self` for the root log or a pre-identity broker;
+    /// `logs/<identity>/` for any other, carrying over from a predecessor generation when
+    /// `lineage` links them).
     fn for_log(
         &self,
         log: Option<astream_broker::LogIdentity>,
@@ -608,17 +453,12 @@ impl Store {
             Some(owner) if owner == log => Ok(self.clone()),
             Some(owner) => {
                 let root = self.root.join("logs").join(&name);
-                // A store this log already has — read before, or carried
-                // over by another selector's reader — is its own. Only a log
-                // with none is carried over, and only once.
                 if !root.exists() {
                     if let Some((from, fork)) = self.predecessor(owner, log, lineage)? {
                         self.carry(&from, &root, fork)?;
                     }
                 }
                 std::fs::create_dir_all(root.join("cur"))?;
-                // Housekeeping, never a refusal: a store left behind costs
-                // disk, and a notifier stopped for it pages nobody.
                 if let Err(e) = self.prune_logs(&name) {
                     eprintln!(
                         "aterm-link notify: could not prune the stores of old logs under {}: {e}",
@@ -630,16 +470,8 @@ impl Store {
         }
     }
 
-    /// THE STORE `log` CONTINUES, if any: among the stores this notifier
-    /// holds — the root's (whose log is `owner`) and every `logs/<identity>/`
-    /// — the one of the NEWEST generation of the same log that `log` continues
-    /// by `lineage` ([`astream_broker::LogIdentity::continues`]), with the
-    /// offset below which the two agree. The newest, because its cursors and
-    /// verdicts are the latest this notifier wrote for that log, and its fork
-    /// the highest the chain allows. `None` with no lineage (a broker before
-    /// it, or a log found shorter, re-based or foreign, which astream records
-    /// none for), for another log's `id`, or a generation past the window:
-    /// then the log is read the way a first run reads it, from `--since`.
+    /// Find the newest stored generation of the same log that `log` continues under `lineage`,
+    /// together with the fork offset where they agree.
     fn predecessor(
         &self,
         owner: astream_broker::LogIdentity,
@@ -691,20 +523,9 @@ impl Store {
         }
     }
 
-    /// CARRY `from`'s store over to `to`, a moved generation that agrees with
-    /// `from`'s log below `fork` ([`Store`]'s doc): every `cur/<key>` at the
-    /// lower of itself and `fork`; the journal's verdicts below `fork` only (a
-    /// line whose offset does not parse names nothing, and goes); `standing`
-    /// as it is — a token a human was told of stays told, whatever record
-    /// carried it.
-    ///
-    /// Built whole in a scratch directory beside `to`, each file written
-    /// durably, then RENAMED into place: a crash leaves either no store for the
-    /// new log — the next read carries it over again from the same `from` — or
-    /// all of it, never a store with some cursors missing (a missing cursor
-    /// starts from `--since`, the very skip this exists to prevent). Two
-    /// readers carrying at once both build, and the second rename finds the
-    /// first's store and gives way to it: they carried the same thing.
+    /// Carry `from`'s store into `to` for a generation that agrees below `fork`: clamp each
+    /// `cur/<key>` to `min(cur, fork)`, keep only `journal` verdicts below `fork`, and copy
+    /// `standing` intact. Built in a sibling temp dir and atomically renamed into place.
     fn carry(&self, from: &Store, to: &Path, fork: u64) -> io::Result<()> {
         let logs = to.parent().unwrap_or(&self.root).to_path_buf();
         std::fs::create_dir_all(&logs)?;
@@ -758,8 +579,6 @@ impl Store {
                 built.set_journal(&below)?;
             }
             if let Some(standing) = from.carry_text("standing")? {
-                // Preserve the successful standing contents; Store::write appends its
-                // ordinary final newline, and the reader retains malformed-row leniency.
                 if !standing.is_empty() {
                     built.write("standing", &standing)?;
                 }
@@ -770,32 +589,15 @@ impl Store {
         carried?;
         match std::fs::rename(scratch.path(), to) {
             Ok(()) => {
-                // Publication transferred the directory. Disarm cleanup of its
-                // former name before a later caller can acquire that name.
                 let _ = scratch.keep();
                 crate::state::sync_dir(&logs)
             }
-            // Another reader's carry landed first: retire only our own stage.
             Err(_) if to.join("cur").is_dir() => Ok(()),
             Err(e) => Err(e),
         }
     }
 
-    /// KEEP ONLY THE NEWEST [`LOGS_KEEP`] OTHER LOGS' STORES. A log change
-    /// files a new `logs/<identity>/` (its `cur/`, journal and `standing`),
-    /// and an old one is read again only if exactly that identity comes back —
-    /// the same log after an off/on of its broker, never a moved generation,
-    /// a repaired or recreated one (a moved generation carries its store over
-    /// into a new one instead, [`Store::carry`]). Changes used to be rare;
-    /// under a relaxed broker one follows every reboot it was not cleanly
-    /// stopped before ([`crate::durability`]), and stores nothing reads would
-    /// pile up, one per change, for ever. So `logs/used` lists the identities read, the latest
-    /// last: `name`, read now, moves to its end, and every `logs/<identity>/`
-    /// outside its newest [`LOGS_KEEP`] is removed — those from before the
-    /// list included. A pruned log read again starts the way a first run
-    /// does, from `--since`. Only names that parse as an identity are
-    /// touched, and the root's own store (the log `notify/log` names) is
-    /// never under `logs/`.
+    /// Keep only the newest [`LOGS_KEEP`] stores under `logs/<identity>/` (tracked in `logs/used`).
     fn prune_logs(&self, name: &str) -> io::Result<()> {
         let mut used: Vec<String> = self
             .read("logs/used")
@@ -1057,19 +859,9 @@ impl Notifier {
         Ok(())
     }
 
-    /// THE GRANTS, CHECKED ONCE, BEFORE ANYTHING RUNS. A cap file that cannot
-    /// be read, a ring the broker refuses, or a selector whose filter no
-    /// attached grant covers is a configuration that can never succeed — a
-    /// follow-mode reader would retry it every few seconds for ever and a
-    /// `--once` would stop at it before the selectors after it ran — so it is
-    /// a refusal naming what is missing. Only a PERMANENT answer
-    /// ([`astream_broker::BrokerRefusal::is_permanent`]) refuses: a broker that
-    /// cannot be reached, or one that refuses for now, is left to the readers'
-    /// own back-off, which is how this notifier outlives a broker restart.
-    ///
-    /// # Errors
-    ///
-    /// What is missing, in words.
+    /// Check once before starting that `--cap-file` paths read cleanly and no permanent broker
+    /// refusal rejects the attached capabilities or selector filters. Transient connection or
+    /// broker errors return `Ok(())` so readers can retry under backoff.
     fn preflight(&self) -> Result<(), String> {
         for path in &self.cfg.cap_files {
             crate::bridge::read_cap_file(path).map_err(|e| format!("--cap-file {path}: {e}"))?;
@@ -1438,15 +1230,8 @@ impl Notifier {
         ))
     }
 
-    /// THE EXECUTOR: one notice from a follow-mode reader, in the order its
-    /// reader sent it.
-    ///
-    /// A record read from a broker that serves ordered and not yet durable is
-    /// HELD, with every later record of its selector, until a
-    /// [`Notice::Durable`] covers it (the module doc); its selector's cursor
-    /// stays at the first held record — a page checkpoint past it is kept in
-    /// [`Self::scanned`] and written once the held records are paged. Every
-    /// other record is paged as it is read, and its cursor moves past it.
+    /// Process one [`Notice`] from a follow-mode reader in read order, holding records from an
+    /// `ordered` broker until a [`Notice::Durable`] mark covers them.
     fn take(&mut self, notice: Notice) -> io::Result<()> {
         match notice {
             Notice::Log(idx, log) => {
@@ -1454,10 +1239,8 @@ impl Notifier {
                     return Ok(());
                 };
                 if slot.id != log.id {
-                    // Held from ANOTHER log: offsets that name nothing here. The
-                    // reader re-reads this log from its own cursor, which never
-                    // passed them (a moved generation's carried store clamps it
-                    // at the fork, below which the records are the same).
+                    // Drop records held from another log; the reader re-reads this log from its
+                    // own cursor.
                     let dropped: usize = self.held[idx]
                         .drain(..)
                         .map(|h| h.subject.len() + h.body.len())
@@ -1465,17 +1248,11 @@ impl Notifier {
                     self.held_bytes -= dropped;
                     self.scanned[idx] = None;
                 }
-                // A new connection's own marks say how far it is durable.
                 self.durable[idx] = 0;
                 let ordered = log.ordered;
                 self.reader_log[idx] = log;
-                // THE SAME LOG, NOW SERVED BY A BROKER THAT DOES NOT SERVE
-                // ORDERED (restarted strict or relaxed, or latched): it sends no
-                // durable mark for what is held, and the new connection's
-                // records would page ahead of it. What is held is as durable
-                // as this broker will ever say (its open flushed the log in
-                // full), so it pages now, in read order, before any record of
-                // the new connection.
+                // If the same log is now served non-ordered, release any held records in read
+                // order before processing the new connection's deliveries.
                 if !ordered && !self.held[idx].is_empty() {
                     self.release(idx, u64::MAX)?;
                 }
@@ -1644,19 +1421,8 @@ fn reader(idx: usize, sel: &Sel, cfg: &Config, root: &Path, tx: &mpsc::SyncSende
                 if !closed {
                     match conn.subscribe(from, &filter) {
                         Ok(mut sub) => {
-                            // Following is parking in `recv`: the read bound
-                            // the catch-up ran under comes off here, and comes
-                            // back as a LIVENESS bound on the broker's first
-                            // idle mark — so a link that went silent without a
-                            // FIN ends the subscription and is redialled,
-                            // instead of parking this reader for good. Every
-                            // mark re-arms it: astream's `recv_live` rule,
-                            // read event by event (`recv_live_event`) because
-                            // a mark also carries the durable head — the
-                            // durable mark an ordered broker (or one that
-                            // latched from ordered to strict since) sends when
-                            // a full flush covers what this subscription was
-                            // delivered.
+                            // Clear the catch-up read timeout and bound liveness via idle marks
+                            // (`recv_live_event`), which also carry the broker's durable head.
                             let _ = closer.set_read_timeout(None);
                             loop {
                                 match sub
@@ -1792,36 +1558,29 @@ thread_local! {
 
 // the command line
 
-/// Usage, printed to stderr on a usage error (exit 2, aterm's convention).
+/// Usage, printed to stderr on a usage error (exit 2).
 const USAGE: &str = "\
 aterm-link notify — run a command when the fabric needs a human
 
   aterm-link notify --fleet <F> --broker <socket> --cap-file <path>...
                     --on <attention|ask:<person>|halt>,... --exec <cmd> [options]
 
-  --on <sel>,...         what is worth waking someone for; repeatable.
-                         attention: a presence row raising one (node.cap reads it);
-                         ask:<person>: an ask a session posted to=<person>, read
-                         with that person's cap (`aterm fabric mint-for <person>`);
-                         halt: a fleet halt coming on (node.cap reads it). A
-                         selector no --cap-file grants is refused, exit 2
-  --exec <cmd>           run as `/bin/sh -c <cmd>`; record facts arrive only in
-                         $ATERM_NOTIFY_*, never in <cmd>
-  --rate <n>/<window>    the budget, e.g. 10/1m, 1/30s, 40/1h (default 10/1m)
-  --since head|start|<n> where a selector with no cursor starts (default head)
-  --once                 catch up to the head and exit, rather than following
-  --exec-timeout <ms>    how long the command may run before it is killed (30000)
-  --state <dir>          the state dir; the journal lives in <dir>/notify/
+  --on <sel>,...         selectors to watch (repeatable):
+                         - `attention`: presence row raising `attention=` (`node.cap`)
+                         - `ask:<person>`: ask addressed to `<person>` (`aterm fabric mint-for <person>`)
+                         - `halt`: fleet halt coming on (`node.cap`)
+                         Refuses (exit 2) if no `--cap-file` grants a selector.
+  --exec <cmd>           run `/bin/sh -c <cmd>`; record facts arrive in `$ATERM_NOTIFY_*`
+  --rate <n>/<window>    rate budget, e.g. `10/1m`, `1/30s`, `40/1h` (default `10/1m`)
+  --since head|start|<n> initial scan offset when a selector has no cursor (default `head`)
+  --once                 catch up to the head and exit
+  --exec-timeout <ms>    command timeout before SIGKILL (default `30000`)
+  --state <dir>          state dir (`<dir>/notify/` holds cursors and journal)
 
-The command runs once per matching offset, deduped across restarts, and for
-attention once per escalation: a session's row republished with the attention
-it was told of pages nobody; a clear and a raise pages again. A crash during
-the exec re-fires it with ATERM_NOTIFY_DUP=1: twice, never zero times. On a
-broker that serves ordered a record pages once the broker says it is durable
-(a halt or mail to a person at once; an attention row after its horizon plus
-one batch and one full flush). If the bounded holding buffer fills, the
-notifier warns and pages held records before durability is known; those can
-still be lost in a power loss. --once leaves one not durable yet for the next run.
+Deduplicated across restarts by offset, and for `attention` by standing value per
+subject (clearing and re-raising pages again; crashes during `--exec` re-fire with
+`ATERM_NOTIFY_DUP=1`). On an `ordered` broker, records wait until durable (`--once`
+leaves non-durable records for the next run).
 ";
 
 /// `aterm-link notify`. Every failure is an exit code and a line on stderr.
@@ -2586,8 +2345,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// **A CURSOR BELOW A RETAINING BROKER'S FLOOR READS ON FROM IT** (session
-    /// log Phase 6 step 6E-2). Three escalations at offsets 0, 1 and 2, the log
+    /// **A CURSOR BELOW A RETAINING BROKER'S FLOOR READS ON FROM IT**.
+    /// Three escalations at offsets 0, 1 and 2, the log
     /// then cut below 1; a first run from the start reads from 0, below what the
     /// broker keeps. The two it kept fire and the catch-up ends well, never a
     /// refusal each run repeats for ever. NEGATIVE CONTROL, run: the plain

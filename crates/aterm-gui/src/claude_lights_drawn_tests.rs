@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! THE CHIP AS DRAWN (`docs/DESIGN-harness-autopilot-2026-10-15.md` §12.5.3
-//! and §12.5.6, slice 5b): `chrome`'s `autopilot` line says the chip's face
+//! and §12.5.6): `chrome`'s `autopilot` line says the chip's face
 //! now and its cells only as the last frame drew them — never a stale face
 //! for a pane that frame did not draw, never a chip a later band covers,
 //! never a face for a program with no footer. Driven on the real engine

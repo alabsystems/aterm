@@ -1089,6 +1089,15 @@ pub struct JobsView {
     pub demand: Demand,
     /// Lanes that are off, as `lane_off:<name>` words for `sys jobs --json`.
     pub lanes_off: Vec<&'static str>,
+    /// The tabs PARKED ON THE PERSON'S READ this tick, ascending: each has a
+    /// live job, and every live job of it holds the foreground at the
+    /// person's own terminal read (`tty-raw` or `tty-password` named from a
+    /// mode word stamped after its last terminal output, no key queued,
+    /// whatever its class) and is neither stuck nor capable of suspicion, so
+    /// the tab adds no demand. The host reads it to judge its output edges
+    /// (design §6.1: a parked screen's own redraws start no job). Not on the
+    /// wire.
+    pub parked_tabs: Vec<u64>,
 }
 
 impl JobsView {

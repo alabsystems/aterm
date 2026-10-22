@@ -160,8 +160,8 @@ pub(crate) fn restored_position_on_screen(window: &Window, x: i32, y: i32) -> bo
     restored_origin_visible((f64::from(x), f64::from(y)), &monitors)
 }
 
-/// A restored window's FRAME, as its layout row carried it — an update's (P6
-/// finding 4) or a cold restore's: the grid the window is created at, and the
+/// A restored window's FRAME, as its layout row carried it — an update's
+/// or a cold restore's: the grid the window is created at, and the
 /// raw inner size it had, which its first attach takes when that size holds the
 /// grid ([`App::attach_frame_px`], [`crate::WindowState::take_carried_frame`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

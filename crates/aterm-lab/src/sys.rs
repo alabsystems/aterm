@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Every OS call the lab makes outside `std`, each behind a safe wrapper: the
-//! crate's one `unsafe` module, so an audit reads one file.
+//! Safe wrappers around the OS and Darwin calls `aterm-lab` makes outside `std`.
 
 #![allow(unsafe_code)]
 
@@ -11,18 +10,14 @@ use std::io;
 use std::os::fd::RawFd;
 use std::sync::atomic::{AtomicI32, Ordering};
 
-/// Whether `pid` names a live process this user may signal. Never 0, 1 or a
-/// negative number: `kill(0, 0)` would ask about our own process group.
+/// Whether `pid` (> 1) names a live process this user may signal (`kill(pid, 0)`).
 #[must_use]
 pub fn alive(pid: i32) -> bool {
     // SAFETY: `kill` with signal 0 sends nothing; it only checks the pid.
     pid > 1 && unsafe { libc::kill(pid, 0) } == 0
 }
 
-/// Send `sig` to `pid` (a pid above 1 only: see [`alive`]).
-///
-/// # Errors
-/// The kernel's refusal, or `InvalidInput` for a pid of 1 or less.
+/// Send `sig` to `pid` (> 1; see [`alive`]).
 pub fn kill(pid: i32, sig: i32) -> io::Result<()> {
     if pid <= 1 {
         return Err(io::Error::new(io::ErrorKind::InvalidInput, "pid <= 1"));
@@ -35,11 +30,7 @@ pub fn kill(pid: i32, sig: i32) -> io::Result<()> {
     }
 }
 
-/// Send `sig` to every process in the group `pgid` leads (a `setsid` child's
-/// pid; above 1 only, since `killpg(0, …)` would signal our own group).
-///
-/// # Errors
-/// The kernel's refusal, or `InvalidInput` for a group of 1 or less.
+/// Send `sig` to every process in process group `pgid` (> 1).
 pub fn kill_group(pgid: i32, sig: i32) -> io::Result<()> {
     if pgid <= 1 {
         return Err(io::Error::new(io::ErrorKind::InvalidInput, "pgid <= 1"));
@@ -52,13 +43,9 @@ pub fn kill_group(pgid: i32, sig: i32) -> io::Result<()> {
     }
 }
 
-/// `kill(pid, 0)` as the probe judges it: `Ok` or the errno.
-///
-/// # Errors
-/// The kernel's refusal.
+/// Probe whether `kill(pid, sig)` succeeds.
 pub fn signal_probe(pid: i32, sig: i32) -> io::Result<()> {
-    // SAFETY: as [`kill`]; the probe's pids are its own parent, itself and its
-    // own children, never 0 or 1.
+    // SAFETY: as [`kill`].
     if unsafe { libc::kill(pid, sig) } == 0 {
         Ok(())
     } else {
@@ -66,14 +53,14 @@ pub fn signal_probe(pid: i32, sig: i32) -> io::Result<()> {
     }
 }
 
-/// This process's parent.
+/// Parent PID of this process.
 #[must_use]
 pub fn getppid() -> i32 {
     // SAFETY: no arguments, cannot fail.
     unsafe { libc::getppid() }
 }
 
-/// The kernel session containing a live process, when it can be read.
+/// Kernel session ID (`getsid`) of `pid`, if live and readable.
 #[must_use]
 pub fn session_id(pid: i32) -> Option<i32> {
     if pid <= 1 {
@@ -84,15 +71,14 @@ pub fn session_id(pid: i32) -> Option<i32> {
     (sid >= 0).then_some(sid)
 }
 
-/// This process's user id.
+/// Real user ID of this process.
 #[must_use]
 pub fn getuid() -> u32 {
     // SAFETY: no arguments, cannot fail.
     unsafe { libc::getuid() }
 }
 
-/// This user's login name from the password database (`id -un`), never
-/// from the environment, which `env -i` may have emptied.
+/// Login name of this user from the password database (`getpwuid_r`).
 #[must_use]
 pub fn login_name() -> Option<String> {
     // SAFETY: `passwd` is plain data (pointers and integers); all-zero is a valid value.
@@ -117,8 +103,7 @@ pub fn login_name() -> Option<String> {
     Some(name.to_string_lossy().into_owned()).filter(|n| !n.is_empty())
 }
 
-/// Remove every variable `forget` names from this process's environment.
-/// Called first in `main`, before any thread exists.
+/// Remove every environment variable matched by `forget` before threads spawn.
 pub fn forget_env(forget: fn(&str) -> bool) {
     let keys: Vec<std::ffi::OsString> = std::env::vars_os()
         .map(|(k, _)| k)
@@ -130,17 +115,7 @@ pub fn forget_env(forget: fn(&str) -> bool) {
     }
 }
 
-/// Nothing the lab runs OUTSIDE the jail may be, or be chosen by, something a
-/// jailed process could have written: a bare-name program comes from the
-/// system's own directories only (`PATH=/usr/bin:/bin:/usr/sbin:/sbin`;
-/// SIP: no process of this user writes there, jailed or not), and the xcrun
-/// shims among them (`git`, `cc`, `python3`, …) resolve from the developer
-/// dir, never from the per-user cache any process of the user may write
-/// (`xcrun_nocache=1`, handed to everything the lab starts). The lab then
-/// works from `/`, never from the caller's directory, which may be the lab's
-/// project dir; a relative path the caller gave (`LAB_CLAUDE`, `LAB_CODEX`)
-/// is made absolute against that directory first, once, so a nested call
-/// reads the same file. Called first in `main`, before any thread exists.
+/// Confine `PATH`, `xcrun_nocache`, and working directory to `/` before threads spawn.
 pub fn confine_env() {
     let caller = crate::paths::caller_dir();
     for k in ["LAB_CLAUDE", "LAB_CODEX"] {
@@ -161,7 +136,7 @@ pub fn confine_env() {
     let _ = std::env::set_current_dir("/");
 }
 
-/// Whether `path` may be executed by this process (`access(X_OK)`).
+/// Whether `path` is executable by this process (`access(X_OK)`).
 #[must_use]
 pub fn executable(path: &str) -> bool {
     let Ok(c) = CString::new(path) else {
@@ -176,10 +151,7 @@ unsafe extern "C" {
     fn localtime_r(clock: *const libc::time_t, out: *mut Tm) -> *mut Tm;
 }
 
-/// A new private directory from a `mkdtemp(3)` template (`/tmp/at.XXXX`).
-///
-/// # Errors
-/// The template holds a NUL, or `mkdtemp` failed.
+/// Create a private temporary directory from a `mkdtemp(3)` template.
 pub fn make_temp_dir(template: &str) -> io::Result<String> {
     let c = CString::new(template).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
     let mut buf = c.into_bytes_with_nul();
@@ -192,7 +164,6 @@ pub fn make_temp_dir(template: &str) -> io::Result<String> {
     String::from_utf8(buf).map_err(|_| io::Error::from(io::ErrorKind::InvalidData))
 }
 
-/// `struct tm` as macOS and glibc lay it out.
 #[repr(C)]
 struct Tm {
     tm_sec: libc::c_int,
@@ -208,14 +179,13 @@ struct Tm {
     tm_zone: *const libc::c_char,
 }
 
-/// The machine's zone's offset from UTC at a unix second, in seconds east
-/// (`localtime_r`'s `tm_gmtoff`).
+/// Local UTC offset in seconds east (`tm_gmtoff`) at Unix timestamp `secs`.
 #[must_use]
 pub fn local_offset_s(secs: i64) -> i64 {
     local_tm(secs).tm_gmtoff
 }
 
-/// Local calendar fields of a unix second: (year, month 1-12, day, hour, minute, second).
+/// Local calendar fields `(year, month, day, hour, minute, second)` at `secs`.
 #[must_use]
 pub fn local_time(secs: i64) -> (i32, u32, u32, u32, u32, u32) {
     let tm = local_tm(secs);
@@ -230,7 +200,6 @@ pub fn local_time(secs: i64) -> (i32, u32, u32, u32, u32, u32) {
     )
 }
 
-/// `localtime_r` of a unix second.
 fn local_tm(secs: i64) -> Tm {
     let t: libc::time_t = secs;
     let mut tm = Tm {
@@ -251,24 +220,22 @@ fn local_tm(secs: i64) -> Tm {
     tm
 }
 
-// ------------------------------------------------------------------ processes
-
-/// One process as `ps` reads it: `proc_pidinfo`'s BSD record.
+/// BSD process record from `proc_pidinfo`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProcRow {
     pub pid: i32,
     pub ppid: i32,
     pub pgid: i32,
-    /// The controlling terminal's device (`-1`: none).
+    /// Controlling terminal device (`-1` when none).
     pub tdev: i32,
     pub tpgid: i32,
-    /// The command name (at most 16 bytes).
+    /// Command name (up to 16 bytes).
     pub comm: String,
-    /// When it started, seconds since the epoch.
+    /// Process start time in seconds since the epoch.
     pub start: i64,
 }
 
-/// The BSD record of `pid`, or `None` when it is gone or not ours to read.
+/// Read the [`ProcRow`] of `pid`.
 #[must_use]
 pub fn proc_row(pid: i32) -> Option<ProcRow> {
     // SAFETY: a zeroed `proc_bsdinfo` is a valid buffer for the kernel to fill.
@@ -298,7 +265,7 @@ pub fn proc_row(pid: i32) -> Option<ProcRow> {
     })
 }
 
-/// Every pid on the system.
+/// List all PIDs on the system (`proc_listallpids`).
 #[must_use]
 pub fn all_pids() -> Vec<i32> {
     // SAFETY: a null buffer asks for the count only.
@@ -318,7 +285,7 @@ unsafe extern "C" {
     fn devname(dev: libc::dev_t, kind: libc::mode_t) -> *const libc::c_char;
 }
 
-/// The name of the terminal device `dev` (`ttys003`), `??` for none.
+/// Terminal device name (`devname`) for `dev`, or `??` when none.
 #[must_use]
 pub fn tty_name(dev: i32) -> String {
     if dev == -1 || dev == 0 {
@@ -335,17 +302,13 @@ pub fn tty_name(dev: i32) -> String {
         .into_owned()
 }
 
-// ------------------------------------------------------------------ signals
-
-/// The write end the handler of [`SignalPipe`] writes each signal's number to.
 static SIGNAL_WR: AtomicI32 = AtomicI32::new(-1);
 
 extern "C" fn on_signal(sig: libc::c_int) {
     let fd = SIGNAL_WR.load(Ordering::Relaxed);
     if fd >= 0 {
         let b = u8::try_from(sig).unwrap_or(0);
-        // SAFETY: `write(2)` is async-signal-safe; errno is saved and restored
-        // around it so the interrupted code never sees it change.
+        // SAFETY: `write(2)` is async-signal-safe.
         unsafe {
             let saved = *libc::__error();
             let _ = libc::write(fd, (&raw const b).cast(), 1);
@@ -354,13 +317,9 @@ extern "C" fn on_signal(sig: libc::c_int) {
     }
 }
 
-/// `sig`'s disposition now: `SIG_DFL`, `SIG_IGN` or a handler's address.
-///
-/// # Errors
-/// `sigaction` refused `sig`.
+/// Current signal disposition (`SIG_DFL`, `SIG_IGN`, or handler address) for `sig`.
 pub fn disposition(sig: libc::c_int) -> io::Result<libc::sighandler_t> {
-    // SAFETY: a null new action only reads the current one into `old`, a zeroed
-    // `sigaction` (a valid value) that outlives the call.
+    // SAFETY: a null new action only reads the current one into `old`, a zeroed `sigaction` (a valid value) that outlives the call.
     unsafe {
         let mut old: libc::sigaction = std::mem::zeroed();
         if libc::sigaction(sig, std::ptr::null(), &raw mut old) != 0 {
@@ -370,8 +329,7 @@ pub fn disposition(sig: libc::c_int) -> io::Result<libc::sighandler_t> {
     }
 }
 
-/// Set `sig` ignored (`ignore`) or at its default, as `nohup` (or its absence)
-/// starts a process: a test's probe of [`SignalPipe::install`].
+/// Set `sig` to `SIG_IGN` (`ignore`) or `SIG_DFL` for testing [`SignalPipe::install`].
 #[cfg(test)]
 pub fn start_signal(sig: libc::c_int, ignore: bool) {
     let h = if ignore { libc::SIG_IGN } else { libc::SIG_DFL };
@@ -381,23 +339,14 @@ pub fn start_signal(sig: libc::c_int, ignore: bool) {
     }
 }
 
-/// Signals delivered as bytes on a pipe: the handler writes the signal's
-/// number, and the reader takes it in ordinary code (a thread, a `poll`).
-/// One per process.
+/// Self-pipe delivering caught signal numbers as bytes on [`Self::read_fd`].
 pub struct SignalPipe {
-    /// The read end; one byte per signal.
+    /// Read end of the signal pipe (one byte per signal).
     pub read_fd: RawFd,
 }
 
 impl SignalPipe {
-    /// Install the handler for `signals` (`SA_RESTART`, an empty mask), except a
-    /// signal this process was started ignoring, which stays ignored: under
-    /// `nohup` a hang-up never reaches a lab that a closed terminal started, as
-    /// every program that respects `SIG_IGN` does (`if (signal(sig, SIG_IGN) !=
-    /// SIG_IGN) signal(sig, handler)`; `aterm-release`'s `interrupt::install`).
-    ///
-    /// # Errors
-    /// `pipe` or `sigaction` failed.
+    /// Install the self-pipe handler for `signals`, leaving `SIG_IGN` signals ignored.
     pub fn install(signals: &[libc::c_int]) -> io::Result<Self> {
         let mut fds = [0 as libc::c_int; 2];
         // SAFETY: `fds` is a two-int array, as `pipe(2)` requires.
@@ -416,8 +365,7 @@ impl SignalPipe {
             if disposition(sig)? == libc::SIG_IGN {
                 continue;
             }
-            // SAFETY: a zeroed `sigaction` is a valid starting value; the handler
-            // is an `extern "C" fn(c_int)` that only calls async-signal-safe code.
+            // SAFETY: a zeroed `sigaction` is a valid starting value.
             unsafe {
                 let mut sa: libc::sigaction = std::mem::zeroed();
                 sa.sa_sigaction = on_signal as extern "C" fn(libc::c_int) as libc::sighandler_t;
@@ -431,7 +379,7 @@ impl SignalPipe {
         Ok(Self { read_fd: fds[0] })
     }
 
-    /// The signals delivered since the last call (none when the pipe is empty).
+    /// Drain all signals delivered since the last read.
     #[must_use]
     pub fn drain(&self) -> Vec<i32> {
         let mut buf = [0u8; 64];
@@ -444,8 +392,7 @@ impl SignalPipe {
         }
     }
 
-    /// Block until a signal arrives; every signal delivered by then, in order
-    /// (never empty: two that land together are both reported).
+    /// Block until at least one signal arrives and drain all pending signals.
     #[must_use]
     pub fn wait(&self) -> Vec<i32> {
         loop {
@@ -459,9 +406,7 @@ impl SignalPipe {
     }
 }
 
-// ------------------------------------------------------------------ descriptors
-
-/// A `pollfd` asking for input on `fd`.
+/// Build a `pollfd` polling `POLLIN` on `fd`.
 #[must_use]
 pub fn pollfd(fd: RawFd) -> libc::pollfd {
     libc::pollfd {
@@ -471,10 +416,7 @@ pub fn pollfd(fd: RawFd) -> libc::pollfd {
     }
 }
 
-/// `poll(2)`, retried on `EINTR`; the number of ready descriptors.
-///
-/// # Errors
-/// Any other `poll` failure.
+/// Poll `fds` with `timeout_ms`, retrying on `EINTR`.
 pub fn poll(fds: &mut [libc::pollfd], timeout_ms: i32) -> io::Result<usize> {
     loop {
         let n = libc::nfds_t::try_from(fds.len()).unwrap_or(0);
@@ -490,20 +432,14 @@ pub fn poll(fds: &mut [libc::pollfd], timeout_ms: i32) -> io::Result<usize> {
     }
 }
 
-/// One `read(2)`: the bytes read (0 at end of file).
-///
-/// # Errors
-/// The read failed (`EINTR` and `EAGAIN` included: the caller decides).
+/// Perform a single `read(2)` on `fd`.
 pub fn read(fd: RawFd, buf: &mut [u8]) -> io::Result<usize> {
     // SAFETY: `buf` is valid for `buf.len()` bytes of writes.
     let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) };
     usize::try_from(n).map_err(|_| io::Error::last_os_error())
 }
 
-/// Write all of `buf` to `fd`, waiting (`poll`) when it would block.
-///
-/// # Errors
-/// The write failed for another reason than `EINTR`/`EAGAIN`.
+/// Write all of `buf` to `fd`, polling on `EAGAIN` and retrying on `EINTR`.
 pub fn write_all(fd: RawFd, mut buf: &[u8]) -> io::Result<()> {
     while !buf.is_empty() {
         // SAFETY: `buf` is valid for `buf.len()` bytes of reads.
@@ -529,8 +465,7 @@ pub fn write_all(fd: RawFd, mut buf: &[u8]) -> io::Result<()> {
     Ok(())
 }
 
-/// Take ownership of a descriptor this process was just handed and owns alone
-/// (a PTY end `open_pty_pair` returned).
+/// Wrap a newly created raw descriptor `fd` in an [`std::os::fd::OwnedFd`].
 #[must_use]
 pub fn own_fd(fd: RawFd) -> std::os::fd::OwnedFd {
     use std::os::fd::FromRawFd as _;
@@ -538,14 +473,10 @@ pub fn own_fd(fd: RawFd) -> std::os::fd::OwnedFd {
     unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) }
 }
 
-/// Start `cmd`'s child in a session of its own (`setsid` between its fork and
-/// its exec), so it has no controlling terminal: the std-`Command` spelling of
-/// the spawn seam's `setsid(true)`.
+/// Configure `cmd` to call `setsid` in the child before `exec`.
 pub fn in_own_session(cmd: &mut aterm_uds::spawnfd::StdCommand) {
     use std::os::unix::process::CommandExt as _;
-    // SAFETY: the hook runs in the forked child before its exec and makes one
-    // async-signal-safe call; `last_os_error` reads `errno` and allocates
-    // nothing.
+    // SAFETY: the hook runs in the forked child before its exec and makes one async-signal-safe call.
     unsafe {
         cmd.pre_exec(|| {
             if libc::setsid() < 0 {
@@ -556,10 +487,7 @@ pub fn in_own_session(cmd: &mut aterm_uds::spawnfd::StdCommand) {
     }
 }
 
-/// The monotonic clock (`CLOCK_MONOTONIC`) in nanoseconds: a recorder's
-/// stamps. Darwin counts it in microseconds; a take's reader works in
-/// milliseconds from its first line, so neither the resolution nor the origin
-/// is read.
+/// Current `CLOCK_MONOTONIC` timestamp in nanoseconds.
 #[must_use]
 pub fn monotonic_ns() -> u64 {
     let mut ts = libc::timespec {
@@ -574,18 +502,16 @@ pub fn monotonic_ns() -> u64 {
         .saturating_add(u64::try_from(ts.tv_nsec).unwrap_or(0))
 }
 
-/// Close a descriptor this process owns.
+/// Close an owned file descriptor `fd`.
 pub fn close(fd: RawFd) {
     // SAFETY: the caller owns `fd` and does not use it again.
     unsafe { libc::close(fd) };
 }
 
-// ------------------------------------------------------------------ terminals
-
-/// A terminal's size, every field (rows, columns and both pixel counts).
+/// Terminal window size (`struct winsize`).
 pub type WinSize = libc::winsize;
 
-/// The size of the terminal on `fd`, or `None` when it is no terminal.
+/// Read the [`WinSize`] of `fd` via `TIOCGWINSZ`.
 #[must_use]
 pub fn winsize(fd: RawFd) -> Option<WinSize> {
     let mut ws = WinSize {
@@ -598,20 +524,20 @@ pub fn winsize(fd: RawFd) -> Option<WinSize> {
     (unsafe { libc::ioctl(fd, libc::TIOCGWINSZ, &raw mut ws) } == 0).then_some(ws)
 }
 
-/// Set the size of the terminal on `fd` (the kernel signals its foreground group).
+/// Set the [`WinSize`] of `fd` via `TIOCSWINSZ`.
 pub fn set_winsize(fd: RawFd, ws: &WinSize) {
     // SAFETY: `TIOCSWINSZ` reads one `winsize` from the pointer given.
     unsafe { libc::ioctl(fd, libc::TIOCSWINSZ, std::ptr::from_ref(ws)) };
 }
 
-/// Raw mode on a terminal, put back as it was when dropped.
+/// RAII guard restoring terminal attributes on drop.
 pub struct RawMode {
     fd: RawFd,
     saved: libc::termios,
 }
 
 impl RawMode {
-    /// `cfmakeraw` on `fd`; `None` when `fd` is no terminal.
+    /// Put `fd` into raw mode (`cfmakeraw`), returning `None` if not a tty.
     #[must_use]
     pub fn enter(fd: RawFd) -> Option<Self> {
         // SAFETY: a zeroed `termios` is a valid buffer for `tcgetattr` to fill.
@@ -637,10 +563,7 @@ impl Drop for RawMode {
     }
 }
 
-/// Make the terminal on `fd` this session leader's controlling terminal.
-///
-/// # Errors
-/// The `TIOCSCTTY` refusal.
+/// Make `fd` the controlling terminal (`TIOCSCTTY`) of this session leader.
 pub fn take_controlling_tty(fd: RawFd) -> io::Result<()> {
     // SAFETY: `TIOCSCTTY` takes an int argument and touches no memory.
     if unsafe { libc::ioctl(fd, libc::TIOCSCTTY as _, 0) } == 0 {
@@ -650,13 +573,9 @@ pub fn take_controlling_tty(fd: RawFd) -> io::Result<()> {
     }
 }
 
-/// `TIOCSTI`: put `byte` into the input queue of the terminal on `fd` as if typed.
 const TIOCSTI: libc::c_ulong = 0x8001_7472;
 
-/// Try `TIOCSTI` on `fd` (the isolation probe: the jail must refuse it).
-///
-/// # Errors
-/// The kernel's (or the sandbox's) refusal.
+/// Attempt `TIOCSTI` on `fd` for the sandbox isolation probe.
 pub fn tiocsti(fd: RawFd, byte: u8) -> io::Result<()> {
     // SAFETY: `TIOCSTI` reads one byte from the pointer given.
     if unsafe { libc::ioctl(fd, TIOCSTI, &raw const byte) } == 0 {
@@ -666,13 +585,7 @@ pub fn tiocsti(fd: RawFd, byte: u8) -> io::Result<()> {
     }
 }
 
-// ------------------------------------------------------------------ the probe's network and Mach calls
-
-/// A UDP `connect()` to an IPv4 address (sends no packet; the sandbox judges
-/// it as an outbound connection).
-///
-/// # Errors
-/// The `socket` or `connect` refusal.
+/// Attempt an outbound IPv4 UDP `connect()` to `(ip, port)`.
 pub fn udp_connect(ip: [u8; 4], port: u16) -> io::Result<()> {
     // SAFETY: a plain datagram socket; closed below on every path.
     let s = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0) };
@@ -707,21 +620,18 @@ unsafe extern "C" {
     ) -> libc::c_int;
 }
 
-/// `bootstrap_look_up` of a Mach service: the kernel return (0 found, 1100
-/// not privileged, 1102 unknown service).
+/// Query `bootstrap_look_up` for Mach service `name`.
 #[must_use]
 pub fn mach_look_up(name: &str) -> i32 {
     let Ok(c) = CString::new(name) else { return -1 };
     let mut port: libc::c_uint = 0;
-    // SAFETY: `bootstrap_port` is the task's bootstrap port, set by the runtime
-    // before `main`; `c` is a valid C string and `port` a valid out-pointer.
+    // SAFETY: `bootstrap_port` is the task's bootstrap port, set by the runtime before `main`.
     unsafe { bootstrap_look_up(bootstrap_port, c.as_ptr(), &raw mut port) }
 }
 
-/// The symbolic name of an errno (`EPERM`), as the probe reports outcomes.
+/// Symbolic errno name (e.g. `EPERM`) or decimal fallback for `code`.
 #[must_use]
 pub fn errname(code: i32) -> String {
-    // The outcomes the probe meets; anything else is printed by number.
     let name = match code {
         libc::EPERM => "EPERM",
         libc::ENOENT => "ENOENT",
@@ -754,7 +664,7 @@ pub fn errname(code: i32) -> String {
     name.to_string()
 }
 
-/// The errno name of an I/O error, or its kind when it carries no errno.
+/// Symbolic errno name or `ErrorKind` string for `e`.
 #[must_use]
 pub fn io_errname(e: &io::Error) -> String {
     match e.raw_os_error() {
@@ -763,15 +673,9 @@ pub fn io_errname(e: &io::Error) -> String {
     }
 }
 
-// ------------------------------------------------------------------ the scheduling band (`crate::band`)
-
-/// `PRIO_DARWIN_ROLE` (`<sys/resource.h>`, private): `getpriority`'s darwin-role
-/// selector. Not in `libc` (aterm-pty names it the same way).
 #[cfg(target_os = "macos")]
 const PRIO_DARWIN_ROLE: libc::c_int = 6;
 
-/// A `posix_spawnattr_t` (an opaque pointer on Darwin; the workspace's libc
-/// has no spawn API, as aterm-uds's `pspawn` declares its own).
 #[cfg(target_os = "macos")]
 type SpawnAttr = *mut libc::c_void;
 
@@ -780,7 +684,6 @@ unsafe extern "C" {
     fn posix_spawnattr_init(attr: *mut SpawnAttr) -> libc::c_int;
     fn posix_spawnattr_destroy(attr: *mut SpawnAttr) -> libc::c_int;
     fn posix_spawnattr_setflags(attr: *mut SpawnAttr, flags: libc::c_short) -> libc::c_int;
-    // <spawn_private.h>: what launchd and RunningBoard spawn an app with.
     fn posix_spawnattr_setprocesstype_np(attr: *mut SpawnAttr, kind: libc::c_int) -> libc::c_int;
     fn posix_spawnattr_set_darwin_role_np(attr: *mut SpawnAttr, role: u64) -> libc::c_int;
     fn posix_spawn(
@@ -793,21 +696,12 @@ unsafe extern "C" {
     ) -> libc::c_int;
 }
 
-/// `POSIX_SPAWN_SETEXEC` and `POSIX_SPAWN_PROC_TYPE_APP_DEFAULT`
-/// (`<spawn.h>`, `<spawn_private.h>`): an exec in place, as an app's task type.
 #[cfg(target_os = "macos")]
 const SPAWN_SETEXEC: libc::c_short = 0x40;
 #[cfg(target_os = "macos")]
 const PROC_TYPE_APP_DEFAULT: libc::c_int = 0x100;
 
-/// Become `program` (`argv`, its first word included; exactly `env`) as an
-/// APP-type task at darwin role `role`, through `posix_spawn` with
-/// `POSIX_SPAWN_SETEXEC` (this pid, these descriptors 0-2). A launchd job is
-/// a DAEMON-type task, in which `setpriority(PRIO_DARWIN_ROLE)` fails with
-/// `ENOTSUP`: so neither a role set before an exec nor aterm-pty's UI role for
-/// each shell would take (read on macOS 27, 2026-10-20). An aterm.app is
-/// APP-type, and its shells inherit that. Not `spawnfd`: it sets neither
-/// attribute. Returns only on failure.
+/// Replace this process in place (`POSIX_SPAWN_SETEXEC`) with `program` as an app-type task at Darwin `role`.
 #[cfg(target_os = "macos")]
 pub fn exec_as_app(
     program: &str,
@@ -836,9 +730,7 @@ pub fn exec_as_app(
     };
     let (argp, envp) = (ptrs(&args), ptrs(&vars));
     let mut attr: SpawnAttr = std::ptr::null_mut();
-    // SAFETY: `attr` is initialized before use and destroyed after; every
-    // pointer passed (path, argv, envp: NULL-terminated arrays of C strings
-    // that outlive the call) is valid; on success the call does not return.
+    // SAFETY: `attr` is initialized before use and destroyed after.
     unsafe {
         let rc = posix_spawnattr_init(&raw mut attr);
         if rc != 0 {
@@ -866,10 +758,7 @@ pub fn exec_as_app(
     }
 }
 
-/// `dup2(fd, target)`: put `fd` at `target` (0-2, before an exec).
-///
-/// # Errors
-/// The kernel's refusal.
+/// Duplicate `fd` onto `target` (`dup2`).
 pub fn dup_onto(fd: RawFd, target: RawFd) -> io::Result<()> {
     // SAFETY: `dup2` on descriptors the caller owns; takes no pointers.
     if unsafe { libc::dup2(fd, target) } < 0 {
@@ -879,16 +768,12 @@ pub fn dup_onto(fd: RawFd, target: RawFd) -> io::Result<()> {
     }
 }
 
-/// The darwin role of `pid` (`getpriority(PRIO_DARWIN_ROLE, pid)`).
-///
-/// # Errors
-/// The kernel's refusal (no such process, another user's).
+/// Read the Darwin role of `pid` (`getpriority(PRIO_DARWIN_ROLE, pid)`).
 #[cfg(target_os = "macos")]
 pub fn darwin_role(pid: i32) -> io::Result<i32> {
     let who =
         libc::id_t::try_from(pid).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
-    // SAFETY: `errno` is this thread's; `getpriority` takes no pointers. Its
-    // answer can be -1 legitimately, so errno (cleared first) tells a failure.
+    // SAFETY: `errno` is this thread's.
     unsafe {
         *libc::__error() = 0;
         let role = libc::getpriority(PRIO_DARWIN_ROLE, who);
@@ -899,11 +784,7 @@ pub fn darwin_role(pid: i32) -> io::Result<i32> {
     }
 }
 
-/// Set the darwin role of `pid` (`setpriority(PRIO_DARWIN_ROLE, pid, role)`).
-///
-/// # Errors
-/// The kernel's refusal: `ENOTSUP` in a DAEMON-type task (a submitted launchd
-/// job that did not exec as an app), `EPERM` for another user's process.
+/// Set the Darwin role of `pid` (`setpriority(PRIO_DARWIN_ROLE, pid, role)`).
 #[cfg(target_os = "macos")]
 pub fn set_darwin_role(pid: i32, role: i32) -> io::Result<()> {
     let who =
@@ -916,9 +797,7 @@ pub fn set_darwin_role(pid: i32, role: i32) -> io::Result<()> {
     }
 }
 
-/// `pid`'s resource and jetsam coalition ids (`proc_pidinfo` flavour
-/// `PROC_PIDCOALITIONINFO`, 20: XNU-private, two `u64` ids then three
-/// reserved), or `None` when the kernel will not say.
+/// Resource and jetsam coalition IDs of `pid` (`PROC_PIDCOALITIONINFO`).
 #[cfg(target_os = "macos")]
 #[must_use]
 pub fn coalition_ids(pid: i32) -> Option<[u64; 2]> {
@@ -929,8 +808,6 @@ pub fn coalition_ids(pid: i32) -> Option<[u64; 2]> {
     (got == size).then_some([buf[0], buf[1]])
 }
 
-/// `proc_pidinfo` flavours (`<sys/proc_info.h>`) not in the workspace's libc:
-/// a process's thread ids, and one thread's info by its id.
 #[cfg(target_os = "macos")]
 const PROC_PIDLISTTHREADIDS: libc::c_int = 28;
 #[cfg(target_os = "macos")]
@@ -941,7 +818,6 @@ unsafe extern "C" {
     fn pthread_threadid_np(thread: libc::pthread_t, id: *mut u64) -> libc::c_int;
 }
 
-/// The base priority of `pid`'s thread `tid` (`PROC_PIDTHREADID64INFO`).
 #[cfg(target_os = "macos")]
 fn thread_priority(pid: i32, tid: u64) -> Option<i32> {
     // SAFETY: an all-zero `proc_threadinfo` is valid (integers and a byte array).
@@ -960,9 +836,7 @@ fn thread_priority(pid: i32, tid: u64) -> Option<i32> {
     (got == size).then_some(info.pth_priority)
 }
 
-/// The base priority of `pid`'s main thread (its lowest thread id): 46-47 in
-/// aterm.app's band, 20 under launchd's utility clamp, 31 for an app without
-/// a role.
+/// Base priority of `pid`'s main thread (`PROC_PIDTHREADID64INFO`).
 #[cfg(target_os = "macos")]
 #[must_use]
 pub fn main_thread_priority(pid: i32) -> Option<i32> {
@@ -975,12 +849,7 @@ pub fn main_thread_priority(pid: i32) -> Option<i32> {
     thread_priority(pid, *ids.get(..n)?.iter().min()?)
 }
 
-/// Ask for `QOS_CLASS_USER_INTERACTIVE` on the calling thread and return the
-/// base priority the kernel then gives it: 46-47 in an app's band, 20 in a
-/// task launchd clamped to utility (a `ProcessType` `Standard` job).
-///
-/// # Errors
-/// The request or the read-back was refused.
+/// Request `QOS_CLASS_USER_INTERACTIVE` on the calling thread and return its resulting base priority.
 #[cfg(target_os = "macos")]
 pub fn ui_request_lands() -> io::Result<i32> {
     // SAFETY: sets this thread's own QoS class; takes no pointers.
@@ -1001,10 +870,7 @@ pub fn ui_request_lands() -> io::Result<i32> {
     thread_priority(pid, tid).ok_or_else(io::Error::last_os_error)
 }
 
-/// `mkfifo(3)` at `path`, mode 0600.
-///
-/// # Errors
-/// The path holds a NUL, or `mkfifo` failed.
+/// Create a mode-0600 FIFO at `path` (`mkfifo`).
 pub fn make_fifo(path: &std::path::Path) -> io::Result<()> {
     use std::os::unix::ffi::OsStrExt as _;
     let c = CString::new(path.as_os_str().as_bytes())
@@ -1017,19 +883,12 @@ pub fn make_fifo(path: &std::path::Path) -> io::Result<()> {
     }
 }
 
-/// Clear `O_NONBLOCK` on `fd` (a FIFO end opened non-blocking so the open
-/// could not wait for a writer).
-///
-/// # Errors
-/// The kernel's refusal.
+/// Clear `O_NONBLOCK` on `fd`.
 pub fn set_blocking(fd: RawFd) -> io::Result<()> {
     set_nonblocking_mode(fd, false)
 }
 
-/// Set `O_NONBLOCK` on an owned descriptor, retaining its other flags.
-///
-/// # Errors
-/// The kernel's refusal.
+/// Set `O_NONBLOCK` on `fd`.
 pub fn set_nonblocking(fd: RawFd) -> io::Result<()> {
     set_nonblocking_mode(fd, true)
 }
@@ -1052,9 +911,7 @@ fn set_nonblocking_mode(fd: RawFd, on: bool) -> io::Result<()> {
     Ok(())
 }
 
-// ------------------------------------------------------------------ the scratch's files, through no link
-
-/// `O_NOFOLLOW_ANY` (macOS): the open fails on a link ANYWHERE on the path, not only its last part.
+/// Darwin `open(2)` flag rejecting symlinks anywhere along the path.
 pub const O_NOFOLLOW_ANY: libc::c_int = 0x2000_0000;
 
 unsafe extern "C" {
@@ -1090,7 +947,6 @@ fn cname(n: &std::ffi::OsStr) -> io::Result<CString> {
     CString::new(n.as_bytes()).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))
 }
 
-/// `fstat(2)` of a descriptor: (file type bits, owner, link count).
 fn fstat_of(fd: RawFd) -> io::Result<(libc::mode_t, u32, u64)> {
     // SAFETY: `stat` is plain data; all-zero is a valid value for `fstat` to fill.
     let mut st: libc::stat = unsafe { std::mem::zeroed() };
@@ -1101,14 +957,7 @@ fn fstat_of(fd: RawFd) -> io::Result<(libc::mode_t, u32, u64)> {
     Ok((st.st_mode & libc::S_IFMT, st.st_uid, u64::from(st.st_nlink)))
 }
 
-/// The regular file at `path`, read through no link on its whole path
-/// (`O_NOFOLLOW_ANY`: the lab's state dir is a physical path, so a link there
-/// is one a jailed process planted), and only a file of this user with one
-/// name (a hard link is a second name for a file that lives elsewhere): the
-/// one reader of what jailed code may write. `Ok(None)` when nothing is there.
-///
-/// # Errors
-/// A link on the path, or something that is not this user's regular file with one name.
+/// Open this user's single-link regular file at `path` with `O_NOFOLLOW_ANY`.
 pub fn scratch_file(path: &std::path::Path) -> io::Result<Option<std::fs::File>> {
     let c = cpath(path)?;
     // SAFETY: `c` is a valid NUL-terminated path; the descriptor is owned below.
@@ -1140,24 +989,16 @@ pub fn scratch_file(path: &std::path::Path) -> io::Result<Option<std::fs::File>>
     Ok(Some(std::fs::File::from(owned)))
 }
 
-/// What a directory entry of [`scratch_dir`] is: a subdirectory or a regular
-/// file (links and every other kind are never listed).
+/// Directory entry kind returned by [`scratch_dir`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EntryKind {
-    /// A directory.
+    /// Subdirectory.
     Dir,
-    /// A regular file.
+    /// Regular file.
     File,
 }
 
-/// The entries of the directory at `path`, opened through no link on its
-/// whole path (`O_NOFOLLOW_ANY`) and only when it is this user's directory:
-/// its subdirectories and regular files by name, never a link (the
-/// directory-listing twin of [`scratch_file`], for trees jailed code writes).
-/// `Ok(None)` when nothing is there.
-///
-/// # Errors
-/// A link on the path, or something that is not this user's directory.
+/// List subdirectories and regular files in this user's directory at `path` with `O_NOFOLLOW_ANY`.
 pub fn scratch_dir(
     path: &std::path::Path,
 ) -> io::Result<Option<Vec<(std::ffi::OsString, EntryKind)>>> {
@@ -1232,10 +1073,7 @@ pub fn scratch_dir(
     Ok(Some(out))
 }
 
-/// The contents of [`scratch_file`], through the same checked descriptor.
-///
-/// # Errors
-/// The file was refused, or its read failed.
+/// Read the contents of [`scratch_file`] at `path`.
 pub fn scratch_read(path: &std::path::Path) -> io::Result<Option<Vec<u8>>> {
     let Some(mut f) = scratch_file(path)? else {
         return Ok(None);
@@ -1245,15 +1083,14 @@ pub fn scratch_read(path: &std::path::Path) -> io::Result<Option<Vec<u8>>> {
     Ok(Some(buf))
 }
 
-/// What [`put`] writes.
+/// Source payload written by [`put`].
 pub enum PutSrc<'a> {
-    /// These bytes.
+    /// In-memory byte slice.
     Bytes(&'a [u8]),
-    /// A clone (APFS copy-on-write, else a copy) of this regular file, read through no link.
+    /// Regular file cloned (`fclonefileat`) or copied without following links.
     File(&'a std::path::Path),
 }
 
-/// A directory opened from `d` by one name, through no link; made (0755) when missing.
 fn open_dir_at(d: RawFd, name: &CString) -> io::Result<RawFd> {
     let flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
     // SAFETY: `d` is an open directory, `name` a valid C string.
@@ -1280,13 +1117,7 @@ fn open_dir_at(d: RawFd, name: &CString) -> io::Result<RawFd> {
     Ok(fd)
 }
 
-/// Write `src` into the absolute `path` by a rename, with `mode`: each
-/// directory on the way is opened from `/` through no link (made when
-/// missing), and a link standing at `path` is replaced, never followed. A link
-/// planted in either path (`src`'s included) is refused.
-///
-/// # Errors
-/// A relative path, a link on the way, or the write or rename failing.
+/// Atomically stage and rename `src` to absolute `path` with `mode` without following symlinks.
 pub fn put(path: &std::path::Path, mode: u32, src: &PutSrc<'_>) -> io::Result<()> {
     put_with_nonce(path, mode, src, || {
         let mut r = [0u8; 4];
@@ -1295,8 +1126,6 @@ pub fn put(path: &std::path::Path, mode: u32, src: &PutSrc<'_>) -> io::Result<()
     })
 }
 
-/// [`put`] with its stage-name nonce supplied at the same point: deterministic
-/// private filesystem controls never depend on a random collision.
 fn put_with_nonce(
     path: &std::path::Path,
     mode: u32,
@@ -1350,9 +1179,6 @@ fn put_with_nonce(
         std::process::id(),
         nonce()
     )))?;
-    // Only a successfully created stage can arm cleanup. Keep its descriptor
-    // even if writing fails, so its inode cannot be reused before the check
-    // through this same pinned parent before an unlink.
     let mut owned_stage = None;
     let create = |d: RawFd,
                   owned: &mut Option<std::os::fd::OwnedFd>|
@@ -1423,8 +1249,6 @@ fn put_with_nonce(
                         path.display()
                     )));
                 }
-                // A clone that cannot be reopened/retained is left in place:
-                // cleanup must not guess which entry now stands there.
                 owned_stage = Some(fd.try_clone()?);
                 return Ok(fd);
             }
@@ -1441,8 +1265,7 @@ fn put_with_nonce(
                 .ok()
                 .is_some_and(|inode| put_inode_at(d, &tmp) == Some(inode))
         }) {
-            // SAFETY: `d` is the pinned parent; `tmp` is one name, inspected
-            // without following links. It names the retained stage at the check.
+            // SAFETY: `d` is the pinned parent.
             unsafe { libc::unlinkat(d, tmp.as_ptr(), 0) };
         }
     };
@@ -1472,8 +1295,6 @@ fn put_with_nonce(
     Ok(())
 }
 
-/// The identity of a retained stage descriptor. A failed identity read
-/// preserves the entry rather than removing an uncertain name.
 fn put_inode(fd: RawFd) -> io::Result<(libc::dev_t, libc::ino_t)> {
     // SAFETY: `stat` is plain data; `fstat` fills this live value.
     let mut st: libc::stat = unsafe { std::mem::zeroed() };
@@ -1484,25 +1305,15 @@ fn put_inode(fd: RawFd) -> io::Result<(libc::dev_t, libc::ino_t)> {
     Ok((st.st_dev, st.st_ino))
 }
 
-/// The stage name still stands for its captured inode, through no final
-/// link. This refuses an observed replacement; it is not an atomic
-/// check-and-unlink against a concurrent writer of this same directory.
 fn put_inode_at(dir: RawFd, name: &CString) -> Option<(libc::dev_t, libc::ino_t)> {
     // SAFETY: `stat` is plain data; `fstatat` fills this live value.
     let mut st: libc::stat = unsafe { std::mem::zeroed() };
-    // SAFETY: the pinned directory and one NUL-terminated name are live;
-    // AT_SYMLINK_NOFOLLOW inspects an entry rather than its target.
+    // SAFETY: the pinned directory and one NUL-terminated name are live.
     (unsafe { libc::fstatat(dir, name.as_ptr(), &raw mut st, libc::AT_SYMLINK_NOFOLLOW) } == 0)
         .then_some((st.st_dev, st.st_ino))
 }
 
-/// Remove the entry at the absolute `path` from the scratch: its directory
-/// is opened through no link on its whole path (`O_NOFOLLOW_ANY`, as
-/// [`scratch_file`] reads), and the entry is unlinked by name, so a link
-/// standing there is removed, never followed. `Ok(())` when nothing is there.
-///
-/// # Errors
-/// A link on the directory's path, or the unlink failing.
+/// Unlink the entry at absolute `path` without following symlinks.
 pub fn scratch_remove(path: &std::path::Path) -> io::Result<()> {
     let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
         return Err(io::Error::from(io::ErrorKind::InvalidInput));
@@ -1538,24 +1349,21 @@ pub fn scratch_remove(path: &std::path::Path) -> io::Result<()> {
     Ok(())
 }
 
-/// What [`entry_stat`] read of an entry.
+/// Metadata returned by [`entry_stat`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct EntryStat {
-    /// Its device.
+    /// Device ID.
     pub dev: u64,
-    /// Its inode.
+    /// Inode number.
     pub ino: u64,
-    /// Its file type bits (`S_IFREG`, `S_IFSOCK`, `S_IFDIR`, `S_IFLNK`, …).
+    /// File type mode bits (`S_IFMT`).
     pub kind: libc::mode_t,
-    /// Its owner.
+    /// Owner UID.
     pub uid: u32,
-    /// Its birth time, in seconds since the epoch.
+    /// Birth time in seconds since the epoch.
     pub born: i64,
 }
 
-/// The directory of the absolute `path`, opened through no link on its whole
-/// path (`O_NOFOLLOW_ANY`), and the entry's name: `Ok(None)` when the
-/// directory is not there.
 fn open_parent(path: &std::path::Path) -> io::Result<Option<(std::os::fd::OwnedFd, CString)>> {
     let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
         return Err(io::Error::from(io::ErrorKind::InvalidInput));
@@ -1579,12 +1387,10 @@ fn open_parent(path: &std::path::Path) -> io::Result<Option<(std::os::fd::OwnedF
     Ok(Some((own_fd(fd), cname(name)?)))
 }
 
-/// `fstatat` of the entry `name` in the open directory `dir`, never following it.
 fn stat_at(dir: RawFd, name: &CString) -> io::Result<Option<EntryStat>> {
     // SAFETY: `stat` is plain data; all-zero is a valid value for `fstatat` to fill.
     let mut st: libc::stat = unsafe { std::mem::zeroed() };
-    // SAFETY: `dir` is an open directory, `name` a valid C string, `st` a live `stat`;
-    // AT_SYMLINK_NOFOLLOW reads the entry, never what a link there points at.
+    // SAFETY: `dir` is an open directory, `name` a valid C string, `st` a live `stat`.
     if unsafe { libc::fstatat(dir, name.as_ptr(), &raw mut st, libc::AT_SYMLINK_NOFOLLOW) } != 0 {
         let e = io::Error::last_os_error();
         return if e.raw_os_error() == Some(libc::ENOENT) {
@@ -1602,23 +1408,16 @@ fn stat_at(dir: RawFd, name: &CString) -> io::Result<Option<EntryStat>> {
     }))
 }
 
-/// Which of an entry's times [`touch_now`] sets to now.
+/// Timestamp selector for [`touch_now`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Touch {
-    /// The access time (a file's: what a read sets).
+    /// Access time (`atime`).
     Accessed,
-    /// The modification time (a directory's: what an entry made in it sets).
+    /// Modification time (`mtime`).
     Modified,
 }
 
-/// Set one of the times of the entry at the absolute `path` to now, the other
-/// left as it is, its directory reached through no link on its whole path and
-/// the entry itself never followed (a link there gets the time itself). The
-/// change time moves too, as it does for any change of an entry's times.
-/// `Ok(false)` when nothing is there.
-///
-/// # Errors
-/// A link on the directory's path, or the kernel's refusal.
+/// Update the [`Touch`] timestamp of `path` to now without following symlinks.
 pub fn touch_now(path: &std::path::Path, which: Touch) -> io::Result<bool> {
     let Some((dir, name)) = open_parent(path)? else {
         return Ok(false);
@@ -1631,8 +1430,7 @@ pub fn touch_now(path: &std::path::Path, which: Touch) -> io::Result<bool> {
         Touch::Accessed => [at(libc::UTIME_NOW), at(libc::UTIME_OMIT)],
         Touch::Modified => [at(libc::UTIME_OMIT), at(libc::UTIME_NOW)],
     };
-    // SAFETY: `dir` is an open directory, `name` a valid C string and `times` two live timespecs;
-    // AT_SYMLINK_NOFOLLOW sets the entry's own times, never a link's target's.
+    // SAFETY: `dir` is an open directory, `name` a valid C string and `times` two live timespecs.
     let rc = unsafe {
         libc::utimensat(
             std::os::fd::AsRawFd::as_raw_fd(&dir),
@@ -1652,12 +1450,7 @@ pub fn touch_now(path: &std::path::Path, which: Touch) -> io::Result<bool> {
     }
 }
 
-/// What stands at the absolute `path`, its directory reached through no link
-/// on its whole path and the entry itself not followed (a link there is read
-/// as a link). `Ok(None)` when nothing is there.
-///
-/// # Errors
-/// A link on the directory's path, or the read failing.
+/// Stat `path` (`AT_SYMLINK_NOFOLLOW`) through an `O_NOFOLLOW_ANY` parent directory.
 pub fn entry_stat(path: &std::path::Path) -> io::Result<Option<EntryStat>> {
     let Some((dir, name)) = open_parent(path)? else {
         return Ok(None);
@@ -1665,13 +1458,7 @@ pub fn entry_stat(path: &std::path::Path) -> io::Result<Option<EntryStat>> {
     stat_at(std::os::fd::AsRawFd::as_raw_fd(&dir), &name)
 }
 
-/// Unlink the entry at the absolute `path` only while it is the file `dev`/`ino`
-/// it was, its directory reached through no link on its whole path and the
-/// entry unlinked by name (never followed): `Ok(true)` when it was removed,
-/// `Ok(false)` when nothing or another file stands there.
-///
-/// # Errors
-/// A link on the directory's path, or the unlink failing.
+/// Unlink `path` without following symlinks only if its `(dev, ino)` still matches.
 pub fn remove_if_same(path: &std::path::Path, dev: u64, ino: u64) -> io::Result<bool> {
     let Some((dir, name)) = open_parent(path)? else {
         return Ok(false);
@@ -1681,7 +1468,7 @@ pub fn remove_if_same(path: &std::path::Path, dev: u64, ino: u64) -> io::Result<
         Some(st) if st.dev == dev && st.ino == ino => {}
         _ => return Ok(false),
     }
-    // SAFETY: `fd` is an open directory, `name` a valid C string; unlinkat never follows its last part.
+    // SAFETY: `fd` is an open directory, `name` a valid C string.
     if unsafe { libc::unlinkat(fd, name.as_ptr(), 0) } != 0 {
         let e = io::Error::last_os_error();
         return if e.raw_os_error() == Some(libc::ENOENT) {
@@ -1693,7 +1480,7 @@ pub fn remove_if_same(path: &std::path::Path, dev: u64, ino: u64) -> io::Result<
     Ok(true)
 }
 
-/// The user's temp dir (`getconf DARWIN_USER_TEMP_DIR`), as the system names it.
+/// Per-user Darwin temporary directory (`_CS_DARWIN_USER_TEMP_DIR`).
 #[must_use]
 pub fn user_temp_dir() -> Option<String> {
     const CS_DARWIN_USER_TEMP_DIR: libc::c_int = 65537;
@@ -1708,18 +1495,14 @@ pub fn user_temp_dir() -> Option<String> {
     Some(s.to_string_lossy().into_owned()).filter(|s| !s.is_empty())
 }
 
-/// `pid`'s physical footprint in bytes (`proc_pid_rusage`'s
-/// `ri_phys_footprint`, the "Memory" Activity Monitor shows): its own dirty
-/// and compressed pages, never the shared clean text of its binary that its
-/// resident set counts. `None` when the process is gone or not this user's.
+/// Physical memory footprint in bytes (`ri_phys_footprint`) of `pid`.
 #[must_use]
 pub fn phys_footprint(pid: i32) -> Option<u64> {
     if pid <= 1 {
         return None;
     }
     let mut info = std::mem::MaybeUninit::<libc::rusage_info_v4>::zeroed();
-    // SAFETY: `info` is a zeroed `rusage_info_v4`, the struct `RUSAGE_INFO_V4`
-    // fills; the kernel writes at most its size, and it is read only on success.
+    // SAFETY: `info` is a zeroed `rusage_info_v4`, the struct `RUSAGE_INFO_V4` fills.
     let rc = unsafe {
         libc::proc_pid_rusage(
             pid,
@@ -1727,13 +1510,10 @@ pub fn phys_footprint(pid: i32) -> Option<u64> {
             info.as_mut_ptr().cast::<libc::rusage_info_t>(),
         )
     };
-    // SAFETY: zeroed is a valid `rusage_info_v4` (plain integers), and on
-    // success the kernel filled it.
+    // SAFETY: zeroed is a valid `rusage_info_v4` (plain integers), and on success the kernel filled it.
     (rc == 0).then(|| unsafe { info.assume_init() }.ri_phys_footprint)
 }
 
-/// A shared read-only mapping of a whole regular file, unmapped when it drops;
-/// `None` for an empty file. Mapping takes no page fault, so it reads nothing.
 struct WholeMap {
     addr: *mut libc::c_void,
     len: usize,
@@ -1748,8 +1528,7 @@ impl WholeMap {
         if len == 0 {
             return Ok(None);
         }
-        // SAFETY: a fresh read-only shared mapping of an open file; the
-        // descriptor may close once it exists. Unmapped in `drop`.
+        // SAFETY: a fresh read-only shared mapping of an open file.
         let addr = unsafe {
             libc::mmap(
                 std::ptr::null_mut(),
@@ -1774,17 +1553,9 @@ impl Drop for WholeMap {
     }
 }
 
-/// How many of `path`'s pages are in the page cache, of how many: `mincore`
-/// over a fresh mapping. A directory counts every regular file under it
-/// (symbolic links are not followed). What `instance --pages cold` checks
-/// before and after its launch (r6 sweep #19).
-///
-/// # Errors
-/// A file could not be read, mapped or asked about.
+/// Count `(resident_pages, total_pages)` of `path` in the page cache via `mincore`.
 pub fn resident_pages(path: &std::path::Path) -> io::Result<(u64, u64)> {
     unsafe extern "C" {
-        /// `<sys/mman.h>`: `int mincore(const void *, size_t, char *)`; the
-        /// first-party `libc` declares none.
         fn mincore(addr: *const libc::c_void, len: usize, vec: *mut libc::c_char) -> libc::c_int;
     }
     let meta = std::fs::symlink_metadata(path)?;
@@ -1810,19 +1581,11 @@ pub fn resident_pages(path: &std::path::Path) -> io::Result<(u64, u64)> {
     if unsafe { mincore(map.addr, map.len, vec.as_mut_ptr()) } != 0 {
         return Err(io::Error::last_os_error());
     }
-    // `MINCORE_INCORE` is bit 0.
     let resident = vec.iter().filter(|&&b| b & 1 != 0).count();
     Ok((resident as u64, vec.len() as u64))
 }
 
-/// Drop `path`'s clean pages from the page cache (every regular file under it,
-/// for a directory): `msync(MS_INVALIDATE)` over a fresh mapping. Nothing is
-/// written or renamed, either of which would void the verdict macOS keeps
-/// from an executable's first exec, so a launch after this pays only its page
-/// faults (r6 sweep #19: `instance --pages cold`).
-///
-/// # Errors
-/// A file could not be read, mapped or invalidated.
+/// Evict clean cached pages of `path` via `msync(MS_INVALIDATE)`.
 pub fn evict_pages(path: &std::path::Path) -> io::Result<()> {
     let meta = std::fs::symlink_metadata(path)?;
     if meta.is_dir() {
@@ -1844,13 +1607,7 @@ pub fn evict_pages(path: &std::path::Path) -> io::Result<()> {
     Ok(())
 }
 
-/// Read the byte of a named shared-memory canary created by the probe's parent.
-/// The parent keeps it sized and unchanged until the child has exited. This
-/// opens it read-only by name, then maps it read-only: an inherited descriptor
-/// cannot bypass the policy being tested.
-///
-/// # Errors
-/// Open/map/read refusal, an empty object, or a byte other than the canary.
+/// Open and verify a 1-byte named shared-memory canary created by [`NamedShm`].
 #[cfg(test)]
 pub fn read_named_shm(name: &str) -> io::Result<()> {
     use std::os::fd::AsRawFd as _;
@@ -1865,8 +1622,7 @@ pub fn read_named_shm(name: &str) -> io::Result<()> {
     if file.metadata()?.len() == 0 {
         return Err(io::Error::from(io::ErrorKind::UnexpectedEof));
     }
-    // SAFETY: a fresh read-only mapping of one byte of the retained, sized
-    // object. No writable mapping or resize is active in the parent.
+    // SAFETY: a fresh read-only mapping of one byte of the retained, sized object. No writable mapping or resize is active in the parent.
     let addr = unsafe {
         libc::mmap(
             std::ptr::null_mut(),
@@ -1880,8 +1636,7 @@ pub fn read_named_shm(name: &str) -> io::Result<()> {
     if addr == libc::MAP_FAILED {
         return Err(io::Error::last_os_error());
     }
-    // SAFETY: the successful one-byte mapping is still live; volatile loads
-    // read this externally backed memory without creating a Rust reference.
+    // SAFETY: the successful one-byte mapping is still live.
     let byte = unsafe { addr.cast::<u8>().read_volatile() };
     // SAFETY: exactly the one mapping made above, unmapped once.
     if unsafe { libc::munmap(addr, 1) } != 0 {
@@ -1893,9 +1648,7 @@ pub fn read_named_shm(name: &str) -> io::Result<()> {
     Ok(())
 }
 
-/// An exclusively created named canary. Only the test parent creates/writes
-/// these; children use [`read_named_shm`]. A name stays until confirmed child
-/// EOF; the parent retains this whole owner if the kernel has not confirmed it.
+/// Exclusively created 1-byte POSIX shared-memory canary unlinked on drop.
 #[cfg(test)]
 pub struct NamedShm {
     name: CString,
@@ -1904,11 +1657,7 @@ pub struct NamedShm {
 
 #[cfg(test)]
 impl NamedShm {
-    /// Create one random, mode-0600 canary under `prefix` without replacing a
-    /// collision. The writable mapping is gone before this function returns.
-    ///
-    /// # Errors
-    /// No entropy, a name collision, or an OS create/size/map refusal.
+    /// Create a random mode-0600 shared-memory canary under `prefix`.
     pub fn create(prefix: &str) -> io::Result<Self> {
         use std::os::fd::AsRawFd as _;
         use std::os::unix::fs::MetadataExt as _;
@@ -1919,8 +1668,7 @@ impl NamedShm {
             u64::from_ne_bytes(entropy) >> 16
         ))
         .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
-        // SAFETY: the valid name and unsigned-int mode match shm_open's
-        // variadic ABI. O_EXCL establishes custody before any cleanup exists.
+        // SAFETY: the valid name and unsigned-int mode match shm_open's variadic ABI. O_EXCL establishes custody before any cleanup exists.
         let mode: libc::c_uint = 0o600;
         let fd = unsafe {
             libc::shm_open(
@@ -1936,8 +1684,7 @@ impl NamedShm {
             name,
             fd: own_fd(fd),
         };
-        // SAFETY: our exclusively owned descriptor; no writable alias is
-        // handed to the child, by either exec inheritance or spawnfd custody.
+        // SAFETY: our exclusively owned descriptor.
         if unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) } != 0 {
             return Err(io::Error::last_os_error());
         }
@@ -1972,7 +1719,7 @@ impl NamedShm {
         Ok(owner)
     }
 
-    /// The exact spelling used to create it, including an optional slash.
+    /// Exact shared-memory name passed to `shm_open`.
     #[must_use]
     pub fn name(&self) -> &str {
         self.name
@@ -1989,12 +1736,7 @@ impl Drop for NamedShm {
     }
 }
 
-/// Ask the kernel about this process's preferences policy, without contacting
-/// a service or loading a preference. `scope` is global/local Mach or the
-/// domain-independent user-preference-read operation.
-///
-/// # Errors
-/// An invalid query or no policy answer.
+/// Query `sandbox_check` for this process's preference policy on `(scope, name)`.
 pub fn preference_policy(scope: &str, name: &str) -> io::Result<bool> {
     let (op, kind) = match scope {
         "global" => (c"mach-lookup", 2),
@@ -2003,8 +1745,7 @@ pub fn preference_policy(scope: &str, name: &str) -> io::Result<bool> {
         _ => return Err(io::Error::from(io::ErrorKind::InvalidInput)),
     };
     let name = CString::new(name).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
-    // SAFETY: the constant and C strings are valid. This is only a policy
-    // query for our own process, with no service lookup or preference access.
+    // SAFETY: the constant and C strings are valid. This is only a policy query for our own process, with no service lookup or preference access.
     let rc = unsafe {
         sandbox_check(
             std::process::id().cast_signed(),
@@ -2020,19 +1761,7 @@ pub fn preference_policy(scope: &str, name: &str) -> io::Result<bool> {
     }
 }
 
-/// The pids of every live process of this user in the jail that carries
-/// `mark`, sorted. The lab's profile denies `(mach-lookup (global-name
-/// MARK))`, a name nobody serves, random per lab and named by no other
-/// profile; the kernel answers `sandbox_check` about any process of the same
-/// user, and no process can leave its sandbox, so a process is found by its
-/// jail, not by its parentage (an orphan launchd adopted, one in a session of
-/// its own, one that cleared its environment). A process is in THIS jail when
-/// `mark` is denied to it and `mark.none`, a name no profile names, is not (a
-/// sandbox that denies every lookup is not the lab's). Asked with
-/// `SANDBOX_CHECK_NO_REPORT`: a query, never a logged refusal.
-///
-/// # Errors
-/// The kernel gives no answer here (this process runs in a sandbox).
+/// Sorted PIDs of all live processes of this user in the sandbox profile denying `mark`.
 pub fn jail_pids(mark: &str) -> Result<Vec<i32>, String> {
     const FILTER_NONE: libc::c_int = 0;
     const FILTER_GLOBAL_NAME: libc::c_int = 2;
@@ -2053,7 +1782,6 @@ pub fn jail_pids(mark: &str) -> Result<Vec<i32>, String> {
             name.as_ptr(),
         )
     };
-    // the control of the query itself: this process is in no sandbox, so the mark is not denied to it
     let me = i32::try_from(std::process::id()).unwrap_or(0);
     if sandboxed(me) != 0 || denied(me, &m) != 0 {
         return Err(
@@ -2085,13 +1813,7 @@ pub fn jail_pids(mark: &str) -> Result<Vec<i32>, String> {
     Ok(out)
 }
 
-// ------------------------------------------------------------ input sources
-
-/// HIToolbox's keyboard input sources (`TextInputSources.h`) and the Unicode key
-/// layout one carries (`UCKeyTranslate`): what `meta-keys` selects for its run,
-/// puts back after it, and derives each layout's characters from. HIToolbox wants
-/// its main thread, which is where the lab's verbs run; nothing here is called
-/// from another.
+/// HIToolbox keyboard input source selection and `UCKeyTranslate` layout queries.
 pub mod tis {
     use std::ffi::c_void;
 
@@ -2145,19 +1867,10 @@ pub mod tis {
         fn CFPreferencesAppSynchronize(app: CfRef) -> u8;
     }
 
-    /// `kCFStringEncodingUTF8`.
     const UTF8: u32 = 0x0800_0100;
-    /// `kCFPropertyListBinaryFormat_v1_0`.
     const BINARY_PLIST: isize = 200;
-    /// The preferences domain HIToolbox keeps the input sources in.
     const HITOOLBOX: &str = "com.apple.HIToolbox";
-    /// What HIToolbox writes there of its own when a source is selected, beside the
-    /// enabled list, and no TIS call puts back: the history of selected sources (the
-    /// one that would still name a layout the run selected) and the selection's own
-    /// record. Read as this process's HIToolbox has them, which serves the selection's
-    /// values even where the domain holds no key yet; written back, they land in the
-    /// domain. `AppleInputSourceUpdateTime` is left out: HIToolbox stamps it on its own
-    /// clock, about two seconds after a change, so nothing written before then holds.
+    /// HIToolbox preference keys snapshotted and restored around input-source changes.
     pub const BOOKKEEPING: [&str; 3] = [
         "AppleInputSourceHistory",
         "AppleSelectedInputSources",
@@ -2189,14 +1902,11 @@ pub mod tis {
         ) -> i32;
     }
 
-    /// `kUCKeyActionDown`: the key pressed, dead-key state carried.
     const KEY_ACTION_DOWN: u16 = 0;
 
-    /// One reference to a CoreFoundation object, released when it drops.
     struct Owned(CfRef);
 
     impl Owned {
-        /// `cf` from a Create or Copy call (or retained); `None` for null.
         fn new(cf: CfRef) -> Option<Owned> {
             (!cf.is_null()).then(|| Owned(cf))
         }
@@ -2209,13 +1919,11 @@ pub mod tis {
         }
     }
 
-    /// The text of `s`, `None` unless it is a `CFString`.
     fn string(s: CfRef) -> Option<String> {
         if s.is_null() {
             return None;
         }
-        // SAFETY: `CFGetTypeID` reads any live CF object; a non-string is refused
-        // before it is read as one, and the buffer holds the string's whole length.
+        // SAFETY: `CFGetTypeID` reads any live CF object.
         unsafe {
             if CFGetTypeID(s) != CFStringGetTypeID() {
                 return None;
@@ -2234,10 +1942,8 @@ pub mod tis {
         }
     }
 
-    /// A new `CFString` of `s`.
     fn cf_string(s: &str) -> Option<Owned> {
-        // SAFETY: the bytes and their length are `s`'s; the result follows the
-        // Create rule.
+        // SAFETY: the bytes and their length are `s`'s; the result follows the Create rule.
         Owned::new(unsafe {
             CFStringCreateWithBytes(
                 std::ptr::null(),
@@ -2249,11 +1955,7 @@ pub mod tis {
         })
     }
 
-    /// HIToolbox's own bookkeeping ([`BOOKKEEPING`]) as it stands: each key with
-    /// its value as a binary property list, `None` where the key is absent.
-    ///
-    /// # Errors
-    /// A value cannot be read or written as a property list.
+    /// Snapshot [`BOOKKEEPING`] preference values from `com.apple.HIToolbox`.
     pub fn bookkeeping() -> Result<Vec<Pref>, String> {
         let app = cf_string(HITOOLBOX).ok_or("cannot name com.apple.HIToolbox")?;
         // SAFETY: `app` is a live CFString.
@@ -2267,8 +1969,7 @@ pub mod tis {
                 else {
                     return Ok(((*key).to_string(), None));
                 };
-                // SAFETY: `value` is a live property list; the data follows the Create
-                // rule, and its bytes are copied while it lives.
+                // SAFETY: `value` is a live property list.
                 let data = Owned::new(unsafe {
                     CFPropertyListCreateData(
                         std::ptr::null(),
@@ -2289,11 +1990,7 @@ pub mod tis {
             .collect()
     }
 
-    /// Write `prefs` (what [`bookkeeping`] read) back into HIToolbox's domain, a
-    /// `None` by removing its key, and synchronize it.
-    ///
-    /// # Errors
-    /// A value is not a property list, or the domain did not synchronize.
+    /// Restore [`BOOKKEEPING`] preference values into `com.apple.HIToolbox`.
     pub fn put_bookkeeping(prefs: &[Pref]) -> Result<(), String> {
         let app = cf_string(HITOOLBOX).ok_or("cannot name com.apple.HIToolbox")?;
         for (key, bytes) in prefs {
@@ -2301,8 +1998,7 @@ pub mod tis {
             let value = match bytes {
                 None => None,
                 Some(b) => {
-                    // SAFETY: the bytes and their length are `b`'s; both results follow
-                    // the Create rule.
+                    // SAFETY: the bytes and their length are `b`'s; both results follow the Create rule.
                     let len = isize::try_from(b.len()).map_err(|_| format!("{key}: too long"))?;
                     let data =
                         Owned::new(unsafe { CFDataCreate(std::ptr::null(), b.as_ptr(), len) })
@@ -2336,25 +2032,18 @@ pub mod tis {
         Ok(())
     }
 
-    /// The input source's ID (`com.apple.keylayout.US`).
     fn id_of(source: CfRef) -> Option<String> {
-        // SAFETY: `source` is a live input source; the property is a Get-rule
-        // CFString that `string` checks before reading.
+        // SAFETY: `source` is a live input source.
         string(unsafe { TISGetInputSourceProperty(source, kTISPropertyInputSourceID) })
     }
 
-    /// HIToolbox's list of input sources: the enabled ones, or with `all` every
-    /// one installed.
     fn list(all: bool) -> Option<Owned> {
-        // SAFETY: a null property dictionary asks for every source; the list
-        // follows the Create rule, so the owner releases it.
+        // SAFETY: a null property dictionary asks for every source.
         Owned::new(unsafe { TISCreateInputSourceList(std::ptr::null(), u8::from(all)) })
     }
 
-    /// Each source of `list` with its ID, until `f` answers `Some`.
     fn find<T>(list: &Owned, mut f: impl FnMut(CfRef, String) -> Option<T>) -> Option<T> {
-        // SAFETY: `list` is a live CFArray of input sources, read in bounds; each
-        // element is a Get-rule source the list keeps alive while `f` runs.
+        // SAFETY: `list` is a live CFArray of input sources, read in bounds.
         let n = unsafe { CFArrayGetCount(list.0) };
         (0..n).find_map(|i| {
             // SAFETY: as above.
@@ -2363,7 +2052,7 @@ pub mod tis {
         })
     }
 
-    /// The IDs of the enabled input sources, in HIToolbox's order.
+    /// IDs of currently enabled HIToolbox input sources.
     #[must_use]
     pub fn enabled() -> Vec<String> {
         let mut out = Vec::new();
@@ -2376,7 +2065,7 @@ pub mod tis {
         out
     }
 
-    /// The ID of the selected keyboard input source.
+    /// ID of the currently selected keyboard input source.
     #[must_use]
     pub fn selected() -> Option<String> {
         // SAFETY: a Copy-rule source, released when the owner drops.
@@ -2384,11 +2073,9 @@ pub mod tis {
         id_of(source.0)
     }
 
-    /// `call` (one of the TIS setters) on the installed input source `id`.
     fn on(id: &str, what: &str, call: unsafe extern "C" fn(CfRef) -> i32) -> Result<(), String> {
         let l = list(true).ok_or_else(|| format!("{what} {id}: HIToolbox lists no sources"))?;
-        // SAFETY: `source` is a live input source of `l`, the argument every
-        // setter takes.
+        // SAFETY: `source` is a live input source of `l`, the argument every setter takes.
         let status = find(&l, |source, sid| {
             (sid == id).then(|| unsafe { call(source) })
         });
@@ -2399,50 +2086,36 @@ pub mod tis {
         }
     }
 
-    /// Enable the installed input source `id` (`TISEnableInputSource`).
-    ///
-    /// # Errors
-    /// It is not installed, or HIToolbox refused.
+    /// Enable installed input source `id` (`TISEnableInputSource`).
     pub fn enable(id: &str) -> Result<(), String> {
         on(id, "TISEnableInputSource", TISEnableInputSource)
     }
 
-    /// Disable the input source `id` (`TISDisableInputSource`).
-    ///
-    /// # Errors
-    /// It is not installed, or HIToolbox refused.
+    /// Disable input source `id` (`TISDisableInputSource`).
     pub fn disable(id: &str) -> Result<(), String> {
         on(id, "TISDisableInputSource", TISDisableInputSource)
     }
 
-    /// Select the enabled input source `id` (`TISSelectInputSource`).
-    ///
-    /// # Errors
-    /// It is not installed, or HIToolbox refused.
+    /// Select enabled input source `id` (`TISSelectInputSource`).
     pub fn select(id: &str) -> Result<(), String> {
         on(id, "TISSelectInputSource", TISSelectInputSource)
     }
 
-    /// The Unicode key layout of an input source, read for this Mac's keyboard type.
+    /// Retained `UCKeyboardLayout` for an installed input source.
     pub struct Layout {
-        /// The `kTISPropertyUnicodeKeyLayoutData`, retained.
         data: Owned,
         kbd: u32,
     }
 
     impl Layout {
-        /// The layout of the installed input source `id`, enabled or not.
-        ///
-        /// # Errors
-        /// It is not installed, or carries no Unicode key layout (an input method).
+        /// Load the Unicode key layout of installed input source `id`.
         pub fn of(id: &str) -> Result<Layout, String> {
             let l = list(true).ok_or_else(|| format!("{id}: HIToolbox lists no sources"))?;
             let data = find(&l, |source, sid| {
                 if sid != id {
                     return None;
                 }
-                // SAFETY: `source` is live; the property is a Get-rule CFData (checked
-                // by type before it is kept), retained here so it outlives the list.
+                // SAFETY: `source` is live.
                 unsafe {
                     let d = TISGetInputSourceProperty(source, kTISPropertyUnicodeKeyLayoutData);
                     (!d.is_null() && CFGetTypeID(d) == CFDataGetTypeID())
@@ -2456,24 +2129,18 @@ pub mod tis {
             Ok(Layout { data, kbd })
         }
 
-        /// The keyboard type (`LMGetKbdType`) the layout is read for.
+        /// Keyboard type (`LMGetKbdType`) used by this layout.
         #[must_use]
         pub fn keyboard_type(&self) -> u32 {
             self.kbd
         }
 
-        /// What `key_code` types pressed with `modifiers` (UCKeyTranslate's modifier
-        /// byte: Carbon's `EventModifiers` shifted right by 8, so 0x02 Shift and 0x08
-        /// Option) after the dead-key state `dead`, which it updates: a dead key
-        /// types nothing and leaves `dead` non-zero. `None` when UCKeyTranslate
-        /// refuses.
+        /// Translate `key_code` and Carbon `modifiers` with dead-key state `dead` (`UCKeyTranslate`).
         #[must_use]
         pub fn press(&self, key_code: u16, modifiers: u32, dead: &mut u32) -> Option<String> {
             let mut buf = [0u16; 8];
             let mut len = 0usize;
-            // SAFETY: the layout bytes live while `self.data` holds the CFData; the
-            // output buffer and its length, the state and the count are valid
-            // for the call.
+            // SAFETY: the layout bytes live while `self.data` holds the CFData.
             let status = unsafe {
                 UCKeyTranslate(
                     CFDataGetBytePtr(self.data.0),
@@ -2497,7 +2164,6 @@ pub mod tis {
 mod tests {
     use super::*;
 
-    /// A physical scratch dir, removed when it drops.
     struct Dir(std::path::PathBuf);
 
     impl Drop for Dir {
@@ -2515,9 +2181,6 @@ mod tests {
         Dir(d)
     }
 
-    /// Errors before a stage is created never remove another entry at its
-    /// name. The nonce is supplied to the real put path; every path belongs to
-    /// this exclusively created, physical scratch directory.
     #[test]
     fn put_preserves_occupied_stages_and_source_refusals() {
         use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _, symlink};
@@ -2576,13 +2239,11 @@ mod tests {
                 .is_symlink()
         );
         assert_eq!(std::fs::read(&source).unwrap(), b"source bytes");
-        // A stage this call did create is removed after a failed publish.
         let directory = root.join("directory");
         std::fs::create_dir(&directory).unwrap();
         assert!(put_with_nonce(&directory, 0o600, &PutSrc::Bytes(b"no"), || 4).is_err());
         assert!(directory.is_dir());
         assert!(std::fs::symlink_metadata(stage(&directory, 4)).is_err());
-        // Preserve the whole-path no-follow boundary too.
         let parent_link = root.join("via");
         symlink(&directory, &parent_link).unwrap();
         assert!(
@@ -2631,8 +2292,6 @@ mod tests {
                 std::fs::read(&other).unwrap() == b"standing other",
             ));
         }
-        // Run every refusal before the aggregate: EEXIST and failures before
-        // creation must all preserve the standing inode/link and bytes.
         assert!(
             observed
                 .iter()
@@ -2652,7 +2311,6 @@ mod tests {
             std::fs::metadata(&p).unwrap().permissions().mode() & 0o777,
             0o640
         );
-        // a link standing at the name is replaced, never followed
         let outside = d.0.join("outside");
         std::fs::write(&outside, "keep").unwrap();
         let at = d.0.join("a/link");
@@ -2665,13 +2323,11 @@ mod tests {
                 .file_type()
                 .is_symlink()
         );
-        // a link on the way is refused, and nothing is written where it points
         let elsewhere = d.0.join("elsewhere");
         std::fs::create_dir_all(&elsewhere).unwrap();
         std::os::unix::fs::symlink(&elsewhere, d.0.join("via")).unwrap();
         assert!(put(&d.0.join("via/x"), 0o600, &PutSrc::Bytes(b"no")).is_err());
         assert!(std::fs::read_dir(&elsewhere).unwrap().next().is_none());
-        // a clone of a regular file; a link as the source is refused
         put(&d.0.join("copy"), 0o644, &PutSrc::File(&p)).unwrap();
         assert_eq!(std::fs::read(d.0.join("copy")).unwrap(), b"one");
         assert!(
@@ -2750,8 +2406,6 @@ mod tests {
         assert!(scratch_dir(&d.0.join("f")).is_err(), "a file");
     }
 
-    /// NEGATIVE CONTROLS: a link standing at the name is removed and what it
-    /// names kept; a link on the way is refused, and the file it leads to kept.
     #[test]
     fn scratch_remove_unlinks_by_name_through_no_link() {
         let d = dir("remove");
@@ -2779,12 +2433,6 @@ mod tests {
         );
     }
 
-    /// `entry_stat` reads an entry without following it, and `remove_if_same`
-    /// unlinks it only while it is the file its device and inode name.
-    /// NEGATIVE CONTROLS: another inode or device leaves the file; a link
-    /// standing at the entry is read and removed as the link, and what it
-    /// names kept; a link on the directory's path is refused, and the file it
-    /// leads to kept; an absent directory or entry is nothing.
     #[test]
     fn remove_if_same_unlinks_only_the_file_it_was_through_no_link() {
         use std::os::unix::fs::{MetadataExt as _, symlink};
@@ -2816,7 +2464,6 @@ mod tests {
         assert!(std::fs::symlink_metadata(&f).is_err());
         assert_eq!(entry_stat(&f).unwrap(), None);
         assert!(!remove_if_same(&f, st.dev, st.ino).unwrap(), "already gone");
-        // a link at the entry: read as the link, removed as the link, what it names kept
         let target = d.0.join("target");
         std::fs::write(&target, "keep").unwrap();
         let l = d.0.join("sub/l");
@@ -2831,7 +2478,6 @@ mod tests {
         assert!(remove_if_same(&l, ls.dev, ls.ino).unwrap());
         assert!(std::fs::symlink_metadata(&l).is_err());
         assert_eq!(std::fs::read_to_string(&target).unwrap(), "keep");
-        // a link on the directory's path is refused, the file it leads to kept
         let elsewhere = d.0.join("elsewhere");
         std::fs::create_dir_all(&elsewhere).unwrap();
         std::fs::write(elsewhere.join("f"), "keep").unwrap();
@@ -2843,14 +2489,11 @@ mod tests {
             std::fs::read_to_string(elsewhere.join("f")).unwrap(),
             "keep"
         );
-        // an absent directory or entry is nothing
         assert_eq!(entry_stat(&d.0.join("missing/f")).unwrap(), None);
         assert!(!remove_if_same(&d.0.join("missing/f"), es.dev, es.ino).unwrap());
         assert_eq!(entry_stat(&d.0.join("sub/none")).unwrap(), None);
     }
 
-    /// A file just written and read is in the page cache; evicting it leaves none of its
-    /// pages there, and its bytes are unchanged (the eviction writes nothing).
     #[test]
     fn evicted_pages_leave_the_page_cache_and_the_file_unchanged() {
         let d = dir("pages");
@@ -2858,7 +2501,6 @@ mod tests {
         std::fs::create_dir_all(f.parent().unwrap()).unwrap();
         let bytes: Vec<u8> = (0..4 << 20).map(|i: u32| (i % 251) as u8).collect();
         std::fs::write(&f, &bytes).unwrap();
-        // Written out, so its pages are clean; a test promises nothing past a crash.
         aterm_durable::ordered(&std::fs::File::open(&f).unwrap()).unwrap();
         assert_eq!(std::fs::read(&f).unwrap(), bytes);
         let (resident, pages) = resident_pages(&d.0).unwrap();
@@ -2874,7 +2516,6 @@ mod tests {
     #[test]
     fn the_user_temp_dir_is_named_and_this_process_is_in_no_jail() {
         assert!(user_temp_dir().is_some_and(|t| t.starts_with('/')));
-        // a mark no profile names is denied to no process: none is found, and the query itself is answered
         let none = jail_pids("lab.jail.test.0000000000000000").unwrap();
         assert!(none.is_empty(), "{none:?}");
     }

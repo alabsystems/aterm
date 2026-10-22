@@ -117,7 +117,7 @@ pub const SPECTRUM_ANCHOR_AT: [usize; SPECTRUM_STOPS] = [0, 58, 130, 237, 404, 4
 /// turnarounds.
 #[inline]
 #[cfg(test)]
-fn smoothstep01(x: f64) -> f64 {
+const fn smoothstep01(x: f64) -> f64 {
     let x = x.clamp(0.0, 1.0);
     x * x * (3.0 - 2.0 * x)
 }
@@ -485,10 +485,19 @@ fn spectrum_pace_at(cum: &[(f64, [f64; 3])], cost: &impl Fn([f64; 3]) -> f64, wa
               cost to any test. `f32::max` returns the other operand when one is \
               NaN, so this spelling is total where `clamp` is not."
 )]
-pub fn spectrum(t: f32) -> u32 {
+pub const fn spectrum(t: f32) -> u32 {
     let x = t.max(0.0).min(1.0) * (SPECTRUM_LUT_LEN - 1) as f32;
-    let i = (x as usize).min(SPECTRUM_LUT_LEN - 1);
-    let j = (i + 1).min(SPECTRUM_LUT_LEN - 1);
+    let xi = x as usize;
+    let i = if xi < SPECTRUM_LUT_LEN - 1 {
+        xi
+    } else {
+        SPECTRUM_LUT_LEN - 1
+    };
+    let j = if i + 1 < SPECTRUM_LUT_LEN - 1 {
+        i + 1
+    } else {
+        SPECTRUM_LUT_LEN - 1
+    };
     lerp_rgb(SPECTRUM_LUT[i], SPECTRUM_LUT[j], x - i as f32)
 }
 
@@ -504,13 +513,15 @@ pub fn spectrum(t: f32) -> u32 {
 /// `s_min · max / (max − min)`, so the minimum lands at `max · (1 − s_min)`.
 #[must_use]
 #[inline]
-pub fn spectrum_with_min_saturation(rgb: u32, s_min: f32) -> u32 {
+pub const fn spectrum_with_min_saturation(rgb: u32, s_min: f32) -> u32 {
     if !s_min.is_finite() {
         return rgb;
     }
     let (r, g, b) = ((rgb >> 16) & 0xff, (rgb >> 8) & 0xff, rgb & 0xff);
-    let mx = r.max(g).max(b);
-    let mn = r.min(g).min(b);
+    let rg_max = if r > g { r } else { g };
+    let mx = if rg_max > b { rg_max } else { b };
+    let rg_min = if r < g { r } else { g };
+    let mn = if rg_min < b { rg_min } else { b };
     if mx == 0 || mx == mn {
         return rgb;
     }
@@ -520,8 +531,10 @@ pub fn spectrum_with_min_saturation(rgb: u32, s_min: f32) -> u32 {
         return rgb;
     }
     let k = s_min * mx as f32 / spread;
-    let ch = |c: u32| (mx as f32 - (mx - c) as f32 * k + 0.5).clamp(0.0, 255.0) as u32;
-    (ch(r) << 16) | (ch(g) << 8) | ch(b)
+    const fn ch(mx: u32, c: u32, k: f32) -> u32 {
+        (mx as f32 - (mx - c) as f32 * k + 0.5).clamp(0.0, 255.0) as u32
+    }
+    (ch(mx, r, k) << 16) | (ch(mx, g, k) << 8) | ch(mx, b, k)
 }
 
 /// The pixel the emitter writes for one glow quad over one ground: additive
@@ -530,7 +543,7 @@ pub fn spectrum_with_min_saturation(rgb: u32, s_min: f32) -> u32 {
 /// a blend the renderer does not perform.
 #[inline]
 #[must_use]
-pub fn compose_on_glass(ground: u32, premul: u32, alpha: u8) -> u32 {
+pub const fn compose_on_glass(ground: u32, premul: u32, alpha: u8) -> u32 {
     if alpha == 0 {
         aterm_render::add_sat(ground, premul)
     } else {
@@ -543,16 +556,26 @@ pub fn compose_on_glass(ground: u32, premul: u32, alpha: u8) -> u32 {
 /// own bytes.
 #[inline]
 #[must_use]
-pub(crate) fn spectrum_stop_position(i: usize) -> f32 {
-    SPECTRUM_ANCHOR_AT[i.min(SPECTRUM_STOPS - 1)] as f32 / (SPECTRUM_LUT_LEN - 1) as f32
+pub(crate) const fn spectrum_stop_position(i: usize) -> f32 {
+    let idx = if i < SPECTRUM_STOPS - 1 {
+        i
+    } else {
+        SPECTRUM_STOPS - 1
+    };
+    SPECTRUM_ANCHOR_AT[idx] as f32 / (SPECTRUM_LUT_LEN - 1) as f32
 }
 
 /// The colour of named stop `i` (red, orange, yellow, green, blue, indigo,
 /// violet), read from the table at its exact index.
 #[inline]
 #[must_use]
-pub fn spectrum_stop(i: usize) -> u32 {
-    SPECTRUM_LUT[SPECTRUM_ANCHOR_AT[i.min(SPECTRUM_STOPS - 1)]]
+pub const fn spectrum_stop(i: usize) -> u32 {
+    let idx = if i < SPECTRUM_STOPS - 1 {
+        i
+    } else {
+        SPECTRUM_STOPS - 1
+    };
+    SPECTRUM_LUT[SPECTRUM_ANCHOR_AT[idx]]
 }
 
 /// Midpoints between consecutive [`SPECTRUM_ANCHOR_AT`] entries. Because the
@@ -575,14 +598,14 @@ const SPECTRUM_SNAP_MIDS: [f32; SPECTRUM_STOPS - 1] = {
 /// [`spectrum_stop`].
 #[inline]
 #[must_use]
-pub fn spectrum_snap_index(t: f32) -> usize {
+pub const fn spectrum_snap_index(t: f32) -> usize {
     let x = t.clamp(0.0, 1.0) * (SPECTRUM_LUT_LEN - 1) as f32;
-    usize::from(x > SPECTRUM_SNAP_MIDS[0])
-        + usize::from(x > SPECTRUM_SNAP_MIDS[1])
-        + usize::from(x > SPECTRUM_SNAP_MIDS[2])
-        + usize::from(x > SPECTRUM_SNAP_MIDS[3])
-        + usize::from(x > SPECTRUM_SNAP_MIDS[4])
-        + usize::from(x > SPECTRUM_SNAP_MIDS[5])
+    (x > SPECTRUM_SNAP_MIDS[0]) as usize
+        + (x > SPECTRUM_SNAP_MIDS[1]) as usize
+        + (x > SPECTRUM_SNAP_MIDS[2]) as usize
+        + (x > SPECTRUM_SNAP_MIDS[3]) as usize
+        + (x > SPECTRUM_SNAP_MIDS[4]) as usize
+        + (x > SPECTRUM_SNAP_MIDS[5]) as usize
 }
 
 /// Snap to a name (§2.3.3): the nearest named stop's colour to `t`. Every
@@ -591,7 +614,7 @@ pub fn spectrum_snap_index(t: f32) -> usize {
 /// thing must be nameable (no teal dot, no cyan caret).
 #[inline]
 #[must_use]
-pub fn spectrum_snap(t: f32) -> u32 {
+pub const fn spectrum_snap(t: f32) -> u32 {
     spectrum_stop(spectrum_snap_index(t))
 }
 

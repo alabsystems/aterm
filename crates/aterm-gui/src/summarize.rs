@@ -23,8 +23,8 @@
 //! brief and Read the Fleet's row ([`in_fleet`]): the fleet secret in the
 //! state directory, the one answer the fleet glance reads too. Whether this
 //! aterm's fabric is configured adds one sentence to either brief, right
-//! after its survey: read the fabric's log once ([`FABRIC_READ`], session log
-//! Phase 6 step 6E-5, ruling U45); without the fabric the briefs are
+//! after its survey: read the fabric's log once ([`FABRIC_READ`]);
+//! without the fabric the briefs are
 //! [`FLEET_BRIEF`] and [`MAC_BRIEF`] byte for byte.
 
 use std::sync::Mutex;
@@ -44,7 +44,7 @@ to commit, push or land.";
 /// [`FLEET_BRIEF`] for a Mac in no fleet: the same summary of this Mac's
 /// sessions, from `aterm ctl survey`, then the local brief, `aterm ctl survey
 /// --brief`: each instance's node log and its sessions' briefs, read off the
-/// session log (session log Phase 6 step 6H-7).
+/// session log.
 pub(crate) const MAC_BRIEF: &str = "Summarize this Mac's aterm sessions for the person reading \
 this tab. Run `aterm ctl survey` once, then `aterm ctl survey --brief` once, for what each \
 session's log says. Write, in this order: first what needs the person (the session, and why); \
@@ -60,7 +60,7 @@ const FLEET_SURVEY: &str = "Run `aterm ctl survey --fleet` once.";
 const MAC_SURVEY: &str = "Run `aterm ctl survey` once, then `aterm ctl survey --brief` once, \
 for what each session's log says.";
 
-/// THE FABRIC'S SENTENCE (session log Phase 6 step 6E-5, ruling U45): where
+/// THE FABRIC'S SENTENCE: where
 /// this aterm's fabric is configured, either brief reads the fabric's log
 /// once too, right after its survey, for the sessions the fabric's other
 /// machines report from the bus alone.
@@ -393,7 +393,7 @@ impl crate::App {
     /// What a Summarize press books in `folder` ([`summary_spawn`]): the
     /// fleet's brief where this Mac is in a fleet ([`in_fleet`]), this Mac's
     /// otherwise, with the fabric's sentence where THIS aterm's fabric is
-    /// configured ([`Self::fabric_configured`], ruling U45).
+    /// configured ([`Self::fabric_configured`]).
     fn summary_spawn_in(
         &self,
         folder: Option<&std::path::Path>,
@@ -483,8 +483,8 @@ mod tests {
         }
     }
 
-    /// THE FABRIC'S SENTENCE, ONLY WHERE THE FABRIC IS ON (session log
-    /// Phase 6 step 6E-5, ruling U45), in all four arms: with no fabric each
+    /// THE FABRIC'S SENTENCE, ONLY WHERE THE FABRIC IS ON,
+    /// in all four arms: with no fabric each
     /// brief is [`FLEET_BRIEF`] or [`MAC_BRIEF`] byte for byte and names no
     /// fabric; with it, the same brief with exactly [`FABRIC_READ`] added,
     /// right after its survey and before what it asks for. NEGATIVE
@@ -513,8 +513,8 @@ mod tests {
         }
     }
 
-    /// THIS MAC'S BRIEF READS THE SURVEY, THEN THE LOCAL BRIEF (session log
-    /// Phase 6 step 6H-7): `aterm ctl survey` once, then `aterm ctl survey
+    /// THIS MAC'S BRIEF READS THE SURVEY, THEN THE LOCAL BRIEF:
+    /// `aterm ctl survey` once, then `aterm ctl survey
     /// --brief` once, and where the fabric is on its sentence follows both.
     /// The fleet's brief is unchanged. NEGATIVE CONTROL, run: the old order
     /// (the survey alone) fails it.
@@ -535,8 +535,8 @@ mod tests {
         }
     }
 
-    /// A PRESS NAMES THE FABRIC WHERE THIS ATERM'S IS ON (session log Phase
-    /// 6 step 6E-5, ruling U45), at the press: the order Summarize books
+    /// A PRESS NAMES THE FABRIC WHERE THIS ATERM'S IS ON,
+    /// at the press: the order Summarize books
     /// ([`App::summary_spawn_in`]) carries [`FABRIC_READ`] exactly where
     /// [`App::fabric_configured`] says this aterm's fabric is configured.
     /// NEGATIVE CONTROL, run: the press passing `false` for the fabric fails

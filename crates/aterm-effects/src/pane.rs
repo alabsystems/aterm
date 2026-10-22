@@ -102,7 +102,7 @@ impl PanePlace {
     /// stays open (a sprite may overhang the window pad); every interior edge is a divider and
     /// clips hard.
     #[inline]
-    fn px_box(self) -> (i32, i32, i32, i32) {
+    const fn px_box(self) -> (i32, i32, i32, i32) {
         let (cw, ch) = (self.cell_w as i32, self.cell_h as i32);
         // Half the range: unreachable by any real sprite, far from overflow in `x0 + w`.
         let open_lo = i32::MIN / 2;
@@ -110,32 +110,32 @@ impl PanePlace {
         let x0 = if self.col_off == 0 {
             open_lo
         } else {
-            i32::from(self.col_off) * cw
+            self.col_off as i32 * cw
         };
         let y0 = if self.row_off == 0 {
             open_lo
         } else {
-            i32::from(self.row_off) * ch
+            self.row_off as i32 * ch
         };
         let x1 = if self.col_off.saturating_add(self.cols) >= self.win_cols {
             open_hi
         } else {
-            (i32::from(self.col_off) + i32::from(self.cols)) * cw
+            (self.col_off as i32 + self.cols as i32) * cw
         };
         let y1 = if self.row_off.saturating_add(self.rows) >= self.win_rows {
             open_hi
         } else {
-            (i32::from(self.row_off) + i32::from(self.rows)) * ch
+            (self.row_off as i32 + self.rows as i32) * ch
         };
         (x0, y0, x1, y1)
     }
 
     /// Grid-interior pixel shift from pane-local to window-content coords.
     #[inline]
-    fn px_shift(self) -> (i32, i32) {
+    const fn px_shift(self) -> (i32, i32) {
         (
-            i32::from(self.col_off) * self.cell_w as i32,
-            i32::from(self.row_off) * self.cell_h as i32,
+            self.col_off as i32 * self.cell_w as i32,
+            self.row_off as i32 * self.cell_h as i32,
         )
     }
 }
@@ -196,33 +196,42 @@ pub fn translate_free_into_pane(free: &mut Vec<aterm_core::render::FreeSprite>, 
 /// Crop one free sprite to the pixel box `(x0, y0, x1, y1)`: dest rect and, in lockstep, its
 /// atlas source rect by the sprite's own scale. `false`: nothing of it is left in the box.
 #[inline]
-pub fn crop_free_sprite(
+pub const fn crop_free_sprite(
     s: &mut aterm_core::render::FreeSprite,
     px_box: (i32, i32, i32, i32),
 ) -> bool {
     let (bx0, by0, bx1, by1) = px_box;
     let (x0, y0) = (s.x, s.y);
-    let x1 = x0.saturating_add(i32::from(s.w));
-    let y1 = y0.saturating_add(i32::from(s.h));
-    let (cx0, cy0) = (x0.max(bx0), y0.max(by0));
-    let (cx1, cy1) = (x1.min(bx1), y1.min(by1));
+    let x1 = x0.saturating_add(s.w as i32);
+    let y1 = y0.saturating_add(s.h as i32);
+    let cx0 = if x0 > bx0 { x0 } else { bx0 };
+    let cy0 = if y0 > by0 { y0 } else { by0 };
+    let cx1 = if x1 < bx1 { x1 } else { bx1 };
+    let cy1 = if y1 < by1 { y1 } else { by1 };
     if cx1 <= cx0 || cy1 <= cy0 {
         return false;
     }
     s.x = cx0;
     s.y = cy0;
-    if (cx0, cy0, cx1, cy1) == (x0, y0, x1, y1) {
+    if cx0 == x0 && cy0 == y0 && cx1 == x1 && cy1 == y1 {
         return true; // wholly inside: a pure shift, no atlas math
     }
     // Dest span -> atlas span by the sprite's own scale, rounded to nearest so a one-pixel
     // dest sliver still selects a texel instead of an empty source rect.
-    let scale = |span: i32, dest: u16, atlas: u16| -> u16 {
+    const fn scale(span: i32, dest: u16, atlas: u16) -> u16 {
         if dest == 0 {
             return 0;
         }
-        let n = i64::from(span) * i64::from(atlas) + i64::from(dest) / 2;
-        (n / i64::from(dest)).clamp(0, i64::from(u16::MAX)) as u16
-    };
+        let n = span as i64 * atlas as i64 + dest as i64 / 2;
+        let q = n / dest as i64;
+        if q < 0 {
+            0
+        } else if q > u16::MAX as i64 {
+            u16::MAX
+        } else {
+            q as u16
+        }
+    }
     let (aw0, ah0) = (s.aw, s.ah);
     let (w0, h0) = (s.w, s.h);
     // A mirrored sprite samples its atlas window backwards from `ax + aw` on both backends
@@ -239,8 +248,10 @@ pub fn crop_free_sprite(
     s.w = (cx1 - cx0) as u16;
     s.h = (cy1 - cy0) as u16;
     // At least one texel, or the sprite has nothing to sample.
-    s.aw = scale(cx1 - cx0, w0, aw0).max(1);
-    s.ah = scale(cy1 - cy0, h0, ah0).max(1);
+    let aw_scaled = scale(cx1 - cx0, w0, aw0);
+    s.aw = if aw_scaled < 1 { 1 } else { aw_scaled };
+    let ah_scaled = scale(cy1 - cy0, h0, ah0);
+    s.ah = if ah_scaled < 1 { 1 } else { ah_scaled };
     true
 }
 

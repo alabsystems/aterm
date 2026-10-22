@@ -11,8 +11,8 @@
 //! name, WHY aterm runs it, where it is found and who provides it
 //! (docs/DESIGN-init-system-2026-10-20.md §8). A gate that cannot find one ends COULD NOT
 //! RUN naming that provider ([`Tool::refusal`]), so the remedy is the provider's one
-//! command, or, where the provider's slice has not landed, the route that works today;
-//! never a command that does not exist, and never a system-wide install.
+//! command (for a tool the checkout pins, `targo --unverified verify provision`); never a
+//! command that does not exist, and never a system-wide install.
 //!
 //! The one shell read of what a child holds ([`sh_held_any`]) is here too, for the same
 //! reason: every crate's test that asks a child shell for its descriptors asks it this way.
@@ -170,22 +170,12 @@ pub enum Provider {
         /// The default-set program that carries this tool.
         program: &'static str,
     },
-    /// A tool the checkout pins, which the design's S7 slice fetches or builds into the
-    /// tooling cache ([`tooling_dir`]) with a `verify provision` verb that `aterm init
-    /// --develop` runs (§6.2–§6.4). Neither command exists yet, so the words name only
-    /// `meanwhile`, the route that provides the tool today: as for [`Provider::Unprovided`],
-    /// naming a command that does not do the job would send a person nowhere. The slice
-    /// that adds the verb names it here.
+    /// A tool the checkout pins by version and sha256, which `targo --unverified verify
+    /// provision` fetches or builds into this user's cache (the tooling cache,
+    /// [`tooling_dir`], or the browser lane's own) (§4.4, §6.2–§6.4).
     Workspace {
-        /// Which provisioning run will provide it (S7).
+        /// Which `verify provision` run provides it ([`When::command`]).
         when: When,
-        /// Where the tool comes from today, and how a copy is put in reach without a
-        /// system-wide install: the whole remedy until S7 lands.
-        meanwhile: &'static str,
-        /// The command of this tree that provides it today, where one does (`verify
-        /// fetch-browser` for the browsers): `verify list` names it as the provider, and
-        /// `upstream` where the route is the official build.
-        by: Option<&'static str>,
     },
     /// A release host's own (`ship provision` acquires and audits it).
     ReleaseHost,
@@ -203,28 +193,85 @@ pub enum Provider {
     Hardware(&'static str),
 }
 
-/// Which provisioning run will provide a [`Provider::Workspace`] row (S7's, §8.1).
+/// Which `verify provision` run provides a [`Provider::Workspace`] row (§8.1).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum When {
     /// Every run: what testing a checkout needs.
     Always,
-    /// The Linux lane's own.
+    /// The Linux lane's own (`--linux`).
     Linux,
-    /// Only to re-record a golden.
+    /// Only to re-record a golden (`--record`).
     Record,
 }
 
-/// The version of a [`Provider::Workspace`] tool the tree pins, and where its install lays
-/// the program: `<tooling>/<name>-<version>/<exe>` ([`Tool::pinned_in`]). The resolver
-/// reads exactly that version, so a stale copy is never used.
+impl When {
+    /// The flag that adds this row to a `verify provision` run: none for [`When::Always`].
+    #[must_use]
+    pub const fn flag(self) -> Option<&'static str> {
+        match self {
+            Self::Always => None,
+            Self::Linux => Some("--linux"),
+            Self::Record => Some("--record"),
+        }
+    }
+
+    /// The `verify` words of the run that provides it: `verify provision`, `verify
+    /// provision --linux` or `verify provision --record`.
+    #[must_use]
+    pub fn verb(self) -> String {
+        match self.flag() {
+            None => "verify provision".to_string(),
+            Some(flag) => format!("verify provision {flag}"),
+        }
+    }
+
+    /// The whole command: `targo --unverified ` and [`When::verb`].
+    #[must_use]
+    pub fn command(self) -> String {
+        format!("targo --unverified {}", self.verb())
+    }
+}
+
+/// The version of a [`Provider::Workspace`] tool the tree pins, and where `verify
+/// provision` lays the program: `<tooling>/<package>-<version>/<exe>`
+/// ([`Tool::pinned_in`]). The resolver reads exactly that version, so a stale copy is
+/// never used.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Pin {
+    /// What carries the program, the install directory's name before its version:
+    /// `binaryen` for `wasm-opt`, `lima` for `limactl`, else the tool's own name.
+    pub package: &'static str,
     /// The pinned version.
     pub version: &'static str,
     /// The program's path under `<name>-<version>/`.
     pub exe: &'static str,
     /// Built on this machine from a pinned source (fish), rather than fetched.
     pub built: bool,
+    /// The hosts (`<os>-<arch>` as Rust names them, [`host_platform`]) the tree pins it
+    /// for; empty for a crate targo builds wherever it runs (wasm-bindgen).
+    pub hosts: &'static [&'static str],
+}
+
+impl Pin {
+    /// Whether the tree pins this program for `platform` (`macos-aarch64`).
+    #[must_use]
+    pub fn pinned_for(&self, platform: &str) -> bool {
+        self.hosts.is_empty() || self.hosts.contains(&platform)
+    }
+}
+
+/// The macOS hosts a fetched or built pin covers: Apple silicon and Intel.
+pub const MACOS_HOSTS: &[&str] = &["macos-aarch64", "macos-x86_64"];
+
+/// The name of the stamp `verify provision` writes into a row's directory as it places
+/// it: the record of what was fetched, held to what, and when. A program at a pinned path
+/// with no stamp beside it was laid some other way and is not the pin.
+pub const PIN_STAMP: &str = "stamp.json";
+
+/// This host as a [`Pin`] names one: `<os>-<arch>` (`macos-aarch64`).
+#[must_use]
+pub fn host_platform() -> String {
+    format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH)
 }
 
 /// One outside program aterm runs: a row of [`TOOLS`].
@@ -288,20 +335,35 @@ impl Tool {
         format!("ATERM_TEST_{name}")
     }
 
-    /// Where the tree's pin of this tool lives under `tooling`: `<name>-<version>/<exe>`;
-    /// `None` for a row with no pin.
+    /// The directory `verify provision` lays the tree's pin of this tool in under
+    /// `tooling`: `<package>-<version>`; `None` for a row with no pin.
+    #[must_use]
+    pub fn pinned_root(&self, tooling: &Path) -> Option<PathBuf> {
+        let pin = self.pin?;
+        Some(tooling.join(format!("{}-{}", pin.package, pin.version)))
+    }
+
+    /// Where the tree's pin of this tool lives under `tooling`:
+    /// `<package>-<version>/<exe>`; `None` for a row with no pin.
     #[must_use]
     pub fn pinned_in(&self, tooling: &Path) -> Option<PathBuf> {
-        let pin = self.pin?;
-        Some(
-            tooling
-                .join(format!("{}-{}", self.name, pin.version))
-                .join(pin.exe),
-        )
+        Some(self.pinned_root(tooling)?.join(self.pin?.exe))
+    }
+
+    /// [`Tool::pinned_in`] where `verify provision` placed it: the program a file, its
+    /// directory's [`PIN_STAMP`] a file beside it. A copy at the path with no stamp (laid
+    /// by hand, or by the retired installers) is not the pin, and nothing resolves it.
+    #[must_use]
+    pub fn placed_in(&self, tooling: &Path) -> Option<PathBuf> {
+        let exe = self.pinned_in(tooling)?;
+        let stamp = self.pinned_root(tooling)?.join(PIN_STAMP);
+        (exe.is_file() && std::fs::symlink_metadata(&stamp).is_ok_and(|m| m.is_file()))
+            .then_some(exe)
     }
 
     /// This tool on the host `lookup` describes, in the one order every gate resolves:
-    /// `$ATERM_TEST_<NAME>`, then the tooling cache's pinned version, then [`Tool::at`],
+    /// `$ATERM_TEST_<NAME>`, then the tooling cache's pinned version where `verify
+    /// provision` placed it ([`Tool::placed_in`]), then [`Tool::at`],
     /// then the first `name` on `$PATH`; `None` where none has it.
     ///
     /// The pinned copy comes before the usual install paths, so every dev machine tests
@@ -332,8 +394,7 @@ impl Tool {
         if let Some(pinned) = lookup
             .tooling
             .as_deref()
-            .and_then(|tooling| self.pinned_in(tooling))
-            .filter(|pinned| pinned.is_file())
+            .and_then(|tooling| self.placed_in(tooling))
         {
             return Some(pinned);
         }
@@ -373,9 +434,18 @@ impl Tool {
     }
 
     /// The provider's one command for a host without this tool, or, for an [`Provider::Os`]
-    /// or [`Provider::Hardware`] row, that no command adds it.
+    /// or [`Provider::Hardware`] row, that no command adds it: [`Tool::remedy_on`] this
+    /// host.
     #[must_use]
     pub fn remedy(&self) -> String {
+        self.remedy_on(&host_platform())
+    }
+
+    /// [`Tool::remedy`] on the host `platform` (`<os>-<arch>`): a pinned row names its
+    /// `verify provision` run only where the tree pins it for that host, so a refusal
+    /// never sends a person to a run that answers "nothing is pinned".
+    #[must_use]
+    pub fn remedy_on(&self, platform: &str) -> String {
         match self.provider {
             Provider::Os => "it comes with the operating system, and no command adds it".into(),
             // Never `xcode-select --install`: it raises a dialog on whoever's desktop this
@@ -386,7 +456,21 @@ impl Tool {
             Provider::Toolset { program } => format!(
                 "ALab's default set provides it (`aterm pkg install --default-set` installs {program})"
             ),
-            Provider::Workspace { meanwhile, .. } => meanwhile.into(),
+            Provider::Workspace { when } => {
+                if let Some(pin) = self.pin.filter(|p| !p.pinned_for(platform)) {
+                    return format!(
+                        "aterm provides none for {platform}: `{}` pins it for {} only",
+                        when.command(),
+                        pin.hosts.join(" and ")
+                    );
+                }
+                let does = match self.pin {
+                    Some(pin) if pin.built => format!("builds the pinned {}", pin.version),
+                    Some(pin) => format!("fetches the pinned {}", pin.version),
+                    None => "fetches the pinned build".to_string(),
+                };
+                format!("`{}` {does} into this user's cache", when.command())
+            }
             Provider::ReleaseHost => {
                 "a release host carries it (`targo --unverified ship provision` audits one)".into()
             }
@@ -402,39 +486,37 @@ impl Tool {
     /// What a gate that found no such tool says: what is missing, then [`Tool::remedy`],
     /// then the variable that names another copy. Only for a gate that resolves the tool
     /// through [`Tool::find_in`], which reads that variable; any other gate says
-    /// [`Tool::remedy`] alone. A [`Provider::Workspace`] copy got today lands nowhere the
-    /// resolver looks, so its words lead with the variable, the route that finds it.
+    /// [`Tool::remedy`] alone.
     #[must_use]
     pub fn refusal(&self) -> String {
+        self.refusal_on(&host_platform())
+    }
+
+    /// [`Tool::refusal`] on the host `platform` ([`Tool::remedy_on`]).
+    #[must_use]
+    pub fn refusal_on(&self, platform: &str) -> String {
         match self.provider {
             Provider::Hardware(what) => format!("this host lacks {what}, and no command adds it"),
-            Provider::Workspace { .. } => format!(
-                "no {} here: {}=<path> names one; {}",
-                self.missing.unwrap_or(self.name),
-                self.var(),
-                self.remedy()
-            ),
             _ => format!(
                 "no {} here: {} (or {}=<path> names one)",
                 self.missing.unwrap_or(self.name),
-                self.remedy(),
+                self.remedy_on(platform),
                 self.var()
             ),
         }
     }
 
     /// Its provider in a word or two, as `verify list` prints it: for a
-    /// [`Provider::Workspace`] row the command that provides it today (`verify
-    /// fetch-browser`), else `upstream` (its official build, until S7 provides the pin);
-    /// `default set`, `OS`, `unprovided` for a [`Provider::Unprovided`] row, or `hardware`
-    /// for a [`Provider::Hardware`] row.
+    /// [`Provider::Workspace`] row the run that provides it ([`When::verb`]: `verify
+    /// provision`, `verify provision --linux`); `default set`, `OS`, `unprovided` for a
+    /// [`Provider::Unprovided`] row, or `hardware` for a [`Provider::Hardware`] row.
     #[must_use]
     pub fn provided_by(&self) -> String {
         match self.provider {
             Provider::Os => "OS".to_string(),
             Provider::Clt => "CLT".to_string(),
             Provider::Toolset { .. } => "default set".to_string(),
-            Provider::Workspace { by, .. } => by.unwrap_or("upstream").to_string(),
+            Provider::Workspace { when } => when.verb(),
             Provider::ReleaseHost => "release host".to_string(),
             Provider::Guest => "Linux guest".to_string(),
             Provider::Unprovided { .. } => "unprovided".to_string(),
@@ -443,7 +525,7 @@ impl Tool {
     }
 
     /// This row as `verify list`'s NEEDS column names it: the tool and its provider in a
-    /// word (`fish (upstream)`), or a [`Provider::Hardware`] row's own words.
+    /// word (`fish (verify provision)`), or a [`Provider::Hardware`] row's own words.
     #[must_use]
     pub fn needs_label(&self) -> String {
         match self.provider {
@@ -470,7 +552,7 @@ pub fn tool(name: &str) -> &'static Tool {
 
 /// The version the tree pins for the [`TOOLS`] row `name`, at compile time: one source
 /// for the resolver and for the code that installs the pin (the wasm-glue oracle's
-/// `BINDGEN`, and S7's `verify provision` rows).
+/// `BINDGEN`, and `verify provision`'s rows).
 ///
 /// # Panics
 ///
@@ -565,6 +647,11 @@ pub fn refusals_for(absent: &[&str]) -> Option<String> {
 /// The name of the machine-wide directory [`Provider::Workspace`] tools install into, in
 /// aterm's user cache ([`user_cache`]).
 pub const TOOLING: &str = "tooling";
+
+/// The prefix of a `verify provision` row's scratch in a cache it places into: a
+/// download, an unpack or a build not yet renamed into place. One a run left (killed part
+/// way) is what the build-cache reclaim's tooling pass removes a day later.
+pub const TOOLING_SCRATCH: &str = ".provision-";
 
 /// aterm's directory `name` in this user's cache, by each platform's rule: on macOS
 /// `~/Library/Caches/aterm/<name>.noindex` (Spotlight skips `.noindex`), elsewhere

@@ -1182,7 +1182,7 @@ fn a_restated_landings_note_carries_its_first_time_forward() {
 }
 
 /// THE PAGE COUNTS EACH LANDING ONCE, FROM THE FILES THE LOOPS WROTE (design
-/// §12.4.3, item 2; slice 4b): a real landing kept through the task's own
+/// §12.4.3, item 2): a real landing kept through the task's own
 /// wake (its note restated, `WAKE_KEPT`), then two loops restarted over it
 /// (a seamless update, a relaunch), each restating it with its first time
 /// (`ended`) — the page's one reading of the ledger and the journal

@@ -41,7 +41,7 @@
 //!
 //! A relaunch under an adopted id starts a new session log for it, whose
 //! first epoch must be above every epoch a predecessor's log of the id held
-//! (`session_log::Epochs`, ruling U1), or a reader's cursor of the dead
+//! (`session_log::Epochs`), or a reader's cursor of the dead
 //! process reads on into the live one with no gap. The wall seconds give that
 //! only when the relaunch comes a second or more after the predecessor's
 //! log started and the clock has not stepped back, and a restore leaf's

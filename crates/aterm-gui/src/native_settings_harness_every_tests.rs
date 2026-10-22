@@ -114,7 +114,7 @@ fn the_every_row_comes_after_the_rows_and_moves_none_of_them() {
     assert_eq!(row_frames(&pages, 8), two);
 }
 
-/// A WORD'S PRESS MOVES NO ROW (design §11.7.7, the review of slice 7): on
+/// A WORD'S PRESS MOVES NO ROW (design §11.7.7): on
 /// one open page, session 7 taking its own word from Settings ▸ Harness,
 /// handing it back to the default, and session 8 taking one change only the
 /// words of their setting lines (`follows the default` ↔ `its own setting,
