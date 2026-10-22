@@ -845,7 +845,7 @@ ensure_dirs_writable() { # <dir>...
 	done
 }
 
-# Six random bytes as hex. od reads EXACTLY its byte count, so pipefail never
+# Six random bytes as hex. od reads exactly its byte count, so pipefail never
 # sees a SIGPIPE here (a `head -c` over /dev/urandom would).
 random_suffix() {
 	local s
@@ -1616,7 +1616,7 @@ linux_candidate_answers_tag() { # <exe> <tag>
 	esac
 }
 
-# Linux has no Apple bootstrap chain. Verify the SAME paper-master -> live
+# Linux has no Apple bootstrap chain. Verify the same paper-master -> live
 # machine -> appcast chain as update-core before interpreting an artifact claim.
 # Kept inside the one-file installer so the curl|bash path never fetches an
 # unverified executable helper, and this heredoc is the verifier's only copy.
@@ -2182,7 +2182,7 @@ linux_store_preflight() { # <store>
 	return 1
 }
 
-# --- OWNERSHIP: one set of tests for BOTH directions ---------------------------
+# --- ownership: one set of tests for both directions ---------------------------
 #
 # The uninstaller always refused to delete what it did not place; the installer
 # used to move aside whatever sat at $DEST/aterm.app and `ln -sfn` over whatever
